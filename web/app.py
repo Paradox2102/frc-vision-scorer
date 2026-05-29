@@ -2389,9 +2389,24 @@ async def calibration_frame(request: Request):
     Crop origin is (0,0) so pixel coords match full-frame coords."""
     body = await request.json()
     ts = float(body.get("timestamp", 75))
-    path = Path(body.get("video_path") or CALIB_TEST_VIDEO)
+    # video_path is restricted to data/test_footage/ with a video extension to
+    # prevent arbitrary local-file / URL reads via cv2.VideoCapture.
+    raw = body.get("video_path")
+    if not raw:
+        path = CALIB_TEST_VIDEO
+    else:
+        allowed_dir = (Path(__file__).resolve().parents[1] / "data/test_footage").resolve()
+        candidate = Path(raw).resolve()
+        try:
+            candidate.relative_to(allowed_dir)
+        except ValueError:
+            return JSONResponse(status_code=400,
+                                content={"error": "video_path outside allowed directory"})
+        if candidate.suffix.lower() not in {".mp4", ".mov", ".mkv"}:
+            return JSONResponse(status_code=400, content={"error": "unsupported video extension"})
+        path = candidate
     if not path.exists():
-        return JSONResponse(status_code=400, content={"error": f"video not found: {path}"})
+        return JSONResponse(status_code=400, content={"error": "video not found"})
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))

@@ -74,3 +74,49 @@ def test_color_unknown_still_associates_by_position():
     out = trk.update([_det(2.1, 3.0, "unknown"), _det(5, 3, "blue"),
                       _det(8, 3, "blue")] + base, {}, 0.1)
     assert sum(t.alliance == "blue" and t.state == "visible" for t in out) == 3
+
+
+def test_coasting_track_not_matched_across_field():
+    """Regression: a coasting track must NOT be matched to a detection 13 m away."""
+    trk = FieldTracker(field_length=16.541, max_coast_open=4, max_coast_occluded=90)
+    # Seed a single blue track at (2, 3)
+    _step(trk, [_det(2, 3, "blue")])
+    blue_slot = [t for t in trk.tracks if t.alliance == "blue" and t.active][0]
+    sid = blue_slot.slot_id
+
+    # Let it coast for 3 frames with view_occluded=True (no matching detections)
+    for _ in range(3):
+        trk.update([], {sid: {"view_occluded": True}}, 0.1)
+
+    # Confirm the slot is still active and coasting near its origin
+    assert blue_slot.active
+    assert blue_slot.coasting
+    origin_x, origin_y = blue_slot.kf.pos
+
+    # Present a detection very far away (across the field, ~13 m from origin)
+    far_det = _det(15, 7, "blue")
+    trk.update([far_det], {sid: {"view_occluded": True}}, 0.1)
+
+    # The coasting slot must NOT have teleported to ~(15, 7)
+    px, py = blue_slot.kf.pos
+    dist_moved = ((px - origin_x) ** 2 + (py - origin_y) ** 2) ** 0.5
+    assert dist_moved < 5.0, (
+        f"Coasting track teleported: was ~({origin_x:.1f},{origin_y:.1f}), "
+        f"now ({px:.1f},{py:.1f}) — dist {dist_moved:.1f} m"
+    )
+
+
+def test_unknown_detection_seeds_one_slot_only():
+    """Regression: an unknown detection in blue territory must seed exactly one slot."""
+    trk = FieldTracker(field_length=16.541)
+    # x=2 is well within the blue half (< 16.541/2 ≈ 8.27)
+    _step(trk, [_det(2, 4, "unknown")])
+
+    active = [t for t in trk.tracks if t.active]
+    assert len(active) == 1, (
+        f"Expected 1 active slot, got {len(active)}: "
+        + str([(t.slot_id, t.alliance) for t in active])
+    )
+    assert active[0].alliance == "blue", (
+        f"Expected blue slot, got {active[0].alliance}"
+    )

@@ -2,10 +2,10 @@
 
 6 slots (3 blue + 3 red), each a constant-velocity Kalman filter in field meters.
 Per frame, per alliance, assign that color's <=3 detections to its 3 slots by
-minimum-cost matching, brute-forced over <=3!=6 permutations. Update matched, coast
+minimum-cost matching, brute-forced over small permutation sets. Update matched, coast
 unmatched. Occluded slots coast far longer and cannot be re-seeded. Alliance sticky."""
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import permutations
 from typing import Optional
 import numpy as np
@@ -32,6 +32,8 @@ class TrackOut:
 
 
 class _KF:
+    """Constant-velocity Kalman filter. State vector: [x, y, vx, vy]."""
+
     def __init__(self, xy, q=2.0, r=0.05):
         self.x = np.array([xy[0], xy[1], 0.0, 0.0], float)
         self.P = np.diag([r, r, 4.0, 4.0])
@@ -73,6 +75,7 @@ class FieldTracker:
     def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
                  max_coast_occluded=90, color_penalty=3.0):
         self.gate = gate_m
+        self.field_length = field_length
         self.max_open = max_coast_open
         self.max_occ = max_coast_occluded
         self.color_penalty = color_penalty
@@ -92,11 +95,19 @@ class FieldTracker:
             if t.active:
                 t.kf.predict(dt)
 
-        # Assign detections per alliance
+        # Assign detections per alliance.
+        # Unknown-color detections go only to the alliance whose half they're in
+        # (x < field_length/2 → "blue", else "red"), preventing a single unknown
+        # detection from seeding slots in both alliances simultaneously.
+        half = self.field_length / 2.0
         for alliance in ALLIANCES:
+            def _territory(pos):
+                return "blue" if pos[0] < half else "red"
             self._assign(
                 self._slots(alliance),
-                [d for d in detections if d.color in (alliance, "unknown")],
+                [d for d in detections
+                 if d.color == alliance
+                 or (d.color == "unknown" and _territory(d.pos) == alliance)],
                 alliance,
             )
 
@@ -132,9 +143,10 @@ class FieldTracker:
                 for j, d in enumerate(dets):
                     dp = np.array(d.pos)
                     dist = float(np.linalg.norm(tp - dp))
-                    # Coasting (occluded) tracks are not hard-gated; they can
-                    # recover from anywhere. Visible tracks must be within gate.
-                    if t.coasting or dist <= self.gate:
+                    # Widen the gate for coasting tracks (more missed frames →
+                    # wider gate), but cap the multiplier to prevent teleportation.
+                    effective_gate = self.gate * min(4.0, 1.0 + 0.5 * t.missed)
+                    if dist <= effective_gate:
                         c = dist
                         if d.color == "unknown":
                             c += self.color_penalty
@@ -199,6 +211,7 @@ class FieldTracker:
 
         When n > m (more tracks than detections), we iterate permutations of
         track indices choosing m of them to match, paired with all m! det orderings.
+        For a 3×3 matrix this evaluates P(3,3)×P(3,3) = 36 candidate pairings.
         Returns (track_rows, det_cols) for the best finite-cost pairs found.
         """
         n, m = cost.shape
@@ -214,6 +227,7 @@ class FieldTracker:
         return best if best else ([], [])
 
     def _emit(self):
+        # Only active (visible or coasting) tracks are emitted; empty slots are omitted.
         out = []
         for t in self.tracks:
             if t.active:

@@ -1,0 +1,68 @@
+<View>
+  <Header value="FRC Vision Scorer — Phase 1 Annotation"/>
+  <Text name="instructions" value="Annotate robot + bumper number ROI + center goal ROI. Mark made-shot events only when the ball enters the center container."/>
+
+  <Image name="image" value="$image"/>
+
+  <RectangleLabels name="regions" toName="image">
+    <Label value="robot" background="#2E7D32"/>
+    <Label value="bumper_number_roi" background="#6A1B9A"/>
+    <Label value="center_goal_roi" background="#1565C0"/>
+    <Label value="fuel_ball" background="#F9A825"/>
+  </RectangleLabels>
+
+  <Header value="Per-region metadata (select a box first)"/>
+  <TextArea
+    name="region_team_number"
+    toName="image"
+    perRegion="true"
+    rows="1"
+    editable="true"
+    maxSubmissions="1"
+    placeholder="Team number for robot/bumper ROI (e.g., 3255)"
+  />
+
+  <Choices name="region_alliance" toName="image" perRegion="true" choice="single">
+    <Choice value="red"/>
+    <Choice value="blue"/>
+    <Choice value="unknown"/>
+  </Choices>
+
+  <Choices name="region_occlusion" toName="image" perRegion="true" choice="single">
+    <Choice value="clear"/>
+    <Choice value="partial"/>
+    <Choice value="heavy"/>
+    <Choice value="unknown"/>
+  </Choices>
+
+  <Header value="Frame-level made-shot event (center container only)"/>
+  <Choices name="made_shot_event" toName="image" choice="single" showInline="true">
+    <Choice value="none"/>
+    <Choice value="made_shot_center"/>
+  </Choices>
+
+  <TextArea
+    name="shot_team_number"
+    toName="image"
+    rows="1"
+    editable="true"
+    maxSubmissions="1"
+    placeholder="Team number credited with made shot (if known)"
+  />
+
+  <TextArea
+    name="shot_ball_track_id"
+    toName="image"
+    rows="1"
+    editable="true"
+    maxSubmissions="1"
+    placeholder="Optional ball track id (if available from pre-label pipeline)"
+  />
+
+  <Choices name="shot_confidence" toName="image" choice="single" showInline="true">
+    <Choice value="high"/>
+    <Choice value="medium"/>
+    <Choice value="low"/>
+    <Choice value="unknown"/>
+  </Choices>
+</View>

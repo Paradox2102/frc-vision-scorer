@@ -1,0 +1,3 @@
+video,roi,run_name,motion_threshold
+/Users/ship/development/projects/frc-vision-scorer/data/videos/2026_cranberry_breakdown.mp4,"0.43,0.22,0.58,0.43",cranberry_breakdown,
+/Users/ship/development/projects/frc-vision-scorer/data/videos/2026_cranberry_shooter.mp4,"0.41,0.18,0.61,0.42",cranberry_shooter,

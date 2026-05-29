@@ -1,0 +1,23 @@
+# YOLO Hub-Zone Dataset Configuration
+# Dataset: Hub-zone crops for per-robot scoring attribution
+# Classes: fuel_ball, robot, hub_opening
+
+# Paths (relative to this YAML file)
+path: ../data  # dataset root dir
+train: hub_zones_filtered/images/train  # train images (relative to 'path')
+val: hub_zones_filtered/images/val      # val images (relative to 'path')
+test: hub_zones_filtered/images/test    # test images (optional, relative to 'path')
+
+# Classes
+names:
+  0: fuel_ball
+  1: robot
+  2: hub_opening
+
+# Number of classes
+nc: 3
+
+# Dataset info
+# Note: After labeling in Label Studio, export as YOLO format and organize into
+# the directory structure above (train/val/test splits).
+# Recommended split: 70% train, 20% val, 10% test

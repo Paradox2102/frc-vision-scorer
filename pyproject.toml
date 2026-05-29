@@ -1,0 +1,13 @@
+[project]
+name = "frc-vision-scorer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "model: tests that load the DINOv2 model (downloads weights once, slower)",
+]

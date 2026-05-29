@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data (large files)
+data/videos/
+data/frames/
+data/results/
+models/*.pt
+models/*.onnx
+
+# Training runs (large - plots, caches)
+runs/*
+!runs/train/
+runs/train/*
+!runs/train/hub_zone_yolo26s/
+runs/train/hub_zone_yolo26s/*
+!runs/train/hub_zone_yolo26s/weights/
+runs/train/hub_zone_yolo26s/weights/*
+!runs/train/hub_zone_yolo26s/weights/best.pt
+*.cache
+
+# Raw frames (can regenerate from videos)
+data/raw_frames/
+
+# Label Studio internal data
+labeling/ls_fuelball/
+labeling/.venv/
+
+# Label Studio venv
+.ls-venv/
+
+# Database (user data)
+*.db
+
+# Environment
+.env
+.DS_Store
+
+# Keep structure
+!data/.gitkeep
+!data/videos/.gitkeep
+!models/.gitkeep
+
+# Dataset v4 (large - can regenerate)
+data/dataset_v4/images/
+data/dataset_v4/labels/
+data/dataset_v4/images_old/
+data/dataset_v4/labels_old/
+web/uploads/*.mp4
+
+# Hub zone data (large - crops, filtered, samples)
+data/hub_zones/
+data/hub_zones_filtered/
+data/hub_zones_sample/
+data/alliance_crops/
+data/dataset_alliance/
+
+# Robot training frames (large)
+data/robot_training_frames/
+data/labeling/images/
+data/labeling/labels/
+data/labeling/*.json
+
+# Training data (large videos/frames)
+training-data/
+
+# Dataset v5
+data/dataset_v5/
+
+# Runtime artifacts + large datasets (excluded from the clean team repo)
+web/uploads/*
+!web/uploads/.gitkeep
+web/logs/
+data/merged_robot_dataset/
+data/roboflow_frc/
+# Old YOLO training datasets (large, regenerable from video; superseded by rework)
+data/dataset_v1/
+data/dataset_v2/
+data/dataset_v3/
+data/alliance_yolo_dataset/
+data/analysis_frames/
+
+# YOLO base weights
+yolo26n.pt
+
+# Labeling and training data (too large for git)
+data/labeling/
+data/training/
+data/videos/
+yolo11m.pt
+*.pt
+!runs/train/hub_zone_yolo26s/weights/best.pt

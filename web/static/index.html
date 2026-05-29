@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FRC Vision Scorer</title>
+    <link rel="stylesheet" href="/static/style.css?v=20260307a">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>FRC Vision Scorer</h1>
+            <nav id="mainNav">
+                <button class="nav-btn active" data-view="scorer">Scorer</button>
+                <button class="nav-btn" data-view="history">Match History</button>
+            </nav>
+        </header>
+
+        <!-- ===================== SCORER VIEW ===================== -->
+        <div id="scorerView">
+
+            <!-- Step 1: Event Setup -->
+            <section class="event-section" id="eventSection">
+                <div class="event-setup">
+                    <h2>Load Event</h2>
+                    <p class="hint">Paste a Blue Alliance event URL or event key to load teams and schedule.</p>
+                    <form id="eventForm">
+                        <div class="input-group">
+                            <input type="text" id="eventUrl" placeholder="https://www.thebluealliance.com/event/2026week0" required>
+                            <button type="submit" class="btn-primary">Load Event</button>
+                        </div>
+                    </form>
+                    <div id="eventStatus" class="event-status" style="display:none;"></div>
+                </div>
+            </section>
+
+            <!-- Step 2: OCR Region Setup (per-event) -->
+            <section class="ocr-setup-section" id="ocrSetupSection" style="display:none;">
+                <div class="event-banner" id="ocrEventBanner"></div>
+                <div class="ocr-setup">
+                    <h2>Scoreboard Setup</h2>
+                    <p class="hint">Mark the hub positions and score regions on the scoreboard. This only needs to be done once per event.</p>
+                    <div class="ocr-controls">
+                        <div class="ocr-loading" id="ocrLoading">
+                            <p>Grabbing a sample frame from this event's video (5-10 seconds)...</p>
+                        </div>
+                        <div class="ocr-draw-controls" id="ocrDrawControls" style="display:none;">
+                            <div class="setup-group">
+                                <span class="setup-label">1. Click on each hub:</span>
+                                <button class="btn-red" id="ocrMarkRedHub">Click RED Hub</button>
+                                <button class="btn-blue" id="ocrMarkBlueHub">Click BLUE Hub</button>
+                            </div>
+                            <div class="setup-group">
+                                <span class="setup-label">2. Draw score regions:</span>
+                                <button class="btn-red" id="ocrDrawRed">Draw RED Score</button>
+                                <button class="btn-blue" id="ocrDrawBlue">Draw BLUE Score</button>
+                            </div>
+                            <div class="setup-group">
+                                <button class="btn-primary" id="ocrSaveBtn" disabled>Save & Continue</button>
+                                <button class="btn-secondary" id="ocrSkipBtn">Skip (use defaults)</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="ocr-canvas-container" id="ocrCanvasContainer" style="display:none;">
+                        <canvas id="ocrCanvas"></canvas>
+                        <div class="ocr-status" id="ocrStatus"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 3: Match Selection + Video Upload -->
+            <section class="match-setup-section" id="matchSetupSection" style="display:none;">
+                <div class="event-banner" id="eventBanner"></div>
+                <div class="match-setup">
+                    <div class="match-select-group">
+                        <label for="matchSelect">Select Match:</label>
+                        <select id="matchSelect">
+                            <option value="">-- Choose a match --</option>
+                        </select>
+                    </div>
+                    <div id="matchTeams" class="match-teams" style="display:none;"></div>
+                    <div class="upload-area" id="uploadArea" style="display:none;">
+                        <form id="uploadForm">
+                            <div class="input-group">
+                                <label for="videoFile">Video File:</label>
+                                <input type="file" id="videoFile" accept="video/*">
+                            </div>
+                            <div class="divider">— OR —</div>
+                            <div class="input-group">
+                                <label for="youtubeUrl">YouTube URL:</label>
+                                <input type="text" id="youtubeUrl" placeholder="https://youtube.com/watch?v=...">
+                            </div>
+                            <button type="submit" class="btn-primary">Analyze Video</button>
+                        </form>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Status Bar -->
+            <div class="status-bar" id="statusBar">
+                <span id="statusText">Ready</span>
+                <div class="progress-container">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+            </div>
+
+            <div class="inference-controls" id="inferenceControls" style="display:none;">
+                <button id="startInferenceBtn" class="inference-btn start-btn" style="display:none;">Start Inference</button>
+                <button id="pauseInferenceBtn" class="inference-btn pause-btn" style="display:none;">Pause</button>
+                <button id="resumeInferenceBtn" class="inference-btn resume-btn" style="display:none;">Resume</button>
+                <button id="stopInferenceBtn" class="inference-btn stop-btn" style="display:none;">Stop</button>
+            </div>
+
+            <!-- Step 3: Video + Live Results -->
+            <section class="main-layout" id="videoSection" style="display: none;">
+                <div class="video-column">
+                    <div class="hud-overlay">
+                        <div class="hud-left">
+                            <span class="hud-item"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
+                            <span class="hud-item"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
+                        </div>
+                        <div class="hud-scores">
+                            <div class="score-chip blue">
+                                <span class="score-label">BLUE</span>
+                                <span class="score-value" id="scoreBlue">0</span>
+                            </div>
+                            <div class="score-chip red">
+                                <span class="score-label">RED</span>
+                                <span class="score-value" id="scoreRed">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="video-container">
+                        <canvas id="videoCanvas"></canvas>
+                    </div>
+                </div>
+
+                <div class="alliance-column">
+                    <div class="alliance-card blue">
+                        <div class="alliance-header blue">
+                            <span class="alliance-title">BLUE ALLIANCE</span>
+                            <span class="alliance-score" id="blueAllianceScore">0</span>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr><th>Robot</th><th>Team</th><th>Goals</th></tr>
+                            </thead>
+                            <tbody id="blueRobotsTable">
+                                <tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="alliance-card red">
+                        <div class="alliance-header red">
+                            <span class="alliance-title">RED ALLIANCE</span>
+                            <span class="alliance-score" id="redAllianceScore">0</span>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr><th>Robot</th><th>Team</th><th>Goals</th></tr>
+                            </thead>
+                            <tbody id="redRobotsTable">
+                                <tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="timeline-card">
+                        <div class="timeline-header">SCORING EVENTS</div>
+                        <div class="timeline-container" id="timelineContainer">
+                            <p class="empty-state">No events yet</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 4: Post-Inference Edit & Save -->
+            <section class="results-section" id="resultsSection" style="display:none;">
+                <h2>Review & Save Results</h2>
+                <div class="results-layout">
+                    <!-- TBA Ground Truth -->
+                    <div class="ground-truth-card" id="groundTruthCard">
+                        <h3>TBA Ground Truth</h3>
+                        <div class="gt-scores">
+                            <div class="gt-alliance blue">
+                                <span class="gt-label">Blue Hub Total</span>
+                                <span class="gt-value" id="gtBlueTotal">—</span>
+                            </div>
+                            <div class="gt-alliance red">
+                                <span class="gt-label">Red Hub Total</span>
+                                <span class="gt-value" id="gtRedTotal">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Editable Results -->
+                    <div class="edit-card blue">
+                        <h3>Blue Alliance</h3>
+                        <table class="edit-table">
+                            <thead>
+                                <tr><th>Position</th><th>Team #</th><th>Predicted</th><th>Corrected</th></tr>
+                            </thead>
+                            <tbody id="editBlueTable"></tbody>
+                            <tfoot>
+                                <tr class="total-row">
+                                    <td colspan="2">Total</td>
+                                    <td id="editBluePredTotal">0</td>
+                                    <td id="editBlueCorrTotal">—</td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+
+                    <div class="edit-card red">
+                        <h3>Red Alliance</h3>
+                        <table class="edit-table">
+                            <thead>
+                                <tr><th>Position</th><th>Team #</th><th>Predicted</th><th>Corrected</th></tr>
+                            </thead>
+                            <tbody id="editRedTable"></tbody>
+                            <tfoot>
+                                <tr class="total-row">
+                                    <td colspan="2">Total</td>
+                                    <td id="editRedPredTotal">0</td>
+                                    <td id="editRedCorrTotal">—</td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+
+                    <div class="notes-card">
+                        <label for="matchNotes">Notes:</label>
+                        <textarea id="matchNotes" rows="3" placeholder="Optional notes about this match..."></textarea>
+                    </div>
+
+                    <div class="save-actions">
+                        <button class="btn-primary" id="saveResultsBtn">Save Results</button>
+                        <button class="btn-secondary" id="newMatchBtn">Analyze Another Match</button>
+                        <span id="saveStatus" class="save-status"></span>
+                    </div>
+                </div>
+            </section>
+
+        </div>
+
+        <!-- ===================== HISTORY VIEW ===================== -->
+        <div id="historyView" style="display:none;">
+            <section class="history-section">
+                <div class="history-filter-bar" id="historyFilterBar" style="display:none;">
+                    <label for="historyEventFilter">Filter by event:</label>
+                    <select id="historyEventFilter">
+                        <option value="all">All Events</option>
+                    </select>
+                </div>
+                <div id="historyContent">
+                    <p class="empty-state">Loading match history...</p>
+                </div>
+            </section>
+
+            <!-- History Detail Modal -->
+            <div class="modal-overlay" id="matchDetailModal" style="display:none;">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3 id="modalTitle">Match Details</h3>
+                        <button class="modal-close" id="modalClose">&times;</button>
+                    </div>
+                    <div class="modal-body" id="modalBody"></div>
+                    <div class="modal-footer">
+                        <button class="btn-primary" id="modalSaveBtn">Save Changes</button>
+                        <button class="btn-secondary" id="modalCancelBtn">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="/static/app.js?v=20260307a"></script>
+</body>
+</html>

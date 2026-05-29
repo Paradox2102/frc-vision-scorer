@@ -1,0 +1,21 @@
+{
+  "categories": [
+    {
+      "id": 0,
+      "name": "fuel_ball"
+    },
+    {
+      "id": 1,
+      "name": "hub_opening"
+    },
+    {
+      "id": 2,
+      "name": "robot"
+    }
+  ],
+  "info": {
+    "year": 2026,
+    "version": "1.0",
+    "contributor": "Label Studio"
+  }
+}

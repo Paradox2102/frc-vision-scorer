@@ -1,0 +1,15 @@
+# FRC Vision Scorer - Dataset v4 (YOLO format)
+# Auto-annotated from Week 0 Finals match videos
+
+path: /Users/ship/development/projects/frc-vision-scorer/data/dataset_v4
+train: images/train
+val: images/val
+
+# Classes
+names:
+  0: fuel_ball
+  1: robot_red
+  2: robot_blue
+  3: hub
+
+nc: 4

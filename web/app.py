@@ -38,6 +38,10 @@ from web.embedder import RobotEmbedder, cosine_similarity
 from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
+from web.field import store as field_store
+from web.field.field_model import FieldModel
+from web.field.calibration import Calibrator, CalibrationError
+from web.field.apriltag_detect import detect_tags
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -2280,6 +2284,94 @@ async def grab_frame(request: Request):
     except Exception as e:
         frame_path.unlink(missing_ok=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Calibration endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/calibration")
+async def get_calibration(event: str, camera: str = "main"):
+    cal = field_store.load(event, camera)
+    return {"has_calibration": cal is not None,
+            "rms_error": cal.rms_error if cal else None}
+
+
+def _decode_b64_image(b64: str):
+    """Base64 (optionally data-URL) JPEG/PNG -> BGR ndarray."""
+    if "," in b64 and b64.strip().startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    buf = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+@app.post("/api/calibration/manual")
+async def calibration_manual(request: Request):
+    """Solve POSE from human-clicked points against saved intrinsics.
+    Body: {event, camera?, points: [{u, v, x, y, z}, ...]}."""
+    body = await request.json()
+    event = body["event"]; camera = body.get("camera", "main")
+    K, D = field_store.load_intrinsics(event, camera)
+    if K is None:
+        return JSONResponse(status_code=400, content={
+            "error": "No saved intrinsics — run auto calibration first."})
+    pts = body.get("points", [])
+    if len(pts) < 2:
+        return JSONResponse(status_code=400, content={
+            "error": "Need at least 2 clicked points."})
+    corr = {f"pt{i}": (np.array([[p["u"], p["v"]]], float),
+                       np.array([[p["x"], p["y"], p["z"]]], float))
+            for i, p in enumerate(pts)}
+    existing = field_store.load(event, camera)
+    image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
+    season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
+    try:
+        cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size, field_season=season)
+    except CalibrationError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    field_store.save(event, camera, cal)
+    return {"status": "ok", "rms_error": cal.rms_error}
+
+
+@app.post("/api/calibration/auto")
+async def calibration_auto(request: Request):
+    """Solve POSE from AprilTags detected in supplied frames, against saved
+    intrinsics. Body: {event, camera?, season?, frames: [b64,...], image_size?}.
+    Frames are pre-grabbed (e.g. via /api/grab-frame)."""
+    body = await request.json()
+    event = body["event"]; camera = body.get("camera", "main")
+    season = body.get("season", "2026-rebuilt-welded")
+    K, D = field_store.load_intrinsics(event, camera)
+    if K is None:
+        return JSONResponse(status_code=400, content={
+            "error": "No intrinsics — import or run multi-viewpoint "
+                     "intrinsics calibration first."})
+    fm = FieldModel.load(season)
+    frames = body.get("frames", [])
+    if not frames:
+        return JSONResponse(status_code=400, content={"error": "No frames supplied."})
+    image_size = None
+    corr = {}
+    for b64 in frames:
+        img = _decode_b64_image(b64)
+        if img is None:
+            continue
+        image_size = (img.shape[1], img.shape[0])
+        for tid, corners_2d in detect_tags(img).items():
+            if tid in fm.tags and tid not in corr:
+                # corners_2d: detector order [TR, TL, BL, BR] (Task 3).
+                # corners_3d: FieldModel order (Task 2). >>> CORNER-ORDER ALIGNMENT <<<
+                # If real-frame RMS is high, fix the index mapping HERE (one place)
+                # — validate during Task 10 manual calibration by watching rms_error.
+                corr[tid] = (corners_2d, fm.tag_corners_3d(tid))
+    try:
+        cal = Calibrator.solve_pose(corr, K=K, D=D,
+                                    image_size=image_size or (1920, 1080),
+                                    field_season=season)
+    except CalibrationError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    field_store.save(event, camera, cal)
+    return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
 
 
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,

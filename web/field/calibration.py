@@ -11,6 +11,7 @@ class CalibrationError(Exception):
 
 
 MIN_POSE_TAGS = 2          # >=2 tags so points are non-coplanar across the field
+MIN_CALIB_POINTS = 8       # single-view calibrateCamera: ~10 free params
 
 
 @dataclass
@@ -147,6 +148,49 @@ class Calibrator:
         proj = cv2.perspectiveTransform(fld.reshape(-1, 1, 2), Hinv).reshape(-1, 2)
         cal.rms_error = float(np.sqrt(((proj - img) ** 2).sum(axis=1).mean()))
         return cal
+
+    @staticmethod
+    def solve_camera_from_tags(correspondences: dict, image_size: tuple,
+                               field_season: str) -> "CameraCalibration":
+        """Single-view full-camera resection from AprilTag correspondences.
+
+        correspondences: {key: (img_pts (N,2), obj_pts (N,3))} — N=4 for auto-detected
+        tag corners, N=1 for a manually-labeled tag center. Estimates a pinhole model
+        (fx, fy + radial k1,k2) and pose via cv2.calibrateCamera over the non-coplanar
+        tag points; principal point is fixed at the image center, tangential distortion
+        and k3 are zeroed. Returns a mode='pinhole' calibration."""
+        img_list, obj_list = [], []
+        for (i2d, o3d) in correspondences.values():
+            img_list.append(np.asarray(i2d, np.float64).reshape(-1, 2))
+            obj_list.append(np.asarray(o3d, np.float64).reshape(-1, 3))
+        if not img_list:
+            raise CalibrationError("no correspondences supplied")
+        img_all = np.vstack(img_list).astype(np.float32)
+        obj_all = np.vstack(obj_list).astype(np.float32)
+        n = len(img_all)
+        if n < MIN_CALIB_POINTS:
+            raise CalibrationError(
+                f"need >= {MIN_CALIB_POINTS} points for single-view calibration, got "
+                f"{n} (auto tags give 4 points each, manual tags 1 each)")
+        w, h = int(image_size[0]), int(image_size[1])
+        K0 = np.array([[float(w), 0., w / 2.0],
+                       [0., float(w), h / 2.0],
+                       [0., 0., 1.]])
+        flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT |
+                 cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3)
+        try:
+            rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+                [obj_all.reshape(-1, 1, 3)], [img_all.reshape(-1, 1, 2)],
+                (w, h), K0.copy(), np.zeros(5), flags=flags)
+        except cv2.error as e:
+            raise CalibrationError(f"calibrateCamera failed: {str(e)[:120]}")
+        return CameraCalibration(
+            mode="pinhole", K=np.asarray(K, float),
+            D=np.asarray(D, float).reshape(-1),
+            rvec=np.asarray(rvecs[0], float).reshape(3, 1),
+            tvec=np.asarray(tvecs[0], float).reshape(3, 1),
+            image_size=(w, h), crop_region=(0, 0, w, h),
+            field_season=field_season, rms_error=float(rms))
 
     @staticmethod
     def solve_pose(correspondences: dict, K, D, image_size: tuple,

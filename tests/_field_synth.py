@@ -26,6 +26,24 @@ def truth_camera(eye=(8.27, -3.0, 6.0), target=(8.27, 4.03, 0.0),
                              image_size=IMAGE_SIZE, crop_region=None,
                              field_season="2026-rebuilt-welded")
 
+# Pinhole truth camera for single-view calibration tests. Principal point MUST be
+# at image center (cx=w/2, cy=h/2) because solve_camera_from_tags FIXES it there.
+TRUTH_K_PINHOLE = np.array([[1200., 0., 960.], [0., 1200., 540.], [0., 0., 1.]])
+TRUTH_D_PINHOLE = np.array([-0.25, -0.08, 0.0, 0.0, 0.0])   # k1,k2,p1,p2,k3 (mild radial)
+
+
+def truth_pinhole_camera(eye=(8.27, -3.0, 6.0), target=(8.27, 4.03, 0.0),
+                         K=TRUTH_K_PINHOLE, D=TRUTH_D_PINHOLE,
+                         image_size=(1920, 1080)):
+    """Pinhole camera above/behind the scoring table looking across the field.
+    cx/cy are image-centered to match the solver's fixed principal point."""
+    rvec, tvec = look_at(eye, target)
+    return CameraCalibration(mode="pinhole", K=K.copy(), D=D.copy(),
+                             rvec=rvec, tvec=tvec, image_size=image_size,
+                             crop_region=(0, 0, image_size[0], image_size[1]),
+                             field_season="2026-rebuilt-welded")
+
+
 def project_tag_corners(cam, fm):
     """{tag_id: (corners_2d (4,2), corners_3d (4,3))} for tags fully in-frame."""
     w, h = cam.image_size

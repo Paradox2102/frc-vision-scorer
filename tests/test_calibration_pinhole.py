@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 from web.field.calibration import CameraCalibration, Calibrator, CalibrationError
 from web.field.field_model import FieldModel
-from tests._field_synth import look_at
+from tests._field_synth import (look_at, truth_pinhole_camera,
+                                 project_tag_corners, in_frame_points)
 
 
 def test_pinhole_field_image_roundtrip_on_ground():
@@ -20,3 +21,47 @@ def test_pinhole_field_image_roundtrip_on_ground():
         # exact to ~sub-mm rather than machine epsilon. 1 mm is far below the 10 cm
         # field-tracking requirement.
         assert np.hypot(xs - x, ys - y) < 1e-3
+
+
+def test_solve_camera_from_tags_recovers_pinhole_camera():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()                   # image_size (1920,1080)
+    corr = project_tag_corners(cam, fm)            # 4 corners per in-frame tag
+    assert len(corr) >= 4
+    solved = Calibrator.solve_camera_from_tags(
+        corr, image_size=cam.image_size, field_season="2026-rebuilt-welded")
+    assert solved.mode == "pinhole"
+    assert solved.rms_error < 1.0                  # px
+    assert solved.crop_region == (0, 0, cam.image_size[0], cam.image_size[1])
+    for x, y in in_frame_points(cam, [(3., 3.), (8.27, 4.), (13., 5.), (6., 6.)]):
+        uv = cam.field_to_image((x, y, 0.0))
+        xs, ys = solved.image_to_field(uv)
+        assert np.hypot(xs - x, ys - y) < 0.10     # 10 cm on the ground plane
+
+
+def test_solve_camera_from_tags_mixed_corners_and_centers():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    corners = project_tag_corners(cam, fm)
+    mixed = {}
+    for i, tid in enumerate(sorted(corners)):
+        if i % 2 == 0:
+            mixed[tid] = corners[tid]                       # 4 corners
+        else:
+            c3d = fm.tag_corners_3d(tid).mean(axis=0)
+            uv = cam.field_to_image(tuple(c3d))
+            mixed[tid] = (np.array([uv]), np.array([c3d]))  # 1 center
+    solved = Calibrator.solve_camera_from_tags(
+        mixed, image_size=cam.image_size, field_season="2026-rebuilt-welded")
+    assert solved.rms_error < 2.0
+
+
+def test_solve_camera_from_tags_too_few_points_raises():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    tid = sorted(fm.tags)[0]
+    c3d = fm.tag_corners_3d(tid).mean(axis=0)
+    one = {tid: (np.array([cam.field_to_image(tuple(c3d))]), np.array([c3d]))}
+    with pytest.raises(CalibrationError):
+        Calibrator.solve_camera_from_tags(
+            one, image_size=cam.image_size, field_season="2026-rebuilt-welded")

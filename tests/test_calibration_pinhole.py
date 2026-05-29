@@ -72,3 +72,22 @@ def test_solve_camera_from_tags_too_few_points_raises():
     with pytest.raises(CalibrationError):
         Calibrator.solve_camera_from_tags(
             one, image_size=cam.image_size, field_season="2026-rebuilt-welded")
+
+
+def test_camera_center_matches_neg_RT_t():
+    from tests._field_synth import look_at
+    K = np.array([[1200., 0., 960.], [0., 1200., 540.], [0., 0., 1.]])
+    rvec, tvec = look_at((8.27, -3.0, 6.0), (8.27, 4.03, 0.0))
+    cam = CameraCalibration(mode="pinhole", K=K, D=np.zeros(5), rvec=rvec, tvec=tvec,
+                            image_size=(1920, 1080), field_season="2026-rebuilt-welded")
+    import cv2
+    R, _ = cv2.Rodrigues(rvec)
+    expected = (-R.T @ tvec).reshape(3)
+    assert np.allclose(cam.camera_center, expected)
+    assert np.allclose(cam.camera_center, [8.27, -3.0, 6.0], atol=1e-6)  # = eye
+
+
+def test_camera_center_none_without_pose():
+    cam = CameraCalibration(mode="homography", H=np.eye(3),
+                            image_size=(100, 100), field_season="x")
+    assert cam.camera_center is None

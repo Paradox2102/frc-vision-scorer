@@ -91,6 +91,14 @@ class CameraCalibration:
         world = cam_center + s * ray_world
         return (float(world[0]), float(world[1]))
 
+    @property
+    def camera_center(self):
+        """Camera center in field coords (-R^T t), or None for pose-free modes."""
+        if self.rvec is None or self.tvec is None:
+            return None
+        R, _ = cv2.Rodrigues(self.rvec)
+        return (-R.T @ self.tvec).reshape(3)
+
     def image_to_field(self, uv) -> "tuple | None":
         if self.mode == "homography":
             pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)

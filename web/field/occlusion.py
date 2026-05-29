@@ -131,24 +131,27 @@ def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
     tdist = {t["slot_id"]: camera_distance(cc, t["pos"]) for t in tracks}
     for t in tracks:
         sid = t["slot_id"]; box = t["box"]; view = False; bump = False; cause = None
+        if box is None:   # coasting track with no projected box -> nothing to test
+            out[sid] = {"view_occluded": False, "bumper_occluded": False, "cause": None}
+            continue
         area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
         bregion = _bumper_region(box)
         barea = max(1.0, (bregion[2] - bregion[0]) * (bregion[3] - bregion[1]))
         for p in hub_prisms:
             if occluded_by_hub(cc, p, t["pos"]):
-                view = True; cause = "hub"
+                view = True; cause = cause or "hub"
         for pb in person_boxes:
             if box_overlap(box, pb) / area > 0.5:
                 view = True; cause = cause or "person"
             if box_overlap(bregion, pb) / barea > 0.3:
-                bump = True
+                bump = True; cause = cause or "person"
         for o in tracks:
-            if o["slot_id"] == sid:
+            if o["slot_id"] == sid or o["box"] is None:
                 continue
             if tdist[o["slot_id"]] < tdist[sid]:
                 if box_overlap(box, o["box"]) / area > 0.6:
                     view = True; cause = cause or "robot"
                 if box_overlap(bregion, o["box"]) / barea > 0.3:
-                    bump = True
+                    bump = True; cause = cause or "robot"
         out[sid] = {"view_occluded": view, "bumper_occluded": bump or view, "cause": cause}
     return out

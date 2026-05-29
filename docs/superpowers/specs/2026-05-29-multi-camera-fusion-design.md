@@ -72,13 +72,23 @@ central hub cluster:
   a **small upscaled ROI around that click**. On success it snaps to the tag's
   sub-pixel corners (full 4-point constraint, detector-grade precision); on failure
   it falls back to the single clicked center point. This combines human tag-spotting
-  with detector precision and is the key addition over the main-camera flow.
+  with detector precision and is the key addition over the main-camera flow. Two
+  details the implementation must handle: (a) corners decoded in the upscaled ROI are
+  **mapped back to full-frame pixels** (divide by upscale factor, add ROI offset) —
+  `detect_tags` currently returns corners in the frame it is handed; (b) on ROI
+  success the **decoded `tag_id` must match the field tag the operator is mapping
+  to** — if a different tag decodes (or the id isn't in the field layout), reject the
+  refine and keep the manual center, so a stray decode can't create a mislabeled
+  correspondence.
 - The spread tags (far wall, near/far rails) are what make the resection
   well-conditioned and constrain distortion across the frame, not just the center.
 
 **Validate honestly:** hold out a subset of tags distributed toward the frame edges;
-report their reprojection error (px) and field-position error (m). This is the
-acceptance gate.
+report their reprojection error (px) and field-position error (m). The acceptance
+gate is **both** that held-out error (target ≤0.5 m) **and a spread requirement** —
+at least N successfully-located off-hub tags spanning the frame (not just the
+collinear hub blob), so a solve can't clear `MIN_CALIB_POINTS` on the central
+cluster alone and still validate poorly at the edges. (N set during implementation.)
 
 **If validation fails** (manual-click noise or wide-lens distortion exceeding two
 radial terms), escalate in order: (1) relax the solver's `CALIB_FIX_K3` /
@@ -149,8 +159,12 @@ cameras add evidence, they don't get a separate identity path:
   `_vision_read_bumpers(crops, match_teams, blue_teams, red_teams)`.
 - Each read attaches to a slot via the fusion↔identity seam above (the tracker's own
   assignment) and casts **votes in the existing per-slot tally**
-  (`team_ocr_votes`). **Corner-camera reads are weighted higher** (e.g. 2–3× a
-  main-cam vote), using the per-source weight carried on the `FusedObservation`.
+  (`team_ocr_votes`). **Corner-camera reads are weighted higher**, using the
+  per-source weight carried on the `FusedObservation`. The corner weight is chosen
+  *relative to the existing weights* on the vote path (`EASYOCR_VOTE_WEIGHT` and the
+  reader's `weight` param for VLM vs OCR), not as a number picked in isolation — so
+  a corner read out-weights a same-modality main read without distorting the
+  established VLM/OCR balance.
 - **No hard override.** A confirmed identity can still flip if corner cameras
   consistently disagree — robust to one-off misreads. This is the explicit conflict
   policy.

@@ -2484,6 +2484,34 @@ async def calibration_frame(request: Request):
             "detected_tags": detected}
 
 
+@app.post("/api/calibration/refine-tag")
+async def calibration_refine_tag(request: Request):
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, u, v, id}.
+    Reads the configured CALIB_TEST_VIDEO at the timestamp, crops to the camera's
+    composite region, runs tag detection in an upscaled ROI around (u,v), and
+    returns {corners: [[u,v]x4]} in crop-pixel coords, or {corners: null}."""
+    from web.field.apriltag_detect import detect_tags_in_roi
+    body = await request.json()
+    camera = body.get("camera", "main")
+    tid = int(body["id"])
+    ts = float(body.get("timestamp", 75))
+    path = CALIB_TEST_VIDEO
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+    cl = load_layout().get(camera)
+    if cl is None:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    cx, cy, cw, ch = cl.crop
+    crop = frame[cy:cy + ch, cx:cx + cw]
+    corners = detect_tags_in_roi(crop, (float(body["u"]), float(body["v"])), tid)
+    return {"corners": corners.tolist() if corners is not None else None}
+
+
 def _draw_field_overlay(frame, cal, fm):
     """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
     Field lines are SAMPLED into polylines (a straight field line projects to a curved

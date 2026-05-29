@@ -19,7 +19,7 @@
 - **Canonical data:** `data/field/2026-rebuilt-welded.json` (32 tags, full pose). See `data/field/FIELD_REFERENCE.md`.
 - **Tag size constant:** the FRC 36h11 tag edge length is **not** in the JSON. Use a single module constant `TAG_SIZE_M` (provisional `0.1651` / 6.5 in — marked TODO to confirm from the 2026 manual). All synthetic tests are *self-consistent* and do not depend on this value being correct; only real-frame accuracy does.
 - **WPILib tag frame:** a tag's pose rotates a tag whose default (identity) outward normal is field **+x**; the tag plane spans the tag-local **y** (left) and **z** (up) axes. A tag's 4 corners in tag-local coords are therefore `(0, ±s/2, ±s/2)`, rotated by the pose quaternion and translated to the pose position.
-- **Corner ordering is the #1 correctness risk.** The 3D corner order from `field_model.tag_corners_3d()` MUST match the 2D corner order returned by `pupil_apriltags` for `solvePnP` to be correct. Task 3 determines the detector's order empirically; Task 2 matches it.
+- **Corner ordering is the #1 correctness risk.** The 3D corner order from `field_model.tag_corners_3d()` MUST match the 2D corner order returned by `pupil_apriltags` for `solvePnP` to be correct. Task 3 determines the detector's order empirically; Task 2 matches it; **Task 5's pose solve (exact, runnable) is the authoritative validator** — if `image_to_field` is systematically mirrored/rotated, the corner order is wrong (fix the order, never the tolerance).
 - **Robot detections:** supervision `Detections`; robot class id = `1` (`detections.class_id == 1`, boxes from `detections.xyxy`). The localization point is the **bottom-center** of the robot bbox: `((x1+x2)/2, y2)`.
 - **Main-camera crop:** SP1 operates on the existing overhead crop (top `OVERHEAD_CROP_RATIO=0.67` of the frame; `web/app.py:108`). The crop region is stored with the calibration.
 - **Commits:** one per task step group as shown. End commit messages with the Co-Authored-By trailer used in this repo. Work happens on branch `feature/field-coordinate-foundation`.
@@ -35,7 +35,7 @@
 - `web/field/calibration.py` — `Calibrator.solve(...)`, `CameraCalibration` (projections, rms, (de)serialize).
 - `web/field/radar.py` — top-down field render + point plotting.
 - `web/field/store.py` — persist/load calibration JSON per camera+event.
-- `tests/test_field_model.py`, `tests/test_field_corners.py`, `tests/test_apriltag_detect.py`, `tests/test_calibration_projection.py`, `tests/test_calibration_solve.py`, `tests/test_calibration_store.py`, `tests/test_radar.py`, `tests/test_calibration_api.py`
+- `tests/_field_synth.py` (shared synthetic-camera helper), `tests/test_field_model.py`, `tests/test_field_corners.py`, `tests/test_apriltag_detect.py`, `tests/test_calibration_projection.py`, `tests/test_calibration_solve.py`, `tests/test_calibration_intrinsics.py`, `tests/test_calibration_store.py`, `tests/test_radar.py`, `tests/test_calibration_api.py`
 - `data/field/2026_landmarks.json` — curated manual-fallback landmarks (stub in this SP; populated from the 3D model later).
 
 **Modify:**
@@ -373,39 +373,81 @@ Implement `field_to_image` and `image_to_field` for a calibration with known `K,
 
 - [ ] **Step 1: Write failing tests**
 
+First create a shared synthetic-camera helper (used by Tasks 4, 5, 5b, 7). It builds a *realistic* camera with a `look_at` so test points genuinely fall in-frame — no magic extrinsics.
+
 ```python
-# tests/test_calibration_projection.py
+# tests/_field_synth.py
+"""Shared synthetic fisheye camera for field-calibration tests."""
 import cv2
 import numpy as np
 from web.field.calibration import CameraCalibration
 
-def _synthetic_camera():
-    # Camera behind/above the scoring table looking across the field.
-    K = np.array([[900., 0., 960.], [0., 900., 540.], [0., 0., 1.]])
-    D = np.array([-0.05, 0.01, 0.0, 0.0])          # mild fisheye
-    # Place camera ~5 m above, ~4 m back from a field point, looking down-forward.
-    rvec, _ = cv2.Rodrigues(cv2.Rodrigues(np.array([[1,0,0],[0,-1,0],[0,0,-1]], float))[0])
-    tvec = np.array([[-8.0], [-4.0], [9.0]])
-    return CameraCalibration(K=K, D=D, rvec=rvec.reshape(3,1), tvec=tvec,
-                             image_size=(1920, 1080), crop_region=None,
+IMAGE_SIZE = (1920, 1080)
+TRUTH_K = np.array([[900., 0., 960.], [0., 900., 540.], [0., 0., 1.]])
+TRUTH_D = np.array([-0.05, 0.01, 0.0, 0.0])      # mild fisheye
+
+def look_at(eye, target, world_up=(0., 0., 1.)):
+    """OpenCV-convention extrinsics: camera +z = forward, +x = right, +y = down."""
+    eye = np.asarray(eye, float); target = np.asarray(target, float)
+    z = target - eye; z /= np.linalg.norm(z)
+    x = np.cross(np.asarray(world_up, float), z); x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    R = np.vstack([x, y, z])                      # world -> camera
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = (-R @ eye).reshape(3, 1)
+    return rvec, tvec
+
+def truth_camera(eye=(8.27, -3.0, 6.0), target=(8.27, 4.03, 0.0),
+                 K=TRUTH_K, D=TRUTH_D):
+    """Camera behind/above the scoring table (y<0) looking across the field."""
+    rvec, tvec = look_at(eye, target)
+    return CameraCalibration(K=K.copy(), D=D.copy(), rvec=rvec, tvec=tvec,
+                             image_size=IMAGE_SIZE, crop_region=None,
                              field_season="2026-rebuilt-welded")
 
+def project_tag_corners(cam, fm):
+    """{tag_id: (corners_2d (4,2), corners_3d (4,3))} for tags fully in-frame."""
+    w, h = cam.image_size
+    corr = {}
+    for tid in fm.tags:
+        c3d = fm.tag_corners_3d(tid)
+        uv = np.array([cam.field_to_image(p) for p in c3d])
+        if np.all((uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)):
+            corr[tid] = (uv, c3d)
+    return corr
+
+def in_frame_points(cam, candidates):
+    w, h = cam.image_size
+    keep = []
+    for x, y in candidates:
+        u, v = cam.field_to_image((x, y, 0.0))
+        if 0 <= u < w and 0 <= v < h:
+            keep.append((x, y))
+    return keep
+```
+
+```python
+# tests/test_calibration_projection.py
+import numpy as np
+from tests._field_synth import truth_camera, in_frame_points
+
 def test_field_to_image_to_field_roundtrip():
-    cam = _synthetic_camera()
-    pts = [(2.0, 2.0), (8.27, 4.0), (14.0, 1.0), (14.0, 7.0)]  # incl. edges
+    cam = truth_camera()
+    pts = in_frame_points(cam, [(2.0, 2.0), (8.27, 4.0), (14.0, 2.0), (14.0, 6.0)])
+    assert len(pts) >= 3                                  # honest: these are imaged
     for x, y in pts:
         uv = cam.field_to_image((x, y, 0.0))
         xy = cam.image_to_field(uv)
         assert np.linalg.norm(np.array(xy) - np.array([x, y])) < 0.01  # 1 cm
 
 def test_image_to_field_lands_on_ground_plane():
-    cam = _synthetic_camera()
+    cam = truth_camera()
     uv = cam.field_to_image((6.0, 3.0, 0.0))
     x, y = cam.image_to_field(uv)
     assert abs(x - 6.0) < 0.01 and abs(y - 3.0) < 0.01
 ```
 
-> Note: the worker may need to adjust the synthetic extrinsics in Step 1 so the test points project within the image; the *assertions* (round-trip < 1 cm) must not be weakened.
+> The round-trip is pure math and holds regardless of image bounds; `in_frame_points` keeps the asserted points honestly inside the frame. Do not weaken the 1 cm tolerance.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -469,9 +511,9 @@ git commit -m "feat(field): fisheye field<->image projection (synthetic round-tr
 
 ---
 
-## Task 5: Calibrator.solve — recover the camera from correspondences
+## Task 5: Calibrator.solve_pose — auto-solve camera POSE from tags (headline accuracy)
 
-The headline accuracy guarantee: build a synthetic ground-truth camera, project every real tag corner through it, solve from those correspondences, and assert the recovered camera localizes robots within 10 cm (including field-edge points).
+The per-event auto step and the headline accuracy guarantee: given known intrinsics, project every in-frame tag corner through a synthetic ground-truth camera, solve **pose** from those correspondences, and assert the recovered camera localizes robots within 10 cm. (Intrinsics are NOT solved here — see Task 5b for why; pose is what changes per venue and solves exactly from a single frame.) This pose solve is also the real validator of the Task 2/3 corner ordering.
 
 **Files:**
 - Modify: `web/field/calibration.py`
@@ -481,51 +523,36 @@ The headline accuracy guarantee: build a synthetic ground-truth camera, project 
 
 ```python
 # tests/test_calibration_solve.py
-import cv2
 import numpy as np
 import pytest
-from web.field.calibration import CameraCalibration, Calibrator, CalibrationError
+from web.field.calibration import Calibrator, CalibrationError
 from web.field.field_model import FieldModel
+from tests._field_synth import truth_camera, project_tag_corners, in_frame_points
 
-def _truth():
-    K = np.array([[900., 0., 960.], [0., 900., 540.], [0., 0., 1.]])
-    D = np.array([-0.05, 0.01, 0.0, 0.0])
-    R = np.array([[1,0,0],[0,-1,0],[0,0,-1]], float)
-    rvec, _ = cv2.Rodrigues(R)
-    tvec = np.array([[-8.0], [-4.0], [9.0]])
-    return CameraCalibration(K, D, rvec, tvec, (1920,1080), None, "2026-rebuilt-welded")
-
-def _project_all_tag_corners(cam, fm):
-    """Build correspondences {tag_id: (corners_2d (4,2), corners_3d (4,3))} for
-    tags whose projection lands inside the image."""
-    corr = {}
-    for tid in fm.tags:
-        c3d = fm.tag_corners_3d(tid)
-        uv = np.array([cam.field_to_image(p) for p in c3d])
-        if np.all((uv[:,0] >= 0) & (uv[:,0] < 1920) & (uv[:,1] >= 0) & (uv[:,1] < 1080)):
-            corr[tid] = (uv, c3d)
-    return corr
-
-def test_solve_recovers_camera_within_10cm():
+def test_solve_pose_recovers_camera_within_10cm():
     fm = FieldModel.load("2026-rebuilt-welded")
-    cam = _truth()
-    corr = _project_all_tag_corners(cam, fm)
-    assert len(corr) >= 4
-    solved = Calibrator.solve(corr, image_size=(1920,1080),
-                              field_season="2026-rebuilt-welded")
+    cam = truth_camera()
+    corr = project_tag_corners(cam, fm)
+    assert len(corr) >= 2
+    solved = Calibrator.solve_pose(corr, K=cam.K, D=cam.D,
+                                   image_size=(1920, 1080),
+                                   field_season="2026-rebuilt-welded")
     assert solved.rms_error < 1.0  # px
-    for x, y in [(2.,2.), (8.27,4.), (14.,1.), (14.,7.)]:
+    pts = in_frame_points(cam, [(2., 2.), (8.27, 4.), (14., 2.), (14., 6.)])
+    assert len(pts) >= 3
+    for x, y in pts:
         uv = cam.field_to_image((x, y, 0.0))
         xs, ys = solved.image_to_field(uv)
         assert np.hypot(xs - x, ys - y) < 0.10  # 10 cm
 
 def test_too_few_tags_raises():
     fm = FieldModel.load("2026-rebuilt-welded")
-    cam = _truth()
-    corr = _project_all_tag_corners(cam, fm)
-    few = dict(list(corr.items())[:1])
+    cam = truth_camera()
+    corr = project_tag_corners(cam, fm)
+    one = dict(list(corr.items())[:1])  # a single tag (4 coplanar pts) is not enough
     with pytest.raises(CalibrationError):
-        Calibrator.solve(few, image_size=(1920,1080), field_season="2026-rebuilt-welded")
+        Calibrator.solve_pose(one, K=cam.K, D=cam.D, image_size=(1920, 1080),
+                              field_season="2026-rebuilt-welded")
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -533,7 +560,7 @@ def test_too_few_tags_raises():
 Run: `.venv/bin/python -m pytest tests/test_calibration_solve.py -v`
 Expected: FAIL (`ImportError: Calibrator`).
 
-- [ ] **Step 3: Implement `Calibrator` + `CalibrationError`**
+- [ ] **Step 3: Implement `Calibrator.solve_pose` + `CalibrationError`**
 
 Add to `calibration.py`:
 
@@ -542,47 +569,31 @@ class CalibrationError(Exception):
     pass
 
 
-MIN_TAGS = 4
-MIN_POINTS = 12
+MIN_POSE_TAGS = 2          # >=2 tags so points are non-coplanar across the field
 
 
 class Calibrator:
     @staticmethod
-    def solve(correspondences: dict, image_size: tuple,
-              field_season: str, K: np.ndarray | None = None,
-              D: np.ndarray | None = None) -> "CameraCalibration":
-        """correspondences: {tag_id: (corners_2d (4,2), corners_3d (4,3))}.
-        If K/D are provided, solve pose only (manual fallback); else full solve."""
-        obj_pts = [c3d.astype(np.float64) for (_, c3d) in correspondences.values()]
-        img_pts = [c2d.astype(np.float64) for (c2d, _) in correspondences.values()]
-        n_pts = sum(len(p) for p in img_pts)
-
-        if K is None or D is None:
-            if len(correspondences) < MIN_TAGS or n_pts < MIN_POINTS:
-                raise CalibrationError(
-                    f"need >= {MIN_TAGS} tags / {MIN_POINTS} points, "
-                    f"got {len(correspondences)} / {n_pts}")
-            K = np.zeros((3, 3)); D = np.zeros((4, 1))
-            obj_arr = [p.reshape(-1, 1, 3) for p in obj_pts]
-            img_arr = [p.reshape(-1, 1, 2) for p in img_pts]
-            flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC |
-                     cv2.fisheye.CALIB_FIX_SKEW)
-            rms, K, D, _, _ = cv2.fisheye.calibrate(
-                obj_arr, img_arr, image_size, K, D, flags=flags,
-                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-8))
-
-        # Pose via solvePnP on undistorted points (pinhole after undistortion).
-        all_obj = np.vstack(obj_pts)
-        all_img = np.vstack(img_pts).reshape(-1, 1, 2)
-        undist = cv2.fisheye.undistortPoints(all_img, K, D, P=K).reshape(-1, 2)
-        ok, rvec, tvec = cv2.solvePnP(
-            all_obj, undist, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+    def solve_pose(correspondences: dict, K, D, image_size: tuple,
+                   field_season: str) -> "CameraCalibration":
+        """Solve camera POSE against KNOWN intrinsics K, D (the per-event auto step).
+        correspondences: {tag_id: (corners_2d (4,2), corners_3d (4,3))}."""
+        if len(correspondences) < MIN_POSE_TAGS:
+            raise CalibrationError(
+                f"need >= {MIN_POSE_TAGS} tags for pose, got {len(correspondences)}")
+        K = np.asarray(K, float)
+        D = np.asarray(D, float).reshape(-1)
+        obj = np.vstack([c3d for (_, c3d) in correspondences.values()]).astype(np.float64)
+        img = np.vstack([c2d for (c2d, _) in correspondences.values()]).astype(np.float64)
+        # Undistort to a pinhole frame (intrinsics K), then PnP.
+        undist = cv2.fisheye.undistortPoints(img.reshape(-1, 1, 2), K, D, P=K)
+        ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
+                                      flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok:
             raise CalibrationError("solvePnP failed")
-
-        cal = CameraCalibration(K=np.asarray(K), D=np.asarray(D).reshape(-1),
-                                rvec=rvec, tvec=tvec, image_size=image_size,
-                                crop_region=None, field_season=field_season)
+        cal = CameraCalibration(K=K, D=D, rvec=rvec, tvec=tvec,
+                                image_size=image_size, crop_region=None,
+                                field_season=field_season)
         cal.rms_error = _reprojection_rms(cal, correspondences)
         return cal
 
@@ -599,13 +610,105 @@ def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_calibration_solve.py -v`
-Expected: PASS. If `image_to_field` is systematically off, the tag corner order (Task 2/3) is likely flipped — fix the `local` corner order in `tag_corners_3d`, not the tolerance.
+Expected: PASS. If `image_to_field` is systematically off (e.g. mirrored/rotated), the tag corner order from `tag_corners_3d` (Task 2) does not match the detector order (Task 3) — fix the `local` corner order in `tag_corners_3d`, **not** the tolerance. This pose solve is exact, so it is the authoritative corner-order check.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add web/field/calibration.py tests/test_calibration_solve.py
-git commit -m "feat(field): Calibrator.solve (fisheye intrinsics + PnP pose) <10cm"
+git commit -m "feat(field): Calibrator.solve_pose (PnP against known intrinsics) <10cm"
+```
+
+---
+
+## Task 5b: Calibrator.calibrate_intrinsics — multi-viewpoint fisheye intrinsics
+
+Fisheye intrinsics (`K, D`) **cannot** be recovered from a single static viewpoint — `cv2.fisheye.calibrate` needs multiple genuinely distinct vantages to separate focal length from distortion. This is a one-time, per-camera utility (fed real footage where the camera moves, or used to import/derive intrinsics offline); the per-event flow then uses `solve_pose` (Task 5). The synthetic test proves multi-viewpoint recovery works and documents the requirement.
+
+**Files:**
+- Modify: `web/field/calibration.py`
+- Test: `tests/test_calibration_intrinsics.py`
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+# tests/test_calibration_intrinsics.py
+import numpy as np
+import pytest
+from web.field.calibration import Calibrator, CalibrationError
+from web.field.field_model import FieldModel
+from tests._field_synth import truth_camera, TRUTH_K, IMAGE_SIZE
+
+def _view_from(eye, fm):
+    cam = truth_camera(eye=eye)
+    w, h = IMAGE_SIZE
+    obj, img = [], []
+    for tid in fm.tags:
+        c3d = fm.tag_corners_3d(tid)
+        uv = np.array([cam.field_to_image(p) for p in c3d])
+        if np.all((uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)):
+            obj.append(c3d); img.append(uv)
+    return (np.vstack(obj), np.vstack(img)) if obj else None
+
+def test_intrinsics_recovered_from_multiple_viewpoints():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    eyes = [(8.27,-3,6), (4,-2,5), (12,-2,5), (8.27,-5,8), (2,-1,4), (14,-1,4)]
+    views = [v for v in (_view_from(e, fm) for e in eyes) if v is not None]
+    assert len(views) >= 4
+    K, D = Calibrator.calibrate_intrinsics(views, IMAGE_SIZE)
+    assert abs(K[0,0] - TRUTH_K[0,0]) < 30 and abs(K[1,1] - TRUTH_K[1,1]) < 30  # ~3%
+    assert abs(K[0,2] - TRUTH_K[0,2]) < 20 and abs(K[1,2] - TRUTH_K[1,2]) < 20
+
+def test_intrinsics_needs_enough_viewpoints():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    one = [_view_from((8.27,-3,6), fm)]
+    with pytest.raises(CalibrationError):
+        Calibrator.calibrate_intrinsics(one, IMAGE_SIZE)
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/test_calibration_intrinsics.py -v`
+Expected: FAIL (`AttributeError: calibrate_intrinsics`).
+
+- [ ] **Step 3: Implement `calibrate_intrinsics`**
+
+Add to the `Calibrator` class in `calibration.py`:
+
+```python
+    MIN_INTRINSIC_VIEWS = 4
+
+    @staticmethod
+    def calibrate_intrinsics(views: list, image_size: tuple):
+        """views: list of (obj_pts (N,3), img_pts (N,2)) from DISTINCT viewpoints.
+        Returns (K, D). Requires multiple genuinely different camera vantages —
+        a single static viewpoint is degenerate for fisheye intrinsics."""
+        if len(views) < Calibrator.MIN_INTRINSIC_VIEWS:
+            raise CalibrationError(
+                f"fisheye intrinsics need >= {Calibrator.MIN_INTRINSIC_VIEWS} "
+                f"distinct viewpoints, got {len(views)}")
+        obj_arr = [o.reshape(-1, 1, 3).astype(np.float64) for (o, _) in views]
+        img_arr = [i.reshape(-1, 1, 2).astype(np.float64) for (_, i) in views]
+        K = np.zeros((3, 3)); D = np.zeros((4, 1))
+        flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW)
+        cv2.fisheye.calibrate(
+            obj_arr, img_arr, image_size, K, D, flags=flags,
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-9))
+        return K, D.reshape(-1)
+```
+
+> If `cv2.fisheye.calibrate` raises `CALIB_CHECK_COND`-related errors on real (noisy) data, drop that implicit check by keeping `CALIB_RECOMPUTE_EXTRINSIC` and adding `cv2.fisheye.CALIB_FIX_SKEW`; for stubborn real footage, fall back to importing known intrinsics. The synthetic (noise-free) test should converge cleanly.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `.venv/bin/python -m pytest tests/test_calibration_intrinsics.py -v`
+Expected: PASS (intrinsics within tolerance; single-viewpoint raises). If recovery is loose, add more/again-more-varied viewpoints to `eyes` — do not loosen tolerances beyond ~3%.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add web/field/calibration.py tests/test_calibration_intrinsics.py
+git commit -m "feat(field): multi-viewpoint fisheye intrinsics calibration"
 ```
 
 ---
@@ -728,7 +831,9 @@ git commit -m "feat(field): calibration (de)serialization + JSON store"
 
 ---
 
-## Task 7: Manual fallback — pose-only solve against saved intrinsics
+## Task 7: Manual fallback — pose from sparse clicked points
+
+The manual path uses the *same* `solve_pose`, but its correspondences come from a handful of human-clicked points (each bound to a known 3D field coordinate) rather than auto-detected tag corners. This test proves pose recovers from sparse, mixed points — the realistic blurred-tag fallback. (`solve_pose` accepts any `{key: (pts_2d, pts_3d)}` mapping, not only 4-corner tags.)
 
 **Files:**
 - Test: `tests/test_calibration_solve.py` (extend)
@@ -737,30 +842,38 @@ git commit -m "feat(field): calibration (de)serialization + JSON store"
 
 ```python
 # append to tests/test_calibration_solve.py
-def test_manual_pose_solve_with_given_intrinsics():
+def test_manual_pose_from_sparse_clicked_points():
     fm = FieldModel.load("2026-rebuilt-welded")
-    cam = _truth()
-    corr = _project_all_tag_corners(cam, fm)
-    # Use a handful of manually-clicked-style points; reuse known K, D.
-    pose_only = Calibrator.solve(corr, image_size=(1920,1080),
-                                 field_season="2026-rebuilt-welded",
-                                 K=cam.K, D=cam.D)
-    for x, y in [(3.,3.), (13.,5.)]:
+    cam = truth_camera()
+    # Simulate ~8 clicked points: tag centers (known 3D) projected to pixels.
+    items = {}
+    for i, tid in enumerate(t for t in fm.tags if t <= 28):
+        c3d = fm.tag_corners_3d(tid).mean(axis=0)          # tag center (3,)
+        uv = cam.field_to_image(tuple(c3d))
+        w, h = cam.image_size
+        if 0 <= uv[0] < w and 0 <= uv[1] < h:
+            items[f"pt{i}"] = (np.array([uv]), np.array([c3d]))   # (1,2),(1,3)
+        if len(items) >= 8:
+            break
+    pose = Calibrator.solve_pose(items, K=cam.K, D=cam.D,
+                                 image_size=(1920, 1080),
+                                 field_season="2026-rebuilt-welded")
+    for x, y in in_frame_points(cam, [(3., 3.), (13., 5.)]):
         uv = cam.field_to_image((x, y, 0.0))
-        xs, ys = pose_only.image_to_field(uv)
+        xs, ys = pose.image_to_field(uv)
         assert np.hypot(xs - x, ys - y) < 0.10
 ```
 
-- [ ] **Step 2: Run to verify it fails (or passes if already supported)**
+- [ ] **Step 2: Run to verify it passes**
 
-Run: `.venv/bin/python -m pytest tests/test_calibration_solve.py::test_manual_pose_solve_with_given_intrinsics -v`
-Expected: PASS if Task 5's `K/D` branch is correct (this test confirms the manual path). If it fails, fix the given-intrinsics branch.
+Run: `.venv/bin/python -m pytest tests/test_calibration_solve.py::test_manual_pose_from_sparse_clicked_points -v`
+Expected: PASS — confirms `solve_pose` works on sparse non-tag-corner correspondences (the manual fallback). If it fails because points are coplanar/few, ensure ≥6 well-spread points.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add tests/test_calibration_solve.py
-git commit -m "test(field): manual pose-only solve against saved intrinsics"
+git commit -m "test(field): manual pose from sparse clicked points"
 ```
 
 ---
@@ -883,7 +996,14 @@ Expected: FAIL (404 / endpoint missing).
 
 - [ ] **Step 3: Implement endpoints**
 
-Add to `web/app.py` (import `from field import store as field_store`, `from field.field_model import FieldModel`, `from field.calibration import Calibrator, CalibrationError`, `from field.apriltag_detect import detect_tags` — match the existing import style, which imports sibling modules like `database`, `reid` by bare name):
+Add to `web/app.py`. **Imports must be fully qualified** — `web/app.py` imports its own modules as `from web import reid`, `from web.embedder import ...`, `from web.diagnostic import ...` (verified: there are no bare-name sibling imports). Use the same form:
+
+```python
+from web.field import store as field_store
+from web.field.field_model import FieldModel
+from web.field.calibration import Calibrator, CalibrationError
+from web.field.apriltag_detect import detect_tags
+```
 
 ```python
 @app.get("/api/calibration")
@@ -900,20 +1020,28 @@ async def calibration_manual(request: Request):
     if K is None:
         return JSONResponse(status_code=400, content={
             "error": "No saved intrinsics — run auto calibration first."})
-    # ... build correspondences from clicked points + FieldModel, solve pose-only ...
-    # (worker: assemble {tag_id:(c2d,c3d)} or point/field pairs; call Calibrator.solve
-    #  with K, D; save via field_store.save; return rms_error.)
+    # ... build correspondences {key:(pts_2d, pts_3d)} from clicked points +
+    #     FieldModel; call Calibrator.solve_pose(corr, K, D, image_size, season);
+    #     field_store.save; return {"rms_error": cal.rms_error}.
     return {"status": "ok"}
 
 @app.post("/api/calibration/auto")
 async def calibration_auto(request: Request):
     body = await request.json()
     event = body["event"]; camera = body.get("camera", "main")
+    K, D = field_store.load_intrinsics(event, camera)
+    if K is None:
+        return JSONResponse(status_code=400, content={
+            "error": "No intrinsics — import or run multi-viewpoint "
+                     "intrinsics calibration (Task 5b) first."})
     # ... grab N frames (reuse grab-frame mechanics), detect_tags across them,
-    #     build correspondences via FieldModel.tag_corners_3d, Calibrator.solve,
-    #     field_store.save, return {rms_error, n_tags, overlay_b64}.
+    #     build correspondences via FieldModel.tag_corners_3d (match detector
+    #     corner order), Calibrator.solve_pose(corr, K, D, ...), field_store.save,
+    #     return {rms_error, n_tags, overlay_b64}.
     return {"status": "ok"}
 ```
+
+> The `auto` endpoint solves **pose** against existing intrinsics (per Task 5 — fisheye intrinsics are not derivable from one static viewpoint). Intrinsics come from Task 5b (multi-viewpoint) or an import step. Keep the *solve* logic in `web/field/` (already tested); these endpoints only marshal frames/points in and JSON out.
 
 > The `auto`/`manual` bodies are the integration glue; keep the *solve* logic in `web/field/` (already tested). These endpoints only marshal frames/points in and JSON out. Keep them thin.
 
@@ -988,10 +1116,10 @@ git commit -m "feat(app): project per-frame robot detections onto live radar"
 
 - [ ] Run the whole field suite:
 
-Run: `.venv/bin/python -m pytest tests/test_field_model.py tests/test_field_corners.py tests/test_apriltag_detect.py tests/test_calibration_projection.py tests/test_calibration_solve.py tests/test_calibration_store.py tests/test_radar.py tests/test_calibration_api.py -v`
+Run: `.venv/bin/python -m pytest tests/test_field_model.py tests/test_field_corners.py tests/test_apriltag_detect.py tests/test_calibration_projection.py tests/test_calibration_solve.py tests/test_calibration_intrinsics.py tests/test_calibration_store.py tests/test_radar.py tests/test_calibration_api.py -v`
 Expected: all PASS.
 
-- [ ] Confirm the synthetic-solve accuracy test (`test_solve_recovers_camera_within_10cm`) passes — this is the closed-loop guarantee that the geometry is correct.
+- [ ] Confirm the synthetic pose-solve accuracy test (`test_solve_pose_recovers_camera_within_10cm`) passes — this is the closed-loop guarantee that the per-event geometry is correct — and `test_intrinsics_recovered_from_multiple_viewpoints` (proves multi-viewpoint intrinsics work).
 - [ ] Confirm no regression in the existing suite:
 
 Run: `.venv/bin/python -m pytest tests/ -q`

@@ -127,11 +127,12 @@ field — well-suited to ground-plane projection.
 ```
 Composited frame
   └─ crop main-camera sub-region
-       └─ [calibration, one-time]  detect AprilTags ──► correspondences ──┐
-       │                            (+ manual clicks) ────────────────────┤
-       │                                                                  ▼
-       │                                          cv2.fisheye.calibrate → K, D
-       │                                          solvePnP (undistorted) → rvec, tvec
+       │   intrinsics K,D  ── once per camera (multi-viewpoint calib OR imported) ──┐
+       │                                                                            │
+       └─ [per event]  detect AprilTags ──► correspondences ──┐                     │
+       │                 (+ manual clicks) ───────────────────┤                     ▼
+       │                                                       ▼          solvePnP(undistorted)
+       │                                              (K,D from above) ──► rvec, tvec
        │                                                                  │
        │                                                       CameraCalibration (persisted)
        │
@@ -188,12 +189,21 @@ frame, maximizing distinct tags and image coverage. Each tag → 4 image corners
 correspondences (a clicked tag corner, or a point placed on a top-down field
 template → `(x, y, 0)`).
 
-**Step B — Intrinsics + distortion.** Feed multi-frame correspondences to
-`cv2.fisheye.calibrate` → `K` and `D` (4 fisheye coefficients).
+**Step B — Obtain intrinsics + distortion (once per camera, NOT per event).**
+Fisheye intrinsics (`K` + `D`) **cannot be recovered from a single static
+viewpoint**: `cv2.fisheye.calibrate` needs multiple genuinely distinct viewpoints to
+separate focal length from distortion, and a fixed match camera over many frames is
+still *one* viewpoint (occlusion only changes which tags are visible, not the
+vantage). So intrinsics are acquired separately and treated as a per-camera-model
+constant — via a one-time **multi-viewpoint** calibration (footage where the camera
+actually moves, e.g. pre-match panning or a dedicated capture) fed to
+`cv2.fisheye.calibrate`, **or imported** known lens values. Saved once and reused.
 
-**Step C — Pose.** Undistort tag corners with `cv2.fisheye.undistortPoints`, then
-`cv2.solvePnP` against their 3D coords → `rvec, tvec`. Static camera ⇒ refine /
-average over the window for stability.
+**Step C — Solve pose from tags (the per-event auto step).** Given the saved
+intrinsics, undistort the detected tag corners with `cv2.fisheye.undistortPoints`,
+then `cv2.solvePnP` against their known 3D coords → `rvec, tvec`. Pose is exactly
+what changes between venues and solves robustly from a single frame's tag
+detections. Static camera ⇒ refine / average over the window for stability.
 
 **Step D — Projections.**
 - `field_to_image(x,y,z)` → `cv2.fisheye.projectPoints`.
@@ -299,8 +309,15 @@ TDD per project skills — the synthetic test defines "correct" and is written f
 - **Tags too small/blurred to decode in a given venue feed** → manual-click fallback
   for pose; intrinsics can come from any frame/event with readable tags (lens is
   constant) and be reused.
-- **Single-frame intrinsics under-constrained** → accumulate correspondences across
-  a multi-frame window; gate on RMS; require a minimum tag/coverage count.
+- **Fisheye intrinsics cannot be derived from a static viewpoint** (the core
+  geometric constraint) → intrinsics come from a one-time *multi-viewpoint*
+  calibration (footage with real camera motion) or are imported, then reused; the
+  per-event auto step solves **pose only** from tags. Do not attempt to recover
+  `K, D` from a single match frame.
+- **Acquiring real intrinsics for a camera we don't physically control** → use
+  footage where the camera moves (pre-match panning, between-match repositioning) as
+  the multi-viewpoint source, or import known lens values; gate pose solves on RMS
+  and a minimum tag/coverage count.
 - **Fisheye edge accuracy** (robots near the walls) → the fisheye model is chosen
   precisely for this; the synthetic test must include edge points and assert their
   tolerance.

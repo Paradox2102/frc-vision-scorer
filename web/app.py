@@ -429,6 +429,8 @@ class InferenceJob:
             robot = self.robot_tracks.get(canonical_id)
             if not robot or robot.team_number_confirmed:
                 continue  # Already confirmed, skip OCR
+            if self._occ.get(canonical_id, {}).get("bumper_occluded"):
+                continue  # bumper hidden by hub/person/robot — an unreliable read
 
             result = _ocr_bumper_number(frame, box, self.match_teams)
             raw = result.get("ocr_raw", "").strip()
@@ -486,17 +488,8 @@ class InferenceJob:
                 robot.team_number = best_team
                 robot.team_number_confirmed = True
 
-                # Correct alliance based on TBA team data
-                if best_team in self.match_blue_teams:
-                    if robot.alliance != "blue":
-                        print(f"  OCR team ID: Robot {canonical_id} alliance corrected "
-                              f"{robot.alliance} -> blue (team {best_team})")
-                        robot.alliance = "blue"
-                elif best_team in self.match_red_teams:
-                    if robot.alliance != "red":
-                        print(f"  OCR team ID: Robot {canonical_id} alliance corrected "
-                              f"{robot.alliance} -> red (team {best_team})")
-                        robot.alliance = "red"
+                # Alliance is owned by the field-tracker slot (bumper color); a team
+                # read records the number but never flips the slot's alliance (SP2).
 
                 # Clear this team from other robots' tentative assignments
                 self._clear_team_from_other_robots(canonical_id, best_team)
@@ -536,6 +529,8 @@ class InferenceJob:
                 continue
             if robot.team_number_confirmed and not is_reread_pass:
                 continue  # skip confirmed unless this is a re-read pass
+            if self._occ.get(canonical_id, {}).get("bumper_occluded"):
+                continue  # bumper hidden by hub/person/robot — don't read it
 
             x1, y1, x2, y2 = map(int, box)
             fh, fw = frame.shape[:2]
@@ -728,21 +723,13 @@ class InferenceJob:
         locked_robots = {r.robot_id for r in self.robot_tracks.values()
                          if r.team_number_confirmed}
 
-        # Per-robot alliance for the constraint:
-        #  - if it has a team (tentative or confirmed) → roster (authoritative)
-        #  - else → red/blue color-vote majority, or "unknown" if equal/zero
-        alliance_of_robot = {}
-        for r in self.robot_tracks.values():
-            if r.team_number and r.team_number in self.match_red_teams:
-                alliance_of_robot[r.robot_id] = "red"
-            elif r.team_number and r.team_number in self.match_blue_teams:
-                alliance_of_robot[r.robot_id] = "blue"
-            elif r.red_votes > r.blue_votes:
-                alliance_of_robot[r.robot_id] = "red"
-            elif r.blue_votes > r.red_votes:
-                alliance_of_robot[r.robot_id] = "blue"
-            else:
-                alliance_of_robot[r.robot_id] = "unknown"
+        # Per-robot alliance for the constraint is the field-tracker SLOT alliance
+        # (bumper color), set every frame by the loop sync — authoritative in SP2.
+        # Team assignment is masked to the slot's alliance; it never flips it.
+        alliance_of_robot = {
+            r.robot_id: (r.alliance if r.alliance in ("red", "blue") else "unknown")
+            for r in self.robot_tracks.values()
+        }
 
         votes = {r.robot_id: dict(r.team_ocr_votes or {})
                  for r in self.robot_tracks.values()}
@@ -762,7 +749,6 @@ class InferenceJob:
             v = (r.team_ocr_votes or {}).get(team, 0.0)
             total = sum((r.team_ocr_votes or {}).values()) or 1.0
             r.team_number = team
-            r.alliance = "red" if team in self.match_red_teams else "blue"
             r.team_number_confirmed = bool(v >= 3.0 and v / total >= 0.6)
             self.diagnostic.record_assignment(
                 frame=self._current_frame, robot_id=rid, team=team,
@@ -785,7 +771,6 @@ class InferenceJob:
         for rid, team in eliminated.items():
             r = self.robot_tracks[rid]
             r.team_number = team
-            r.alliance = "red" if team in self.match_red_teams else "blue"
             r.team_number_confirmed = True
             self.diagnostic.record_elimination(
                 frame=self._current_frame, robot_id=rid, team=team, alliance=r.alliance,
@@ -916,10 +901,7 @@ class InferenceJob:
             if robot.appearance_votes[top] >= APPEARANCE_CONFIRM_VOTES:
                 robot.team_number = top
                 robot.team_number_confirmed = True
-                if top in self.match_blue_teams:
-                    robot.alliance = "blue"
-                elif top in self.match_red_teams:
-                    robot.alliance = "red"
+                # Alliance stays the field-tracker slot (bumper) alliance (SP2).
                 for event in self.scoring_events:
                     if event.robot_id == robot_id:
                         event.team_number = top

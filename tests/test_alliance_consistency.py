@@ -1,7 +1,10 @@
-"""Regression guard for the alliance flip-flop bug.
+"""Regression guard for alliance consistency.
 
-A robot with a tentative team number must report the roster alliance for that
-team. No code path may override that with embedding clustering or anything else.
+SP2 change: alliance is owned by the field-tracker SLOT (bumper color), set every
+frame by the loop sync. Team assignment is masked to the slot's alliance and must
+NEVER flip it — bumper color is the physical ground truth, so a contradictory team
+read is the suspect, not the alliance. (This supersedes the old "alliance follows the
+team roster" rule, whose flip-flop root cause — embedding clustering — is removed.)
 """
 from collections import deque
 from pathlib import Path
@@ -27,24 +30,38 @@ def _make_job():
     )
 
 
-def test_tentative_team_alliance_matches_roster():
-    """A robot with strong votes for a red team must end up red, not blue."""
+def test_team_assignment_respects_slot_alliance_and_never_flips_it():
+    """A blue-bumper slot is assigned a BLUE team, and assign_teams_from_votes never
+    changes the slot's alliance."""
     job = _make_job()
     job.robot_tracks = {
         0: RobotTrack(robot_id=0, alliance="blue", team_number=None,
                       last_position=(0, 0), positions_history=deque(maxlen=30)),
     }
-    # Strong VLM votes for a RED team
-    job.robot_tracks[0].team_ocr_votes = {"4322": 5.0}
+    job.robot_tracks[0].team_ocr_votes = {"2102": 5.0}   # 2102 is BLUE
 
     InferenceJob.assign_teams_from_votes(job)
 
     r = job.robot_tracks[0]
-    assert r.team_number == "4322"
-    assert r.alliance == "red", (
-        f"Robot has team 4322 (red) but alliance={r.alliance!r}; "
-        "regression: alliance must follow the roster when a team is assigned."
-    )
+    assert r.team_number == "2102"
+    assert r.alliance == "blue"   # slot alliance must not change
+
+
+def test_cross_alliance_read_is_rejected_not_flipped():
+    """A confident RED-team read on a blue slot must NOT be assigned to it and must NOT
+    flip the slot to red — bumper color wins, the contradictory read is the suspect."""
+    job = _make_job()
+    job.robot_tracks = {
+        0: RobotTrack(robot_id=0, alliance="blue", team_number=None,
+                      last_position=(0, 0), positions_history=deque(maxlen=30)),
+    }
+    job.robot_tracks[0].team_ocr_votes = {"4322": 5.0}   # 4322 is RED
+
+    InferenceJob.assign_teams_from_votes(job)
+
+    r = job.robot_tracks[0]
+    assert r.alliance == "blue"        # unchanged
+    assert r.team_number != "4322"     # red team not placed on a blue slot
 
 
 def test_no_embedding_alliance_calls_in_loop():

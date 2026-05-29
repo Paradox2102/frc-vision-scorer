@@ -228,6 +228,20 @@ class Calibrator:
         return cal
 
 
+def holdout_field_error(cal: "CameraCalibration", held: dict) -> float:
+    """Mean field-position error in meters over held-out correspondences.
+    held: {tag_id: (img_pts (N,2), obj_pts (N,3))}. Projects each image point to
+    the field and compares to the tag's known field (x,y)."""
+    errs = []
+    for (i2d, o3d) in held.values():
+        for (u, v), p in zip(np.asarray(i2d).reshape(-1, 2), np.asarray(o3d).reshape(-1, 3)):
+            xy = cal.image_to_field((float(u), float(v)))
+            if xy is None:
+                continue
+            errs.append(np.hypot(xy[0] - p[0], xy[1] - p[1]))
+    return float(np.mean(errs)) if errs else float("inf")
+
+
 def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:
     errs = []
     for (c2d, c3d) in correspondences.values():

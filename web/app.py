@@ -42,6 +42,10 @@ from web.field import store as field_store
 from web.field.field_model import FieldModel
 from web.field.calibration import Calibrator, CalibrationError
 from web.field.apriltag_detect import detect_tags
+from web.field.tracker import FieldTracker
+from web.field.occlusion import hub_prisms, resolve_occlusion
+from web.field.detect_bridge import to_field_detections, field_adjacent_persons
+from web.field.radar import Radar
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -280,6 +284,25 @@ class InferenceJob:
             minimum_matching_threshold=0.8,     # Require high IoU overlap to match (reduces ID switches)
         )
         self.embedder = RobotEmbedder(EMBED_MODEL_NAME)
+        # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
+        self.person_model = YOLO("yolo26n.pt")
+
+        # Field-space tracking — bound to the loaded event/camera calibration.
+        # Snapshot the active event key at construction; calibration + field model
+        # are loaded at the top of process_video() (decision 7 gate).
+        self.event_key = (current_event or {}).get('event_key')
+        self.camera = "main"
+        self.calib = None
+        self.field_model = None
+        self.hub_prisms = []
+        self.field_tracker: Optional[FieldTracker] = None
+        self.radar: Optional[Radar] = None
+        self.field_tracking = False
+        # Per-frame occlusion state. `_view_flags` feeds the NEXT frame's tracker
+        # (view_occluded -> longer coast); `_occ` is this frame's full result and
+        # gates VLM reads (bumper_occluded). Both keyed by slot_id.
+        self._view_flags: Dict[int, dict] = {}
+        self._occ: Dict[int, dict] = {}
 
         # Video metadata
         self.video_width = 0
@@ -1667,9 +1690,56 @@ class InferenceJob:
                 pass
             self._log_file = None
 
+    def _init_field_tracking(self) -> bool:
+        """Load calibration + field model and build the field-space tracker.
+
+        Returns True if field tracking is ready. On any failure (no event loaded,
+        missing/invalid calibration) returns False and records a clear error —
+        the caller ends the job cleanly WITHOUT robot processing (decision 7).
+        """
+        if not self.event_key:
+            self.error = ("No event loaded — load an event with a calibrated "
+                          "camera before running inference.")
+            print(f"  FIELD TRACKING DISABLED: {self.error}")
+            return False
+        cal = field_store.load(self.event_key, self.camera)
+        if cal is None:
+            self.error = (f"No calibration found for event '{self.event_key}' "
+                          f"camera '{self.camera}'. Calibrate the camera first.")
+            print(f"  FIELD TRACKING DISABLED: {self.error}")
+            return False
+        try:
+            self.calib = cal
+            self.field_model = FieldModel.load(cal.field_season)
+            self.field_dims = (self.field_model.length_m, self.field_model.width_m)
+            self.hub_prisms = hub_prisms(self.field_model)
+            self.field_tracker = FieldTracker(self.field_model.length_m)
+            self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
+        except Exception as e:
+            self.error = f"Failed to initialize field tracking: {e}"
+            print(f"  FIELD TRACKING DISABLED: {self.error}")
+            return False
+        self.field_tracking = True
+        print(f"  Field tracking ENABLED: event={self.event_key} camera={self.camera} "
+              f"season={cal.field_season} mode={cal.mode}")
+        return True
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
+        # Gate on calibration / loaded event (decision 7). No fallback to the old
+        # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
+        if not self._init_field_tracking():
+            self.status = "error"
+            self._open_log_file()
+            print(f"ABORTING JOB: {self.error}")
+            self._close_log_file()
+            if self.websocket:
+                try:
+                    await self.websocket.send_json({"type": "error", "error": self.error})
+                except Exception:
+                    pass
+            return
         try:
             self.status = "processing"
             self._open_log_file()

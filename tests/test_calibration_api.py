@@ -85,3 +85,36 @@ def test_calibration_frame_includes_detected_tags():
     assert "detected_tags" in j        # dict; may be empty but key present
     for corners in j["detected_tags"].values():
         assert len(corners) == 4       # 4 (u,v) corners per tag
+
+
+def test_solve_tags_recovers_and_saves(tmp_path, monkeypatch):
+    import numpy as np
+    from web.field import store as field_store
+    from web.field.field_model import FieldModel
+    from tests._field_synth import truth_pinhole_camera, project_tag_corners
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()                       # image_size (1920,1080)
+    corr = project_tag_corners(cam, fm)
+    auto = {str(tid): corr[tid][0].tolist() for tid in corr}
+
+    r = _client().post("/api/calibration/solve-tags", json={
+        "event": "evt_tags", "camera": "main", "season": "2026-rebuilt-welded",
+        "image_size": list(cam.image_size), "auto_tags": auto, "manual_tags": []})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["rms_error"] < 2.0
+    assert j["n_tags"] >= 4
+    saved = field_store.load("evt_tags", "main")
+    assert saved is not None and saved.mode == "pinhole"
+
+
+def test_solve_tags_too_few_points(tmp_path, monkeypatch):
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    r = _client().post("/api/calibration/solve-tags", json={
+        "image_size": [1920, 648], "auto_tags": {},
+        "manual_tags": [{"id": 1, "u": 10, "v": 10}]})
+    assert r.status_code == 400
+    assert "point" in r.json().get("error", "").lower()

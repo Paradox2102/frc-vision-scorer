@@ -2427,6 +2427,24 @@ async def calibration_frame(request: Request):
             "detected_tags": detected}
 
 
+def _draw_field_overlay(frame, cal, fm):
+    """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
+    Returns fp(x,y)->(int,int) so callers can add their own markers."""
+    L, W = fm.length_m, fm.width_m
+    def fp(x, y):
+        u, v = cal.field_to_image((x, y, 0.0))
+        return (int(u), int(v))
+    cv2.polylines(frame, [np.array([fp(0, 0), fp(L, 0), fp(L, W), fp(0, W)],
+                                   np.int32)], True, (0, 255, 0), 2)
+    x = 0.0
+    while x <= L + 1e-6:
+        cv2.line(frame, fp(x, 0), fp(x, W), (0, 180, 0), 1); x += 2.0
+    y = 0.0
+    while y <= W + 1e-6:
+        cv2.line(frame, fp(0, y), fp(L, y), (0, 180, 0), 1); y += 2.0
+    return fp
+
+
 @app.post("/api/calibration/solve-homography")
 async def calibration_solve_homography(request: Request):
     """Body: {event?, camera?, timestamp?, image_size:[w,h], points:[{u,v,x,y},...]}.
@@ -2458,19 +2476,7 @@ async def calibration_solve_homography(request: Request):
     overlay_b64 = None
     if okf and frame is not None:
         main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
-        L, W = fm.length_m, fm.width_m
-        def fp(x, y):
-            u, v = cal.field_to_image((x, y, 0.0)); return (int(u), int(v))
-        # perimeter
-        per = [fp(0,0), fp(L,0), fp(L,W), fp(0,W)]
-        cv2.polylines(main, [np.array(per, np.int32)], True, (0,255,0), 2)
-        # 2 m grid
-        x = 0.0
-        while x <= L + 1e-6:
-            cv2.line(main, fp(x,0), fp(x,W), (0,180,0), 1); x += 2.0
-        y = 0.0
-        while y <= W + 1e-6:
-            cv2.line(main, fp(0,y), fp(L,y), (0,180,0), 1); y += 2.0
+        _draw_field_overlay(main, cal, fm)
         # clicked points
         for p in pts:
             cv2.circle(main, (int(p["u"]), int(p["v"])), 5, (0,0,255), -1)
@@ -2479,6 +2485,65 @@ async def calibration_solve_homography(request: Request):
             overlay_b64 = base64.b64encode(buf.tobytes()).decode()
     return {"status": "ok", "rms_error": cal.rms_error, "n_points": len(pts),
             "overlay": overlay_b64}
+
+
+@app.post("/api/calibration/solve-tags")
+async def calibration_solve_tags(request: Request):
+    """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
+    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}]}.
+    Solves a single-view pinhole camera model from AprilTag correspondences
+    (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay."""
+    body = await request.json()
+    event = body.get("event", "test"); camera = body.get("camera", "main")
+    season = body.get("season", "2026-rebuilt-welded")
+    image_size = tuple(body.get("image_size", [1920, 648]))
+    fm = FieldModel.load(season)
+    auto = body.get("auto_tags", {}) or {}
+    manual = body.get("manual_tags", []) or []
+    corr = {}
+    for sid, corners in auto.items():
+        tid = int(sid)
+        if tid in fm.tags:
+            corr[f"a{tid}"] = (np.array(corners, float).reshape(-1, 2),
+                               fm.tag_corners_3d(tid))
+    for m in manual:
+        tid = int(m["id"])
+        if tid in fm.tags:
+            center3d = fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3)
+            corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]], float),
+                               center3d)
+    try:
+        cal = Calibrator.solve_camera_from_tags(corr, image_size=image_size,
+                                                field_season=season)
+    except CalibrationError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    field_store.save(event, camera, cal)
+
+    used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
+    n_points = sum(len(c[0]) for c in corr.values())
+    overlay_b64 = None
+    ts = float(body.get("timestamp", 75))
+    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    okf, frame = cap.read(); cap.release()
+    if okf and frame is not None:
+        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
+        _draw_field_overlay(main, cal, fm)
+        mh, mw = main.shape[:2]
+        for tid in fm.tags:
+            t3 = fm.tag_translation(tid)
+            u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
+            if 0 <= u < mw and 0 <= v < mh:
+                color = (0, 255, 0) if tid in used else (0, 165, 255)
+                cv2.circle(main, (int(u), int(v)), 5, color, -1)
+                cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if okj:
+            overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
+            "n_points": n_points, "overlay": overlay_b64}
 
 
 @app.get("/api/calibration/landmarks")

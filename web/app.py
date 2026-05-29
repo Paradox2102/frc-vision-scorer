@@ -80,6 +80,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 SCORE_REGIONS_FILE = PROJECT_ROOT / "score_regions.json"
+CALIB_TEST_VIDEO = Path(__file__).resolve().parents[1] / "data/test_footage/qual1_first_champs_2026.mp4"
+CALIB_MAIN_CROP_FRAC = 0.60   # main camera = top 60% of the composite
 
 # --- Per-match logging -------------------------------------------------------
 # Mirror everything this module print()s into any open match-log file(s) so a
@@ -2372,6 +2374,94 @@ async def calibration_auto(request: Request):
         return JSONResponse(status_code=400, content={"error": str(e)})
     field_store.save(event, camera, cal)
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
+
+
+@app.post("/api/calibration/frame")
+async def calibration_frame(request: Request):
+    """Grab a frame from a LOCAL video, cropped to the main-camera region (top
+    CALIB_MAIN_CROP_FRAC). Body: {timestamp?: seconds (default 75), video_path?}.
+    Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
+    Crop origin is (0,0) so pixel coords match full-frame coords."""
+    body = await request.json()
+    ts = float(body.get("timestamp", 75))
+    path = Path(body.get("video_path") or CALIB_TEST_VIDEO)
+    if not path.exists():
+        return JSONResponse(status_code=400, content={"error": f"video not found: {path}"})
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+    h = frame.shape[0]
+    main = frame[: int(h * CALIB_MAIN_CROP_FRAC), :]
+    ok2, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok2:
+        return JSONResponse(status_code=500, content={"error": "jpeg encode failed"})
+    b64 = base64.b64encode(buf.tobytes()).decode()
+    return {"frame": b64, "width": int(main.shape[1]), "height": int(main.shape[0])}
+
+
+@app.post("/api/calibration/solve-homography")
+async def calibration_solve_homography(request: Request):
+    """Body: {event?, camera?, timestamp?, image_size:[w,h], points:[{u,v,x,y},...]}.
+    Fits a ground-plane homography from clicked (pixel<->field-xy) correspondences,
+    saves it, and returns RMS + an overlay JPEG (reprojected field perimeter + 2 m
+    grid drawn on the same frame) for visual verification."""
+    body = await request.json()
+    event = body.get("event", "test"); camera = body.get("camera", "main")
+    pts = body.get("points", [])
+    if len(pts) < 4:
+        return JSONResponse(status_code=400, content={"error": "need >= 4 points"})
+    img_pts = np.array([[p["u"], p["v"]] for p in pts], float)
+    fld_xy = np.array([[p["x"], p["y"]] for p in pts], float)
+    image_size = tuple(body.get("image_size", [1920, 1080]))
+    try:
+        cal = Calibrator.solve_ground_homography(img_pts, fld_xy, image_size,
+                                                 "2026-rebuilt-welded")
+    except CalibrationError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    field_store.save(event, camera, cal)
+
+    # Build overlay on the same frame/timestamp.
+    fm = FieldModel.load("2026-rebuilt-welded")
+    ts = float(body.get("timestamp", 75))
+    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    okf, frame = cap.read(); cap.release()
+    overlay_b64 = None
+    if okf and frame is not None:
+        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
+        L, W = fm.length_m, fm.width_m
+        def fp(x, y):
+            u, v = cal.field_to_image((x, y, 0.0)); return (int(u), int(v))
+        # perimeter
+        per = [fp(0,0), fp(L,0), fp(L,W), fp(0,W)]
+        cv2.polylines(main, [np.array(per, np.int32)], True, (0,255,0), 2)
+        # 2 m grid
+        x = 0.0
+        while x <= L + 1e-6:
+            cv2.line(main, fp(x,0), fp(x,W), (0,180,0), 1); x += 2.0
+        y = 0.0
+        while y <= W + 1e-6:
+            cv2.line(main, fp(0,y), fp(L,y), (0,180,0), 1); y += 2.0
+        # clicked points
+        for p in pts:
+            cv2.circle(main, (int(p["u"]), int(p["v"])), 5, (0,0,255), -1)
+        okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if okj:
+            overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    return {"status": "ok", "rms_error": cal.rms_error, "n_points": len(pts),
+            "overlay": overlay_b64}
+
+
+@app.get("/api/calibration/landmarks")
+async def calibration_landmarks():
+    import json
+    p = Path(__file__).resolve().parents[1] / "data/field/2026_landmarks.json"
+    return json.loads(p.read_text())
 
 
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,

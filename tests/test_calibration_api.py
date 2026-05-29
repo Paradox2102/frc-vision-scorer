@@ -42,3 +42,24 @@ def test_manual_with_intrinsics_too_few_points(tmp_path, monkeypatch):
     })
     assert r.status_code == 400
     assert "point" in r.json().get("error", "").lower()
+
+
+def test_calibration_frame_from_local_video():
+    import os
+    if not os.path.exists("data/test_footage/qual1_first_champs_2026.mp4"):
+        import pytest; pytest.skip("test video not present")
+    r = _client().post("/api/calibration/frame", json={"timestamp": 75})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["width"] == 1920 and 600 <= j["height"] <= 700  # top 60% of 1080
+    assert len(j["frame"]) > 1000  # base64 jpeg present
+
+def test_solve_homography_too_few_points():
+    r = _client().post("/api/calibration/solve-homography",
+                       json={"points": [{"u":1,"v":1,"x":0,"y":0}]})
+    assert r.status_code == 400
+
+def test_landmarks_endpoint():
+    r = _client().get("/api/calibration/landmarks")
+    assert r.status_code == 200
+    assert len(r.json()["landmarks"]) >= 4

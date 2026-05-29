@@ -1,0 +1,9 @@
+{"landmarks": [
+  {"name": "Field corner: Blue-Right (origin)", "x": 0.0, "y": 0.0},
+  {"name": "Field corner: Blue-Left", "x": 0.0, "y": 8.069},
+  {"name": "Field corner: Red-Right", "x": 16.541, "y": 0.0},
+  {"name": "Field corner: Red-Left", "x": 16.541, "y": 8.069},
+  {"name": "Midline @ scoring-table side", "x": 8.2705, "y": 0.0},
+  {"name": "Midline @ far side", "x": 8.2705, "y": 8.069},
+  {"name": "Field center", "x": 8.2705, "y": 4.0345}
+]}

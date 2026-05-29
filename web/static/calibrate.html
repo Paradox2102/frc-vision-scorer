@@ -65,7 +65,13 @@
   <label>Timestamp (s): <input type="number" id="timestamp" value="75" min="0" step="1"></label>
   <button onclick="grabFrame()">Grab frame</button>
   <label>Event: <input type="text" id="event" value="test"></label>
-  <label>Camera: <input type="text" id="camera" value="main"></label>
+  <label>Camera:
+    <select id="camera">
+      <option value="main">main</option>
+      <option value="corner_left">corner_left</option>
+      <option value="corner_right">corner_right</option>
+    </select>
+  </label>
 </div>
 
 <div class="canvases">
@@ -84,8 +90,8 @@
 <div class="points-section">
   <h2>Correspondences</h2>
   <table>
-    <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th></th></tr></thead>
-    <tbody id="rowsBody"><tr><td colspan="5" style="color:#556;font-style:italic;padding:12px 10px;">
+    <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th>Hold out</th><th></th></tr></thead>
+    <tbody id="rowsBody"><tr><td colspan="6" style="color:#556;font-style:italic;padding:12px 10px;">
       Grab a frame to begin.</td></tr></tbody>
   </table>
 </div>
@@ -109,10 +115,15 @@ let baseImg = null, frameW = 0, frameH = 0, fScale = 1.0;
 let autoTags = {};        // {id: [[u,v]x4]}
 let manualTags = [];      // [{id, u, v}]
 let pendingPixel = null;  // {u, v} awaiting a map click
+let heldOut = new Set();  // ids marked as held-out for validation
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
 
 (async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await grabFrame(); })();
+
+// Switching camera re-grabs (which resets autoTags/manualTags/pendingPixel) so each
+// camera keeps its own independent working correspondence set.
+document.getElementById('camera').addEventListener('change', function(){ grabFrame(); });
 
 async function fetchCurrentEvent(){
   // Save the calibration under the EVENT THE APP HAS LOADED — otherwise inference
@@ -194,7 +205,8 @@ async function grabFrame(){
   setStatus('Grabbing frame…','rms-info');
   try {
     const r = await fetch('/api/calibration/frame', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({timestamp:ts})});
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({timestamp:ts, camera: document.getElementById('camera').value})});
     const j = await r.json();
     if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return; }
     autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null;
@@ -252,7 +264,7 @@ document.getElementById('frameCanvas').addEventListener('click', function(e){
   redrawFrame(); drawMap();
 });
 
-document.getElementById('mapCanvas').addEventListener('click', function(e){
+document.getElementById('mapCanvas').addEventListener('click', async function(e){
   const rect = this.getBoundingClientRect();
   const mx = e.clientX-rect.left, my = e.clientY-rect.top;
   // nearest tag marker within 14px
@@ -265,12 +277,30 @@ document.getElementById('mapCanvas').addEventListener('click', function(e){
   if (!pendingPixel){ setStatus('Click a tag on the frame first.','rms-warn'); return; }
   if (best in autoTags){ setStatus(`Tag ${best} already auto-detected.`,'rms-warn');
     pendingPixel=null; redrawFrame(); drawMap(); return; }
-  manualTags = manualTags.filter(m=>m.id!==best);
-  manualTags.push({id:best, u:pendingPixel.u, v:pendingPixel.v});
-  pendingPixel=null;
+  // Try ROI refine first: snap to sub-pixel corners; fall back to the center click.
+  const px = pendingPixel; pendingPixel = null;
+  const camera = document.getElementById('camera').value;
+  const ts = parseFloat(document.getElementById('timestamp').value) || 75;
+  setStatus(`Refining tag ${best}…`, 'rms-info');
+  let refined = null;
+  try {
+    const rr = await fetch('/api/calibration/refine-tag', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({camera, timestamp: ts, u: px.u, v: px.v, id: best})});
+    const jj = await rr.json();
+    refined = jj.corners;   // [[u,v]x4] or null
+  } catch(e) { /* fall through to manual */ }
+  if (refined){
+    autoTags[String(best)] = refined;            // treat as a 4-corner (auto-style) entry
+    manualTags = manualTags.filter(m=>m.id!==best);
+    setStatus(`Refined tag ${best} → 4 corners ✓`, 'rms-good');
+  } else {
+    manualTags = manualTags.filter(m=>m.id!==best);
+    manualTags.push({id:best, u:px.u, v:px.v});   // fall back to single center point
+    setStatus(`Tag ${best}: ROI refine failed, added center point.`, 'rms-warn');
+  }
   document.getElementById('frameHint').textContent='Click a tag here, then its marker on the map →';
   redrawFrame(); drawMap(); renderRows();
-  setStatus(`Added manual tag ${best}.`,'rms-info');
 });
 
 function renderRows(){
@@ -279,7 +309,7 @@ function renderRows(){
   Object.keys(autoTags).map(Number).sort((a,b)=>a-b).forEach(id => rows.push({id,src:'auto'}));
   manualTags.slice().sort((a,b)=>a.id-b.id).forEach(m => rows.push({id:m.id,src:'manual',u:m.u,v:m.v}));
   if (!rows.length){ const tr=document.createElement('tr'); const td=document.createElement('td');
-    td.colSpan=5; td.textContent='No tags yet.'; td.style.cssText='color:#556;font-style:italic;padding:12px 10px;';
+    td.colSpan=6; td.textContent='No tags yet.'; td.style.cssText='color:#556;font-style:italic;padding:12px 10px;';
     tr.appendChild(td); tb.appendChild(tr); return; }
   rows.forEach(r => {
     const t = tagMap[r.id] || {x:'?',y:'?'};
@@ -291,6 +321,10 @@ function renderRows(){
     tdPx.textContent = r.src==='manual' ? `(${r.u}, ${r.v})` : '4 corners'; tr.appendChild(tdPx);
     const tdXY=document.createElement('td'); tdXY.style.fontFamily='monospace';
     tdXY.textContent = `(${(+t.x).toFixed(2)}, ${(+t.y).toFixed(2)})`; tr.appendChild(tdXY);
+    const tdHold=document.createElement('td');
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=heldOut.has(r.id);
+    cb.onchange=()=>{ if (cb.checked) heldOut.add(r.id); else heldOut.delete(r.id); };
+    tdHold.appendChild(cb); tr.appendChild(tdHold);
     const tdDel=document.createElement('td');
     if (r.src==='manual'){ const b=document.createElement('button'); b.textContent='✕';
       b.className='del-btn'; b.onclick=()=>{ manualTags=manualTags.filter(m=>m.id!==r.id);
@@ -310,12 +344,18 @@ async function solve(){
     const r = await fetch('/api/calibration/solve-tags',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({event,camera,timestamp:ts,image_size:[frameW,frameH],
-        auto_tags:autoTags, manual_tags:manualTags})});
+        auto_tags:autoTags, manual_tags:manualTags, holdout_ids:[...heldOut]})});
     const j = await r.json();
     if (j.error){ setStatus('Solve error: '+j.error,'rms-err'); return; }
     const rms = parseFloat(j.rms_error);
     let cls='rms-good'; if (rms>=20) cls='rms-bad'; else if (rms>=8) cls='rms-warn';
-    setStatus(`RMS = ${rms.toFixed(2)} px  (${j.n_tags} tags, ${j.n_points} pts)`, cls);
+    let msg = `RMS = ${rms.toFixed(2)} px  (${j.n_tags} tags, ${j.n_points} pts)`;
+    if (j.holdout_error_m != null){
+      const he = parseFloat(j.holdout_error_m);
+      msg += ` · held-out ${he.toFixed(2)} m`;
+      if (he>0.5) cls='rms-bad'; else if (he>0.3 && cls==='rms-good') cls='rms-warn';
+    }
+    setStatus(msg, cls);
     if (j.overlay){ const img=document.getElementById('overlayImg');
       img.src='data:image/jpeg;base64,'+j.overlay; img.style.display='block';
       document.getElementById('noOverlayMsg').style.display='none'; }

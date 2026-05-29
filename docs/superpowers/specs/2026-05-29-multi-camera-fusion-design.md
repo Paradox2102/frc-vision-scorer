@@ -98,14 +98,27 @@ color + bumper crop.
 A new, isolated `fuse_detections(per_camera_detections)` unit keeps the
 `FieldTracker` untouched:
 
-- **Input:** for each camera, a list of `FieldDetection` (field pos, color, box,
-  bumper crop, source camera).
+- **Input:** for each camera, a list of detections. Today `FieldDetection`
+  (tracker.py) is only `pos, color, box, score` — it carries no bumper crop or
+  source camera. Identity evidence must therefore ride a **side channel**, not the
+  `FieldDetection` the tracker consumes. Define a small `FusedObservation` that
+  pairs the merged `FieldDetection` (what the tracker sees) with its pooled
+  identity evidence: `[(source_camera, bumper_crop, weight), ...]`. The tracker
+  contract is unchanged; the evidence travels alongside.
 - **Cluster** detections within ~0.5–0.75 m across cameras as one physical robot.
-- **Merge** each cluster to a single `FieldDetection`: quality-weighted average
-  position, pooled color votes, and **pooled identity evidence** (the bumper crops +
-  source-camera weights, carried forward to the reader).
-- **Output:** a merged `FieldDetection` list → existing `FieldTracker.update()`,
-  unchanged. Still 6 slots (3 blue + 3 red).
+- **Merge** each cluster to a single `FieldDetection` (quality-weighted average
+  position, pooled color votes) plus its pooled identity evidence.
+- **Output:** the merged `FieldDetection` list → existing `FieldTracker.update()`,
+  unchanged (still 6 slots, 3 blue + 3 red) — *and* the parallel
+  `FusedObservation` list, retained for the identity step below.
+
+**Read → slot attachment (the fusion↔identity seam).** `FieldTracker.update()`
+assigns each merged detection to a slot and returns that mapping (it already
+associates detections to slots internally). Carry the fused detection's index
+through `update()`'s assignment so each `FusedObservation`'s pooled bumper crops
+attach to the **slot the tracker chose** for that detection — not a re-derived
+nearest-slot guess. This keeps fusion, tracking, and voting consistent on one
+association decision per frame.
 
 ### Identity: additive, corner-favored (decided: weighted votes, corner favored)
 
@@ -114,10 +127,12 @@ cameras add evidence, they don't get a separate identity path:
 
 - Match roster (`match_blue_teams` / `match_red_teams`, from TBA) makes reading a
   **closed-set** problem ("which of these 6 numbers?"). Bumper crops from **all**
-  cameras go through `_vision_read_bumpers(crops, match_teams)`.
-- Each read attaches to a slot via the fused field position and casts **votes in the
-  existing per-slot tally** (`team_ocr_votes`). **Corner-camera reads are weighted
-  higher** (e.g. 2–3× a main-cam vote).
+  cameras go through the existing reader
+  `_vision_read_bumpers(crops, match_teams, blue_teams, red_teams)`.
+- Each read attaches to a slot via the fusion↔identity seam above (the tracker's own
+  assignment) and casts **votes in the existing per-slot tally**
+  (`team_ocr_votes`). **Corner-camera reads are weighted higher** (e.g. 2–3× a
+  main-cam vote), using the per-source weight carried on the `FusedObservation`.
 - **No hard override.** A confirmed identity can still flip if corner cameras
   consistently disagree — robust to one-off misreads. This is the explicit conflict
   policy.
@@ -181,7 +196,10 @@ New/changed units, each independently testable:
 - **End-to-end smoke (mirrors the SP2 smoke test):** on
   `qual1_first_champs_2026.mp4`, confirm (a) corner detections populate
   hub-occluded field regions, and (b) corner-camera reads lock/confirm identities
-  the main camera reads poorly — the additive-identity requirement, demonstrated.
+  the main camera reads poorly. **Pass signal:** for at least one slot the main cam
+  leaves unconfirmed or mislabeled, the final voted slot identity matches the TBA
+  roster ground truth once corner reads are included — the additive-identity
+  requirement, demonstrated against an objective reference.
 
 ## Out of scope
 

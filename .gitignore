@@ -95,3 +95,6 @@ data/videos/
 yolo11m.pt
 *.pt
 !runs/train/hub_zone_yolo26s/weights/best.pt
+
+# Test footage (large video, not committed)
+data/test_footage/

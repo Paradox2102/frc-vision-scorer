@@ -2429,19 +2429,25 @@ async def calibration_frame(request: Request):
 
 def _draw_field_overlay(frame, cal, fm):
     """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
+    Field lines are SAMPLED into polylines (a straight field line projects to a curved
+    image line under lens distortion, so a 2-point segment can't trace it).
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
     L, W = fm.length_m, fm.width_m
     def fp(x, y):
         u, v = cal.field_to_image((x, y, 0.0))
         return (int(u), int(v))
-    cv2.polylines(frame, [np.array([fp(0, 0), fp(L, 0), fp(L, W), fp(0, W)],
-                                   np.int32)], True, (0, 255, 0), 2)
+    def seg(p0, p1, color, thick, n=24):
+        (x0, y0), (x1, y1) = p0, p1
+        pts = [fp(x0 + (x1 - x0) * t / n, y0 + (y1 - y0) * t / n) for t in range(n + 1)]
+        cv2.polylines(frame, [np.array(pts, np.int32)], False, color, thick)
+    for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
+        seg(a, b, (0, 255, 0), 2)
     x = 0.0
     while x <= L + 1e-6:
-        cv2.line(frame, fp(x, 0), fp(x, W), (0, 180, 0), 1); x += 2.0
+        seg((x, 0), (x, W), (0, 180, 0), 1); x += 2.0
     y = 0.0
     while y <= W + 1e-6:
-        cv2.line(frame, fp(0, y), fp(L, y), (0, 180, 0), 1); y += 2.0
+        seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
     return fp
 
 

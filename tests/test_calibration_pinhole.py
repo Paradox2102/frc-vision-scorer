@@ -53,7 +53,14 @@ def test_solve_camera_from_tags_mixed_corners_and_centers():
             mixed[tid] = (np.array([uv]), np.array([c3d]))  # 1 center
     solved = Calibrator.solve_camera_from_tags(
         mixed, image_size=cam.image_size, field_season="2026-rebuilt-welded")
-    assert solved.rms_error < 2.0
+    # With the principal point solved (not fixed), a half-single-point set conditions
+    # the intrinsics a little more loosely, so RMS sits ~2px. What matters is ground
+    # accuracy, which stays well within the 10cm field-tracking budget.
+    assert solved.rms_error < 3.0
+    for x, y in in_frame_points(cam, [(3., 3.), (8.27, 4.), (13., 5.), (10., 2.)]):
+        uv = cam.field_to_image((x, y, 0.0))
+        xs, ys = solved.image_to_field(uv)
+        assert np.hypot(xs - x, ys - y) < 0.10
 
 
 def test_solve_camera_from_tags_too_few_points_raises():

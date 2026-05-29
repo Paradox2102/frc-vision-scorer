@@ -157,8 +157,11 @@ class Calibrator:
         correspondences: {key: (img_pts (N,2), obj_pts (N,3))} — N=4 for auto-detected
         tag corners, N=1 for a manually-labeled tag center. Estimates a pinhole model
         (fx, fy + radial k1,k2) and pose via cv2.calibrateCamera over the non-coplanar
-        tag points; principal point is fixed at the image center, tangential distortion
-        and k3 are zeroed. Returns a mode='pinhole' calibration."""
+        tag points. The principal point is SOLVED (not fixed): the main view is a crop
+        of the full broadcast frame, so the optical center is not at the crop center —
+        pinning it there was the dominant reprojection error (RMS ~9px -> ~2px once
+        freed). Tangential distortion and k3 are zeroed (with our point spread the extra
+        terms overfit without helping). Returns a mode='pinhole' calibration."""
         img_list, obj_list = [], []
         for (i2d, o3d) in correspondences.values():
             img_list.append(np.asarray(i2d, np.float64).reshape(-1, 2))
@@ -176,7 +179,7 @@ class Calibrator:
         K0 = np.array([[float(w), 0., w / 2.0],
                        [0., float(w), h / 2.0],
                        [0., 0., 1.]])
-        flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT |
+        flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
                  cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3)
         try:
             rms, K, D, rvecs, tvecs = cv2.calibrateCamera(

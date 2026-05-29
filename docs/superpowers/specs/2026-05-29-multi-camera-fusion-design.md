@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-29
 **Status:** Draft (pending spec review)
-**Component:** new `web/field/` fusion + per-camera ingest, corner-camera homography calibration, calibrate UI extension, `web/app.py` inference loop
+**Component:** new `web/field/` fusion + per-camera ingest, corner-camera tag-anchored calibration (homography fallback), calibrate UI extension, `web/app.py` inference loop
 **Part of:** "Field-coordinate rework" — Sub-project 3 of 5 (see [SP1 roadmap](2026-05-28-field-coordinate-foundation-design.md))
 
 ## Problem
@@ -34,48 +34,65 @@ drove the central design decisions:
   below the main-camera crop and must be measured precisely, not assumed.
 - **The corner lenses are *moderate* wide-angle, not extreme fisheye** — straight
   structures stay mostly straight with visible-but-mild barrel bow.
-- **Tags are unusable for resection on the corner cameras.** Accumulating
-  AprilTag detections across the entire match (with 2× upscaling) yields only
-  **3–4 distinct field tags per corner**, all on the central hub structure, jammed
-  into a ~130 px-wide, near-collinear cluster in the center of a 960-wide crop:
+- **Auto-detection alone under-performs, but the tags are spread.** An aggressive
+  detection sweep (`quad_decimate=1.0`, 2–3× upscale, accumulated across the whole
+  match) only decodes the **bright central hub cluster** — left: 18/25/26/27 at
+  x≈560–690; right: 5/8/9/10 at x≈277–381 — a ~130 px near-collinear blob. But
+  visual inspection confirms **at least ~7 tags per corner on structures spread
+  across the frame**: a near pillar, the central hub, a far goal, and wall panels.
+  Their published 3D positions span **~4.7 m of depth, nearly the full ~7 m field
+  width (y≈0.6 → 7.4), and two heights** — a genuinely non-coplanar, non-collinear
+  constellation. The detector simply can't decode the small/oblique off-hub tags at
+  this resolution; a human can locate them.
 
-  | Camera | Distinct tags | Image cluster |
-  |---|---|---|
-  | Left | 18, 25, 26, 27 | x≈560–690, y≈240–253 |
-  | Right | 8, 9, 10 | x≈313–381, y≈234–240 |
+  | Tag | x (m) | y (m) | z (m) | structure |
+  |---|---|---|---|---|
+  | 31, 32 | 0.01 | 3.75, 4.18 | 0.55 | far wall |
+  | 25, 26 | 4.02 | 4.39, 4.03 | 1.12 | central hub |
+  | 17 | 4.66 | 0.64 | 0.89 | near rail |
+  | 22 | 4.66 | 7.42 | 0.89 | far rail |
 
-  A wide-FOV intrinsic/distortion model is unconstrained where there are no
-  points. Fitting it to a central cluster would **extrapolate wildly into the frame
-  periphery — exactly the occluded-field region these cameras exist to recover** —
-  and the all-central tags make it impossible to even *measure* that edge error.
-  **Tag-anchored pinhole/fisheye resection (right for the main cam) is the wrong
-  tool here.**
+  So tag-anchored **pinhole resection — the same method as the main camera — is the
+  right primary tool**, provided the spread off-hub tags are supplied by manual
+  click (auto-detect gets the hub cluster's corners; the operator adds the rest).
 
 ## Approach
 
-### Calibration: ground-plane homography (decided: loose homography only)
+### Calibration: tag-anchored pinhole resection (primary), homography (fallback)
 
-Sidestep intrinsics entirely. The corner cameras are oblique views of the flat
-field — the textbook homography case. Reuse the existing
-`Calibrator.solve_ground_homography()` / `mode="homography"`:
+Use the **same method as the main camera** —
+`Calibrator.solve_camera_from_tags()` / `mode="pinhole"` (intrinsics + 2-radial
+distortion + pose from AprilTag correspondences). The corner-camera difference is
+purely in how correspondences are *gathered*, because the detector only decodes the
+central hub cluster:
 
-- The operator **manually clicks known field landmarks** (from
-  `data/field/2026_landmarks.json` plus field-perimeter / hub-footprint / field-line
-  points) **spread across the whole view, including the edges**, mapping each image
-  point to its field `(x, y)`. Distributing control points across the area of
-  interest means the fit *covers* that area instead of extrapolating into it.
-- **No lens-distortion model.** For these moderate-wide lenses and the tolerance
-  required (~0.3–0.5 m), the pure-homography residual is expected to be acceptable.
-- **Validate honestly:** hold out a subset of clicked landmarks distributed toward
-  the edges; report their field-position error in meters. This is the acceptance
-  gate.
+- **Auto-detect** supplies the hub cluster's tag **corners** (4 points/tag).
+- **Manual locate → auto refine** supplies the spread off-hub tags. The operator
+  clicks roughly on a tag the detector missed; the system runs AprilTag detection in
+  a **small upscaled ROI around that click**. On success it snaps to the tag's
+  sub-pixel corners (full 4-point constraint, detector-grade precision); on failure
+  it falls back to the single clicked center point. This combines human tag-spotting
+  with detector precision and is the key addition over the main-camera flow.
+- The spread tags (far wall, near/far rails) are what make the resection
+  well-conditioned and constrain distortion across the frame, not just the center.
 
-Rationale: identity — the corner cameras' headline value — only needs a read to
-associate to the *correct slot*, and the tracker's association gate is 2.5 m. So
-±0.5 m calibration is more than enough for the identity benefit, and adequate for
-occlusion-fill placement. Tighter accuracy (plumb-line radial-distortion estimation
-from straight field lines) is a **documented future escalation**, triggered only if
-held-out validation comes back poor — it is *out of scope* for this spec.
+**Validate honestly:** hold out a subset of tags distributed toward the frame edges;
+report their reprojection error (px) and field-position error (m). This is the
+acceptance gate.
+
+**If validation fails** (manual-click noise or wide-lens distortion exceeding two
+radial terms), escalate in order: (1) relax the solver's `CALIB_FIX_K3` /
+`CALIB_ZERO_TANGENT_DIST` flags to add a third radial / tangential term, given the
+points now span the frame; (2) fall back to a ground-plane homography
+(`solve_ground_homography`, `mode="homography"`) from the same clicked points
+projected to the floor plane — pose-free, ~0.3–0.5 m, sufficient for identity
+association (the tracker gate is 2.5 m) but with no occlusion ray-casting. The
+homography fallback is the contingency, not the plan.
+
+Rationale: a posed pinhole calibration gives corner cams a real 3D camera center —
+so they use the same model as the main cam, **keep occlusion ray-casting**, and need
+no relaxation of the pose-free tracking gate. Identity tolerates loose positioning
+regardless, so even the fallback preserves the headline benefit.
 
 ### Per-camera ingest
 
@@ -90,7 +107,8 @@ single-camera assumptions that get lifted:
 
 Every frame, for **every** view: extract crop → blank masks → YOLO robot detection
 → project each box's ground-contact point (bottom-center) to field `(x, y)` via that
-view's `calibration.image_to_field()` (main: pinhole; corners: homography) → bumper
+view's `calibration.image_to_field()` (all three `mode="pinhole"` on success; a
+corner that fell back to homography projects the same way via its `H`) → bumper
 color + bumper crop.
 
 ### Cross-camera fusion (new unit, before the tracker)
@@ -142,20 +160,25 @@ cameras add evidence, they don't get a separate identity path:
 
 ### Occlusion
 
-Corner cameras have **no 3D pose** (homography is pose-free), so they do not
-participate in ray-cast occlusion (`resolve_occlusion`). They fill occluded zones
-simply by contributing detections there. The main camera keeps its hub/person
-occlusion logic unchanged. The current field-tracking gate that **rejects pose-free
-calibrations** must be relaxed to admit homography mode *for corner cameras*, while
-still requiring a posed calibration for the main camera (occlusion depends on it).
+With the primary pinhole resection, corner cameras **have a 3D pose**, so they
+*can* participate in ray-cast occlusion (`resolve_occlusion`) from their own camera
+centers — more viewpoints make hub/person occlusion inference more robust. They also
+fill occluded zones simply by contributing detections there. The main camera keeps
+its logic unchanged. No change to the pose-free rejection gate is needed for the
+primary path.
+
+Only if a corner camera lands on the **homography fallback** is it pose-free; that
+camera then skips ray-cast occlusion, and the field-tracking gate is relaxed to
+admit homography mode **for corner cameras only** (the main camera still requires a
+posed calibration, since its occlusion depends on it).
 
 ## Components & data flow
 
 ```
 composite frame
    ├─ CameraView[main]        crop+mask → YOLO → image_to_field(pinhole) ─┐
-   ├─ CameraView[corner_left] crop+mask → YOLO → image_to_field(homog.) ──┤
-   └─ CameraView[corner_right]crop+mask → YOLO → image_to_field(homog.) ──┤
+   ├─ CameraView[corner_left] crop+mask → YOLO → image_to_field(pinhole) ─┤
+   └─ CameraView[corner_right]crop+mask → YOLO → image_to_field(pinhole) ─┤
                                                                           ▼
                                               fuse_detections() ── cluster+merge
                                                                           ▼
@@ -170,29 +193,34 @@ New/changed units, each independently testable:
 | Unit | Location | Responsibility |
 |---|---|---|
 | `CameraView` config | `web/field/` (new) | crop rect + masks + calibration per camera |
-| corner homography calibration | existing `solve_ground_homography` + UI | image↔landmark clicks → `mode="homography"` |
+| corner tag resection | existing `solve_camera_from_tags` + UI | auto hub corners + manual-locate→auto-refine spread tags → `mode="pinhole"` |
+| ROI tag refine | `web/field/apriltag_detect.py` (extend) | detect in small upscaled ROI around a manual click; snap to corners or fall back to center |
+| homography fallback | existing `solve_ground_homography` | contingency when resection won't validate → `mode="homography"` |
 | `fuse_detections()` | `web/field/` (new) | cross-camera cluster + merge → merged detections |
 | identity vote weighting | `web/app.py` reader path | corner reads weighted, ungated, into existing tally |
 | ingest loop | `web/app.py` `process_video()` | iterate views instead of single main crop |
-| tracking gate | `web/app.py` `_init_field_tracking()` | allow homography for corner cams only |
-| calibrate UI | `web/static/calibrate.html` + endpoints | camera picker, per-camera crop, held-out error |
+| tracking gate | `web/app.py` `_init_field_tracking()` | unchanged for posed corner cams; relax to allow homography only for a fallback corner cam |
+| calibrate UI | `web/static/calibrate.html` + endpoints | camera picker, per-camera crop, manual-locate refine, held-out error |
 
 ## Error handling
 
 - **Uncalibrated corner camera:** that view is skipped (detections from it dropped);
   main-camera tracking proceeds. Logged, surfaced in the calibrate UI.
-- **Failed/garbage homography (high held-out error):** calibration is rejected at
-  solve time with the measured error; not saved as usable.
-- **No tags / no landmarks clickable in a corner view:** that camera simply cannot
-  be calibrated; system degrades to main + the other corner.
+- **Resection fails validation (high held-out error):** escalate per the
+  calibration section (relax distortion flags, then homography fallback); a
+  calibration that still exceeds the gate is rejected at solve time and not saved.
+- **Too few tags locatable in a corner view:** that camera cannot be calibrated;
+  system degrades to main + the other corner.
 - **Conflicting reads:** resolved by the weighted vote tally (no exception path).
 
 ## Testing
 
 - **Unit:** `fuse_detections()` clustering/merge (synthetic multi-cam detections);
-  `CameraView` crop+mask extraction; homography held-out error computation.
-- **Calibration acceptance:** held-out-landmark field error per corner camera, in
-  meters, under threshold (target ≤0.5 m; gate value set during implementation).
+  `CameraView` crop+mask extraction; ROI tag-refine (snap vs center-fallback);
+  held-out error computation.
+- **Calibration acceptance:** held-out-tag reprojection error (px) and
+  field-position error (m) per corner camera, under threshold (target ≤0.5 m; gate
+  value set during implementation).
 - **End-to-end smoke (mirrors the SP2 smoke test):** on
   `qual1_first_champs_2026.mp4`, confirm (a) corner detections populate
   hub-occluded field regions, and (b) corner-camera reads lock/confirm identities
@@ -203,9 +231,7 @@ New/changed units, each independently testable:
 
 ## Out of scope
 
-- Plumb-line / radial-distortion refinement of corner calibration (future
-  escalation if held-out error is poor).
-- Corner cameras participating in occlusion ray-casting (requires 3D pose they
-  don't have).
+- Plumb-line / straight-line radial-distortion refinement (only the in-solver flag
+  relaxation is in scope; a dedicated distortion estimator is a future escalation).
 - Auto-detection of crop seams / overlay masks (measured once, configured).
 - Triangulating robot position from multiple cameras for sub-decimeter accuracy.

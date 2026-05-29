@@ -52,9 +52,23 @@ class FieldModel:
         return "blue" if point_xy[0] < self.length_m / 2 else "red"
 
     def tag_corners_3d(self, tag_id: int) -> np.ndarray:
-        """4 corner positions (4,3) in field meters. Local corner order
-        (provisional, reconciled with the detector in Task 3):
-        [-y-z, +y-z, +y+z, -y+z] with normal along local +x."""
+        """4 corner positions (4,3) in field meters.
+
+        Local 3D corner order (provisional; definitive reconciliation in Task 5 PnP):
+          index 0: [-y, -z]  (local bottom-left  when normal faces camera)
+          index 1: [+y, -z]  (local bottom-right)
+          index 2: [+y, +z]  (local top-right)
+          index 3: [-y, +z]  (local top-left)
+        Normal along local +x.
+
+        Detector (pupil_apriltags) observed corner order — pinned by
+        test_corner_order_is_ccw_from_bottom_left (Task 3 empirical probe):
+          index 0: top-right      (x>cx, y<cy)
+          index 1: top-left       (x<cx, y<cy)
+          index 2: bottom-left    (x<cx, y>cy)
+          index 3: bottom-right   (x>cx, y>cy)
+        i.e. CW from top-right in image coordinates (y down).
+        The 2D↔3D index alignment is reconciled/validated by Task 5's PnP RMS."""
         s = TAG_SIZE_M / 2.0
         local = np.array([
             [0.0, -s, -s],

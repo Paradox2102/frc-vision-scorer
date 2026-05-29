@@ -74,13 +74,15 @@ def _expand_polygon(poly, margin):
     return poly + vecs / (norms + 1e-9) * margin
 
 
-def occluded_by_hub(cam_center, prism, track_xy, robot_h, n=100, margin=0.35):
+_HUB_MARGIN_M = 0.35  # footprint expansion: tag ring sits at inner hub edge; accounts for surrounding frame/netting
+
+
+def occluded_by_hub(cam_center, prism, track_xy, n=100, margin=_HUB_MARGIN_M):
     """Does the hub prism block the line-of-sight from cam_center to track_xy?
 
-    Uses a 2-D ground-plane shadow check on a slightly expanded footprint (the tag
-    ring sits at the inner edge of the physical hub structure; margin accounts for
-    the surrounding frame/netting).  We also verify the hub is closer to the camera
-    than the target so we don't flag robots that are on the near side.
+    Uses a 2-D ground-plane shadow check on a slightly expanded footprint.
+    We also verify the hub is closer to the camera than the target so we don't
+    flag robots that are on the near side.
     """
     cam_xy = np.asarray(cam_center, float)[:2]
     tgt_xy = np.array([track_xy[0], track_xy[1]], float)
@@ -119,7 +121,11 @@ def _bumper_region(box):
 
 def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
     """tracks: list of {slot_id, pos:(x,y), box:(x1,y1,x2,y2)}.
-    Returns {slot_id: {view_occluded, bumper_occluded, cause}}."""
+    Returns {slot_id: {view_occluded, bumper_occluded, cause}}.
+
+    robot_h is reserved for future 3-D hub occlusion; the current 2-D shadow
+    model inside occluded_by_hub does not use robot height.
+    """
     cc = cam.camera_center
     out = {}
     tdist = {t["slot_id"]: camera_distance(cc, t["pos"]) for t in tracks}
@@ -129,7 +135,7 @@ def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
         bregion = _bumper_region(box)
         barea = max(1.0, (bregion[2] - bregion[0]) * (bregion[3] - bregion[1]))
         for p in hub_prisms:
-            if occluded_by_hub(cc, p, t["pos"], robot_h):
+            if occluded_by_hub(cc, p, t["pos"]):
                 view = True; cause = "hub"
         for pb in person_boxes:
             if box_overlap(box, pb) / area > 0.5:

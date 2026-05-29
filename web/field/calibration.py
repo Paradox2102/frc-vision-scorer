@@ -24,6 +24,25 @@ class CameraCalibration:
     field_season: str
     rms_error: float = 0.0
 
+    def to_json(self) -> dict:
+        return {
+            "K": self.K.tolist(), "D": np.asarray(self.D).reshape(-1).tolist(),
+            "rvec": self.rvec.reshape(-1).tolist(), "tvec": self.tvec.reshape(-1).tolist(),
+            "image_size": list(self.image_size),
+            "crop_region": list(self.crop_region) if self.crop_region else None,
+            "field_season": self.field_season, "rms_error": self.rms_error,
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "CameraCalibration":
+        return cls(
+            K=np.array(d["K"], float), D=np.array(d["D"], float),
+            rvec=np.array(d["rvec"], float).reshape(3,1),
+            tvec=np.array(d["tvec"], float).reshape(3,1),
+            image_size=tuple(d["image_size"]),
+            crop_region=tuple(d["crop_region"]) if d["crop_region"] else None,
+            field_season=d["field_season"], rms_error=d.get("rms_error", 0.0))
+
     def field_to_image(self, point_xyz) -> tuple:
         obj = np.array([[point_xyz]], dtype=np.float64)  # (1,1,3)
         img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec, self.K, self.D)

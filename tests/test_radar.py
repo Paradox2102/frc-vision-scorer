@@ -16,4 +16,9 @@ def test_point_maps_to_expected_pixel():
 def test_side_tint_blue_left_red_right():
     r = Radar(field_length=16.541, field_width=8.069, px_per_m=40)
     img = r.render([((2.0, 4.0), "blue"), ((14.0, 4.0), "red")])
-    assert img is not None  # smoke: renders without error
+    bu, bv = r.field_to_pixel((2.0, 4.0))
+    ru, rv = r.field_to_pixel((14.0, 4.0))
+    blue_px = img[int(bv), int(bu)]   # BGR; _TINT blue = (255, 120, 0)
+    red_px  = img[int(rv), int(ru)]   # BGR; _TINT red  = (0,   0, 255)
+    assert blue_px[0] > blue_px[2], f"Blue dot: B channel should dominate, got BGR={blue_px}"
+    assert red_px[2]  > red_px[0],  f"Red dot: R channel should dominate, got BGR={red_px}"

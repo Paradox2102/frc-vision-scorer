@@ -49,7 +49,14 @@ class CameraCalibration:
         u, v = img.reshape(2)
         return (float(u), float(v))
 
-    def image_to_field(self, uv) -> tuple:
+    def image_to_field(self, uv) -> "tuple | None":
+        """Back-project image pixel *uv* to the field ground plane (z=0).
+
+        Returns ``(x, y)`` in field metres, or ``None`` when the pixel's
+        back-projected ray is parallel to / pointing above the ground plane
+        (i.e. the pixel lies at or above the camera horizon).  Callers must
+        handle the ``None`` case.
+        """
         pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
         # Undistort to normalized camera-frame ray (z=1).
         norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
@@ -57,8 +64,14 @@ class CameraCalibration:
         R, _ = cv2.Rodrigues(self.rvec)
         cam_center = (-R.T @ self.tvec).reshape(3)
         ray_world = R.T @ ray_cam
-        # Intersect with ground plane z=0.
-        s = -cam_center[2] / ray_world[2]
+        # Intersect with ground plane z=0. Reject rays parallel to / above the
+        # ground (no valid forward intersection) so callers can drop the point.
+        denom = ray_world[2]
+        if abs(denom) < 1e-9:
+            return None
+        s = -cam_center[2] / denom
+        if s <= 0:
+            return None
         world = cam_center + s * ray_world
         return (float(world[0]), float(world[1]))
 

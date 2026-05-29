@@ -104,6 +104,18 @@ so they use the same model as the main cam, **keep occlusion ray-casting**, and 
 no relaxation of the pose-free tracking gate. Identity tolerates loose positioning
 regardless, so even the fallback preserves the headline benefit.
 
+### Per-camera correspondences (calibration UI)
+
+Each camera is calibrated independently against its **own** correspondence set, and
+**the corner cams share tags with the main cam** (the hub cluster 25/26/27 is
+visible to all three). So a given field tag must be selectable and mappable
+*separately per camera* — calibrating `corner_left` and mapping tag 25 there must
+not touch the `main` camera's tag-25 correspondence. Concretely: the calibrate page
+keys its working correspondence list (auto + manual) by the selected camera, solves
+into that camera's file (`field_store` is already camera-keyed), and the shared
+field tag map / landmark source is read-only reference shown to every camera. No
+single global "this tag is used" state across cameras.
+
 ### Per-camera ingest
 
 A `CameraView` describes each physical camera and is the single source of

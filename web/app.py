@@ -40,8 +40,9 @@ from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
 from web.field.field_model import FieldModel
-from web.field.calibration import Calibrator, CalibrationError
+from web.field.calibration import Calibrator, CalibrationError, holdout_field_error
 from web.field.apriltag_detect import detect_tags
+from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker
 from web.field.occlusion import hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
@@ -2431,10 +2432,11 @@ async def calibration_auto(request: Request):
 
 @app.post("/api/calibration/frame")
 async def calibration_frame(request: Request):
-    """Grab a frame from a LOCAL video, cropped to the main-camera region (top
-    CALIB_MAIN_CROP_FRAC). Body: {timestamp?: seconds (default 75), video_path?}.
+    """Grab a frame from a LOCAL video, cropped to the requested camera's region
+    from the composite layout (masks applied). Body: {timestamp?: seconds
+    (default 75), video_path?, camera?}.
     Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
-    Crop origin is (0,0) so pixel coords match full-frame coords."""
+    Pixel coords are crop-local (origin at the camera crop's top-left)."""
     body = await request.json()
     ts = float(body.get("timestamp", 75))
     # video_path is restricted to data/test_footage/ with a video extension to
@@ -2462,8 +2464,15 @@ async def calibration_frame(request: Request):
     cap.release()
     if not ok or frame is None:
         return JSONResponse(status_code=400, content={"error": "could not read frame"})
-    h = frame.shape[0]
-    main = frame[: int(h * CALIB_MAIN_CROP_FRAC), :]
+    camera = body.get("camera", "main")
+    layout = load_layout()
+    cl = layout.get(camera)
+    if cl is None:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    cx, cy, cw, ch = cl.crop
+    main = frame[cy:cy + ch, cx:cx + cw].copy()
+    for (mx, my, mw, mh) in cl.masks:
+        main[my:my + mh, mx:mx + mw] = 0
     fm = FieldModel.load("2026-rebuilt-welded")
     det = detect_tags(main)
     detected = {str(tid): det[tid].tolist() for tid in det if tid in fm.tags}

@@ -120,11 +120,24 @@ web/field/
 ### 2. `occlusion.py` — pure geometry
 
 Principle: **an occluder lies between the camera and the robot.** Camera center =
-`-R^T t` from the calibration.
+`-R^T t`, derived from the calibration's exposed `rvec`/`tvec` (compute it once at
+startup — the pose is static). `CameraCalibration` does not currently expose the camera
+center publicly (it's computed inside the private `_cast_norm_ray_to_ground`); the plan
+should add a small `camera_center` property rather than re-deriving inline. Occlusion
+**requires a pose-bearing calibration** (`mode="pinhole"` or `"camera"`); a
+`mode="homography"` calibration has `rvec/tvec=None` and supports `image_to_field` but
+**not** camera-center ray-casting, so occlusion cannot run on it (see Error handling).
 
-- `hub_prisms(field_model) -> list[Prism]`: cluster the field tags into the two hub
-  rings (k=2 on tag (x,y), or split by `alliance_side`); each prism footprint = convex
-  hull of a cluster's (x,y); height = max cluster tag z (+ small margin).
+- `hub_prisms(field_model) -> list[Prism]`: **the hubs are the tag ring at the tallest
+  mounting height** — verified in `data/field/2026-rebuilt-welded.json`: tags group into
+  z ∈ {0.552 (8 tags), 0.889 (8), 1.124 (16)}, and the 16 tags at z≈1.124 are exactly
+  the two hub rings. Recipe: (1) take the **highest z-group** of tags (cluster the z
+  values; the top group is the hub ring — derived, not a hardcoded magic number, though
+  the 2026 value is ~1.124 m / 44.25 in); (2) **k=2 on that group's (x,y)** (equivalently
+  split at the field midline) → the two hubs. Each prism footprint = convex hull of a
+  cluster's (x,y) (≈1.21 × 1.21 m octagon, centered ≈(4.54, 4.03) blue / (12.00, 4.03)
+  red); height = the hub-tag z (+ small margin). Do **not** cluster all tags or split by
+  `alliance_side` — that yields two half-field boxes, not hubs.
 - `occluded_by_hub(cam, prism, track_xy, robot_h) -> bool`: does the segment
   camera_center → (track_xy, robot_h) intersect the prism volume? Uses the track's
   **predicted** position → predictive.
@@ -140,6 +153,11 @@ Principle: **an occluder lies between the camera and the robot.** Camera center 
     overlap of the bumper band).
   - Occluders are depth-ordered by `camera_distance` of their ground points; only
     occluders **nearer than the track** count.
+  - **Expected box for coasting tracks:** a track with no detection this frame (coasting)
+    still needs an image box to test overlap. Project its KF-predicted field position +
+    nominal robot dimensions back through `field_to_image` to get an *expected* box. So
+    `resolve_occlusion` takes, per track, either the matched detection box or this
+    projected expected box.
 
 ### 3. `detect_bridge.py`
 
@@ -153,9 +171,10 @@ Principle: **an occluder lies between the camera and the robot.** Camera center 
 
 ### 4. `InferenceJob` integration
 
-- **Startup:** load `field_store.load(event, camera)`; if absent → clear error, field
-  tracking disabled (we require a calibration). Build `hub_prisms` once. Load a stock
-  COCO YOLO (`yolo26n.pt`/`yolov8n.pt`) for `person`.
+- **Startup:** load `field_store.load(event, camera)`; require a **pose-bearing**
+  calibration (`mode` pinhole/camera) — if absent or homography-only → clear error,
+  field tracking disabled. Build `hub_prisms` once and cache the camera center. Load a
+  stock COCO YOLO (`yolo26n.pt`/`yolov8n.pt`) for `person`.
 - **Per frame:** custom YOLO robots → `to_field_detections`; COCO YOLO → persons →
   `field_adjacent_persons`; `resolve_occlusion` over current tracks + persons + hub
   prisms; `FieldTracker.update(detections, {slot: view_occluded}, dt)` → 6 tracks.
@@ -168,9 +187,10 @@ Principle: **an occluder lies between the camera and the robot.** Camera center 
   track positions, alliance-tinted; existing diagnostics keyed by slot_id.
 - **Remove:** `get_canonical_robot_id`, `bytetrack_to_canonical`, embedding re-id
   (`embedder`/`reid` use in the loop), appearance alliance clustering, alliance capping
-  (fixed-6 supersedes it), the side-based alliance heuristic. **Drop ByteTrack** (the
-  field tracker owns continuity). **Keep:** custom YOLO, hub logic, bumper color, VLM,
-  diagnostics.
+  (fixed-6 supersedes it), and the **lineup-frame side heuristic** (`LINEUP_END_FRAME`-
+  based left=blue/right=red seeding, ~app.py 1799–1824) — alliance now comes from bumper
+  color. **Drop ByteTrack** (the field tracker owns continuity). **Keep:** custom YOLO,
+  hub logic, `_detect_bumper_color_static`, VLM, diagnostics.
 
 ## Data flow
 
@@ -180,7 +200,8 @@ resolve_occlusion(camera, tracks, persons, hubs) → FieldTracker.update → 6 t
 
 ## Error handling
 
-- No calibration → explicit error; field tracking does not start.
+- No calibration, or a homography-only (non-pose) calibration → explicit error; field
+  tracking does not start (occlusion ray-casting needs a camera center / pose).
 - `image_to_field` None / off-field → drop detection.
 - Color unknown → still tracked by position; alliance from the slot.
 - <6 visible (occlusion/off-frame) → coast; never fabricate a detection.

@@ -610,7 +610,7 @@ def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_calibration_solve.py -v`
-Expected: PASS. If `image_to_field` is systematically off (e.g. mirrored/rotated), the tag corner order from `tag_corners_3d` (Task 2) does not match the detector order (Task 3) — fix the `local` corner order in `tag_corners_3d`, **not** the tolerance. This pose solve is exact, so it is the authoritative corner-order check.
+Expected: PASS. A wrong tag corner order (Task 2 not matching the detector order from Task 3) **spikes `rms_error` well above 1 px** even though field localization of distant ground points may still look plausible (a tag is tiny vs the field, so the centroid-driven pose barely moves). The `assert solved.rms_error < 1.0` gate — not the 10 cm check — is what catches an order error. Fix the `local` corner order in `tag_corners_3d`, **never** the tolerance.
 
 - [ ] **Step 5: Commit**
 
@@ -905,7 +905,7 @@ def test_point_maps_to_expected_pixel():
 
 def test_side_tint_blue_left_red_right():
     r = Radar(field_length=16.541, field_width=8.069, px_per_m=40)
-    img = r.render([((2.0, 4.0), "blue"), (14.0, 4.0) if False else ((14.0, 4.0), "red")])
+    img = r.render([((2.0, 4.0), "blue"), ((14.0, 4.0), "red")])
     assert img is not None  # smoke: renders without error
 ```
 

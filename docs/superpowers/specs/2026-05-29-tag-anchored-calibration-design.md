@@ -77,9 +77,13 @@ camera geometry (chicken-and-egg).
 - Initial K: `cx, cy` = image center; `fx = fy ≈ image_width` (reasonable broadcast
   guess). Returns `K, D (5,), rvec, tvec`.
 - Returns a `CameraCalibration(mode="pinhole", K, D, rvec, tvec, image_size,
-  field_season, rms_error)`.
-- Raise `CalibrationError` with a clear message when total points are too few or
-  `cv2.calibrateCamera` fails / the geometry is degenerate.
+  field_season, rms_error, crop_region=(0, 0, w, h))` where `(w, h) = image_size` of
+  the cropped main-cam frame. **Record `crop_region`** so the calibration documents the
+  coordinate space it was fit in; downstream `image_to_field` callers must pass
+  cropped-frame pixels (crop origin is (0,0), so x/y positions equal full-frame coords).
+- Raise `CalibrationError` with a clear message when total points are too few
+  (threshold expressed as a **point count**, see Error handling) or `cv2.calibrateCamera`
+  fails / the geometry is degenerate.
 
 **New `mode="pinhole"` on `CameraCalibration`**
 
@@ -111,7 +115,9 @@ The existing `mode="camera"` uses the **fisheye** model (`cv2.fisheye.projectPoi
   calls `solve_camera_from_tags`, saves via `field_store.save`, and returns
   `{status, rms_error, n_tags, n_points, overlay}` where `overlay` is a base64 JPEG of
   the same frame with the reprojected field perimeter + 2 m grid + all tag positions
-  (green = used, orange = other).
+  (green = used, orange = other). The overlay-drawing block (perimeter + 2 m grid + tag
+  markers) duplicates logic already in `/api/calibration/solve-homography`
+  (app.py ~2457–2476); **extract a shared overlay helper** rather than copy-paste.
 - The homography solver and `/api/calibration/solve-homography` endpoint remain in the
   codebase but are no longer called by the page.
 
@@ -126,7 +132,9 @@ Two canvases side by side:
   axes: `screen_x ∝ L − field_x`, `screen_y ∝ W − field_y`) so the map's orientation
   roughly matches the camera's view, making click-to-click matching intuitive. The same
   transform is used for click hit-testing. Underlying tag (x,y) coordinates are
-  unchanged — the flip is render-only.
+  unchanged — the flip is render-only. Note: the 180° flip is **feed-specific** to this
+  broadcast vantage; a differently-oriented camera would want a different (or no) flip.
+  Acceptable given the current single-feed scope.
 
 **Manual labeling flow**: click a tag in the frame → a pending marker highlights →
 click the matching tag marker on the top-down map → the pair is added to the
@@ -151,9 +159,11 @@ surfaces any regression.
 
 ## Error handling
 
-- Require a minimum total of ~8 points (e.g. 2 auto tags, or a mix of auto + manual) —
-  the camera model has ~10 free parameters (fx, fy, k1, k2, + 6 pose). Fewer → 400 with
-  a clear "need more tags" message.
+- Require a minimum total **point count of 8** (auto tags contribute 4 points each,
+  manual tags 1 each — so e.g. 2 auto tags, or 1 auto + 4 manual). The threshold is a
+  **point count, not a tag count** (distinct from the existing `MIN_POSE_TAGS = 2`,
+  which counts tags). The camera model has ~10 free parameters (fx, fy, k1, k2, + 6
+  pose). Fewer than 8 points → 400 with a clear "need more tags" message.
 - `cv2.calibrateCamera` failure or degenerate (coplanar / collinear) geometry → 400
   with the reason. High RMS is surfaced (color-coded) in the UI rather than hidden.
 

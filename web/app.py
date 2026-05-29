@@ -44,7 +44,7 @@ from web.field.calibration import Calibrator, CalibrationError, holdout_field_er
 from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker
-from web.field.occlusion import hub_prisms, resolve_occlusion
+from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.radar import Radar
 from web.field.camera_view import load_views
@@ -308,6 +308,7 @@ class InferenceJob:
         # gates VLM reads (bumper_occluded). Both keyed by slot_id.
         self._view_flags: Dict[int, dict] = {}
         self._occ: Dict[int, dict] = {}
+        self._occ_by_cam: Dict[str, Dict[int, dict]] = {}
 
         # Video metadata
         self.video_width = 0
@@ -1904,16 +1905,20 @@ class InferenceJob:
                 dt = FRAME_SKIP / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
 
-                # Step 5 (occlusion) still runs single-view on main's persons for now
-                # (Task 17 will merge occlusion across posed cameras).
-                person_boxes = person_boxes_by_cam.get("main", [])
-
-                # 5. Resolve occlusion once on the emitted tracks; gate VLM next.
+                # 5. Resolve occlusion from every posed camera and merge: a track
+                #    is occluded only if occluded in ALL posed cameras.
                 occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
                              for t in track_outs]
-                self._occ = resolve_occlusion(
-                    self.calib, occ_input, person_boxes, self.hub_prisms)
-                self._view_flags = self._occ  # feed forward to next frame's tracker
+                posed = [v for v in self.views
+                         if v.calibration.camera_center is not None]
+                self._occ_by_cam = {
+                    v.name: resolve_occlusion(
+                        v.calibration, occ_input,
+                        person_boxes_by_cam.get(v.name, []), self.hub_prisms)
+                    for v in posed
+                }
+                self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
+                self._view_flags = self._occ   # feed forward to next frame's tracker
 
                 # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
                 tracked_robot_boxes = []  # (slot_id, box) for visible tracks

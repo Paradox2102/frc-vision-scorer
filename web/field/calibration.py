@@ -15,37 +15,65 @@ MIN_POSE_TAGS = 2          # >=2 tags so points are non-coplanar across the fiel
 
 @dataclass
 class CameraCalibration:
-    K: np.ndarray            # (3,3)
-    D: np.ndarray            # (4,) fisheye
-    rvec: np.ndarray         # (3,1)
-    tvec: np.ndarray         # (3,1)
-    image_size: tuple        # (w, h)
-    crop_region: Optional[tuple]  # (x, y, w, h) of main-cam crop, or None
-    field_season: str
+    K: Optional[np.ndarray] = None       # (3,3) — None in homography mode
+    D: Optional[np.ndarray] = None       # (4,) fisheye — None in homography mode
+    rvec: Optional[np.ndarray] = None    # (3,1) — None in homography mode
+    tvec: Optional[np.ndarray] = None    # (3,1) — None in homography mode
+    image_size: tuple = (0, 0)           # (w, h)
+    crop_region: Optional[tuple] = None  # (x, y, w, h) of main-cam crop, or None
+    field_season: str = ""
     rms_error: float = 0.0
+    mode: str = "camera"                 # "camera" or "homography"
+    H: Optional[np.ndarray] = None       # (3,3) ground-plane homography (image->field)
 
     def to_json(self) -> dict:
         return {
-            "K": self.K.tolist(), "D": np.asarray(self.D).reshape(-1).tolist(),
-            "rvec": self.rvec.reshape(-1).tolist(), "tvec": self.tvec.reshape(-1).tolist(),
+            "K": self.K.tolist() if self.K is not None else None,
+            "D": np.asarray(self.D).reshape(-1).tolist() if self.D is not None else None,
+            "rvec": self.rvec.reshape(-1).tolist() if self.rvec is not None else None,
+            "tvec": self.tvec.reshape(-1).tolist() if self.tvec is not None else None,
             "image_size": list(self.image_size),
             "crop_region": list(self.crop_region) if self.crop_region else None,
             "field_season": self.field_season, "rms_error": self.rms_error,
+            "mode": self.mode,
+            "H": self.H.tolist() if self.H is not None else None,
         }
 
     @classmethod
     def from_json(cls, d: dict) -> "CameraCalibration":
+        K_raw = d.get("K")
+        D_raw = d.get("D")
+        rvec_raw = d.get("rvec")
+        tvec_raw = d.get("tvec")
+        H_raw = d.get("H")
         return cls(
-            K=np.array(d["K"], float), D=np.array(d["D"], float),
-            rvec=np.array(d["rvec"], float).reshape(3,1),
-            tvec=np.array(d["tvec"], float).reshape(3,1),
+            K=np.array(K_raw, float) if K_raw is not None else None,
+            D=np.array(D_raw, float) if D_raw is not None else None,
+            rvec=np.array(rvec_raw, float).reshape(3, 1) if rvec_raw is not None else None,
+            tvec=np.array(tvec_raw, float).reshape(3, 1) if tvec_raw is not None else None,
             image_size=tuple(d["image_size"]),
-            crop_region=tuple(d["crop_region"]) if d["crop_region"] else None,
-            field_season=d["field_season"], rms_error=d.get("rms_error", 0.0))
+            crop_region=tuple(d["crop_region"]) if d.get("crop_region") else None,
+            field_season=d["field_season"], rms_error=d.get("rms_error", 0.0),
+            mode=d.get("mode", "camera"),
+            H=np.array(H_raw, float) if H_raw is not None else None,
+        )
 
     def field_to_image(self, point_xyz) -> tuple:
+        if self.mode == "homography":
+            Hinv = np.linalg.inv(self.H)
+            pt = np.array([[[float(point_xyz[0]), float(point_xyz[1])]]], dtype=np.float64)
+            out = cv2.perspectiveTransform(pt, Hinv).reshape(2)
+            return (float(out[0]), float(out[1]))
         obj = np.array([[point_xyz]], dtype=np.float64)  # (1,1,3)
-        img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec, self.K, self.D)
+        D_arr = np.asarray(self.D).reshape(-1)
+        if np.all(D_arr == 0):
+            # Zero distortion: use standard pinhole projection so ground-plane
+            # points lie on an exact homography (cv2.fisheye differs even at D=0).
+            img, _ = cv2.projectPoints(obj, self.rvec, self.tvec, self.K,
+                                       np.zeros((4, 1)))
+        else:
+            img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec,
+                                               self.K, self.D)
         u, v = img.reshape(2)
         return (float(u), float(v))
 
@@ -57,9 +85,17 @@ class CameraCalibration:
         (i.e. the pixel lies at or above the camera horizon).  Callers must
         handle the ``None`` case.
         """
+        if self.mode == "homography":
+            pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
+            out = cv2.perspectiveTransform(pt, self.H).reshape(2)
+            return (float(out[0]), float(out[1]))
         pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
         # Undistort to normalized camera-frame ray (z=1).
-        norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
+        D_arr = np.asarray(self.D).reshape(-1)
+        if np.all(D_arr == 0):
+            norm = cv2.undistortPoints(pt, self.K, None).reshape(2)
+        else:
+            norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
         ray_cam = np.array([norm[0], norm[1], 1.0])
         R, _ = cv2.Rodrigues(self.rvec)
         cam_center = (-R.T @ self.tvec).reshape(3)
@@ -96,6 +132,27 @@ class Calibrator:
             obj_arr, img_arr, image_size, K, D, flags=flags,
             criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-9))
         return K, D.reshape(-1)
+
+    @staticmethod
+    def solve_ground_homography(image_points, field_xy, image_size, field_season):
+        """Fit a ground-plane homography (image px -> field x,y at z=0) from
+        well-spread clicked correspondences. Intrinsics-free; for a single static
+        view. image_points,(N,2); field_xy,(N,2). Needs >= 4 points."""
+        img = np.asarray(image_points, np.float64).reshape(-1, 2)
+        fld = np.asarray(field_xy, np.float64).reshape(-1, 2)
+        if len(img) < 4 or len(fld) != len(img):
+            raise CalibrationError(f"homography needs >= 4 correspondences, got {len(img)}")
+        H, _ = cv2.findHomography(img, fld, method=0)   # exact LS fit, no RANSAC
+        if H is None:
+            raise CalibrationError("findHomography failed (degenerate points?)")
+        cal = CameraCalibration(K=None, D=None, rvec=None, tvec=None,
+                                image_size=image_size, crop_region=None,
+                                field_season=field_season, mode="homography", H=H)
+        # rms in PIXELS: reproject field->image via H^-1, compare to clicked px.
+        Hinv = np.linalg.inv(H)
+        proj = cv2.perspectiveTransform(fld.reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+        cal.rms_error = float(np.sqrt(((proj - img) ** 2).sum(axis=1).mean()))
+        return cal
 
     @staticmethod
     def solve_pose(correspondences: dict, K, D, image_size: tuple,

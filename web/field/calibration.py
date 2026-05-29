@@ -64,44 +64,22 @@ class CameraCalibration:
             pt = np.array([[[float(point_xyz[0]), float(point_xyz[1])]]], dtype=np.float64)
             out = cv2.perspectiveTransform(pt, Hinv).reshape(2)
             return (float(out[0]), float(out[1]))
-        obj = np.array([[point_xyz]], dtype=np.float64)  # (1,1,3)
-        D_arr = np.asarray(self.D).reshape(-1)
-        if np.all(D_arr == 0):
-            # Zero distortion: use standard pinhole projection so ground-plane
-            # points lie on an exact homography (cv2.fisheye differs even at D=0).
-            img, _ = cv2.projectPoints(obj, self.rvec, self.tvec, self.K,
-                                       np.zeros((4, 1)))
-        else:
-            img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec,
-                                               self.K, self.D)
+        obj = np.array([[point_xyz]], dtype=np.float64)
+        img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec, self.K, self.D)
         u, v = img.reshape(2)
         return (float(u), float(v))
 
     def image_to_field(self, uv) -> "tuple | None":
-        """Back-project image pixel *uv* to the field ground plane (z=0).
-
-        Returns ``(x, y)`` in field metres, or ``None`` when the pixel's
-        back-projected ray is parallel to / pointing above the ground plane
-        (i.e. the pixel lies at or above the camera horizon).  Callers must
-        handle the ``None`` case.
-        """
         if self.mode == "homography":
             pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
             out = cv2.perspectiveTransform(pt, self.H).reshape(2)
             return (float(out[0]), float(out[1]))
         pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
-        # Undistort to normalized camera-frame ray (z=1).
-        D_arr = np.asarray(self.D).reshape(-1)
-        if np.all(D_arr == 0):
-            norm = cv2.undistortPoints(pt, self.K, None).reshape(2)
-        else:
-            norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
+        norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
         ray_cam = np.array([norm[0], norm[1], 1.0])
         R, _ = cv2.Rodrigues(self.rvec)
         cam_center = (-R.T @ self.tvec).reshape(3)
         ray_world = R.T @ ray_cam
-        # Intersect with ground plane z=0. Reject rays parallel to / above the
-        # ground (no valid forward intersection) so callers can drop the point.
         denom = ray_world[2]
         if abs(denom) < 1e-9:
             return None

@@ -2608,13 +2608,32 @@ def _draw_field_overlay(frame, cal, fm):
     image line under lens distortion, so a 2-point segment can't trace it).
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
     L, W = fm.length_m, fm.width_m
+    H, Wd = frame.shape[:2]
     def fp(x, y):
         u, v = cal.field_to_image((x, y, 0.0))
         return (int(u), int(v))
+    def _ok(u, v):
+        # A poorly-conditioned calibration can project ground points to enormous
+        # (or non-finite) pixel coords — points near/behind the camera blow up.
+        # Keep only finite coords within a generous off-screen margin so the int32
+        # polyline conversion can't overflow (and we don't draw garbage segments).
+        return (np.isfinite(u) and np.isfinite(v)
+                and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
     def seg(p0, p1, color, thick, n=24):
         (x0, y0), (x1, y1) = p0, p1
-        pts = [fp(x0 + (x1 - x0) * t / n, y0 + (y1 - y0) * t / n) for t in range(n + 1)]
-        cv2.polylines(frame, [np.array(pts, np.int32)], False, color, thick)
+        run = []
+        def flush():
+            if len(run) >= 2:
+                cv2.polylines(frame, [np.array(run, np.int32)], False, color, thick)
+            run.clear()
+        for t in range(n + 1):
+            u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
+                                       y0 + (y1 - y0) * t / n, 0.0))
+            if _ok(u, v):
+                run.append((int(u), int(v)))
+            else:
+                flush()   # break the polyline across the blown-up region
+        flush()
     for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
         seg(a, b, (0, 255, 0), 2)
     x = 0.0
@@ -2717,24 +2736,30 @@ async def calibration_solve_tags(request: Request):
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     okf, frame = cap.read(); cap.release()
     cl = load_layout().get(camera)
-    if okf and frame is not None and cl is not None:
-        cx, cy, cw, ch = cl.crop
-        main = frame[cy:cy + ch, cx:cx + cw].copy()
-        for (mx, my, mw_, mh_) in cl.masks:
-            main[my:my + mh_, mx:mx + mw_] = 0
-        _draw_field_overlay(main, cal, fm)
-        mh, mw = main.shape[:2]
-        for tid in fm.tags:
-            t3 = fm.tag_translation(tid)
-            u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
-            if 0 <= u < mw and 0 <= v < mh:
-                color = (0, 255, 0) if tid in used else (0, 165, 255)
-                cv2.circle(main, (int(u), int(v)), 5, color, -1)
-                cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if okj:
-            overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    # Overlay is a best-effort visualization. A poorly-conditioned calibration can
+    # make projection blow up; never let drawing failures sink the solve result
+    # (the caller still needs rms_error + holdout_error_m to judge the calibration).
+    try:
+        if okf and frame is not None and cl is not None:
+            cx, cy, cw, ch = cl.crop
+            main = frame[cy:cy + ch, cx:cx + cw].copy()
+            for (mx, my, mw_, mh_) in cl.masks:
+                main[my:my + mh_, mx:mx + mw_] = 0
+            _draw_field_overlay(main, cal, fm)
+            mh, mw = main.shape[:2]
+            for tid in fm.tags:
+                t3 = fm.tag_translation(tid)
+                u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
+                if 0 <= u < mw and 0 <= v < mh:
+                    color = (0, 255, 0) if tid in used else (0, 165, 255)
+                    cv2.circle(main, (int(u), int(v)), 5, color, -1)
+                    cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if okj:
+                overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    except Exception as e:
+        print(f"  calibration overlay render failed ({camera}): {e}")
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
             "n_points": n_points, "overlay": overlay_b64,
             "holdout_error_m": holdout_err}

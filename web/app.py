@@ -234,6 +234,9 @@ class RobotTrack:
     last_reid_similarity: Optional[float] = None
     last_reid_gap: Optional[float] = None
     last_seen_frame: Optional[int] = None
+    # Field-space position (meters) from the FieldTracker. last_position stays
+    # pixel-space for the (unchanged) pixel-space scoring/ball math.
+    field_position: Optional[Tuple[float, float]] = None
 
 
 @dataclass
@@ -1504,7 +1507,34 @@ class InferenceJob:
         self.bytetrack_to_canonical[bytetrack_id] = canonical_id
         claimed.add(canonical_id)
         return canonical_id
-    
+
+    @staticmethod
+    def _slot_alliance(slot_id: int) -> str:
+        """Slots 0-2 are blue, 3-5 are red (matches FieldTracker)."""
+        return "blue" if slot_id < 3 else "red"
+
+    @staticmethod
+    def _slot_label(slot_id: int) -> str:
+        """Human label for a slot: B1..B3 / R1..R3."""
+        return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
+
+    def _get_or_create_slot_track(self, slot_id: int) -> "RobotTrack":
+        """Lazily create the RobotTrack for a field-tracker slot (6 max).
+
+        FieldTracker owns position/alliance/box each frame; RobotTrack retains the
+        team votes, scores, and diagnostic fields keyed by slot_id."""
+        track = self.robot_tracks.get(slot_id)
+        if track is None:
+            track = RobotTrack(
+                robot_id=slot_id,
+                alliance=self._slot_alliance(slot_id),
+                team_number=None,
+                last_position=(0.0, 0.0),
+                positions_history=deque(maxlen=30),
+            )
+            self.robot_tracks[slot_id] = track
+        return track
+
     def _is_robot_on_alliance_side(self, robot_x: float, alliance: str) -> bool:
         """Check if a robot is on its alliance's side of the field.
         Robots can only score when shooting from their side toward their hub.
@@ -1765,7 +1795,9 @@ class InferenceJob:
             # Skip the first 180 frames (title screen / intro graphics)
             TITLE_SCREEN_FRAMES = 180
 
-            # Early vision OCR pass on frame 200 to identify robots before main loop
+            # Early vision OCR pass on frame 200 to identify robots before main loop.
+            # Seeds the field tracker's slots from this frame so VLM reads bind to
+            # slot ids (the same identity the main loop uses).
             EARLY_OCR_FRAME = 200
             cap.set(cv2.CAP_PROP_POS_FRAMES, EARLY_OCR_FRAME)
             ret, early_ocr_frame = cap.read()
@@ -1775,27 +1807,27 @@ class InferenceJob:
                 results = self.model(early_overhead, conf=DET_CONF_THRESHOLD, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
                 robot_mask = detections.class_id == 1
-                if robot_mask.any():
-                    robot_dets = detections[robot_mask]
-                    early_robots = []
-                    early_claimed = set()
-                    midpoint = self.video_width / 2
-                    for i in range(len(robot_dets)):
-                        box = robot_dets.xyxy[i]
-                        cx = (box[0] + box[2]) / 2
-                        cy = (box[1] + box[3]) / 2
-                        # Before frame 1600: left = blue, right = red
-                        alliance = "red" if cx < midpoint else "blue"
-                        det_embed = self.embedder.embed(early_overhead, box)
-                        cid = self.get_canonical_robot_id(int(i + 9000), (cx, cy), alliance, det_embed, early_claimed)
-                        if cid is None:
-                            continue
-                        robot = self.robot_tracks.get(cid)
-                        if robot:
-                            robot.last_position = (cx, cy)
-                        early_robots.append((cid, box))
-                    if early_robots:
-                        self.vision_identify_robots(early_overhead, early_robots)
+                early_boxes = [detections.xyxy[i] for i in range(len(detections))
+                               if robot_mask[i]]
+                early_field_dets = to_field_detections(
+                    early_boxes, self.calib, early_overhead, self.field_dims,
+                    color_fn=self.detect_bumper_color,
+                )
+                early_dt = FRAME_SKIP / (self.video_fps or 30.0)
+                early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
+                early_robots = []
+                for t in early_outs:
+                    if t.state != "visible" or t.box is None:
+                        continue
+                    robot = self._get_or_create_slot_track(t.slot_id)
+                    robot.alliance = t.alliance
+                    robot.field_position = t.pos
+                    cx = (t.box[0] + t.box[2]) / 2.0
+                    cy = (t.box[1] + t.box[3]) / 2.0
+                    robot.last_position = (float(cx), float(cy))
+                    early_robots.append((t.slot_id, t.box))
+                if early_robots:
+                    self.vision_identify_robots(early_overhead, early_robots)
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
 
@@ -1825,120 +1857,67 @@ class InferenceJob:
                 # Update hub positions (alliance assignment is static from setup)
                 self.update_hub_positions(detections)
                 
-                # Track robots
+                # ---- Field-space robot tracking (replaces ByteTrack/canonical re-ID) ----
+                # 1. Raw robot detection boxes from YOLO.
                 robot_mask = detections.class_id == 1
-                robot_detections = detections[robot_mask]
-                
-                # Build a lookup from detection index → tracked robot info
-                # so the annotation drawing loop can find the right tracker ID
-                detection_to_tracked = {}  # detection_index → (bytetrack_id, canonical_id)
-                
-                tracked_robot_boxes = []  # (canonical_id, box) for bumper OCR
+                robot_boxes = [detections.xyxy[i] for i in range(len(detections))
+                               if robot_mask[i]]
 
-                if len(robot_detections) > 0:
-                    tracked = self.tracker.update_with_detections(robot_detections)
+                # 2. Persons (occluders) — separate YOLO model, same skip cadence.
+                person_results = self.person_model(
+                    overhead_frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                person_dets = sv.Detections.from_ultralytics(person_results)
+                person_boxes_all = [tuple(person_dets.xyxy[i]) for i in range(len(person_dets))]
+                person_boxes = field_adjacent_persons(
+                    person_boxes_all, self.calib, self.field_dims)
 
-                    # Embed every tracked crop once (single batched GPU forward).
-                    n_tracked = len(tracked)
-                    det_embeds = self.embedder.embed_batch(
-                        overhead_frame, [tracked.xyxy[i] for i in range(n_tracked)]
-                    )
-                    # Order detections best-match-first so the strongest claimant
-                    # binds a contested canonical before weaker detections.
-                    tracks_view = [
-                        reid.TrackView(r.robot_id, r.alliance, r.last_position, r.appearance_embedding)
-                        for r in self.robot_tracks.values()
-                    ]
-                    def _order_key(i):
-                        b = tracked.xyxy[i]
-                        return reid.best_candidate_score(
-                            ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2), det_embeds[i],
-                            tracks_view, POS_GATE_PX, W_POS, W_APP, APP_FLOOR,
-                        )
-                    order = sorted(range(n_tracked), key=_order_key, reverse=True)
-                    claimed = set()
+                # 3. Bridge image boxes -> field-space detections (bumper color via
+                #    detect_bumper_color, injected as color_fn).
+                field_dets = to_field_detections(
+                    robot_boxes, self.calib, overhead_frame, self.field_dims,
+                    color_fn=self.detect_bumper_color,
+                )
 
-                    # Process tracked robots
-                    for i in order:
-                        bytetrack_id = tracked.tracker_id[i]
-                        box = tracked.xyxy[i]
-                        center_x = (box[0] + box[2]) / 2
-                        center_y = (box[1] + box[3]) / 2
-                        
-                        # Determine alliance
-                        # Before frame 1600: left side = blue, right side = red (pre-match lineup)
-                        LINEUP_END_FRAME = 1600
-                        if frame_num < LINEUP_END_FRAME:
-                            midpoint = self.video_width / 2
-                            alliance = "red" if center_x < midpoint else "blue"
-                        else:
-                            # After lineup: use bumper color detection
-                            bumper_alliance = self.detect_bumper_color(overhead_frame, box)
-                            alliance = bumper_alliance
-                            if alliance == "unknown":
-                                # Fallback: use hub proximity if bumper color unclear
-                                if len(self.hubs) == 2:
-                                    dist_to_hub0 = abs(center_x - self.hubs[0].x)
-                                    dist_to_hub1 = abs(center_x - self.hubs[1].x)
-                                    alliance = self.hubs[0].alliance if dist_to_hub0 < dist_to_hub1 else self.hubs[1].alliance
-                                else:
-                                    closest_alliance = None
-                                    closest_dist = float('inf')
-                                    for rt in self.robot_tracks.values():
-                                        if rt.alliance in ("blue", "red"):
-                                            d = np.sqrt((rt.last_position[0] - center_x)**2 +
-                                                       (rt.last_position[1] - center_y)**2)
-                                            if d < closest_dist:
-                                                closest_dist = d
-                                                closest_alliance = rt.alliance
-                                    alliance = closest_alliance if closest_alliance else "blue"
+                # 4. Drive the field tracker. view_occluded flags from the PREVIOUS
+                #    frame widen this frame's coast budget.
+                dt = FRAME_SKIP / (self.video_fps or 30.0)
+                track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
 
-                        # Get canonical robot ID (claimed-aware; may return None = drop)
-                        det_embed = det_embeds[i]
-                        canonical_id = self.get_canonical_robot_id(
-                            bytetrack_id, (center_x, center_y), alliance, det_embed, claimed)
-                        if canonical_id is None:
-                            continue  # surplus detection this frame — cannot be a 7th robot
+                # 5. Resolve occlusion once on the emitted tracks; gate VLM next.
+                occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
+                             for t in track_outs]
+                self._occ = resolve_occlusion(
+                    self.calib, occ_input, person_boxes, self.hub_prisms)
+                self._view_flags = self._occ  # feed forward to next frame's tracker
 
-                        # Update position (with frame number for trajectory matching)
-                        robot = self.robot_tracks[canonical_id]
-                        # EMA only when the crop actually matches the track, so a
-                        # transitional/mismatched detection never poisons the centroid.
-                        if det_embed is not None:
-                            if robot.appearance_embedding is None:
-                                robot.appearance_embedding = det_embed
-                            elif cosine_similarity(det_embed, robot.appearance_embedding) >= APP_FLOOR:
-                                blended = (1 - EMBED_EMA_ALPHA) * robot.appearance_embedding + EMBED_EMA_ALPHA * det_embed
-                                n = np.linalg.norm(blended)
-                                robot.appearance_embedding = blended / n if n > 0 else blended
-                        robot.last_position = (center_x, center_y)
-                        robot.positions_history.append((processed_frame_num, center_x, center_y))
-                        tracked_robot_boxes.append((canonical_id, box))
+                # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
+                tracked_robot_boxes = []  # (slot_id, box) for visible tracks
+                for t in track_outs:
+                    robot = self._get_or_create_slot_track(t.slot_id)
+                    robot.alliance = t.alliance  # slot (bumper-color) alliance wins
+                    robot.field_position = t.pos  # field meters, for consumers that want it
+                    if t.state == "visible" and t.box is not None:
+                        cx = (t.box[0] + t.box[2]) / 2.0
+                        cy = (t.box[1] + t.box[3]) / 2.0
+                        robot.last_position = (float(cx), float(cy))  # pixel space (scoring)
+                        robot.positions_history.append((processed_frame_num, float(cx), float(cy)))
+                        robot.last_seen_frame = frame_num
+                        tracked_robot_boxes.append((t.slot_id, t.box))
+                    # Coasting tracks keep their stale last_position untouched.
 
-                        # Accumulate bumper-color votes (diagnostics / optional cluster
-                        # fallback). Alliance is now owned by the team reads:
-                        # assign_teams_from_votes sets each robot's alliance from its
-                        # assigned team's roster side — so a read "4322" is always red.
-                        if frame_num >= LINEUP_END_FRAME and not robot.team_number_confirmed:
-                            bumper_alliance = self.detect_bumper_color(overhead_frame, box)
-                            if bumper_alliance == "blue":
-                                robot.blue_votes += 1
-                                robot.red_votes = max(0, robot.red_votes - 1)
-                            elif bumper_alliance == "red":
-                                robot.red_votes += 1
-                                robot.blue_votes = max(0, robot.blue_votes - 1)
-                        
-                        # Map tracked box back to the original detection index
-                        # by finding the detection whose box is closest to this tracked box
-                        for det_idx in range(len(detections)):
-                            if detections.class_id[det_idx] != 1:
-                                continue
-                            det_box = detections.xyxy[det_idx]
-                            if (abs(det_box[0] - box[0]) < 2 and abs(det_box[1] - box[1]) < 2 and
-                                abs(det_box[2] - box[2]) < 2 and abs(det_box[3] - box[3]) < 2):
-                                detection_to_tracked[det_idx] = (bytetrack_id, canonical_id)
-                                break
-                
+                # Map detection index -> slot_id for the annotation pass (a track's
+                # box is the same ndarray its field detection was built from).
+                detection_to_tracked = {}  # det_index -> slot_id
+                for slot_id, tbox in tracked_robot_boxes:
+                    for di in range(len(detections)):
+                        if detections.class_id[di] != 1:
+                            continue
+                        db = detections.xyxy[di]
+                        if (abs(db[0] - tbox[0]) < 1 and abs(db[1] - tbox[1]) < 1 and
+                                abs(db[2] - tbox[2]) < 1 and abs(db[3] - tbox[3]) < 1):
+                            detection_to_tracked[di] = slot_id
+                            break
+
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
                 # paid-API leftover); it runs the whole match until robots are identified.
@@ -2017,8 +1996,8 @@ class InferenceJob:
                     elif class_id == 1:  # robot
                         # Use the detection→tracked mapping built above
                         if i in detection_to_tracked:
-                            _, canonical_id = detection_to_tracked[i]
-                            robot = self.robot_tracks[canonical_id]
+                            slot_id = detection_to_tracked[i]
+                            robot = self.robot_tracks[slot_id]
                             alliance = robot.alliance
                             confirmed = robot.team_number_confirmed
                             if confirmed:
@@ -2037,7 +2016,7 @@ class InferenceJob:
                                 label = f"{robot.team_number}? ({conf}%)"
                             else:
                                 color = (150, 150, 150)
-                                label = f"R{canonical_id}"
+                                label = self._slot_label(slot_id)
                         else:
                             # Untracked robot detection — use bumper color for display only
                             alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])
@@ -2079,6 +2058,17 @@ class InferenceJob:
                     cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
                     cv2.putText(annotated_frame, region_key,
                                (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
+
+                # Radar picture-in-picture (bottom-right): top-down field with tracks.
+                radar_img = self.radar.render(
+                    [(t.pos, t.alliance) for t in track_outs if t.state != "empty"])
+                rh, rw = radar_img.shape[:2]
+                rscale = min(1.0, 360.0 / rw)
+                rsz = cv2.resize(radar_img, (int(rw * rscale), int(rh * rscale)))
+                ah, aw = annotated_frame.shape[:2]
+                ry0, rx0 = ah - rsz.shape[0] - 8, aw - rsz.shape[1] - 8
+                if ry0 > 0 and rx0 > 0:
+                    annotated_frame[ry0:ry0 + rsz.shape[0], rx0:rx0 + rsz.shape[1]] = rsz
 
                 # Encode frame
                 _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])

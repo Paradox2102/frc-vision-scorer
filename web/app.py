@@ -172,6 +172,7 @@ LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
 REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
 OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by this to overturn
+CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 
 # Bumper-number reading VLM. Swap models here (loaded via AutoModelForImageTextToText,
 # so any transformers-supported image-text-to-text model works, e.g. InternVL3, Nemotron).
@@ -503,6 +504,79 @@ class InferenceJob:
                 print(f"  OCR confirmed: Robot {canonical_id} = Team {best_team} "
                       f"(was {old_team}, {votes:.1f} votes, all: {dict(robot.team_ocr_votes)})")
 
+    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None):
+        """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
+        encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
+        None when the crop is empty or below LEGIBILITY_FLOOR.
+
+        When a non-None robot_id is supplied and the crop is below the legibility floor,
+        the rejected crop is recorded as a vlm_filtered diagnostic (preserving the prior
+        behavior of vision_identify_robots).
+        """
+        x1, y1, x2, y2 = map(int, box)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        # Bumper band (lower part of the robot box).
+        box_h = y2 - y1
+        bumper_y1 = y1 + int(box_h * 0.35)
+        crop = frame[bumper_y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        score = legibility_score(crop)
+        if score < LEGIBILITY_FLOOR:
+            # Record the rejected crop so the diagnostic view can show why this robot
+            # went unread.
+            if robot_id is not None:
+                try:
+                    _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    rejected_b64 = base64.b64encode(buf).decode('utf-8')
+                except Exception as e:
+                    print(f"  vlm_filtered: imencode failed for robot {robot_id}: {e}")
+                    rejected_b64 = ""
+                self.diagnostic.record_vlm_filtered(
+                    frame=self._current_frame, robot_id=robot_id,
+                    crop_b64=rejected_b64, legibility=score,
+                    reason="below_legibility_floor",
+                )
+            return None
+
+        # Upscale so the bumper crop is at least ~384px tall (existing behavior).
+        if crop.shape[0] < 384:
+            scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        crop_b64 = base64.b64encode(buf).decode('utf-8')
+        return crop_b64, score
+
+    def _detect_view(self, view, composite_frame):
+        """Run YOLO + person detection on one camera view; returns
+        (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
+        and person_boxes are field-filtered occluder boxes in that view's pixels."""
+        frame = view.extract(composite_frame)
+        cal = view.calibration
+        results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        dets = sv.Detections.from_ultralytics(results)
+        robot_boxes = [dets.xyxy[i] for i in range(len(dets)) if dets.class_id[i] == 1]
+        field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
+                                         color_fn=self.detect_bumper_color)
+        paired = []
+        for d in field_dets:
+            cb = self._bumper_crop_b64(frame, d.box)
+            crop_b64 = cb[0] if cb is not None else None
+            paired.append((d, crop_b64))
+        person_results = self.person_model(frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        pdets = sv.Detections.from_ultralytics(person_results)
+        person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
+        person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
+        return paired, person_boxes
+
     def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
@@ -533,45 +607,10 @@ class InferenceJob:
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
                 continue  # bumper hidden by hub/person/robot — don't read it
 
-            x1, y1, x2, y2 = map(int, box)
-            fh, fw = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(fw, x2), min(fh, y2)
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # Bumper band (lower part of the robot box).
-            box_h = y2 - y1
-            bumper_y1 = y1 + int(box_h * 0.35)
-            crop = frame[bumper_y1:y2, x1:x2]
-            if crop.size == 0:
-                crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            score = legibility_score(crop)
-            if score < LEGIBILITY_FLOOR:
-                # Record the rejected crop so the diagnostic view can show why
-                # this robot went unread.
-                try:
-                    _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    rejected_b64 = base64.b64encode(buf).decode('utf-8')
-                except Exception as e:
-                    print(f"  vlm_filtered: imencode failed for robot {canonical_id}: {e}")
-                    rejected_b64 = ""
-                self.diagnostic.record_vlm_filtered(
-                    frame=self._current_frame, robot_id=canonical_id,
-                    crop_b64=rejected_b64, legibility=score,
-                    reason="below_legibility_floor",
-                )
-                continue
-
-            # Upscale so the bumper crop is at least ~384px tall (existing behavior).
-            if crop.shape[0] < 384:
-                scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
-                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            crop_b64 = base64.b64encode(buf).decode('utf-8')
+            cb = self._bumper_crop_b64(frame, box, robot_id=canonical_id)
+            if cb is None:
+                continue  # empty crop or below legibility floor (diagnostic recorded)
+            crop_b64, score = cb
             candidates.append((score, canonical_id, box, crop_b64))
 
         if not candidates:
@@ -1850,31 +1889,24 @@ class InferenceJob:
                 # Update hub positions (alliance assignment is static from setup)
                 self.update_hub_positions(detections)
                 
-                # ---- Field-space robot tracking (replaces ByteTrack/canonical re-ID) ----
-                # 1. Raw robot detection boxes from YOLO.
-                robot_mask = detections.class_id == 1
-                robot_boxes = [detections.xyxy[i] for i in range(len(detections))
-                               if robot_mask[i]]
+                # ---- Multi-camera field-space tracking ----
+                per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
+                person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
+                for view in self.views:
+                    paired, pboxes = self._detect_view(view, frame)
+                    per_camera[view.name] = paired
+                    person_boxes_by_cam[view.name] = pboxes
 
-                # 2. Persons (occluders) — separate YOLO model, same skip cadence.
-                person_results = self.person_model(
-                    overhead_frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                person_dets = sv.Detections.from_ultralytics(person_results)
-                person_boxes_all = [tuple(person_dets.xyxy[i]) for i in range(len(person_dets))]
-                person_boxes = field_adjacent_persons(
-                    person_boxes_all, self.calib, self.field_dims)
-
-                # 3. Bridge image boxes -> field-space detections (bumper color via
-                #    detect_bumper_color, injected as color_fn).
-                field_dets = to_field_detections(
-                    robot_boxes, self.calib, overhead_frame, self.field_dims,
-                    color_fn=self.detect_bumper_color,
-                )
-
-                # 4. Drive the field tracker. view_occluded flags from the PREVIOUS
-                #    frame widen this frame's coast budget.
+                weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
+                           for v in self.views}
+                fused = fuse_detections(per_camera, weights=weights)   # list[FusedObservation]
+                field_dets = [obs.detection for obs in fused]
                 dt = FRAME_SKIP / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+
+                # Step 5 (occlusion) still runs single-view on main's persons for now
+                # (Task 17 will merge occlusion across posed cameras).
+                person_boxes = person_boxes_by_cam.get("main", [])
 
                 # 5. Resolve occlusion once on the emitted tracks; gate VLM next.
                 occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}

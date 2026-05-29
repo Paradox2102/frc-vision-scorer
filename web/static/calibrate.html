@@ -56,8 +56,8 @@
 <p class="instructions">
   Grab a frame. Detected tags are outlined in <span style="color:#80ffb4">green</span>.
   For a tag you can see but that wasn't detected: <b>click it on the left frame</b>, then
-  <b>click the matching tag on the right map</b>. The map is rotated 180° to roughly match
-  the camera's view. Add several spread-out tags, then Solve. Need &ge; 8 points
+  <b>click the matching tag on the right map</b>. The map is oriented to match the
+  camera's view (blue end left, red end right). Add several spread-out tags, then Solve. Need &ge; 8 points
   (each detected tag = 4 points, each manual tag = 1).
 </p>
 
@@ -75,7 +75,7 @@
     <div class="hint" id="frameHint">Click a tag here, then its marker on the map →</div>
   </div>
   <div class="canvas-col">
-    <h2>Top-down tag map (rotated 180°)</h2>
+    <h2>Top-down tag map (oriented to camera: blue left, red right)</h2>
     <div class="canvas-wrap"><canvas id="mapCanvas"></canvas></div>
     <div class="hint">Green = used · grey = available</div>
   </div>
@@ -122,10 +122,15 @@ async function fetchTagMap(){
   } catch(e){ setStatus('Could not load tag map: '+e.message,'rms-err'); }
 }
 
-// ---- 180-rotated map transform (flip both field axes) ----
+// ---- Map oriented to match THIS camera ----
+// Verified against the auto-detected tags: red end (x=L) lands at high image-u (right),
+// blue end (x=0) at low image-u (left); near/scoring side (y=0) is at the bottom of the
+// image. So screen-x tracks x (NO horizontal flip), and since canvas-y is down we use
+// (W - y) so y=0 sits at the bottom. (A full 180° rotation would also mirror x, which
+// makes every manual pick land on the wrong tag — that was the earlier bug.)
 function fieldToMap(x, y){
-  return [MAP_PAD + (field.length - x) * mapScale,
-          MAP_PAD + (field.width  - y) * mapScale];
+  return [MAP_PAD + x * mapScale,
+          MAP_PAD + (field.width - y) * mapScale];
 }
 function drawMap(){
   const canvas = document.getElementById('mapCanvas');

@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 
+from web.field.composite_layout import load_layout
+from web.field import store as field_store
+
 
 @dataclass
 class CameraView:
@@ -19,3 +22,18 @@ class CameraView:
         for (mx, my, mw, mh) in self.masks:
             crop[my:my + mh, mx:mx + mw] = 0
         return crop
+
+
+def load_views(event_key: str) -> list["CameraView"]:
+    """Build the list of calibrated CameraViews for an event. Cameras without a
+    saved calibration are omitted. 'main' is always ordered first so it remains the
+    reference view for fusion."""
+    layout = load_layout()
+    views = []
+    for name, cl in layout.items():
+        cal = field_store.load(event_key, name)
+        if cal is None:
+            continue
+        views.append(CameraView(name=name, crop=cl.crop, masks=cl.masks, calibration=cal))
+    views.sort(key=lambda v: (v.name != "main", v.name))  # main first, then stable
+    return views

@@ -184,9 +184,10 @@ def test_color_unknown_still_associates_by_position():
 """Fixed-3v3 field-space multi-object tracker (pure NumPy).
 
 6 slots (3 blue + 3 red), each a constant-velocity Kalman filter in field meters.
-Per frame, per alliance, brute-force assign that color's <=3 detections to its 3
-slots (>=3!=6 permutations), update matched, coast unmatched. Occluded slots coast
-far longer and cannot be re-seeded. Alliance is sticky per slot."""
+Per frame, per alliance, assign that color's <=3 detections to its 3 slots by
+minimum-cost matching — brute-forced over <=3!=6 permutations (small enough that a
+full Hungarian solver is unnecessary). Update matched, coast unmatched. Occluded slots
+coast far longer and cannot be re-seeded. Alliance is sticky per slot."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import permutations
@@ -706,7 +707,17 @@ def field_adjacent_persons(person_boxes, calibration, field_dims, margin=2.0):
 
 - [ ] **Step 1: Startup wiring (`InferenceJob.__init__` / `run` setup)**
   - Import: `from web.field import store as field_store` (already present), `from web.field.tracker import FieldTracker`, `from web.field.occlusion import hub_prisms, resolve_occlusion`, `from web.field.detect_bridge import to_field_detections, field_adjacent_persons`, `from web.field.field_model import FieldModel`, `from web.field.radar import Radar`.
-  - Load calibration: `self.calib = field_store.load(self.event_key, self.camera)`. If `self.calib is None or self.calib.mode == "homography"` → log a clear error and set `self.field_tracking = False` (fall through to legacy only if you choose to keep it; per spec, prefer to **raise/abort** field tracking with a visible message). Otherwise `self.field_tracking = True`.
+  - **Thread the event key + camera into the job (REQUIRED — they don't exist yet).**
+    `InferenceJob.__init__(self, job_id, video_path)` (app.py:262) takes neither, and the
+    event key lives only in the module global `current_event['event_key']` (app.py:191).
+    At construction (app.py:~3465) or at `run()` start, capture and store:
+    ```python
+    self.event_key = (current_event or {}).get("event_key")
+    self.camera = "main"
+    ```
+    Guard `current_event is None` (calibration can't be loaded without an event key →
+    treat as "no calibration", below).
+  - Load calibration: `self.calib = field_store.load(self.event_key, self.camera) if self.event_key else None`. If `self.calib is None or self.calib.mode == "homography"` → log a clear error (e.g. "field tracking needs a pose-bearing calibration for event/camera") and set `self.field_tracking = False`; per spec, **abort field tracking with a visible message** rather than silently continuing. Otherwise `self.field_tracking = True`.
   - `self.field_model = FieldModel.load(self.calib.field_season)`.
   - `self.hub_prisms = hub_prisms(self.field_model)`.
   - `self.field_tracker = FieldTracker(field_length=self.field_model.length_m)`.
@@ -715,35 +726,34 @@ def field_adjacent_persons(person_boxes, calibration, field_dims, margin=2.0):
   - Commit: `feat(app): load calibration + field tracker at job start`.
 
 - [ ] **Step 2: Per-frame core replacement (in the `while` loop, ~app.py 1751-1860)**
-  Replace the ByteTrack/`get_canonical_robot_id`/embedding ordering block with:
+  Replace the ByteTrack/`get_canonical_robot_id`/embedding ordering block. **Single,
+  unambiguous ordering: update the tracker first, then resolve occlusion once on the
+  emitted tracks** (occlusion changes slowly frame-to-frame, so using this frame's
+  occlusion to inform next frame's coast is fine). For coasting tracks with no detection
+  box, `resolve_occlusion` projects an expected box from the predicted field position via
+  `field_to_image` — but to keep Task 5 minimal, only pass tracks that have a `box`
+  (visible or last-known); coasting tracks with no box are simply treated as not-occluded
+  this frame (they still coast on the budget). `dt` uses `self.video_fps` (guard 0):
   ```python
-  # robot detections -> field detections
   robot_boxes = [robot_detections.xyxy[i] for i in range(len(robot_detections))]
   field_dims = (self.field_model.length_m, self.field_model.width_m)
   dets = to_field_detections(robot_boxes, self.calib, overhead_frame, field_dims,
                              color_fn=_detect_bumper_color_static)
-  # persons -> field-adjacent occluder boxes
   pres = self.person_model(overhead_frame, conf=0.35, verbose=False, classes=[0])[0]
   pboxes = [pres.boxes.xyxy[i].cpu().numpy() for i in range(len(pres.boxes))]
   persons = field_adjacent_persons(pboxes, self.calib, field_dims)
-  # expected boxes for occlusion of currently-active tracks (predicted positions)
-  prev = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
-          for t in self.field_tracker._emit() if t.box is not None]
-  occ = resolve_occlusion(self.calib, prev + _det_track_views(dets), persons,
-                          self.hub_prisms)
-  view_flags = {sid: {"view_occluded": v["view_occluded"]} for sid, v in occ.items()}
-  tracks = self.field_tracker.update(dets, view_flags, dt=FRAME_SKIP / self.fps)
+  fps = self.video_fps or 30.0
+  tracks = self.field_tracker.update(dets, self._view_flags, dt=FRAME_SKIP / fps)
+  occ = resolve_occlusion(self.calib, [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
+                                       for t in tracks if t.box is not None],
+                          persons, self.hub_prisms)
+  self._occ = occ                                   # for the VLM bumper gate (Step 3)
+  self._view_flags = {sid: {"view_occluded": v["view_occluded"]}
+                      for sid, v in occ.items()}    # consumed by NEXT frame's update()
   ```
-  Then build `tracked_robot_boxes = [(t.slot_id, t.box) for t in tracks if t.state == "visible"]`
-  for the OCR/VLM stage, and keep a `self._occ = occ` for the VLM gate. `_det_track_views`
-  is a tiny helper mapping current detections to `{slot_id?, pos, box}` for occlusion of
-  *visible* detections (or simply resolve occlusion on the post-update `tracks`). Prefer:
-  resolve occlusion AFTER `update` using the emitted tracks (their `box` or projected
-  expected box), so a single consistent set feeds both `view`/`bumper`. Restructure to:
-  predict → resolve(view) → update → resolve(bumper) if needed, OR resolve once on the
-  emitted tracks and use both fields (simpler; the predicted boxes are close enough).
-  Keep it simple: **resolve once on emitted tracks; use view for next-frame coast intent
-  is fine since occlusion changes slowly.** Drive the exact ordering with the smoke test.
+  Initialize `self._view_flags = {}` and `self._occ = {}` in `__init__`. Then
+  `tracked_robot_boxes = [(t.slot_id, t.box) for t in tracks if t.state == "visible"]`
+  feeds the OCR/VLM stage.
   - Commit: `feat(app): field tracker drives per-frame robot identity`.
 
 - [ ] **Step 3: VLM re-bind + bumper-occlusion gate**
@@ -764,11 +774,14 @@ def field_adjacent_persons(person_boxes, calibration, field_dims, margin=2.0):
   - Commit: `feat(app): HUD labels by slot + live radar`.
 
 - [ ] **Step 5: Remove superseded code**
-  - Delete / stop calling: `get_canonical_robot_id`, `bytetrack_to_canonical`,
-    `next_canonical_id`, `self.tracker` (ByteTrack) usage, `self.embedder` usage in the
-    loop, `appearance_match_robots`/appearance clustering, `_clear_team_from_other_robots`,
-    `cap_alliance`, the `LINEUP_END_FRAME` left=blue/right=red seeding (~1799-1824).
-    Leave scoring-side helpers (`_is_robot_on_alliance_side`) untouched.
+  - Delete / stop calling: `get_canonical_robot_id` (@1382), `bytetrack_to_canonical`
+    (@294), `next_canonical_id`, `self.tracker` (ByteTrack) usage, `self.embedder` usage
+    in the loop, `appearance_match_robots`/appearance clustering,
+    `_clear_team_from_other_robots` (@901), and the `LINEUP_END_FRAME` left=blue/right=red
+    seeding (~1799-1824). The fixed-6 tracker supersedes the per-alliance count logic
+    (there is no symbol literally named `cap_alliance` — just remove whatever caps/moves
+    robots between alliances). Leave scoring-side helpers (`_is_robot_on_alliance_side`)
+    untouched.
   - Run full suite: `.venv/bin/python -m pytest tests/ -q` → all green.
   - Commit: `refactor(app): remove pixel-space canonical-ID/reid tracking (superseded by SP2)`.
 

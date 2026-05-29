@@ -23,7 +23,7 @@ class CameraCalibration:
     crop_region: Optional[tuple] = None  # (x, y, w, h) of main-cam crop, or None
     field_season: str = ""
     rms_error: float = 0.0
-    mode: str = "camera"                 # "camera" or "homography"
+    mode: str = "camera"                 # "camera" (fisheye), "homography", or "pinhole"
     H: Optional[np.ndarray] = None       # (3,3) ground-plane homography (image->field)
 
     def to_json(self) -> dict:
@@ -64,18 +64,19 @@ class CameraCalibration:
             pt = np.array([[[float(point_xyz[0]), float(point_xyz[1])]]], dtype=np.float64)
             out = cv2.perspectiveTransform(pt, Hinv).reshape(2)
             return (float(out[0]), float(out[1]))
+        if self.mode == "pinhole":
+            obj = np.array([[point_xyz]], dtype=np.float64)
+            D = np.asarray(self.D, float).reshape(-1, 1)
+            img, _ = cv2.projectPoints(obj, self.rvec, self.tvec, self.K, D)
+            u, v = img.reshape(2)
+            return (float(u), float(v))
         obj = np.array([[point_xyz]], dtype=np.float64)
         img, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec, self.K, self.D)
         u, v = img.reshape(2)
         return (float(u), float(v))
 
-    def image_to_field(self, uv) -> "tuple | None":
-        if self.mode == "homography":
-            pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
-            out = cv2.perspectiveTransform(pt, self.H).reshape(2)
-            return (float(out[0]), float(out[1]))
-        pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
-        norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
+    def _cast_norm_ray_to_ground(self, norm) -> "tuple | None":
+        """Normalized camera ray (x_n, y_n) -> field (x, y) where it hits z=0."""
         ray_cam = np.array([norm[0], norm[1], 1.0])
         R, _ = cv2.Rodrigues(self.rvec)
         cam_center = (-R.T @ self.tvec).reshape(3)
@@ -88,6 +89,21 @@ class CameraCalibration:
             return None
         world = cam_center + s * ray_world
         return (float(world[0]), float(world[1]))
+
+    def image_to_field(self, uv) -> "tuple | None":
+        if self.mode == "homography":
+            pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
+            out = cv2.perspectiveTransform(pt, self.H).reshape(2)
+            return (float(out[0]), float(out[1]))
+        if self.mode == "pinhole":
+            pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
+            D = np.asarray(self.D, float).reshape(-1, 1)
+            norm = cv2.undistortPoints(pt, self.K, D).reshape(2)
+            return self._cast_norm_ray_to_ground(norm)
+        # fisheye camera mode:
+        pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
+        norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
+        return self._cast_norm_ray_to_ground(norm)
 
 
 class Calibrator:

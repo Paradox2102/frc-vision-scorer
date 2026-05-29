@@ -45,6 +45,26 @@ class CameraCalibration:
 
 
 class Calibrator:
+    MIN_INTRINSIC_VIEWS = 4
+
+    @staticmethod
+    def calibrate_intrinsics(views: list, image_size: tuple):
+        """views: list of (obj_pts (N,3), img_pts (N,2)) from DISTINCT viewpoints.
+        Returns (K, D). Requires multiple genuinely different camera vantages —
+        a single static viewpoint is degenerate for fisheye intrinsics."""
+        if len(views) < Calibrator.MIN_INTRINSIC_VIEWS:
+            raise CalibrationError(
+                f"fisheye intrinsics need >= {Calibrator.MIN_INTRINSIC_VIEWS} "
+                f"distinct viewpoints, got {len(views)}")
+        obj_arr = [o.reshape(-1, 1, 3).astype(np.float64) for (o, _) in views]
+        img_arr = [i.reshape(-1, 1, 2).astype(np.float64) for (_, i) in views]
+        K = np.zeros((3, 3)); D = np.zeros((4, 1))
+        flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW)
+        cv2.fisheye.calibrate(
+            obj_arr, img_arr, image_size, K, D, flags=flags,
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-9))
+        return K, D.reshape(-1)
+
     @staticmethod
     def solve_pose(correspondences: dict, K, D, image_size: tuple,
                    field_season: str) -> "CameraCalibration":

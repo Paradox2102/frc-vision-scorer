@@ -173,6 +173,7 @@ VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field
 REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
 OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by this to overturn
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
+CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
 
 # Bumper-number reading VLM. Swap models here (loaded via AutoModelForImageTextToText,
 # so any transformers-supported image-text-to-text model works, e.g. InternVL3, Nemotron).
@@ -577,6 +578,36 @@ class InferenceJob:
         person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
         return paired, person_boxes
+
+    def _remaining_rosters(self):
+        """(remaining_all, remaining_blue, remaining_red) — match roster minus
+        already-confirmed teams. Shared by the main and corner read paths."""
+        confirmed = {r.team_number for r in self.robot_tracks.values()
+                     if r.team_number_confirmed and r.team_number}
+        return (
+            [t for t in self.match_teams if t not in confirmed],
+            [t for t in self.match_blue_teams if t not in confirmed],
+            [t for t in self.match_red_teams if t not in confirmed],
+        )
+
+    def _apply_bumper_read(self, slot_id, crop_b64, remaining, remaining_blue,
+                           remaining_red, source_weight):
+        """Read one bumper crop with the VLM and add a (confidence x source_weight)
+        vote to the slot's team tally. source_weight > 1 for corner cameras."""
+        robot = self.robot_tracks.get(slot_id)
+        if not robot:
+            return
+        res = _vision_read_bumpers([crop_b64], remaining, remaining_blue, remaining_red)[0]
+        team = res.get("team_number")
+        if not team:
+            return
+        conf = res.get("confidence", 0.0)
+        weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
+        if robot.team_ocr_votes is None:
+            robot.team_ocr_votes = {}
+        robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
+        print(f"  Corner read: slot {slot_id} += {team} (w={weight:.1f}, "
+              f"total={robot.team_ocr_votes[team]:.1f})")
 
     def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
@@ -1967,6 +1998,24 @@ class InferenceJob:
                     self._claude_vision_calls += 1
                     self._claude_vision_last_time = current_time
                     self.vision_identify_robots(overhead_frame, tracked_robot_boxes)
+
+                # Corner-camera bumper reads: additive, weighted, NOT occlusion-gated.
+                # Corner cams read more clearly than main, so their reads confirm/correct
+                # identities every pass — even for already-confirmed slots (that's how a
+                # wrong main lock gets overturned by assign_teams_from_votes/audit).
+                if (processed_frame_num >= 10
+                        and processed_frame_num % CORNER_READ_INTERVAL == 0
+                        and self.match_teams):
+                    remaining, r_blue, r_red = self._remaining_rosters()
+                    for i, obs in enumerate(fused):
+                        slot_id = self.field_tracker.last_det_to_slot.get(i)
+                        if slot_id is None:
+                            continue
+                        for (cam, crop_b64, w) in obs.evidence:
+                            if cam == "main" or crop_b64 is None:
+                                continue   # main handled above; skip empty/illegible
+                            self._apply_bumper_read(slot_id, crop_b64, remaining,
+                                                    r_blue, r_red, source_weight=w)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()

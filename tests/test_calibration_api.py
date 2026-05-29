@@ -51,7 +51,10 @@ def test_calibration_frame_from_local_video():
     r = _client().post("/api/calibration/frame", json={"timestamp": 75})
     assert r.status_code == 200
     j = r.json()
-    assert j["width"] == 1920 and 600 <= j["height"] <= 700  # top 60% of 1080
+    # Crop now comes from the composite layout's "main" camera ([0,0,1920,723]).
+    from web.field.composite_layout import load_layout
+    _, _, cw, ch = load_layout()["main"].crop
+    assert j["width"] == cw and j["height"] == ch
     assert len(j["frame"]) > 1000  # base64 jpeg present
 
 def test_solve_homography_too_few_points():

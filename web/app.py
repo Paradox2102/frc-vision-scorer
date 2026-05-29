@@ -2578,6 +2578,10 @@ async def calibration_solve_homography(request: Request):
             "overlay": overlay_b64}
 
 
+def _tag_id_of(key: str) -> int:
+    return int(key[1:]) if key[:1] in ("a", "m") else int(key)
+
+
 @app.post("/api/calibration/solve-tags")
 async def calibration_solve_tags(request: Request):
     """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
@@ -2603,12 +2607,16 @@ async def calibration_solve_tags(request: Request):
             center3d = fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3)
             corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]], float),
                                center3d)
+    holdout_ids = set(int(i) for i in body.get("holdout_ids", []))
+    held = {k: v for k, v in corr.items() if _tag_id_of(k) in holdout_ids}
+    solve_corr = {k: v for k, v in corr.items() if _tag_id_of(k) not in holdout_ids}
     try:
-        cal = Calibrator.solve_camera_from_tags(corr, image_size=image_size,
+        cal = Calibrator.solve_camera_from_tags(solve_corr, image_size=image_size,
                                                 field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     field_store.save(event, camera, cal)
+    holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
@@ -2618,8 +2626,12 @@ async def calibration_solve_tags(request: Request):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     okf, frame = cap.read(); cap.release()
-    if okf and frame is not None:
-        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
+    cl = load_layout().get(camera)
+    if okf and frame is not None and cl is not None:
+        cx, cy, cw, ch = cl.crop
+        main = frame[cy:cy + ch, cx:cx + cw].copy()
+        for (mx, my, mw_, mh_) in cl.masks:
+            main[my:my + mh_, mx:mx + mw_] = 0
         _draw_field_overlay(main, cal, fm)
         mh, mw = main.shape[:2]
         for tid in fm.tags:
@@ -2634,7 +2646,8 @@ async def calibration_solve_tags(request: Request):
         if okj:
             overlay_b64 = base64.b64encode(buf.tobytes()).decode()
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
-            "n_points": n_points, "overlay": overlay_b64}
+            "n_points": n_points, "overlay": overlay_b64,
+            "holdout_error_m": holdout_err}
 
 
 @app.get("/api/calibration/landmarks")

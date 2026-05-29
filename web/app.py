@@ -2416,11 +2416,15 @@ async def calibration_frame(request: Request):
         return JSONResponse(status_code=400, content={"error": "could not read frame"})
     h = frame.shape[0]
     main = frame[: int(h * CALIB_MAIN_CROP_FRAC), :]
+    fm = FieldModel.load("2026-rebuilt-welded")
+    det = detect_tags(main)
+    detected = {str(tid): det[tid].tolist() for tid in det if tid in fm.tags}
     ok2, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not ok2:
         return JSONResponse(status_code=500, content={"error": "jpeg encode failed"})
     b64 = base64.b64encode(buf.tobytes()).decode()
-    return {"frame": b64, "width": int(main.shape[1]), "height": int(main.shape[0])}
+    return {"frame": b64, "width": int(main.shape[1]), "height": int(main.shape[0]),
+            "detected_tags": detected}
 
 
 @app.post("/api/calibration/solve-homography")
@@ -2482,6 +2486,16 @@ async def calibration_landmarks():
     import json
     p = Path(__file__).resolve().parents[1] / "data/field/2026_landmarks.json"
     return json.loads(p.read_text())
+
+
+@app.get("/api/calibration/tag-map")
+async def calibration_tag_map(season: str = "2026-rebuilt-welded"):
+    """Top-down field tag layout for the calibration UI: tag (x,y,z) + field dims."""
+    fm = FieldModel.load(season)
+    tags = {str(tid): {"x": float(t["t"][0]), "y": float(t["t"][1]),
+                       "z": float(t["t"][2])}
+            for tid, t in fm.tags.items()}
+    return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m}}
 
 
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,

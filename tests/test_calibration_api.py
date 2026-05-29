@@ -63,3 +63,25 @@ def test_landmarks_endpoint():
     r = _client().get("/api/calibration/landmarks")
     assert r.status_code == 200
     assert len(r.json()["landmarks"]) >= 4
+
+
+def test_tag_map_endpoint():
+    r = _client().get("/api/calibration/tag-map")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["field"]["length"] > 0 and j["field"]["width"] > 0
+    assert len(j["tags"]) >= 4
+    some = next(iter(j["tags"].values()))
+    assert {"x", "y", "z"} <= set(some)
+
+
+def test_calibration_frame_includes_detected_tags():
+    import os
+    if not os.path.exists("data/test_footage/qual1_first_champs_2026.mp4"):
+        import pytest; pytest.skip("test video not present")
+    r = _client().post("/api/calibration/frame", json={"timestamp": 75})
+    assert r.status_code == 200
+    j = r.json()
+    assert "detected_tags" in j        # dict; may be empty but key present
+    for corners in j["detected_tags"].values():
+        assert len(corners) == 4       # 4 (u,v) corners per tag

@@ -47,6 +47,8 @@ from web.field.tracker import FieldTracker
 from web.field.occlusion import hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.radar import Radar
+from web.field.camera_view import load_views
+from web.field.fusion import fuse_detections
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -1734,6 +1736,8 @@ class InferenceJob:
             self.hub_prisms = hub_prisms(self.field_model)
             self.field_tracker = FieldTracker(self.field_model.length_m)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
+            self.views = load_views(self.event_key)  # main first; corners if calibrated
+            print(f"  Cameras active: {[v.name for v in self.views]}")
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
             print(f"  FIELD TRACKING DISABLED: {self.error}")

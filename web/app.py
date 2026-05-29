@@ -284,7 +284,9 @@ class InferenceJob:
         # loads), so neither the ByteTracker nor the embedder is instantiated here.
         self.model = YOLO(str(MODEL_PATH))
         # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
-        self.person_model = YOLO("yolo26n.pt")
+        # Absolute path so it doesn't depend on CWD (a bare name would trigger a
+        # hub auto-download attempt for a non-existent release).
+        self.person_model = YOLO(str(PROJECT_ROOT / "yolo26n.pt"))
 
         # Field-space tracking — bound to the loaded event/camera calibration.
         # Snapshot the active event key at construction; calibration + field model
@@ -1714,6 +1716,14 @@ class InferenceJob:
         if cal is None:
             self.error = (f"No calibration found for event '{self.event_key}' "
                           f"camera '{self.camera}'. Calibrate the camera first.")
+            print(f"  FIELD TRACKING DISABLED: {self.error}")
+            return False
+        if cal.camera_center is None:
+            # Homography (or any pose-free) calibration has no camera center, so
+            # occlusion ray-casting can't run. Require a pose-bearing solve.
+            self.error = (f"Calibration for '{self.event_key}'/{self.camera} is "
+                          f"mode '{cal.mode}' (no camera pose). Re-calibrate with the "
+                          f"tag-anchored (pinhole) flow before running inference.")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
         try:

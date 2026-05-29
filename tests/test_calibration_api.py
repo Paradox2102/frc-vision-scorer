@@ -118,3 +118,22 @@ def test_solve_tags_too_few_points(tmp_path, monkeypatch):
         "manual_tags": [{"id": 1, "u": 10, "v": 10}]})
     assert r.status_code == 400
     assert "point" in r.json().get("error", "").lower()
+
+
+def test_init_field_tracking_rejects_homography(monkeypatch):
+    """A pose-free (homography) calibration must abort field tracking with a clear
+    error, not pass the gate and crash per-frame in occlusion ray-casting."""
+    from types import SimpleNamespace
+    import numpy as np
+    from web.app import InferenceJob
+    from web.field import store as field_store
+    from web.field.calibration import CameraCalibration
+
+    homog = CameraCalibration(mode="homography", H=np.eye(3),
+                              image_size=(100, 100), field_season="2026-rebuilt-welded")
+    monkeypatch.setattr(field_store, "load", lambda e, c: homog)
+    job = SimpleNamespace(event_key="evt", camera="main", error=None, calib=None,
+                          field_model=None, field_dims=None, hub_prisms=None,
+                          field_tracker=None, radar=None, field_tracking=False)
+    assert InferenceJob._init_field_tracking(job) is False
+    assert "pinhole" in job.error.lower() or "pose" in job.error.lower()

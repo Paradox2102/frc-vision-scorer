@@ -15,6 +15,7 @@
 ## Conventions for every task
 
 - **Run tests with** `.venv/bin/python -m pytest` — never bare `pytest`.
+- **Test location:** new tests are grouped under `tests/field/`. The repo uses pytest package-import mode (`tests/__init__.py` exists), so **create `tests/field/__init__.py` (empty) once** before the first `tests/field/` test, or collection will error. (Alternatively place the tests flat in `tests/` to match the existing convention — filenames are unique either way.)
 - **TDD:** write the failing test, run it red, implement minimally, run it green, commit.
 - **Commit** after each green step with the message shown.
 - Field-package modules import as `web.field.*` (see existing `detect_bridge.py`).
@@ -646,7 +647,25 @@ git commit -m "feat(ui): calibrate page supports corner cameras + ROI refine + h
 
 - [ ] **Step 1: Calibrate `corner_left`** via the UI on `qual1_first_champs_2026.mp4` (event `test`): auto hub tags + manually locate the spread tags (31/32/17/22/27). Aim for ≥2 successfully-located off-hub tags spanning the frame plus the hub cluster.
 
-- [ ] **Step 2: Validate.** Mark 1–2 edge tags as held-out and Solve. **Acceptance gate:** held-out field error ≤ 0.5 m AND ≥2 off-hub tags located. If it fails, follow the spec escalation: relax `solve_camera_from_tags` flags (drop `CALIB_FIX_K3` / `CALIB_ZERO_TANGENT_DIST`) and re-solve; if still failing, fall back to homography (`/api/calibration/solve-homography`) for that camera and record that it is pose-free.
+- [ ] **Step 2: Validate.** Mark 1–2 edge tags as held-out and Solve. **Acceptance gate:** held-out field error ≤ 0.5 m AND ≥2 off-hub tags located.
+
+  If it fails, follow the spec escalation ladder:
+
+  **Tier 1 — relax distortion flags.** The flags are currently hardcoded at `web/field/calibration.py:190-191`. Parameterize them so the escalation is real (this is a required code edit, not just an operator action):
+
+  ```python
+  # calibration.py — change the signature:
+  def solve_camera_from_tags(correspondences, image_size, field_season,
+                             relax_distortion: bool = False):
+      ...
+      flags = cv2.CALIB_USE_INTRINSIC_GUESS
+      if not relax_distortion:
+          flags |= cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3
+      # else: allow tangential + k3 (more terms, justified once points span the frame)
+  ```
+  Then thread `relax_distortion` through `/api/calibration/solve-tags` (read `body.get("relax_distortion", False)`) and add a checkbox in the calibrate UI. Re-solve with it on and re-check the held-out gate. Add a quick unit test that `relax_distortion=True` produces a non-zero `D[2]`/`D[4]` term on a synthetic spread set.
+
+  **Tier 2 — homography fallback.** If still failing, fall back to homography (`/api/calibration/solve-homography`) for that camera and record that it is pose-free (it will be excluded from ray-cast occlusion by Task 17's `posed` filter — no further gate change needed).
 
 - [ ] **Step 3: Repeat for `corner_right`** (tags 8/9/10 hub + spread).
 
@@ -869,7 +888,7 @@ def _detect_view(self, view, composite_frame):
     return paired, person_boxes
 ```
 
-Add `_bumper_crop_b64(self, frame, box)` factoring the existing bumper-band crop+upscale+encode logic out of `vision_identify_robots` (DRY — `vision_identify_robots` should call it too).
+Add `_bumper_crop_b64(self, frame, box)` factoring the existing bumper-band crop+upscale+encode logic out of `vision_identify_robots` (DRY — `vision_identify_robots` should call it too). **Preserve the `LEGIBILITY_FLOOR` check**: have it return `(crop_b64, legibility_score)` (or `None` when below floor) so the read loop can skip illegible crops — today's main path filters on `legibility_score` and `VLM_TOP_K`, and dropping that for main would be a perf/quality regression. The read loop (Task 16) skips evidence whose crop is `None`/below floor; corner crops are still read when legible, just ungated on occlusion.
 
 - [ ] **Step 2: Replace loop steps 1–4** (single-view detection + `to_field_detections` + `field_tracker.update`) with the multi-view version:
 
@@ -988,6 +1007,8 @@ if processed_frame_num >= 10 and (processed_frame_num % BUMPER_READ_INTERVAL == 
         if robot and robot.team_number_confirmed and not is_reread_due:
             continue
         for (cam, crop_b64, w) in obs.evidence:
+            if crop_b64 is None:
+                continue       # below legibility floor (see _bumper_crop_b64) — skip
             if cam == "main" and self._occ.get(slot_id, {}).get("bumper_occluded"):
                 continue       # main keeps its occlusion gate
             # corner reads are NOT gated -> additive even when main sees the robot

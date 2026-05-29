@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Field Calibration</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 14px;
+    padding: 16px;
+  }
+  h1 { font-size: 1.2em; color: #a0c4ff; margin-bottom: 6px; }
+  .instructions {
+    color: #b0b8c8;
+    margin-bottom: 14px;
+    font-size: 0.9em;
+    max-width: 900px;
+    line-height: 1.5;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .controls label { color: #a0b0c0; }
+  input[type="number"], input[type="text"] {
+    background: #16213e;
+    border: 1px solid #334;
+    color: #e0e0e0;
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  input[type="number"] { width: 80px; }
+  input[type="text"] { width: 100px; }
+  button {
+    background: #0f3460;
+    color: #a0c4ff;
+    border: 1px solid #1a5080;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.15s;
+  }
+  button:hover { background: #1a5080; }
+  button.primary {
+    background: #155030;
+    color: #80ffb4;
+    border-color: #1e7040;
+  }
+  button.primary:hover { background: #1e7040; }
+  #canvasWrap {
+    position: relative;
+    margin-bottom: 14px;
+    border: 1px solid #334;
+    display: inline-block;
+    cursor: crosshair;
+    background: #0a0a14;
+    max-width: 100%;
+  }
+  canvas {
+    display: block;
+    max-width: 100%;
+  }
+  .points-section { margin-bottom: 14px; }
+  .points-section h2 { font-size: 1em; color: #a0c4ff; margin-bottom: 8px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    max-width: 900px;
+    background: #16213e;
+  }
+  th {
+    background: #0f3460;
+    color: #a0c4ff;
+    padding: 6px 10px;
+    text-align: left;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  td {
+    border-bottom: 1px solid #222840;
+    padding: 5px 8px;
+    vertical-align: middle;
+  }
+  tr:hover td { background: #1a2540; }
+  td input[type="number"] { width: 72px; }
+  select {
+    background: #16213e;
+    border: 1px solid #334;
+    color: #e0e0e0;
+    padding: 4px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    max-width: 180px;
+  }
+  .del-btn {
+    background: #3a0a0a;
+    color: #ff8080;
+    border-color: #6a1010;
+    padding: 3px 8px;
+    font-size: 12px;
+  }
+  .del-btn:hover { background: #5a1010; }
+  .solve-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  #statusLine {
+    font-size: 13px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: #111;
+    min-width: 200px;
+  }
+  .rms-good  { color: #60ff90; }
+  .rms-warn  { color: #ffd060; }
+  .rms-bad   { color: #ff6060; }
+  .rms-info  { color: #a0c4ff; }
+  .rms-err   { color: #ff8080; }
+  .overlay-section h2 { font-size: 1em; color: #a0c4ff; margin-bottom: 8px; }
+  #overlayImg {
+    max-width: 100%;
+    border: 1px solid #334;
+    display: block;
+    background: #0a0a14;
+    min-height: 40px;
+  }
+  .no-overlay {
+    color: #556;
+    font-style: italic;
+    font-size: 12px;
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Field Calibration (ground-plane homography)</h1>
+<p class="instructions">
+  Grab a frame, click ground points you can identify (field corners, line intersections),
+  assign each its field (x,y), then Solve. Need &ge;4 well-spread points; more spread = better.
+</p>
+
+<div class="controls">
+  <label>Timestamp (s):
+    <input type="number" id="timestamp" value="75" min="0" step="1">
+  </label>
+  <button onclick="grabFrame()">Grab frame</button>
+  <label>Event:
+    <input type="text" id="event" value="test">
+  </label>
+  <label>Camera:
+    <input type="text" id="camera" value="main">
+  </label>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="frameCanvas"></canvas>
+</div>
+
+<div class="points-section">
+  <h2>Correspondence Points</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Pixel (u, v)</th>
+        <th>Landmark</th>
+        <th>x (m)</th>
+        <th>y (m)</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="pointsBody">
+      <tr><td colspan="6" style="color:#556; font-style:italic; padding:12px 10px;">
+        Click on the frame to add points.
+      </td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="solve-row">
+  <button class="primary" onclick="solve()">Solve &amp; preview</button>
+  <span id="statusLine" class="rms-info">—</span>
+</div>
+
+<div class="overlay-section">
+  <h2>Overlay (reprojected field lines)</h2>
+  <p class="no-overlay" id="noOverlayMsg">Overlay will appear here after a successful solve.</p>
+  <img id="overlayImg" src="" alt="" style="display:none;">
+</div>
+
+<script>
+// ---- State ----
+let points = [];       // [{u, v, x, y}]  x/y may be null
+let landmarks = [];    // [{name, x, y}]
+let baseImg = null;    // HTMLImageElement of current frame
+let frameW = 0, frameH = 0, scale = 1.0;
+
+// ---- Init ----
+(async function init() {
+  await fetchLandmarks();
+  await grabFrame();
+})();
+
+async function fetchLandmarks() {
+  try {
+    const r = await fetch('/api/calibration/landmarks');
+    const j = await r.json();
+    landmarks = j.landmarks || [];
+  } catch(e) {
+    setStatus('Could not load landmarks: ' + e.message, 'rms-err');
+  }
+}
+
+// ---- Grab Frame ----
+async function grabFrame() {
+  const ts = parseFloat(document.getElementById('timestamp').value) || 75;
+
+  // Warn if points exist
+  if (points.length > 0) {
+    if (!confirm('Grabbing a new frame will clear all current points. Continue?')) return;
+  }
+
+  setStatus('Grabbing frame…', 'rms-info');
+  try {
+    const r = await fetch('/api/calibration/frame', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({timestamp: ts})
+    });
+    const j = await r.json();
+    if (j.error) { setStatus('Frame error: ' + j.error, 'rms-err'); return; }
+
+    const img = new Image();
+    img.onload = function() {
+      const wrap = document.getElementById('canvasWrap');
+      const maxW = Math.min(1400, wrap.parentElement.clientWidth - 32);
+      scale = maxW / img.naturalWidth;
+      frameW = img.naturalWidth;
+      frameH = img.naturalHeight;
+      const canvas = document.getElementById('frameCanvas');
+      canvas.width  = Math.round(frameW * scale);
+      canvas.height = Math.round(frameH * scale);
+      baseImg = img;
+      points = [];
+      renderTable();
+      redraw();
+      setStatus('Frame grabbed. Click points on the canvas.', 'rms-info');
+    };
+    img.src = 'data:image/jpeg;base64,' + j.frame;
+  } catch(e) {
+    setStatus('Fetch error: ' + e.message, 'rms-err');
+  }
+}
+
+// ---- Canvas click ----
+document.getElementById('frameCanvas').addEventListener('click', function(e) {
+  if (!baseImg) return;
+  const rect = this.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const u = Math.round(cx / scale);
+  const v = Math.round(cy / scale);
+  points.push({u, v, x: null, y: null});
+  renderTable();
+  redraw();
+});
+
+// ---- Redraw canvas ----
+function redraw() {
+  const canvas = document.getElementById('frameCanvas');
+  const ctx = canvas.getContext('2d');
+  if (!baseImg) return;
+  ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
+  points.forEach((p, i) => {
+    const px = p.u * scale;
+    const py = p.v * scale;
+    ctx.beginPath();
+    ctx.arc(px, py, 6, 0, 2 * Math.PI);
+    ctx.fillStyle = 'rgba(255,60,60,0.85)';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Label
+    ctx.font = 'bold 13px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(String(i + 1), px + 8, py - 6);
+    ctx.fillText(String(i + 1), px + 8, py - 6);
+  });
+}
+
+// ---- Render table ----
+function renderTable() {
+  const tbody = document.getElementById('pointsBody');
+  tbody.replaceChildren();
+  if (points.length === 0) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.textContent = 'Click on the frame to add points.';
+    td.style.cssText = 'color:#556; font-style:italic; padding:12px 10px;';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  points.forEach((p, i) => {
+    const tr = document.createElement('tr');
+
+    // #
+    const tdIdx = document.createElement('td');
+    tdIdx.textContent = i + 1;
+    tdIdx.style.color = '#a0b0c0';
+    tr.appendChild(tdIdx);
+
+    // pixel
+    const tdPx = document.createElement('td');
+    tdPx.textContent = `(${p.u}, ${p.v})`;
+    tdPx.style.fontFamily = 'monospace';
+    tdPx.style.color = '#c0d0e0';
+    tr.appendChild(tdPx);
+
+    // landmark select
+    const tdSel = document.createElement('td');
+    const sel = document.createElement('select');
+    const optNone = document.createElement('option');
+    optNone.value = '';
+    optNone.textContent = '— manual —';
+    sel.appendChild(optNone);
+    landmarks.forEach(lm => {
+      const opt = document.createElement('option');
+      opt.value = JSON.stringify({x: lm.x, y: lm.y});
+      opt.textContent = `${lm.name} (${lm.x}, ${lm.y})`;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener('change', function() {
+      if (!this.value) return;
+      const lm = JSON.parse(this.value);
+      points[i].x = lm.x;
+      points[i].y = lm.y;
+      // Update the x/y inputs in the same row
+      tr.querySelector('.xi').value = lm.x;
+      tr.querySelector('.yi').value = lm.y;
+    });
+    tdSel.appendChild(sel);
+    tr.appendChild(tdSel);
+
+    // x input
+    const tdX = document.createElement('td');
+    const xi = document.createElement('input');
+    xi.type = 'number'; xi.step = '0.01'; xi.className = 'xi';
+    if (p.x !== null) xi.value = p.x;
+    xi.placeholder = 'x m';
+    xi.addEventListener('change', function() {
+      const v = parseFloat(this.value);
+      points[i].x = isNaN(v) ? null : v;
+    });
+    tdX.appendChild(xi);
+    tr.appendChild(tdX);
+
+    // y input
+    const tdY = document.createElement('td');
+    const yi = document.createElement('input');
+    yi.type = 'number'; yi.step = '0.01'; yi.className = 'yi';
+    if (p.y !== null) yi.value = p.y;
+    yi.placeholder = 'y m';
+    yi.addEventListener('change', function() {
+      const v = parseFloat(this.value);
+      points[i].y = isNaN(v) ? null : v;
+    });
+    tdY.appendChild(yi);
+    tr.appendChild(tdY);
+
+    // delete
+    const tdDel = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.textContent = '✕';
+    btn.className = 'del-btn';
+    btn.addEventListener('click', function() {
+      points.splice(i, 1);
+      renderTable();
+      redraw();
+    });
+    tdDel.appendChild(btn);
+    tr.appendChild(tdDel);
+
+    tbody.appendChild(tr);
+  });
+}
+
+// ---- Solve ----
+async function solve() {
+  if (points.length < 4) {
+    setStatus('Need at least 4 points.', 'rms-err');
+    return;
+  }
+
+  // Validate all points have numeric x,y — collect bad row numbers
+  const missing = [];
+  points.forEach((p, i) => {
+    if (p.x === null || p.y === null || isNaN(p.x) || isNaN(p.y)) {
+      missing.push(i + 1);
+    }
+  });
+  if (missing.length > 0) {
+    setStatus(`Rows missing field coords: ${missing.join(', ')}`, 'rms-err');
+    return;
+  }
+
+  const ts     = parseFloat(document.getElementById('timestamp').value) || 75;
+  const event  = document.getElementById('event').value.trim() || 'test';
+  const camera = document.getElementById('camera').value.trim() || 'main';
+
+  setStatus('Solving…', 'rms-info');
+
+  // Sync any typed-but-not-change-event values from the table inputs
+  syncTableToPoints();
+
+  try {
+    const r = await fetch('/api/calibration/solve-homography', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        event, camera, timestamp: ts,
+        image_size: [frameW, frameH],
+        points: points.map(p => ({u: p.u, v: p.v, x: p.x, y: p.y}))
+      })
+    });
+    const j = await r.json();
+    if (j.error) {
+      setStatus('Solve error: ' + j.error, 'rms-err');
+      return;
+    }
+    const rms = parseFloat(j.rms_error).toFixed(2);
+    const n   = j.n_points;
+    let cls = 'rms-good';
+    if (rms >= 20) cls = 'rms-bad';
+    else if (rms >= 8) cls = 'rms-warn';
+    setStatus(`RMS = ${rms} px  (${n} points)`, cls);
+
+    // Show overlay
+    if (j.overlay) {
+      const img = document.getElementById('overlayImg');
+      img.src = 'data:image/jpeg;base64,' + j.overlay;
+      img.style.display = 'block';
+      document.getElementById('noOverlayMsg').style.display = 'none';
+    }
+  } catch(e) {
+    setStatus('Fetch error: ' + e.message, 'rms-err');
+  }
+}
+
+// Read current values from table inputs back into points[] before solve
+function syncTableToPoints() {
+  const tbody = document.getElementById('pointsBody');
+  const rows = tbody.querySelectorAll('tr');
+  rows.forEach((tr, i) => {
+    if (i >= points.length) return;
+    const xi = tr.querySelector('.xi');
+    const yi = tr.querySelector('.yi');
+    if (xi) {
+      const v = parseFloat(xi.value);
+      points[i].x = isNaN(v) ? null : v;
+    }
+    if (yi) {
+      const v = parseFloat(yi.value);
+      points[i].y = isNaN(v) ? null : v;
+    }
+  });
+}
+
+// ---- Status helper ----
+function setStatus(msg, cls) {
+  const el = document.getElementById('statusLine');
+  el.textContent = msg;
+  el.className = cls || 'rms-info';
+}
+</script>
+</body>
+</html>

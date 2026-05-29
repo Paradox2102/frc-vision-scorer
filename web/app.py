@@ -2138,6 +2138,11 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/calibrate")
+async def calibrate_page():
+    return FileResponse(STATIC_DIR / "calibrate.html")
+
+
 @app.get("/api/status")
 async def status():
     """Return model and system status"""

@@ -112,7 +112,23 @@ let pendingPixel = null;  // {u, v} awaiting a map click
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
 
-(async function init(){ await fetchTagMap(); drawMap(); await grabFrame(); })();
+(async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await grabFrame(); })();
+
+async function fetchCurrentEvent(){
+  // Save the calibration under the EVENT THE APP HAS LOADED — otherwise inference
+  // (which looks up the live event key) won't find it. Falls back to the manual field.
+  try {
+    const r = await fetch('/api/event/current');
+    if (!r.ok) { setStatus('No event loaded — calibration will save under "'
+      + document.getElementById('event').value + '". Load the event first.', 'rms-warn'); return; }
+    const j = await r.json();
+    if (j.event_key){
+      document.getElementById('event').value = j.event_key;
+      document.getElementById('event').title = 'Auto-filled from the loaded event ('
+        + (j.event_name || j.event_key) + ')';
+    }
+  } catch(e){ /* keep the manual default */ }
+}
 
 async function fetchTagMap(){
   try {

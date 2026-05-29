@@ -279,14 +279,10 @@ class InferenceJob:
         self._pause_frame = 0
         self._current_frame = 0
         
-        # Model and tracking
+        # Model and tracking. SP2 replaced ByteTrack + DINOv2 re-ID with the
+        # field-space FieldTracker (built in process_video once the calibration
+        # loads), so neither the ByteTracker nor the embedder is instantiated here.
         self.model = YOLO(str(MODEL_PATH))
-        self.tracker = sv.ByteTrack(
-            lost_track_buffer=LOST_TRACK_BUFFER,
-            track_activation_threshold=0.25,   # Accept lower-confidence detections into existing tracks
-            minimum_matching_threshold=0.8,     # Require high IoU overlap to match (reduces ID switches)
-        )
-        self.embedder = RobotEmbedder(EMBED_MODEL_NAME)
         # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
         self.person_model = YOLO("yolo26n.pt")
 

@@ -1,0 +1,7 @@
+{
+  "video": "data/test_footage/qual1_first_champs_2026.mp4",
+  "_note": "Segment auto-selected (6 robots present near f2160). anchors is EMPTY pending human ground-truth: swaps must be counted manually from the rendered side-by-side video (qual1_spike_compare.mp4), or anchors placed via scripts/segment_scrubber.py. Continuity (births/deaths) and latency in the harness output are anchor-free and trustworthy.",
+  "segment": {"start_frame": 2130, "end_frame": 2280, "prompt_frame": 2160, "stride": 2},
+  "anchors": [],
+  "occlusion_events": []
+}

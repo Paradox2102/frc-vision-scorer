@@ -16,9 +16,12 @@
 
 **Phase 0 — Spike (SP-T.0), fully detailed below:**
 - Create `scripts/sam2_spike.py` — integration harness: runs SAM2 + `FieldTracker` over a clip, renders a side-by-side video, prints the metrics table. Mirrors the standalone pattern in `scripts/verify_field_tracking.py`.
-- Create `web/field/spike_metrics.py` — pure, testable metric functions (ID-switch counting from anchors, continuity stats). No SAM2/torch imports, so it unit-tests fast.
+- Create `web/field/spike_metrics.py` — pure, testable metric functions (ID-switch counting from anchors, continuity stats). No SAM2/torch imports, so it unit-tests fast. Metric is computed in **image space (uv)** — calibration-independent.
 - Create `tests/field/test_spike_metrics.py` — unit tests for the metric functions.
-- Create `data/videos/qual37.spike_labels.json` — hand-authored ground-truth sidecar (segment frame range + swap/occlusion anchor events).
+- Create `scripts/segment_scrubber.py` — helper for picking the hard segment + reading anchor uv (montage + gridded single-frame dump). Built ahead of the spike.
+- Create `data/test_footage/qual1_first_champs_2026.spike_labels.json` — hand-authored ground-truth sidecar (segment frame range + swap/occlusion anchor events).
+
+**Footage + calibration:** the spike runs on `data/test_footage/qual1_first_champs_2026.mp4`, the footage the validated `test/main` calibration (and SP2 smoke check) were built on. `qual37.mp4` has no matching calibration, so `FieldTracker` (the baseline) cannot run on it without a fresh calibration. The main view is the **top `OVERHEAD_CROP_RATIO = 0.67`** of the frame (`web/app.py:125`) — note `CALIB_MAIN_CROP_FRAC` referenced by `scripts/verify_field_tracking.py` is a stale name and does NOT exist; use `OVERHEAD_CROP_RATIO`.
 
 **Phases 1–4 — post-gate (task-level only; expanded after the spike):**
 - Create `web/field/sam2_tracker.py` — production SAM2 tracker wrapper (prompt + propagate + periodic re-prompt), emits `(track_id, box, mask)` per camera.
@@ -224,22 +227,23 @@ git commit -m "feat(spike): pure id-switch + continuity metrics for tracking com
 ### Task 2: Author the ground-truth label sidecar
 
 **Files:**
-- Create: `data/videos/qual37.spike_labels.json`
+- Create: `data/test_footage/qual1_first_champs_2026.spike_labels.json`
 
-- [ ] **Step 1: Pick the hard segment**
+- [ ] **Step 1: Pick the hard segment (use the scrubber)**
 
-Scrub `data/videos/qual37.mp4` for a ~15–30 s window containing a hub-zone scrum and at least one same-alliance crossing. Record the frame range. Pick a `prompt_frame` near the segment start where all robots to be tracked are visible (un-occluded), so SAM2 can be prompted cleanly.
-
-Helper to scrub:
+Use `scripts/segment_scrubber.py` (built before this plan executes). First a montage to find the scrum window, then gridded single frames to read anchor uv:
 ```bash
-.venv/bin/python -c "import cv2;c=cv2.VideoCapture('data/videos/qual37.mp4');print('fps',c.get(5),'frames',int(c.get(7)))"
+.venv/bin/python scripts/segment_scrubber.py montage --start 200 --end 1200 --step 20 --out /tmp/scrub_montage.png
+# spot the scrum window, then dump candidate frames with a coordinate grid:
+.venv/bin/python scripts/segment_scrubber.py frame --idx 640 --grid --out /tmp/frame_640.png
 ```
+Choose a ~15–30 s window with a hub-zone scrum and at least one same-alliance crossing; record the frame range. Pick a `prompt_frame` near the start where all robots are visible (un-occluded) so SAM2 prompts cleanly. The scrubber's grid prints uv in **main-crop pixels** (top 0.67 crop) — the space anchors live in.
 
 - [ ] **Step 2: Write the sidecar**
 
 ```json
 {
-  "video": "data/videos/qual37.mp4",
+  "video": "data/test_footage/qual1_first_champs_2026.mp4",
   "segment": {"start_frame": 0, "end_frame": 0, "prompt_frame": 0, "stride": 2},
   "anchors": [
     {"frame": 0, "uv": [0, 0], "label": "blue_A"}
@@ -256,8 +260,8 @@ This anchor/occlusion sidecar shape is what the harness actually reads; it super
 - [ ] **Step 3: Commit**
 
 ```bash
-git add data/videos/qual37.spike_labels.json
-git commit -m "test(spike): ground-truth swap/occlusion labels for qual37 hard segment"
+git add data/test_footage/qual1_first_champs_2026.spike_labels.json
+git commit -m "test(spike): ground-truth swap/occlusion labels for qual1 hard segment"
 ```
 
 ### Task 3: Spike harness — SAM2 vs FieldTracker
@@ -268,20 +272,20 @@ This is an integration experiment, not TDD. Correctness is judged by the rendere
 - Create: `scripts/sam2_spike.py`
 
 Reference APIs (verified):
-- Calibration: `from web.field import store as field_store; cal = field_store.load("test", "main")`
+- Calibration: `from web.field import store as field_store; cal = field_store.load("test", "main")` (validated combo: test/main ↔ qual1 footage)
 - Field model + dims: `from web.field.field_model import FieldModel; fm = FieldModel.load(cal.field_season)`
-- Detector + bridge: `from web.app import MODEL_PATH, CALIB_MAIN_CROP_FRAC, _detect_bumper_color_static`; `from web.field.detect_bridge import to_field_detections`
-- Kalman baseline: `from web.field.tracker import FieldTracker`
-- Projection: `cal.image_to_field((u, v))`
+- Detector + bridge: `from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO, _detect_bumper_color_static`; `from web.field.detect_bridge import to_field_detections` (NOTE: not `CALIB_MAIN_CROP_FRAC` — that name is stale/absent)
+- Kalman baseline: `from web.field.tracker import FieldTracker` (needs valid calibration internally; that is why the clip must be qual1)
+- Projection (internal to FieldTracker only): `cal.image_to_field((u, v))`
 - SAM2: `from sam2.build_sam import build_sam2_video_predictor`
 
 - [ ] **Step 1: Scaffold — load clip, calibration, segment sidecar**
 
-Mirror the header of `scripts/verify_field_tracking.py` (path setup, `field_store.load("test", "main")`, `FieldModel.load`, skip-cleanly if calibration absent). Load `data/videos/qual37.spike_labels.json`. Crop each frame to `fr[: int(h * CALIB_MAIN_CROP_FRAC), :]` (same crop the calibration was solved on).
+Mirror the header of `scripts/verify_field_tracking.py` (path setup, `field_store.load("test", "main")`, `FieldModel.load`, skip-cleanly if calibration absent) — but fix the stale `CALIB_MAIN_CROP_FRAC` import to `OVERHEAD_CROP_RATIO`. Load `data/test_footage/qual1_first_champs_2026.spike_labels.json`. Crop each frame to `fr[: int(h * OVERHEAD_CROP_RATIO), :]` (the main view the calibration was solved on).
 
 - [ ] **Step 2: Baseline pass — run FieldTracker over the segment**
 
-For each frame in the segment (by `stride`): YOLO detect (`conf=0.4`, robot `class_id == 1`), `to_field_detections(...)`, `trk.update(dets, {}, dt=stride/fps)`. Record `baseline_frames[frame] = {slot_id: pos}` and keep each track's `box` for rendering.
+For each frame in the segment (by `stride`): YOLO detect (`conf=0.4`, robot `class_id == 1`), `to_field_detections(...)`, `trk.update(dets, {}, dt=stride/fps)`. The metric is image-space, so record `baseline_frames[frame] = {slot_id: bottom_center_uv}` using each `TrackOut.box` (skip tracks with `box is None`); keep the box for rendering too.
 
 - [ ] **Step 3: SAM2 pass — prompt at prompt_frame, propagate over the segment**
 
@@ -302,9 +306,9 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                                         obj_id=obj_id, box=box)
     for f_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
         masks = (mask_logits > 0).cpu().numpy()
-        # mask -> box -> bottom-center -> cal.image_to_field
+        # mask -> sv.mask_to_xyxy -> bottom-center (image uv); image-space metric, no projection
         ...
-        sam2_frames[seg_to_global(f_idx)] = {oid: field_xy for oid, field_xy in ...}
+        sam2_frames[seg_to_global(f_idx)] = {oid: bottom_center_uv for oid, bottom_center_uv in ...}
 ```
 Note: for the gate, a **single prompt at a clean frame** is sufficient to test SAM2's core occlusion-robustness. Periodic re-prompting is deferred to Phase 1 (SP-T.1).
 
@@ -312,17 +316,18 @@ Note: for the gate, a **single prompt at a clean frame** is sufficient to test S
 
 ```python
 from web.field.spike_metrics import count_id_switches, continuity_stats
+# Anchors and both trackers' positions are all in main-crop uv — no projection,
+# so calibration accuracy cannot bias the comparison.
 anchors = [(a["frame"], tuple(a["uv"]), a["label"]) for a in labels["anchors"]]
-# anchors are in image uv; project to field once so they live in the same space as tracks
-anchors_field = [(f, cal.image_to_field(uv), lab) for f, uv, lab in anchors]
-print("FieldTracker swaps:", count_id_switches(baseline_frames, anchors_field), continuity_stats(baseline_frames))
-print("SAM2 swaps:        ", count_id_switches(sam2_frames, anchors_field), continuity_stats(sam2_frames))
+print("FieldTracker swaps:", count_id_switches(baseline_frames, anchors), continuity_stats(baseline_frames))
+print("SAM2 swaps:        ", count_id_switches(sam2_frames, anchors), continuity_stats(sam2_frames))
 print("SAM2 latency ms/frame:", sam2_ms_per_frame)
 ```
+(SAM2's `sam2_frames[frame] = {obj_id: bottom_center_uv}` likewise from each mask's box.)
 
 - [ ] **Step 5: Render side-by-side video for eyeballing**
 
-Left = frame with FieldTracker slot boxes+ids; right = frame with SAM2 masks+ids. Write `data/videos/qual37_spike_compare.mp4`. Visually confirm the swap counts match what you see.
+Left = frame with FieldTracker slot boxes+ids; right = frame with SAM2 masks+ids. Write `data/test_footage/qual1_spike_compare.mp4`. Visually confirm the swap counts match what you see.
 
 - [ ] **Step 6: Run the spike**
 
@@ -333,7 +338,7 @@ Expected: prints both metric lines + latency; writes the comparison video.
 
 ```bash
 git add scripts/sam2_spike.py
-git commit -m "feat(spike): SAM2-vs-FieldTracker comparison harness on qual37 segment"
+git commit -m "feat(spike): SAM2-vs-FieldTracker comparison harness on qual1 segment"
 ```
 
 ### Task 4: Evaluate the gate and record the decision

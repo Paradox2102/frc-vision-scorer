@@ -5,6 +5,28 @@
 **Component:** new `web/field/sam2_tracker.py`; `web/field/tracker.py` (Kalman → thin `SlotMapper`); SP3 fusion re-point in `web/field/` + `web/app.py`; SP4 identity (detector `bumper_number` class, IoS matching, consecutive-agreement lock, appearance embeddings); spike harness `scripts/sam2_spike.py`
 **Part of:** "Field-coordinate rework" — unifies the remaining roadmap (replaces SP2 tracking approach, re-points SP3, defines SP4). See [SP1 roadmap](2026-05-28-field-coordinate-foundation-design.md#roadmap-where-this-fits).
 
+## SP-T.0 Result (2026-05-29, preliminary)
+
+First spike run on a 6-robot window of `qual1_first_champs_2026.mp4` (frames
+2130–2280, stride 2, prompt 2160), SAM2.1-hiera-large on the RTX 3090.
+
+| Signal | FieldTracker (Kalman) | SAM2 | Trust |
+|---|---|---|---|
+| Track births/deaths (fragmentation) | 31 / 31 | **7 / 7** | anchor-free — trustworthy |
+| Tracks maintained | 6 | 6 | trustworthy |
+| Mean frames/track | 57.3 | 58.7 | trustworthy |
+| Latency | — | **151 ms/frame** (GPU, 0.5× crop) | trustworthy |
+| Identity swaps | pending | pending | needs manual count |
+
+**Continuity strongly favors SAM2** (~77% less track fragmentation: 7 vs 31
+births/deaths over 76 frames), which is the mechanism behind fewer identity
+errors. Latency (151 ms/frame) is fine for offline batch (~11 min/match), too slow
+for naive 30 fps live — a known later concern. **The swap-based gate criterion is
+NOT yet decided:** the run used an empty anchor set, so swaps must be counted
+manually from `data/test_footage/qual1_spike_compare.mp4` (the spec's intended
+method) or via human-placed anchors. **Verdict: PASS-leaning on the continuity
+proxy, pending the manual swap count.** Harness/metrics/checkpoint all validated.
+
 ## Problem
 
 Sub-projects 1–3 are merged: the main camera is calibrated (SP1), a field-space

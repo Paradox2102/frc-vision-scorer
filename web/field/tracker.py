@@ -95,19 +95,24 @@ class FieldTracker:
             if t.active:
                 t.kf.predict(dt)
 
+        # Initialise assignment map: detection index -> slot_id
+        self.last_det_to_slot = {}
+
         # Assign detections per alliance.
         # Unknown-color detections go only to the alliance whose half they're in
         # (x < field_length/2 → "blue", else "red"), preventing a single unknown
         # detection from seeding slots in both alliances simultaneously.
         half = self.field_length / 2.0
+        indexed = list(enumerate(detections))
         for alliance in ALLIANCES:
             def _territory(pos):
                 return "blue" if pos[0] < half else "red"
+            pairs = [(i, d) for (i, d) in indexed
+                     if d.color == alliance
+                     or (d.color == "unknown" and _territory(d.pos) == alliance)]
             self._assign(
                 self._slots(alliance),
-                [d for d in detections
-                 if d.color == alliance
-                 or (d.color == "unknown" and _territory(d.pos) == alliance)],
+                pairs,
                 alliance,
             )
 
@@ -128,10 +133,14 @@ class FieldTracker:
 
         return self._emit()
 
-    def _assign(self, slots, dets, alliance):
+    def _assign(self, slots, dets_with_idx, alliance):
         """Match active tracks to dets, update matched, coast unmatched, seed free slots."""
         active_slots = [t for t in slots if t.active]
         free_slots = [t for t in slots if not t.active]
+
+        # Unpack original indices and detection objects from paired list
+        idxs = [i for (i, _) in dets_with_idx]
+        dets = [d for (_, d) in dets_with_idx]
 
         if active_slots and dets:
             # Build cost matrix: rows=active_slots, cols=dets
@@ -169,6 +178,7 @@ class FieldTracker:
                     t.coasting = False
                     matched_slot_indices.add(r)
                     matched_det_indices.add(c)
+                    self.last_det_to_slot[idxs[c]] = t.slot_id
 
             # Increment missed for unmatched active slots
             for i, t in enumerate(active_slots):
@@ -176,8 +186,8 @@ class FieldTracker:
                     t.missed += 1
 
             # Seed leftover detections into free slots
-            leftover_dets = [d for j, d in enumerate(dets) if j not in matched_det_indices]
-            for d in leftover_dets:
+            leftover_pairs = [(j, dets[j]) for j in range(len(dets)) if j not in matched_det_indices]
+            for j, d in leftover_pairs:
                 if not free_slots:
                     break
                 slot = free_slots.pop(0)
@@ -187,6 +197,7 @@ class FieldTracker:
                 slot.hits = 1
                 slot.coasting = False
                 slot.active = True
+                self.last_det_to_slot[idxs[j]] = slot.slot_id
 
         elif active_slots and not dets:
             # No detections: all active slots missed
@@ -195,7 +206,7 @@ class FieldTracker:
 
         else:
             # No active slots: seed as many dets as we have free slots
-            for d in dets:
+            for j, d in enumerate(dets):
                 if not free_slots:
                     break
                 slot = free_slots.pop(0)
@@ -205,6 +216,7 @@ class FieldTracker:
                 slot.hits = 1
                 slot.coasting = False
                 slot.active = True
+                self.last_det_to_slot[idxs[j]] = slot.slot_id
 
     def _best_assignment(self, cost):
         """Brute-force minimum-cost assignment for ≤3×3 cost matrices.

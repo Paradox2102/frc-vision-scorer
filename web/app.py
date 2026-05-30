@@ -40,12 +40,15 @@ from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
 from web.field.field_model import FieldModel
-from web.field.calibration import Calibrator, CalibrationError
+from web.field.calibration import Calibrator, CalibrationError, holdout_field_error
 from web.field.apriltag_detect import detect_tags
+from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker
-from web.field.occlusion import hub_prisms, resolve_occlusion
+from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.radar import Radar
+from web.field.camera_view import load_views
+from web.field.fusion import fuse_detections
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -85,7 +88,7 @@ LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 SCORE_REGIONS_FILE = PROJECT_ROOT / "score_regions.json"
 CALIB_TEST_VIDEO = Path(__file__).resolve().parents[1] / "data/test_footage/qual1_first_champs_2026.mp4"
-CALIB_MAIN_CROP_FRAC = 0.60   # main camera = top 60% of the composite
+# Per-camera crop regions now come from data/field/composite_layout.json (load_layout).
 
 # --- Per-match logging -------------------------------------------------------
 # Mirror everything this module print()s into any open match-log file(s) so a
@@ -169,6 +172,8 @@ LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
 REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
 OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by this to overturn
+CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
+CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
 
 # Bumper-number reading VLM. Swap models here (loaded via AutoModelForImageTextToText,
 # so any transformers-supported image-text-to-text model works, e.g. InternVL3, Nemotron).
@@ -304,6 +309,7 @@ class InferenceJob:
         # gates VLM reads (bumper_occluded). Both keyed by slot_id.
         self._view_flags: Dict[int, dict] = {}
         self._occ: Dict[int, dict] = {}
+        self._occ_by_cam: Dict[str, Dict[int, dict]] = {}
 
         # Video metadata
         self.video_width = 0
@@ -500,6 +506,116 @@ class InferenceJob:
                 print(f"  OCR confirmed: Robot {canonical_id} = Team {best_team} "
                       f"(was {old_team}, {votes:.1f} votes, all: {dict(robot.team_ocr_votes)})")
 
+    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None):
+        """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
+        encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
+        None when the crop is empty or below LEGIBILITY_FLOOR.
+
+        When a non-None robot_id is supplied and the crop is below the legibility floor,
+        the rejected crop is recorded as a vlm_filtered diagnostic (preserving the prior
+        behavior of vision_identify_robots).
+        """
+        x1, y1, x2, y2 = map(int, box)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        # Bumper band (lower part of the robot box).
+        box_h = y2 - y1
+        bumper_y1 = y1 + int(box_h * 0.35)
+        crop = frame[bumper_y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        score = legibility_score(crop)
+        if score < LEGIBILITY_FLOOR:
+            # Record the rejected crop so the diagnostic view can show why this robot
+            # went unread.
+            if robot_id is not None:
+                try:
+                    _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    rejected_b64 = base64.b64encode(buf).decode('utf-8')
+                except Exception as e:
+                    print(f"  vlm_filtered: imencode failed for robot {robot_id}: {e}")
+                    rejected_b64 = ""
+                self.diagnostic.record_vlm_filtered(
+                    frame=self._current_frame, robot_id=robot_id,
+                    crop_b64=rejected_b64, legibility=score,
+                    reason="below_legibility_floor",
+                )
+            return None
+
+        # Upscale so the bumper crop is at least ~384px tall (existing behavior).
+        if crop.shape[0] < 384:
+            scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        crop_b64 = base64.b64encode(buf).decode('utf-8')
+        return crop_b64, score
+
+    def _detect_view(self, view, composite_frame, precomputed_dets=None):
+        """Run YOLO + person detection on one camera view; returns
+        (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
+        and person_boxes are field-filtered occluder boxes in that view's pixels.
+
+        precomputed_dets: an sv.Detections already run on this view's frame (the main
+        loop computes robot/ball detections on the main overhead frame for hub/ball/
+        annotation, so we reuse them here instead of re-running YOLO on the same crop)."""
+        frame = view.extract(composite_frame)
+        cal = view.calibration
+        if precomputed_dets is not None:
+            dets = precomputed_dets
+        else:
+            results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+            dets = sv.Detections.from_ultralytics(results)
+        robot_boxes = [dets.xyxy[i] for i in range(len(dets)) if dets.class_id[i] == 1]
+        field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
+                                         color_fn=self.detect_bumper_color)
+        paired = []
+        for d in field_dets:
+            cb = self._bumper_crop_b64(frame, d.box)
+            crop_b64 = cb[0] if cb is not None else None
+            paired.append((d, crop_b64))
+        person_results = self.person_model(frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        pdets = sv.Detections.from_ultralytics(person_results)
+        person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
+        person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
+        return paired, person_boxes
+
+    def _remaining_rosters(self):
+        """(remaining_all, remaining_blue, remaining_red) — match roster minus
+        already-confirmed teams. Shared by the main and corner read paths."""
+        confirmed = {r.team_number for r in self.robot_tracks.values()
+                     if r.team_number_confirmed and r.team_number}
+        return (
+            [t for t in self.match_teams if t not in confirmed],
+            [t for t in self.match_blue_teams if t not in confirmed],
+            [t for t in self.match_red_teams if t not in confirmed],
+        )
+
+    def _apply_bumper_read(self, slot_id, crop_b64, remaining, remaining_blue,
+                           remaining_red, source_weight):
+        """Read one bumper crop with the VLM and add a (confidence x source_weight)
+        vote to the slot's team tally. source_weight > 1 for corner cameras."""
+        robot = self.robot_tracks.get(slot_id)
+        if not robot:
+            return
+        res = _vision_read_bumpers([crop_b64], remaining, remaining_blue, remaining_red)[0]
+        team = res.get("team_number")
+        if not team:
+            return
+        conf = res.get("confidence", 0.0)
+        weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
+        if robot.team_ocr_votes is None:
+            robot.team_ocr_votes = {}
+        robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
+        print(f"  Corner read: slot {slot_id} += {team} (w={weight:.1f}, "
+              f"total={robot.team_ocr_votes[team]:.1f})")
+
     def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
@@ -530,45 +646,10 @@ class InferenceJob:
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
                 continue  # bumper hidden by hub/person/robot — don't read it
 
-            x1, y1, x2, y2 = map(int, box)
-            fh, fw = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(fw, x2), min(fh, y2)
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # Bumper band (lower part of the robot box).
-            box_h = y2 - y1
-            bumper_y1 = y1 + int(box_h * 0.35)
-            crop = frame[bumper_y1:y2, x1:x2]
-            if crop.size == 0:
-                crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            score = legibility_score(crop)
-            if score < LEGIBILITY_FLOOR:
-                # Record the rejected crop so the diagnostic view can show why
-                # this robot went unread.
-                try:
-                    _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    rejected_b64 = base64.b64encode(buf).decode('utf-8')
-                except Exception as e:
-                    print(f"  vlm_filtered: imencode failed for robot {canonical_id}: {e}")
-                    rejected_b64 = ""
-                self.diagnostic.record_vlm_filtered(
-                    frame=self._current_frame, robot_id=canonical_id,
-                    crop_b64=rejected_b64, legibility=score,
-                    reason="below_legibility_floor",
-                )
-                continue
-
-            # Upscale so the bumper crop is at least ~384px tall (existing behavior).
-            if crop.shape[0] < 384:
-                scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
-                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            crop_b64 = base64.b64encode(buf).decode('utf-8')
+            cb = self._bumper_crop_b64(frame, box, robot_id=canonical_id)
+            if cb is None:
+                continue  # empty crop or below legibility floor (diagnostic recorded)
+            crop_b64, score = cb
             candidates.append((score, canonical_id, box, crop_b64))
 
         if not candidates:
@@ -1733,6 +1814,8 @@ class InferenceJob:
             self.hub_prisms = hub_prisms(self.field_model)
             self.field_tracker = FieldTracker(self.field_model.length_m)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
+            self.views = load_views(self.event_key)  # main first; corners if calibrated
+            print(f"  Cameras active: {[v.name for v in self.views]}")
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
             print(f"  FIELD TRACKING DISABLED: {self.error}")
@@ -1845,38 +1928,39 @@ class InferenceJob:
                 # Update hub positions (alliance assignment is static from setup)
                 self.update_hub_positions(detections)
                 
-                # ---- Field-space robot tracking (replaces ByteTrack/canonical re-ID) ----
-                # 1. Raw robot detection boxes from YOLO.
-                robot_mask = detections.class_id == 1
-                robot_boxes = [detections.xyxy[i] for i in range(len(detections))
-                               if robot_mask[i]]
+                # ---- Multi-camera field-space tracking ----
+                per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
+                person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
+                for view in self.views:
+                    # Reuse the top-of-loop YOLO result for main (its crop is the
+                    # overhead frame `detections` was computed on) — avoids a second
+                    # robot-YOLO pass per frame on the heaviest model.
+                    pre = detections if view.name == "main" else None
+                    paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
+                    per_camera[view.name] = paired
+                    person_boxes_by_cam[view.name] = pboxes
 
-                # 2. Persons (occluders) — separate YOLO model, same skip cadence.
-                person_results = self.person_model(
-                    overhead_frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                person_dets = sv.Detections.from_ultralytics(person_results)
-                person_boxes_all = [tuple(person_dets.xyxy[i]) for i in range(len(person_dets))]
-                person_boxes = field_adjacent_persons(
-                    person_boxes_all, self.calib, self.field_dims)
-
-                # 3. Bridge image boxes -> field-space detections (bumper color via
-                #    detect_bumper_color, injected as color_fn).
-                field_dets = to_field_detections(
-                    robot_boxes, self.calib, overhead_frame, self.field_dims,
-                    color_fn=self.detect_bumper_color,
-                )
-
-                # 4. Drive the field tracker. view_occluded flags from the PREVIOUS
-                #    frame widen this frame's coast budget.
+                weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
+                           for v in self.views}
+                fused = fuse_detections(per_camera, weights=weights)   # list[FusedObservation]
+                field_dets = [obs.detection for obs in fused]
                 dt = FRAME_SKIP / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
 
-                # 5. Resolve occlusion once on the emitted tracks; gate VLM next.
+                # 5. Resolve occlusion from every posed camera and merge: a track
+                #    is occluded only if occluded in ALL posed cameras.
                 occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
                              for t in track_outs]
-                self._occ = resolve_occlusion(
-                    self.calib, occ_input, person_boxes, self.hub_prisms)
-                self._view_flags = self._occ  # feed forward to next frame's tracker
+                posed = [v for v in self.views
+                         if v.calibration.camera_center is not None]
+                self._occ_by_cam = {
+                    v.name: resolve_occlusion(
+                        v.calibration, occ_input,
+                        person_boxes_by_cam.get(v.name, []), self.hub_prisms)
+                    for v in posed
+                }
+                self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
+                self._view_flags = self._occ   # feed forward to next frame's tracker
 
                 # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
                 tracked_robot_boxes = []  # (slot_id, box) for visible tracks
@@ -1925,6 +2009,28 @@ class InferenceJob:
                     self._claude_vision_calls += 1
                     self._claude_vision_last_time = current_time
                     self.vision_identify_robots(overhead_frame, tracked_robot_boxes)
+
+                # Corner-camera bumper reads: additive, weighted, NOT occlusion-gated.
+                # Corner cams read more clearly than main, so their reads confirm/correct
+                # identities every pass — even for already-confirmed slots (that's how a
+                # wrong main lock gets overturned by assign_teams_from_votes/audit).
+                if (processed_frame_num >= 10
+                        and processed_frame_num % CORNER_READ_INTERVAL == 0
+                        and self.match_teams):
+                    remaining, r_blue, r_red = self._remaining_rosters()
+                    # Mirror the main path's early-out: once every team is confirmed,
+                    # only keep reading on re-read passes (to self-correct a wrong
+                    # lock). Otherwise skip the VLM calls entirely.
+                    do_corner = bool(remaining) or is_reread_due
+                    for i, obs in enumerate(fused if do_corner else []):
+                        slot_id = self.field_tracker.last_det_to_slot.get(i)
+                        if slot_id is None:
+                            continue
+                        for (cam, crop_b64, w) in obs.evidence:
+                            if cam == "main" or crop_b64 is None:
+                                continue   # main handled above; skip empty/illegible
+                            self._apply_bumper_read(slot_id, crop_b64, remaining,
+                                                    r_blue, r_red, source_weight=w)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -2431,10 +2537,11 @@ async def calibration_auto(request: Request):
 
 @app.post("/api/calibration/frame")
 async def calibration_frame(request: Request):
-    """Grab a frame from a LOCAL video, cropped to the main-camera region (top
-    CALIB_MAIN_CROP_FRAC). Body: {timestamp?: seconds (default 75), video_path?}.
+    """Grab a frame from a LOCAL video, cropped to the requested camera's region
+    from the composite layout (masks applied). Body: {timestamp?: seconds
+    (default 75), video_path?, camera?}.
     Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
-    Crop origin is (0,0) so pixel coords match full-frame coords."""
+    Pixel coords are crop-local (origin at the camera crop's top-left)."""
     body = await request.json()
     ts = float(body.get("timestamp", 75))
     # video_path is restricted to data/test_footage/ with a video extension to
@@ -2462,8 +2569,15 @@ async def calibration_frame(request: Request):
     cap.release()
     if not ok or frame is None:
         return JSONResponse(status_code=400, content={"error": "could not read frame"})
-    h = frame.shape[0]
-    main = frame[: int(h * CALIB_MAIN_CROP_FRAC), :]
+    camera = body.get("camera", "main")
+    layout = load_layout()
+    cl = layout.get(camera)
+    if cl is None:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    cx, cy, cw, ch = cl.crop
+    main = frame[cy:cy + ch, cx:cx + cw].copy()
+    for (mx, my, mw, mh) in cl.masks:
+        main[my:my + mh, mx:mx + mw] = 0
     fm = FieldModel.load("2026-rebuilt-welded")
     det = detect_tags(main)
     detected = {str(tid): det[tid].tolist() for tid in det if tid in fm.tags}
@@ -2475,19 +2589,66 @@ async def calibration_frame(request: Request):
             "detected_tags": detected}
 
 
+@app.post("/api/calibration/refine-tag")
+async def calibration_refine_tag(request: Request):
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, u, v, id}.
+    Reads the configured CALIB_TEST_VIDEO at the timestamp, crops to the camera's
+    composite region, runs tag detection in an upscaled ROI around (u,v), and
+    returns {corners: [[u,v]x4]} in crop-pixel coords, or {corners: null}."""
+    from web.field.apriltag_detect import detect_tags_in_roi
+    body = await request.json()
+    camera = body.get("camera", "main")
+    tid = int(body["id"])
+    ts = float(body.get("timestamp", 75))
+    path = CALIB_TEST_VIDEO
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+    cl = load_layout().get(camera)
+    if cl is None:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    cx, cy, cw, ch = cl.crop
+    crop = frame[cy:cy + ch, cx:cx + cw]
+    corners = detect_tags_in_roi(crop, (float(body["u"]), float(body["v"])), tid)
+    return {"corners": corners.tolist() if corners is not None else None}
+
+
 def _draw_field_overlay(frame, cal, fm):
     """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
     Field lines are SAMPLED into polylines (a straight field line projects to a curved
     image line under lens distortion, so a 2-point segment can't trace it).
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
     L, W = fm.length_m, fm.width_m
+    H, Wd = frame.shape[:2]
     def fp(x, y):
         u, v = cal.field_to_image((x, y, 0.0))
         return (int(u), int(v))
+    def _ok(u, v):
+        # A poorly-conditioned calibration can project ground points to enormous
+        # (or non-finite) pixel coords — points near/behind the camera blow up.
+        # Keep only finite coords within a generous off-screen margin so the int32
+        # polyline conversion can't overflow (and we don't draw garbage segments).
+        return (np.isfinite(u) and np.isfinite(v)
+                and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
     def seg(p0, p1, color, thick, n=24):
         (x0, y0), (x1, y1) = p0, p1
-        pts = [fp(x0 + (x1 - x0) * t / n, y0 + (y1 - y0) * t / n) for t in range(n + 1)]
-        cv2.polylines(frame, [np.array(pts, np.int32)], False, color, thick)
+        run = []
+        def flush():
+            if len(run) >= 2:
+                cv2.polylines(frame, [np.array(run, np.int32)], False, color, thick)
+            run.clear()
+        for t in range(n + 1):
+            u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
+                                       y0 + (y1 - y0) * t / n, 0.0))
+            if _ok(u, v):
+                run.append((int(u), int(v)))
+            else:
+                flush()   # break the polyline across the blown-up region
+        flush()
     for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
         seg(a, b, (0, 255, 0), 2)
     x = 0.0
@@ -2528,8 +2689,12 @@ async def calibration_solve_homography(request: Request):
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     okf, frame = cap.read(); cap.release()
     overlay_b64 = None
-    if okf and frame is not None:
-        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
+    cl = load_layout().get(camera)
+    if okf and frame is not None and cl is not None:
+        cx, cy, cw, ch = cl.crop
+        main = frame[cy:cy + ch, cx:cx + cw].copy()
+        for (mx, my, mw_, mh_) in cl.masks:
+            main[my:my + mh_, mx:mx + mw_] = 0
         _draw_field_overlay(main, cal, fm)
         # clicked points
         for p in pts:
@@ -2539,6 +2704,10 @@ async def calibration_solve_homography(request: Request):
             overlay_b64 = base64.b64encode(buf.tobytes()).decode()
     return {"status": "ok", "rms_error": cal.rms_error, "n_points": len(pts),
             "overlay": overlay_b64}
+
+
+def _tag_id_of(key: str) -> int:
+    return int(key[1:]) if key[:1] in ("a", "m") else int(key)
 
 
 @app.post("/api/calibration/solve-tags")
@@ -2566,12 +2735,16 @@ async def calibration_solve_tags(request: Request):
             center3d = fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3)
             corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]], float),
                                center3d)
+    holdout_ids = set(int(i) for i in body.get("holdout_ids", []))
+    held = {k: v for k, v in corr.items() if _tag_id_of(k) in holdout_ids}
+    solve_corr = {k: v for k, v in corr.items() if _tag_id_of(k) not in holdout_ids}
     try:
-        cal = Calibrator.solve_camera_from_tags(corr, image_size=image_size,
+        cal = Calibrator.solve_camera_from_tags(solve_corr, image_size=image_size,
                                                 field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     field_store.save(event, camera, cal)
+    holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
@@ -2581,23 +2754,34 @@ async def calibration_solve_tags(request: Request):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     okf, frame = cap.read(); cap.release()
-    if okf and frame is not None:
-        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
-        _draw_field_overlay(main, cal, fm)
-        mh, mw = main.shape[:2]
-        for tid in fm.tags:
-            t3 = fm.tag_translation(tid)
-            u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
-            if 0 <= u < mw and 0 <= v < mh:
-                color = (0, 255, 0) if tid in used else (0, 165, 255)
-                cv2.circle(main, (int(u), int(v)), 5, color, -1)
-                cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if okj:
-            overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    cl = load_layout().get(camera)
+    # Overlay is a best-effort visualization. A poorly-conditioned calibration can
+    # make projection blow up; never let drawing failures sink the solve result
+    # (the caller still needs rms_error + holdout_error_m to judge the calibration).
+    try:
+        if okf and frame is not None and cl is not None:
+            cx, cy, cw, ch = cl.crop
+            main = frame[cy:cy + ch, cx:cx + cw].copy()
+            for (mx, my, mw_, mh_) in cl.masks:
+                main[my:my + mh_, mx:mx + mw_] = 0
+            _draw_field_overlay(main, cal, fm)
+            mh, mw = main.shape[:2]
+            for tid in fm.tags:
+                t3 = fm.tag_translation(tid)
+                u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
+                if 0 <= u < mw and 0 <= v < mh:
+                    color = (0, 255, 0) if tid in used else (0, 165, 255)
+                    cv2.circle(main, (int(u), int(v)), 5, color, -1)
+                    cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if okj:
+                overlay_b64 = base64.b64encode(buf.tobytes()).decode()
+    except Exception as e:
+        print(f"  calibration overlay render failed ({camera}): {e}")
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
-            "n_points": n_points, "overlay": overlay_b64}
+            "n_points": n_points, "overlay": overlay_b64,
+            "holdout_error_m": holdout_err}
 
 
 @app.get("/api/calibration/landmarks")

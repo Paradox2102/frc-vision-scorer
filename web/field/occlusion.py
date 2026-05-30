@@ -155,3 +155,22 @@ def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
                     bump = True; cause = cause or "robot"
         out[sid] = {"view_occluded": view, "bumper_occluded": bump or view, "cause": cause}
     return out
+
+
+def _merge_occlusion(per_cam):
+    """Merge per-camera occlusion dicts. A slot is occluded only if occluded in
+    EVERY camera (visible if any camera can see it). per_cam: list of
+    {slot_id: {view_occluded, bumper_occluded, cause}}. Returns one merged dict."""
+    if not per_cam:
+        return {}
+    slot_ids = set()
+    for d in per_cam:
+        slot_ids |= set(d.keys())
+    out = {}
+    for sid in slot_ids:
+        entries = [d[sid] for d in per_cam if sid in d]
+        view = all(e["view_occluded"] for e in entries) if entries else False
+        bump = all(e["bumper_occluded"] for e in entries) if entries else False
+        cause = next((e["cause"] for e in entries if e.get("cause")), None)
+        out[sid] = {"view_occluded": view, "bumper_occluded": bump, "cause": cause}
+    return out

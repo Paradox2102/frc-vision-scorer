@@ -76,8 +76,10 @@ class CameraCalibration:
         u, v = img.reshape(2)
         return (float(u), float(v))
 
-    def _cast_norm_ray_to_ground(self, norm) -> "tuple | None":
-        """Normalized camera ray (x_n, y_n) -> field (x, y) where it hits z=0."""
+    def _cast_norm_ray_to_z(self, norm, z=0.0) -> "tuple | None":
+        """Normalized camera ray (x_n, y_n) -> field (x, y) where it hits plane Z=z.
+        z=0 is the carpet (used for projecting robot ground-contact points); a
+        nonzero z is used to validate elevated references (e.g. AprilTags at z~1m)."""
         ray_cam = np.array([norm[0], norm[1], 1.0])
         R, _ = cv2.Rodrigues(self.rvec)
         cam_center = (-R.T @ self.tvec).reshape(3)
@@ -85,7 +87,7 @@ class CameraCalibration:
         denom = ray_world[2]
         if abs(denom) < 1e-9:
             return None
-        s = -cam_center[2] / denom
+        s = (z - cam_center[2]) / denom
         if s <= 0:
             return None
         world = cam_center + s * ray_world
@@ -99,7 +101,9 @@ class CameraCalibration:
         R, _ = cv2.Rodrigues(self.rvec)
         return (-R.T @ self.tvec).reshape(3)
 
-    def image_to_field(self, uv) -> "tuple | None":
+    def image_to_field(self, uv, z=0.0) -> "tuple | None":
+        """Project an image point to field (x, y) on the plane Z=z (default carpet,
+        z=0). Homography mode is ground-only and ignores z."""
         if self.mode == "homography":
             pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
             out = cv2.perspectiveTransform(pt, self.H).reshape(2)
@@ -108,11 +112,11 @@ class CameraCalibration:
             pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
             D = np.asarray(self.D, float).reshape(-1, 1)
             norm = cv2.undistortPoints(pt, self.K, D).reshape(2)
-            return self._cast_norm_ray_to_ground(norm)
+            return self._cast_norm_ray_to_z(norm, z)
         # fisheye camera mode:
         pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
         norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
-        return self._cast_norm_ray_to_ground(norm)
+        return self._cast_norm_ray_to_z(norm, z)
 
 
 class Calibrator:
@@ -226,6 +230,22 @@ class Calibrator:
                                 field_season=field_season)
         cal.rms_error = _reprojection_rms(cal, correspondences)
         return cal
+
+
+def holdout_field_error(cal: "CameraCalibration", held: dict) -> float:
+    """Mean field-position error in meters over held-out correspondences.
+    held: {tag_id: (img_pts (N,2), obj_pts (N,3))}. Each image point is projected
+    to the plane at the reference point's OWN height (obj z) — AprilTags sit at
+    z~0.55-1.12 m, so casting them to the carpet (z=0) would inject a large parallax
+    error and make a good calibration look bad. Compares against the known (x,y)."""
+    errs = []
+    for (i2d, o3d) in held.values():
+        for (u, v), p in zip(np.asarray(i2d).reshape(-1, 2), np.asarray(o3d).reshape(-1, 3)):
+            xy = cal.image_to_field((float(u), float(v)), z=float(p[2]))
+            if xy is None:
+                continue
+            errs.append(np.hypot(xy[0] - p[0], xy[1] - p[1]))
+    return float(np.mean(errs)) if errs else float("inf")
 
 
 def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:

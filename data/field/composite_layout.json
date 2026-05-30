@@ -1,9 +1,9 @@
 {
   "frame_size": [1920, 1080],
-  "_notes": "Measured from data/test_footage/qual1_first_champs_2026.mp4 via scripts/measure_composite_layout.py. main = top overhead (0..723 = OVERHEAD_CROP_RATIO*1080, unchanged from single-cam inference). Corner cameras occupy the bottom row below the perimeter-wall seam at y=703, split left/right at x=960. The broadcast lower-third bar is a single centered graphic straddling the seam (full-x 505..1390, corner-local y 272..377), so its left half masks corner_left's right side and its right half masks corner_right's left side; the molex watermark masks corner_right's bottom-right. masks are (x,y,w,h) in each camera's CROP-LOCAL pixels.",
+  "_notes": "Measured from data/test_footage/qual1_first_champs_2026.mp4 via scripts/measure_composite_layout.py. main = top overhead (0..723 = OVERHEAD_CROP_RATIO*1080, unchanged from single-cam inference). Corner cameras occupy the bottom row below the perimeter-wall seam at y=703, split left/right at x=960. The broadcast lower-third bar is a single OPAQUE centered graphic straddling the seam; its black rectangle was edge-fitted via temporal-variance + straight-edge detection to full-x 510..1408, full-y 982..1080 (corner-local y 279..377), so its left half masks corner_left's right side and its right half masks corner_right's left side. The molex watermark (corner_right bottom-right, formerly [740,278,220,99]) is intentionally NOT masked: it is semi-transparent (field carpet visible through it, temporal-mean gray ~133 vs banner ~57), so masking it discarded usable field. masks are (x,y,w,h) in each camera's CROP-LOCAL pixels.",
   "cameras": {
     "main":         { "crop": [0, 0, 1920, 723],   "masks": [] },
-    "corner_left":  { "crop": [0, 703, 960, 377],  "masks": [[500, 272, 460, 105]] },
-    "corner_right": { "crop": [960, 703, 960, 377], "masks": [[0, 272, 435, 105], [740, 278, 220, 99]] }
+    "corner_left":  { "crop": [0, 703, 960, 377],  "masks": [[510, 279, 450, 98]] },
+    "corner_right": { "crop": [960, 703, 960, 377], "masks": [[0, 279, 448, 98]] }
   }
 }

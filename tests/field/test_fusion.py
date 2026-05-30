@@ -41,3 +41,21 @@ def test_color_vote_resolves_unknown():
     }
     fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
     assert fused[0].detection.color == "blue"
+
+
+def test_members_single_camera():
+    # per-camera FieldDetection carries its SAM2 obj id as track_id
+    d = FieldDetection(pos=(1.0, 2.0), color="blue", box=(0, 0, 10, 10), track_id=1)
+    per_cam = {"main": [(d, b"crop")]}
+    fused = fuse_detections(per_cam, weights={"main": 1.0}, radius_m=0.6)
+    assert fused[0].members == [("main", 1)]
+    assert fused[0].track_id is None  # registry assigns it later; default is None
+
+
+def test_members_two_cameras_same_robot():
+    dm = FieldDetection(pos=(5.0, 3.0), color="blue", box=(0, 0, 10, 10), track_id=2)
+    dc = FieldDetection(pos=(5.2, 3.1), color="blue", box=(0, 0, 10, 10), track_id=1)
+    per_cam = {"main": [(dm, b"m")], "corner_left": [(dc, b"c")]}
+    fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
+    assert len(fused) == 1
+    assert set(fused[0].members) == {("main", 2), ("corner_left", 1)}

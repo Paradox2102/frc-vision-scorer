@@ -8,7 +8,7 @@ color vote) is what the tracker consumes; the FusedObservation also carries the
 raw evidence so the identity step can read each camera's bumper crop with its
 source weight."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 from web.field.tracker import FieldDetection
 
@@ -17,6 +17,8 @@ from web.field.tracker import FieldDetection
 class FusedObservation:
     detection: FieldDetection                 # what the tracker sees
     evidence: list                            # [(source_camera, bumper_crop, weight), ...]
+    members: list = field(default_factory=list)   # [(camera, per_camera_track_id), ...]
+    track_id: int | None = None               # stable fused id (assigned by FusedTrackRegistry)
 
 
 def fuse_detections(per_camera: dict, weights: dict, radius_m: float = 0.6) -> list:
@@ -62,7 +64,9 @@ def _merge(cluster) -> FusedObservation:
     # representative box: highest-weight cluster member
     box = max(cluster, key=lambda c: c[3])[1].box
     evidence = [(cam, crop, w) for (cam, det, crop, w) in cluster]
+    members = [(cam, det.track_id) for (cam, det, crop, w) in cluster]
     return FusedObservation(
         detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box),
         evidence=evidence,
+        members=members,
     )

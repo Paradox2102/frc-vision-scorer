@@ -8,7 +8,13 @@ def test_render_returns_image_of_configured_size():
 
 def test_point_maps_to_expected_pixel():
     r = Radar(field_length=16.541, field_width=8.069, px_per_m=40)
-    # field (0,0) -> top-left-ish origin mapping; check a known interior point.
+    # Observer HUD flips field Y so +Y is upward on screen.
+    origin_px = r.field_to_pixel((0.0, 0.0))
+    top_px = r.field_to_pixel((0.0, 8.069))
+    assert abs(origin_px[1] - 8.069 * 40) <= 1
+    assert abs(top_px[1]) <= 1
+
+    # Field center still maps to screen center.
     px = r.field_to_pixel((8.2705, 4.0345))  # field center
     assert abs(px[0] - 16.541*40/2) <= 1
     assert abs(px[1] - 8.069*40/2) <= 1

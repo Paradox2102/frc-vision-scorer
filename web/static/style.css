@@ -271,6 +271,34 @@ nav {
     margin-right: 0.75rem;
 }
 
+.reader-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0.75rem 0 1rem;
+    padding: 0.65rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+.reader-toggle-label {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-right: auto;
+}
+
+.reader-toggle label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
 .divider {
     text-align: center;
     color: var(--text-secondary);
@@ -409,7 +437,11 @@ nav {
     flex-shrink: 0;
 }
 
-.hud-left { display: flex; gap: 1.5rem; }
+.hud-left {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+}
 .hud-item { display: flex; gap: 0.4rem; font-size: 0.85rem; }
 .hud-label { color: var(--text-secondary); font-weight: 500; }
 .hud-scores { display: flex; gap: 1rem; }
@@ -502,6 +534,90 @@ nav {
 .alliance-card tbody tr:last-child td { border-bottom: none; }
 .alliance-card tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 .goal-count { font-weight: 700; font-size: 1.1rem; }
+
+.vlm-card {
+    background: var(--bg-secondary);
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.vlm-header {
+    padding: 0.5rem 0.8rem;
+    font-weight: 700;
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.vlm-crops {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.5rem;
+    padding: 0.6rem;
+}
+
+.vlm-crop {
+    display: grid;
+    grid-template-columns: 96px 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.45rem;
+    background: var(--bg-primary);
+}
+
+.vlm-crop.blue { border-color: var(--blue-border); }
+.vlm-crop.red { border-color: var(--red-border); }
+
+.vlm-crop img {
+    width: 96px;
+    height: 58px;
+    object-fit: contain;
+    background: #05070c;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.vlm-crop-meta {
+    min-width: 0;
+}
+
+.vlm-crop-title {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+}
+
+.vlm-result {
+    margin-top: 0.15rem;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+}
+
+.vlm-result.matched { color: #f8fafc; }
+.vlm-result.unmatched { color: var(--text-secondary); }
+
+.vlm-subtext,
+.vlm-error {
+    margin-top: 0.1rem;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.vlm-error {
+    color: #fca5a5;
+    overflow-wrap: anywhere;
+}
 
 .empty-state {
     text-align: center;

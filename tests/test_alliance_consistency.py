@@ -19,7 +19,7 @@ def _make_job():
     `assign_teams_from_votes` actually reads. Lets us call the method as an
     unbound function (`InferenceJob.assign_teams_from_votes(job)`) without
     paying the cost of `InferenceJob.__init__` (which loads YOLO weights)."""
-    return SimpleNamespace(
+    job = SimpleNamespace(
         match_blue_teams=["2102", "9452", "2485"],
         match_red_teams=["1538", "294", "4322"],
         match_teams=["2102", "9452", "2485", "1538", "294", "4322"],
@@ -28,6 +28,10 @@ def _make_job():
         _current_frame=0,
         diagnostic=NullRecorder(),
     )
+    # Confirming a team now purges it from other slots; bind the real helper so
+    # the stand-in exercises that behavior instead of crashing on a missing attr.
+    job._clear_team_from_other_robots = InferenceJob._clear_team_from_other_robots.__get__(job)
+    return job
 
 
 def test_team_assignment_respects_slot_alliance_and_never_flips_it():

@@ -90,6 +90,17 @@
                                 <label for="youtubeUrl">YouTube URL:</label>
                                 <input type="text" id="youtubeUrl" placeholder="https://youtube.com/watch?v=...">
                             </div>
+                            <div class="reader-toggle">
+                                <span class="reader-toggle-label">Team Number Reader</span>
+                                <label>
+                                    <input type="radio" name="teamReader" value="local" checked>
+                                    <span>Local GPU</span>
+                                </label>
+                                <label>
+                                    <input type="radio" name="teamReader" value="deepseek">
+                                    <span>DeepSeek V4</span>
+                                </label>
+                            </div>
                             <button type="submit" class="btn-primary">Analyze Video</button>
                         </form>
                     </div>
@@ -118,6 +129,7 @@
                         <div class="hud-left">
                             <span class="hud-item"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
                             <span class="hud-item"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
+                            <span class="hud-item"><span class="hud-label">Reader</span> <span id="hudReader">local idle</span></span>
                         </div>
                         <div class="hud-scores">
                             <div class="score-chip blue">
@@ -164,6 +176,13 @@
                                 <tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+
+                    <div class="vlm-card">
+                        <div class="vlm-header">BUMPER READS</div>
+                        <div class="vlm-crops" id="vlmCrops">
+                            <p class="empty-state">No VLM crops sent yet</p>
+                        </div>
                     </div>
 
                     <div class="timeline-card">

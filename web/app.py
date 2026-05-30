@@ -14,6 +14,8 @@ import pytesseract
 import shutil
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -49,6 +51,8 @@ from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.radar import Radar
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
+from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color
+from web.field.zones import load_zones, save_zones
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -171,7 +175,12 @@ EMBED_EMA_ALPHA = 0.3     # weight of the new embedding in the running EMA
 LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
 REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
+VLM_UNCONFIRMED_FAST_INTERVAL_SEC = 0.75
+VLM_UNCONFIRMED_MED_INTERVAL_SEC = 1.25
+VLM_UNCONFIRMED_SLOW_INTERVAL_SEC = 2.0
+VLM_CONFIRMED_AUDIT_INTERVAL_SEC = 8.0
 OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by this to overturn
+VLM_DIRECT_CONTRADICTION_CONF = 0.9  # exact/high-confidence read that unlocks a wrong confirmed label
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
 
@@ -271,9 +280,10 @@ class ScoringEvent:
 class InferenceJob:
     """Manages a single video inference job"""
     
-    def __init__(self, job_id: str, video_path: Path):
+    def __init__(self, job_id: str, video_path: Path, team_reader: str = "local"):
         self.job_id = job_id
         self.video_path = video_path
+        self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
         self._log_file = None
@@ -331,6 +341,17 @@ class InferenceJob:
         self.recent_ball_detections: deque = deque(maxlen=BALL_PROXIMITY_FRAMES)
         self.last_ocr_crops: list = []     # crops fed to the VLM + reads, for UI spot-check
         self._ocr_crops_dirty = False      # only stream crops on frames where a new batch exists
+        self.vlm_status = {
+            "provider": self.team_reader,
+            "calls": 0,
+            "last_frame": None,
+            "last_candidates": 0,
+            "last_sent": 0,
+            "last_interval_sec": None,
+            "unconfirmed": 0,
+            "last_results": [],
+            "last_error": None,
+        }
         
         # OCR state (raw reads for authoritative score sync)
         self._last_ocr = {"blue": None, "red": None}
@@ -506,10 +527,10 @@ class InferenceJob:
                 print(f"  OCR confirmed: Robot {canonical_id} = Team {best_team} "
                       f"(was {old_team}, {votes:.1f} votes, all: {dict(robot.team_ocr_votes)})")
 
-    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None):
+    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None, enforce_floor: bool = True):
         """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
         encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
-        None when the crop is empty or below LEGIBILITY_FLOOR.
+        None when the crop is empty or, when enforce_floor=True, below LEGIBILITY_FLOOR.
 
         When a non-None robot_id is supplied and the crop is below the legibility floor,
         the rejected crop is recorded as a vlm_filtered diagnostic (preserving the prior
@@ -522,17 +543,14 @@ class InferenceJob:
         if x2 <= x1 or y2 <= y1:
             return None
 
-        # Bumper band (lower part of the robot box).
-        box_h = y2 - y1
-        bumper_y1 = y1 + int(box_h * 0.35)
-        crop = frame[bumper_y1:y2, x1:x2]
-        if crop.size == 0:
+        crop = bumper_crop(frame, (x1, y1, x2, y2))
+        if crop is None or crop.size == 0:
             crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return None
 
         score = legibility_score(crop)
-        if score < LEGIBILITY_FLOOR:
+        if enforce_floor and score < LEGIBILITY_FLOOR:
             # Record the rejected crop so the diagnostic view can show why this robot
             # went unread.
             if robot_id is not None:
@@ -577,7 +595,7 @@ class InferenceJob:
                                          color_fn=self.detect_bumper_color)
         paired = []
         for d in field_dets:
-            cb = self._bumper_crop_b64(frame, d.box)
+            cb = self._bumper_crop_b64(frame, d.box, enforce_floor=False)
             crop_b64 = cb[0] if cb is not None else None
             paired.append((d, crop_b64))
         person_results = self.person_model(frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
@@ -604,7 +622,17 @@ class InferenceJob:
         robot = self.robot_tracks.get(slot_id)
         if not robot:
             return
-        res = _vision_read_bumpers([crop_b64], remaining, remaining_blue, remaining_red)[0]
+        alliance = getattr(robot, "alliance", "unknown")
+        expected = alliance if alliance in ("blue", "red") else "unknown"
+        try:
+            res = _vision_read_bumpers(
+                [crop_b64], getattr(self, "match_teams", None) or remaining, remaining_blue, remaining_red,
+                expected_alliances=[expected],
+                provider=getattr(self, "team_reader", "local"),
+            )[0]
+        except TypeError:
+            # Older tests monkeypatch the previous 4-arg helper shape.
+            res = _vision_read_bumpers([crop_b64], remaining, remaining_blue, remaining_red)[0]
         team = res.get("team_number")
         if not team:
             return
@@ -615,6 +643,213 @@ class InferenceJob:
         robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
         print(f"  Corner read: slot {slot_id} += {team} (w={weight:.1f}, "
               f"total={robot.team_ocr_votes[team]:.1f})")
+
+    def _is_reread_pass(self, unconfirmed_count: int) -> bool:
+        """Whether this VLM pass also re-reads already-confirmed slots.
+
+        Re-reading confirmed slots is the only way a wrong lock self-corrects.
+        It must NOT depend solely on `unconfirmed_count == 0`: a wrong lock holds
+        a roster team hostage (locked teams are excluded from assignment in
+        reid.assign_teams_alliance_masked), so the real robot for that team can
+        never confirm — `unconfirmed_count` then never reaches 0 and the bad lock
+        deadlocks forever, its early crop "stuck" on screen all match. So also
+        force a periodic audit every REREAD_EVERY_N_PASSES calls regardless.
+        """
+        if unconfirmed_count == 0:
+            return True
+        return self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0
+
+    def _vlm_interval_seconds(self, unconfirmed_count: int) -> float:
+        """Retry faster while robot identities are missing, then back off to audits."""
+        if unconfirmed_count >= 4:
+            return VLM_UNCONFIRMED_FAST_INTERVAL_SEC
+        if unconfirmed_count >= 2:
+            return VLM_UNCONFIRMED_MED_INTERVAL_SEC
+        if unconfirmed_count == 1:
+            return VLM_UNCONFIRMED_SLOW_INTERVAL_SEC
+        return VLM_CONFIRMED_AUDIT_INTERVAL_SEC
+
+    def _handle_confirmed_vlm_contradiction(self, robot, new_team: Optional[str],
+                                            confidence: float, raw_read: Optional[str],
+                                            source: str) -> None:
+        """Unlock a confirmed label when a strong current VLM read contradicts it.
+
+        A confirmed team is a state lock, not ground truth. If the current bumper
+        crop reads a different roster team with high confidence, keep the vote and
+        clear the lock so the normal one-to-one assignment can correct the HUD and
+        scoring attribution on the next identity pass.
+        """
+        if not robot or not robot.team_number_confirmed or not robot.team_number:
+            return
+        if not new_team or new_team == robot.team_number:
+            return
+        raw_digits = "".join(ch for ch in str(raw_read or "") if ch.isdigit())
+        # Treat exact roster reads as strong contradictions. Fuzzy/partial reads
+        # still accumulate votes and can overturn through the margin audit.
+        if confidence < VLM_DIRECT_CONTRADICTION_CONF or raw_digits != str(new_team):
+            return
+
+        old_team = robot.team_number
+        self.diagnostic.record_overturn(
+            frame=self._current_frame, robot_id=robot.robot_id,
+            old_team=old_team, challenger_team=new_team,
+            current_votes=float((robot.team_ocr_votes or {}).get(old_team, 0.0)),
+            challenger_votes=float((robot.team_ocr_votes or {}).get(new_team, 0.0)),
+        )
+        print(f"  VLM contradiction [{source}]: {self._slot_label(robot.robot_id)} "
+              f"was locked as {old_team}, current crop reads {raw_digits}->{new_team}; unlocking")
+        if robot.team_ocr_votes is None:
+            robot.team_ocr_votes = {}
+        robot.team_ocr_votes.pop(old_team, None)
+        robot.team_ocr_votes[new_team] = max(
+            float(robot.team_ocr_votes.get(new_team, 0.0)),
+            float(OCR_TEAM_CONFIRM_VOTES),
+        )
+        robot.team_number = None
+        robot.team_number_confirmed = False
+
+    def read_fused_bumper_numbers(self, fused, is_reread_pass: bool) -> None:
+        """Read team numbers from the per-camera bumper crops attached to fusion.
+
+        This is the reliable path for multi-camera tracking: every crop is already
+        in its source camera's coordinates. Do not crop the final fused/track box
+        from the main overhead frame; that box may have come from a corner camera.
+        """
+        if not self.match_teams:
+            self.vlm_status.update({
+                "provider": getattr(self, "team_reader", "local"),
+                "last_frame": self._current_frame,
+                "last_candidates": 0,
+                "last_sent": 0,
+                "last_results": [],
+                "last_error": "no match roster",
+            })
+            self._ocr_crops_dirty = True
+            return
+
+        candidates = []  # (priority, slot_id, cam, crop_b64, source_weight)
+        for i, obs in enumerate(fused):
+            slot_id = self.field_tracker.last_det_to_slot.get(i)
+            if slot_id is None:
+                continue
+            robot = self.robot_tracks.get(slot_id)
+            if robot is None:
+                continue
+            if robot.team_number_confirmed and not is_reread_pass:
+                continue
+            # If every camera says the bumper is occluded, skip. Otherwise corner
+            # evidence remains useful even when the main view is blocked.
+            if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
+                cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
+            ):
+                continue
+            for cam, crop_b64, source_weight in obs.evidence:
+                if crop_b64 is None:
+                    continue
+                # Prefer corner-camera crops slightly because they often see
+                # side bumpers more directly; source_weight already encodes that.
+                candidates.append((float(source_weight), slot_id, cam, crop_b64, float(source_weight)))
+
+        if not candidates:
+            print("  VLM skipped: no legible fused bumper crops this pass")
+            self.vlm_status.update({
+                "provider": getattr(self, "team_reader", "local"),
+                "last_frame": self._current_frame,
+                "last_candidates": 0,
+                "last_sent": 0,
+                "last_results": [],
+                "last_error": "no fused bumper crops",
+            })
+            self._ocr_crops_dirty = True
+            return
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        chosen = candidates[:VLM_TOP_K]
+
+        crops = [c[3] for c in chosen]
+        expected = []
+        for _priority, slot_id, _cam, _crop_b64, _source_weight in chosen:
+            robot = self.robot_tracks.get(slot_id)
+            alliance = getattr(robot, "alliance", "unknown")
+            expected.append(alliance if alliance in ("blue", "red") else "unknown")
+
+        provider = getattr(self, "team_reader", "local")
+        self.vlm_status.update({
+            "provider": provider,
+            "calls": int(self.vlm_status.get("calls", 0)) + 1,
+            "last_frame": self._current_frame,
+            "last_candidates": len(candidates),
+            "last_sent": len(chosen),
+            "last_results": [],
+            "last_error": None,
+        })
+        try:
+            results = _vision_read_bumpers(
+                crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
+                expected_alliances=expected,
+                provider=provider,
+            )
+        except Exception as e:
+            print(f"  VLM failed [{provider}]: {e}")
+            self.vlm_status["last_error"] = str(e)
+            return
+
+        ocr_crops = []
+        status_results = []
+        for (_priority, slot_id, cam, crop_b64, source_weight), res in zip(chosen, results):
+            robot = self.robot_tracks.get(slot_id)
+            if not robot:
+                continue
+            team = res.get("team_number")
+            conf = float(res.get("confidence", 0.0))
+            vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
+            status_results.append({
+                "slot": self._slot_label(slot_id),
+                "source": cam,
+                "raw_read": res.get("raw_read"),
+                "team_number": team,
+                "confidence": conf,
+                "error": res.get("error"),
+            })
+            ocr_crops.append({
+                "robot_id": slot_id,
+                "slot": self._slot_label(slot_id),
+                "alliance": res.get("alliance", "unknown"),
+                "source": cam,
+                "crop": crop_b64,
+                "raw_read": res.get("raw_read"),
+                "matched": team,
+                "confidence": conf,
+                "error": res.get("error"),
+                "legibility": None,
+            })
+            self.diagnostic.record_vlm_read(
+                frame=self._current_frame, robot_id=slot_id,
+                crop_b64=crop_b64,
+                legibility=0.0,
+                raw_read=res.get("raw_read"),
+                matched_team=team,
+                alliance_read=res.get("alliance", "unknown"),
+                confidence=conf,
+                vote_weight=vote_weight,
+            )
+            if not team:
+                continue
+            if robot.team_ocr_votes is None:
+                robot.team_ocr_votes = {}
+            robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
+            self._handle_confirmed_vlm_contradiction(
+                robot, team, conf, res.get("raw_read"), cam
+            )
+            print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
+                  f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
+
+        self.last_ocr_crops = ocr_crops
+        self._ocr_crops_dirty = True
+        self.vlm_status["last_results"] = status_results
+        errors = [r.get("error") for r in status_results if r.get("error")]
+        if errors:
+            self.vlm_status["last_error"] = errors[0]
 
     def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
@@ -662,14 +897,26 @@ class InferenceJob:
         results = []
         ocr_crops = []
         for score, canonical_id, box, crop_b64 in chosen:
-            res = _vision_read_bumpers([crop_b64], remaining_teams, remaining_blue, remaining_red)[0]
+            expected = "unknown"
+            robot = self.robot_tracks.get(canonical_id)
+            if robot and robot.alliance in ("blue", "red"):
+                expected = robot.alliance
+            res = _vision_read_bumpers(
+                [crop_b64], self.match_teams, self.match_blue_teams, self.match_red_teams,
+                expected_alliances=[expected],
+                provider=getattr(self, "team_reader", "local"),
+            )[0]
             results.append((canonical_id, box, res))
             ocr_crops.append({
                 "robot_id": canonical_id,
+                "slot": self._slot_label(canonical_id),
                 "alliance": res.get("alliance", "unknown"),
+                "source": "main",
                 "crop": crop_b64,
                 "raw_read": res.get("raw_read"),
                 "matched": res.get("team_number"),
+                "confidence": float(res.get("confidence", 0.0)),
+                "error": res.get("error"),
                 "legibility": round(score, 4),
             })
             self.diagnostic.record_vlm_read(
@@ -697,6 +944,9 @@ class InferenceJob:
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
+            self._handle_confirmed_vlm_contradiction(
+                robot, team, float(conf), result.get("raw_read"), "main"
+            )
             tag = "RE-READ" if robot.team_number_confirmed else "read"
             print(f"  Vision {tag}: Robot {canonical_id} += {team} "
                   f"(w={weight}, total={robot.team_ocr_votes[team]:.1f})")
@@ -829,6 +1079,8 @@ class InferenceJob:
             total = sum((r.team_ocr_votes or {}).values()) or 1.0
             r.team_number = team
             r.team_number_confirmed = bool(v >= 3.0 and v / total >= 0.6)
+            if r.team_number_confirmed:
+                self._clear_team_from_other_robots(rid, team)
             self.diagnostic.record_assignment(
                 frame=self._current_frame, robot_id=rid, team=team,
                 alliance=r.alliance, confirmed=r.team_number_confirmed,
@@ -851,6 +1103,7 @@ class InferenceJob:
             r = self.robot_tracks[rid]
             r.team_number = team
             r.team_number_confirmed = True
+            self._clear_team_from_other_robots(rid, team)
             self.diagnostic.record_elimination(
                 frame=self._current_frame, robot_id=rid, team=team, alliance=r.alliance,
             )
@@ -1097,58 +1350,194 @@ class InferenceJob:
         return "red" if x < midpoint else "blue"
 
     def detect_bumper_color(self, frame: np.ndarray, box: np.ndarray) -> str:
-        """Detect robot alliance from bumper color using HSV analysis.
-        Tuned for elevated camera angles (30-40 degrees) where bumpers may be
-        partially occluded and arena lighting can wash out saturation.
+        """Detect current-match alliance from the bumper band only.
+
+        Robot paint, LEDs, and mechanisms can be the opposite color from the
+        bumpers, so this delegates to the bumper-focused lower-band classifier.
         Returns 'blue', 'red', or 'unknown'."""
+        return classify_bumper_color(frame, box).alliance
+
+    def _team_hud_label(self, robot, fallback: str) -> tuple[str, bool]:
+        """Return a display label and whether the team is confirmed.
+
+        VLM/OCR votes may exist before the interval assignment step promotes a
+        team into `robot.team_number`; show those leading votes so the HUD makes
+        active team-number reads visible immediately.
+        """
+        if robot is None:
+            return f"{fallback} no #", False
+        if robot.team_number and robot.team_number_confirmed:
+            return f"{robot.team_number} (100%) S{robot.scores}", True
+
+        best_team = robot.team_number
+        best_vote = 0.0
+        if robot.team_ocr_votes:
+            best_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
+        if best_team:
+            if best_vote:
+                conf = min(99, int(best_vote / OCR_TEAM_CONFIRM_VOTES * 100))
+            else:
+                conf = 50
+            return f"{best_team}? ({conf}%) S{robot.scores}", False
+        return f"{fallback} no # S{robot.scores}", False
+
+    def _nearest_track_for_detection(self, det, track_outs, max_dist_m: float = 0.85):
+        best = None
+        best_d = max_dist_m
+        dp = np.array(det.pos, float)
+        for t in track_outs:
+            if t.state == "empty":
+                continue
+            d = float(np.linalg.norm(dp - np.array(t.pos, float)))
+            if d <= best_d:
+                best = t
+                best_d = d
+        return best
+
+    def _draw_bumper_hud(self, img: np.ndarray, box, alliance: str, label: str,
+                         slot_id: Optional[int] = None, cal=None, field_pos=None,
+                         vel=None) -> None:
+        """Draw bumper-specific evidence over a camera view."""
+        color = (255, 80, 20) if alliance == "blue" else (30, 30, 255) if alliance == "red" else (190, 190, 190)
         x1, y1, x2, y2 = map(int, box)
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return "unknown"
-        
-        # Elevated spectator view: bumpers are usually in lower-middle, not extreme bottom.
-        # Also trim side edges to reduce floor/reflection contamination.
-        bw = x2 - x1
-        bh = y2 - y1
-        roi_x1 = x1 + int(bw * 0.10)
-        roi_x2 = x2 - int(bw * 0.10)
-        roi_y1 = y1 + int(bh * 0.35)
-        roi_y2 = y1 + int(bh * 0.95)
-        if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
-            roi = frame[y1:y2, x1:x2]
-        else:
-            roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-        if roi.size == 0:
-            roi = frame[y1:y2, x1:x2]
-        if roi.size == 0:
-            return "unknown"
-        
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        
-        # Wider HSV ranges for arena lighting conditions
-        # Red bumper (red wraps around hue 0/180) — wider hue range, lower S/V minimums
-        red_mask1 = cv2.inRange(hsv, np.array([0, 45, 40]), np.array([16, 255, 255]))
-        red_mask2 = cv2.inRange(hsv, np.array([165, 45, 40]), np.array([180, 255, 255]))
-        red_pixels = cv2.countNonZero(red_mask1 | red_mask2)
-        
-        # Blue bumper — wider hue range, lower S/V minimums  
-        blue_mask = cv2.inRange(hsv, np.array([88, 45, 40]), np.array([140, 255, 255]))
-        blue_pixels = cv2.countNonZero(blue_mask)
-        
-        total_pixels = roi.shape[0] * roi.shape[1]
-        if total_pixels == 0:
-            return "unknown"
-        red_ratio = red_pixels / total_pixels
-        blue_ratio = blue_pixels / total_pixels
-        
-        # Lower threshold tuned for partially visible bumpers at elevated angles.
-        if red_ratio > 0.015 and red_ratio > blue_ratio * 1.25:
-            return "red"
-        elif blue_ratio > 0.015 and blue_ratio > red_ratio * 1.25:
-            return "blue"
-        return "unknown"
+        band = bumper_band_box(img, box)
+        if band is not None:
+            bx1, by1, bx2, by2 = band
+            overlay = img.copy()
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
+            cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
+            cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
+            cv2.line(img, (bx1, by2), (bx2, by2), (255, 255, 255), 2)
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        text = f"{self._slot_label(slot_id)} {label}" if slot_id is not None else label
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(img, (x1, max(0, y1 - th - 9)), (x1 + tw + 7, y1), (0, 0, 0), -1)
+        cv2.putText(img, text, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, color, 2, cv2.LINE_AA)
+
+        if cal is not None and field_pos is not None:
+            self._draw_projected_robot_plane(img, cal, field_pos, vel, color, box)
+
+    def _draw_projected_robot_plane(self, img: np.ndarray, cal, field_pos, vel, color, box=None) -> None:
+        """Draw bumper-ground evidence and a separate motion vector.
+
+        Robot bumper/chassis orientation and robot travel direction are different
+        signals. The debug plane is anchored to the detected bumper bottom edge
+        in image space so it visualizes the measurement instead of a potentially
+        lagged/smoothed track center.
+        """
+        try:
+            x, y = float(field_pos[0]), float(field_pos[1])
+            vx, vy = (float(vel[0]), float(vel[1])) if vel is not None else (0.0, 0.0)
+
+            if box is not None:
+                band = bumper_band_box(img, box)
+                if band is not None:
+                    bx1, by1, bx2, by2 = band
+                    bottom_y = by2
+                    # A visual ground contact strip: lower edge is the bumper
+                    # bottom, upper edge is just above it. This stays attached to
+                    # the detected robot even when the field track is smoothed.
+                    height = max(10, int((by2 - by1) * 0.45))
+                    skew = int((bx2 - bx1) * 0.12)
+                    poly = np.array([
+                        (bx1, bottom_y),
+                        (bx2, bottom_y),
+                        (bx2 - skew, bottom_y + height),
+                        (bx1 + skew, bottom_y + height),
+                    ], np.int32)
+                    h, w = img.shape[:2]
+                    poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+                    poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+                    overlay = img.copy()
+                    cv2.fillPoly(overlay, [poly], color)
+                    cv2.addWeighted(overlay, 0.18, img, 0.82, 0, img)
+                    cv2.polylines(img, [poly], True, color, 2)
+
+            speed = float(np.hypot(vx, vy))
+            center = cal.field_to_image((x, y, 0.0))
+            if speed >= 0.15 and center is not None:
+                n = max(speed, 1e-6)
+                arrow_len = min(1.0, 0.35 + speed * 0.20)
+                tip = cal.field_to_image((x + arrow_len * vx / n, y + arrow_len * vy / n, 0.0))
+                if tip is None:
+                    return
+                cv2.arrowedLine(img, (int(center[0]), int(center[1])),
+                                (int(tip[0]), int(tip[1])), (255, 255, 255), 2,
+                                tipLength=0.35)
+        except Exception:
+            return
+
+    def _camera_panel(self, view, composite_frame, paired, track_outs=None, max_width=720) -> np.ndarray:
+        panel = view.extract(composite_frame)
+        track_outs = track_outs or []
+        for det, _crop_b64 in paired:
+            t = self._nearest_track_for_detection(det, track_outs)
+            robot = self.robot_tracks.get(t.slot_id) if t is not None else None
+            fallback = f"{det.color} bumper" if det.color != "unknown" else "bumper?"
+            label, _confirmed = self._team_hud_label(robot, fallback)
+            alliance = robot.alliance if robot is not None else det.color
+            self._draw_bumper_hud(
+                panel, det.box, alliance, label,
+                slot_id=t.slot_id if t is not None else None,
+                cal=view.calibration,
+                field_pos=t.pos if t is not None else det.pos,
+                vel=t.vel if t is not None else None,
+            )
+        h, w = panel.shape[:2]
+        if w > max_width:
+            scale = max_width / float(w)
+            panel = cv2.resize(panel, (max_width, int(h * scale)))
+        header_h = 26
+        out = np.full((panel.shape[0] + header_h, panel.shape[1], 3), 18, np.uint8)
+        out[header_h:, :] = panel
+        cv2.putText(out, view.name, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (230, 230, 230), 1, cv2.LINE_AA)
+        return out
+
+    def _compose_hud_frame(self, annotated_frame, radar_img, camera_panels) -> np.ndarray:
+        """Stack a larger field/corner-camera dashboard below the main view."""
+        ah, aw = annotated_frame.shape[:2]
+        dash_h = max(300, min(560, int(ah * 0.48)))
+        dash = np.full((dash_h, aw, 3), 16, np.uint8)
+        pad = 12
+        title_h = 30
+        body_y = pad + title_h
+        body_h = dash_h - body_y - pad
+
+        def paste_fit(dst, src, x, y, w, h, max_upscale=1.8):
+            sh, sw = src.shape[:2]
+            if sh <= 0 or sw <= 0 or w <= 0 or h <= 0:
+                return
+            scale = min(w / sw, h / sh, max_upscale)
+            out = cv2.resize(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
+            ox = x + max(0, (w - out.shape[1]) // 2)
+            oy = y + max(0, (h - out.shape[0]) // 2)
+            dst[oy:oy + out.shape[0], ox:ox + out.shape[1]] = out
+
+        map_w = int(aw * 0.34) if camera_panels else aw - 2 * pad
+        cv2.putText(dash, "FIELD MAP", (pad, pad + 21), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (235, 235, 235), 1, cv2.LINE_AA)
+        paste_fit(dash, radar_img, pad, body_y, map_w - pad, body_h, max_upscale=2.0)
+
+        if camera_panels:
+            cams_x = map_w + pad
+            cams_w = aw - cams_x - pad
+            cv2.putText(dash, "CORNER CAMERA HUD", (cams_x, pad + 21),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (235, 235, 235), 1, cv2.LINE_AA)
+            n = len(camera_panels)
+            gap = 10
+            cell_w = max(1, (cams_w - gap * (n - 1)) // n)
+            for i, panel in enumerate(camera_panels):
+                x = cams_x + i * (cell_w + gap)
+                cv2.rectangle(dash, (x, body_y), (x + cell_w, body_y + body_h),
+                              (55, 55, 55), 1)
+                paste_fit(dash, panel, x + 4, body_y + 4, cell_w - 8, body_h - 8,
+                          max_upscale=1.7)
+
+        cv2.line(dash, (0, 0), (aw, 0), (80, 80, 80), 1)
+        return np.vstack([annotated_frame, dash])
 
     def detect_hub_alliance(self, frame: np.ndarray) -> None:
         """Detect hub alliance colors from the surrounding field area.
@@ -1812,7 +2201,10 @@ class InferenceJob:
             self.field_model = FieldModel.load(cal.field_season)
             self.field_dims = (self.field_model.length_m, self.field_model.width_m)
             self.hub_prisms = hub_prisms(self.field_model)
-            self.field_tracker = FieldTracker(self.field_model.length_m)
+            static_zones = load_zones(self.event_key)
+            if static_zones:
+                print(f"  Static-structure zones (field m): {static_zones}")
+            self.field_tracker = FieldTracker(self.field_model.length_m, zones=static_zones)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
             self.views = load_views(self.event_key)  # main first; corners if calibrated
             print(f"  Cameras active: {[v.name for v in self.views]}")
@@ -1992,45 +2384,24 @@ class InferenceJob:
 
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
-                # paid-API leftover); it runs the whole match until robots are identified.
+                # paid-API leftover). It ramps up while identities are missing and then
+                # backs off to audit reads after all robots are confirmed.
                 current_time = time.time()
-                elapsed = current_time - self._inference_start_time if hasattr(self, '_inference_start_time') else 999
-                vision_interval = 2 if elapsed < 60 else self._claude_vision_interval_sec
                 unconfirmed_count = sum(
                     1 for r in self.robot_tracks.values() if not r.team_number_confirmed
                 )
-                # Let the call through even when everything is confirmed if the
-                # next pass is a re-read pass — that's how a wrong lock self-corrects.
-                is_reread_due = ((self._claude_vision_calls + 1) % REREAD_EVERY_N_PASSES == 0)
-                if ((unconfirmed_count > 0 or is_reread_due) and
-                        tracked_robot_boxes and
-                        processed_frame_num >= 10 and
-                        current_time - self._claude_vision_last_time >= vision_interval):
+                vision_interval = self._vlm_interval_seconds(unconfirmed_count)
+                elapsed_since_vlm = current_time - self._claude_vision_last_time
+                should_read = bool(fused) and elapsed_since_vlm >= vision_interval
+                self.vlm_status.update({
+                    "last_interval_sec": vision_interval,
+                    "unconfirmed": unconfirmed_count,
+                })
+                if should_read:
                     self._claude_vision_calls += 1
                     self._claude_vision_last_time = current_time
-                    self.vision_identify_robots(overhead_frame, tracked_robot_boxes)
-
-                # Corner-camera bumper reads: additive, weighted, NOT occlusion-gated.
-                # Corner cams read more clearly than main, so their reads confirm/correct
-                # identities every pass — even for already-confirmed slots (that's how a
-                # wrong main lock gets overturned by assign_teams_from_votes/audit).
-                if (processed_frame_num >= 10
-                        and processed_frame_num % CORNER_READ_INTERVAL == 0
-                        and self.match_teams):
-                    remaining, r_blue, r_red = self._remaining_rosters()
-                    # Mirror the main path's early-out: once every team is confirmed,
-                    # only keep reading on re-read passes (to self-correct a wrong
-                    # lock). Otherwise skip the VLM calls entirely.
-                    do_corner = bool(remaining) or is_reread_due
-                    for i, obs in enumerate(fused if do_corner else []):
-                        slot_id = self.field_tracker.last_det_to_slot.get(i)
-                        if slot_id is None:
-                            continue
-                        for (cam, crop_b64, w) in obs.evidence:
-                            if cam == "main" or crop_b64 is None:
-                                continue   # main handled above; skip empty/illegible
-                            self._apply_bumper_read(slot_id, crop_b64, remaining,
-                                                    r_blue, r_red, source_weight=w)
+                    is_reread_due = self._is_reread_pass(unconfirmed_count)
+                    self.read_fused_bumper_numbers(fused, is_reread_due)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -2076,6 +2447,7 @@ class InferenceJob:
                 
                 # Draw annotations
                 annotated_frame = overhead_frame.copy()
+                track_by_slot = {t.slot_id: t for t in track_outs}
                 
                 # Draw detections
                 for i in range(len(detections)):
@@ -2093,30 +2465,23 @@ class InferenceJob:
                             slot_id = detection_to_tracked[i]
                             robot = self.robot_tracks[slot_id]
                             alliance = robot.alliance
-                            confirmed = robot.team_number_confirmed
-                            if confirmed:
-                                color = (255, 50, 50) if alliance == "blue" else (50, 50, 255)
-                                label = f"{robot.team_number} (100%)"
-                            elif robot.team_number:
-                                # Compute confidence from best vote ratio
-                                conf = 0
-                                if robot.team_ocr_votes:
-                                    best = max(robot.team_ocr_votes.values())
-                                    conf = max(conf, min(99, int(best / OCR_TEAM_CONFIRM_VOTES * 100)))
-                                if robot.appearance_votes:
-                                    best = max(robot.appearance_votes.values())
-                                    conf = max(conf, min(99, int(best / APPEARANCE_CONFIRM_VOTES * 100)))
-                                color = (180, 100, 100) if alliance == "blue" else (100, 100, 180)
-                                label = f"{robot.team_number}? ({conf}%)"
-                            else:
-                                color = (150, 150, 150)
-                                label = self._slot_label(slot_id)
+                            label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
+                            t = track_by_slot.get(slot_id)
+                            self._draw_bumper_hud(
+                                annotated_frame, box, alliance, label, slot_id=slot_id,
+                                cal=self.calib,
+                                field_pos=t.pos if t else robot.field_position,
+                                vel=t.vel if t else None,
+                            )
+                            continue
                         else:
                             # Untracked robot detection — use bumper color for display only
                             alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])
                             color = (255, 0, 0) if alliance == "blue" else (0, 0, 255) if alliance == "red" else (200, 200, 200)
                             confirmed = False
                             label = "robot"
+                            self._draw_bumper_hud(annotated_frame, box, alliance, label)
+                            continue
                     else:  # hub_opening
                         color = (0, 255, 0)  # Green
                         label = "hub"
@@ -2153,16 +2518,14 @@ class InferenceJob:
                     cv2.putText(annotated_frame, region_key,
                                (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
 
-                # Radar picture-in-picture (bottom-right): top-down field with tracks.
+                # Radar + corner camera HUD panels live in a right rail, not over the video.
                 radar_img = self.radar.render(
                     [(t.pos, t.alliance) for t in track_outs if t.state != "empty"])
-                rh, rw = radar_img.shape[:2]
-                rscale = min(1.0, 360.0 / rw)
-                rsz = cv2.resize(radar_img, (int(rw * rscale), int(rh * rscale)))
-                ah, aw = annotated_frame.shape[:2]
-                ry0, rx0 = ah - rsz.shape[0] - 8, aw - rsz.shape[1] - 8
-                if ry0 > 0 and rx0 > 0:
-                    annotated_frame[ry0:ry0 + rsz.shape[0], rx0:rx0 + rsz.shape[1]] = rsz
+                camera_panels = [
+                    self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
+                    for v in self.views if v.name != "main"
+                ]
+                annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)
 
                 # Encode frame
                 _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2171,11 +2534,18 @@ class InferenceJob:
                 # Prepare robot data
                 robots_data = []
                 for robot in self.robot_tracks.values():
+                    best_vote_team = None
+                    best_vote = 0.0
+                    if robot.team_ocr_votes:
+                        best_vote_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
                     robots_data.append({
                         "id": robot.robot_id,
+                        "slot": self._slot_label(robot.robot_id),
                         "alliance": robot.alliance,
                         "team_number": robot.team_number,
                         "confirmed": robot.team_number_confirmed,
+                        "team_candidate": best_vote_team,
+                        "team_candidate_votes": best_vote,
                         "scores": robot.scores,
                         "position": robot.last_position
                     })
@@ -2183,12 +2553,20 @@ class InferenceJob:
                 # Prepare scoring events
                 events_data = []
                 for event in self.scoring_events[-10:]:  # Last 10 events
+                    robot = self.robot_tracks.get(event.robot_id)
                     events_data.append({
                         "frame": event.frame_num,
                         "timestamp": event.timestamp,
                         "alliance": event.alliance,
                         "robot_id": event.robot_id,
+                        "slot": self._slot_label(event.robot_id),
                         "team_number": event.team_number,
+                        "team_candidate": (robot.team_number if robot else None),
+                        "robot_label": (
+                            event.team_number
+                            or (robot.team_number if robot and robot.team_number else None)
+                            or self._slot_label(event.robot_id)
+                        ),
                         "confidence": event.confidence
                     })
                 
@@ -2209,7 +2587,8 @@ class InferenceJob:
                             "scores": self.alliance_scores,
                             "robots": robots_data,
                             "scoring_events": events_data,
-                            "ocr_crops": ocr_crops_payload
+                            "ocr_crops": ocr_crops_payload,
+                            "vlm_status": self.vlm_status,
                         }))
                         await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
                     except Exception as e:
@@ -2336,6 +2715,36 @@ async def get_ocr_regions():
     """Get current OCR regions."""
     regions = custom_ocr_regions if custom_ocr_regions else OCR_REGIONS_1080P
     return {"regions": {k: list(v) for k, v in regions.items()}, "custom": custom_ocr_regions is not None}
+
+
+@app.post("/api/calibration/zones")
+async def set_static_zones(request: Request):
+    """Save static-structure zones for an event: field-coordinate rectangles
+    (meters) marking known field elements the detector false-positives on. A
+    detection inside a zone can never SEED a new robot track.
+    Body: {"event": "<key>", "zones": [[xmin, ymin, xmax, ymax], ...]}"""
+    body = await request.json()
+    event_key = body.get("event") or (current_event['event_key'] if current_event else None)
+    if not event_key:
+        return JSONResponse(status_code=400,
+                            content={"error": "No event — load an event or pass 'event'."})
+    rects = []
+    for rect in body.get("zones", []):
+        if len(rect) != 4:
+            return JSONResponse(status_code=400,
+                                content={"error": "each zone must be [xmin, ymin, xmax, ymax]"})
+        rects.append(tuple(float(v) for v in rect))
+    save_zones(event_key, rects)
+    return {"status": "ok", "event": event_key, "zones": [list(r) for r in rects]}
+
+
+@app.get("/api/calibration/zones")
+async def get_static_zones(event: Optional[str] = None):
+    """Get static-structure zones for an event (falls back to the loaded event)."""
+    event_key = event or (current_event['event_key'] if current_event else None)
+    if not event_key:
+        return {"zones": []}
+    return {"event": event_key, "zones": [list(r) for r in load_zones(event_key)]}
 
 @app.post("/api/hub-positions")
 async def set_hub_positions(request: Request):
@@ -2802,14 +3211,32 @@ async def calibration_tag_map(season: str = "2026-rebuilt-welded"):
 
 
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
-                          blue_teams: list, red_teams: list) -> list:
+                          blue_teams: list, red_teams: list,
+                          expected_alliances: Optional[list] = None,
+                          provider: str = "local") -> list:
     """Read bumper numbers using best available method.
-    Currently: Qwen VL only (local, free). Claude Vision fallback disabled for testing."""
+    provider="local" uses Qwen VL on the local GPU. provider="deepseek" uses
+    local OCR digits plus DeepSeek V4 text/chat roster normalization."""
+    print(f"  Team reader [{provider}]: sending {len(robot_crops_b64)} bumper crops")
+    if provider == "deepseek":
+        return _deepseek_read_bumpers(
+            robot_crops_b64, match_teams, blue_teams, red_teams,
+            expected_alliances=expected_alliances,
+        )
     try:
-        return _qwen_vl_read_bumpers(robot_crops_b64, match_teams, blue_teams, red_teams)
+        return _qwen_vl_read_bumpers(
+            robot_crops_b64, match_teams, blue_teams, red_teams,
+            expected_alliances=expected_alliances,
+        )
     except Exception as e:
         print(f"  Qwen VL failed: {e}")
-        return [{"team_number": None, "alliance": "unknown", "confidence": 0}] * len(robot_crops_b64)
+        return [{
+            "team_number": None,
+            "alliance": "unknown",
+            "confidence": 0,
+            "raw_read": None,
+            "error": str(e),
+        }] * len(robot_crops_b64)
 
     # Claude Vision fallback (disabled for now)
     # return _claude_vision_read_bumpers(robot_crops_b64, match_teams, blue_teams, red_teams)
@@ -2817,40 +3244,7 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
 
 def _detect_bumper_color_static(frame: np.ndarray, box) -> str:
     """Static version of bumper color detection for use outside InferenceJob."""
-    x1, y1, x2, y2 = map(int, box)
-    h, w = frame.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return "unknown"
-    bw = x2 - x1
-    bh = y2 - y1
-    roi_x1 = x1 + int(bw * 0.10)
-    roi_x2 = x2 - int(bw * 0.10)
-    roi_y1 = y1 + int(bh * 0.35)
-    roi_y2 = y1 + int(bh * 0.95)
-    if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
-        roi = frame[y1:y2, x1:x2]
-    else:
-        roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-    if roi.size == 0:
-        return "unknown"
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    red_mask1 = cv2.inRange(hsv, np.array([0, 45, 40]), np.array([16, 255, 255]))
-    red_mask2 = cv2.inRange(hsv, np.array([165, 45, 40]), np.array([180, 255, 255]))
-    red_pixels = cv2.countNonZero(red_mask1 | red_mask2)
-    blue_mask = cv2.inRange(hsv, np.array([88, 45, 40]), np.array([140, 255, 255]))
-    blue_pixels = cv2.countNonZero(blue_mask)
-    total_pixels = roi.shape[0] * roi.shape[1]
-    if total_pixels == 0:
-        return "unknown"
-    red_ratio = red_pixels / total_pixels
-    blue_ratio = blue_pixels / total_pixels
-    if red_ratio > 0.015 and red_ratio > blue_ratio * 1.25:
-        return "red"
-    elif blue_ratio > 0.015 and blue_ratio > red_ratio * 1.25:
-        return "blue"
-    return "unknown"
+    return classify_bumper_color(frame, box).alliance
 
 
 def _claude_vision_read_bumpers(robot_crops_b64: list, match_teams: list,
@@ -3025,8 +3419,174 @@ def _closest_team(read: str, teams: list):
     return best, best_d
 
 
+def _match_bumper_read_to_roster(
+    read: str,
+    model_color: str,
+    expected_alliance: str,
+    match_teams: list,
+    blue_teams: list,
+    red_teams: list,
+):
+    """Validate a VLM bumper read against the current match roster.
+
+    Exact roster reads are definitive and imply alliance from TBA for this
+    match. Partial/fuzzy reads are constrained by the observed bumper alliance
+    when available, otherwise by the model-reported bumper color.
+    """
+    digits = "".join(ch for ch in str(read or "") if ch.isdigit())
+    if not digits:
+        return None, "unknown", 0.0
+
+    roster_alliance = {}
+    roster_alliance.update({str(t): "blue" for t in blue_teams})
+    roster_alliance.update({str(t): "red" for t in red_teams})
+    all_teams = [str(t) for t in match_teams]
+
+    # A clear full team read wins over color. Teams change alliance match to
+    # match, so the current TBA roster is the source of truth for alliance.
+    if digits in all_teams:
+        return digits, roster_alliance.get(digits, "unknown"), 0.95
+
+    alliance_hint = expected_alliance if expected_alliance in ("blue", "red") else model_color
+    if alliance_hint == "red":
+        candidates = [str(t) for t in red_teams]
+    elif alliance_hint == "blue":
+        candidates = [str(t) for t in blue_teams]
+    else:
+        candidates = all_teams
+
+    substring_matches = [t for t in candidates if digits in t]
+    if len(substring_matches) == 1:
+        team = substring_matches[0]
+        return team, roster_alliance.get(team, alliance_hint), 0.6
+
+    cand, dist = _closest_team(digits, candidates)
+    if cand and dist <= 1 and len(digits) >= 2:
+        return cand, roster_alliance.get(cand, alliance_hint), 0.6
+    return None, alliance_hint if alliance_hint in ("blue", "red") else "unknown", 0.0
+
+
+def _ocr_digits_from_crop_b64(crop_b64: str) -> str:
+    try:
+        raw = base64.b64decode(crop_b64)
+        arr = np.frombuffer(raw, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            return ""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        scale = max(2, int(np.ceil(96 / max(1, gray.shape[0]))))
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        config = "--psm 7 -c tessedit_char_whitelist=0123456789"
+        text = pytesseract.image_to_string(thresh, config=config)
+        return "".join(ch for ch in text if ch.isdigit())
+    except Exception as e:
+        print(f"  DeepSeek OCR pre-read failed: {e}")
+        return ""
+
+
+def _deepseek_chat_json(prompt: str) -> dict:
+    api_key = os.environ.get("DEEPSEEK_API", "")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API is not set")
+    payload = {
+        "model": os.environ.get("DEEPSEEK_TEAM_READER_MODEL", "deepseek-v4-flash"),
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only compact JSON. Do not include markdown.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 80,
+        "response_format": {"type": "json_object"},
+    }
+    req = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    start, end = content.find("{"), content.rfind("}") + 1
+    if start >= 0 and end > start:
+        return json.loads(content[start:end])
+    return json.loads(content)
+
+
+def _deepseek_read_bumpers(robot_crops_b64: list, match_teams: list,
+                           blue_teams: list, red_teams: list,
+                           expected_alliances: Optional[list] = None) -> list:
+    """Cloud team-number reader using DeepSeek V4 text API.
+
+    DeepSeek V4 official API docs do not document image input, so this provider
+    does local OCR on the bumper crop and asks DeepSeek to normalize the digits
+    against the current match roster and bumper-alliance hint.
+    """
+    expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
+    results = []
+    for i, crop_b64 in enumerate(robot_crops_b64):
+        read = _ocr_digits_from_crop_b64(crop_b64)
+        expected = (
+            expected_alliances[i]
+            if i < len(expected_alliances) and expected_alliances[i] in ("blue", "red")
+            else "unknown"
+        )
+        prompt = (
+            "An OCR pass read digits from one FRC robot bumper crop.\n"
+            f"OCR digits: {read or 'none'}\n"
+            f"Observed bumper alliance: {expected}\n"
+            f"All match teams: {', '.join(match_teams)}\n"
+            f"Blue alliance teams: {', '.join(blue_teams)}\n"
+            f"Red alliance teams: {', '.join(red_teams)}\n\n"
+            "If the OCR digits exactly or partially identify one current-match team, return it. "
+            "Use observed bumper alliance to disambiguate partial reads, but an exact current-match "
+            "team number is authoritative. If no team is supported, return null.\n"
+            'JSON schema: {"team": string|null, "confidence": number, "reason": string}'
+        )
+        try:
+            parsed = _deepseek_chat_json(prompt)
+            raw_team = parsed.get("team")
+            raw_team = str(raw_team) if raw_team is not None else ""
+            matched, alliance, base_conf = _match_bumper_read_to_roster(
+                raw_team or read,
+                model_color="unknown",
+                expected_alliance=expected,
+                match_teams=match_teams,
+                blue_teams=blue_teams,
+                red_teams=red_teams,
+            )
+            model_conf = float(parsed.get("confidence", base_conf) or 0.0)
+            confidence = max(base_conf, min(0.95, model_conf))
+            results.append({
+                "team_number": matched,
+                "alliance": alliance,
+                "confidence": confidence if matched else 0.0,
+                "raw_read": read,
+            })
+        except Exception as e:
+            print(f"  DeepSeek team reader failed: {e}")
+            results.append({
+                "team_number": None,
+                "alliance": expected,
+                "confidence": 0.0,
+                "raw_read": read,
+            })
+    identified = sum(1 for r in results if r["team_number"])
+    print(f"  DeepSeek team reader: identified {identified}/{len(robot_crops_b64)} robots")
+    return results
+
+
 def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
-                           blue_teams: list, red_teams: list) -> list:
+                           blue_teams: list, red_teams: list,
+                           expected_alliances: Optional[list] = None) -> list:
     """Use the local VLM (VLM_MODEL_NAME, default Qwen3-VL) to read bumper numbers from robot crops.
 
     Processes each crop individually (Qwen VL handles multi-image differently from Claude).
@@ -3043,9 +3603,10 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     teams_str = ", ".join(match_teams)
     blue_str = ", ".join(blue_teams)
     red_str = ", ".join(red_teams)
+    expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
 
     results = []
-    for crop_b64 in robot_crops_b64:
+    for idx, crop_b64 in enumerate(robot_crops_b64):
         try:
             # Decode base64 to PIL Image
             import io
@@ -3059,13 +3620,33 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 scale = max(min_dim / img.width, min_dim / img.height)
                 img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
 
+            expected_alliance = (
+                expected_alliances[idx]
+                if idx < len(expected_alliances) and expected_alliances[idx] in ("blue", "red")
+                else "unknown"
+            )
+            candidate_teams = (
+                red_teams if expected_alliance == "red"
+                else blue_teams if expected_alliance == "blue"
+                else match_teams
+            )
+            candidate_str = ", ".join(candidate_teams)
+            hint = (
+                f"Computer vision sees {expected_alliance.upper()} bumper pixels, so partial or uncertain reads "
+                f"should be matched only against these {expected_alliance} alliance teams: {candidate_str}.\n"
+                if expected_alliance in ("blue", "red")
+                else f"Possible current-match teams are: {teams_str}.\n"
+            )
             prompt = (
                 "This image shows ONE FRC robot from a side or elevated camera angle. "
                 "Around the base of the robot is a bumper: a solid RED or BLUE band with a "
                 "WHITE team number printed on it. FRC team numbers are 1 to 5 digits "
                 "(for example 294, 2485, 4322).\n\n"
+                f"{hint}"
                 "Carefully read the WHITE digits on the bumper, left to right. Report the "
-                "exact number you SEE — do NOT guess, and do NOT choose from any list.\n\n"
+                "exact number you SEE. Do not use robot paint or mechanisms for alliance color; "
+                "only the bumper band matters. If the digits are clear, report them even if the "
+                "color looks surprising.\n\n"
                 'Reply with ONLY compact JSON and nothing else: '
                 '{"team": "<the digits, or null if you cannot read them>", '
                 '"color": "red" or "blue"}.'
@@ -3124,30 +3705,16 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
             except (json.JSONDecodeError, Exception):
                 pass
 
-            print(f"    Qwen parsed: team={team}, color={color}, candidates={teams_str}")
+            print(f"    Qwen parsed: team={team}, color={color}, expected={expected_alliance}, candidates={candidate_str}")
 
-            # Validate what Qwen READ against the roster, in code — so the prompt can
-            # never bias the model toward a particular team. Use the reported color to
-            # constrain which alliance's teams we match against.
             read = "".join(ch for ch in team if ch.isdigit()) if team else ""
-            alliance = color if color in ("blue", "red") else "unknown"
-            matched, confidence = None, 0.0
-            if read:
-                # Match ONLY within the alliance the model read off the bumper. The
-                # per-crop color is reliable, so a misread never maps cross-alliance
-                # (a blue robot's "432" can't become red 4322).
-                color_cands = (red_teams if alliance == "red"
-                               else blue_teams if alliance == "blue"
-                               else match_teams)
-                if read in color_cands:
-                    matched, confidence = read, 0.9
-                else:
-                    cand, dist = _closest_team(read, color_cands)
-                    if cand and dist <= 1 and len(read) >= 2:
-                        matched, confidence = cand, 0.6
-                        print(f"    Qwen fuzzy match: read '{read}' ({alliance}) -> '{cand}' (edit dist {dist})")
-                    else:
-                        print(f"    Qwen read '{read}' ({alliance}) — no match in {color_cands}")
+            model_color = color if color in ("blue", "red") else "unknown"
+            matched, alliance, confidence = _match_bumper_read_to_roster(
+                read, model_color, expected_alliance,
+                match_teams, blue_teams, red_teams,
+            )
+            if read and not matched:
+                print(f"    Qwen read '{read}' — no roster match for alliance hint {expected_alliance}/{model_color}")
 
             results.append({
                 "team_number": matched,
@@ -3158,7 +3725,13 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
 
         except Exception as e:
             print(f"  Qwen VL error on crop: {e}")
-            results.append({"team_number": None, "alliance": "unknown", "confidence": 0})
+            results.append({
+                "team_number": None,
+                "alliance": "unknown",
+                "confidence": 0,
+                "raw_read": None,
+                "error": str(e),
+            })
 
     identified = sum(1 for r in results if r["team_number"])
     print(f"  Qwen VL: identified {identified}/{len(robot_crops_b64)} robots: "
@@ -3399,7 +3972,12 @@ async def detect_robots(request: Request):
     # Use Claude Vision for bumper number reading (much better than EasyOCR)
     if all_robots and match_teams:
         crops_b64 = [r["crop"] for r in all_robots]
-        claude_results = _vision_read_bumpers(crops_b64, match_teams, blue_teams, red_teams)
+        expected = [r["alliance"] if r.get("alliance") in ("blue", "red") else "unknown"
+                    for r in all_robots]
+        claude_results = _vision_read_bumpers(
+            crops_b64, match_teams, blue_teams, red_teams,
+            expected_alliances=expected,
+        )
         for i, (robot, claude_result) in enumerate(zip(all_robots, claude_results)):
             if claude_result["team_number"]:
                 robot["matched_team"] = claude_result["team_number"]
@@ -3655,7 +4233,8 @@ async def get_diagnostic(key: str):
 @app.post("/api/infer")
 async def infer(
     video_file: Optional[UploadFile] = File(None),
-    youtube_url: Optional[str] = Form(None)
+    youtube_url: Optional[str] = Form(None),
+    team_reader: str = Form("local")
 ):
     """Start inference job"""
     job_id = str(uuid.uuid4())
@@ -3694,7 +4273,8 @@ async def infer(
             return JSONResponse(status_code=400, content={"error": "No video file or YouTube URL provided"})
         
         # Create job
-        job = InferenceJob(job_id, video_path)
+        team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
+        job = InferenceJob(job_id, video_path, team_reader=team_reader)
         jobs[job_id] = job
         
         return {"job_id": job_id}
@@ -3767,6 +4347,10 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
             job.match_teams = data.get("match_teams", [])
             job.match_blue_teams = data.get("blue_teams", [])
             job.match_red_teams = data.get("red_teams", [])
+            print(
+                "Received match roster for VLM: "
+                f"blue={job.match_blue_teams} red={job.match_red_teams}"
+            )
     except (asyncio.TimeoutError, Exception):
         pass
 

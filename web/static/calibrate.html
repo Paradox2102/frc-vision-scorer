@@ -88,6 +88,23 @@
 </div>
 
 <div class="points-section">
+  <h2>Static-element zones <span style="font-weight:normal;color:#889;font-size:.8em;">— block robot false-positives</span></h2>
+  <p class="hint">
+    Tick <b>Draw zones</b>, then <b>drag a box on the map</b> around a field element that gets
+    misdetected as a robot (e.g. a fuel structure). A detection inside a zone can never start a
+    <i>new</i> robot track — but a real robot that drives in keeps tracking. Zones are in field
+    coordinates, so one box covers every camera. Remember to <b>Save</b>.
+  </p>
+  <div class="controls" style="margin-bottom:8px;">
+    <label><input type="checkbox" id="zoneMode"> Draw zones on map</label>
+    <button onclick="saveZones()">Save zones</button>
+    <button onclick="clearZones()">Clear all</button>
+    <span id="zoneStatus" class="hint"></span>
+  </div>
+  <ul id="zoneList" style="margin:0;padding-left:18px;color:#bcd;font-family:monospace;font-size:.85em;"></ul>
+</div>
+
+<div class="points-section">
   <h2>Correspondences</h2>
   <table>
     <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th>Hold out</th><th></th></tr></thead>
@@ -118,8 +135,10 @@ let pendingPixel = null;  // {u, v} awaiting a map click
 let heldOut = new Set();  // ids marked as held-out for validation
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
+let zones = [];           // [[xmin,ymin,xmax,ymax], ...] in field meters
+let zoneDrag = null;      // {x0,y0,x1,y1} in map pixels while dragging
 
-(async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await grabFrame(); })();
+(async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await loadZones(); await grabFrame(); })();
 
 // Switching camera re-grabs (which resets autoTags/manualTags/pendingPixel) so each
 // camera keeps its own independent working correspondence set.
@@ -187,10 +206,33 @@ function drawMap(){
     ctx.font='10px monospace'; ctx.fillStyle = isUsed ? '#d8ffe8' : '#aab';
     ctx.fillText(id, mx+8, my+3);
   }
+  drawZonesOnMap(ctx);
   if (pendingPixel){
     ctx.fillStyle='#ffd060'; ctx.font='12px sans-serif';
     ctx.fillText('pick the tag for the pending frame click', MAP_PAD, 12);
   }
+}
+
+function drawZonesOnMap(ctx){
+  zones.forEach((z,i) => {
+    const a = fieldToMap(z[0], z[1]), b = fieldToMap(z[2], z[3]);
+    const x=Math.min(a[0],b[0]), y=Math.min(a[1],b[1]);
+    const w=Math.abs(b[0]-a[0]), h=Math.abs(b[1]-a[1]);
+    ctx.fillStyle='rgba(255,120,40,0.20)'; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle='rgba(255,120,40,0.95)'; ctx.lineWidth=2; ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle='#ffb070'; ctx.font='11px monospace'; ctx.fillText('zone '+(i+1), x+3, y+12);
+  });
+  if (zoneDrag){
+    const x=Math.min(zoneDrag.x0,zoneDrag.x1), y=Math.min(zoneDrag.y0,zoneDrag.y1);
+    const w=Math.abs(zoneDrag.x1-zoneDrag.x0), h=Math.abs(zoneDrag.y1-zoneDrag.y0);
+    ctx.strokeStyle='rgba(255,180,80,0.9)'; ctx.lineWidth=1.5;
+    ctx.setLineDash([5,4]); ctx.strokeRect(x,y,w,h); ctx.setLineDash([]);
+  }
+}
+
+// Inverse of fieldToMap: map-canvas pixels -> field meters.
+function mapToField(px, py){
+  return [(px - MAP_PAD) / mapScale, field.width - (py - MAP_PAD) / mapScale];
 }
 function usedIds(){
   const s = new Set(Object.keys(autoTags).map(Number));
@@ -265,6 +307,7 @@ document.getElementById('frameCanvas').addEventListener('click', function(e){
 });
 
 document.getElementById('mapCanvas').addEventListener('click', async function(e){
+  if (document.getElementById('zoneMode').checked) return;  // drawing zones, not picking tags
   const rect = this.getBoundingClientRect();
   const mx = e.clientX-rect.left, my = e.clientY-rect.top;
   // nearest tag marker within 14px
@@ -361,6 +404,71 @@ async function solve(){
       document.getElementById('noOverlayMsg').style.display='none'; }
   } catch(e){ setStatus('Fetch error: '+e.message,'rms-err'); }
 }
+
+// ---- Static-element zone drawing (on the top-down map) ----
+(function(){
+  const mc = document.getElementById('mapCanvas');
+  mc.addEventListener('mousedown', e => {
+    if (!document.getElementById('zoneMode').checked) return;
+    const r = mc.getBoundingClientRect();
+    const x = e.clientX-r.left, y = e.clientY-r.top;
+    zoneDrag = {x0:x, y0:y, x1:x, y1:y};
+  });
+  mc.addEventListener('mousemove', e => {
+    if (!zoneDrag) return;
+    const r = mc.getBoundingClientRect();
+    zoneDrag.x1 = e.clientX-r.left; zoneDrag.y1 = e.clientY-r.top;
+    drawMap();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!zoneDrag) return;
+    const [fx0,fy0] = mapToField(zoneDrag.x0, zoneDrag.y0);
+    const [fx1,fy1] = mapToField(zoneDrag.x1, zoneDrag.y1);
+    zoneDrag = null;
+    if (Math.abs(fx1-fx0) >= 0.2 && Math.abs(fy1-fy0) >= 0.2){
+      zones.push([Math.min(fx0,fx1), Math.min(fy0,fy1), Math.max(fx0,fx1), Math.max(fy0,fy1)]);
+    }
+    drawMap(); renderZoneList();
+  });
+})();
+
+function renderZoneList(){
+  const ul = document.getElementById('zoneList'); ul.replaceChildren();
+  zones.forEach((z,i) => {
+    const li = document.createElement('li');
+    li.textContent = `zone ${i+1}: (${z[0].toFixed(2)}, ${z[1].toFixed(2)}) → (${z[2].toFixed(2)}, ${z[3].toFixed(2)}) m  `;
+    const b = document.createElement('button'); b.textContent='✕'; b.className='del-btn';
+    b.onclick = () => { zones.splice(i,1); drawMap(); renderZoneList(); };
+    li.appendChild(b); ul.appendChild(li);
+  });
+}
+
+async function loadZones(){
+  const event = document.getElementById('event').value.trim();
+  if (!event) return;
+  try {
+    const r = await fetch('/api/calibration/zones?event=' + encodeURIComponent(event));
+    const j = await r.json();
+    zones = (j.zones || []).map(z => z.map(Number));
+    drawMap(); renderZoneList();
+  } catch(e){ /* no zones yet */ }
+}
+
+async function saveZones(){
+  const event = document.getElementById('event').value.trim();
+  if (!event){ document.getElementById('zoneStatus').textContent = 'Set an event first.'; return; }
+  try {
+    const r = await fetch('/api/calibration/zones', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({event, zones})});
+    const j = await r.json();
+    document.getElementById('zoneStatus').textContent =
+      j.error ? ('Save error: '+j.error) : `Saved ${zones.length} zone(s) for ${event} ✓`;
+  } catch(e){ document.getElementById('zoneStatus').textContent = 'Save error: '+e.message; }
+}
+
+function clearZones(){ zones = []; drawMap(); renderZoneList();
+  document.getElementById('zoneStatus').textContent = 'Cleared (not yet saved — click Save).'; }
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');
   el.textContent=msg; el.className=cls||'rms-info'; }

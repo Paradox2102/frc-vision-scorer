@@ -29,12 +29,15 @@ class VisionScorer {
         // HUD elements
         this.hudFrame = document.getElementById('hudFrame');
         this.hudFps = document.getElementById('hudFps');
+        this.hudReader = document.getElementById('hudReader');
         this.scoreBlue = document.getElementById('scoreBlue');
         this.scoreRed = document.getElementById('scoreRed');
 
         // Robot tables
         this.blueRobotsTable = document.getElementById('blueRobotsTable');
         this.redRobotsTable = document.getElementById('redRobotsTable');
+        this.vlmCrops = document.getElementById('vlmCrops');
+        this.latestVlmCrops = new Map();
 
         // Alliance score headers
         this.blueAllianceScore = document.getElementById('blueAllianceScore');
@@ -586,6 +589,8 @@ class VisionScorer {
         } else if (youtubeUrl) {
             formData.append('youtube_url', youtubeUrl);
         }
+        const teamReader = document.querySelector('input[name="teamReader"]:checked')?.value || 'local';
+        formData.append('team_reader', teamReader);
 
         this.setStatus('Uploading...', 0);
 
@@ -710,6 +715,18 @@ class VisionScorer {
             if (this.redAllianceScore) this.redAllianceScore.textContent = '0';
             this.hudFrame.textContent = '0 / 0';
             this.hudFps.textContent = '0';
+            if (this.hudReader) this.hudReader.textContent = 'local waiting';
+
+            if (this.selectedMatch) {
+                const blueTeams = this.selectedMatch.blue_teams || [];
+                const redTeams = this.selectedMatch.red_teams || [];
+                this.ws.send(JSON.stringify({
+                    type: 'robot_identifications',
+                    match_teams: [...blueTeams, ...redTeams],
+                    blue_teams: blueTeams,
+                    red_teams: redTeams
+                }));
+            }
         };
 
         this.ws.onmessage = (event) => {
@@ -754,6 +771,22 @@ class VisionScorer {
 
         this.hudFrame.textContent = `${data.frame_num} / ${data.total_frames}`;
         this.hudFps.textContent = data.fps.toFixed(1);
+        if (this.hudReader && data.vlm_status) {
+            const status = data.vlm_status;
+            const provider = status.provider || 'local';
+            const calls = status.calls || 0;
+            const sent = status.last_sent || 0;
+            const candidates = status.last_candidates || 0;
+            const unconfirmed = status.unconfirmed ?? 0;
+            const interval = Number.isFinite(status.last_interval_sec)
+                ? `${status.last_interval_sec.toFixed(2)}s`
+                : '—';
+            const error = status.last_error ? ` ${status.last_error}` : '';
+            const resultCount = Array.isArray(status.last_results)
+                ? status.last_results.filter(r => r.team_number).length
+                : 0;
+            this.hudReader.textContent = `${provider} c${calls} ${resultCount}/${sent} reads ${candidates} crops u${unconfirmed} ${interval}${error}`;
+        }
         this.scoreBlue.textContent = data.scores.blue;
         this.scoreRed.textContent = data.scores.red;
 
@@ -765,6 +798,7 @@ class VisionScorer {
         }
 
         this.updateRobotTables(data.robots);
+        this.updateVlmCrops(data.ocr_crops);
         this.updateTimeline(data.scoring_events);
     }
 
@@ -807,6 +841,62 @@ class VisionScorer {
         tableBody.innerHTML = rows;
     }
 
+    updateVlmCrops(crops) {
+        if (!this.vlmCrops) return;
+
+        if (Array.isArray(crops)) {
+            crops.forEach(crop => {
+                const key = crop.slot || `R${crop.robot_id}`;
+                this.latestVlmCrops.set(key, {
+                    ...crop,
+                    slot: key,
+                    updatedAt: new Date()
+                });
+            });
+        }
+
+        if (this.latestVlmCrops.size === 0) {
+            this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
+            return;
+        }
+
+        const entries = [...this.latestVlmCrops.values()]
+            .sort((a, b) => this.slotSortValue(a.slot) - this.slotSortValue(b.slot));
+        this.vlmCrops.innerHTML = entries.map(crop => {
+            const raw = crop.raw_read || '—';
+            const matched = crop.matched || 'no match';
+            const resultClass = crop.matched ? 'matched' : 'unmatched';
+            const confidence = Number.isFinite(crop.confidence)
+                ? `${Math.round(crop.confidence * 100)}%`
+                : '—';
+            const error = crop.error ? `<div class="vlm-error">${this.escapeHtml(crop.error)}</div>` : '';
+            return `
+                <div class="vlm-crop ${crop.alliance || 'unknown'}">
+                    <img src="data:image/jpeg;base64,${crop.crop}" alt="${this.escapeHtml(crop.slot)} bumper crop">
+                    <div class="vlm-crop-meta">
+                        <div class="vlm-crop-title">
+                            <span>${this.escapeHtml(crop.slot)}</span>
+                            <span>${this.escapeHtml(crop.source || 'cam')}</span>
+                        </div>
+                        <div class="vlm-result ${resultClass}">
+                            ${this.escapeHtml(crop.slot)} ${this.escapeHtml(raw)} &gt; ${this.escapeHtml(matched)}
+                        </div>
+                        <div class="vlm-subtext">${confidence} confidence</div>
+                        ${error}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    slotSortValue(slot) {
+        const text = String(slot || '');
+        const match = text.match(/([BR])(\d+)/);
+        if (!match) return 999;
+        const base = match[1] === 'B' ? 0 : 100;
+        return base + Number(match[2]);
+    }
+
     updateTimeline(events) {
         if (!events || events.length === 0) return;
 
@@ -847,6 +937,16 @@ class VisionScorer {
         const mins = Math.floor(seconds / 60);
         const secs = Math.floor(seconds % 60);
         return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        }[ch]));
     }
 
     handleComplete(data) {
@@ -1096,6 +1196,8 @@ class VisionScorer {
         // Reset robot tables
         this.blueRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
         this.redRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
+        if (this.vlmCrops) this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
+        this.latestVlmCrops.clear();
         this.timelineContainer.innerHTML = '<p class="empty-state">No events yet</p>';
 
         this.setStatus('Ready', 0);

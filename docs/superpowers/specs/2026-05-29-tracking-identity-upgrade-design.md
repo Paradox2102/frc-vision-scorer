@@ -1,7 +1,7 @@
 # Tracking & Identity Upgrade — Design
 
 **Date:** 2026-05-29
-**Status:** Draft (pending spec review)
+**Status:** Approved (spec-reviewed); SP-T.0 gate **PASSED** 2026-05-29 → Phase 1 next
 **Component:** new `web/field/sam2_tracker.py`; `web/field/tracker.py` (Kalman → thin `SlotMapper`); SP3 fusion re-point in `web/field/` + `web/app.py`; SP4 identity (detector `bumper_number` class, IoS matching, consecutive-agreement lock, appearance embeddings); spike harness `scripts/sam2_spike.py`
 **Part of:** "Field-coordinate rework" — unifies the remaining roadmap (replaces SP2 tracking approach, re-points SP3, defines SP4). See [SP1 roadmap](2026-05-28-field-coordinate-foundation-design.md#roadmap-where-this-fits).
 
@@ -18,14 +18,24 @@ First spike run on a 6-robot window of `qual1_first_champs_2026.mp4` (frames
 | Latency | — | **151 ms/frame** (GPU, 0.5× crop) | trustworthy |
 | Identity swaps | pending | pending | needs manual count |
 
-**Continuity strongly favors SAM2** (~77% less track fragmentation: 7 vs 31
-births/deaths over 76 frames), which is the mechanism behind fewer identity
-errors. Latency (151 ms/frame) is fine for offline batch (~11 min/match), too slow
-for naive 30 fps live — a known later concern. **The swap-based gate criterion is
-NOT yet decided:** the run used an empty anchor set, so swaps must be counted
-manually from `data/test_footage/qual1_spike_compare.mp4` (the spec's intended
-method) or via human-placed anchors. **Verdict: PASS-leaning on the continuity
-proxy, pending the manual swap count.** Harness/metrics/checkpoint all validated.
+**Manual review of `qual1_spike_compare.mp4` (human, 2026-05-29):** no identity
+swaps occurred in this window (no same-alliance crossing to swap on — the swap
+criterion is therefore *untested*, not failed). The decisive difference is
+**occlusion recall**: where a robot is partially obscured by a human, field
+element, or another robot, the Kalman tracker drops it (detection-gated — it loses
+any robot YOLO misses that frame), while SAM2 holds it via mask propagation. In a
+representative occlusion frame the Kalman tracker showed **3 of 6** robots while
+SAM2 correctly held **all 6**. This is the per-frame face of the continuity number
+(SAM2 7 vs Kalman 31 track births/deaths over 76 frames, ~77% less fragmentation).
+
+**Gate verdict: PASS.** Basis: occlusion recall (6/6 vs 3/6) + continuity (~77%
+less fragmentation), both decisive and both the upstream cause of identity errors
+(a robot never lost cannot be mis-reacquired). Latency 151 ms/frame is fine for
+offline batch (~11 min/match), too slow for naive 30 fps live — a known later
+concern. Caveat: the literal ≥50%-fewer-*swaps* criterion was not exercised (no
+crossing in the window); worth an opportunistic re-check on a same-alliance-cross
+segment, but not a blocker given the recall/continuity margin. Proceed to Phase 1
+(replace). Harness/metrics/checkpoint all validated.
 
 ## Problem
 

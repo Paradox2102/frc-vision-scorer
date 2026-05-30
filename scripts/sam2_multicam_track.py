@@ -71,10 +71,13 @@ def _export_view(cap, view, all_frames, prompt_frame, robot_model):
         cv2.imwrite(os.path.join(tmpdir_obj.name, f"{local_idx:05d}.jpg"),
                     small, [cv2.IMWRITE_JPEG_QUALITY, 95])
         if gf == prompt_frame:
-            res = robot_model(small, conf=0.4, verbose=False)[0]
+            # Detect prompts at FULL resolution (corner crops are small — 960x377;
+            # detecting on the 0.5x export misses small/distant robots), then scale
+            # boxes down to SAM2's 0.5x propagation space.
+            res = robot_model(crop, conf=0.4, verbose=False)[0]
             for i in range(len(res.boxes)):
                 if int(res.boxes.cls[i]) == 1:
-                    box = res.boxes.xyxy[i].cpu().numpy()
+                    box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
                     prompt_boxes_scaled.append(tuple(box))
     return tmpdir_obj, prompt_boxes_scaled
 
@@ -85,6 +88,10 @@ def main():
     parser.add_argument("--event", default="test", help="Event key for load_views")
     parser.add_argument("--labels", default=str(DEFAULT_LABELS), help="Segment sidecar JSON")
     parser.add_argument("--video", default=str(DEFAULT_VIDEO), help="Composite video path")
+    parser.add_argument("--render", default=None,
+                        help="Optional output .mp4: annotate the composite with each "
+                             "camera's tracklet boxes + fused track-id (cross-camera "
+                             "merges highlighted) for visual ground-truthing.")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -167,6 +174,7 @@ def main():
 
     frames: dict[int, dict] = {}        # global_frame -> {slot_id: (u, v)}
     multicam_clusters = 0               # fused observations with >1 camera member
+    render_data: dict[int, list] = {}   # global_frame -> [(cam, box_crop, fused_id, multicam)]
 
     for local_idx in sorted(local_to_global):
         gf = local_to_global[local_idx]
@@ -197,6 +205,23 @@ def main():
         reg.assign(fused)
         multicam_clusters += sum(1 for o in fused if len({m[0] for m in o.members}) > 1)
         outs = tracker.update([o.detection for o in fused], {}, dt=dt)
+
+        if args.render:
+            # map (camera, per_camera_obj_id) -> (fused_id, spans>1 camera)
+            key_to_fused = {}
+            for o in fused:
+                multi = len({m[0] for m in o.members}) > 1
+                for (cam, oid) in o.members:
+                    key_to_fused[(cam, oid)] = (o.track_id, multi)
+            anns = []
+            for name, dets in per_camera.items():
+                cx, cy, _w, _h = view_by_name[name].crop
+                for (det, _crop) in dets:
+                    bx1, by1, bx2, by2 = det.box
+                    abs_box = (cx + bx1, cy + by1, cx + bx2, cy + by2)
+                    fid, multi = key_to_fused.get((name, det.track_id), (None, False))
+                    anns.append((name, abs_box, fid, multi))
+            render_data[gf] = anns
 
         uv_map = {}
         for t in outs:
@@ -237,6 +262,42 @@ def main():
         print("  (single camera active — no cross-camera fusion this run)")
     print(f"  SAM2 latency: {total_elapsed / max(1, total_prop) * 1000:.1f} ms/frame "
           f"({total_prop} view-frames in {total_elapsed:.2f}s)")
+
+    # ------------------------------------------------------------------
+    # 5. Optional render: annotate the composite for visual ground-truthing
+    # ------------------------------------------------------------------
+    if args.render and render_data:
+        print(f"\n[driver] Rendering annotated capture -> {args.render} ...")
+        cap2 = cv2.VideoCapture(str(video))
+        out_fps = max(1.0, fps / stride)
+        writer = cv2.VideoWriter(args.render, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 out_fps, (1920, 1080))
+        GREEN, MAGENTA, GRAY = (0, 220, 0), (255, 0, 255), (160, 160, 160)
+        for gf in sorted(render_data):
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, gf)
+            ok, fr = cap2.read()
+            if not ok:
+                continue
+            # camera crop outlines + names
+            for v in views:
+                cx, cy, cw, ch = v.crop
+                cv2.rectangle(fr, (cx, cy), (cx + cw - 1, cy + ch - 1), GRAY, 1)
+                cv2.putText(fr, v.name, (cx + 6, cy + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, GRAY, 2)
+            for (name, box, fid, multi) in render_data[gf]:
+                x1, y1, x2, y2 = (int(round(c)) for c in box)
+                color = MAGENTA if multi else GREEN
+                cv2.rectangle(fr, (x1, y1), (x2, y2), color, 3 if multi else 2)
+                label = f"f{fid}" + (" CROSS-CAM" if multi else "")
+                cv2.putText(fr, label, (x1, max(12, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(fr, f"frame {gf}  magenta=same robot fused across cameras",
+                        (10, 1070), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            writer.write(fr)
+        writer.release()
+        cap2.release()
+        print(f"[driver] Wrote {args.render}")
+
     print("\n[driver] Done.")
 
 

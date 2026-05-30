@@ -1,0 +1,7 @@
+{
+  "video": "data/test_footage/2026hop_match.mp4",
+  "_note": "Hopper Division qual1 (youtube Jgbtm3VaUxs), 1920x1080 60fps composite. Segment at t~92-100s where a robot is seen by BOTH main and corner_right with sub-0.3m field agreement (nearest ~0.12m at frame 5580) — exercises the SP-T.2 cross-camera tracklet MERGE path against the 2026hop calibration. Only `segment` is read by scripts/sam2_multicam_track.py.",
+  "segment": {"start_frame": 5520, "end_frame": 6000, "prompt_frame": 5580, "stride": 2},
+  "anchors": [],
+  "occlusion_events": []
+}

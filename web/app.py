@@ -20,7 +20,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yt_dlp
 from fastapi import (FastAPI, File, Form, HTTPException, Request, UploadFile,
@@ -48,6 +48,7 @@ from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker
 from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
+from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
@@ -251,6 +252,8 @@ class RobotTrack:
     # Field-space position (meters) from the FieldTracker. last_position stays
     # pixel-space for the (unchanged) pixel-space scoring/ball math.
     field_position: Optional[Tuple[float, float]] = None
+    # Consecutive-agreement team number lock state
+    consecutive_tracker: Optional[Any] = None
 
 
 @dataclass
@@ -488,44 +491,30 @@ class InferenceJob:
                 # Unique partial match
                 team = matching_teams[0]
                 robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + EASYOCR_VOTE_WEIGHT
+                
+                # Update consecutive tracker
+                if robot.consecutive_tracker is None:
+                    robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+                locked_team, confirmed = robot.consecutive_tracker.update(team)
+                if confirmed and locked_team:
+                    already_assigned = any(
+                        r.team_number == locked_team and r.team_number_confirmed
+                        for r in self.robot_tracks.values() if r.robot_id != canonical_id
+                    )
+                    if not already_assigned:
+                        old_team = robot.team_number
+                        robot.team_number = locked_team
+                        robot.team_number_confirmed = True
+                        self._clear_team_from_other_robots(canonical_id, locked_team)
+                        for event in self.scoring_events:
+                            if event.robot_id == canonical_id:
+                                event.team_number = locked_team
+                        print(f"  OCR confirmed: Robot {canonical_id} = Team {locked_team} (was {old_team})")
             else:
                 # Ambiguous partial match — split vote among candidates
                 vote_share = EASYOCR_VOTE_WEIGHT / len(matching_teams)
                 for team in matching_teams:
                     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + vote_share
-
-            # Check if any team number has enough votes to confirm
-            best_team = max(robot.team_ocr_votes, key=robot.team_ocr_votes.get)
-            votes = robot.team_ocr_votes[best_team]
-
-            if votes >= OCR_TEAM_CONFIRM_VOTES:
-                # Verify this team isn't already assigned to another robot
-                already_assigned = any(
-                    r.team_number == best_team and r.team_number_confirmed
-                    for r in self.robot_tracks.values() if r.robot_id != canonical_id
-                )
-                if already_assigned:
-                    # Remove this candidate and check next best
-                    del robot.team_ocr_votes[best_team]
-                    continue
-
-                old_team = robot.team_number
-                robot.team_number = best_team
-                robot.team_number_confirmed = True
-
-                # Alliance is owned by the field-tracker slot (bumper color); a team
-                # read records the number but never flips the slot's alliance (SP2).
-
-                # Clear this team from other robots' tentative assignments
-                self._clear_team_from_other_robots(canonical_id, best_team)
-
-                # Update scoring events retroactively — fix team numbers on past events
-                for event in self.scoring_events:
-                    if event.robot_id == canonical_id:
-                        event.team_number = best_team
-
-                print(f"  OCR confirmed: Robot {canonical_id} = Team {best_team} "
-                      f"(was {old_team}, {votes:.1f} votes, all: {dict(robot.team_ocr_votes)})")
 
     def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None, enforce_floor: bool = True):
         """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
@@ -705,6 +694,10 @@ class InferenceJob:
             float(robot.team_ocr_votes.get(new_team, 0.0)),
             float(OCR_TEAM_CONFIRM_VOTES),
         )
+        if robot.consecutive_tracker is None:
+            robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+        robot.consecutive_tracker.unlock()
+        robot.consecutive_tracker.update(new_team)
         robot.team_number = None
         robot.team_number_confirmed = False
 
@@ -841,6 +834,18 @@ class InferenceJob:
             self._handle_confirmed_vlm_contradiction(
                 robot, team, conf, res.get("raw_read"), cam
             )
+            if robot.consecutive_tracker is None:
+                robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            locked_team, confirmed = robot.consecutive_tracker.update(team)
+            if confirmed and locked_team:
+                old_team = robot.team_number
+                robot.team_number = locked_team
+                robot.team_number_confirmed = True
+                self._clear_team_from_other_robots(slot_id, locked_team)
+                for event in self.scoring_events:
+                    if event.robot_id == slot_id:
+                        event.team_number = locked_team
+                print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
@@ -947,6 +952,18 @@ class InferenceJob:
             self._handle_confirmed_vlm_contradiction(
                 robot, team, float(conf), result.get("raw_read"), "main"
             )
+            if robot.consecutive_tracker is None:
+                robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            locked_team, confirmed = robot.consecutive_tracker.update(team)
+            if confirmed and locked_team:
+                old_team = robot.team_number
+                robot.team_number = locked_team
+                robot.team_number_confirmed = True
+                self._clear_team_from_other_robots(canonical_id, locked_team)
+                for event in self.scoring_events:
+                    if event.robot_id == canonical_id:
+                        event.team_number = locked_team
+                print(f"  Consecutive-lock confirmed (vision): Robot {canonical_id} = Team {locked_team} (was {old_team})")
             tag = "RE-READ" if robot.team_number_confirmed else "read"
             print(f"  Vision {tag}: Robot {canonical_id} += {team} "
                   f"(w={weight}, total={robot.team_ocr_votes[team]:.1f})")
@@ -1072,15 +1089,15 @@ class InferenceJob:
         # Apply Hungarian assignments.
         for rid, team in assignment.items():
             r = self.robot_tracks[rid]
+            if r.team_number_confirmed:
+                continue
             if team is None:
                 r.team_number = None
                 continue
             v = (r.team_ocr_votes or {}).get(team, 0.0)
             total = sum((r.team_ocr_votes or {}).values()) or 1.0
             r.team_number = team
-            r.team_number_confirmed = bool(v >= 3.0 and v / total >= 0.6)
-            if r.team_number_confirmed:
-                self._clear_team_from_other_robots(rid, team)
+            r.team_number_confirmed = False
             self.diagnostic.record_assignment(
                 frame=self._current_frame, robot_id=rid, team=team,
                 alliance=r.alliance, confirmed=r.team_number_confirmed,
@@ -1101,8 +1118,14 @@ class InferenceJob:
         )
         for rid, team in eliminated.items():
             r = self.robot_tracks[rid]
+            if r.team_number_confirmed:
+                continue
             r.team_number = team
             r.team_number_confirmed = True
+            if r.consecutive_tracker is None:
+                r.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            r.consecutive_tracker.locked_value = team
+            r.consecutive_tracker.confirmed = True
             self._clear_team_from_other_robots(rid, team)
             self.diagnostic.record_elimination(
                 frame=self._current_frame, robot_id=rid, team=team, alliance=r.alliance,
@@ -1981,8 +2004,11 @@ class InferenceJob:
                 team_number=None,
                 last_position=(0.0, 0.0),
                 positions_history=deque(maxlen=30),
+                consecutive_tracker=ConsecutiveValueTracker(n_consecutive=3),
             )
             self.robot_tracks[slot_id] = track
+        elif track.consecutive_tracker is None:
+            track.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
         return track
 
     def _is_robot_on_alliance_side(self, robot_x: float, alliance: str) -> bool:

@@ -96,5 +96,8 @@ yolo11m.pt
 *.pt
 !runs/train/hub_zone_yolo26s/weights/best.pt
 
+# SAM2 checkpoints (downloaded, ~900MB)
+checkpoints/
+
 # Test footage (large video, not committed)
 data/test_footage/

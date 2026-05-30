@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pupil-apriltags>=1.0.4",
+    # SAM2 tracking spike (SP-T). NOTE: this manifest under-declares the ML stack
+    # (torch/ultralytics/supervision are installed directly into .venv); sam2 is
+    # recorded here because the spike adds it. Checkpoint weights are gitignored.
+    "sam2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
 ]
 
 [tool.pytest.ini_options]

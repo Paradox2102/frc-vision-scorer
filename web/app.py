@@ -557,14 +557,21 @@ class InferenceJob:
         crop_b64 = base64.b64encode(buf).decode('utf-8')
         return crop_b64, score
 
-    def _detect_view(self, view, composite_frame):
+    def _detect_view(self, view, composite_frame, precomputed_dets=None):
         """Run YOLO + person detection on one camera view; returns
         (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
-        and person_boxes are field-filtered occluder boxes in that view's pixels."""
+        and person_boxes are field-filtered occluder boxes in that view's pixels.
+
+        precomputed_dets: an sv.Detections already run on this view's frame (the main
+        loop computes robot/ball detections on the main overhead frame for hub/ball/
+        annotation, so we reuse them here instead of re-running YOLO on the same crop)."""
         frame = view.extract(composite_frame)
         cal = view.calibration
-        results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
-        dets = sv.Detections.from_ultralytics(results)
+        if precomputed_dets is not None:
+            dets = precomputed_dets
+        else:
+            results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+            dets = sv.Detections.from_ultralytics(results)
         robot_boxes = [dets.xyxy[i] for i in range(len(dets)) if dets.class_id[i] == 1]
         field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
                                          color_fn=self.detect_bumper_color)
@@ -1925,7 +1932,11 @@ class InferenceJob:
                 per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
                 for view in self.views:
-                    paired, pboxes = self._detect_view(view, frame)
+                    # Reuse the top-of-loop YOLO result for main (its crop is the
+                    # overhead frame `detections` was computed on) — avoids a second
+                    # robot-YOLO pass per frame on the heaviest model.
+                    pre = detections if view.name == "main" else None
+                    paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
                     per_camera[view.name] = paired
                     person_boxes_by_cam[view.name] = pboxes
 

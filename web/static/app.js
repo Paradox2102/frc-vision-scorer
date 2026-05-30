@@ -69,7 +69,11 @@ class VisionScorer {
 
         // Navigation
         document.querySelectorAll('.nav-btn').forEach(btn => {
-            btn.addEventListener('click', () => this.switchView(btn.dataset.view));
+            btn.addEventListener('click', () => {
+                if (btn.dataset.view) {
+                    this.switchView(btn.dataset.view);
+                }
+            });
         });
 
         // Modal
@@ -591,6 +595,10 @@ class VisionScorer {
         }
         const teamReader = document.querySelector('input[name="teamReader"]:checked')?.value || 'local';
         formData.append('team_reader', teamReader);
+        const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
+        if (Number.isFinite(vramBudget) && vramBudget > 0) {
+            formData.append('sam2_max_gpu_frames', vramBudget);
+        }
 
         this.setStatus('Uploading...', 0);
 
@@ -762,6 +770,9 @@ class VisionScorer {
         if (data.status === 'paused') {
             const currentProgress = parseFloat(this.progressBar.style.width) || 0;
             this.setStatus(`Paused at frame ${data.frame_num}`, currentProgress);
+        } else if (data.message) {
+            const currentProgress = data.progress !== undefined ? data.progress : (parseFloat(this.progressBar.style.width) || 0);
+            this.setStatus(data.message, currentProgress);
         }
     }
 

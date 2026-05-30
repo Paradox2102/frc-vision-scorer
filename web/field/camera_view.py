@@ -34,6 +34,7 @@ def load_views(event_key: str) -> list["CameraView"]:
         cal = field_store.load(event_key, name)
         if cal is None:
             continue
-        views.append(CameraView(name=name, crop=cl.crop, masks=cl.masks, calibration=cal))
+        masks = cal.masks if (hasattr(cal, "masks") and cal.masks) else cl.masks
+        views.append(CameraView(name=name, crop=cl.crop, masks=tuple(masks), calibration=cal))
     views.sort(key=lambda v: (v.name != "main", v.name))  # main first, then stable
     return views

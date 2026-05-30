@@ -49,3 +49,35 @@ def test_load_views_orders_main_first(monkeypatch):
     monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: object())
     views = cv_mod.load_views("evt")
     assert views[0].name == "main"
+
+
+def test_load_views_uses_calibration_masks(monkeypatch):
+    from web.field.composite_layout import CameraLayout
+    from web.field.calibration import CameraCalibration
+    layout = {
+        "main": CameraLayout("main", (0, 0, 1920, 723), ((1, 2, 3, 4),)),
+    }
+    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    
+    cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole", masks=[(5, 6, 7, 8)])
+    monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: cal)
+    
+    views = cv_mod.load_views("evt")
+    assert len(views) == 1
+    assert views[0].masks == ((5, 6, 7, 8),)
+
+
+def test_load_views_falls_back_to_layout_masks(monkeypatch):
+    from web.field.composite_layout import CameraLayout
+    from web.field.calibration import CameraCalibration
+    layout = {
+        "main": CameraLayout("main", (0, 0, 1920, 723), ((1, 2, 3, 4),)),
+    }
+    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    
+    cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole", masks=[])
+    monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: cal)
+    
+    views = cv_mod.load_views("evt")
+    assert len(views) == 1
+    assert views[0].masks == ((1, 2, 3, 4),)

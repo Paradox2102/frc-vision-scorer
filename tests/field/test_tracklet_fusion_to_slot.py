@@ -96,3 +96,36 @@ def test_abrupt_position_swap_keeps_slot_by_track_id():
     a1, b1 = frame(5.0, 2.0)
     assert a1 == a0, "robot A must keep its original slot via stable track_id"
     assert b1 == b0, "robot B must keep its original slot via stable track_id"
+
+
+def test_lost_track_relink_retains_slot_by_embedding():
+    import numpy as np
+    tracker = FieldTracker(FIELD_LEN)
+    reg = FusedTrackRegistry()
+    emb_a = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    # Frame 1: Robot A seen on main:1 with embedding A.
+    det1 = _det(3.0, 3.0, 1)
+    det1.embedding = emb_a
+    per_cam1 = {"main": [(det1, b"a")]}
+    outs1 = _step(tracker, reg, per_cam1)
+    assert len(outs1) == 1
+    slot = outs1[0].slot_id
+
+    # Frame 2: Robot A disappears (e.g. occluded, no detections).
+    # FieldTracker coasts it.
+    outs2 = _step(tracker, reg, {"main": []})
+    assert len(outs2) == 1
+    assert outs2[0].state == "coasting"
+
+    # Frame 3: Robot A re-appears at a completely different position (beyond the position gate),
+    # and under a new SAM2 ID (main:2), but carries the same embedding A.
+    det3 = _det(8.0, 8.0, 2)
+    det3.embedding = emb_a
+    per_cam3 = {"main": [(det3, b"a")]}
+    outs3 = _step(tracker, reg, per_cam3)
+    
+    # It should have re-linked to fused ID 0, and FieldTracker should have re-bound it to the SAME slot!
+    assert len(outs3) == 1
+    assert outs3[0].slot_id == slot
+    assert outs3[0].state == "visible"

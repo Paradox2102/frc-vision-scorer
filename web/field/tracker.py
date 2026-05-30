@@ -22,6 +22,7 @@ class FieldDetection:
     box: tuple
     score: float = 1.0
     track_id: int | None = None
+    embedding: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -242,6 +243,8 @@ class FieldTracker:
                     matched_slot_indices.add(r)
                     matched_det_indices.add(c)
                     self.last_det_to_slot[idxs[c]] = t.slot_id
+                    if dets[c].track_id is not None:
+                        self._id_to_slot[dets[c].track_id] = t.slot_id
 
             # Increment missed for unmatched active slots
             for i, t in enumerate(active_slots):

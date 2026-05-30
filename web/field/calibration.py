@@ -1,6 +1,6 @@
 """Fisheye camera calibration + field<->image projection."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import cv2
 import numpy as np
@@ -26,6 +26,8 @@ class CameraCalibration:
     rms_error: float = 0.0
     mode: str = "camera"                 # "camera" (fisheye), "homography", or "pinhole"
     H: Optional[np.ndarray] = None       # (3,3) ground-plane homography (image->field)
+    masks: list[tuple] = field(default_factory=list) # crop-local coordinates (x, y, w, h)
+    robot_track_top_crop: float = 0.0    # fraction (0.0–0.5) of frame top excluded from SAM2 robot tracking
 
     def to_json(self) -> dict:
         return {
@@ -38,6 +40,8 @@ class CameraCalibration:
             "field_season": self.field_season, "rms_error": self.rms_error,
             "mode": self.mode,
             "H": self.H.tolist() if self.H is not None else None,
+            "masks": [list(m) for m in self.masks] if self.masks is not None else [],
+            "robot_track_top_crop": self.robot_track_top_crop,
         }
 
     @classmethod
@@ -57,6 +61,8 @@ class CameraCalibration:
             field_season=d["field_season"], rms_error=d.get("rms_error", 0.0),
             mode=d.get("mode", "camera"),
             H=np.array(H_raw, float) if H_raw is not None else None,
+            masks=[tuple(m) for m in d.get("masks", [])],
+            robot_track_top_crop=float(d.get("robot_track_top_crop", 0.0) or 0.0),
         )
 
     def field_to_image(self, point_xyz) -> tuple:

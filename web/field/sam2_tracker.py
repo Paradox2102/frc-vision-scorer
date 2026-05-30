@@ -151,6 +151,8 @@ class Sam2FieldTracker:
         config: str = _DEFAULT_SAM2_CONFIG,
         checkpoint: str = _DEFAULT_SAM2_CKPT,
         device: str = "cuda",
+        offload_video_to_cpu: bool = True,
+        offload_state_to_cpu: bool = True,
     ) -> None:
         """Initialise the tracker.
 
@@ -161,7 +163,12 @@ class Sam2FieldTracker:
                 ``build_sam2_video_predictor``).
             checkpoint: Path to the SAM2 checkpoint file.
             device: torch device string (``"cuda"`` or ``"cpu"``).
+            offload_video_to_cpu: Offload video frames to CPU to save GPU VRAM.
+            offload_state_to_cpu: Offload tracker state to CPU to save GPU VRAM.
         """
+        self.offload_video_to_cpu = offload_video_to_cpu
+        self.offload_state_to_cpu = offload_state_to_cpu
+
         if predictor is not None:
             self._predictor = predictor
             self._device = device
@@ -191,6 +198,9 @@ class Sam2FieldTracker:
         *,
         reprompt_every: int | None = None,
         detect_fn=None,
+        max_objects: int | None = None,
+        new_obj_ios_thresh: float = 0.5,
+        progress_cb=None,
     ) -> dict[int, dict[int, dict]]:
         """Run offline SAM2 propagation over a directory of frames.
 
@@ -203,64 +213,165 @@ class Sam2FieldTracker:
             prompt_boxes: Sequence of ``(x1, y1, x2, y2)`` boxes (float or
                 int) defining one robot per entry.  Object IDs are assigned as
                 ``1, 2, 3, …`` in list order.
-            reprompt_every: Reserved for future mid-stream reprompting.
-                Currently ignored; accepted so callers can pass it without a
-                TypeError.
-            detect_fn: Reserved for future mid-stream reprompting.  Ignored.
+            reprompt_every: When set together with ``detect_fn``, propagation is
+                run in chunks of this many frames; at each chunk boundary
+                ``detect_fn`` is run and any detection that does not already
+                overlap a tracked object is added as a *new* object and tracked
+                forward.  ``None`` (the default) runs a single forward pass —
+                the original single-prompt behavior.
+            detect_fn: Callable ``(local_idx, frame_path) -> list[(x1,y1,x2,y2)]``
+                returning robot boxes (in frame-pixel coordinates) for the given
+                boundary frame.  Only used when ``reprompt_every`` is set.
+            max_objects: Hard cap on the total number of tracked objects.  Once
+                reached, re-prompting stops adding new objects (prevents false
+                detections from spawning phantom tracks).  ``None`` = no cap.
+            new_obj_ios_thresh: A detection whose best intersection-over-smaller
+                against any tracked mask is below this threshold is treated as a
+                new robot.  Passed to :func:`match_new_detections`.
+            progress_cb: Optional callback taking (processed_count, total_frames).
 
         Returns:
             Nested dict ``{frame_idx: {obj_id: {"box": (x1,y1,x2,y2),
             "mask": ndarray_2d}}}``.  Objects with empty masks on a given
             frame are omitted from that frame's dict.
         """
+        import os
+        if os.path.isdir(frames_dir):
+            frame_files = sorted(
+                f for f in os.listdir(frames_dir)
+                if f.endswith(".jpg") or f.endswith(".jpeg")
+            )
+            frame_paths = [os.path.join(frames_dir, f) for f in frame_files]
+        else:
+            frame_paths = []
+        total_frames = max(1, len(frame_paths))
+
         predictor = self._predictor
 
-        state = predictor.init_state(video_path=frames_dir)
+        state = predictor.init_state(
+            video_path=frames_dir,
+            offload_video_to_cpu=self.offload_video_to_cpu,
+            offload_state_to_cpu=self.offload_state_to_cpu,
+        )
 
-        # Prompt each robot box on the prompt frame.
-        for i, box in enumerate(prompt_boxes):
-            obj_id = i + 1
-            box_arr = np.asarray(box, dtype=np.float32)
+        # Prompt each robot box on the prompt frame.  Object IDs are 1-based.
+        next_obj_id = 1
+        for box in prompt_boxes:
             predictor.add_new_points_or_box(
                 state,
                 frame_idx=prompt_idx,
-                obj_id=obj_id,
-                box=box_arr,
+                obj_id=next_obj_id,
+                box=np.asarray(box, dtype=np.float32),
             )
+            next_obj_id += 1
 
         results: dict[int, dict[int, dict]] = {}
+        self._processed_count = 0
 
-        # Propagate — use torch contexts only on the real-torch path.
-        def _propagate():
+        reprompting = bool(reprompt_every) and detect_fn is not None
+
+        def _propagate(start_frame_idx=None, max_frame_num_to_track=None):
+            # Pass chunk kwargs only when re-prompting, so single-pass callers
+            # (and the simple test stub) keep the original zero-arg signature.
+            if reprompting:
+                kwargs = {
+                    "start_frame_idx": start_frame_idx,
+                    "max_frame_num_to_track": max_frame_num_to_track,
+                }
+            else:
+                kwargs = {}
             if self._real_torch:
                 import torch
                 with torch.inference_mode(), _maybe_autocast(self._device):
-                    yield from predictor.propagate_in_video(state)
+                    yield from predictor.propagate_in_video(state, **kwargs)
             else:
-                yield from predictor.propagate_in_video(state)
+                yield from predictor.propagate_in_video(state, **kwargs)
 
-        for f_idx, obj_ids, mask_logits in _propagate():
-            # mask_logits may be a real torch tensor (shape N,1,H,W) or our
-            # FakeTensor stub.  Either way: > 0, .cpu(), .numpy() works.
-            bool_arr = (mask_logits > 0).cpu().numpy()  # numpy bool array
+        def _record_chunk(start_frame_idx, max_frame_num_to_track):
+            """Propagate one chunk; record masks; return the last frame index seen."""
+            last_idx = None
+            for f_idx, obj_ids, mask_logits in _propagate(
+                start_frame_idx, max_frame_num_to_track
+            ):
+                # mask_logits may be a real torch tensor (N,1,H,W) or a stub.
+                bool_arr = (mask_logits > 0).cpu().numpy()
+                frame_entry: dict[int, dict] = {}
+                for i, obj_id in enumerate(obj_ids):
+                    if bool_arr.ndim == 4:
+                        mask2d = bool_arr[i, 0].astype(bool)
+                    elif bool_arr.ndim == 3:
+                        mask2d = bool_arr[i].astype(bool)
+                    else:
+                        mask2d = bool_arr.astype(bool)
+                    box = mask_to_box(mask2d)
+                    if box is None:
+                        continue  # object not visible this frame
+                    frame_entry[int(obj_id)] = {"box": box, "mask": mask2d}
+                results[int(f_idx)] = frame_entry
+                last_idx = int(f_idx)
+                self._processed_count += 1
+                if progress_cb is not None:
+                    try:
+                        progress_cb(self._processed_count, total_frames)
+                    except Exception:
+                        pass
+            return last_idx
 
-            frame_entry: dict[int, dict] = {}
-            for i, obj_id in enumerate(obj_ids):
-                # Squeeze per-object slice to 2D regardless of leading dims.
-                if bool_arr.ndim == 4:
-                    mask2d = bool_arr[i, 0].astype(bool)
-                elif bool_arr.ndim == 3:
-                    mask2d = bool_arr[i].astype(bool)
-                else:
-                    mask2d = bool_arr.astype(bool)
+        try:
+            if not reprompting:
+                _record_chunk(None, None)
+            else:
+                cursor = prompt_idx
+                last_end = prompt_idx - 1
+                while True:
+                    last_idx = _record_chunk(cursor, reprompt_every)
+                    if last_idx is None or last_idx <= last_end:
+                        break  # no forward progress -> end of video
+                    last_end = last_idx
 
-                box = mask_to_box(mask2d)
-                if box is None:
-                    # Object has no visible pixels this frame — skip.
-                    continue
+                    # Re-prompt at the chunk boundary: register robots that have
+                    # newly come into view (not overlapping any tracked mask).
+                    capped = max_objects is not None and (next_obj_id - 1) >= max_objects
+                    if not capped:
+                        frame_path = (
+                            frame_paths[last_idx] if last_idx < len(frame_paths) else None
+                        )
+                        try:
+                            new_boxes = detect_fn(last_idx, frame_path) or []
+                        except Exception:
+                            new_boxes = []
+                        existing = {
+                            oid: entry["mask"]
+                            for oid, entry in results.get(last_idx, {}).items()
+                        }
+                        if new_boxes:
+                            # Use any tracked mask's shape for the frame size; fall
+                            # back to a detection-derived size if nothing tracked.
+                            if existing:
+                                h, w = next(iter(existing.values())).shape
+                            else:
+                                w = max(int(b[2]) for b in new_boxes) + 1
+                                h = max(int(b[3]) for b in new_boxes) + 1
+                            int_boxes = [
+                                (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                                for b in new_boxes
+                            ]
+                            for j in match_new_detections(
+                                existing, int_boxes, (w, h), ios_thresh=new_obj_ios_thresh
+                            ):
+                                if max_objects is not None and (next_obj_id - 1) >= max_objects:
+                                    break
+                                predictor.add_new_points_or_box(
+                                    state,
+                                    frame_idx=last_idx,
+                                    obj_id=next_obj_id,
+                                    box=np.asarray(new_boxes[j], dtype=np.float32),
+                                )
+                                next_obj_id += 1
 
-                frame_entry[int(obj_id)] = {"box": box, "mask": mask2d}
-
-            results[int(f_idx)] = frame_entry
+                    cursor = last_idx + 1
+        finally:
+            if hasattr(predictor, "reset_state"):
+                predictor.reset_state(state)
 
         return results

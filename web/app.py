@@ -8,6 +8,7 @@ import base64
 import cv2
 import datetime
 import json
+import math
 import numpy as np
 import os
 import pytesseract
@@ -42,16 +43,17 @@ from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
 from web.field.field_model import FieldModel
-from web.field.calibration import Calibrator, CalibrationError, holdout_field_error
+from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error
 from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
-from web.field.tracker import FieldTracker
+from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
+from web.field.fused_track_id import FusedTrackRegistry
 from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color
 from web.field.zones import load_zones, save_zones
 
@@ -81,6 +83,29 @@ def jsonify(obj):
     elif isinstance(obj, np.generic):  # any other numpy scalar -> native Python
         return obj.item()
     return obj
+
+
+def _box_iou(box_a, box_b):
+    """Intersection over Union (IoU) of two bounding boxes (x1, y1, x2, y2)."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    if union == 0.0:
+        return 0.0
+    return inter / union
+
+
+def _on_field(xy, dims, margin=1.0):
+    """Check if field coordinate (x, y) is on the field bounds plus some margin."""
+    L, W = dims
+    return -margin <= xy[0] <= L + margin and -margin <= xy[1] <= W + margin
+
 
 
 # Configuration
@@ -184,6 +209,26 @@ OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by 
 VLM_DIRECT_CONTRADICTION_CONF = 0.9  # exact/high-confidence read that unlocks a wrong confirmed label
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
+
+# SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
+# to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
+REPROMPT_SECONDS = 2.0
+MAX_TRACKED_ROBOTS = 6         # FRC match maximum (3 per alliance); caps phantom tracks
+
+# Robot-tracking top crop: DISABLED for now. SAM2 resizes every frame to a fixed
+# square, so cropping the top distorts robot aspect ratio (squished into 1024x1024)
+# which may hurt tracking more than the airspace false-positive filtering helps.
+# The calibration field/API/UI are kept; flip this to re-enable and revisit.
+ROBOT_TRACK_TOP_CROP_ENABLED = False
+
+# VRAM-fit tunable knob (speed/quality experiment).  When > 0, the SAM2 pass keeps
+# all video + state tensors on the GPU (no CPU offload, which removes the per-frame
+# host->device copy that dominates runtime) and raises frame_skip so the tracked
+# segment stays within this many frames.  Trades temporal resolution for speed.
+# Set via env, e.g. `SAM2_MAX_GPU_FRAMES=1200 python web/app.py`.  0 = disabled.
+SAM2_MAX_GPU_FRAMES = int(os.environ.get("SAM2_MAX_GPU_FRAMES", "0") or "0")
+# SAM2 stores each frame as float32 (3 x 1024 x 1024) = 12.0 MiB of GPU memory.
+SAM2_FRAME_GPU_MIB = 12.0
 
 # Bumper-number reading VLM. Swap models here (loaded via AutoModelForImageTextToText,
 # so any transformers-supported image-text-to-text model works, e.g. InternVL3, Nemotron).
@@ -330,7 +375,11 @@ class InferenceJob:
         self.video_fps = 0
         self.total_frames = 0
         self.overhead_height = 0
-        
+        self.frame_skip = FRAME_SKIP
+        self.target_tracking_fps = None
+        # Per-run VRAM frame budget; defaults to the env constant, overridable per job.
+        self.sam2_max_gpu_frames = SAM2_MAX_GPU_FRAMES
+
         # Detection state
         self.hubs: List[DetectedHub] = []
         self.robot_tracks: Dict[int, RobotTrack] = {}
@@ -579,7 +628,19 @@ class InferenceJob:
         else:
             results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
             dets = sv.Detections.from_ultralytics(results)
-        robot_boxes = [dets.xyxy[i] for i in range(len(dets)) if dets.class_id[i] == 1]
+        robot_boxes = []
+        for i in range(len(dets)):
+            if dets.class_id[i] == 1:
+                box = dets.xyxy[i]
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                is_masked = False
+                for (mx, my, mw, mh) in view.masks:
+                    if mx <= cx <= mx + mw and my <= cy <= my + mh:
+                        is_masked = True
+                        break
+                if not is_masked:
+                    robot_boxes.append(box)
         field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
                                          color_fn=self.detect_bumper_color)
         paired = []
@@ -1419,10 +1480,28 @@ class InferenceJob:
 
     def _draw_bumper_hud(self, img: np.ndarray, box, alliance: str, label: str,
                          slot_id: Optional[int] = None, cal=None, field_pos=None,
-                         vel=None) -> None:
+                         vel=None, mask: Optional[np.ndarray] = None) -> None:
         """Draw bumper-specific evidence over a camera view."""
         color = (255, 80, 20) if alliance == "blue" else (30, 30, 255) if alliance == "red" else (190, 190, 190)
+
+        SLOT_COLORS = {
+            0: (0, 220, 0),       # slot 0 (B1): Green
+            1: (255, 220, 0),     # slot 1 (B2): Cyan/Light Blue
+            2: (0, 220, 220),     # slot 2 (B3): Yellow
+            3: (30, 30, 255),     # slot 3 (R1): Red
+            4: (225, 50, 225),    # slot 4 (R2): Magenta/Pink
+            5: (0, 165, 255),     # slot 5 (R3): Orange
+        }
+        mask_color = SLOT_COLORS.get(slot_id, color) if slot_id is not None else color
+
         x1, y1, x2, y2 = map(int, box)
+        
+        # Draw SAM2 mask overlay if present
+        if mask is not None:
+            overlay = img.copy()
+            overlay[mask] = mask_color
+            cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+
         band = bumper_band_box(img, box)
         if band is not None:
             bx1, by1, bx2, by2 = band
@@ -2269,6 +2348,11 @@ class InferenceJob:
             self.video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.video_fps = cap.get(cv2.CAP_PROP_FPS)
             self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if self.video_fps and self.video_fps > 0:
+                self.frame_skip = max(1, int(round(self.video_fps / 10.0)))
+            else:
+                self.frame_skip = FRAME_SKIP
+            print(f"Using dynamic frame_skip = {self.frame_skip} for video FPS = {self.video_fps}")
             self.overhead_height = int(self.video_height * OVERHEAD_CROP_RATIO)
             self.ocr_regions = scale_ocr_regions(self.video_width, self.overhead_height)
             print(f"Video: {self.video_width}x{self.video_height}, overhead: {self.video_width}x{self.overhead_height}")
@@ -2283,11 +2367,237 @@ class InferenceJob:
                 self.extract_team_numbers(early_overhead)
             # Skip the first 180 frames (title screen / intro graphics)
             TITLE_SCREEN_FRAMES = 180
+            EARLY_OCR_FRAME = 200
+
+            # ----- SAM2 PRE-COMPUTATION PASS -----
+            self.use_sam2 = False
+            self.sam2_raw = {}
+            self.robot_embedder = None
+            
+            if self.total_frames <= EARLY_OCR_FRAME:
+                print(f"  [SAM2] Video is too short ({self.total_frames} frames) for early prompt frame {EARLY_OCR_FRAME}. Disabling SAM2.")
+            else:
+                try:
+                    from web.field.sam2_tracker import Sam2FieldTracker
+                    import torch
+                    
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    offload_vid = True
+                    offload_st = True
+                    target_tracking_fps = 10.0
+                    
+                    if self.target_tracking_fps is not None:
+                        target_tracking_fps = self.target_tracking_fps
+                        if device == "cuda":
+                            try:
+                                free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(0)
+                                free_vram_gb = free_mem_bytes / (1024 ** 3)
+                                if free_vram_gb >= 16.0:
+                                    offload_st = False
+                            except Exception:
+                                pass
+                    elif device == "cuda":
+                        try:
+                            free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(0)
+                            free_vram_gb = free_mem_bytes / (1024 ** 3)
+                            total_vram_gb = total_mem_bytes / (1024 ** 3)
+                            print(f"  [SAM2] GPU VRAM: {free_vram_gb:.2f} GB free of {total_vram_gb:.2f} GB total")
+                            if free_vram_gb >= 16.0:
+                                offload_st = False
+                                target_tracking_fps = 20.0
+                                print("  [SAM2] Free VRAM >= 16GB: keeping tensors on GPU and targeting 20 FPS tracking.")
+                            else:
+                                print("  [SAM2] Free VRAM < 16GB: offloading tensors to CPU and targeting 10 FPS tracking.")
+                        except Exception as e:
+                            print(f"  [SAM2] Error querying GPU VRAM info: {e}. Using conservative defaults.")
+                    
+                    # Update dynamic frame_skip calculation based on adaptive target tracking FPS
+                    if self.video_fps and self.video_fps > 0:
+                        self.frame_skip = max(1, int(round(self.video_fps / target_tracking_fps)))
+                    else:
+                        self.frame_skip = FRAME_SKIP
+                    print(f"  [SAM2] Recalculating dynamic frame_skip = {self.frame_skip} for target FPS = {target_tracking_fps}")
+
+                    # VRAM-fit override: keep all tensors on the GPU and raise
+                    # frame_skip so the tracked segment fits within the budget.
+                    if self.sam2_max_gpu_frames > 0 and self.total_frames:
+                        source_frames = max(1, self.total_frames - TITLE_SCREEN_FRAMES)
+                        self.frame_skip = max(
+                            self.frame_skip,
+                            math.ceil(source_frames / self.sam2_max_gpu_frames),
+                        )
+                        seg_frames = math.ceil(source_frames / self.frame_skip)
+                        offload_vid = False
+                        offload_st = False
+                        est_gib = seg_frames * SAM2_FRAME_GPU_MIB / 1024.0
+                        print(f"  [SAM2] VRAM-fit: budget={self.sam2_max_gpu_frames} frames -> "
+                              f"frame_skip={self.frame_skip}, ~{seg_frames} tracked frames "
+                              f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
+
+                    sam2_tracker = Sam2FieldTracker(
+                        device=device,
+                        offload_video_to_cpu=offload_vid,
+                        offload_state_to_cpu=offload_st
+                    )
+                    self.robot_embedder = RobotEmbedder()
+                    self.use_sam2 = True
+                    print(f"  [SAM2] Loaded Sam2FieldTracker and RobotEmbedder on {device}")
+                except Exception as e:
+                    print(f"  [SAM2] Failed to initialize SAM2/embedder: {e}. Falling back to Kalman tracking.")
+                    self.use_sam2 = False
+                    self.robot_embedder = None
+
+            if self.use_sam2:
+                print(f"  [SAM2] Running pre-computation pass over {len(self.views)} views...")
+                all_frames = list(range(TITLE_SCREEN_FRAMES, self.total_frames, self.frame_skip))
+                # Find the index of the frame in all_frames closest to EARLY_OCR_FRAME
+                prompt_local_idx = min(range(len(all_frames)), key=lambda i: abs(all_frames[i] - EARLY_OCR_FRAME))
+                prompt_frame = all_frames[prompt_local_idx]
+                SAM2_SCALE = 0.5
+                
+                N = len(self.views)
+                loop = asyncio.get_running_loop()
+
+                async def safe_send_status(msg: str, pct: float):
+                    if self.websocket:
+                        try:
+                            await self.websocket.send_json({
+                                "type": "status",
+                                "status": "processing",
+                                "message": msg,
+                                "progress": round(pct, 1)
+                            })
+                        except Exception:
+                            pass
+
+                for view_idx, view in enumerate(self.views):
+                    base_pct = (view_idx / N) * 100.0
+                    print(f"  [SAM2] Pre-processing view: {view.name} ...")
+                    tmp_dir_obj = tempfile.TemporaryDirectory()
+                    prompt_boxes_scaled = []
+                    
+                    cap_pre = cv2.VideoCapture(str(self.video_path))
+                    try:
+                        for local_idx, gf in enumerate(all_frames):
+                            cap_pre.set(cv2.CAP_PROP_POS_FRAMES, gf)
+                            ok, fr = cap_pre.read()
+                            if not ok:
+                                continue
+                            
+                            # Extract crop and resize to 0.5x
+                            crop = view.extract(fr)
+                            # Exclude the airspace at the top of the view from robot
+                            # tracking (robots can't be there) — a false-positive filter.
+                            # NOTE: this does NOT save SAM2 VRAM/compute: SAM2 hard-resizes
+                            # every frame to a fixed image_size square (see misc.py
+                            # _load_img_as_tensor), so fewer input rows == same tensor.
+                            # It does make robots larger in that square (better mask res).
+                            top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                            if top_crop_frac > 0:
+                                top_crop_px = int(crop.shape[0] * top_crop_frac)
+                                crop = crop[top_crop_px:, :]
+                            new_w = int(crop.shape[1] * SAM2_SCALE)
+                            new_h = int(crop.shape[0] * SAM2_SCALE)
+                            small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                            
+                            # Write to temp dir
+                            fname = os.path.join(tmp_dir_obj.name, f"{local_idx:05d}.jpg")
+                            cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            
+                            # Detect YOLO prompt boxes on prompt frame (gf == prompt_frame)
+                            if gf == prompt_frame:
+                                res = self.model(crop, conf=0.4, verbose=False)[0]
+                                for i in range(len(res.boxes)):
+                                    if int(res.boxes.cls[i]) == 1:
+                                        box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
+                                        prompt_boxes_scaled.append(tuple(box))
+                                        
+                            if local_idx % 20 == 0 or local_idx == len(all_frames) - 1:
+                                pct = base_pct + (local_idx / len(all_frames)) * (30.0 / N)
+                                msg = f"[SAM2] View '{view.name}': exporting frames ({local_idx}/{len(all_frames)})..."
+                                await safe_send_status(msg, pct)
+                    except Exception as e:
+                        print(f"  [SAM2] Error exporting frames for view {view.name}: {e}")
+                    finally:
+                        cap_pre.release()
+                        
+                    print(f"  [SAM2] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
+                    if not prompt_boxes_scaled:
+                        print(f"  [SAM2] View {view.name}: nothing to track, skipping SAM2 for this view.")
+                        pct = base_pct + 100.0 / N
+                        msg = f"[SAM2] View '{view.name}': skipped (no robots detected)."
+                        await safe_send_status(msg, pct)
+                        tmp_dir_obj.cleanup()
+                        continue
+                        
+                    try:
+                        def make_progress_cb(v_idx, v_name):
+                            def progress_cb(current, total):
+                                pct = base_pct + (30.0 / N) + (current / total) * (70.0 / N)
+                                msg = f"[SAM2] View '{v_name}': tracking frame {current}/{total}..."
+                                loop.call_soon_threadsafe(
+                                    lambda: asyncio.create_task(safe_send_status(msg, pct))
+                                )
+                            return progress_cb
+
+                        # Periodic re-prompting: re-run YOLO at chunk boundaries so
+                        # robots that start occluded (e.g. behind the hub) get picked
+                        # up once they emerge.  detect_fn runs on the exact JPEG SAM2
+                        # tracks, so returned boxes are already in SAM2 (0.5x) coords.
+                        def make_detect_fn():
+                            def detect_fn(local_idx, frame_path):
+                                if not frame_path:
+                                    return []
+                                img = cv2.imread(frame_path)
+                                if img is None:
+                                    return []
+                                res = self.model(img, conf=0.4, verbose=False)[0]
+                                boxes = []
+                                for i in range(len(res.boxes)):
+                                    if int(res.boxes.cls[i]) == 1:
+                                        boxes.append(tuple(res.boxes.xyxy[i].cpu().numpy()))
+                                return boxes
+                            return detect_fn
+
+                        # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
+                        eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
+                        reprompt_every = max(1, int(round(REPROMPT_SECONDS * eff_fps)))
+
+                        t0 = time.perf_counter()
+                        view_tracks = await asyncio.to_thread(
+                            sam2_tracker.track,
+                            frames_dir=tmp_dir_obj.name,
+                            prompt_idx=prompt_local_idx,
+                            prompt_boxes=prompt_boxes_scaled,
+                            reprompt_every=reprompt_every,
+                            detect_fn=make_detect_fn(),
+                            max_objects=MAX_TRACKED_ROBOTS,
+                            progress_cb=make_progress_cb(view_idx, view.name)
+                        )
+                        elapsed = time.perf_counter() - t0
+                        n = len(view_tracks)
+                        print(f"  [SAM2] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
+                              f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
+                        self.sam2_raw[view.name] = view_tracks
+                        
+                        pct = base_pct + 100.0 / N
+                        msg = f"[SAM2] View '{view.name}': tracking complete."
+                        await safe_send_status(msg, pct)
+                    except Exception as e:
+                        print(f"  [SAM2] Error during propagation for view {view.name}: {e}")
+                    finally:
+                        tmp_dir_obj.cleanup()
+                
+                if not self.sam2_raw:
+                    print("  [SAM2] No views produced tracklets — falling back to Kalman tracking.")
+                    self.use_sam2 = False
+                else:
+                    self.fused_registry = FusedTrackRegistry()
+            # -------------------------------------
 
             # Early vision OCR pass on frame 200 to identify robots before main loop.
             # Seeds the field tracker's slots from this frame so VLM reads bind to
             # slot ids (the same identity the main loop uses).
-            EARLY_OCR_FRAME = 200
             cap.set(cv2.CAP_PROP_POS_FRAMES, EARLY_OCR_FRAME)
             ret, early_ocr_frame = cap.read()
             if ret and self.match_teams:
@@ -2298,11 +2608,25 @@ class InferenceJob:
                 robot_mask = detections.class_id == 1
                 early_boxes = [detections.xyxy[i] for i in range(len(detections))
                                if robot_mask[i]]
+                main_view = next((v for v in self.views if v.name == "main"), None)
+                if main_view:
+                    filtered_early_boxes = []
+                    for box in early_boxes:
+                        cx = (box[0] + box[2]) / 2.0
+                        cy = (box[1] + box[3]) / 2.0
+                        is_masked = False
+                        for (mx, my, mw, mh) in main_view.masks:
+                            if mx <= cx <= mx + mw and my <= cy <= my + mh:
+                                is_masked = True
+                                break
+                        if not is_masked:
+                            filtered_early_boxes.append(box)
+                    early_boxes = filtered_early_boxes
                 early_field_dets = to_field_detections(
                     early_boxes, self.calib, early_overhead, self.field_dims,
                     color_fn=self.detect_bumper_color,
                 )
-                early_dt = FRAME_SKIP / (self.video_fps or 30.0)
+                early_dt = self.frame_skip / (self.video_fps or 30.0)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
                 early_robots = []
                 for t in early_outs:
@@ -2332,7 +2656,7 @@ class InferenceJob:
                     break
                 
                 # Skip frames
-                if frame_num % FRAME_SKIP != 0:
+                if (frame_num - TITLE_SCREEN_FRAMES) % self.frame_skip != 0:
                     frame_num += 1
                     continue
                 
@@ -2349,20 +2673,97 @@ class InferenceJob:
                 # ---- Multi-camera field-space tracking ----
                 per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
-                for view in self.views:
-                    # Reuse the top-of-loop YOLO result for main (its crop is the
-                    # overhead frame `detections` was computed on) — avoids a second
-                    # robot-YOLO pass per frame on the heaviest model.
-                    pre = detections if view.name == "main" else None
-                    paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
-                    per_camera[view.name] = paired
-                    person_boxes_by_cam[view.name] = pboxes
+                
+                if self.use_sam2:
+                    local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
+                    SAM2_SCALE = 0.5
+                    for view in self.views:
+                        paired = []
+                        view_raw = self.sam2_raw.get(view.name, {})
+                        
+                        view_frame = view.extract(frame)
+                        cal = view.calibration
+                        # SAM2 tracked a top-cropped view; add the excluded rows back
+                        # so box y-coords are in full-crop space (what cal/masks expect).
+                        top_crop_frac = (getattr(cal, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                        sam2_y_offset = int(view_frame.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
+                        
+                        # Prepare small frame for DINOv2 embedding if robot_embedder is loaded
+                        small_frame = None
+                        if self.robot_embedder is not None:
+                            new_w = int(view_frame.shape[1] * SAM2_SCALE)
+                            new_h = int(view_frame.shape[0] * SAM2_SCALE)
+                            small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                        for obj_id, info in view_raw.get(local_idx, {}).items():
+                            x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
+                            fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
+                                                  x2 / SAM2_SCALE, y2 / SAM2_SCALE + sam2_y_offset)
+                            cx = (fx1 + fx2) / 2.0
+                            cy = (fy1 + fy2) / 2.0
+                            is_masked = False
+                            for (mx, my, mw, mh) in view.masks:
+                                if mx <= cx <= mx + mw and my <= cy <= my + mh:
+                                    is_masked = True
+                                    break
+                            if is_masked:
+                                continue
+                            uv = ((fx1 + fx2) / 2.0, fy2)  # bottom-center, full-res crop
+                            xy = cal.image_to_field(uv)
+                            if xy is None or not _on_field(xy, self.field_dims):
+                                continue
+                            
+                            # Detect bumper color on the full resolution view crop frame
+                            color = self.detect_bumper_color(view_frame, np.array([fx1, fy1, fx2, fy2]))
+                            
+                            det_embed = None
+                            if small_frame is not None:
+                                # small_frame is the full-crop at 0.5x; index it with the
+                                # offset-corrected box scaled back to 0.5x (== raw box when
+                                # no top-crop is configured).
+                                det_embed = self.robot_embedder.embed(
+                                    small_frame,
+                                    (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
+                                     fx2 * SAM2_SCALE, fy2 * SAM2_SCALE),
+                                )
+                                
+                            det = FieldDetection(
+                                pos=xy,
+                                color=color,
+                                box=(fx1, fy1, fx2, fy2),
+                                score=1.0,
+                                track_id=obj_id,
+                                embedding=det_embed
+                            )
+                            
+                            cb = self._bumper_crop_b64(view_frame, det.box, enforce_floor=False)
+                            crop_b64 = cb[0] if cb is not None else None
+                            paired.append((det, crop_b64))
+                            
+                        # Feed the person detector for occlusion reasoning in SAM2 mode
+                        person_results = self.person_model(view_frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                        pdets = sv.Detections.from_ultralytics(person_results)
+                        person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
+                        person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
+                        
+                        per_camera[view.name] = paired
+                        person_boxes_by_cam[view.name] = person_boxes
+                else:
+                    for view in self.views:
+                        pre = detections if view.name == "main" else None
+                        paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
+                        per_camera[view.name] = paired
+                        person_boxes_by_cam[view.name] = pboxes
 
                 weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
                            for v in self.views}
                 fused = fuse_detections(per_camera, weights=weights)   # list[FusedObservation]
+                
+                if self.use_sam2:
+                    self.fused_registry.assign(fused)
+
                 field_dets = [obs.detection for obs in fused]
-                dt = FRAME_SKIP / (self.video_fps or 30.0)
+                dt = self.frame_skip / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
 
                 # 5. Resolve occlusion from every posed camera and merge: a track
@@ -2398,15 +2799,43 @@ class InferenceJob:
                 # Map detection index -> slot_id for the annotation pass (a track's
                 # box is the same ndarray its field detection was built from).
                 detection_to_tracked = {}  # det_index -> slot_id
-                for slot_id, tbox in tracked_robot_boxes:
+                
+                if self.use_sam2:
+                    slot_to_main_box = {}
+                    for obs in fused:
+                        if obs.track_id is not None:
+                            for cam, det_id in obs.members:
+                                if cam == "main":
+                                    main_det = next((d for (d, _) in per_camera.get("main", []) if d.track_id == det_id), None)
+                                    if main_det is not None and main_det.box is not None:
+                                        slot_to_main_box[obs.track_id] = main_det.box
+                                    break
+                    
                     for di in range(len(detections)):
                         if detections.class_id[di] != 1:
                             continue
                         db = detections.xyxy[di]
-                        if (abs(db[0] - tbox[0]) < 1 and abs(db[1] - tbox[1]) < 1 and
-                                abs(db[2] - tbox[2]) < 1 and abs(db[3] - tbox[3]) < 1):
-                            detection_to_tracked[di] = slot_id
-                            break
+                        best_slot = None
+                        best_iou = 0.3
+                        for registry_track_id, sbox in slot_to_main_box.items():
+                            iou = _box_iou(db, sbox)
+                            if iou > best_iou:
+                                best_iou = iou
+                                resolved_slot = self.field_tracker._id_to_slot.get(registry_track_id)
+                                if resolved_slot is not None:
+                                    best_slot = resolved_slot
+                        if best_slot is not None:
+                            detection_to_tracked[di] = best_slot
+                else:
+                    for slot_id, tbox in tracked_robot_boxes:
+                        for di in range(len(detections)):
+                            if detections.class_id[di] != 1:
+                                continue
+                            db = detections.xyxy[di]
+                            if (abs(db[0] - tbox[0]) < 1 and abs(db[1] - tbox[1]) < 1 and
+                                    abs(db[2] - tbox[2]) < 1 and abs(db[3] - tbox[3]) < 1):
+                                detection_to_tracked[di] = slot_id
+                                break
 
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
@@ -2493,11 +2922,31 @@ class InferenceJob:
                             alliance = robot.alliance
                             label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
                             t = track_by_slot.get(slot_id)
+                            
+                            # Find main view mask for this slot
+                            mask = None
+                            if self.use_sam2:
+                                local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
+                                registry_track_id = next((k for k, v in self.field_tracker._id_to_slot.items() if v == slot_id), None)
+                                if registry_track_id is not None:
+                                    obs = next((o for o in fused if o.track_id == registry_track_id), None)
+                                    if obs is not None:
+                                        for cam, det_id in obs.members:
+                                            if cam == "main" and "main" in self.sam2_raw:
+                                                view_raw = self.sam2_raw["main"]
+                                                if local_idx in view_raw and det_id in view_raw[local_idx]:
+                                                    mask2d = view_raw[local_idx][det_id].get("mask")
+                                                    if mask2d is not None:
+                                                        crop_h, crop_w = overhead_frame.shape[:2]
+                                                        mask = cv2.resize(mask2d.astype(np.uint8), (crop_w, crop_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                                                break
+
                             self._draw_bumper_hud(
                                 annotated_frame, box, alliance, label, slot_id=slot_id,
                                 cal=self.calib,
                                 field_pos=t.pos if t else robot.field_position,
                                 vel=t.vel if t else None,
+                                mask=mask,
                             )
                             continue
                         else:
@@ -2889,8 +3338,51 @@ async def grab_frame(request: Request):
 @app.get("/api/calibration")
 async def get_calibration(event: str, camera: str = "main"):
     cal = field_store.load(event, camera)
-    return {"has_calibration": cal is not None,
-            "rms_error": cal.rms_error if cal else None}
+    return {
+        "has_calibration": cal is not None,
+        "rms_error": cal.rms_error if cal else None,
+        "masks": cal.masks if (cal and hasattr(cal, "masks")) else [],
+        "robot_track_top_crop": getattr(cal, "robot_track_top_crop", 0.0) if cal else 0.0,
+    }
+
+
+@app.post("/api/calibration/masks")
+async def save_calibration_masks(request: Request):
+    """Body: {event, camera?, masks: [[x,y,w,h], ...]}."""
+    body = await request.json()
+    event = body["event"]
+    camera = body.get("camera", "main")
+    masks = body.get("masks", [])
+
+    cal = field_store.load(event, camera)
+    if cal is None:
+        cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
+
+    cal.masks = [tuple(m) for m in masks]
+    field_store.save(event, camera, cal)
+    return {"status": "ok", "masks": cal.masks}
+
+
+@app.post("/api/calibration/robot-track-top-crop")
+async def save_robot_track_top_crop(request: Request):
+    """Body: {event, camera?, robot_track_top_crop: float}.
+
+    Fraction (0.0–0.5) of the top of this view excluded from the SAM2 robot
+    tracking pass — robots cannot be in the airspace above the field.  Stored
+    per camera/event; preserves any existing calibration (masks, intrinsics).
+    """
+    body = await request.json()
+    event = body["event"]
+    camera = body.get("camera", "main")
+    crop = max(0.0, min(0.5, float(body.get("robot_track_top_crop", 0.0))))
+
+    cal = field_store.load(event, camera)
+    if cal is None:
+        cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
+
+    cal.robot_track_top_crop = crop
+    field_store.save(event, camera, cal)
+    return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
 
 
 def _decode_b64_image(b64: str):
@@ -3114,6 +3606,11 @@ async def calibration_solve_homography(request: Request):
                                                  "2026-rebuilt-welded")
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    existing = field_store.load(event, camera)
+    if existing and hasattr(existing, "masks"):
+        cal.masks = existing.masks
+    if existing and hasattr(existing, "robot_track_top_crop"):
+        cal.robot_track_top_crop = existing.robot_track_top_crop
     field_store.save(event, camera, cal)
 
     # Build overlay on the same frame/timestamp.
@@ -3178,6 +3675,11 @@ async def calibration_solve_tags(request: Request):
                                                 field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    existing = field_store.load(event, camera)
+    if existing and hasattr(existing, "masks"):
+        cal.masks = existing.masks
+    if existing and hasattr(existing, "robot_track_top_crop"):
+        cal.robot_track_top_crop = existing.robot_track_top_crop
     field_store.save(event, camera, cal)
     holdout_err = holdout_field_error(cal, held) if held else None
 
@@ -4260,7 +4762,8 @@ async def get_diagnostic(key: str):
 async def infer(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
-    team_reader: str = Form("local")
+    team_reader: str = Form("local"),
+    sam2_max_gpu_frames: Optional[int] = Form(None),
 ):
     """Start inference job"""
     job_id = str(uuid.uuid4())
@@ -4301,6 +4804,9 @@ async def infer(
         # Create job
         team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
         job = InferenceJob(job_id, video_path, team_reader=team_reader)
+        # Per-run VRAM frame budget (UI override); falls back to env default when omitted.
+        if sam2_max_gpu_frames is not None:
+            job.sam2_max_gpu_frames = max(0, int(sam2_max_gpu_frames))
         jobs[job_id] = job
         
         return {"job_id": job_id}

@@ -95,6 +95,133 @@ class StubPredictor:
             yield f_idx, obj_ids, mask_logits
 
 
+# ---------------------------------------------------------------------------
+# Re-prompting (chunked propagation) stub + tests
+# ---------------------------------------------------------------------------
+
+class RepromptStubPredictor:
+    """Stub modelling SAM2's mid-stream object addition.
+
+    An object added via ``add_new_points_or_box(frame_idx=K)`` becomes active
+    from frame K onward, exactly like the real predictor.  ``propagate_in_video``
+    honours ``start_frame_idx``/``max_frame_num_to_track`` and yields, for each
+    frame, the obj_ids active at that frame plus their (static, non-overlapping)
+    masks.  Object ``oid`` lives at x in [6*oid, 6*oid+4).
+    """
+
+    H = 20
+    W = 60
+    NUM_FRAMES = 6
+
+    def __init__(self) -> None:
+        self.add_calls: list[tuple[int, int]] = []  # (frame_idx, obj_id)
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}  # obj_id -> first active frame_idx
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+
+    def _rect_for(self, oid: int) -> tuple[int, int, int, int]:
+        x0 = oid * 6
+        return (x0, 2, x0 + 4, 6)
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        if max_frame_num_to_track is None:
+            end = self.NUM_FRAMES - 1
+        else:
+            end = min(start + max_frame_num_to_track, self.NUM_FRAMES - 1)
+        for f in range(start, end + 1):
+            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            rects = [self._rect_for(oid) for oid in active]
+            yield f, active, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_reprompt_adds_new_robot_and_tracks_it_forward():
+    """A robot detected at a chunk boundary becomes a new tracked object."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    # detect_fn always reports: one box overlapping obj 1 (already tracked) and
+    # one box at obj 3's location (a genuinely new robot).
+    overlap_box = stub._rect_for(1)   # (6,2,10,6) — matches tracked obj 1
+    new_box = stub._rect_for(3)       # (18,2,22,6) — unmatched -> new robot
+    calls: list[int] = []
+
+    def detect_fn(local_idx, frame_path):
+        calls.append(local_idx)
+        return [overlap_box, new_box]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],  # objs 1, 2
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_objects=6,
+    )
+
+    # All 6 frames present.
+    assert set(result.keys()) == {0, 1, 2, 3, 4, 5}
+    # Frames before the first reprompt boundary: only the 2 initial robots.
+    assert set(result[0].keys()) == {1, 2}
+    assert set(result[2].keys()) == {1, 2}
+    # After re-prompting at frame 2, the new robot (obj 3) is tracked forward.
+    assert set(result[3].keys()) == {1, 2, 3}
+    assert set(result[5].keys()) == {1, 2, 3}
+    # The new robot was added exactly once; the overlapping box was deduped.
+    assert (2, 3) in stub.add_calls
+    assert stub.add_calls == [(0, 1), (0, 2), (2, 3)]
+
+
+def test_reprompt_respects_max_objects_cap():
+    """No new objects are added once the robot cap is reached."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        return [stub._rect_for(3)]  # a new robot every boundary
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],  # cap already at 2
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_objects=2,
+    )
+
+    # Cap reached at construction; obj 3 is never added.
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert set(result[5].keys()) == {1, 2}
+
+
+def test_no_reprompt_when_detect_fn_absent_is_single_pass():
+    """Without reprompt_every/detect_fn, track() runs a single-pass propagation."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = StubPredictor()  # original single-pass stub: propagate_in_video(state)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+    )
+    # Same behavior as before: 3 frames, 2 objects.
+    assert set(result.keys()) == {0, 1, 2}
+    assert set(result[0].keys()) == {1, 2}
+
+
 def test_sam2_field_tracker_returns_correct_structure():
     """Sam2FieldTracker with a stub predictor produces the expected nested dict."""
     from web.field.sam2_tracker import Sam2FieldTracker

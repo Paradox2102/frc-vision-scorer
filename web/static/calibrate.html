@@ -105,6 +105,39 @@
 </div>
 
 <div class="points-section">
+  <h2>Camera view exclusion masks <span style="font-weight:normal;color:#889;font-size:.8em;">— screen out background false-positives</span></h2>
+  <p class="hint">
+    Tick <b>Draw exclusion masks</b>, then <b>drag a box on the camera view (Broadcast frame)</b> to block out background regions. Detections inside these regions are completely ignored. Remember to <b>Save masks</b>.
+  </p>
+  <div class="controls" style="margin-bottom:8px;">
+    <label><input type="checkbox" id="maskMode"> Draw exclusion masks on frame</label>
+    <button onclick="saveMasks()">Save masks</button>
+    <button onclick="clearMasks()">Clear all</button>
+    <span id="maskStatus" class="hint"></span>
+  </div>
+  <ul id="maskList" style="margin:0;padding-left:18px;color:#bcd;font-family:monospace;font-size:.85em;"></ul>
+</div>
+
+<div class="points-section">
+  <h2>Robot-tracking top crop <span style="font-weight:normal;color:#c89b3c;font-size:.8em;">— disabled, under review</span></h2>
+  <p class="hint">
+    <b>Currently disabled.</b> Cropping the top airspace would block false positives up there, but
+    because SAM2 resizes every frame to a fixed square it also distorts robot aspect ratio (squished),
+    which may hurt tracking. Parked until we can evaluate that trade-off. The setting still saves, but
+    has no effect on tracking while disabled. (For speed, use the VRAM budget on the main page.)
+  </p>
+  <div class="controls" style="margin-bottom:8px;opacity:.55;">
+    <label>Top crop:
+      <input type="range" id="topCropRange" min="0" max="0.5" step="0.01" value="0" disabled
+             oninput="document.getElementById('topCropVal').textContent=(this.value*100).toFixed(0)+'%'; redrawFrame();">
+      <span id="topCropVal" style="font-family:monospace;color:#bcd;">0%</span>
+    </label>
+    <button onclick="saveTopCrop()" disabled>Save top crop</button>
+    <span id="topCropStatus" class="hint"></span>
+  </div>
+</div>
+
+<div class="points-section">
   <h2>Correspondences</h2>
   <table>
     <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th>Hold out</th><th></th></tr></thead>
@@ -137,6 +170,8 @@ let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
 let zones = [];           // [[xmin,ymin,xmax,ymax], ...] in field meters
 let zoneDrag = null;      // {x0,y0,x1,y1} in map pixels while dragging
+let frameMasks = [];      // [[x,y,w,h], ...] in actual cropped frame coordinates
+let frameDrag = null;      // {x0,y0,x1,y1} in canvas pixels while dragging
 
 (async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await loadZones(); await grabFrame(); })();
 
@@ -253,12 +288,15 @@ async function grabFrame(){
     if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return; }
     autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null;
     const img = new Image();
-    img.onload = function(){
+    img.onload = async function(){
       frameW = img.naturalWidth; frameH = img.naturalHeight;
       const canvas = document.getElementById('frameCanvas');
       const maxW = 760; fScale = Math.min(1, maxW / frameW);
       canvas.width = Math.round(frameW*fScale); canvas.height = Math.round(frameH*fScale);
-      baseImg = img; redrawFrame(); drawMap(); renderRows();
+      baseImg = img;
+      await loadMasks();
+      await loadTopCrop();
+      redrawFrame(); drawMap(); renderRows();
       setStatus(`Frame grabbed. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
     };
     img.src = 'data:image/jpeg;base64,' + j.frame;
@@ -270,6 +308,63 @@ function redrawFrame(){
   const ctx = canvas.getContext('2d');
   if (!baseImg) return;
   ctx.drawImage(baseImg,0,0,canvas.width,canvas.height);
+  
+  // Draw exclusion masks (in transparent red/orange)
+  frameMasks.forEach((m, i) => {
+    const x = m[0] * fScale;
+    const y = m[1] * fScale;
+    const w = m[2] * fScale;
+    const h = m[3] * fScale;
+    ctx.fillStyle = 'rgba(255, 60, 60, 0.2)';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = 'rgba(255, 60, 60, 0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#ff8080';
+    ctx.font = '10px monospace';
+    ctx.fillText('mask ' + (i+1), x + 3, y + 12);
+  });
+
+  // Robot-tracking top-crop band: the airspace SAM2 ignores during tracking.
+  const cropEl = document.getElementById('topCropRange');
+  const cropFrac = cropEl ? (parseFloat(cropEl.value) || 0) : 0;
+  if (cropFrac > 0) {
+    const bandH = cropFrac * canvas.height;
+    ctx.fillStyle = 'rgba(20, 30, 60, 0.55)';
+    ctx.fillRect(0, 0, canvas.width, bandH);
+    // diagonal hatch, clipped to the band height
+    ctx.strokeStyle = 'rgba(120, 160, 255, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = -bandH; x < canvas.width; x += 14) {
+      ctx.moveTo(x, 0); ctx.lineTo(x + bandH, bandH);
+    }
+    ctx.stroke();
+    // solid boundary line
+    ctx.strokeStyle = 'rgba(120, 200, 255, 0.95)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, bandH); ctx.lineTo(canvas.width, bandH); ctx.stroke();
+    // label (inside the band if tall enough, otherwise just below the line)
+    const label = `robot tracking ignores top ${(cropFrac*100).toFixed(0)}%`;
+    ctx.font = '11px monospace';
+    const ly = bandH > 22 ? bandH - 8 : bandH + 14;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(4, ly - 11, ctx.measureText(label).width + 6, 14);
+    ctx.fillStyle = '#bfe0ff'; ctx.fillText(label, 7, ly);
+  }
+
+  // Draw active mask drag
+  if (frameDrag) {
+    const x = Math.min(frameDrag.x0, frameDrag.x1);
+    const y = Math.min(frameDrag.y0, frameDrag.y1);
+    const w = Math.abs(frameDrag.x1 - frameDrag.x0);
+    const h = Math.abs(frameDrag.y1 - frameDrag.y0);
+    ctx.strokeStyle = 'rgba(255, 100, 100, 0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
+  }
+
   // auto tag quads
   ctx.lineWidth = 2;
   for (const [id, corners] of Object.entries(autoTags)){
@@ -297,6 +392,7 @@ function redrawFrame(){
 }
 
 document.getElementById('frameCanvas').addEventListener('click', function(e){
+  if (document.getElementById('maskMode').checked) return;
   if (!baseImg) return;
   const rect = this.getBoundingClientRect();
   pendingPixel = {u: Math.round((e.clientX-rect.left)/fScale),
@@ -469,6 +565,111 @@ async function saveZones(){
 
 function clearZones(){ zones = []; drawMap(); renderZoneList();
   document.getElementById('zoneStatus').textContent = 'Cleared (not yet saved — click Save).'; }
+
+// ---- Camera view exclusion masks ----
+(function(){
+  const fc = document.getElementById('frameCanvas');
+  fc.addEventListener('mousedown', e => {
+    if (!document.getElementById('maskMode').checked) return;
+    if (!baseImg) return;
+    const r = fc.getBoundingClientRect();
+    const x = e.clientX-r.left, y = e.clientY-r.top;
+    frameDrag = {x0:x, y0:y, x1:x, y1:y};
+  });
+  fc.addEventListener('mousemove', e => {
+    if (!frameDrag) return;
+    const r = fc.getBoundingClientRect();
+    frameDrag.x1 = e.clientX-r.left; frameDrag.y1 = e.clientY-r.top;
+    redrawFrame();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!frameDrag) return;
+    const x0 = Math.round(frameDrag.x0 / fScale);
+    const y0 = Math.round(frameDrag.y0 / fScale);
+    const x1 = Math.round(frameDrag.x1 / fScale);
+    const y1 = Math.round(frameDrag.y1 / fScale);
+    frameDrag = null;
+    
+    const w = Math.abs(x1 - x0);
+    const h = Math.abs(y1 - y0);
+    if (w >= 5 && h >= 5) {
+      frameMasks.push([Math.min(x0, x1), Math.min(y0, y1), w, h]);
+    }
+    redrawFrame(); renderMaskList();
+  });
+})();
+
+function renderMaskList(){
+  const ul = document.getElementById('maskList'); ul.replaceChildren();
+  frameMasks.forEach((m,i) => {
+    const li = document.createElement('li');
+    li.textContent = `mask ${i+1}: (${m[0]}, ${m[1]}) size ${m[2]}x${m[3]} px  `;
+    const b = document.createElement('button'); b.textContent='✕'; b.className='del-btn';
+    b.onclick = () => { frameMasks.splice(i,1); redrawFrame(); renderMaskList(); };
+    li.appendChild(b); ul.appendChild(li);
+  });
+}
+
+async function loadMasks(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  if (!event || !camera) return;
+  try {
+    const r = await fetch(`/api/calibration?event=${encodeURIComponent(event)}&camera=${encodeURIComponent(camera)}`);
+    const j = await r.json();
+    frameMasks = (j.masks || []).map(m => m.map(Number));
+    renderMaskList();
+  } catch(e){
+    frameMasks = [];
+    renderMaskList();
+  }
+}
+
+async function saveMasks(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  if (!event){ document.getElementById('maskStatus').textContent = 'Set an event first.'; return; }
+  try {
+    const r = await fetch('/api/calibration/masks', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({event, camera, masks: frameMasks})});
+    const j = await r.json();
+    document.getElementById('maskStatus').textContent =
+      j.error ? ('Save error: '+j.error) : `Saved ${frameMasks.length} mask(s) for ${camera} ✓`;
+  } catch(e){ document.getElementById('maskStatus').textContent = 'Save error: '+e.message; }
+}
+
+function clearMasks(){ frameMasks = []; redrawFrame(); renderMaskList();
+  document.getElementById('maskStatus').textContent = 'Cleared (not yet saved — click Save).'; }
+
+async function loadTopCrop(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  if (!event || !camera) return;
+  try {
+    const r = await fetch(`/api/calibration?event=${encodeURIComponent(event)}&camera=${encodeURIComponent(camera)}`);
+    const j = await r.json();
+    const v = Number(j.robot_track_top_crop || 0);
+    document.getElementById('topCropRange').value = v;
+    document.getElementById('topCropVal').textContent = (v*100).toFixed(0)+'%';
+    redrawFrame();
+  } catch(e){ /* leave at current value */ }
+}
+
+async function saveTopCrop(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  if (!event){ document.getElementById('topCropStatus').textContent = 'Set an event first.'; return; }
+  const frac = parseFloat(document.getElementById('topCropRange').value) || 0;
+  try {
+    const r = await fetch('/api/calibration/robot-track-top-crop', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({event, camera, robot_track_top_crop: frac})});
+    const j = await r.json();
+    document.getElementById('topCropStatus').textContent =
+      j.error ? ('Save error: '+j.error) : `Saved top crop ${(j.robot_track_top_crop*100).toFixed(0)}% for ${camera} ✓`;
+  } catch(e){ document.getElementById('topCropStatus').textContent = 'Save error: '+e.message; }
+}
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');
   el.textContent=msg; el.className=cls||'rms-info'; }

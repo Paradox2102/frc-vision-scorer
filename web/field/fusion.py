@@ -65,8 +65,19 @@ def _merge(cluster) -> FusedObservation:
     box = max(cluster, key=lambda c: c[3])[1].box
     evidence = [(cam, crop, w) for (cam, det, crop, w) in cluster]
     members = [(cam, det.track_id) for (cam, det, crop, w) in cluster]
+
+    # Weighted average and L2-normalize crop embeddings
+    embs = [c[1].embedding for c in cluster if c[1].embedding is not None]
+    emb_ws = [c[3] for c in cluster if c[1].embedding is not None]
+    if embs:
+        avg_emb = np.average(embs, axis=0, weights=emb_ws)
+        norm = np.linalg.norm(avg_emb)
+        merged_embedding = avg_emb / norm if norm > 0 else avg_emb
+    else:
+        merged_embedding = None
+
     return FusedObservation(
-        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box),
+        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box, embedding=merged_embedding),
         evidence=evidence,
         members=members,
     )

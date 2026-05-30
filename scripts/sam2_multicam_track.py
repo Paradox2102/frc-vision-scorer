@@ -41,6 +41,7 @@ from web.field.fusion import fuse_detections
 from web.field.tracker import FieldDetection, FieldTracker
 from web.field.spike_metrics import continuity_stats
 from web.app import MODEL_PATH
+from web.embedder import RobotEmbedder
 
 DEFAULT_VIDEO = ROOT / "data/test_footage/qual1_first_champs_2026.mp4"
 DEFAULT_LABELS = ROOT / "data/test_footage/qual1_first_champs_2026.spike_labels.json"
@@ -138,6 +139,7 @@ def main():
 
     raw: dict[str, dict] = {}    # view_name -> {local_idx: {obj_id: {"box","mask"}}}
     total_prop, total_elapsed = 0, 0.0
+    tmp_dirs: dict[str, tempfile.TemporaryDirectory] = {}
     for view in views:
         tmp_obj, prompt_boxes = _export_view(cap, view, all_frames, prompt_frame, robot_model)
         print(f"[driver] {view.name}: prompt frame detected {len(prompt_boxes)} robots")
@@ -145,6 +147,7 @@ def main():
             print(f"[driver] {view.name}: nothing to track — skipping this view")
             tmp_obj.cleanup()
             continue
+        tmp_dirs[view.name] = tmp_obj
         t0 = time.perf_counter()
         raw[view.name] = sam2.track(
             frames_dir=tmp_obj.name,
@@ -157,7 +160,6 @@ def main():
         total_elapsed += elapsed
         print(f"[driver] {view.name}: propagated {n} frames in {elapsed:.2f}s "
               f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
-        tmp_obj.cleanup()
     cap.release()
 
     if not raw:
@@ -172,6 +174,9 @@ def main():
     tracker = FieldTracker(fm.length_m)
     dt = stride / fps
 
+    print("[driver] Building RobotEmbedder ...")
+    embedder = RobotEmbedder()
+
     frames: dict[int, dict] = {}        # global_frame -> {slot_id: (u, v)}
     multicam_clusters = 0               # fused observations with >1 camera member
     render_data: dict[int, list] = {}   # global_frame -> [(cam, box_crop, fused_id, multicam)]
@@ -183,6 +188,14 @@ def main():
             view = view_by_name[name]
             cal = view.calibration
             dets = []
+
+            # Read the 0.5x crop frame for this view if it exists
+            view_frame = None
+            if name in tmp_dirs:
+                fname = os.path.join(tmp_dirs[name].name, f"{local_idx:05d}.jpg")
+                if os.path.exists(fname):
+                    view_frame = cv2.imread(fname)
+
             for obj_id, info in view_raw.get(local_idx, {}).items():
                 x1, y1, x2, y2 = info["box"]                  # 0.5x crop coords
                 fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE,
@@ -191,9 +204,15 @@ def main():
                 xy = cal.image_to_field(uv)
                 if xy is None or not _on_field(xy, dims):
                     continue
+
+                det_embed = None
+                if view_frame is not None:
+                    # Compute embedding directly on the 0.5x frame using 0.5x box coords
+                    det_embed = embedder.embed(view_frame, (x1, y1, x2, y2))
+
                 dets.append((FieldDetection(pos=xy, color="unknown",
                                             box=(fx1, fy1, fx2, fy2), score=1.0,
-                                            track_id=obj_id), None))
+                                            track_id=obj_id, embedding=det_embed), None))
             if dets:
                 per_camera[name] = dets
 
@@ -298,6 +317,8 @@ def main():
         cap2.release()
         print(f"[driver] Wrote {args.render}")
 
+    for td in tmp_dirs.values():
+        td.cleanup()
     print("\n[driver] Done.")
 
 

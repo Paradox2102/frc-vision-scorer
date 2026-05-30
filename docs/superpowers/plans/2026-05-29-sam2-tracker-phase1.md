@@ -68,8 +68,8 @@ def _rect_mask(x1, y1, x2, y2, wh=(10, 10)):
 - [ ] **Step 2: Run → fail** (`.venv/bin/python -m pytest tests/field/test_sam2_tracker.py -v`)
 
 - [ ] **Step 3: Implement the pure helpers** in `web/field/sam2_tracker.py`:
-  - `mask_to_box(mask)->tuple|None`: nonzero bbox (x1,y1,x2,y2), None if empty. (May use `sv.mask_to_xyxy` but a NumPy `np.where` impl keeps it torch-free for tests — prefer NumPy.)
-  - `bottom_center(box)->tuple`: `((x1+x2)/2, y2)`.
+  - `mask_to_box(mask)->tuple|None`: nonzero bbox (x1,y1,x2,y2), None if empty. Use NumPy `np.where` (torch-free for tests). **Convention: exclusive max** — `x2 = xs.max()+1`, `y2 = ys.max()+1` (matches the test `(3,2,8,5)` for `m[2:5,3:8]`). Note this differs from the spike's inclusive `_mask_to_box`; pick exclusive here and keep `bottom_center` consistent with it.
+  - `bottom_center(box)->tuple`: `((x1+x2)/2, y2)` — `y2` is the exclusive-max bottom from `mask_to_box`.
   - `match_new_detections(existing_masks, new_boxes, wh, ios_thresh)->list[int]`: rasterize each new box to a mask (`np.zeros` + slice), compute Intersection-over-Smaller vs each existing mask, return indices of boxes whose best IoS < thresh (i.e. genuinely new robots to prompt). Keep IoS as a small pure helper.
 
 - [ ] **Step 4: Run → pass.**
@@ -94,7 +94,7 @@ Integration facts: `FieldDetection(pos, color, box, score)` (`tracker.py:18`); `
 
 - [ ] **Step 1: Failing tests** — (a) a detection with a stable `track_id` binds to a slot and KEEPS that slot on later frames even when a closer detection of another id appears (no distance steal); (b) detections with `track_id=None` behave exactly as today (regression test mirroring existing behavior).
 
-- [ ] **Step 2-4:** Add `track_id: int|None = None` to `FieldDetection`. In `_assign`, before distance matching, bind any detection whose `track_id` is already mapped to its existing slot (sticky), and bind a never-seen `track_id` to a free slot (respecting alliance side + static-zone gate); only `track_id is None` detections go through the existing distance min-cost path. Maintain a `self._id_to_slot` map. Preserve `last_det_to_slot` + `TrackOut`/`update` contract exactly. Run full `tests/field/` + `tests/test_radar.py` + `tests/test_alliance_consistency.py` → green (proves app.py path unaffected).
+- [ ] **Step 2-4:** Add `track_id: int|None = None` to `FieldDetection`. In `_assign`, before distance matching, bind any detection whose `track_id` is already mapped to its existing slot (sticky), and bind a never-seen `track_id` to a free slot (respecting alliance side + static-zone gate); only `track_id is None` detections go through the existing distance min-cost path. **Critical: remove the sticky-bound detections from the paired list BEFORE allocating the `np.full` cost matrix**, or they'd appear as both sticky and distance candidates and corrupt the index→slot mapping. For each sticky detection still set `last_det_to_slot[orig_idx]=slot_id` so the VLM-binding contract holds. Maintain a `self._id_to_slot` map. Preserve `last_det_to_slot` + `TrackOut`/`update` contract exactly. Run full `tests/field/` + `tests/test_radar.py` + `tests/test_alliance_consistency.py` → green (proves app.py path unaffected).
 
 - [ ] **Step 5: Commit** (`feat(field): optional stable track_id with sticky slot binding (back-compat)`).
 
@@ -102,7 +102,8 @@ Integration facts: `FieldDetection(pos, color, box, score)` (`tracker.py:18`); `
 
 **Files:** Create `scripts/sam2_field_track.py`.
 
-- [ ] End-to-end: `Sam2FieldTracker` over a clip → per-frame field detections WITH track_ids (bottom-center → `image_to_field`) → `FieldTracker.update` → assert fixed-6 / 3-per-alliance invariants hold; print continuity vs the anonymous path. Run on the qual1 window; eyeball the radar/боxes. Commit.
+- [ ] End-to-end: `Sam2FieldTracker` over a clip → per-frame field detections WITH track_ids (bottom-center → `image_to_field`) → `FieldTracker.update` → assert fixed-6 / 3-per-alliance invariants hold; print continuity vs the anonymous path. Run on the qual1 window; eyeball the radar/boxes. Commit.
+- **Coordinate-space gotcha:** SAM2 masks are computed on the 0.5×-scaled export frames (see the spike). Rescale mask bottom-centers back to full-res crop pixels (÷0.5 → ×2) BEFORE `cal.image_to_field(...)`, since the calibration is in full-res main-crop space. Mirror the spike's rescale at `scripts/sam2_spike.py` (~lines 366–371).
 
 ---
 

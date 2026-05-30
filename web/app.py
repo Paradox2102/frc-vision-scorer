@@ -88,7 +88,7 @@ LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 SCORE_REGIONS_FILE = PROJECT_ROOT / "score_regions.json"
 CALIB_TEST_VIDEO = Path(__file__).resolve().parents[1] / "data/test_footage/qual1_first_champs_2026.mp4"
-CALIB_MAIN_CROP_FRAC = 0.60   # main camera = top 60% of the composite
+# Per-camera crop regions now come from data/field/composite_layout.json (load_layout).
 
 # --- Per-match logging -------------------------------------------------------
 # Mirror everything this module print()s into any open match-log file(s) so a
@@ -2018,7 +2018,11 @@ class InferenceJob:
                         and processed_frame_num % CORNER_READ_INTERVAL == 0
                         and self.match_teams):
                     remaining, r_blue, r_red = self._remaining_rosters()
-                    for i, obs in enumerate(fused):
+                    # Mirror the main path's early-out: once every team is confirmed,
+                    # only keep reading on re-read passes (to self-correct a wrong
+                    # lock). Otherwise skip the VLM calls entirely.
+                    do_corner = bool(remaining) or is_reread_due
+                    for i, obs in enumerate(fused if do_corner else []):
                         slot_id = self.field_tracker.last_det_to_slot.get(i)
                         if slot_id is None:
                             continue
@@ -2685,8 +2689,12 @@ async def calibration_solve_homography(request: Request):
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     okf, frame = cap.read(); cap.release()
     overlay_b64 = None
-    if okf and frame is not None:
-        main = frame[: int(frame.shape[0] * CALIB_MAIN_CROP_FRAC), :]
+    cl = load_layout().get(camera)
+    if okf and frame is not None and cl is not None:
+        cx, cy, cw, ch = cl.crop
+        main = frame[cy:cy + ch, cx:cx + cw].copy()
+        for (mx, my, mw_, mh_) in cl.masks:
+            main[my:my + mh_, mx:mx + mw_] = 0
         _draw_field_overlay(main, cal, fm)
         # clicked points
         for p in pts:

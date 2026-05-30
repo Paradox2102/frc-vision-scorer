@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 from pupil_apriltags import Detector
 
+# Module-level singleton holding C-level state — not thread-safe. Fine for the
+# sequential calibration UI and single-job inference; do not call detect_tags /
+# detect_tags_in_roi concurrently from multiple threads.
 _detector = Detector(families="tag36h11")
 
 

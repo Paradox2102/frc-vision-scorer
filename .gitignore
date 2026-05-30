@@ -101,3 +101,7 @@ checkpoints/
 
 # Test footage (large video, not committed)
 data/test_footage/
+
+# Local tooling / session state (not shared)
+.antigravitycli/
+.claude/

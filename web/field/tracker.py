@@ -10,6 +10,8 @@ from itertools import permutations
 from typing import Optional
 import numpy as np
 
+from web.field.zones import point_in_zones
+
 ALLIANCES = ("blue", "red")
 
 
@@ -19,6 +21,7 @@ class FieldDetection:
     color: str
     box: tuple
     score: float = 1.0
+    track_id: int | None = None
 
 
 @dataclass
@@ -73,18 +76,23 @@ class _Track:
 
 class FieldTracker:
     def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
-                 max_coast_occluded=90, color_penalty=3.0):
+                 max_coast_occluded=90, color_penalty=3.0, zones=None):
         self.gate = gate_m
         self.field_length = field_length
         self.max_open = max_coast_open
         self.max_occ = max_coast_occluded
         self.color_penalty = color_penalty
+        # Static-structure zones (field meters). A new slot is never seeded from
+        # a detection inside a zone; existing tracks update normally.
+        self.zones = list(zones) if zones else []
         self.tracks = []
         sid = 0
         for a in ALLIANCES:
             for _ in range(3):
                 self.tracks.append(_Track(slot_id=sid, alliance=a))
                 sid += 1
+        # Maps stable track_id -> slot_id for sticky binding.
+        self._id_to_slot: dict[int, int] = {}
 
     def _slots(self, alliance):
         return [t for t in self.tracks if t.alliance == alliance]
@@ -138,6 +146,61 @@ class FieldTracker:
         active_slots = [t for t in slots if t.active]
         free_slots = [t for t in slots if not t.active]
 
+        # ---- Sticky binding pass (track_id is not None) ----
+        # Process before building the cost matrix so these detections are
+        # removed from the pool and never cause an index off-by-one.
+        remaining_pairs = []
+        for orig_idx, d in dets_with_idx:
+            if d.track_id is None:
+                remaining_pairs.append((orig_idx, d))
+                continue
+
+            tid = d.track_id
+            if tid in self._id_to_slot:
+                # Re-bind to the known slot.
+                slot_id = self._id_to_slot[tid]
+                slot = next((t for t in slots if t.slot_id == slot_id), None)
+                if slot is not None and slot.active:
+                    slot.kf.update(d.pos)
+                    slot.box = d.box
+                    slot.missed = 0
+                    slot.hits += 1
+                    slot.coasting = False
+                    self.last_det_to_slot[orig_idx] = slot.slot_id
+                    # Remove this slot from active_slots so it won't be
+                    # processed again in the distance-matching pass.
+                    if slot in active_slots:
+                        active_slots.remove(slot)
+                    continue
+                # Slot expired or doesn't exist — fall through to seed path
+                # (remove stale mapping so it can be re-seeded below)
+                del self._id_to_slot[tid]
+
+            # New track_id — seed into a free slot if available, respecting
+            # the static-zone gate exactly like the existing seed path.
+            if free_slots and not point_in_zones(d.pos, self.zones):
+                slot = free_slots.pop(0)
+                slot.kf = _KF(d.pos)
+                slot.box = d.box
+                slot.missed = 0
+                slot.hits = 1
+                slot.coasting = False
+                slot.active = True
+                self._id_to_slot[tid] = slot.slot_id
+                self.last_det_to_slot[orig_idx] = slot.slot_id
+            elif point_in_zones(d.pos, self.zones):
+                # Inside a seeding-blocked zone — don't seed, don't add to
+                # remaining (same behavior as anonymous dets in zone).
+                pass
+            else:
+                # No free slots available — treat as an anonymous detection
+                # so distance matching can at least try to match it.
+                remaining_pairs.append((orig_idx, d))
+
+        # Replace dets_with_idx with the non-sticky remainder for the
+        # existing distance-matching / seeding path below.
+        dets_with_idx = remaining_pairs
+
         # Unpack original indices and detection objects from paired list
         idxs = [i for (i, _) in dets_with_idx]
         dets = [d for (_, d) in dets_with_idx]
@@ -185,11 +248,15 @@ class FieldTracker:
                 if i not in matched_slot_indices:
                     t.missed += 1
 
-            # Seed leftover detections into free slots
+            # Seed leftover detections into free slots — but never seed a new
+            # slot from a detection inside a static-structure zone (a real robot
+            # is never born there; it drives in as an already-active track).
             leftover_pairs = [(j, dets[j]) for j in range(len(dets)) if j not in matched_det_indices]
             for j, d in leftover_pairs:
                 if not free_slots:
                     break
+                if point_in_zones(d.pos, self.zones):
+                    continue
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
@@ -205,10 +272,13 @@ class FieldTracker:
                 t.missed += 1
 
         else:
-            # No active slots: seed as many dets as we have free slots
+            # No active slots: seed as many dets as we have free slots, skipping
+            # any detection sitting inside a static-structure zone.
             for j, d in enumerate(dets):
                 if not free_slots:
                     break
+                if point_in_zones(d.pos, self.zones):
+                    continue
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box

@@ -330,12 +330,25 @@ Sub-project 1 of 5. Build order 1 → 2 → 3 → 4 (each verifiable on its own)
 as future polish:
 
 1. **Field-coordinate foundation (this spec)** — main cam: calibration + projection
-   + diagnostic radar.
+   + diagnostic radar. **Done.**
 2. **Field-space tracking + alliance** — motion-model tracker; 6 stable tracks;
-   alliance by side.
+   alliance by side. **Done, then superseded:** the Kalman tracker's image-space
+   association role moves to SAM2; the Kalman tracker is demoted to a thin
+   field-space `SlotMapper`. See the
+   [Tracking & Identity Upgrade](2026-05-29-tracking-identity-upgrade-design.md).
 3. **Multi-camera fusion** — both corner cameras into the shared field space.
+   **Done, then re-pointed** to fuse per-camera SAM2 tracklets (same fusion model).
 4. **Identity rebuild** — greenfield team-number assignment on stable field tracks.
+   **Defined by the Tracking & Identity Upgrade:** `bumper_number` detection class +
+   IoS matching, consecutive-agreement number lock, appearance embeddings.
 5. **Polish / scoring / analytics** — photoreal radar, scoring-from-position,
-   heatmaps.
+   heatmaps. **Unchanged, deferred.**
+
+**Tracking replacement (new, between 2 and 3 in dependency order):** SAM2
+mask-propagation tracking replaces the Kalman tracker's frame-to-frame association,
+spike-gated. Defined in the
+[Tracking & Identity Upgrade](2026-05-29-tracking-identity-upgrade-design.md), which
+unifies the remaining work (tracking replacement + SP3 re-point + SP4) into one
+sequenced effort.
 
 Each sub-project gets its own spec → plan → implementation cycle.

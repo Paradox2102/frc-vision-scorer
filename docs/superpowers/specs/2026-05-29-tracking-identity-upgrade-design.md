@@ -229,6 +229,24 @@ only the per-camera detection source changes (raw detections → SAM2 tracklets)
 views now arrives as two tracklets and resolves to one slot; a corner-only
 tracklet (main-camera-occluded robot) still maps to its slot.
 
+**SP-T.2 Result (2026-05-29, DONE).** Implemented per
+`docs/superpowers/plans/2026-05-29-sam2-tracker-phase2.md`. `FusedObservation`
+additively gained `members` (`(camera, per_camera_track_id)`) and `track_id`
+(defaults preserve the 3-tuple `evidence` contract, so `app.py`'s live SP3 fusion
+path is byte-for-byte unchanged). New pure `web/field/fused_track_id.py`
+`FusedTrackRegistry` assigns one stable integer id per physical robot via
+union-find over member keys (corner-only robot keeps its id when main later
+joins; bridged ids collapse). Pure acceptance test
+(`tests/field/test_tracklet_fusion_to_slot.py`) proves two-view→one slot,
+corner-only→slot, and an abrupt one-frame position swap that defeats the
+constant-velocity distance matcher but is held by stable fused ids (verified to
+fail when the id is withheld from the tracker). Offline GPU driver
+`scripts/sam2_multicam_track.py` runs the full chain on real footage (qual1
+test/main: 6 robots→6 slots, fixed-6 invariants held, ~180 ms/frame; skip-clean
+when no calibrated views). Cross-camera real-SAM2 fusion is unit-covered only —
+corner cameras are calibrated for `2026hop` (no matching footage on hand). Full
+suite green (183 passed). **app.py untouched** (offline-first, per Phase 1).
+
 ### SP4 — Identity rebuild
 
 Identity rides on stable SAM2 track IDs. Three isolated pieces.

@@ -74,29 +74,61 @@ match_robot_crop(
 
 Capture: during `read_fused_bumper_numbers`, maintain per slot the **top-3** crops by
 legibility (`self._slot_crops[slot]` — a small sorted list of
-`{legibility, crop_b64, embedding}`, where `embedding` is the slot's
-`appearance_embedding` snapshot at that read). At finalize, downscale each kept crop to
-a ~128px-tall JPEG thumbnail and write `match_robot_identity` (assigned team/alliance/
-confidence/source) + its `match_robot_crop` rows. `source` is "ocr" or "gallery".
+`{legibility, crop_b64, embedding}`, where `embedding` is a **copy** of the slot's
+`appearance_embedding` at that read — the field-path embedding is an in-place
+EMA-updated array, so snapshots must be copied or all three would reflect the final
+state). At finalize, downscale each kept crop to a ~128px-tall JPEG thumbnail and write
+`match_robot_identity` (assigned team/alliance/confidence/source) + its
+`match_robot_crop` rows. `source` is "ocr" or "gallery".
+
+### F1b. Populate `replays.event_key` at finalize (REQUIRED — currently None)
+
+The replay finalize currently hard-codes `"event_key": None, "match_key": None` when
+inserting the `replays` row (web/app.py ~3445), even though `self.event_key` is set on
+the job. The correction endpoint needs the replay's `event_key` to deposit gallery
+exemplars under the right event. Fix the finalize insert to write
+`"event_key": self.event_key` (leave `match_key` as-is; it is not used here). Without
+this, every correction would hit the "no event_key → skip gallery deposit" path and the
+feature's headline behavior would be dead on arrival.
 
 ### F2. Gallery gains images + a verified tier
 
 Add to `appearance_gallery`: `image BLOB` (crop thumbnail) and
-`verified INTEGER DEFAULT 0`. Auto-deposits (`_deposit_to_gallery`) now also store the
-crop thumbnail (the crop is in scope in `read_fused_bumper_numbers`) with `verified=0`.
-Human corrections store `verified=1`. Added via `CREATE TABLE IF NOT EXISTS` for the new
-columns through the lightweight `ALTER TABLE` try/except pattern already used for
-replays, so existing installs upgrade cleanly.
+`verified INTEGER DEFAULT 0`. These are **new columns on an existing table**, so they
+are added through the lightweight `ALTER TABLE ... ADD COLUMN` try/except loop in
+`init_db` (the same mechanism replays uses for its added columns) — *not* via the
+`SCHEMA` `CREATE TABLE` text (that only creates the table on fresh installs). The two
+brand-new tables in F1 use `CREATE TABLE IF NOT EXISTS` in `SCHEMA`.
+
+`_deposit_to_gallery` gains an `image_bytes` parameter:
+`_deposit_to_gallery(robot, legibility=0.0, image_bytes=None)`. Its two call sites in
+`read_fused_bumper_numbers` (the lock-confirm and re-affirm sites) pass the encoded
+thumbnail of the current `crop_b64`. The buffered `_pending_gallery_rows` dict gains an
+`image` field; auto-deposits store it with `verified=0`. Human corrections insert with
+`verified=1`.
+
+`get_gallery_exemplars` must extend its SELECT to include `id`, `image`, and `verified`
+(currently only `team, alliance_color, embedding, legibility`) — the matcher load needs
+`verified`, and Phase 2's manager needs `id` and `image`.
 
 ### F3. Verified-outweighs matching
 
 `AppearanceGallery.query(embedding, color)` returns
-`list[(team, best_sim, best_is_verified)]`, sorted by `best_sim` desc with **verified
-first on ties**. In `_apply_gallery_vote`, the vote weight becomes
-`GALLERY_VERIFIED_VOTE_WEIGHT` (default 2.0) when the winning match is verified,
-otherwise the existing strong/weak weights. `classify_match` is unchanged (it still
-operates on `(team, sim)` projection); only the weight and tie-break change. New tunable
-`GALLERY_VERIFIED_VOTE_WEIGHT`.
+`list[(team, best_sim, best_is_verified)]` (a 3-tuple per team), sorted by `best_sim`
+desc with **verified first on ties**. To track `best_is_verified`, exemplars carry a
+`verified` flag (loaded from the DB column); `query` records, for each team's best
+exemplar, whether it was verified.
+
+Because `query` now yields 3-tuples, `classify_match` must read positionally —
+`team, sim = ranked[0][0], ranked[0][1]` and `second = ranked[1][1]` — instead of
+unpacking a 2-tuple. Its verdict logic is otherwise unchanged (it only uses team + sim).
+The verified flag rides alongside and is read by the caller.
+
+`_apply_gallery_vote` reads the winning team's verified flag from `ranked[0][2]` and
+picks the vote weight: `GALLERY_VERIFIED_VOTE_WEIGHT` (new tunable, default 2.0) when
+verified, otherwise the existing strong/weak weights. `apply_gallery_matches` (the other
+caller) is updated for the new tuple shape as well. From-DB exemplars set `verified` from
+the column; `add()` gains a `verified` parameter (default False) for verified deposits.
 
 ## Phase 1 — Post-match review & correction (on the replay)
 
@@ -107,15 +139,21 @@ operates on `(team, sim)` projection); only the weight and tie-break change. New
 - `POST /api/replays/{job_id}/correct` body `{slot, team_number}` →
   1. Update `match_robot_identity.team_number` for `(job_id, slot)`.
   2. Update the replay's stored team lists (`replays.blue_teams`/`red_teams`) so the
-     replay shows corrected teams.
+     replay shows corrected teams. (Look up the slot's alliance from
+     `match_robot_identity` to know which list/position to set.)
   3. Mint **verified** gallery exemplars: for each of that slot's `match_robot_crop`
      rows, insert an `appearance_gallery` row (embedding + image, `verified=1`) for
-     `(event_key, team_number, alliance_color)`. Subject to the gallery's dedup/cap on
-     load; here we insert directly to the DB.
-  4. Best-effort: if the replay maps to a saved scored match, update the corresponding
-     `match_robots.team_number` via the existing `update_robot_scores`.
-  - If the run had no `event_key`, steps 1–2 still run; the gallery deposit (step 3) is
-    skipped.
+     `(replays.event_key, team_number, alliance_color)`. Inserted directly to the DB
+     (the in-memory dedup/cap apply only on a future run's load).
+  - If the replay has no `event_key`, steps 1–2 still run; the gallery deposit (step 3)
+    is skipped.
+
+  **Not in scope:** propagating the correction into the separately-saved scored-match
+  (`match_robots`/`scoring_events`). There is no replay→`match_robots.id` linkage today
+  (the replay row carries no `match_key`, and `update_robot_scores` needs a
+  `match_robots.id` reached via `match_key → matches.id → match_robots` + slot→position
+  mapping). Users already edit scored-match teams in the existing `/api/match/save`
+  flow. Designing that linkage is deferred (see Non-goals).
 
 ### Frontend (`web/static/index.html`, `app.js`, `style.css`)
 A "Review identities" panel inside the existing replay player modal: 6 robot cards, each
@@ -181,3 +219,11 @@ This is the surface for cleaning exemplars that false IDs polluted.
 - No cross-event gallery management; the manager is per-event.
 - No editing of historical scoring math — correction changes team attribution and the
   gallery, not alliance score totals.
+- No propagation of corrections into the saved scored-match (`match_robots`/
+  `scoring_events`) flow — that linkage (replay → `match_key` → `matches` →
+  `match_robots.id` per slot) doesn't exist and is deferred; the existing
+  `/api/match/save` UI already edits those teams.
+- Image storage budget: the gallery `image` column grows per verified deposit, bounded
+  in memory only by the per-`(team,color)` cap on load (which evicts by legibility);
+  rows on disk are not separately capped. At ~15 KB/thumbnail and a few hundred
+  exemplars/event this is a few MB — acceptable; no pruning job in this scope.

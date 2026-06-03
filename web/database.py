@@ -70,6 +70,30 @@ CREATE TABLE IF NOT EXISTS scoring_events (
     distance_to_hub REAL,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS replays (
+    id TEXT PRIMARY KEY,
+    created_at TEXT,
+    label TEXT,
+    event_key TEXT,
+    match_key TEXT,
+    comp_level TEXT,
+    blue_score INTEGER DEFAULT 0,
+    red_score INTEGER DEFAULT 0,
+    blue_teams TEXT,
+    red_teams TEXT,
+    video_path TEXT,
+    meta_path TEXT,
+    source_video_path TEXT,
+    thumb_path TEXT,
+    fps REAL,
+    frame_count INTEGER,
+    duration_sec REAL,
+    width INTEGER,
+    height INTEGER,
+    codec TEXT,
+    status TEXT
+);
 """
 
 
@@ -421,3 +445,47 @@ async def get_scored_matches(event_id: int = None) -> List[Dict]:
             result.append(match_dict)
 
         return result
+
+
+# --- Replays ---
+
+_REPLAY_COLUMNS = [
+    "id", "created_at", "label", "event_key", "match_key", "comp_level",
+    "blue_score", "red_score", "blue_teams", "red_teams",
+    "video_path", "meta_path", "source_video_path", "thumb_path",
+    "fps", "frame_count", "duration_sec", "width", "height", "codec", "status",
+]
+
+
+async def insert_replay(row: Dict[str, Any]) -> None:
+    """Insert or replace a replay row (keyed by id)."""
+    cols = ", ".join(_REPLAY_COLUMNS)
+    placeholders = ", ".join("?" for _ in _REPLAY_COLUMNS)
+    values = [row.get(c) for c in _REPLAY_COLUMNS]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"INSERT OR REPLACE INTO replays ({cols}) VALUES ({placeholders})", values)
+        await db.commit()
+
+
+async def list_replays() -> List[Dict]:
+    """All replays, newest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM replays ORDER BY created_at DESC, id DESC")
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_replay(replay_id: str) -> Optional[Dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM replays WHERE id = ?", (replay_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def delete_replay(replay_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM replays WHERE id = ?", (replay_id,))
+        await db.commit()

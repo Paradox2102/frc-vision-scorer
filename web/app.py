@@ -901,6 +901,9 @@ class InferenceJob:
                 card["via"] = "gallery"
                 card["gallery_sim"] = round(sim, 3)
             if robot.team_number_confirmed:
+                # Mirror the OCR lock path: a confirmed identity is exclusive, so
+                # release this team from any other track that was tentatively holding it.
+                self._clear_team_from_other_robots(slot_id, robot.team_number)
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
                         event.team_number = robot.team_number

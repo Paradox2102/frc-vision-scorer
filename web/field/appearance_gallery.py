@@ -93,9 +93,17 @@ class AppearanceGallery:
             emb = r["embedding"]
             if isinstance(emb, (bytes, bytearray)):
                 emb = np.frombuffer(emb, dtype=np.float32)
-            # load directly (bypass dedup/cap; DB is the source of truth)
+            # load directly, skipping dedup (the DB is the source of truth for which
+            # viewpoints are distinct), but still honor the cap below.
             g._sets.setdefault((r["team"], r["alliance_color"]), []).append(
                 _Exemplar(emb, r.get("legibility") or 0.0))
+        # Re-cap each bucket: the DB is append-only across matches, so a bucket can
+        # hold more rows than max_exemplars. Keep the highest-legibility ones so
+        # loaded sets stay bounded (memory + per-query cost).
+        for key, bucket in g._sets.items():
+            if len(bucket) > max_exemplars:
+                bucket.sort(key=lambda ex: ex.legibility, reverse=True)
+                g._sets[key] = bucket[:max_exemplars]
         return g
 
 

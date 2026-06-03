@@ -81,3 +81,14 @@ def test_serialize_roundtrip():
     assert rows and set(rows[0]) >= {"team", "alliance_color", "embedding", "legibility"}
     g2 = AppearanceGallery.from_rows(rows)
     assert g2.query(_unit(1, 0, 0), "blue")[0][0] == "1787"
+
+
+def test_from_rows_recaps_oversized_bucket_keeping_highest_legibility():
+    # The DB is append-only across matches, so a (team,color) bucket can arrive with
+    # more rows than max_exemplars; from_rows must keep only the best `max_exemplars`.
+    rows = [{"team": "1787", "alliance_color": "blue",
+             "embedding": _unit(1, i * 0.3, 0), "legibility": leg}
+            for i, leg in enumerate([0.1, 0.5, 0.9, 0.7, 0.3])]
+    g = AppearanceGallery.from_rows(rows, max_exemplars=2)
+    assert g.exemplar_count("1787", "blue") == 2
+    assert sorted(g.legibilities("1787", "blue")) == [0.7, 0.9]

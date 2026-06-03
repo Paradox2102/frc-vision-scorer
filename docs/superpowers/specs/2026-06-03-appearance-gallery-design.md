@@ -99,12 +99,15 @@ without manual migration.
 - **Load:** at job start, `self.gallery = AppearanceGallery.load(rows for self.event_key)`.
   If `event_key` is absent, the gallery is disabled (in-memory empty, no persistence).
 - **Deposit:** deposit a track's `appearance_embedding` under `(team, detected red/blue
-  color)` whenever its identity is confirmed by a **high-trust source** — i.e. an OCR
-  read crossing the lock threshold, *or* a manual/calibration confirm (the path around
-  `app.py:1254`). Both are trustworthy labels. Re-deposit periodically on confirmed
-  re-read passes (subject to dedup) so coverage improves. Do **not** deposit from a
-  gallery-driven confirmation — only externally-grounded labels seed the gallery, to
-  avoid appearance matches reinforcing themselves.
+  color)` whenever its identity is confirmed by an **externally-grounded label** — i.e.
+  an OCR read crossing the lock threshold, or an OCR re-affirmation of an already-locked
+  team on a re-read pass (subject to dedup) so coverage improves. A future manual
+  team-set / calibration confirm endpoint would also be a valid deposit site (no such
+  endpoint exists today). Do **not** deposit from:
+  - a **gallery-driven** confirmation — appearance matches must not reinforce themselves;
+  - the **process-of-elimination** path (`reid.eliminate_last_team`, ~`app.py:1249-1258`),
+    which assigns a team by inference rather than by reading the bumper or a human label —
+    seeding the gallery from a guess would corrupt it.
 - **Query:** each read pass, for tracks that are **not** confirmed, query with the
   track's embedding + detected color:
   - **Strong match** — `best_sim ≥ GALLERY_CONFIRM_SIM` (≈0.88) **and**

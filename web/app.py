@@ -56,6 +56,8 @@ from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
 from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color
 from web.field.zones import load_zones, save_zones
+from web.replay_recorder import ReplayRecorder
+from web import database
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -114,6 +116,8 @@ MODEL_PATH = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
 STATIC_DIR = Path(__file__).parent / "static"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+REPLAYS_DIR = Path(__file__).parent / "replays"
+REPLAYS_DIR.mkdir(exist_ok=True)
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 SCORE_REGIONS_FILE = PROJECT_ROOT / "score_regions.json"
@@ -2218,6 +2222,7 @@ class InferenceJob:
                 confidence=confidence, distance_to_hub=dist
             )
             self.scoring_events.append(event)
+            self._mirror_event_to_replay()
             print(f"  TRAJECTORY attribution [{alliance}]: Robot {robot.team_number or robot.robot_id} "
                   f"(trajectory-based, dist={dist:.0f})")
             return
@@ -2236,6 +2241,7 @@ class InferenceJob:
                 team_number=alliance_robots[0].team_number,
                 confidence="low", distance_to_hub=999
             ))
+            self._mirror_event_to_replay()
             return
         
         # Filter to robots on their alliance side
@@ -2259,6 +2265,7 @@ class InferenceJob:
             confidence=confidence, distance_to_hub=dist_to_hub
         )
         self.scoring_events.append(event)
+        self._mirror_event_to_replay()
         print(f"  PROXIMITY fallback [{alliance}]: Robot {best_robot.team_number or best_robot.robot_id} "
               f"(dist={dist_to_hub:.0f})")
     
@@ -2380,6 +2387,24 @@ class InferenceJob:
               f"season={cal.field_season} mode={cal.mode}")
         return True
 
+    def _mirror_event_to_replay(self) -> None:
+        """Mirror the most recently appended scoring event into the replay recorder."""
+        rec = getattr(self, "_replay", None)
+        if rec is None or not self.scoring_events:
+            return
+        ev = self.scoring_events[-1]
+        try:
+            rec.add_event({
+                "frame_num": ev.frame_num,
+                "alliance": ev.alliance,
+                "slot": self._slot_label(ev.robot_id),
+                "team_number": ev.team_number,
+                "confidence": ev.confidence,
+                "robot_label": ev.team_number or self._slot_label(ev.robot_id),
+            })
+        except Exception:
+            pass
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
@@ -2430,6 +2455,7 @@ class InferenceJob:
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
+            self._replay = ReplayRecorder()
             self.robot_embedder = None
             
             if self.total_frames <= EARLY_OCR_FRAME:
@@ -3089,6 +3115,30 @@ class InferenceJob:
                 ]
                 annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)
 
+                # --- Replay recording: capture the composited HUD frame + metadata
+                try:
+                    if not self._replay.is_open:
+                        eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 8.0
+                        self._replay.open_lazy(annotated_frame, eff_fps, REPLAYS_DIR / self.job_id)
+                    self._replay.add_frame(annotated_frame, {
+                        "frame_num": frame_num,
+                        "scores": dict(self.alliance_scores),
+                        "robots": [
+                            {
+                                "slot": self._slot_label(t.slot_id),
+                                "alliance": t.alliance,
+                                "team_number": (self.robot_tracks[t.slot_id].team_number
+                                                if t.slot_id in self.robot_tracks else None),
+                                "confirmed": (self.robot_tracks[t.slot_id].team_number_confirmed
+                                              if t.slot_id in self.robot_tracks else False),
+                                "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
+                            }
+                            for t in track_outs if t.state != "empty"
+                        ],
+                    })
+                except Exception as e:
+                    print(f"[replay] frame record error: {e}")
+
                 # Encode frame
                 _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 frame_b64 = base64.b64encode(buffer).decode('utf-8')
@@ -3218,6 +3268,38 @@ class InferenceJob:
             self._close_log_file()
             if cap is not None:
                 cap.release()
+            try:
+                rec = getattr(self, "_replay", None)
+                if rec is not None and rec.is_open:
+                    status = "complete" if self.status == "completed" else "partial"
+                    blue_teams = [self.robot_tracks[s].team_number for s in sorted(self.robot_tracks)
+                                  if self.robot_tracks[s].alliance == "blue"]
+                    red_teams = [self.robot_tracks[s].team_number for s in sorted(self.robot_tracks)
+                                 if self.robot_tracks[s].alliance == "red"]
+                    summary = {
+                        "match_label": Path(str(self.video_path)).stem,
+                        "blue_score": self.alliance_scores.get("blue", 0),
+                        "red_score": self.alliance_scores.get("red", 0),
+                        "robots": [r for f in rec.frames[:1] for r in f["robots"]],
+                    }
+                    artifacts = rec.finalize(status=status, summary=summary)
+                    import json as _json
+                    from datetime import datetime as _dt
+                    await database.insert_replay({
+                        "id": self.job_id,
+                        "created_at": _dt.now().isoformat(timespec="seconds"),
+                        "label": Path(str(self.video_path)).stem,
+                        "event_key": None, "match_key": None, "comp_level": None,
+                        "blue_score": self.alliance_scores.get("blue", 0),
+                        "red_score": self.alliance_scores.get("red", 0),
+                        "blue_teams": _json.dumps(blue_teams),
+                        "red_teams": _json.dumps(red_teams),
+                        "source_video_path": str(self.video_path),
+                        **artifacts,
+                    })
+                    print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
+            except Exception as e:
+                print(f"[replay] finalize error: {e}")
 
 
 @app.on_event("startup")

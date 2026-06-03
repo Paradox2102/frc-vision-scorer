@@ -224,6 +224,9 @@ GALLERY_MAX_EXEMPLARS = int(os.environ.get("GALLERY_MAX_EXEMPLARS", "12"))
 GALLERY_DEDUP_SIM = float(os.environ.get("GALLERY_DEDUP_SIM", "0.92"))
 GALLERY_STRONG_VOTE_WEIGHT = float(os.environ.get("GALLERY_STRONG_VOTE_WEIGHT", "1.0"))
 GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4"))
+# Human-verified exemplars (created when a user corrects an identity) out-weigh
+# auto-deposited ones so corrections reliably override bad OCR.
+GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGHT", "2.0"))
 
 # SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
 # to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
@@ -410,7 +413,13 @@ def _apply_gallery_vote(robot, gallery,
         ranked, confirm_sim=confirm_sim, confirm_gap=confirm_gap, supplement_sim=supplement_sim)
     if verdict == "none" or not team:
         return ("none", None, sim)
-    weight = strong_w if verdict == "confirm" else weak_w
+    # A human-verified top match out-weighs the normal strong/weak vote so that
+    # user corrections reliably override bad OCR. ranked holds (team, sim, verified).
+    best_verified = bool(ranked[0][2]) if ranked else False
+    if best_verified:
+        weight = GALLERY_VERIFIED_VOTE_WEIGHT
+    else:
+        weight = strong_w if verdict == "confirm" else weak_w
     if robot.team_ocr_votes is None:
         robot.team_ocr_votes = {}
     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight

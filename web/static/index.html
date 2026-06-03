@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260603b">
+    <link rel="stylesheet" href="/static/style.css?v=20260603c">
 </head>
 <body>
     <div class="container">
@@ -318,6 +318,10 @@
                     <div class="replay-player-bar">
                         <button class="btn-small" id="replayBackBtn">&larr; Back to Library</button>
                         <span class="replay-player-label" id="replayPlayerLabel"></span>
+                        <span class="replay-export-group">
+                            <a class="btn-small" id="replayDownloadVideo" download>&#11015; Video</a>
+                            <a class="btn-small" id="replayDownloadData" download>&#11015; Data (JSON)</a>
+                        </span>
                     </div>
                     <section class="main-layout">
                         <div class="video-column">
@@ -390,6 +394,6 @@
 
     </div>
 
-    <script src="/static/app.js?v=20260603b"></script>
+    <script src="/static/app.js?v=20260603c"></script>
 </body>
 </html>

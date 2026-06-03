@@ -1552,6 +1552,12 @@ class VisionScorer {
             this.replayVideo.src = `/api/replays/${id}/video`;
             this.replayVideo.load();
 
+            // Wire the export/download buttons (server sends Content-Disposition: attachment)
+            const dlVideo = document.getElementById('replayDownloadVideo');
+            const dlData = document.getElementById('replayDownloadData');
+            if (dlVideo) dlVideo.href = `/api/replays/${id}/download/video`;
+            if (dlData) dlData.href = `/api/replays/${id}/download/data`;
+
             // Render the full clickable scoring-event timeline up front
             const events = meta.events || [];
             this.updateTimeline(events, {

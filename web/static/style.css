@@ -1219,6 +1219,8 @@ nav {
     padding: 0.4rem 0.2rem 0.6rem;
 }
 .replay-player-label { font-weight: 600; font-size: 1rem; }
+.replay-export-group { margin-left: auto; display: flex; gap: 0.5rem; }
+a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; }
 
 /* Keep the video fixed as the SCORING EVENTS list grows. By default the grid
    stretches both columns to the tallest one, so a long event list grew the row

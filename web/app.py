@@ -5096,6 +5096,33 @@ async def get_replay_video(replay_id: str, request: Request):
                              media_type="video/mp4", headers=headers)
 
 
+def _safe_filename(label: str, ext: str) -> str:
+    """Filesystem-safe download filename derived from a replay label."""
+    base = "".join(c if (c.isalnum() or c in "._-") else "_"
+                   for c in (label or "replay")).strip("_") or "replay"
+    return f"{base}.{ext}"
+
+
+@app.get("/api/replays/{replay_id}/download/video")
+async def download_replay_video(replay_id: str):
+    """Serve the recorded mp4 as an attachment (forces a download with a clean name)."""
+    row = await database.get_replay(replay_id)
+    if not row or not Path(row["video_path"]).exists():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return FileResponse(row["video_path"], media_type="video/mp4",
+                        filename=_safe_filename(row["label"], "mp4"))
+
+
+@app.get("/api/replays/{replay_id}/download/data")
+async def download_replay_data(replay_id: str):
+    """Serve the match data (meta.json: summary + per-frame tracking + events) as a download."""
+    row = await database.get_replay(replay_id)
+    if not row or not Path(row["meta_path"]).exists():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return FileResponse(row["meta_path"], media_type="application/json",
+                        filename=_safe_filename(row["label"], "json"))
+
+
 @app.get("/api/replays/{replay_id}")
 async def get_replay_endpoint(replay_id: str):
     row = await database.get_replay(replay_id)

@@ -93,3 +93,29 @@ def test_video_full_get_and_range(client):
 def test_video_missing_returns_404(client):
     c, tmp_path = client
     assert c.get("/api/replays/nope/video").status_code == 404
+
+
+def test_download_video_and_data_are_attachments(client):
+    c, tmp_path = client
+    d = _make_replay_files(tmp_path, rid="job-9")
+    _insert(database, d, rid="job-9")  # label "Qual 10" -> "Qual_10"
+
+    r = c.get("/api/replays/job-9/download/video")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("video/mp4")
+    assert "attachment" in r.headers.get("content-disposition", "")
+    assert "Qual_10.mp4" in r.headers["content-disposition"]
+    assert len(r.content) == (d / "hud.mp4").stat().st_size
+
+    r = c.get("/api/replays/job-9/download/data")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    assert "attachment" in r.headers.get("content-disposition", "")
+    assert "Qual_10.json" in r.headers["content-disposition"]
+    assert json.loads(r.content)["summary"]["frame_count"] == 5
+
+
+def test_download_missing_returns_404(client):
+    c, tmp_path = client
+    assert c.get("/api/replays/nope/download/video").status_code == 404
+    assert c.get("/api/replays/nope/download/data").status_code == 404

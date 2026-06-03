@@ -17,7 +17,9 @@ class _Exemplar:
     __slots__ = ("embedding", "legibility")
 
     def __init__(self, embedding: np.ndarray, legibility: float):
-        self.embedding = np.asarray(embedding, dtype=np.float32)
+        # Copy: track embeddings are EMA-updated in place elsewhere, so storing a
+        # reference would let later updates silently mutate a stored exemplar.
+        self.embedding = np.array(embedding, dtype=np.float32, copy=True)
         self.legibility = float(legibility)
 
 

@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import numpy as np
 import cv2
 import pytest
@@ -32,7 +34,28 @@ def test_records_playable_video_and_meta(tmp_path):
     assert (tmp_path / "thumb.jpg").exists()
     assert artifacts["frame_count"] == 10
     assert artifacts["duration_sec"] == pytest.approx(10 / 8.0)
-    assert artifacts["codec"] in ("avc1", "mp4v")
+    assert artifacts["codec"] in ("h264", "avc1", "mp4v")
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+                    reason="ffmpeg/ffprobe not available")
+def test_output_is_browser_playable_h264(tmp_path):
+    """With ffmpeg present, the mp4 must be H.264 so HTML5 <video> can decode it
+    (regression: OpenCV's mp4v fallback produced un-playable MPEG-4 Part 2)."""
+    rec = ReplayRecorder()
+    rec.open_lazy(_frame(w=321, h=241), fps=8.0, out_dir=tmp_path)  # odd dims -> must be locked even
+    for i in range(8):
+        rec.add_frame(_frame(w=321, h=241, val=20 + i), {"scores": {"blue": 0, "red": 0}, "robots": []})
+    artifacts = rec.finalize(status="complete", summary={})
+
+    assert artifacts["codec"] == "h264"
+    assert artifacts["width"] % 2 == 0 and artifacts["height"] % 2 == 0  # even for yuv420p
+    codec_name = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+         str(tmp_path / "hud.mp4")],
+        capture_output=True, text=True).stdout.strip()
+    assert codec_name == "h264"
 
 
 def test_add_frame_before_open_raises(tmp_path):

@@ -7,6 +7,8 @@ given output directory.  The caller owns DB insertion.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -15,8 +17,17 @@ import numpy as np
 
 
 class ReplayRecorder:
+    """Encodes frames to a browser-playable H.264 mp4.
+
+    Prefers an ``ffmpeg`` subprocess (libx264 / yuv420p / +faststart) so the
+    result plays in any HTML5 ``<video>``.  OpenCV's ``VideoWriter`` is only a
+    fallback: its ``avc1`` path commonly fails to open and silently degrades to
+    ``mp4v`` (MPEG-4 Part 2), which browsers cannot decode.
+    """
+
     def __init__(self) -> None:
         self._writer: Optional[cv2.VideoWriter] = None
+        self._proc: Optional[subprocess.Popen] = None
         self._out_dir: Optional[Path] = None
         self.fps: float = 0.0
         self.width: int = 0
@@ -28,16 +39,36 @@ class ReplayRecorder:
 
     @property
     def is_open(self) -> bool:
-        return self._writer is not None
+        return self._writer is not None or self._proc is not None
 
     def open_lazy(self, first_frame: np.ndarray, fps: float, out_dir) -> None:
-        if self._writer is not None:
+        if self.is_open:
             return
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self.fps = float(fps) if fps and fps > 0 else 8.0
-        self.height, self.width = first_frame.shape[:2]
+        h, w = first_frame.shape[:2]
+        # libx264 + yuv420p require even dimensions; lock to even and resize frames to match.
+        self.height, self.width = h - (h % 2), w - (w % 2)
         path = str(self._out_dir / "hud.mp4")
+
+        if shutil.which("ffmpeg"):
+            self._proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s", f"{self.width}x{self.height}", "-r", f"{self.fps}",
+                    "-i", "-", "-an",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-preset", "veryfast", "-crf", "20",
+                    "-movflags", "+faststart", path,
+                ],
+                stdin=subprocess.PIPE,
+            )
+            self.codec = "h264"
+            return
+
+        # Fallback: no ffmpeg on PATH — use OpenCV (may produce non-browser-playable mp4v).
         for codec in ("avc1", "mp4v"):
             writer = cv2.VideoWriter(
                 path, cv2.VideoWriter_fourcc(*codec), self.fps, (self.width, self.height))
@@ -46,14 +77,20 @@ class ReplayRecorder:
                 self.codec = codec
                 return
             writer.release()
-        raise RuntimeError("Could not open a VideoWriter with avc1 or mp4v")
+        raise RuntimeError("Could not open ffmpeg or an OpenCV VideoWriter (avc1/mp4v)")
 
     def add_frame(self, frame: np.ndarray, record: dict) -> None:
-        if self._writer is None:
+        if not self.is_open:
             raise RuntimeError("add_frame called before open_lazy")
         if frame.shape[:2] != (self.height, self.width):
             frame = cv2.resize(frame, (self.width, self.height))
-        self._writer.write(frame)
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            except (BrokenPipeError, ValueError):
+                pass  # ffmpeg died; analysis must not crash. finalize() will surface it.
+        else:
+            self._writer.write(frame)
         i = len(self.frames)
         rec = dict(record)
         rec["i"] = i
@@ -66,6 +103,13 @@ class ReplayRecorder:
         self.events.append(dict(event))
 
     def finalize(self, status: str, summary: dict) -> dict:
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+                self._proc.wait(timeout=180)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
         if self._writer is not None:
             self._writer.release()
             self._writer = None

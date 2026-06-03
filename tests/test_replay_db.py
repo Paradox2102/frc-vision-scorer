@@ -51,3 +51,28 @@ def test_insert_replay_is_idempotent_upsert(db):
     got = asyncio.run(db.get_replay("job-1"))
     assert got["status"] == "partial"
     assert len(asyncio.run(db.list_replays())) == 1
+
+
+def test_init_db_migrates_old_replays_table_and_roundtrips_timings(tmp_path, monkeypatch):
+    import asyncio, sqlite3, json as _json
+    import web.database as database
+    dbfile = tmp_path / "old.db"
+    # Simulate a pre-existing replays table WITHOUT processing_sec/timings columns.
+    con = sqlite3.connect(dbfile)
+    con.execute("CREATE TABLE replays (id TEXT PRIMARY KEY, created_at TEXT, label TEXT, "
+                "blue_score INTEGER, red_score INTEGER, blue_teams TEXT, red_teams TEXT, "
+                "video_path TEXT, meta_path TEXT, source_video_path TEXT, thumb_path TEXT, "
+                "fps REAL, frame_count INTEGER, duration_sec REAL, width INTEGER, height INTEGER, "
+                "codec TEXT, status TEXT, event_key TEXT, match_key TEXT, comp_level TEXT)")
+    con.commit(); con.close()
+
+    monkeypatch.setattr(database, "DB_PATH", dbfile)
+    asyncio.run(database.init_db())  # must ALTER-add the new columns without error
+
+    row = _sample_row("job-t")
+    row["processing_sec"] = 197.9
+    row["timings"] = _json.dumps({"total": 197.9, "sam2_tracking": 120.0, "analysis_loop": 60.0})
+    asyncio.run(database.insert_replay(row))
+    got = asyncio.run(database.get_replay("job-t"))
+    assert got["processing_sec"] == 197.9
+    assert _json.loads(got["timings"])["sam2_tracking"] == 120.0

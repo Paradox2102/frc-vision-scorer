@@ -1012,6 +1012,48 @@ class VisionScorer {
         }[ch]));
     }
 
+    formatDuration(sec) {
+        if (sec == null || isNaN(sec)) return '—';
+        sec = Math.round(sec);
+        if (sec < 60) return `${sec}s`;
+        const m = Math.floor(sec / 60), s = sec % 60;
+        if (m < 60) return `${m}m ${String(s).padStart(2, '0')}s`;
+        const h = Math.floor(m / 60);
+        return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+    }
+
+    // Render a processing-time breakdown from a timings object (seconds per phase).
+    renderTimings(timings) {
+        if (!timings || timings.total == null) return '<p class="empty-state">No timing data</p>';
+        const labels = {
+            model_load: 'Model load', frame_export: 'Frame export',
+            sam2_tracking: 'SAM2 tracking', analysis_loop: 'Analysis loop',
+            bumper_vlm: '↳ Bumper VLM',
+        };
+        const topLevel = ['model_load', 'frame_export', 'sam2_tracking', 'analysis_loop'];
+        const total = timings.total;
+        const known = topLevel.reduce((a, k) => a + (timings[k] || 0), 0);
+        const rowHtml = (label, val, sub) => {
+            const pct = total ? Math.max(0, Math.min(100, Math.round((val / total) * 100))) : 0;
+            return `<div class="timing-row${sub ? ' sub' : ''}">
+                <span class="timing-label">${label}</span>
+                <span class="timing-bar"><span style="width:${pct}%"></span></span>
+                <span class="timing-val">${this.formatDuration(val)}</span>
+            </div>`;
+        };
+        let rows = '';
+        for (const k of ['model_load', 'frame_export', 'sam2_tracking', 'analysis_loop', 'bumper_vlm']) {
+            if (timings[k] != null) rows += rowHtml(labels[k], timings[k], k === 'bumper_vlm');
+        }
+        const other = Math.max(0, total - known);
+        if (other > 0.05) rows += rowHtml('Setup / other', other, false);
+        rows += `<div class="timing-row total">
+            <span class="timing-label">Total</span><span class="timing-bar"></span>
+            <span class="timing-val">${this.formatDuration(total)}</span>
+        </div>`;
+        return rows;
+    }
+
     handleComplete(data) {
         this.setStatus('Processing complete!', 100);
         this.inferenceResults = data;
@@ -1047,6 +1089,18 @@ class VisionScorer {
     showResultsEditor(data) {
         this.resultsSection.style.display = 'block';
         this.resultsSection.scrollIntoView({ behavior: 'smooth' });
+
+        // Processing-time breakdown
+        const ptCard = document.getElementById('processingTimeCard');
+        if (ptCard) {
+            if (data && data.timings && data.timings.total != null) {
+                document.getElementById('processingTimeBreakdown').innerHTML =
+                    this.renderTimings(data.timings);
+                ptCard.style.display = 'block';
+            } else {
+                ptCard.style.display = 'none';
+            }
+        }
 
         // Show TBA ground truth if available
         const gtCard = document.getElementById('groundTruthCard');
@@ -1462,6 +1516,7 @@ class VisionScorer {
         const redScore = r.red_score != null ? r.red_score : '—';
         const date = r.created_at ? new Date(r.created_at).toLocaleString() : '';
         const duration = r.duration_sec != null ? `${Math.round(r.duration_sec)}s` : '';
+        const procTime = r.processing_sec != null ? this.formatDuration(r.processing_sec) : null;
         const partialBadge = r.status === 'partial'
             ? '<span class="replay-badge partial">PARTIAL</span>' : '';
         const thumb = r.thumb_url
@@ -1487,6 +1542,7 @@ class VisionScorer {
                         <span class="red">${this.escapeHtml(redTeams)}</span>
                     </div>
                     <div class="replay-card-meta">${this.escapeHtml(date)}${duration ? ` &middot; ${duration}` : ''}</div>
+                    ${procTime ? `<div class="replay-card-proctime">⏱ Processed in ${procTime}</div>` : ''}
                     <div class="replay-card-actions">
                         <button class="btn-small" data-replay-action="play" data-replay-id="${id}">Replay</button>
                         <button class="btn-small replay-delete" data-replay-action="delete" data-replay-id="${id}">Delete</button>
@@ -1547,6 +1603,18 @@ class VisionScorer {
 
             const summary = meta.summary || {};
             labelEl.textContent = summary.match_label || `Replay ${id}`;
+
+            // Processing-time breakdown for this match
+            const ptCard = document.getElementById('replayTimingCard');
+            if (ptCard) {
+                if (summary.timings && summary.timings.total != null) {
+                    document.getElementById('replayTimingBreakdown').innerHTML =
+                        this.renderTimings(summary.timings);
+                    ptCard.style.display = 'block';
+                } else {
+                    ptCard.style.display = 'none';
+                }
+            }
 
             // Point the <video> at the range-aware stream (native scrub/seek/speed)
             this.replayVideo.src = `/api/replays/${id}/video`;

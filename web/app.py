@@ -976,6 +976,17 @@ class InferenceJob:
             self.vlm_status["last_error"] = errors[0]
 
     def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
+        """Time-tracking wrapper around the bumper-VLM read (accumulates into
+        timings['bumper_vlm'], a sub-component of the analysis loop)."""
+        _t = time.perf_counter()
+        try:
+            return self._vision_identify_robots_impl(frame, tracked_robots)
+        finally:
+            t = getattr(self, "timings", None)
+            if t is not None:
+                t["bumper_vlm"] = t.get("bumper_vlm", 0.0) + (time.perf_counter() - _t)
+
+    def _vision_identify_robots_impl(self, frame: np.ndarray, tracked_robots) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
         identity can be overturned by the audit (assign_teams_from_votes +
@@ -2424,7 +2435,10 @@ class InferenceJob:
         try:
             self.status = "processing"
             self._open_log_file()
-            
+            # Per-phase processing timers (seconds). `total` is filled at the end.
+            self.timings = {}
+            self._proc_t0 = time.perf_counter()
+
             # Open video
             cap = cv2.VideoCapture(str(self.video_path))
             self.video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2514,6 +2528,7 @@ class InferenceJob:
                               f"frame_skip={self.frame_skip}, ~{seg_frames} tracked frames "
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
+                    _t_load = time.perf_counter()
                     sam2_tracker = Sam2FieldTracker(
                         config=SAM2_CONFIG,
                         checkpoint=SAM2_CHECKPOINT,
@@ -2523,6 +2538,7 @@ class InferenceJob:
                         vos_optimized=(SAM2_VOS_OPTIMIZED and device == "cuda"),
                     )
                     self.robot_embedder = RobotEmbedder()
+                    self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
                     self.use_sam2 = True
                     print(f"  [SAM2] Loaded Sam2FieldTracker ({SAM2_MODEL_SIZE} model, "
                           f"vos_optimized={SAM2_VOS_OPTIMIZED and device == 'cuda'}) "
@@ -2618,6 +2634,7 @@ class InferenceJob:
                     print(f"  [SAM2] Error during single-pass frame export: {e}")
                 finally:
                     cap_pre.release()
+                self.timings["frame_export"] = self.timings.get("frame_export", 0.0) + (time.perf_counter() - export_t0)
                 print(f"  [SAM2] Exported {exported} frames/view across {N} view(s) in "
                       f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
 
@@ -2682,6 +2699,7 @@ class InferenceJob:
                             progress_cb=make_progress_cb(base_pct, span_pct, view.name)
                         )
                         elapsed = time.perf_counter() - t0
+                        self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
                         n = len(view_tracks)
                         print(f"  [SAM2] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
                               f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
@@ -2757,7 +2775,8 @@ class InferenceJob:
             self._inference_start_time = time.time()
             robots_data = []
             events_data = []
-            
+
+            _loop_t0 = time.perf_counter()
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -3238,15 +3257,19 @@ class InferenceJob:
                 frame_num += 1
                 processed_frame_num += 1
             
+            self.timings["analysis_loop"] = round(time.perf_counter() - _loop_t0, 2)
+            self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
             self.status = "completed"
-            
+
             if self.websocket:
                 await self.websocket.send_json(jsonify({
                     "type": "complete",
                     "total_frames": self.total_frames,
                     "robots": robots_data,
                     "scoring_events": events_data,
-                    "final_scores": self.alliance_scores
+                    "final_scores": self.alliance_scores,
+                    "processing_sec": self.timings.get("total"),
+                    "timings": self.timings,
                 }))
         
         except Exception as e:
@@ -3268,6 +3291,13 @@ class InferenceJob:
             self._close_log_file()
             if cap is not None:
                 cap.release()
+            # Finalize processing timings (covers partial/errored runs the success
+            # path never reached) and round to 2 decimals for display/storage.
+            timings = getattr(self, "timings", {}) or {}
+            if "total" not in timings and getattr(self, "_proc_t0", None) is not None:
+                timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
+            timings = {k: round(v, 2) for k, v in timings.items()}
+            self.timings = timings
             try:
                 rec = getattr(self, "_replay", None)
                 if rec is not None and rec.is_open:
@@ -3281,6 +3311,8 @@ class InferenceJob:
                         "blue_score": self.alliance_scores.get("blue", 0),
                         "red_score": self.alliance_scores.get("red", 0),
                         "robots": [r for f in rec.frames[:1] for r in f["robots"]],
+                        "processing_sec": timings.get("total"),
+                        "timings": timings,
                     }
                     artifacts = rec.finalize(status=status, summary=summary)
                     import json as _json
@@ -3295,6 +3327,8 @@ class InferenceJob:
                         "blue_teams": _json.dumps(blue_teams),
                         "red_teams": _json.dumps(red_teams),
                         "source_video_path": str(self.video_path),
+                        "processing_sec": timings.get("total"),
+                        "timings": _json.dumps(timings),
                         **artifacts,
                     })
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
@@ -5036,6 +5070,7 @@ async def list_replays_endpoint():
             "blue_teams": json.loads(r["blue_teams"] or "[]"),
             "red_teams": json.loads(r["red_teams"] or "[]"),
             "duration_sec": r["duration_sec"], "status": r["status"],
+            "processing_sec": r["processing_sec"],
             "thumb_url": f"/api/replays/{r['id']}/thumb",
             "video_url": f"/api/replays/{r['id']}/video",
         })

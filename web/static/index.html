@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260603c">
+    <link rel="stylesheet" href="/static/style.css?v=20260603d">
 </head>
 <body>
     <div class="container">
@@ -208,6 +208,10 @@
             <!-- Step 4: Post-Inference Edit & Save -->
             <section class="results-section" id="resultsSection" style="display:none;">
                 <h2>Review & Save Results</h2>
+                <div class="processing-time-card" id="processingTimeCard" style="display:none;">
+                    <h3>Processing Time</h3>
+                    <div class="timing-breakdown" id="processingTimeBreakdown"></div>
+                </div>
                 <div class="results-layout">
                     <!-- TBA Ground Truth -->
                     <div class="ground-truth-card" id="groundTruthCard">
@@ -347,6 +351,10 @@
                             <div class="replay-fieldmap-wrap">
                                 <canvas id="replayFieldMap" width="640" height="320"></canvas>
                             </div>
+                            <div class="replay-timing-card" id="replayTimingCard" style="display:none;">
+                                <div class="timeline-header">PROCESSING TIME</div>
+                                <div class="timing-breakdown" id="replayTimingBreakdown"></div>
+                            </div>
                         </div>
 
                         <div class="alliance-column">
@@ -394,6 +402,6 @@
 
     </div>
 
-    <script src="/static/app.js?v=20260603c"></script>
+    <script src="/static/app.js?v=20260603d"></script>
 </body>
 </html>

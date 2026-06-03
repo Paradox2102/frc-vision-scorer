@@ -1245,3 +1245,29 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
     background: rgba(255, 255, 255, 0.07);
     outline: 1px solid var(--blue-border);
 }
+
+/* ========== Processing-time breakdown ========== */
+.processing-time-card, .replay-timing-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.6rem 0.8rem;
+    margin-bottom: 0.8rem;
+}
+.processing-time-card h3 { font-size: 0.95rem; margin: 0 0 0.5rem; }
+.timing-breakdown { display: flex; flex-direction: column; gap: 0.3rem; }
+.timing-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 56px;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+}
+.timing-row.sub .timing-label { color: var(--text-secondary); padding-left: 0.6rem; font-size: 0.78rem; }
+.timing-row.total { font-weight: 700; border-top: 1px solid var(--border-color); margin-top: 0.2rem; padding-top: 0.3rem; }
+.timing-label { color: var(--text-primary); }
+.timing-bar { height: 8px; background: var(--bg-primary); border-radius: 4px; overflow: hidden; }
+.timing-bar > span { display: block; height: 100%; background: var(--blue-alliance); border-radius: 4px; }
+.timing-val { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.timing-row.total .timing-val { color: var(--text-primary); }
+.replay-card-proctime { font-size: 0.78rem; color: var(--text-secondary); margin-top: 0.2rem; }

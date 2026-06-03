@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS replays (
     width INTEGER,
     height INTEGER,
     codec TEXT,
-    status TEXT
+    status TEXT,
+    processing_sec REAL,
+    timings TEXT
 );
 """
 
@@ -101,6 +103,12 @@ async def init_db():
     """Initialize the database and create tables if they don't exist."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Lightweight migrations: add columns to a pre-existing replays table.
+        for col_def in ("processing_sec REAL", "timings TEXT"):
+            try:
+                await db.execute(f"ALTER TABLE replays ADD COLUMN {col_def}")
+            except Exception:
+                pass  # column already exists
         await db.commit()
 
 
@@ -454,6 +462,7 @@ _REPLAY_COLUMNS = [
     "blue_score", "red_score", "blue_teams", "red_teams",
     "video_path", "meta_path", "source_video_path", "thumb_path",
     "fps", "frame_count", "duration_sec", "width", "height", "codec", "status",
+    "processing_sec", "timings",
 ]
 
 

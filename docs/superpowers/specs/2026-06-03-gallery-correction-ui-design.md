@@ -126,9 +126,16 @@ The verified flag rides alongside and is read by the caller.
 
 `_apply_gallery_vote` reads the winning team's verified flag from `ranked[0][2]` and
 picks the vote weight: `GALLERY_VERIFIED_VOTE_WEIGHT` (new tunable, default 2.0) when
-verified, otherwise the existing strong/weak weights. `apply_gallery_matches` (the other
-caller) is updated for the new tuple shape as well. From-DB exemplars set `verified` from
-the column; `add()` gains a `verified` parameter (default False) for verified deposits.
+verified, otherwise the existing strong/weak weights. `apply_gallery_matches` consumes
+only `_apply_gallery_vote`'s return, so it needs no direct change. `add()` gains a
+`verified` parameter (default False) for verified deposits — its existing 4-positional
+call site in `_deposit_to_gallery` stays valid.
+
+Concretely in `web/field/appearance_gallery.py`: `_Exemplar` gains a `verified` field
+(add it to `__slots__`); `add(team, color, embedding, legibility, verified=False)` stores
+it; `serialize()` emits `verified`; `from_rows` reads `r.get("verified")` (and the new
+`id`/`image` columns are passed through for the Phase 2 manager). This is the one round-
+trip an implementer could miss.
 
 ## Phase 1 — Post-match review & correction (on the replay)
 
@@ -200,6 +207,10 @@ This is the surface for cleaning exemplars that false IDs polluted.
   identity + replay teams + mints a verified exemplar (and skips deposit when no
   event_key); gallery CRUD relabel/delete/verify.
 - **Thumbnail**: encode produces a small (<~15KB) JPEG of bounded height.
+- **Existing tests touched**: `tests/test_appearance_gallery.py` (`test_serialize_roundtrip`
+  gains a `verified` key; positional `query` asserts already survive the 3-tuple change)
+  and `tests/test_gallery_match_logic.py` (any verified-weight assertion must feed a
+  gallery whose `query` yields 3-tuples). Update these alongside the new tests.
 
 ## Edge cases
 

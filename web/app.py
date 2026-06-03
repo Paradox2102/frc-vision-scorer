@@ -51,6 +51,7 @@ from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
+from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
@@ -214,6 +215,16 @@ VLM_DIRECT_CONTRADICTION_CONF = 0.9  # exact/high-confidence read that unlocks a
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
 
+# Appearance gallery (per-event re-ID exemplar memory)
+GALLERY_ENABLED = os.environ.get("GALLERY_ENABLED", "1") not in ("0", "false", "False")
+GALLERY_CONFIRM_SIM = float(os.environ.get("GALLERY_CONFIRM_SIM", "0.88"))
+GALLERY_CONFIRM_GAP = float(os.environ.get("GALLERY_CONFIRM_GAP", "0.06"))
+GALLERY_SUPPLEMENT_SIM = float(os.environ.get("GALLERY_SUPPLEMENT_SIM", "0.80"))
+GALLERY_MAX_EXEMPLARS = int(os.environ.get("GALLERY_MAX_EXEMPLARS", "12"))
+GALLERY_DEDUP_SIM = float(os.environ.get("GALLERY_DEDUP_SIM", "0.92"))
+GALLERY_STRONG_VOTE_WEIGHT = float(os.environ.get("GALLERY_STRONG_VOTE_WEIGHT", "1.0"))
+GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4"))
+
 # SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
 # to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
 REPROMPT_SECONDS = 2.0
@@ -339,7 +350,7 @@ class RobotTrack:
     blue_votes: int = 0
     red_votes: int = 0
     # Continuous OCR voting: accumulate team number reads over time
-    team_ocr_votes: Optional[Dict[str, int]] = None  # team_number -> vote count
+    team_ocr_votes: Optional[Dict[str, float]] = None  # team_number -> vote weight
     team_number_confirmed: bool = False  # True once OCR or calibration locked it in
     # Appearance embedding for re-ID (DINOv2, EMA-updated)
     appearance_embedding: Optional[np.ndarray] = None
@@ -441,6 +452,8 @@ class InferenceJob:
         # Detection state
         self.hubs: List[DetectedHub] = []
         self.robot_tracks: Dict[int, RobotTrack] = {}
+        self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
+        self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -820,6 +833,26 @@ class InferenceJob:
         robot.team_number = None
         robot.team_number_confirmed = False
 
+    def _deposit_to_gallery(self, robot, legibility: float = 0.0) -> None:
+        """Deposit a confirmed robot's appearance into the in-memory event gallery and
+        buffer it for persistence at finalize. Only externally-grounded labels (an OCR
+        lock or OCR re-affirmation) should call this — never a gallery-driven
+        confirmation, to avoid self-reinforcement."""
+        if self.gallery is None or robot is None:
+            return
+        color = robot.alliance if robot.alliance in ("red", "blue") else None
+        if color is None or not robot.team_number or robot.appearance_embedding is None:
+            return
+        stored = self.gallery.add(robot.team_number, color, robot.appearance_embedding, legibility)
+        if not stored or not self.event_key:
+            return  # rejected as near-duplicate, or no event to persist under
+        self._pending_gallery_rows.append({
+            "event_key": self.event_key, "team": robot.team_number,
+            "alliance_color": color,
+            "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
+            "legibility": legibility,
+        })
+
     def read_fused_bumper_numbers(self, fused, is_reread_pass: bool) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
@@ -945,6 +978,9 @@ class InferenceJob:
                 confidence=conf,
                 vote_weight=vote_weight,
             )
+            if (robot.team_number_confirmed and team == robot.team_number
+                    and conf >= 0.85):
+                self._deposit_to_gallery(robot, legibility=conf)
             if not team:
                 continue
             if robot.team_ocr_votes is None:
@@ -965,6 +1001,7 @@ class InferenceJob:
                     if event.robot_id == slot_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
+                self._deposit_to_gallery(robot, legibility=conf)
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
@@ -2433,6 +2470,15 @@ class InferenceJob:
                     pass
             return
         try:
+            if GALLERY_ENABLED and self.event_key:
+                try:
+                    rows = await database.get_gallery_exemplars(self.event_key)
+                    self.gallery = AppearanceGallery.from_rows(
+                        rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
+                    print(f"  Appearance gallery loaded: {len(rows)} exemplars for {self.event_key}")
+                except Exception as e:
+                    print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
+                    self.gallery = None
             self.status = "processing"
             self._open_log_file()
             # Per-phase processing timers (seconds). `total` is filled at the end.
@@ -3334,6 +3380,15 @@ class InferenceJob:
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
             except Exception as e:
                 print(f"[replay] finalize error: {e}")
+            try:
+                if self._pending_gallery_rows:
+                    for row in self._pending_gallery_rows:
+                        await database.insert_gallery_exemplar(row)
+                    print(f"  Appearance gallery: persisted {len(self._pending_gallery_rows)} "
+                          f"new exemplars for {self.event_key}")
+                    self._pending_gallery_rows = []
+            except Exception as e:
+                print(f"  Appearance gallery flush failed ({e})")
 
 
 @app.on_event("startup")

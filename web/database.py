@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS replays (
     processing_sec REAL,
     timings TEXT
 );
+
+CREATE TABLE IF NOT EXISTS appearance_gallery (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL,
+    team TEXT NOT NULL,
+    alliance_color TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    legibility REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_gallery_event ON appearance_gallery(event_key, alliance_color);
 """
 
 
@@ -498,3 +509,27 @@ async def delete_replay(replay_id: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM replays WHERE id = ?", (replay_id,))
         await db.commit()
+
+
+# --- Appearance gallery ---
+
+async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
+    """Insert one appearance-gallery exemplar."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO appearance_gallery "
+            "(event_key, team, alliance_color, embedding, legibility) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (row["event_key"], row["team"], row["alliance_color"],
+             row["embedding"], row.get("legibility")))
+        await db.commit()
+
+
+async def get_gallery_exemplars(event_key: str) -> List[Dict]:
+    """All gallery exemplars for an event."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT team, alliance_color, embedding, legibility "
+            "FROM appearance_gallery WHERE event_key = ?", (event_key,))
+        return [dict(r) for r in await cursor.fetchall()]

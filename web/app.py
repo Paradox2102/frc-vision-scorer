@@ -221,6 +221,35 @@ MAX_TRACKED_ROBOTS = 6         # FRC match maximum (3 per alliance); caps phanto
 # The calibration field/API/UI are kept; flip this to re-enable and revisit.
 ROBOT_TRACK_TOP_CROP_ENABLED = False
 
+# SAM2 model size — the single biggest speed lever.  Robots are large, high-contrast
+# blobs, so the "small" Hiera encoder tracks them well at ~3-5x the throughput of the
+# "large" model (which ran ~650-730 ms/frame, i.e. ~hours per match).  Override via
+# `SAM2_MODEL_SIZE=large python web/app.py` when maximum mask fidelity is needed.
+# All variants resize every frame to a 1024² square, so per-frame VRAM (and thus the
+# SAM2_MAX_GPU_FRAMES budget below) is identical across sizes — only compute differs.
+SAM2_MODEL_SIZE = os.environ.get("SAM2_MODEL_SIZE", "small").lower()
+_SAM2_MODELS = {
+    "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  "checkpoints/sam2.1_hiera_tiny.pt"),
+    "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  "checkpoints/sam2.1_hiera_small.pt"),
+    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "checkpoints/sam2.1_hiera_base_plus.pt"),
+    "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "checkpoints/sam2.1_hiera_large.pt"),
+}
+SAM2_CONFIG, SAM2_CHECKPOINT = _SAM2_MODELS.get(SAM2_MODEL_SIZE, _SAM2_MODELS["small"])
+# EXPERIMENTAL: torch.compile the SAM2 image encoder via the VOS-optimized predictor
+# for a further ~2x.  Disabled by default — its CUDA-graph capture is incompatible with
+# our multi-chunk re-prompting flow (we read mask tensors every frame and re-enter
+# propagate_in_video per chunk, which trips "accessing tensor output of CUDAGraphs that
+# has been overwritten").  Only safe with reprompt disabled.  Enable via SAM2_VOS_OPTIMIZED=1.
+SAM2_VOS_OPTIMIZED = os.environ.get("SAM2_VOS_OPTIMIZED", "0") not in ("0", "false", "False")
+
+# SAM2 tracking frame rate — the single biggest *controllable* speed lever.  Total SAM2
+# time is near-linear in the number of tracked frames, and frame count = source_fps /
+# this value.  Robots move slowly relative to frame rate and the field tracker
+# interpolates between samples, so 8 fps tracks them fine while a 60 fps match drops from
+# ~4223 to ~1100 tracked frames.  Override via SAM2_TRACK_FPS.  (Previously this was
+# implicitly forced to 20 fps whenever VRAM >= 16 GB — exactly backwards for speed.)
+SAM2_TRACK_FPS = float(os.environ.get("SAM2_TRACK_FPS", "8.0") or "8.0")
+
 # VRAM-fit tunable knob (speed/quality experiment).  When > 0, the SAM2 pass keeps
 # all video + state tensors on the GPU (no CPU offload, which removes the per-frame
 # host->device copy that dominates runtime) and raises frame_skip so the tracked
@@ -230,9 +259,34 @@ SAM2_MAX_GPU_FRAMES = int(os.environ.get("SAM2_MAX_GPU_FRAMES", "0") or "0")
 # SAM2 stores each frame as float32 (3 x 1024 x 1024) = 12.0 MiB of GPU memory.
 SAM2_FRAME_GPU_MIB = 12.0
 
-# Bumper-number reading VLM. Swap models here (loaded via AutoModelForImageTextToText,
-# so any transformers-supported image-text-to-text model works, e.g. InternVL3, Nemotron).
-VLM_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+
+def _hud_flag(name: str, default: str) -> bool:
+    """Read a boolean HUD overlay toggle from the environment ('0'/'false' = off)."""
+    return os.environ.get(name, default) not in ("0", "false", "False")
+
+
+# HUD overlay toggles.  Now that SAM2 masks highlight each robot's silhouette, the
+# extra per-robot bounding box, ground-contact plane, and velocity arrow are redundant
+# clutter (see the busy overlay), so they default OFF.  The mask highlight, alliance
+# bumper band, and team/slot label carry the useful information and stay ON.  Flip any
+# of these back via env (e.g. `HUD_DRAW_ROBOT_BOX=1 python web/app.py`).
+HUD_DRAW_ROBOT_MASK     = _hud_flag("HUD_DRAW_ROBOT_MASK", "1")      # SAM2 silhouette highlight
+HUD_DRAW_BUMPER_BAND    = _hud_flag("HUD_DRAW_BUMPER_BAND", "1")     # alliance-color bumper band
+HUD_DRAW_ROBOT_LABEL    = _hud_flag("HUD_DRAW_ROBOT_LABEL", "1")     # team #/slot/confidence text
+HUD_DRAW_ROBOT_BOX      = _hud_flag("HUD_DRAW_ROBOT_BOX", "0")       # full bounding box (redundant w/ mask)
+HUD_DRAW_GROUND_PLANE   = _hud_flag("HUD_DRAW_GROUND_PLANE", "0")    # bumper ground-contact polygon
+HUD_DRAW_VELOCITY_ARROW = _hud_flag("HUD_DRAW_VELOCITY_ARROW", "0")  # motion-direction arrow
+HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball detection boxes (hundreds = noise)
+
+# Bumper-number reading VLM. Loaded via AutoModelForImageTextToText, so any
+# transformers-supported image-text-to-text model works.  Override via VLM_MODEL_NAME
+# env to A/B a smaller/faster reader without code edits — the Qwen3-VL family ships
+# 2B and 4B Instruct variants that are drop-in (same processor/chat-template API) and
+# much faster than 8B for digit transcription, e.g.:
+#   VLM_MODEL_NAME=Qwen/Qwen3-VL-8B-Instruct python web/app.py   # fall back to 8B
+# Default is the 4B Instruct variant: drop-in with the 8B (same processor/chat API),
+# much faster, and adequate for bumper-digit transcription.
+VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
@@ -1497,28 +1551,32 @@ class InferenceJob:
         x1, y1, x2, y2 = map(int, box)
         
         # Draw SAM2 mask overlay if present
-        if mask is not None:
+        if mask is not None and HUD_DRAW_ROBOT_MASK:
             overlay = img.copy()
             overlay[mask] = mask_color
             cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
 
-        band = bumper_band_box(img, box)
-        if band is not None:
-            bx1, by1, bx2, by2 = band
-            overlay = img.copy()
-            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
-            cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
-            cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
-            cv2.line(img, (bx1, by2), (bx2, by2), (255, 255, 255), 2)
+        if HUD_DRAW_BUMPER_BAND:
+            band = bumper_band_box(img, box)
+            if band is not None:
+                bx1, by1, bx2, by2 = band
+                overlay = img.copy()
+                cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
+                cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
+                cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
+                cv2.line(img, (bx1, by2), (bx2, by2), (255, 255, 255), 2)
 
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        text = f"{self._slot_label(slot_id)} {label}" if slot_id is not None else label
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-        cv2.rectangle(img, (x1, max(0, y1 - th - 9)), (x1 + tw + 7, y1), (0, 0, 0), -1)
-        cv2.putText(img, text, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, color, 2, cv2.LINE_AA)
+        if HUD_DRAW_ROBOT_BOX:
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-        if cal is not None and field_pos is not None:
+        if HUD_DRAW_ROBOT_LABEL:
+            text = f"{self._slot_label(slot_id)} {label}" if slot_id is not None else label
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.rectangle(img, (x1, max(0, y1 - th - 9)), (x1 + tw + 7, y1), (0, 0, 0), -1)
+            cv2.putText(img, text, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, color, 2, cv2.LINE_AA)
+
+        if cal is not None and field_pos is not None and (HUD_DRAW_GROUND_PLANE or HUD_DRAW_VELOCITY_ARROW):
             self._draw_projected_robot_plane(img, cal, field_pos, vel, color, box)
 
     def _draw_projected_robot_plane(self, img: np.ndarray, cal, field_pos, vel, color, box=None) -> None:
@@ -1533,7 +1591,7 @@ class InferenceJob:
             x, y = float(field_pos[0]), float(field_pos[1])
             vx, vy = (float(vel[0]), float(vel[1])) if vel is not None else (0.0, 0.0)
 
-            if box is not None:
+            if box is not None and HUD_DRAW_GROUND_PLANE:
                 band = bumper_band_box(img, box)
                 if band is not None:
                     bx1, by1, bx2, by2 = band
@@ -1559,7 +1617,7 @@ class InferenceJob:
 
             speed = float(np.hypot(vx, vy))
             center = cal.field_to_image((x, y, 0.0))
-            if speed >= 0.15 and center is not None:
+            if HUD_DRAW_VELOCITY_ARROW and speed >= 0.15 and center is not None:
                 n = max(speed, 1e-6)
                 arrow_len = min(1.0, 0.35 + speed * 0.20)
                 tip = cal.field_to_image((x + arrow_len * vx / n, y + arrow_len * vy / n, 0.0))
@@ -2384,19 +2442,16 @@ class InferenceJob:
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     offload_vid = True
                     offload_st = True
-                    target_tracking_fps = 10.0
-                    
-                    if self.target_tracking_fps is not None:
-                        target_tracking_fps = self.target_tracking_fps
-                        if device == "cuda":
-                            try:
-                                free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(0)
-                                free_vram_gb = free_mem_bytes / (1024 ** 3)
-                                if free_vram_gb >= 16.0:
-                                    offload_st = False
-                            except Exception:
-                                pass
-                    elif device == "cuda":
+                    # Target FPS is a fixed speed knob (SAM2_TRACK_FPS), independent of
+                    # VRAM.  A per-job override (self.target_tracking_fps) still wins.
+                    # VRAM only decides whether tracker state can stay on the GPU (small
+                    # latency win); it no longer inflates the frame rate.
+                    target_tracking_fps = (
+                        self.target_tracking_fps
+                        if self.target_tracking_fps is not None
+                        else SAM2_TRACK_FPS
+                    )
+                    if device == "cuda":
                         try:
                             free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(0)
                             free_vram_gb = free_mem_bytes / (1024 ** 3)
@@ -2404,10 +2459,9 @@ class InferenceJob:
                             print(f"  [SAM2] GPU VRAM: {free_vram_gb:.2f} GB free of {total_vram_gb:.2f} GB total")
                             if free_vram_gb >= 16.0:
                                 offload_st = False
-                                target_tracking_fps = 20.0
-                                print("  [SAM2] Free VRAM >= 16GB: keeping tensors on GPU and targeting 20 FPS tracking.")
+                                print("  [SAM2] Free VRAM >= 16GB: keeping tracker state on GPU.")
                             else:
-                                print("  [SAM2] Free VRAM < 16GB: offloading tensors to CPU and targeting 10 FPS tracking.")
+                                print("  [SAM2] Free VRAM < 16GB: offloading tracker state to CPU.")
                         except Exception as e:
                             print(f"  [SAM2] Error querying GPU VRAM info: {e}. Using conservative defaults.")
                     
@@ -2435,13 +2489,18 @@ class InferenceJob:
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
                     sam2_tracker = Sam2FieldTracker(
+                        config=SAM2_CONFIG,
+                        checkpoint=SAM2_CHECKPOINT,
                         device=device,
                         offload_video_to_cpu=offload_vid,
-                        offload_state_to_cpu=offload_st
+                        offload_state_to_cpu=offload_st,
+                        vos_optimized=(SAM2_VOS_OPTIMIZED and device == "cuda"),
                     )
                     self.robot_embedder = RobotEmbedder()
                     self.use_sam2 = True
-                    print(f"  [SAM2] Loaded Sam2FieldTracker and RobotEmbedder on {device}")
+                    print(f"  [SAM2] Loaded Sam2FieldTracker ({SAM2_MODEL_SIZE} model, "
+                          f"vos_optimized={SAM2_VOS_OPTIMIZED and device == 'cuda'}) "
+                          f"and RobotEmbedder on {device}")
                 except Exception as e:
                     print(f"  [SAM2] Failed to initialize SAM2/embedder: {e}. Falling back to Kalman tracking.")
                     self.use_sam2 = False
@@ -2470,70 +2529,92 @@ class InferenceJob:
                         except Exception:
                             pass
 
-                for view_idx, view in enumerate(self.views):
-                    base_pct = (view_idx / N) * 100.0
-                    print(f"  [SAM2] Pre-processing view: {view.name} ...")
-                    tmp_dir_obj = tempfile.TemporaryDirectory()
-                    prompt_boxes_scaled = []
-                    
-                    cap_pre = cv2.VideoCapture(str(self.video_path))
-                    try:
-                        for local_idx, gf in enumerate(all_frames):
-                            cap_pre.set(cv2.CAP_PROP_POS_FRAMES, gf)
-                            ok, fr = cap_pre.read()
-                            if not ok:
-                                continue
-                            
-                            # Extract crop and resize to 0.5x
-                            crop = view.extract(fr)
-                            # Exclude the airspace at the top of the view from robot
-                            # tracking (robots can't be there) — a false-positive filter.
-                            # NOTE: this does NOT save SAM2 VRAM/compute: SAM2 hard-resizes
-                            # every frame to a fixed image_size square (see misc.py
-                            # _load_img_as_tensor), so fewer input rows == same tensor.
-                            # It does make robots larger in that square (better mask res).
-                            top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                            if top_crop_frac > 0:
-                                top_crop_px = int(crop.shape[0] * top_crop_frac)
-                                crop = crop[top_crop_px:, :]
-                            new_w = int(crop.shape[1] * SAM2_SCALE)
-                            new_h = int(crop.shape[0] * SAM2_SCALE)
-                            small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                            
-                            # Write to temp dir
-                            fname = os.path.join(tmp_dir_obj.name, f"{local_idx:05d}.jpg")
-                            cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                            
-                            # Detect YOLO prompt boxes on prompt frame (gf == prompt_frame)
-                            if gf == prompt_frame:
-                                res = self.model(crop, conf=0.4, verbose=False)[0]
-                                for i in range(len(res.boxes)):
-                                    if int(res.boxes.cls[i]) == 1:
-                                        box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
-                                        prompt_boxes_scaled.append(tuple(box))
-                                        
-                            if local_idx % 20 == 0 or local_idx == len(all_frames) - 1:
-                                pct = base_pct + (local_idx / len(all_frames)) * (30.0 / N)
-                                msg = f"[SAM2] View '{view.name}': exporting frames ({local_idx}/{len(all_frames)})..."
+                # ----- Phase 1: ONE sequential decode pass exports every view's frames.
+                # Previously each view re-opened the video and random-seeked to every kept
+                # frame (cap.set(POS_FRAMES, gf) per frame, repeated N times) — pathological
+                # on H.264, where an arbitrary seek re-decodes from the nearest prior
+                # keyframe.  Here we seek once to the first kept frame, then read forward
+                # sequentially and fan each kept frame out to all views.  The kept frames
+                # are exactly TITLE_SCREEN_FRAMES + k*frame_skip, byte-identical to before,
+                # but decoding is linear instead of seek-thrashing and happens only once.
+                view_dirs = {v.name: tempfile.TemporaryDirectory() for v in self.views}
+                view_prompt_boxes: dict[str, list] = {v.name: [] for v in self.views}
+                EXPORT_PCT = 25.0  # share of the progress bar spent exporting frames
+                export_t0 = time.perf_counter()
+                exported = 0
+                cap_pre = cv2.VideoCapture(str(self.video_path))
+                try:
+                    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
+                    fpos = TITLE_SCREEN_FRAMES
+                    local_idx = 0
+                    while fpos < self.total_frames:
+                        ok, fr = cap_pre.read()
+                        if not ok:
+                            break
+                        if (fpos - TITLE_SCREEN_FRAMES) % self.frame_skip == 0:
+                            is_prompt = (fpos == prompt_frame)
+                            for view in self.views:
+                                try:
+                                    crop = view.extract(fr)
+                                    # Exclude the airspace at the top of the view from robot
+                                    # tracking (robots can't be there) — a false-positive
+                                    # filter.  NOTE: this does NOT save SAM2 VRAM/compute:
+                                    # SAM2 hard-resizes every frame to a fixed image_size
+                                    # square, so fewer input rows == same tensor.  It does
+                                    # make robots larger in that square (better mask res).
+                                    top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                    if top_crop_frac > 0:
+                                        top_crop_px = int(crop.shape[0] * top_crop_frac)
+                                        crop = crop[top_crop_px:, :]
+                                    new_w = int(crop.shape[1] * SAM2_SCALE)
+                                    new_h = int(crop.shape[0] * SAM2_SCALE)
+                                    small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                                    fname = os.path.join(view_dirs[view.name].name, f"{local_idx:05d}.jpg")
+                                    cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+                                    # Detect YOLO prompt boxes on the prompt frame.
+                                    if is_prompt:
+                                        res = self.model(crop, conf=0.4, verbose=False)[0]
+                                        for i in range(len(res.boxes)):
+                                            if int(res.boxes.cls[i]) == 1:
+                                                box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
+                                                view_prompt_boxes[view.name].append(tuple(box))
+                                except Exception as e:
+                                    print(f"  [SAM2] Error exporting frame {local_idx} for view {view.name}: {e}")
+                            local_idx += 1
+                            exported += 1
+                            if exported % 20 == 0:
+                                pct = (exported / max(1, len(all_frames))) * EXPORT_PCT
+                                msg = f"[SAM2] Exporting frames ({exported}/{len(all_frames)}) across {N} view(s)..."
                                 await safe_send_status(msg, pct)
-                    except Exception as e:
-                        print(f"  [SAM2] Error exporting frames for view {view.name}: {e}")
-                    finally:
-                        cap_pre.release()
-                        
+                        fpos += 1
+                except Exception as e:
+                    print(f"  [SAM2] Error during single-pass frame export: {e}")
+                finally:
+                    cap_pre.release()
+                print(f"  [SAM2] Exported {exported} frames/view across {N} view(s) in "
+                      f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
+
+                # ----- Phase 2: per-view SAM2 propagation over the exported frames.
+                for view_idx, view in enumerate(self.views):
+                    tmp_dir_obj = view_dirs[view.name]
+                    prompt_boxes_scaled = view_prompt_boxes[view.name]
+                    base_pct = EXPORT_PCT + (view_idx / N) * (100.0 - EXPORT_PCT)
+                    span_pct = (100.0 - EXPORT_PCT) / N
                     print(f"  [SAM2] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
                     if not prompt_boxes_scaled:
                         print(f"  [SAM2] View {view.name}: nothing to track, skipping SAM2 for this view.")
-                        pct = base_pct + 100.0 / N
-                        msg = f"[SAM2] View '{view.name}': skipped (no robots detected)."
-                        await safe_send_status(msg, pct)
+                        await safe_send_status(
+                            f"[SAM2] View '{view.name}': skipped (no robots detected).",
+                            base_pct + span_pct,
+                        )
                         tmp_dir_obj.cleanup()
                         continue
-                        
+
                     try:
-                        def make_progress_cb(v_idx, v_name):
+                        def make_progress_cb(b_pct, sp_pct, v_name):
                             def progress_cb(current, total):
-                                pct = base_pct + (30.0 / N) + (current / total) * (70.0 / N)
+                                pct = b_pct + (current / max(1, total)) * sp_pct
                                 msg = f"[SAM2] View '{v_name}': tracking frame {current}/{total}..."
                                 loop.call_soon_threadsafe(
                                     lambda: asyncio.create_task(safe_send_status(msg, pct))
@@ -2572,22 +2653,23 @@ class InferenceJob:
                             reprompt_every=reprompt_every,
                             detect_fn=make_detect_fn(),
                             max_objects=MAX_TRACKED_ROBOTS,
-                            progress_cb=make_progress_cb(view_idx, view.name)
+                            progress_cb=make_progress_cb(base_pct, span_pct, view.name)
                         )
                         elapsed = time.perf_counter() - t0
                         n = len(view_tracks)
                         print(f"  [SAM2] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
                               f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
                         self.sam2_raw[view.name] = view_tracks
-                        
-                        pct = base_pct + 100.0 / N
-                        msg = f"[SAM2] View '{view.name}': tracking complete."
-                        await safe_send_status(msg, pct)
+
+                        await safe_send_status(
+                            f"[SAM2] View '{view.name}': tracking complete.",
+                            base_pct + span_pct,
+                        )
                     except Exception as e:
                         print(f"  [SAM2] Error during propagation for view {view.name}: {e}")
                     finally:
                         tmp_dir_obj.cleanup()
-                
+
                 if not self.sam2_raw:
                     print("  [SAM2] No views produced tracklets — falling back to Kalman tracking.")
                     self.use_sam2 = False
@@ -2960,7 +3042,12 @@ class InferenceJob:
                     else:  # hub_opening
                         color = (0, 255, 0)  # Green
                         label = "hub"
-                    
+
+                    # Per-ball boxes are visual noise (hundreds of balls per frame); skip
+                    # when disabled.  Hub boxes (class_id 2) are kept regardless.
+                    if class_id == 0 and not HUD_DRAW_BALL_BOXES:
+                        continue
+
                     if class_id == 1 and i in detection_to_tracked and confirmed:
                         # Confirmed robot: thick solid box
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)

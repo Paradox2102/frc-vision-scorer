@@ -411,43 +411,51 @@ Add the import near the top with the other `web.field` imports:
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 ```
 
-- [ ] **Step 2: Initialize the gallery field in `__init__`**
+While here, correct the now-inaccurate type hint on `RobotTrack.team_ocr_votes` (web/app.py:342) — existing code and gallery votes both store floats:
+
+```python
+    team_ocr_votes: Optional[Dict[str, float]] = None  # team_number -> vote weight
+```
+
+- [ ] **Step 2: Initialize the gallery fields in `__init__`**
 
 In `InferenceJob.__init__`, near the other tracking state (after `self.robot_tracks = {}`), add:
 
 ```python
 self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
+self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
 ```
+
+> **Async context (critical):** `process_video` is `async def` (web/app.py:2419) and runs inside a live event loop; `read_fused_bumper_numbers` is a **sync** method called on the loop thread at web/app.py:2986. Therefore: **never call `asyncio.run(...)`** on these paths (it raises `RuntimeError: asyncio.run() cannot be called from a running event loop`). Gallery *loading* happens in async `process_video` via `await`. Gallery *deposits* happen from the sync read path, so they only mutate the in-memory gallery and **buffer** their DB rows; the buffer is flushed with `await` at the async finalize region. This keeps within-match recovery live and persists across matches at job end (satisfying "gets better over time").
 
 - [ ] **Step 3: Load the gallery at job start**
 
-In `process_video`, near where the event calibration loads (search for `field_store.load(self.event_key`), add a gallery load that tolerates a missing event_key or DB error:
+In `process_video`, immediately after the `_init_field_tracking()` gate passes — i.e. at the top of the `try:` block at web/app.py:2435 (event_key/calibration is known by then) — add an `await`ed load that tolerates a missing event_key or DB error:
 
 ```python
-if GALLERY_ENABLED and self.event_key:
-    try:
-        import asyncio as _asyncio
-        from web import database as _db
-        rows = _asyncio.run(_db.get_gallery_exemplars(self.event_key))
-        self.gallery = AppearanceGallery.from_rows(
-            rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
-        print(f"  Appearance gallery loaded: {len(rows)} exemplars for {self.event_key}")
-    except Exception as e:
-        print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
-        self.gallery = None
+        if GALLERY_ENABLED and self.event_key:
+            try:
+                rows = await database.get_gallery_exemplars(self.event_key)
+                self.gallery = AppearanceGallery.from_rows(
+                    rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
+                print(f"  Appearance gallery loaded: {len(rows)} exemplars for {self.event_key}")
+            except Exception as e:
+                print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
+                self.gallery = None
 ```
 
-> NOTE: confirm whether `process_video` is sync or async before choosing `asyncio.run` vs `await`. The codebase calls DB helpers with `asyncio.run(...)` from sync contexts (see tests) and `await` from async endpoints. Match the surrounding code at the insertion point. If `process_video` runs in a worker thread (no running loop), `asyncio.run` is correct.
+(`database` is already imported at module level — it is used at web/app.py:3320. Use it directly; do not add a local import.)
 
-- [ ] **Step 4: Add the deposit helper**
+- [ ] **Step 4: Add the deposit helper (in-memory + buffer, NO DB call)**
 
-Add a method on `InferenceJob` (near `read_fused_bumper_numbers`):
+Add a method on `InferenceJob` (near `read_fused_bumper_numbers`). It is sync-safe: it updates the in-memory gallery immediately and appends the persistable row to `self._pending_gallery_rows`. It never touches the DB.
 
 ```python
 def _deposit_to_gallery(self, robot, legibility: float = 0.0) -> None:
-    """Deposit a confirmed robot's appearance into the event gallery (memory + DB).
-    Only externally-grounded labels (OCR lock, manual confirm) should call this —
-    never a gallery-driven confirmation, to avoid self-reinforcement."""
+    """Deposit a confirmed robot's appearance into the in-memory event gallery and
+    buffer it for persistence at finalize. Only externally-grounded labels (an OCR
+    lock or OCR re-affirmation) should call this — never a gallery-driven
+    confirmation, to avoid self-reinforcement (spec non-goal)."""
     if self.gallery is None or robot is None:
         return
     color = robot.alliance if robot.alliance in ("red", "blue") else None
@@ -455,21 +463,16 @@ def _deposit_to_gallery(self, robot, legibility: float = 0.0) -> None:
         return
     stored = self.gallery.add(robot.team_number, color, robot.appearance_embedding, legibility)
     if not stored or not self.event_key:
-        return  # rejected as near-duplicate, or nowhere to persist
-    try:
-        import asyncio as _asyncio
-        from web import database as _db
-        _asyncio.run(_db.insert_gallery_exemplar({
-            "event_key": self.event_key, "team": robot.team_number,
-            "alliance_color": color,
-            "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
-            "legibility": legibility,
-        }))
-    except Exception as e:
-        print(f"  Gallery deposit persist failed ({e})")
+        return  # rejected as near-duplicate, or no event to persist under
+    self._pending_gallery_rows.append({
+        "event_key": self.event_key, "team": robot.team_number,
+        "alliance_color": color,
+        "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
+        "legibility": legibility,
+    })
 ```
 
-- [ ] **Step 5: Call the deposit helper at confirm sites**
+- [ ] **Step 5: Call the deposit helper at the (externally-grounded) confirm sites**
 
 In `read_fused_bumper_numbers`, inside the `if confirmed and locked_team:` block (after line 967, after the print), add:
 
@@ -485,22 +488,34 @@ Also deposit on confirmed re-read passes when OCR strongly re-affirms the locked
                 self._deposit_to_gallery(robot, legibility=conf)
 ```
 
-At the manual/calibration confirm site (~line 1254, the `r.consecutive_tracker.confirmed = True` block), add after `self._clear_team_from_other_robots(rid, team)`:
+> **Do NOT deposit at the `eliminate_last_team` site (~web/app.py:1249-1258).** That path confirms an identity by *process of elimination* (an inference), not by reading the bumper or a human label. Seeding the gallery from it would violate the spec's external-grounding / no-self-reinforcement rule. There is currently no manual team-set endpoint; if one is added later, it is the correct additional deposit site (with `legibility=1.0`).
+
+- [ ] **Step 6: Flush buffered exemplars at finalize (awaited)**
+
+In `process_video`, just after the replay-finalize `try/except` block (after web/app.py:3336), add an awaited flush in its own guarded block:
 
 ```python
-            self._deposit_to_gallery(r, legibility=1.0)  # manual label is fully trusted
+            try:
+                if self._pending_gallery_rows:
+                    for row in self._pending_gallery_rows:
+                        await database.insert_gallery_exemplar(row)
+                    print(f"  Appearance gallery: persisted {len(self._pending_gallery_rows)} "
+                          f"new exemplars for {self.event_key}")
+                    self._pending_gallery_rows = []
+            except Exception as e:
+                print(f"  Appearance gallery flush failed ({e})")
 ```
 
-- [ ] **Step 6: Verify nothing is broken**
+- [ ] **Step 7: Verify nothing is broken**
 
 Run: `.venv/bin/python -m pytest tests/ -v -m "not model"`
-Expected: PASS (existing suite still green; no new failures). The deposit wiring has no isolated unit test — it is exercised by the integration verification in Task 5's manual check and by the existing suite continuing to pass.
+Expected: PASS (existing suite still green; no new failures). The deposit/flush wiring has no isolated unit test — it is exercised by the integration verification in the Final Verification section (run two matches at one event_key, confirm exemplars persist) and by the existing suite continuing to pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add web/app.py
-git commit -m "feat(gallery): load per-event gallery + deposit on confirmed identity"
+git commit -m "feat(gallery): load per-event gallery, buffer deposits, flush at finalize"
 ```
 
 ---
@@ -548,7 +563,7 @@ def test_strong_match_three_times_locks_identity():
     t = FakeTrack("blue", _unit(1, 0.01, 0))  # ~identical -> strong, no rival
     verdict = None
     for _ in range(3):
-        verdict = _apply_gallery_vote(t, g)
+        verdict, team, sim = _apply_gallery_vote(t, g)
     assert verdict == "confirm"
     assert t.team_number_confirmed is True
     assert t.team_number == "1787"
@@ -568,7 +583,8 @@ def test_no_match_when_below_supplement():
     g = AppearanceGallery()
     g.add("1787", "blue", _unit(1, 0, 0), 0.9)
     t = FakeTrack("blue", _unit(0, 1, 0))  # orthogonal -> weak
-    assert _apply_gallery_vote(t, g) == "none"
+    verdict, team, sim = _apply_gallery_vote(t, g)
+    assert verdict == "none"
     assert (t.team_ocr_votes or {}) == {}
 ```
 
@@ -588,16 +604,16 @@ def _apply_gallery_vote(robot, gallery,
                         strong_w=GALLERY_STRONG_VOTE_WEIGHT, weak_w=GALLERY_WEAK_VOTE_WEIGHT):
     """Cast a gallery-derived vote into a track's existing vote/lock state.
 
-    Returns ('confirm'|'supplement'|'none', team, sim_tuple) verdict string for
-    callers/tests. Skips confirmed tracks (never overrides a lock)."""
+    Returns (verdict, team, sim) where verdict is 'confirm'|'supplement'|'none'.
+    Skips confirmed tracks (never overrides a lock)."""
     if gallery is None or robot.team_number_confirmed or robot.appearance_embedding is None:
-        return "none"
+        return ("none", None, 0.0)
     color = robot.alliance if robot.alliance in ("red", "blue") else None
     ranked = gallery.query(robot.appearance_embedding, color)
     verdict, team, sim = classify_match(
         ranked, confirm_sim=confirm_sim, confirm_gap=confirm_gap, supplement_sim=supplement_sim)
     if verdict == "none" or not team:
-        return "none"
+        return ("none", None, sim)
     weight = strong_w if verdict == "confirm" else weak_w
     if robot.team_ocr_votes is None:
         robot.team_ocr_votes = {}
@@ -609,7 +625,7 @@ def _apply_gallery_vote(robot, gallery,
         if confirmed and locked_team:
             robot.team_number = locked_team
             robot.team_number_confirmed = True
-    return verdict
+    return (verdict, team, sim)
 ```
 
 > Note: `_apply_gallery_vote` does NOT call `_deposit_to_gallery` — gallery-driven confirmations must not seed the gallery (self-reinforcement guard from the spec).
@@ -626,14 +642,9 @@ def apply_gallery_matches(self, ocr_crops: list) -> None:
     for slot_id, robot in self.robot_tracks.items():
         if robot.team_number_confirmed:
             continue
-        color = robot.alliance if robot.alliance in ("red", "blue") else None
-        ranked = self.gallery.query(robot.appearance_embedding, color)
-        verdict, team, sim = classify_match(
-            ranked, confirm_sim=GALLERY_CONFIRM_SIM, confirm_gap=GALLERY_CONFIRM_GAP,
-            supplement_sim=GALLERY_SUPPLEMENT_SIM)
+        verdict, team, sim = _apply_gallery_vote(robot, self.gallery)
         if verdict == "none" or not team:
             continue
-        _apply_gallery_vote(robot, self.gallery)
         card = by_slot.get(slot_id)
         if card is not None and not card.get("matched"):
             card["matched"] = team
@@ -647,7 +658,7 @@ def apply_gallery_matches(self, ocr_crops: list) -> None:
                   f"(appearance {sim:.2f})")
 ```
 
-> The method recomputes `classify_match` for the card annotation/log, then delegates the actual vote to `_apply_gallery_vote` to keep one source of truth for the vote math. (If you prefer, inline the verdict — just keep the vote mutation in one place.)
+> `_apply_gallery_vote` returns the `(verdict, team, sim)` it already computed, so the method casts the vote and annotates the card from a single query — no double `classify_match`.
 
 Tag OCR-sourced cards with `via: "ocr"`. In `read_fused_bumper_numbers`, in the `ocr_crops.append({...})` dict (line 926-937), add `"via": "ocr"`.
 

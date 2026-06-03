@@ -28,6 +28,12 @@ class FusedTrackRegistry:
         # running embedding per fused track
         self._id_to_embedding: dict[int, np.ndarray] = {}
 
+    def get_embedding(self, track_id: int) -> "np.ndarray | None":
+        """Running (EMA) appearance embedding for a fused track, or None if the
+        track has no embedding yet. Used to mirror embeddings onto per-slot
+        RobotTracks for the appearance gallery."""
+        return self._id_to_embedding.get(track_id)
+
     def assign(self, observations: list) -> None:
         """Stamp a stable ``track_id`` onto each FusedObservation (and its
         ``detection``), mutating in place. Call once per frame, in order."""

@@ -2529,6 +2529,10 @@ class InferenceJob:
                     pass
             return
         try:
+            self.status = "processing"
+            self._open_log_file()
+            # Load the per-event appearance gallery AFTER the log file is open so the
+            # load line lands in the match log (not just the server console).
             if GALLERY_ENABLED and self.event_key:
                 try:
                     rows = await database.get_gallery_exemplars(self.event_key)
@@ -2538,8 +2542,6 @@ class InferenceJob:
                 except Exception as e:
                     print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
                     self.gallery = None
-            self.status = "processing"
-            self._open_log_file()
             # Per-phase processing timers (seconds). `total` is filled at the end.
             self.timings = {}
             self._proc_t0 = time.perf_counter()
@@ -3014,11 +3016,25 @@ class InferenceJob:
                 self._view_flags = self._occ   # feed forward to next frame's tracker
 
                 # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
+                # Mirror each slot's fused-track appearance embedding (kept in the
+                # FusedTrackRegistry, keyed by fused id) onto its RobotTrack. Without
+                # this the per-slot appearance_embedding stays None on the field path,
+                # so the appearance gallery never deposits or queries anything.
+                slot_to_embedding = {}
+                if self.use_sam2 and self.field_tracker is not None:
+                    for tid, slot in self.field_tracker._id_to_slot.items():
+                        emb = self.fused_registry.get_embedding(tid)
+                        if emb is not None:
+                            slot_to_embedding[slot] = emb
+
                 tracked_robot_boxes = []  # (slot_id, box) for visible tracks
                 for t in track_outs:
                     robot = self._get_or_create_slot_track(t.slot_id)
                     robot.alliance = t.alliance  # slot (bumper-color) alliance wins
                     robot.field_position = t.pos  # field meters, for consumers that want it
+                    _emb = slot_to_embedding.get(t.slot_id)
+                    if _emb is not None:
+                        robot.appearance_embedding = _emb
                     if t.state == "visible" and t.box is not None:
                         cx = (t.box[0] + t.box[2]) / 2.0
                         cy = (t.box[1] + t.box[3]) / 2.0

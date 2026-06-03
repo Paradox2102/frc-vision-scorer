@@ -100,3 +100,16 @@ def test_ema_updates_running_embedding():
     expected = expected / np.linalg.norm(expected)
 
     np.testing.assert_array_almost_equal(reg._id_to_embedding[0], expected)
+
+
+def test_get_embedding_returns_ema_and_none_for_unknown():
+    # Regression: the appearance gallery reads per-track embeddings via this
+    # accessor; without it, RobotTrack.appearance_embedding stays None on the
+    # field-tracking path and the gallery silently never deposits/queries.
+    reg = FusedTrackRegistry()
+    f1 = _obs([("main", 1)], embedding=_e(1, 0, 0))
+    reg.assign([f1])
+    emb = reg.get_embedding(f1.track_id)
+    assert emb is not None
+    np.testing.assert_array_almost_equal(emb, _e(1, 0, 0))
+    assert reg.get_embedding(99999) is None

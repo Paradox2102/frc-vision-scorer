@@ -1220,6 +1220,14 @@ nav {
 }
 .replay-player-label { font-weight: 600; font-size: 1rem; }
 
+/* Keep the video fixed as the SCORING EVENTS list grows. By default the grid
+   stretches both columns to the tallest one, so a long event list grew the row
+   and re-centered the video. `align-items: start` lets the video column keep its
+   own (content) height, and capping the alliance column makes the event list
+   scroll internally instead of growing the layout. */
+.replay-player .main-layout { align-items: start; }
+.replay-player .alliance-column { max-height: calc(100vh - 180px); }
+
 .replay-fieldmap-wrap {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);

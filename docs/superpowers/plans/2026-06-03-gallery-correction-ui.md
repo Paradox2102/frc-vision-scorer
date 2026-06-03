@@ -456,7 +456,14 @@ Expected: FAIL (`_thumbnail_bytes` undefined).
 
 - [ ] **Step 3: Implement**
 
-(a) Add a module-level helper in `web/app.py` (near other helpers; `base64`, `io`, `Image` are imported — confirm `from PIL import Image` exists, else add):
+(a) **First add module-level imports.** `web/app.py` has `base64` at module level (line 7) but `io` and `from PIL import Image` appear ONLY inside a function (~line 4473) — `_thumbnail_bytes` is module-level and will `NameError` without them. Add near the top imports (~line 13):
+```python
+import io
+from PIL import Image
+```
+(If a `from PIL import Image` already gets added at module scope, don't duplicate.)
+
+Then add a module-level helper in `web/app.py` (near other module-level helpers):
 ```python
 def _thumbnail_bytes(crop_b64, max_h=128):
     """Decode a raw-base64 JPEG bumper crop and return a small JPEG thumbnail (bytes),
@@ -749,7 +756,7 @@ Inside the replay player modal (after the robot tables / timeline; read ~312-401
 
 - [ ] **Step 2: Fetch + render in `app.js`**
 
-In the replay loader (where `/api/replays/${id}` is fetched, ~1606), after priming frame 0, add:
+In the replay loader, after the frame-0 prime call `this.renderReplayFrame(0);` (at `app.js:1647`), add:
 ```javascript
             this.loadReplayIdentities(id);
 ```
@@ -923,17 +930,27 @@ git commit -m "feat(gallery): manager endpoints (list/relabel/verify/delete exem
 </div>
 ```
 
-- [ ] **Step 2: Wire nav + render in `app.js`** (mirror `switchToReplaysView` ~1653 and the nav handler ~76-119):
-```javascript
-    switchToGalleryView() {
-        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-        document.querySelector('.nav-btn[data-view="gallery"]')?.classList.add('active');
-        ['scorerView','replaysView','historyView'].forEach(v => {
-            const el = document.getElementById(v); if (el) el.style.display = 'none';
-        });
-        document.getElementById('galleryView').style.display = 'block';
-    }
+- [ ] **Step 2: Wire nav + render in `app.js`**
 
+The nav dispatch is a single `switchView(view)` (`app.js:106-122`) with a hardcoded view list — there is NO per-view `switchToX` dispatch, so do NOT add a standalone `switchToGalleryView` (it would never be called). Instead **edit `switchView`**: add the galleryView toggle line and a `gallery` branch.
+
+Add after the `replaysView` display line (~112):
+```javascript
+        document.getElementById('galleryView').style.display = view === 'gallery' ? 'block' : 'none';
+```
+Add to the `if/else if` chain (~121):
+```javascript
+        } else if (view === 'gallery') {
+            this.loadGallery();
+        }
+```
+Wire the load button in the init/bind section (near the other `addEventListener` setup ~95-101):
+```javascript
+        const galleryLoadBtn = document.getElementById('galleryLoadBtn');
+        if (galleryLoadBtn) galleryLoadBtn.addEventListener('click', () => this.loadGallery());
+```
+Then add the render methods:
+```javascript
     async loadGallery() {
         const key = document.getElementById('galleryEventKey').value.trim();
         const grid = document.getElementById('galleryGrid');
@@ -975,7 +992,7 @@ git commit -m "feat(gallery): manager endpoints (list/relabel/verify/delete exem
         this.loadGallery();
     }
 ```
-Wire the nav button to `switchToGalleryView` (find where `data-view` clicks are dispatched ~76-119 and add a `gallery` case), and `galleryLoadBtn` click → `this.loadGallery()` in the init/bind section.
+(The nav button + load button are already wired via the `switchView` edit and the `galleryLoadBtn` listener above.)
 
 - [ ] **Step 3: Bump cache-bust version** in `index.html`.
 

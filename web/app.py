@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yt_dlp
 from fastapi import (FastAPI, File, Form, HTTPException, Request, UploadFile,
                      WebSocket, WebSocketDisconnect)
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 import supervision as sv
@@ -5048,6 +5048,52 @@ async def get_replay_thumb(replay_id: str):
     if not row or not Path(row["thumb_path"]).exists():
         return JSONResponse(status_code=404, content={"error": "not found"})
     return FileResponse(row["thumb_path"], media_type="image/jpeg")
+
+
+@app.get("/api/replays/{replay_id}/video")
+async def get_replay_video(replay_id: str, request: Request):
+    row = await database.get_replay(replay_id)
+    if not row or not Path(row["video_path"]).exists():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    path = Path(row["video_path"])
+    file_size = path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if range_header is None:
+        return FileResponse(str(path), media_type="video/mp4")
+
+    # Parse "bytes=START-END"
+    units, _, rng = range_header.partition("=")
+    start_s, _, end_s = rng.partition("-")
+    try:
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+    start = max(0, start)
+    end = min(end, file_size - 1)
+    if start > end:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+    length = end - start + 1
+
+    def iter_slice(chunk=64 * 1024):
+        remaining = length
+        with path.open("rb") as f:
+            f.seek(start)
+            while remaining > 0:
+                data = f.read(min(chunk, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+    }
+    return StreamingResponse(iter_slice(), status_code=206,
+                             media_type="video/mp4", headers=headers)
 
 
 @app.get("/api/replays/{replay_id}")

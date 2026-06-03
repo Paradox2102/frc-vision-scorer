@@ -70,3 +70,26 @@ def test_list_get_thumb_delete(client):
 def test_get_missing_returns_404(client):
     c, tmp_path = client
     assert c.get("/api/replays/nope").status_code == 404
+
+
+def test_video_full_get_and_range(client):
+    c, tmp_path = client
+    d = _make_replay_files(tmp_path, rid="job-2")
+    _insert(database, d, rid="job-2")
+    size = (d / "hud.mp4").stat().st_size
+
+    # full GET -> 200, whole file
+    r = c.get("/api/replays/job-2/video")
+    assert r.status_code == 200 and len(r.content) == size
+
+    # ranged GET -> 206 with correct slice + headers
+    r = c.get("/api/replays/job-2/video", headers={"Range": "bytes=0-99"})
+    assert r.status_code == 206
+    assert r.headers["content-range"] == f"bytes 0-99/{size}"
+    assert r.headers["accept-ranges"] == "bytes"
+    assert len(r.content) == 100
+
+
+def test_video_missing_returns_404(client):
+    c, tmp_path = client
+    assert c.get("/api/replays/nope/video").status_code == 404

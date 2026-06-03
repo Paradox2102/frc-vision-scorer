@@ -394,6 +394,36 @@ class ScoringEvent:
     distance_to_hub: float
 
 
+def _apply_gallery_vote(robot, gallery,
+                        confirm_sim=GALLERY_CONFIRM_SIM, confirm_gap=GALLERY_CONFIRM_GAP,
+                        supplement_sim=GALLERY_SUPPLEMENT_SIM,
+                        strong_w=GALLERY_STRONG_VOTE_WEIGHT, weak_w=GALLERY_WEAK_VOTE_WEIGHT):
+    """Cast a gallery-derived vote into a track's existing vote/lock state.
+
+    Returns (verdict, team, sim) where verdict is 'confirm'|'supplement'|'none'.
+    Skips confirmed tracks (never overrides a lock)."""
+    if gallery is None or robot.team_number_confirmed or robot.appearance_embedding is None:
+        return ("none", None, 0.0)
+    color = robot.alliance if robot.alliance in ("red", "blue") else None
+    ranked = gallery.query(robot.appearance_embedding, color)
+    verdict, team, sim = classify_match(
+        ranked, confirm_sim=confirm_sim, confirm_gap=confirm_gap, supplement_sim=supplement_sim)
+    if verdict == "none" or not team:
+        return ("none", None, sim)
+    weight = strong_w if verdict == "confirm" else weak_w
+    if robot.team_ocr_votes is None:
+        robot.team_ocr_votes = {}
+    robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
+    if verdict == "confirm":
+        if robot.consecutive_tracker is None:
+            robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+        locked_team, confirmed = robot.consecutive_tracker.update(team)
+        if confirmed and locked_team:
+            robot.team_number = locked_team
+            robot.team_number_confirmed = True
+    return (verdict, team, sim)
+
+
 class InferenceJob:
     """Manages a single video inference job"""
     
@@ -853,6 +883,30 @@ class InferenceJob:
             "legibility": legibility,
         })
 
+    def apply_gallery_matches(self, ocr_crops: list) -> None:
+        """Query the gallery for unconfirmed tracks, cast votes, and annotate any
+        matching ocr_crops cards so the UI distinguishes appearance recovery."""
+        if self.gallery is None:
+            return
+        by_slot = {c["robot_id"]: c for c in ocr_crops}
+        for slot_id, robot in self.robot_tracks.items():
+            if robot.team_number_confirmed:
+                continue
+            verdict, team, sim = _apply_gallery_vote(robot, self.gallery)
+            if verdict == "none" or not team:
+                continue
+            card = by_slot.get(slot_id)
+            if card is not None and not card.get("matched"):
+                card["matched"] = team
+                card["via"] = "gallery"
+                card["gallery_sim"] = round(sim, 3)
+            if robot.team_number_confirmed:
+                for event in self.scoring_events:
+                    if event.robot_id == slot_id:
+                        event.team_number = robot.team_number
+                print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
+                      f"(appearance {sim:.2f})")
+
     def read_fused_bumper_numbers(self, fused, is_reread_pass: bool) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
@@ -967,6 +1021,7 @@ class InferenceJob:
                 "confidence": conf,
                 "error": res.get("error"),
                 "legibility": None,
+                "via": "ocr",
             })
             self.diagnostic.record_vlm_read(
                 frame=self._current_frame, robot_id=slot_id,
@@ -1005,6 +1060,7 @@ class InferenceJob:
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
+        self.apply_gallery_matches(ocr_crops)
         self.last_ocr_crops = ocr_crops
         self._ocr_crops_dirty = True
         self.vlm_status["last_results"] = status_results

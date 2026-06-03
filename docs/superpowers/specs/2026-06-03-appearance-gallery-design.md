@@ -70,7 +70,8 @@ Interface:
 - `query(embedding: np.ndarray, color: Optional[str]) -> list[tuple[str, float]]`
   Cosine similarity against exemplars, filtered to the detected `color` (searches both
   colors if `color` is unknown/None). Returns the best similarity per team, sorted
-  descending.
+  descending. "Second-best team" in the matching rules below means the next *distinct
+  team* in this ranked list (not the second exemplar of the same team).
 - `serialize() -> list[dict]` / `AppearanceGallery.load(rows) -> AppearanceGallery`
   for database round-trip.
 
@@ -85,8 +86,8 @@ appearance_gallery(
   embedding     BLOB NOT NULL,         -- float32 × 384
   legibility    REAL,
   created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
--- INDEX idx_gallery_event ON appearance_gallery(event_key, alliance_color)
+);
+CREATE INDEX idx_gallery_event ON appearance_gallery(event_key, alliance_color);
 ```
 
 One row per exemplar. Added via the same lightweight `ALTER TABLE`/try-except
@@ -97,9 +98,13 @@ without manual migration.
 
 - **Load:** at job start, `self.gallery = AppearanceGallery.load(rows for self.event_key)`.
   If `event_key` is absent, the gallery is disabled (in-memory empty, no persistence).
-- **Deposit:** when a track's `team_number_confirmed` flips true *via a real OCR read*,
-  deposit its `appearance_embedding` under `(team, detected red/blue color)`. Re-deposit
-  periodically on confirmed re-read passes (subject to dedup) so coverage improves.
+- **Deposit:** deposit a track's `appearance_embedding` under `(team, detected red/blue
+  color)` whenever its identity is confirmed by a **high-trust source** — i.e. an OCR
+  read crossing the lock threshold, *or* a manual/calibration confirm (the path around
+  `app.py:1254`). Both are trustworthy labels. Re-deposit periodically on confirmed
+  re-read passes (subject to dedup) so coverage improves. Do **not** deposit from a
+  gallery-driven confirmation — only externally-grounded labels seed the gallery, to
+  avoid appearance matches reinforcing themselves.
 - **Query:** each read pass, for tracks that are **not** confirmed, query with the
   track's embedding + detected color:
   - **Strong match** — `best_sim ≥ GALLERY_CONFIRM_SIM` (≈0.88) **and**

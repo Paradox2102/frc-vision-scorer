@@ -96,5 +96,20 @@ class ReplayRecorder:
         }
 
     def _stamp_event_times(self) -> None:
-        """Stamp each event's `t` from its frame number. Implemented in Task 3."""
-        return
+        """Map each event's source frame_num to the recorded-frame index, then t=i/fps.
+
+        Uses the largest recorded frame whose frame_num <= event frame_num (the frame
+        on screen when the event fired). Falls back to index 0 if none precede it.
+        """
+        # (recorded_index, frame_num) pairs in recorded order (ascending by frame_num)
+        indexed = [(f["i"], f.get("frame_num")) for f in self.frames if f.get("frame_num") is not None]
+        for ev in self.events:
+            fn = ev.get("frame_num")
+            idx = 0
+            if fn is not None and indexed:
+                for i, frame_num in indexed:
+                    if frame_num <= fn:
+                        idx = i
+                    else:
+                        break
+            ev["t"] = round(idx / self.fps, 4) if self.fps else 0.0

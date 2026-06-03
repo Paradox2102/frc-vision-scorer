@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260307a">
+    <link rel="stylesheet" href="/static/style.css?v=20260603a">
 </head>
 <body>
     <div class="container">
@@ -12,6 +12,7 @@
             <h1>FRC Vision Scorer</h1>
             <nav id="mainNav">
                 <button class="nav-btn active" data-view="scorer">Scorer</button>
+                <button class="nav-btn" data-view="replays">Replays</button>
                 <button class="nav-btn" data-view="history">Match History</button>
                 <a href="/static/calibrate.html" class="nav-btn" style="text-decoration: none;" target="_blank">Calibration</a>
             </nav>
@@ -303,8 +304,92 @@
             </div>
         </div>
 
+        <!-- ===================== REPLAYS VIEW ===================== -->
+        <div id="replaysView" style="display:none;">
+            <section class="replays-section">
+                <div class="replays-library" id="replaysLibrary">
+                    <div id="replaysGrid" class="replays-grid">
+                        <p class="empty-state">Loading replays...</p>
+                    </div>
+                </div>
+
+                <!-- Replay Player -->
+                <div class="replay-player" id="replayPlayer" style="display:none;">
+                    <div class="replay-player-bar">
+                        <button class="btn-small" id="replayBackBtn">&larr; Back to Library</button>
+                        <span class="replay-player-label" id="replayPlayerLabel"></span>
+                    </div>
+                    <section class="main-layout">
+                        <div class="video-column">
+                            <div class="hud-overlay">
+                                <div class="hud-left">
+                                    <span class="hud-item"><span class="hud-label">Frame</span> <span id="replayHudFrame">0 / 0</span></span>
+                                    <span class="hud-item"><span class="hud-label">Time</span> <span id="replayHudTime">0:00</span></span>
+                                </div>
+                                <div class="hud-scores">
+                                    <div class="score-chip blue">
+                                        <span class="score-label">BLUE</span>
+                                        <span class="score-value" id="replayScoreBlue">0</span>
+                                    </div>
+                                    <div class="score-chip red">
+                                        <span class="score-label">RED</span>
+                                        <span class="score-value" id="replayScoreRed">0</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="video-container">
+                                <video id="replayVideo" controls playsinline preload="metadata" style="width:100%;display:block;height:auto;"></video>
+                            </div>
+                            <div class="replay-fieldmap-wrap">
+                                <canvas id="replayFieldMap" width="640" height="320"></canvas>
+                            </div>
+                        </div>
+
+                        <div class="alliance-column">
+                            <div class="alliance-card blue">
+                                <div class="alliance-header blue">
+                                    <span class="alliance-title">BLUE ALLIANCE</span>
+                                    <span class="alliance-score" id="replayBlueAllianceScore">0</span>
+                                </div>
+                                <table>
+                                    <thead>
+                                        <tr><th>Robot</th><th>Team</th><th>Goals</th></tr>
+                                    </thead>
+                                    <tbody id="replayBlueRobotsTable">
+                                        <tr><td colspan="3" class="empty-state">No robots</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="alliance-card red">
+                                <div class="alliance-header red">
+                                    <span class="alliance-title">RED ALLIANCE</span>
+                                    <span class="alliance-score" id="replayRedAllianceScore">0</span>
+                                </div>
+                                <table>
+                                    <thead>
+                                        <tr><th>Robot</th><th>Team</th><th>Goals</th></tr>
+                                    </thead>
+                                    <tbody id="replayRedRobotsTable">
+                                        <tr><td colspan="3" class="empty-state">No robots</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="timeline-card">
+                                <div class="timeline-header">SCORING EVENTS</div>
+                                <div class="timeline-container" id="replayTimelineContainer">
+                                    <p class="empty-state">No events</p>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </section>
+        </div>
+
     </div>
 
-    <script src="/static/app.js?v=20260307a"></script>
+    <script src="/static/app.js?v=20260603a"></script>
 </body>
 </html>

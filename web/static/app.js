@@ -76,6 +76,22 @@ class VisionScorer {
             });
         });
 
+        // Replays player
+        this.replayVideo = document.getElementById('replayVideo');
+        this.replayMeta = null;
+        const replayBackBtn = document.getElementById('replayBackBtn');
+        if (replayBackBtn) {
+            replayBackBtn.addEventListener('click', () => {
+                if (this.replayVideo) this.replayVideo.pause();
+                this.showReplayLibrary();
+                this.loadReplays();
+            });
+        }
+        if (this.replayVideo) {
+            this.replayVideo.addEventListener('timeupdate', () => this.onReplayTimeUpdate());
+            this.replayVideo.addEventListener('loadedmetadata', () => this.drawReplayFieldMap([]));
+        }
+
         // Modal
         document.getElementById('modalClose').addEventListener('click', () => this.closeModal());
         document.getElementById('modalCancelBtn').addEventListener('click', () => this.closeModal());
@@ -93,9 +109,15 @@ class VisionScorer {
 
         document.getElementById('scorerView').style.display = view === 'scorer' ? 'block' : 'none';
         document.getElementById('historyView').style.display = view === 'history' ? 'block' : 'none';
+        document.getElementById('replaysView').style.display = view === 'replays' ? 'block' : 'none';
 
         if (view === 'history') {
             this.loadHistory();
+        } else if (view === 'replays') {
+            // Leaving any open player when navigating back to the library
+            if (this.replayVideo) this.replayVideo.pause();
+            this.showReplayLibrary();
+            this.loadReplays();
         }
     }
 
@@ -823,11 +845,13 @@ class VisionScorer {
         img.src = 'data:image/jpeg;base64,' + frameDataBase64;
     }
 
-    updateRobotTables(robots) {
+    updateRobotTables(robots, blueTable, redTable) {
+        const blueEl = blueTable || this.blueRobotsTable;
+        const redEl = redTable || this.redRobotsTable;
         const blueRobots = robots.filter(r => r.alliance === 'blue');
         const redRobots = robots.filter(r => r.alliance === 'red');
-        this.updateRobotTable(this.blueRobotsTable, blueRobots, 'blue');
-        this.updateRobotTable(this.redRobotsTable, redRobots, 'red');
+        this.updateRobotTable(blueEl, blueRobots, 'blue');
+        this.updateRobotTable(redEl, redRobots, 'red');
     }
 
     updateRobotTable(tableBody, robots, alliance) {
@@ -836,15 +860,16 @@ class VisionScorer {
             return;
         }
 
-        robots.sort((a, b) => b.scores - a.scores);
+        robots.sort((a, b) => (b.scores || 0) - (a.scores || 0));
 
         const rows = robots.map(robot => {
-            const teamNumber = robot.team_number || `Robot ${robot.id}`;
+            const label = robot.slot || (robot.id != null ? `Robot ${robot.id}` : '—');
+            const goals = robot.scores != null ? robot.scores : '—';
             return `
                 <tr>
-                    <td>${teamNumber}</td>
+                    <td>${label}</td>
                     <td>${robot.team_number || '—'}</td>
-                    <td class="goal-count">${robot.scores}</td>
+                    <td class="goal-count">${goals}</td>
                 </tr>
             `;
         }).join('');
@@ -908,24 +933,39 @@ class VisionScorer {
         return base + Number(match[2]);
     }
 
-    updateTimeline(events) {
+    updateTimeline(events, options = {}) {
+        const container = options.container || this.timelineContainer;
+        const onSeek = options.onSeek || null;
+        const activeIndex = options.activeIndex;
+
         if (!events || events.length === 0) return;
 
-        if (this.timelineContainer.querySelector('.empty-state')) {
-            this.timelineContainer.innerHTML = '';
+        if (container.querySelector('.empty-state')) {
+            container.innerHTML = '';
         }
 
-        const sortedEvents = [...events].reverse();
+        // Live path renders newest-first; clickable (replay) path keeps chronological
+        // order so timestamps line up with the scrubber.
+        const indexed = events.map((event, i) => ({ event, i }));
+        const ordered = onSeek ? indexed : [...indexed].reverse();
 
-        const eventElements = sortedEvents.map(event => {
-            const teamNumber = event.team_number || `R${event.robot_id}`;
-            const timestamp = this.formatTimestamp(event.timestamp);
+        const eventElements = ordered.map(({ event, i }) => {
+            // Replay events: robot_label/slot; live events: team_number/robot_id.
+            const teamNumber = event.team_number || event.robot_label || event.slot
+                || (event.robot_id != null ? `R${event.robot_id}` : '—');
+            // Live events carry `timestamp` + `frame`; replay events carry `t` + `frame_num`.
+            const seconds = event.timestamp != null ? event.timestamp : event.t;
+            const frame = event.frame != null ? event.frame : event.frame_num;
+            const timestamp = this.formatTimestamp(seconds || 0);
+            const clickAttrs = onSeek ? ` data-event-idx="${i}" role="button" tabindex="0"` : '';
+            const activeClass = (activeIndex != null && i === activeIndex) ? ' active' : '';
+            const confidence = event.confidence != null ? event.confidence : '';
 
             return `
-                <div class="timeline-event ${event.alliance}">
+                <div class="timeline-event ${event.alliance}${onSeek ? ' clickable' : ''}${activeClass}"${clickAttrs}>
                     <div class="timeline-event-info">
                         <div class="timeline-event-time">
-                            Frame ${event.frame} | ${timestamp}
+                            Frame ${frame} | ${timestamp}
                         </div>
                         <div class="timeline-event-details">
                             <span class="timeline-event-alliance ${event.alliance}">
@@ -934,14 +974,26 @@ class VisionScorer {
                             scored by <strong>${teamNumber}</strong>
                         </div>
                     </div>
-                    <span class="confidence-badge ${event.confidence}">
-                        ${event.confidence}
-                    </span>
+                    ${confidence !== '' ? `<span class="confidence-badge ${confidence}">${confidence}</span>` : ''}
                 </div>
             `;
         }).join('');
 
-        this.timelineContainer.innerHTML = eventElements;
+        container.innerHTML = eventElements;
+
+        if (onSeek) {
+            container.querySelectorAll('.timeline-event.clickable').forEach(el => {
+                const idx = parseInt(el.dataset.eventIdx, 10);
+                const seek = () => {
+                    const ev = events[idx];
+                    if (ev) onSeek(ev.t != null ? ev.t : ev.timestamp);
+                };
+                el.addEventListener('click', seek);
+                el.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); seek(); }
+                });
+            });
+        }
     }
 
     formatTimestamp(seconds) {
@@ -1017,6 +1069,27 @@ class VisionScorer {
         this.buildEditTable('blue', data);
         this.buildEditTable('red', data);
         this.updateEditTotals();
+
+        // Offer a "Watch Replay" shortcut for the match we just analyzed.
+        // The replay id is the same as the inference job_id.
+        this.setupReplayShortcut();
+    }
+
+    setupReplayShortcut() {
+        const actions = document.querySelector('#resultsSection .save-actions');
+        if (!actions || !this.jobId) return;
+        let btn = document.getElementById('watchReplayBtn');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'watchReplayBtn';
+            btn.className = 'btn-secondary';
+            btn.textContent = 'Watch Replay';
+            // Insert right after the save button so it reads Save / Replay / New
+            const saveBtn = document.getElementById('saveResultsBtn');
+            actions.insertBefore(btn, saveBtn ? saveBtn.nextSibling : null);
+        }
+        const jobId = this.jobId;
+        btn.onclick = () => this.openReplay(jobId);
     }
 
     buildEditTable(alliance, data) {
@@ -1340,6 +1413,317 @@ class VisionScorer {
         }
 
         container.innerHTML = html;
+    }
+
+    // --- Match Replays Library ---
+
+    showReplayLibrary() {
+        document.getElementById('replaysLibrary').style.display = 'block';
+        document.getElementById('replayPlayer').style.display = 'none';
+    }
+
+    showReplayPlayerView() {
+        document.getElementById('replaysLibrary').style.display = 'none';
+        document.getElementById('replayPlayer').style.display = 'block';
+    }
+
+    async loadReplays() {
+        const grid = document.getElementById('replaysGrid');
+        grid.innerHTML = '<p class="empty-state">Loading replays...</p>';
+
+        try {
+            const resp = await fetch('/api/replays');
+            const replays = await resp.json();
+
+            if (!Array.isArray(replays) || replays.length === 0) {
+                grid.innerHTML = '<p class="empty-state">No replays yet. Analyze a match to record one.</p>';
+                return;
+            }
+
+            grid.innerHTML = replays.map(r => this.renderReplayCard(r)).join('');
+
+            grid.querySelectorAll('[data-replay-action="play"]').forEach(btn => {
+                btn.addEventListener('click', () => this.openReplay(btn.dataset.replayId));
+            });
+            grid.querySelectorAll('[data-replay-action="delete"]').forEach(btn => {
+                btn.addEventListener('click', () => this.deleteReplay(btn.dataset.replayId));
+            });
+        } catch (err) {
+            grid.innerHTML = `<p class="empty-state">Error loading replays: ${this.escapeHtml(err.message)}</p>`;
+        }
+    }
+
+    renderReplayCard(r) {
+        const id = this.escapeHtml(r.id);
+        const label = this.escapeHtml(r.label || `Replay ${r.id}`);
+        const blueTeams = (r.blue_teams || []).join(', ') || '—';
+        const redTeams = (r.red_teams || []).join(', ') || '—';
+        const blueScore = r.blue_score != null ? r.blue_score : '—';
+        const redScore = r.red_score != null ? r.red_score : '—';
+        const date = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+        const duration = r.duration_sec != null ? `${Math.round(r.duration_sec)}s` : '';
+        const partialBadge = r.status === 'partial'
+            ? '<span class="replay-badge partial">PARTIAL</span>' : '';
+        const thumb = r.thumb_url
+            ? `<img class="replay-thumb" src="${this.escapeHtml(r.thumb_url)}" alt="${label} thumbnail" loading="lazy">`
+            : '<div class="replay-thumb placeholder">No preview</div>';
+
+        return `
+            <div class="replay-card">
+                <div class="replay-thumb-wrap">
+                    ${thumb}
+                    ${partialBadge}
+                </div>
+                <div class="replay-card-body">
+                    <div class="replay-card-title">${label}</div>
+                    <div class="replay-card-score">
+                        <span class="blue">${blueScore}</span>
+                        <span class="dash">-</span>
+                        <span class="red">${redScore}</span>
+                    </div>
+                    <div class="replay-card-teams">
+                        <span class="blue">${this.escapeHtml(blueTeams)}</span>
+                        <span class="vs">vs</span>
+                        <span class="red">${this.escapeHtml(redTeams)}</span>
+                    </div>
+                    <div class="replay-card-meta">${this.escapeHtml(date)}${duration ? ` &middot; ${duration}` : ''}</div>
+                    <div class="replay-card-actions">
+                        <button class="btn-small" data-replay-action="play" data-replay-id="${id}">Replay</button>
+                        <button class="btn-small replay-delete" data-replay-action="delete" data-replay-id="${id}">Delete</button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    async deleteReplay(id) {
+        if (!confirm('Delete this replay? This cannot be undone.')) return;
+        try {
+            const resp = await fetch(`/api/replays/${id}`, { method: 'DELETE' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(`Delete failed: ${err.error || resp.statusText}`);
+                return;
+            }
+            this.loadReplays();
+        } catch (err) {
+            alert(`Delete failed: ${err.message}`);
+        }
+    }
+
+    // --- Match Replay Player ---
+
+    async openReplay(id) {
+        // Switch to the replays view if invoked from elsewhere (e.g. results screen)
+        this.switchToReplaysView();
+        this.showReplayPlayerView();
+
+        const labelEl = document.getElementById('replayPlayerLabel');
+        labelEl.textContent = 'Loading…';
+
+        // Reset player UI
+        this._replayActiveEventIdx = -1;
+        document.getElementById('replayScoreBlue').textContent = '0';
+        document.getElementById('replayScoreRed').textContent = '0';
+        document.getElementById('replayBlueAllianceScore').textContent = '0';
+        document.getElementById('replayRedAllianceScore').textContent = '0';
+        document.getElementById('replayHudFrame').textContent = '0 / 0';
+        document.getElementById('replayHudTime').textContent = '0:00';
+        document.getElementById('replayBlueRobotsTable').innerHTML =
+            '<tr><td colspan="3" class="empty-state">No robots</td></tr>';
+        document.getElementById('replayRedRobotsTable').innerHTML =
+            '<tr><td colspan="3" class="empty-state">No robots</td></tr>';
+        document.getElementById('replayTimelineContainer').innerHTML =
+            '<p class="empty-state">No events</p>';
+
+        try {
+            const resp = await fetch(`/api/replays/${id}`);
+            if (!resp.ok) {
+                labelEl.textContent = 'Failed to load replay metadata';
+                return;
+            }
+            const meta = await resp.json();
+            this.replayMeta = meta;
+
+            const summary = meta.summary || {};
+            labelEl.textContent = summary.match_label || `Replay ${id}`;
+
+            // Point the <video> at the range-aware stream (native scrub/seek/speed)
+            this.replayVideo.src = `/api/replays/${id}/video`;
+            this.replayVideo.load();
+
+            // Render the full clickable scoring-event timeline up front
+            const events = meta.events || [];
+            this.updateTimeline(events, {
+                container: document.getElementById('replayTimelineContainer'),
+                onSeek: (t) => {
+                    if (Number.isFinite(t)) {
+                        this.replayVideo.currentTime = t;
+                        this.replayVideo.play().catch(() => {});
+                    }
+                },
+            });
+
+            // Prime the displays from frame 0
+            this.renderReplayFrame(0);
+        } catch (err) {
+            labelEl.textContent = `Error: ${err.message}`;
+        }
+    }
+
+    switchToReplaysView() {
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        const navBtn = document.querySelector('.nav-btn[data-view="replays"]');
+        if (navBtn) navBtn.classList.add('active');
+        document.getElementById('scorerView').style.display = 'none';
+        document.getElementById('historyView').style.display = 'none';
+        document.getElementById('replaysView').style.display = 'block';
+    }
+
+    onReplayTimeUpdate() {
+        if (!this.replayMeta) return;
+        const summary = this.replayMeta.summary || {};
+        const fps = summary.fps || 30;
+        const frames = this.replayMeta.frames || [];
+        if (frames.length === 0) return;
+
+        let idx = Math.round(this.replayVideo.currentTime * fps);
+        idx = Math.max(0, Math.min(frames.length - 1, idx));
+        this.renderReplayFrame(idx);
+    }
+
+    renderReplayFrame(idx) {
+        if (!this.replayMeta) return;
+        const frames = this.replayMeta.frames || [];
+        const frame = frames[idx];
+        if (!frame) return;
+
+        // Score display
+        const scores = frame.scores || {};
+        const blue = scores.blue != null ? scores.blue : 0;
+        const red = scores.red != null ? scores.red : 0;
+        document.getElementById('replayScoreBlue').textContent = blue;
+        document.getElementById('replayScoreRed').textContent = red;
+        document.getElementById('replayBlueAllianceScore').textContent = blue;
+        document.getElementById('replayRedAllianceScore').textContent = red;
+
+        // HUD
+        const total = frames.length;
+        document.getElementById('replayHudFrame').textContent =
+            `${frame.i != null ? frame.i : idx} / ${total}`;
+        document.getElementById('replayHudTime').textContent =
+            this.formatTimestamp(frame.t != null ? frame.t : this.replayVideo.currentTime);
+
+        // Robot tables — map replay robot fields to the shape updateRobotTables expects.
+        // Replay robots carry {slot, alliance, team_number, confirmed, field_pos}; no per-robot
+        // goal count, so `scores` is left absent (table renders '—'). `position` is null here.
+        const robots = (frame.robots || []).map(r => ({
+            slot: r.slot,
+            alliance: r.alliance,
+            team_number: r.team_number,
+            confirmed: r.confirmed,
+            position: null,
+        }));
+        this.updateRobotTables(
+            robots,
+            document.getElementById('replayBlueRobotsTable'),
+            document.getElementById('replayRedRobotsTable'),
+        );
+
+        // Highlight current scoring event (largest event.t <= currentTime)
+        this.highlightReplayEvent();
+
+        // Client-side field map
+        this.drawReplayFieldMap(frame.robots || []);
+    }
+
+    highlightReplayEvent() {
+        if (!this.replayMeta) return;
+        const events = this.replayMeta.events || [];
+        if (events.length === 0) return;
+
+        const now = this.replayVideo.currentTime;
+        let activeIdx = -1;
+        for (let i = 0; i < events.length; i++) {
+            if ((events[i].t || 0) <= now) activeIdx = i;
+            else break;
+        }
+        if (activeIdx === this._replayActiveEventIdx) return;
+        this._replayActiveEventIdx = activeIdx;
+
+        const container = document.getElementById('replayTimelineContainer');
+        container.querySelectorAll('.timeline-event').forEach(el => {
+            const idx = parseInt(el.dataset.eventIdx, 10);
+            el.classList.toggle('active', idx === activeIdx);
+        });
+        const activeEl = container.querySelector(`.timeline-event[data-event-idx="${activeIdx}"]`);
+        if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+    }
+
+    drawReplayFieldMap(robots) {
+        const canvas = document.getElementById('replayFieldMap');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.width;
+        const H = canvas.height;
+
+        // 2026 REBUILT field dimensions (metres).
+        // Source: data/field/2026-rebuilt-welded.json -> field.length / field.width,
+        // loaded by web/field/field_model.py (FieldModel.length_m / width_m).
+        const FIELD_LENGTH_M = 16.541;
+        const FIELD_WIDTH_M = 8.069;
+
+        // Fit the field rectangle inside the canvas with a small margin, preserving aspect.
+        const margin = 12;
+        const availW = W - margin * 2;
+        const availH = H - margin * 2;
+        const scale = Math.min(availW / FIELD_LENGTH_M, availH / FIELD_WIDTH_M);
+        const fieldW = FIELD_LENGTH_M * scale;
+        const fieldH = FIELD_WIDTH_M * scale;
+        const ox = (W - fieldW) / 2;
+        const oy = (H - fieldH) / 2;
+
+        ctx.clearRect(0, 0, W, H);
+
+        // Blue (left) / red (right) halves
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.12)';
+        ctx.fillRect(ox, oy, fieldW / 2, fieldH);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
+        ctx.fillRect(ox + fieldW / 2, oy, fieldW / 2, fieldH);
+
+        // Field border
+        ctx.strokeStyle = '#2a3550';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ox, oy, fieldW, fieldH);
+
+        // Center line
+        ctx.beginPath();
+        ctx.moveTo(ox + fieldW / 2, oy);
+        ctx.lineTo(ox + fieldW / 2, oy + fieldH);
+        ctx.stroke();
+
+        // Plot robots
+        for (const r of robots) {
+            const pos = r.field_pos;
+            if (!Array.isArray(pos) || pos.length < 2) continue;
+            const [x, y] = pos;
+            if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+            const px = ox + (x / FIELD_LENGTH_M) * fieldW;
+            const py = oy + (y / FIELD_WIDTH_M) * fieldH;
+            ctx.beginPath();
+            ctx.arc(px, py, 7, 0, Math.PI * 2);
+            ctx.fillStyle = r.alliance === 'red' ? '#ef4444' : '#3b82f6';
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+            ctx.stroke();
+            if (r.team_number) {
+                ctx.fillStyle = '#e8eaf0';
+                ctx.font = 'bold 10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(String(r.team_number), px, py - 10);
+            }
+        }
     }
 
     // --- Match Detail Modal ---

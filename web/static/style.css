@@ -1151,3 +1151,87 @@ nav {
     color: var(--text-secondary);
     font-size: 14px;
 }
+
+/* ========== Replays Library ========== */
+.replays-section { padding: 0.5rem 0; }
+
+.replays-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 1rem;
+    padding: 0.5rem;
+}
+
+.replay-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: border-color 0.2s, transform 0.1s;
+}
+.replay-card:hover { border-color: var(--blue-border); transform: translateY(-2px); }
+
+.replay-thumb-wrap { position: relative; aspect-ratio: 16 / 9; background: var(--bg-tertiary); }
+.replay-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.replay-thumb.placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    height: 100%;
+}
+
+.replay-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+.replay-badge.partial { background: var(--orange); color: #1a1300; }
+
+.replay-card-body { padding: 0.7rem; display: flex; flex-direction: column; gap: 0.35rem; }
+.replay-card-title { font-weight: 600; font-size: 0.95rem; }
+.replay-card-score { font-size: 1.2rem; font-weight: 700; display: flex; gap: 0.4rem; align-items: baseline; }
+.replay-card-score .blue { color: var(--blue-alliance); }
+.replay-card-score .red { color: var(--red-alliance); }
+.replay-card-score .dash { color: var(--text-secondary); }
+.replay-card-teams { font-size: 0.8rem; color: var(--text-secondary); display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.replay-card-teams .blue { color: var(--blue-alliance); }
+.replay-card-teams .red { color: var(--red-alliance); }
+.replay-card-teams .vs { color: var(--text-secondary); }
+.replay-card-meta { font-size: 0.72rem; color: var(--text-secondary); }
+.replay-card-actions { display: flex; gap: 0.5rem; margin-top: 0.3rem; }
+.replay-card-actions .btn-small { flex: 1; }
+.btn-small.replay-delete:hover { border-color: var(--red-alliance); color: var(--red-alliance); }
+
+/* ========== Replay Player ========== */
+.replay-player-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.4rem 0.2rem 0.6rem;
+}
+.replay-player-label { font-weight: 600; font-size: 1rem; }
+
+.replay-fieldmap-wrap {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.4rem;
+    flex-shrink: 0;
+}
+#replayFieldMap { width: 100%; height: auto; display: block; background: var(--bg-primary); border-radius: 4px; }
+
+.timeline-event.clickable { cursor: pointer; }
+.timeline-event.clickable:hover { background: rgba(255, 255, 255, 0.04); }
+.timeline-event.active {
+    background: rgba(255, 255, 255, 0.07);
+    outline: 1px solid var(--blue-border);
+}

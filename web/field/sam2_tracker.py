@@ -153,6 +153,7 @@ class Sam2FieldTracker:
         device: str = "cuda",
         offload_video_to_cpu: bool = True,
         offload_state_to_cpu: bool = True,
+        vos_optimized: bool = False,
     ) -> None:
         """Initialise the tracker.
 
@@ -165,6 +166,11 @@ class Sam2FieldTracker:
             device: torch device string (``"cuda"`` or ``"cpu"``).
             offload_video_to_cpu: Offload video frames to CPU to save GPU VRAM.
             offload_state_to_cpu: Offload tracker state to CPU to save GPU VRAM.
+            vos_optimized: Build the ``SAM2VideoPredictorVOS`` variant with a
+                ``torch.compile``d image encoder.  The image encoder is the
+                dominant per-frame cost, so compiling it gives a large speedup
+                (~2x) at the price of a one-time warmup on the first chunk.
+                Only meaningful on CUDA.
         """
         self.offload_video_to_cpu = offload_video_to_cpu
         self.offload_state_to_cpu = offload_state_to_cpu
@@ -181,7 +187,7 @@ class Sam2FieldTracker:
             from sam2.build_sam import build_sam2_video_predictor  # type: ignore[import]
 
             self._predictor = build_sam2_video_predictor(
-                config, checkpoint, device=device
+                config, checkpoint, device=device, vos_optimized=vos_optimized
             )
             self._device = device
             self._real_torch = True

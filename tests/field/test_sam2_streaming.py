@@ -220,7 +220,13 @@ class TestSAM2Streaming(unittest.TestCase):
         def mock_read():
             nonlocal read_counter
             read_counter += 1
-            if read_counter > 50:  # Allow enough reads for pre-computation and frame loop
+            # All VideoCapture() instances share this one mock, so this counter bounds
+            # the whole pipeline's reads.  The SAM2 frame export now does a single
+            # SEQUENTIAL decode pass (reading every frame between title-screen and end),
+            # rather than one seek+read per kept frame, so it consumes more reads up
+            # front.  Budget must still leave the main loop enough reads to reach
+            # local_idx 10 (frame 200), where the DINOv2 embed() is exercised.
+            if read_counter > 120:
                 return False, None
             return True, np.zeros((1080, 1920, 3), dtype=np.uint8)
         mock_cap.read.side_effect = mock_read

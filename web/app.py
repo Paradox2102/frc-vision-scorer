@@ -5025,6 +5025,54 @@ async def stop_job(job_id: str):
     return {"status": "stopping", "job_id": job_id, "frame_num": job._current_frame}
 
 
+@app.get("/api/replays")
+async def list_replays_endpoint():
+    rows = await database.list_replays()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "label": r["label"], "created_at": r["created_at"],
+            "blue_score": r["blue_score"], "red_score": r["red_score"],
+            "blue_teams": json.loads(r["blue_teams"] or "[]"),
+            "red_teams": json.loads(r["red_teams"] or "[]"),
+            "duration_sec": r["duration_sec"], "status": r["status"],
+            "thumb_url": f"/api/replays/{r['id']}/thumb",
+            "video_url": f"/api/replays/{r['id']}/video",
+        })
+    return out
+
+
+@app.get("/api/replays/{replay_id}/thumb")
+async def get_replay_thumb(replay_id: str):
+    row = await database.get_replay(replay_id)
+    if not row or not Path(row["thumb_path"]).exists():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return FileResponse(row["thumb_path"], media_type="image/jpeg")
+
+
+@app.get("/api/replays/{replay_id}")
+async def get_replay_endpoint(replay_id: str):
+    row = await database.get_replay(replay_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    meta_path = Path(row["meta_path"])
+    if not meta_path.exists():
+        return JSONResponse(status_code=404, content={"error": "metadata missing"})
+    return JSONResponse(content=json.loads(meta_path.read_text()))
+
+
+@app.delete("/api/replays/{replay_id}")
+async def delete_replay_endpoint(replay_id: str):
+    row = await database.get_replay(replay_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    replay_dir = Path(row["video_path"]).parent
+    if replay_dir.exists():
+        shutil.rmtree(replay_dir, ignore_errors=True)
+    await database.delete_replay(replay_id)
+    return {"status": "deleted", "id": replay_id}
+
+
 @app.websocket("/ws/infer/{job_id}")
 async def websocket_infer(websocket: WebSocket, job_id: str):
     """WebSocket endpoint for streaming inference results"""

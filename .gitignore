@@ -105,3 +105,7 @@ data/test_footage/
 # Local tooling / session state (not shared)
 .antigravitycli/
 .claude/
+log.md
+
+# Match replay artifacts (recorded HUD videos + metadata, large/user data)
+web/replays/

@@ -54,7 +54,7 @@ def test_query_returns_best_per_team_sorted():
     g.add("254", "blue", _unit(0, 1, 0), 0.9)
     q = _unit(0.9, 0.2, 0)  # closest to 1787
     ranked = g.query(q, "blue")
-    assert [t for t, _ in ranked] == ["1787", "254"]
+    assert [r[0] for r in ranked] == ["1787", "254"]
     assert ranked[0][1] > ranked[1][1]
 
 
@@ -92,3 +92,23 @@ def test_from_rows_recaps_oversized_bucket_keeping_highest_legibility():
     g = AppearanceGallery.from_rows(rows, max_exemplars=2)
     assert g.exemplar_count("1787", "blue") == 2
     assert sorted(g.legibilities("1787", "blue")) == [0.7, 0.9]
+
+
+def test_query_returns_verified_flag_and_sorts_verified_first_on_tie():
+    g = AppearanceGallery()
+    e = _unit(1, 0, 0)
+    g.add("254", "red", e, 0.9, verified=False)
+    g.add("1787", "red", e, 0.9, verified=True)  # identical sim -> verified wins tie
+    ranked = g.query(e, "red")
+    assert ranked[0][0] == "1787"      # verified team first
+    assert ranked[0][2] is True        # 3-tuple: (team, sim, verified)
+    assert len(ranked[0]) == 3
+
+
+def test_verified_roundtrips_through_serialize_from_rows():
+    g = AppearanceGallery()
+    g.add("1787", "blue", _unit(1, 0, 0), 0.9, verified=True)
+    rows = g.serialize()
+    assert rows[0]["verified"] is True
+    g2 = AppearanceGallery.from_rows(rows)
+    assert g2.query(_unit(1, 0, 0), "blue")[0][2] is True

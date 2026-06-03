@@ -905,6 +905,11 @@ class VisionScorer {
             const confidence = Number.isFinite(crop.confidence)
                 ? `${Math.round(crop.confidence * 100)}%`
                 : '—';
+            const viaGallery = crop.via === 'gallery';
+            const galleryBadge = viaGallery
+                ? `<span class="appearance-badge">appearance ${Number.isFinite(crop.gallery_sim) ? Math.round(crop.gallery_sim * 100) + '%' : ''}</span>`
+                : '';
+            const subtext = viaGallery ? `recovered by appearance` : `${confidence} confidence`;
             const error = crop.error ? `<div class="vlm-error">${this.escapeHtml(crop.error)}</div>` : '';
             return `
                 <div class="vlm-crop ${crop.alliance || 'unknown'}">
@@ -915,9 +920,9 @@ class VisionScorer {
                             <span>${this.escapeHtml(crop.source || 'cam')}</span>
                         </div>
                         <div class="vlm-result ${resultClass}">
-                            ${this.escapeHtml(crop.slot)} ${this.escapeHtml(raw)} &gt; ${this.escapeHtml(matched)}
+                            ${this.escapeHtml(crop.slot)} ${this.escapeHtml(raw)} &gt; ${this.escapeHtml(matched)} ${galleryBadge}
                         </div>
-                        <div class="vlm-subtext">${confidence} confidence</div>
+                        <div class="vlm-subtext">${subtext}</div>
                         ${error}
                     </div>
                 </div>

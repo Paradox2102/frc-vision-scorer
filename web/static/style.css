@@ -673,6 +673,16 @@ nav {
 .timeline-event-alliance.blue { color: var(--blue-alliance); }
 .timeline-event-alliance.red { color: var(--red-alliance); }
 
+.appearance-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 6px;
+    font-size: 0.7rem;
+    background: rgba(139, 92, 246, 0.2);
+    color: #c4b5fd;
+}
+
 .confidence-badge {
     padding: 0.15rem 0.5rem;
     border-radius: 4px;

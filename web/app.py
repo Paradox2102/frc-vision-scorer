@@ -495,6 +495,8 @@ class InferenceJob:
         self.robot_tracks: Dict[int, RobotTrack] = {}
         self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
+        self._slot_crops: dict = {}   # slot_id -> list of {quality, crop_b64, embedding} (top-3)
+        self._slot_source: dict = {}  # slot_id -> "ocr" | "gallery" (last confirm source)
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -874,6 +876,17 @@ class InferenceJob:
         robot.team_number = None
         robot.team_number_confirmed = False
 
+    def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding):
+        """Keep the top-3 (by quality) bumper crops per slot for post-match review.
+        Stores a COPY of the embedding (field-path embeddings are EMA-updated in place)."""
+        if not crop_b64:
+            return
+        emb = None if embedding is None else np.array(embedding, dtype=np.float32, copy=True)
+        bucket = self._slot_crops.setdefault(slot_id, [])
+        bucket.append({"quality": float(quality), "crop_b64": crop_b64, "embedding": emb})
+        bucket.sort(key=lambda c: c["quality"], reverse=True)
+        del bucket[3:]
+
     def _deposit_to_gallery(self, robot, legibility: float = 0.0, image_bytes=None) -> None:
         """Deposit a confirmed robot's appearance into the in-memory event gallery and
         buffer it for persistence at finalize. Only externally-grounded labels (an OCR
@@ -916,6 +929,7 @@ class InferenceJob:
             if robot.team_number_confirmed:
                 # Mirror the OCR lock path: a confirmed identity is exclusive, so
                 # release this team from any other track that was tentatively holding it.
+                self._slot_source[slot_id] = "gallery"
                 self._clear_team_from_other_robots(slot_id, robot.team_number)
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
@@ -1017,6 +1031,7 @@ class InferenceJob:
                 continue
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
+            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
             status_results.append({
                 "slot": self._slot_label(slot_id),
@@ -1067,6 +1082,7 @@ class InferenceJob:
                 old_team = robot.team_number
                 robot.team_number = locked_team
                 robot.team_number_confirmed = True
+                self._slot_source[slot_id] = "ocr"
                 self._clear_team_from_other_robots(slot_id, locked_team)
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
@@ -3455,7 +3471,7 @@ class InferenceJob:
                         "id": self.job_id,
                         "created_at": _dt.now().isoformat(timespec="seconds"),
                         "label": Path(str(self.video_path)).stem,
-                        "event_key": None, "match_key": None, "comp_level": None,
+                        "event_key": self.event_key, "match_key": None, "comp_level": None,
                         "blue_score": self.alliance_scores.get("blue", 0),
                         "red_score": self.alliance_scores.get("red", 0),
                         "blue_teams": _json.dumps(blue_teams),
@@ -3477,6 +3493,27 @@ class InferenceJob:
                     self._pending_gallery_rows = []
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
+            try:
+                for slot_id, robot in self.robot_tracks.items():
+                    crops = self._slot_crops.get(slot_id, [])
+                    await database.upsert_match_robot_identity({
+                        "job_id": self.job_id, "slot": slot_id,
+                        "slot_label": self._slot_label(slot_id),
+                        "alliance": robot.alliance, "team_number": robot.team_number,
+                        "confirmed": int(bool(robot.team_number_confirmed)),
+                        "source": self._slot_source.get(slot_id, "ocr"),
+                        "confidence": (crops[0]["quality"] if crops else None),
+                    })
+                    for c in crops:
+                        await database.insert_match_robot_crop({
+                            "job_id": self.job_id, "slot": slot_id,
+                            "legibility": c["quality"],
+                            "embedding": (None if c["embedding"] is None
+                                          else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
+                            "image": _thumbnail_bytes(c["crop_b64"]),
+                        })
+            except Exception as e:
+                print(f"  Match-identity capture failed ({e})")
 
 
 @app.on_event("startup")

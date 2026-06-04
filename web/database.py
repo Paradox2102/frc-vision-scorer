@@ -543,7 +543,10 @@ async def delete_replay(replay_id: str) -> None:
 
 async def update_replay_teams(replay_id: str, key: str, value: str) -> None:
     """Update one alliance's team list (JSON string) on a replay row."""
-    assert key in ("blue_teams", "red_teams")
+    # Real guard (not assert: assert is stripped under python -O) — the column name
+    # is interpolated into the SQL, so it must never be attacker-influenced.
+    if key not in ("blue_teams", "red_teams"):
+        raise ValueError(f"invalid team column: {key!r}")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             f"UPDATE replays SET {key} = ? WHERE id = ?", (value, replay_id))

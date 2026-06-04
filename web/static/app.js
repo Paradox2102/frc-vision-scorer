@@ -134,28 +134,34 @@ class VisionScorer {
         const key = document.getElementById('galleryEventKey').value.trim();
         const grid = document.getElementById('galleryGrid');
         if (!key) { grid.innerHTML = '<p class="empty-state">Enter an event key</p>'; return; }
-        const resp = await fetch(`/api/gallery?event_key=${encodeURIComponent(key)}`);
-        const data = await resp.json();
-        const ex = data.exemplars || [];
-        if (ex.length === 0) { grid.innerHTML = '<p class="empty-state">No exemplars</p>'; return; }
-        grid.innerHTML = ex.map(e => `
-            <div class="review-robot" data-id="${e.id}">
-                <div class="review-imgs">${e.image ? `<img class="review-crop" src="${e.image}">` : '<span class="empty-state">no image</span>'}</div>
-                <div class="review-meta">
-                    <input class="g-team" type="text" value="${this.escapeHtml(e.team || '')}" style="width:70px">
-                    <select class="g-color"><option value="blue"${e.alliance_color==='blue'?' selected':''}>blue</option><option value="red"${e.alliance_color==='red'?' selected':''}>red</option></select>
-                    <label><input type="checkbox" class="g-verified"${e.verified?' checked':''}> verified</label>
-                    <button class="g-save" data-id="${e.id}">Save</button>
-                    <button class="g-del" data-id="${e.id}">Delete</button>
-                </div>
-            </div>`).join('');
-        grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
-        grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
+        try {
+            const resp = await fetch(`/api/gallery?event_key=${encodeURIComponent(key)}`);
+            if (!resp.ok) { grid.innerHTML = '<p class="empty-state">Failed to load gallery</p>'; return; }
+            const data = await resp.json();
+            const ex = data.exemplars || [];
+            if (ex.length === 0) { grid.innerHTML = '<p class="empty-state">No exemplars</p>'; return; }
+            grid.innerHTML = ex.map(e => `
+                <div class="review-robot" data-id="${e.id}">
+                    <div class="review-imgs">${e.image ? `<img class="review-crop" src="${this.escapeHtml(e.image)}">` : '<span class="empty-state">no image</span>'}</div>
+                    <div class="review-meta">
+                        <input class="g-team" type="text" value="${this.escapeHtml(e.team || '')}">
+                        <select class="g-color"><option value="blue"${e.alliance_color==='blue'?' selected':''}>blue</option><option value="red"${e.alliance_color==='red'?' selected':''}>red</option></select>
+                        <label><input type="checkbox" class="g-verified"${e.verified?' checked':''}> verified</label>
+                        <button class="g-save" data-id="${e.id}">Save</button>
+                        <button class="g-del" data-id="${e.id}">Delete</button>
+                    </div>
+                </div>`).join('');
+            grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
+            grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
+        } catch (e) {
+            grid.innerHTML = '<p class="empty-state">Failed to load gallery</p>';
+        }
     }
 
     async saveGalleryExemplar(btn) {
         const wrap = btn.closest('.review-robot');
-        await fetch(`/api/gallery/${btn.dataset.id}`, {
+        const id = Number(btn.dataset.id);
+        await fetch(`/api/gallery/${id}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 team: wrap.querySelector('.g-team').value.trim(),
@@ -163,12 +169,14 @@ class VisionScorer {
                 verified: wrap.querySelector('.g-verified').checked,
             }),
         });
-        this.loadGallery();
+        await this.loadGallery();
     }
 
     async deleteGalleryExemplar(btn) {
-        await fetch(`/api/gallery/${btn.dataset.id}`, { method: 'DELETE' });
-        this.loadGallery();
+        if (!confirm('Delete this exemplar? This cannot be undone.')) return;
+        const id = Number(btn.dataset.id);
+        await fetch(`/api/gallery/${id}`, { method: 'DELETE' });
+        await this.loadGallery();
     }
 
     // --- Event Loading ---

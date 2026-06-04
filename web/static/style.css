@@ -1289,4 +1289,5 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
 .review-crop { height: 56px; border-radius: 4px; }
 .review-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .review-team { width: 80px; }
+.g-team { width: 70px; }
 .review-status { font-size: 0.8rem; color: var(--text-secondary, #9bb); }

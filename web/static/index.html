@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260603e">
+    <link rel="stylesheet" href="/static/style.css?v=20260603h">
 </head>
 <body>
     <div class="container">
@@ -14,6 +14,7 @@
                 <button class="nav-btn active" data-view="scorer">Scorer</button>
                 <button class="nav-btn" data-view="replays">Replays</button>
                 <button class="nav-btn" data-view="history">Match History</button>
+                <button class="nav-btn" data-view="gallery">Gallery</button>
                 <a href="/static/calibrate.html" class="nav-btn" style="text-decoration: none;" target="_blank">Calibration</a>
             </nav>
         </header>
@@ -396,12 +397,26 @@
                             </div>
                         </div>
                     </section>
+
+                    <div id="replayReviewCard" class="card" style="display:none">
+                        <h3>Review &amp; correct identities</h3>
+                        <div id="replayReviewGrid" class="review-grid"></div>
+                    </div>
                 </div>
             </section>
         </div>
 
+        <div id="galleryView" style="display:none">
+          <div class="card">
+            <h2>Appearance gallery</h2>
+            <input id="galleryEventKey" type="text" placeholder="event key (e.g. 2026x)">
+            <button id="galleryLoadBtn">Load</button>
+          </div>
+          <div id="galleryGrid" class="review-grid"></div>
+        </div>
+
     </div>
 
-    <script src="/static/app.js?v=20260603e"></script>
+    <script src="/static/app.js?v=20260603h"></script>
 </body>
 </html>

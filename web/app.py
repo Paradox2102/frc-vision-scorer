@@ -7,12 +7,14 @@ import asyncio
 import base64
 import cv2
 import datetime
+import io
 import json
 import math
 import numpy as np
 import os
 import pytesseract
 import shutil
+from PIL import Image
 import tempfile
 import time
 import urllib.error
@@ -224,6 +226,9 @@ GALLERY_MAX_EXEMPLARS = int(os.environ.get("GALLERY_MAX_EXEMPLARS", "12"))
 GALLERY_DEDUP_SIM = float(os.environ.get("GALLERY_DEDUP_SIM", "0.92"))
 GALLERY_STRONG_VOTE_WEIGHT = float(os.environ.get("GALLERY_STRONG_VOTE_WEIGHT", "1.0"))
 GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4"))
+# Human-verified exemplars (created when a user corrects an identity) out-weigh
+# auto-deposited ones so corrections reliably override bad OCR.
+GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGHT", "2.0"))
 
 # SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
 # to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
@@ -410,7 +415,13 @@ def _apply_gallery_vote(robot, gallery,
         ranked, confirm_sim=confirm_sim, confirm_gap=confirm_gap, supplement_sim=supplement_sim)
     if verdict == "none" or not team:
         return ("none", None, sim)
-    weight = strong_w if verdict == "confirm" else weak_w
+    # A human-verified top match out-weighs the normal strong/weak vote so that
+    # user corrections reliably override bad OCR. ranked holds (team, sim, verified).
+    best_verified = bool(ranked[0][2]) if ranked else False
+    if best_verified:
+        weight = GALLERY_VERIFIED_VOTE_WEIGHT
+    else:
+        weight = strong_w if verdict == "confirm" else weak_w
     if robot.team_ocr_votes is None:
         robot.team_ocr_votes = {}
     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
@@ -484,6 +495,8 @@ class InferenceJob:
         self.robot_tracks: Dict[int, RobotTrack] = {}
         self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
+        self._slot_crops: dict = {}   # slot_id -> list of {quality, crop_b64, embedding} (top-3)
+        self._slot_source: dict = {}  # slot_id -> "ocr" | "gallery" (last confirm source)
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -863,7 +876,19 @@ class InferenceJob:
         robot.team_number = None
         robot.team_number_confirmed = False
 
-    def _deposit_to_gallery(self, robot, legibility: float = 0.0) -> None:
+    def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding):
+        """Keep the top-3 (by quality) bumper crops per slot for post-match review.
+        Defensive copy: the live track's appearance_embedding is rebound by the EMA
+        each frame, so we snapshot a stable copy here to persist at finalize."""
+        if not crop_b64:
+            return
+        emb = None if embedding is None else np.array(embedding, dtype=np.float32, copy=True)
+        bucket = self._slot_crops.setdefault(slot_id, [])
+        bucket.append({"quality": float(quality), "crop_b64": crop_b64, "embedding": emb})
+        bucket.sort(key=lambda c: c["quality"], reverse=True)
+        del bucket[3:]
+
+    def _deposit_to_gallery(self, robot, legibility: float = 0.0, image_bytes=None) -> None:
         """Deposit a confirmed robot's appearance into the in-memory event gallery and
         buffer it for persistence at finalize. Only externally-grounded labels (an OCR
         lock or OCR re-affirmation) should call this — never a gallery-driven
@@ -881,6 +906,8 @@ class InferenceJob:
             "alliance_color": color,
             "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
             "legibility": legibility,
+            "image": image_bytes,
+            "verified": 0,
         })
 
     def apply_gallery_matches(self, ocr_crops: list) -> None:
@@ -903,6 +930,7 @@ class InferenceJob:
             if robot.team_number_confirmed:
                 # Mirror the OCR lock path: a confirmed identity is exclusive, so
                 # release this team from any other track that was tentatively holding it.
+                self._slot_source[slot_id] = "gallery"
                 self._clear_team_from_other_robots(slot_id, robot.team_number)
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
@@ -1004,6 +1032,7 @@ class InferenceJob:
                 continue
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
+            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
             status_results.append({
                 "slot": self._slot_label(slot_id),
@@ -1038,7 +1067,7 @@ class InferenceJob:
             )
             if (robot.team_number_confirmed and team == robot.team_number
                     and conf >= 0.85):
-                self._deposit_to_gallery(robot, legibility=conf)
+                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
             if not team:
                 continue
             if robot.team_ocr_votes is None:
@@ -1054,12 +1083,13 @@ class InferenceJob:
                 old_team = robot.team_number
                 robot.team_number = locked_team
                 robot.team_number_confirmed = True
+                self._slot_source[slot_id] = "ocr"
                 self._clear_team_from_other_robots(slot_id, locked_team)
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
-                self._deposit_to_gallery(robot, legibility=conf)
+                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
@@ -3442,7 +3472,7 @@ class InferenceJob:
                         "id": self.job_id,
                         "created_at": _dt.now().isoformat(timespec="seconds"),
                         "label": Path(str(self.video_path)).stem,
-                        "event_key": None, "match_key": None, "comp_level": None,
+                        "event_key": self.event_key, "match_key": None, "comp_level": None,
                         "blue_score": self.alliance_scores.get("blue", 0),
                         "red_score": self.alliance_scores.get("red", 0),
                         "blue_teams": _json.dumps(blue_teams),
@@ -3464,6 +3494,27 @@ class InferenceJob:
                     self._pending_gallery_rows = []
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
+            try:
+                for slot_id, robot in self.robot_tracks.items():
+                    crops = self._slot_crops.get(slot_id, [])
+                    await database.upsert_match_robot_identity({
+                        "job_id": self.job_id, "slot": slot_id,
+                        "slot_label": self._slot_label(slot_id),
+                        "alliance": robot.alliance, "team_number": robot.team_number,
+                        "confirmed": int(bool(robot.team_number_confirmed)),
+                        "source": self._slot_source.get(slot_id, "ocr"),
+                        "confidence": (crops[0]["quality"] if crops else None),
+                    })
+                    for c in crops:
+                        await database.insert_match_robot_crop({
+                            "job_id": self.job_id, "slot": slot_id,
+                            "legibility": c["quality"],
+                            "embedding": (None if c["embedding"] is None
+                                          else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
+                            "image": _thumbnail_bytes(c["crop_b64"]),
+                        })
+            except Exception as e:
+                print(f"  Match-identity capture failed ({e})")
 
 
 @app.on_event("startup")
@@ -4327,6 +4378,24 @@ def _match_bumper_read_to_roster(
     return None, alliance_hint if alliance_hint in ("blue", "red") else "unknown", 0.0
 
 
+def _thumbnail_bytes(crop_b64, max_h=128):
+    """Decode a raw-base64 JPEG bumper crop and return a small JPEG thumbnail (bytes),
+    bounded to max_h pixels tall. Returns None on bad/empty input."""
+    if not crop_b64:
+        return None
+    try:
+        raw = base64.b64decode(crop_b64)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if img.height > max_h:
+            w = max(1, int(img.width * max_h / img.height))
+            img = img.resize((w, max_h))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=80)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def _ocr_digits_from_crop_b64(crop_b64: str) -> str:
     try:
         raw = base64.b64decode(crop_b64)
@@ -4470,8 +4539,6 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     for idx, crop_b64 in enumerate(robot_crops_b64):
         try:
             # Decode base64 to PIL Image
-            import io
-            from PIL import Image
             img_bytes = base64.b64decode(crop_b64)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
@@ -5297,6 +5364,115 @@ async def get_replay_endpoint(replay_id: str):
     if not meta_path.exists():
         return JSONResponse(status_code=404, content={"error": "metadata missing"})
     return JSONResponse(content=json.loads(meta_path.read_text()))
+
+
+@app.get("/api/replays/{job_id}/identities")
+async def get_replay_identities(job_id: str):
+    """Robot-slot identities for a job, each with its captured bumper crops as
+    data-URLs. Raw embeddings are NEVER exposed to the client."""
+    ids = await database.get_match_identities(job_id)
+    out = []
+    for r in ids:
+        crops = await database.get_match_crops(job_id, r["slot"])
+        out.append({
+            "slot": r["slot"], "slot_label": r["slot_label"], "alliance": r["alliance"],
+            "team_number": r["team_number"], "confirmed": bool(r["confirmed"]),
+            "source": r["source"], "confidence": r["confidence"],
+            "crops": [
+                "data:image/jpeg;base64," + base64.b64encode(c["image"]).decode()
+                for c in crops if c["image"] is not None
+            ],
+        })
+    return {"job_id": job_id, "robots": out}
+
+
+@app.post("/api/replays/{job_id}/correct")
+async def correct_replay_identity(job_id: str, request: Request):
+    """Correct one robot slot's team. Updates the stored identity, fixes the
+    replay's displayed team list, and mints VERIFIED gallery exemplars from the
+    slot's crops (only when the replay has an event_key)."""
+    body = await request.json()
+    slot = int(body["slot"])
+    team = str(body["team_number"]).strip()
+    ids = {r["slot"]: r for r in await database.get_match_identities(job_id)}
+    rec = ids.get(slot)
+    if rec is None:
+        return JSONResponse(status_code=404, content={"error": "slot not found"})
+    alliance = rec["alliance"]
+    # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence)
+    await database.upsert_match_robot_identity(
+        {**rec, "job_id": job_id, "slot": slot, "team_number": team})
+    # 2. update the replay's team lists for display + mint exemplars
+    replay = await database.get_replay(job_id)
+    minted = 0
+    if replay is not None:
+        key = "blue_teams" if alliance == "blue" else "red_teams"
+        try:
+            teams = json.loads(replay.get(key) or "[]")
+        except Exception:
+            teams = []
+        # replace this slot's old team with the corrected one (best-effort positional)
+        old = rec["team_number"]
+        teams = [team if str(t) == str(old) else t for t in teams]
+        if team not in [str(t) for t in teams]:
+            teams.append(team)
+        await database.update_replay_teams(job_id, key, json.dumps(teams))
+        # 3. mint verified exemplars from this slot's crops (needs event_key + color)
+        event_key = replay.get("event_key")
+        color = alliance if alliance in ("red", "blue") else None
+        if event_key and color:
+            for c in await database.get_match_crops(job_id, slot):
+                if c["embedding"] is None:
+                    continue
+                await database.insert_gallery_exemplar({
+                    "event_key": event_key, "team": team, "alliance_color": color,
+                    "embedding": c["embedding"], "legibility": c["legibility"],
+                    "image": c["image"], "verified": 1})
+                minted += 1
+    return {"status": "ok", "slot": slot, "team_number": team,
+            "verified_exemplars": minted}
+
+
+@app.get("/api/gallery")
+async def list_gallery(event_key: str):
+    """List appearance-gallery exemplars for an event. Returns thumbnails as
+    data-URLs; never serializes the raw embedding bytes."""
+    rows = await database.get_gallery_exemplars(event_key)
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "team": r["team"], "alliance_color": r["alliance_color"],
+            "verified": bool(r["verified"]), "legibility": r["legibility"],
+            "image": ("data:image/jpeg;base64," + base64.b64encode(r["image"]).decode())
+                      if r.get("image") else None,
+        })
+    return {"event_key": event_key, "exemplars": out}
+
+
+@app.post("/api/gallery/{gid}")
+async def update_gallery(gid: int, request: Request):
+    """Relabel team/alliance_color or toggle verified on one gallery exemplar."""
+    body = await request.json()
+    color = body.get("alliance_color")
+    if color is not None and color not in ("red", "blue"):
+        return JSONResponse(status_code=400,
+                            content={"error": "alliance_color must be 'red' or 'blue'"})
+    team = body.get("team")
+    if team is not None:
+        team = str(team).strip()
+    verified = body.get("verified")
+    if verified is not None:
+        verified = bool(verified)
+    await database.update_gallery_exemplar(
+        gid, team=team, alliance_color=color, verified=verified)
+    return {"status": "ok", "id": gid}
+
+
+@app.delete("/api/gallery/{gid}")
+async def remove_gallery(gid: int):
+    """Delete one gallery exemplar."""
+    await database.delete_gallery_exemplar(gid)
+    return {"status": "deleted", "id": gid}
 
 
 @app.delete("/api/replays/{replay_id}")

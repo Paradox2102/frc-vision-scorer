@@ -92,6 +92,10 @@ class VisionScorer {
             this.replayVideo.addEventListener('loadedmetadata', () => this.drawReplayFieldMap([]));
         }
 
+        // Gallery
+        const galleryLoadBtn = document.getElementById('galleryLoadBtn');
+        if (galleryLoadBtn) galleryLoadBtn.addEventListener('click', () => this.loadGallery());
+
         // Modal
         document.getElementById('modalClose').addEventListener('click', () => this.closeModal());
         document.getElementById('modalCancelBtn').addEventListener('click', () => this.closeModal());
@@ -110,6 +114,7 @@ class VisionScorer {
         document.getElementById('scorerView').style.display = view === 'scorer' ? 'block' : 'none';
         document.getElementById('historyView').style.display = view === 'history' ? 'block' : 'none';
         document.getElementById('replaysView').style.display = view === 'replays' ? 'block' : 'none';
+        document.getElementById('galleryView').style.display = view === 'gallery' ? 'block' : 'none';
 
         if (view === 'history') {
             this.loadHistory();
@@ -118,7 +123,60 @@ class VisionScorer {
             if (this.replayVideo) this.replayVideo.pause();
             this.showReplayLibrary();
             this.loadReplays();
+        } else if (view === 'gallery') {
+            this.loadGallery();
         }
+    }
+
+    // --- Gallery Manager ---
+
+    async loadGallery() {
+        const key = document.getElementById('galleryEventKey').value.trim();
+        const grid = document.getElementById('galleryGrid');
+        if (!key) { grid.innerHTML = '<p class="empty-state">Enter an event key</p>'; return; }
+        try {
+            const resp = await fetch(`/api/gallery?event_key=${encodeURIComponent(key)}`);
+            if (!resp.ok) { grid.innerHTML = '<p class="empty-state">Failed to load gallery</p>'; return; }
+            const data = await resp.json();
+            const ex = data.exemplars || [];
+            if (ex.length === 0) { grid.innerHTML = '<p class="empty-state">No exemplars</p>'; return; }
+            grid.innerHTML = ex.map(e => `
+                <div class="review-robot" data-id="${e.id}">
+                    <div class="review-imgs">${e.image ? `<img class="review-crop" src="${this.escapeHtml(e.image)}">` : '<span class="empty-state">no image</span>'}</div>
+                    <div class="review-meta">
+                        <input class="g-team" type="text" value="${this.escapeHtml(e.team || '')}">
+                        <select class="g-color"><option value="blue"${e.alliance_color==='blue'?' selected':''}>blue</option><option value="red"${e.alliance_color==='red'?' selected':''}>red</option></select>
+                        <label><input type="checkbox" class="g-verified"${e.verified?' checked':''}> verified</label>
+                        <button class="g-save" data-id="${e.id}">Save</button>
+                        <button class="g-del" data-id="${e.id}">Delete</button>
+                    </div>
+                </div>`).join('');
+            grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
+            grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
+        } catch (e) {
+            grid.innerHTML = '<p class="empty-state">Failed to load gallery</p>';
+        }
+    }
+
+    async saveGalleryExemplar(btn) {
+        const wrap = btn.closest('.review-robot');
+        const id = Number(btn.dataset.id);
+        await fetch(`/api/gallery/${id}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                team: wrap.querySelector('.g-team').value.trim(),
+                alliance_color: wrap.querySelector('.g-color').value,
+                verified: wrap.querySelector('.g-verified').checked,
+            }),
+        });
+        await this.loadGallery();
+    }
+
+    async deleteGalleryExemplar(btn) {
+        if (!confirm('Delete this exemplar? This cannot be undone.')) return;
+        const id = Number(btn.dataset.id);
+        await fetch(`/api/gallery/${id}`, { method: 'DELETE' });
+        await this.loadGallery();
     }
 
     // --- Event Loading ---
@@ -1645,6 +1703,8 @@ class VisionScorer {
 
             // Prime the displays from frame 0
             this.renderReplayFrame(0);
+
+            this.loadReplayIdentities(id);
         } catch (err) {
             labelEl.textContent = `Error: ${err.message}`;
         }
@@ -1669,6 +1729,63 @@ class VisionScorer {
         let idx = Math.round(this.replayVideo.currentTime * fps);
         idx = Math.max(0, Math.min(frames.length - 1, idx));
         this.renderReplayFrame(idx);
+    }
+
+    async loadReplayIdentities(id) {
+        this._replayId = id;
+        const replayId = id;
+        const card = document.getElementById('replayReviewCard');
+        const grid = document.getElementById('replayReviewGrid');
+        if (!card || !grid) return;
+        try {
+            const resp = await fetch(`/api/replays/${id}/identities`);
+            if (!resp.ok) { card.style.display = 'none'; return; }
+            const data = await resp.json();
+            const robots = data.robots || [];
+            if (robots.length === 0) { card.style.display = 'none'; return; }
+            grid.innerHTML = robots.map(r => {
+                const imgs = (r.crops || []).map(src =>
+                    `<img class="review-crop" src="${src}" alt="${this.escapeHtml(r.slot_label || '')} crop">`).join('')
+                    || '<span class="empty-state">no image</span>';
+                const badge = r.source === 'gallery' ? '<span class="appearance-badge">appearance</span>' : '';
+                return `
+                <div class="review-robot" data-slot="${r.slot}">
+                    <div class="review-imgs">${imgs}</div>
+                    <div class="review-meta">
+                        <strong>${this.escapeHtml(r.slot_label || ('slot ' + r.slot))}</strong> ${badge}
+                        <input class="review-team" type="text" value="${this.escapeHtml(r.team_number || '')}"
+                               placeholder="team #">
+                        <button class="review-save" data-slot="${r.slot}">Save</button>
+                        <span class="review-status"></span>
+                    </div>
+                </div>`;
+            }).join('');
+            grid.querySelectorAll('.review-save').forEach(btn => {
+                btn.addEventListener('click', () => this.saveIdentityCorrection(btn, replayId));
+            });
+            card.style.display = 'block';
+        } catch (e) {
+            card.style.display = 'none';
+        }
+    }
+
+    async saveIdentityCorrection(btn, replayId) {
+        const wrap = btn.closest('.review-robot');
+        const slot = Number(btn.dataset.slot);
+        const team = wrap.querySelector('.review-team').value.trim();
+        const status = wrap.querySelector('.review-status');
+        status.textContent = '…';
+        try {
+            const resp = await fetch(`/api/replays/${replayId}/correct`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ slot, team_number: team }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            status.textContent = resp.ok
+                ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || ('HTTP ' + resp.status)}`;
+        } catch (e) {
+            status.textContent = '✗ ' + e.message;
+        }
     }
 
     renderReplayFrame(idx) {

@@ -50,3 +50,13 @@ def test_no_match_when_below_supplement():
     verdict, team, sim = _apply_gallery_vote(t, g)
     assert verdict == "none"
     assert (t.team_ocr_votes or {}) == {}
+
+
+def test_verified_match_uses_higher_weight():
+    from web.app import GALLERY_VERIFIED_VOTE_WEIGHT
+    g = AppearanceGallery()
+    g.add("1787", "blue", _unit(1, 0, 0), 0.9, verified=True)
+    t = FakeTrack("blue", _unit(1, 0.01, 0))
+    verdict, team, sim = _apply_gallery_vote(t, g)
+    assert verdict == "confirm" and team == "1787"
+    assert t.team_ocr_votes["1787"] == GALLERY_VERIFIED_VOTE_WEIGHT  # verified weight, not strong_w

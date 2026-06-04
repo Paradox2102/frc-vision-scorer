@@ -54,7 +54,7 @@ def test_query_returns_best_per_team_sorted():
     g.add("254", "blue", _unit(0, 1, 0), 0.9)
     q = _unit(0.9, 0.2, 0)  # closest to 1787
     ranked = g.query(q, "blue")
-    assert [t for t, _ in ranked] == ["1787", "254"]
+    assert [r[0] for r in ranked] == ["1787", "254"]
     assert ranked[0][1] > ranked[1][1]
 
 
@@ -92,3 +92,62 @@ def test_from_rows_recaps_oversized_bucket_keeping_highest_legibility():
     g = AppearanceGallery.from_rows(rows, max_exemplars=2)
     assert g.exemplar_count("1787", "blue") == 2
     assert sorted(g.legibilities("1787", "blue")) == [0.7, 0.9]
+
+
+def test_query_returns_verified_flag_and_sorts_verified_first_on_tie():
+    g = AppearanceGallery()
+    e = _unit(1, 0, 0)
+    g.add("254", "red", e, 0.9, verified=False)
+    g.add("1787", "red", e, 0.9, verified=True)  # identical sim -> verified wins tie
+    ranked = g.query(e, "red")
+    assert ranked[0][0] == "1787"      # verified team first
+    assert ranked[0][2] is True        # 3-tuple: (team, sim, verified)
+    assert len(ranked[0]) == 3
+
+
+def test_verified_roundtrips_through_serialize_from_rows():
+    g = AppearanceGallery()
+    g.add("1787", "blue", _unit(1, 0, 0), 0.9, verified=True)
+    rows = g.serialize()
+    assert rows[0]["verified"] is True
+    g2 = AppearanceGallery.from_rows(rows)
+    assert g2.query(_unit(1, 0, 0), "blue")[0][2] is True
+
+
+def test_add_evicts_unverified_before_verified():
+    # Human-verified exemplars (corrections) must survive the per-bucket cap even
+    # when a higher-legibility UNVERIFIED auto-deposit arrives.
+    g = AppearanceGallery(dedup_sim=0.999, max_exemplars=2)
+    # two verified exemplars with LOW legibility (distinct viewpoints so dedup keeps both)
+    g.add("9", "red", _unit(1, 0, 0), legibility=0.1, verified=True)
+    g.add("9", "red", _unit(0, 1, 0), legibility=0.1, verified=True)
+    # a third, UNVERIFIED but HIGH legibility -> exceeds cap, must be the one evicted
+    g.add("9", "red", _unit(0, 0, 1), legibility=0.99, verified=False)
+    assert g.exemplar_count("9", "red") == 2
+    rows = [r for r in g.serialize() if r["team"] == "9" and r["alliance_color"] == "red"]
+    assert len(rows) == 2
+    # both survivors are the verified ones; the unverified high-legibility was evicted
+    assert sum(1 for r in rows if r["verified"]) == 2
+    assert all(r["verified"] for r in rows)
+
+
+def test_from_rows_recap_keeps_verified():
+    # Append-only DB can deliver an oversized bucket. The re-cap must keep verified
+    # exemplars (corrections) even if their legibility is lower than unverified rows.
+    rows = []
+    # 2 verified, LOW legibility
+    for i, leg in enumerate([0.1, 0.2]):
+        rows.append({"team": "1787", "alliance_color": "blue",
+                     "embedding": _unit(1, i * 0.3, 0).tobytes(),
+                     "legibility": leg, "verified": True})
+    # 3 unverified, HIGH legibility
+    for i, leg in enumerate([0.8, 0.9, 0.95]):
+        rows.append({"team": "1787", "alliance_color": "blue",
+                     "embedding": _unit(0, 1, i * 0.3).tobytes(),
+                     "legibility": leg, "verified": False})
+    g = AppearanceGallery.from_rows(rows, max_exemplars=3)
+    assert g.exemplar_count("1787", "blue") == 3
+    kept = [r for r in g.serialize()
+            if r["team"] == "1787" and r["alliance_color"] == "blue"]
+    # both verified inputs survived (2 <= max_exemplars=3)
+    assert sum(1 for r in kept if r["verified"]) == 2

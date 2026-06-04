@@ -140,22 +140,98 @@ class VisionScorer {
             const data = await resp.json();
             const ex = data.exemplars || [];
             if (ex.length === 0) { grid.innerHTML = '<p class="empty-state">No exemplars</p>'; return; }
-            grid.innerHTML = ex.map(e => `
-                <div class="review-robot" data-id="${e.id}">
-                    <div class="review-imgs">${e.image ? `<img class="review-crop" src="${this.escapeHtml(e.image)}">` : '<span class="empty-state">no image</span>'}</div>
-                    <div class="review-meta">
-                        <input class="g-team" type="text" value="${this.escapeHtml(e.team || '')}">
-                        <select class="g-color"><option value="blue"${e.alliance_color==='blue'?' selected':''}>blue</option><option value="red"${e.alliance_color==='red'?' selected':''}>red</option></select>
-                        <label><input type="checkbox" class="g-verified"${e.verified?' checked':''}> verified</label>
-                        <button class="g-save" data-id="${e.id}">Save</button>
-                        <button class="g-del" data-id="${e.id}">Delete</button>
-                    </div>
-                </div>`).join('');
+
+            // Group exemplars by team number so the manager reads as "this team's
+            // appearances", and sort numerically (blank/unknown team last).
+            const groups = new Map();
+            for (const e of ex) {
+                const t = (e.team || '').trim() || '—';
+                if (!groups.has(t)) groups.set(t, []);
+                groups.get(t).push(e);
+            }
+            const teams = [...groups.keys()].sort((a, b) => {
+                if (a === '—') return 1;
+                if (b === '—') return -1;
+                return (parseInt(a, 10) || 1e9) - (parseInt(b, 10) || 1e9);
+            });
+
+            // One collapsible accordion row per team — scales to the 30-75 teams
+            // an event accumulates. Rows are collapsed by default; expand to edit.
+            const rows = teams.map(team => {
+                const items = groups.get(team);
+                const color = items[0].alliance_color;
+                const verified = items.filter(e => e.verified).length;
+                const thumb = (items.find(e => e.image) || {}).image;
+                const cards = items.map(e => `
+                    <div class="review-robot" data-id="${e.id}">
+                        <div class="review-imgs">${e.image ? `<img class="review-crop" src="${this.escapeHtml(e.image)}">` : '<span class="empty-state">no image</span>'}</div>
+                        <div class="review-meta">
+                            ${this.galleryTeamField(e)}
+                            <select class="g-color"><option value="blue"${e.alliance_color==='blue'?' selected':''}>blue</option><option value="red"${e.alliance_color==='red'?' selected':''}>red</option></select>
+                            <label class="g-verify-label"><input type="checkbox" class="g-verified"${e.verified?' checked':''}> verified</label>
+                            <div class="g-actions">
+                                <button class="g-save" data-id="${e.id}">Save</button>
+                                <button class="g-del" data-id="${e.id}" title="Delete exemplar">✕</button>
+                            </div>
+                        </div>
+                    </div>`).join('');
+                return `
+                    <section class="gallery-group team-${this.escapeHtml(color || 'unknown')}" data-team="${this.escapeHtml(team)}">
+                        <button class="gallery-group-head" type="button" aria-expanded="false">
+                            <span class="gallery-chevron">▸</span>
+                            ${thumb ? `<img class="gallery-head-thumb" src="${this.escapeHtml(thumb)}">` : '<span class="gallery-head-thumb gallery-head-thumb--empty"></span>'}
+                            <span class="gallery-team-num">${this.escapeHtml(team)}</span>
+                            <span class="gallery-team-count" data-count><span class="gallery-count-n">${items.length}</span> exemplar${items.length === 1 ? '' : 's'}${verified ? ` · ${verified} verified` : ''}</span>
+                        </button>
+                        <div class="review-grid gallery-body" hidden>${cards}</div>
+                    </section>`;
+            }).join('');
+            grid.innerHTML = `
+                <div class="gallery-toolbar">
+                    <button class="btn-small" id="galleryExpandAll">Expand all</button>
+                    <button class="btn-small" id="galleryCollapseAll">Collapse all</button>
+                    <span class="gallery-toolbar-count">${teams.length} team${teams.length === 1 ? '' : 's'}</span>
+                </div>
+                ${rows}`;
+
+            grid.querySelectorAll('.gallery-group-head').forEach(h => h.addEventListener('click', () => this.toggleGalleryGroup(h)));
+            grid.querySelector('#galleryExpandAll').addEventListener('click', () => this.setAllGalleryGroups(true));
+            grid.querySelector('#galleryCollapseAll').addEventListener('click', () => this.setAllGalleryGroups(false));
             grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
             grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
         } catch (e) {
             grid.innerHTML = '<p class="empty-state">Failed to load gallery</p>';
         }
+    }
+
+    toggleGalleryGroup(head, force) {
+        const section = head.closest('.gallery-group');
+        const body = section.querySelector('.gallery-body');
+        const open = force === undefined ? body.hidden : force;
+        body.hidden = !open;
+        section.classList.toggle('open', open);
+        head.setAttribute('aria-expanded', String(open));
+    }
+
+    setAllGalleryGroups(open) {
+        document.querySelectorAll('#galleryGrid .gallery-group-head')
+            .forEach(h => this.toggleGalleryGroup(h, open));
+    }
+
+    // Team field: a dropdown of the 6 robots from the match this exemplar was
+    // pulled from. Falls back to a free text input for legacy exemplars that
+    // predate source-match tracking (no roster available).
+    galleryTeamField(e) {
+        const roster = (e.match_teams || []).map(String);
+        if (roster.length === 0) {
+            return `<input class="g-team" type="text" value="${this.escapeHtml(e.team || '')}">`;
+        }
+        const opts = roster.slice();
+        const cur = String(e.team || '');
+        if (cur && !opts.includes(cur)) opts.unshift(cur);  // never lose the current label
+        return `<select class="g-team">${opts.map(t =>
+            `<option value="${this.escapeHtml(t)}"${t === cur ? ' selected' : ''}>${this.escapeHtml(t)}</option>`
+        ).join('')}</select>`;
     }
 
     async saveGalleryExemplar(btn) {
@@ -173,10 +249,24 @@ class VisionScorer {
     }
 
     async deleteGalleryExemplar(btn) {
-        if (!confirm('Delete this exemplar? This cannot be undone.')) return;
+        // No confirmation: exemplars are expected to be pruned frequently, and a
+        // re-run of the match regenerates them. Optimistically drop the card so
+        // bulk cleanup feels instant, then sync with the server.
         const id = Number(btn.dataset.id);
+        const card = btn.closest('.review-robot');
+        const section = btn.closest('.gallery-group');
+        if (card) card.remove();
+        // Keep the accordion header count honest; drop the team row if now empty.
+        if (section) {
+            const remaining = section.querySelectorAll('.review-robot').length;
+            if (remaining === 0) {
+                section.remove();
+            } else {
+                const n = section.querySelector('.gallery-count-n');
+                if (n) n.textContent = remaining;
+            }
+        }
         await fetch(`/api/gallery/${id}`, { method: 'DELETE' });
-        await this.loadGallery();
     }
 
     // --- Event Loading ---

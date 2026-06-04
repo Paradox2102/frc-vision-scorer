@@ -39,7 +39,7 @@ import supervision as sv
 # do under pytest (which runs from the root). Harmless when already present.
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from web.embedder import RobotEmbedder, cosine_similarity
+from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
 from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
@@ -360,6 +360,9 @@ class RobotTrack:
     # Appearance embedding for re-ID (DINOv2, EMA-updated)
     appearance_embedding: Optional[np.ndarray] = None
     appearance_votes: Optional[Dict[str, float]] = None  # team_number -> vote score
+    # Latest masked whole-robot crop (base64 JPEG) — the image behind the
+    # appearance signature, shown in the gallery / replay-review UI.
+    appearance_crop_b64: Optional[str] = None
     # Diagnostic / embedding-freshness state. Set when a re-ID match resolves
     # to this canonical; read by _emit_diagnostic_snapshot. None sentinels are
     # load-bearing — frame 0 is a real, valid frame number, so we cannot use 0
@@ -727,6 +730,31 @@ class InferenceJob:
         crop_b64 = base64.b64encode(buf).decode('utf-8')
         return crop_b64, score
 
+    def _masked_robot_crop_b64(self, frame: np.ndarray, box, mask=None):
+        """Crop the whole SAM2-detected robot (background blacked out via `mask`),
+        upscale, and JPEG/base64 encode it for the appearance gallery image.
+
+        This is the image *behind* the appearance signature — the same region
+        DINOv2 embeds — so the gallery shows the whole robot, not the bumper band.
+        Returns a base64 string, or None when the box is empty.
+        """
+        x1, y1, x2, y2 = map(int, box)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = _apply_mask(frame[y1:y2, x1:x2], mask)
+        if crop.size == 0:
+            return None
+        if crop.shape[0] < 192:
+            scale = max(2, int(np.ceil(192 / max(1, crop.shape[0]))))
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return None
+        return base64.b64encode(buf).decode('utf-8')
+
     def _detect_view(self, view, composite_frame, precomputed_dets=None):
         """Run YOLO + person detection on one camera view; returns
         (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
@@ -876,15 +904,20 @@ class InferenceJob:
         robot.team_number = None
         robot.team_number_confirmed = False
 
-    def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding):
-        """Keep the top-3 (by quality) bumper crops per slot for post-match review.
+    def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding, robot_crop_b64=None):
+        """Keep the top-3 (by quality) crops per slot for post-match review.
         Defensive copy: the live track's appearance_embedding is rebound by the EMA
-        each frame, so we snapshot a stable copy here to persist at finalize."""
+        each frame, so we snapshot a stable copy here to persist at finalize.
+
+        `crop_b64` is the bumper-band crop (legibility-ranked); `robot_crop_b64`
+        is the masked whole-robot image behind the embedding. The review UI / gallery
+        prefer the whole-robot image, so it matches the appearance signature."""
         if not crop_b64:
             return
         emb = None if embedding is None else np.array(embedding, dtype=np.float32, copy=True)
         bucket = self._slot_crops.setdefault(slot_id, [])
-        bucket.append({"quality": float(quality), "crop_b64": crop_b64, "embedding": emb})
+        bucket.append({"quality": float(quality), "crop_b64": crop_b64,
+                       "robot_crop_b64": robot_crop_b64, "embedding": emb})
         bucket.sort(key=lambda c: c["quality"], reverse=True)
         del bucket[3:]
 
@@ -908,6 +941,7 @@ class InferenceJob:
             "legibility": legibility,
             "image": image_bytes,
             "verified": 0,
+            "job_id": self.job_id,
         })
 
     def apply_gallery_matches(self, ocr_crops: list) -> None:
@@ -1032,7 +1066,8 @@ class InferenceJob:
                 continue
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
-            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding)
+            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding,
+                                    robot_crop_b64=robot.appearance_crop_b64)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
             status_results.append({
                 "slot": self._slot_label(slot_id),
@@ -1067,7 +1102,8 @@ class InferenceJob:
             )
             if (robot.team_number_confirmed and team == robot.team_number
                     and conf >= 0.85):
-                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
+                self._deposit_to_gallery(robot, legibility=conf,
+                                         image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             if not team:
                 continue
             if robot.team_ocr_votes is None:
@@ -1089,7 +1125,8 @@ class InferenceJob:
                     if event.robot_id == slot_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
-                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
+                self._deposit_to_gallery(robot, legibility=conf,
+                                         image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
@@ -2981,25 +3018,37 @@ class InferenceJob:
                             color = self.detect_bumper_color(view_frame, np.array([fx1, fy1, fx2, fy2]))
                             
                             det_embed = None
+                            robot_crop_b64 = None
                             if small_frame is not None:
                                 # small_frame is the full-crop at 0.5x; index it with the
                                 # offset-corrected box scaled back to 0.5x (== raw box when
                                 # no top-crop is configured).
+                                box_s = (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
+                                         fx2 * SAM2_SCALE, fy2 * SAM2_SCALE)
+                                # SAM2 mask is in raw 0.5x top-cropped coords (same space
+                                # as info["box"]); slice the box region out as a box-local
+                                # mask so the signature covers the robot, not the field.
+                                sub_mask = None
+                                mask2d = info.get("mask")
+                                if mask2d is not None:
+                                    sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
+                                    if sub_mask.size == 0:
+                                        sub_mask = None
                                 det_embed = self.robot_embedder.embed(
-                                    small_frame,
-                                    (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
-                                     fx2 * SAM2_SCALE, fy2 * SAM2_SCALE),
-                                )
-                                
+                                    small_frame, box_s, mask=sub_mask)
+                                robot_crop_b64 = self._masked_robot_crop_b64(
+                                    small_frame, box_s, sub_mask)
+
                             det = FieldDetection(
                                 pos=xy,
                                 color=color,
                                 box=(fx1, fy1, fx2, fy2),
                                 score=1.0,
                                 track_id=obj_id,
-                                embedding=det_embed
+                                embedding=det_embed,
+                                robot_crop_b64=robot_crop_b64,
                             )
-                            
+
                             cb = self._bumper_crop_b64(view_frame, det.box, enforce_floor=False)
                             crop_b64 = cb[0] if cb is not None else None
                             paired.append((det, crop_b64))
@@ -3051,11 +3100,28 @@ class InferenceJob:
                 # this the per-slot appearance_embedding stays None on the field path,
                 # so the appearance gallery never deposits or queries anything.
                 slot_to_embedding = {}
+                slot_to_robot_crop = {}  # slot -> latest masked whole-robot crop (main cam)
                 if self.use_sam2 and self.field_tracker is not None:
                     for tid, slot in self.field_tracker._id_to_slot.items():
                         emb = self.fused_registry.get_embedding(tid)
                         if emb is not None:
                             slot_to_embedding[slot] = emb
+                    # Mirror the main-camera robot crop behind that embedding so the
+                    # gallery / replay-review UI can show the whole robot.
+                    for obs in fused:
+                        if obs.track_id is None:
+                            continue
+                        slot = self.field_tracker._id_to_slot.get(obs.track_id)
+                        if slot is None:
+                            continue
+                        for cam, det_id in obs.members:
+                            if cam != "main":
+                                continue
+                            md = next((d for (d, _) in per_camera.get("main", [])
+                                       if d.track_id == det_id), None)
+                            if md is not None and md.robot_crop_b64:
+                                slot_to_robot_crop[slot] = md.robot_crop_b64
+                            break
 
                 tracked_robot_boxes = []  # (slot_id, box) for visible tracks
                 for t in track_outs:
@@ -3065,6 +3131,9 @@ class InferenceJob:
                     _emb = slot_to_embedding.get(t.slot_id)
                     if _emb is not None:
                         robot.appearance_embedding = _emb
+                    _crop = slot_to_robot_crop.get(t.slot_id)
+                    if _crop:
+                        robot.appearance_crop_b64 = _crop
                     if t.state == "visible" and t.box is not None:
                         cx = (t.box[0] + t.box[2]) / 2.0
                         cy = (t.box[1] + t.box[3]) / 2.0
@@ -3511,7 +3580,7 @@ class InferenceJob:
                             "legibility": c["quality"],
                             "embedding": (None if c["embedding"] is None
                                           else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
-                            "image": _thumbnail_bytes(c["crop_b64"]),
+                            "image": _thumbnail_bytes(c.get("robot_crop_b64") or c["crop_b64"]),
                         })
             except Exception as e:
                 print(f"  Match-identity capture failed ({e})")
@@ -5427,7 +5496,7 @@ async def correct_replay_identity(job_id: str, request: Request):
                 await database.insert_gallery_exemplar({
                     "event_key": event_key, "team": team, "alliance_color": color,
                     "embedding": c["embedding"], "legibility": c["legibility"],
-                    "image": c["image"], "verified": 1})
+                    "image": c["image"], "verified": 1, "job_id": job_id})
                 minted += 1
     return {"status": "ok", "slot": slot, "team_number": team,
             "verified_exemplars": minted}
@@ -5438,11 +5507,27 @@ async def list_gallery(event_key: str):
     """List appearance-gallery exemplars for an event. Returns thumbnails as
     data-URLs; never serializes the raw embedding bytes."""
     rows = await database.get_gallery_exemplars(event_key)
+    # Build a job_id -> roster ([blue+red team numbers]) map once, so each
+    # exemplar can offer the 6 robots from the match it was pulled from.
+    roster_by_job: dict[str, list] = {}
+    for job_id in {r.get("job_id") for r in rows if r.get("job_id")}:
+        replay = await database.get_replay(job_id)
+        if not replay:
+            continue
+        teams = []
+        for key in ("blue_teams", "red_teams"):
+            try:
+                teams.extend(str(t) for t in json.loads(replay.get(key) or "[]"))
+            except (ValueError, TypeError):
+                pass
+        roster_by_job[job_id] = teams
     out = []
     for r in rows:
         out.append({
             "id": r["id"], "team": r["team"], "alliance_color": r["alliance_color"],
             "verified": bool(r["verified"]), "legibility": r["legibility"],
+            "job_id": r.get("job_id"),
+            "match_teams": roster_by_job.get(r.get("job_id"), []),
             "image": ("data:image/jpeg;base64," + base64.b64encode(r["image"]).decode())
                       if r.get("image") else None,
         })

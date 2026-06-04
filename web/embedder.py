@@ -30,15 +30,43 @@ def cosine_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float
     return float(np.dot(a, b) / (na * nb))
 
 
-def _inset_box(box, w: int, h: int):
+def _clamp_box(box, w: int, h: int):
+    """Clamp a box to the frame. Returns None if it's below MIN_CROP_PX."""
     x1, y1, x2, y2 = map(int, box)
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
-    bw, bh = x2 - x1, y2 - y1
-    if bw < MIN_CROP_PX or bh < MIN_CROP_PX:
+    if x2 - x1 < MIN_CROP_PX or y2 - y1 < MIN_CROP_PX:
         return None
+    return x1, y1, x2, y2
+
+
+def _inset_box(box, w: int, h: int):
+    clamped = _clamp_box(box, w, h)
+    if clamped is None:
+        return None
+    x1, y1, x2, y2 = clamped
+    bw, bh = x2 - x1, y2 - y1
     dx, dy = int(bw * BOX_INSET), int(bh * BOX_INSET)
     return x1 + dx, y1 + dy, x2 - dx, y2 - dy
+
+
+def _apply_mask(crop_bgr: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """Black out pixels outside `mask` (the SAM2 robot segmentation).
+
+    `mask` is box-local (covers the same region as the crop) but may be at a
+    different resolution; it's nearest-resized to the crop. Returns `crop_bgr`
+    unchanged (same object) when `mask` is None so the no-mask path is free.
+    """
+    if mask is None:
+        return crop_bgr
+    ch, cw = crop_bgr.shape[:2]
+    m = mask
+    if m.shape[:2] != (ch, cw):
+        m = cv2.resize(m.astype(np.uint8), (cw, ch),
+                       interpolation=cv2.INTER_NEAREST).astype(bool)
+    out = crop_bgr.copy()
+    out[~m] = 0
+    return out
 
 
 class RobotEmbedder:
@@ -75,18 +103,32 @@ class RobotEmbedder:
             self._load_failed = True
             return False
 
-    def embed(self, frame: np.ndarray, box) -> Optional[np.ndarray]:
-        """Return an L2-normalized embedding for the crop, or None if invalid/unavailable."""
-        return self.embed_batch(frame, [box])[0]
+    def embed(self, frame: np.ndarray, box, mask: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """Return an L2-normalized embedding for the crop, or None if invalid/unavailable.
 
-    def embed_batch(self, frame: np.ndarray, boxes) -> list[Optional[np.ndarray]]:
+        When `mask` (a box-local SAM2 segmentation) is given, background pixels
+        are blacked out so the signature describes the robot, not the field.
+        """
+        return self.embed_batch(frame, [box], masks=[mask])[0]
+
+    def embed_batch(self, frame: np.ndarray, boxes, masks=None) -> list[Optional[np.ndarray]]:
         """Embed multiple crops from one frame in a single forward pass.
 
         Returns a list aligned with `boxes`; entries are None for invalid crops.
+        `masks`, when provided, is aligned with `boxes`; each entry is either a
+        box-local boolean SAM2 mask or None. Masked crops skip the background
+        inset (the mask already sheds background); unmasked crops keep the inset.
         """
         h, w = frame.shape[:2]
-        insets = [_inset_box(b, w, h) for b in boxes]
-        valid_idx = [i for i, b in enumerate(insets) if b is not None]
+        if masks is None:
+            masks = [None] * len(boxes)
+        # Masked crops use the full clamped box (the mask removes background);
+        # unmasked crops inset to shed background heuristically.
+        crop_boxes = [
+            _clamp_box(b, w, h) if m is not None else _inset_box(b, w, h)
+            for b, m in zip(boxes, masks)
+        ]
+        valid_idx = [i for i, b in enumerate(crop_boxes) if b is not None]
         out: list[Optional[np.ndarray]] = [None] * len(boxes)
         if not valid_idx:
             return out
@@ -96,8 +138,8 @@ class RobotEmbedder:
         torch = self._torch  # cached during _ensure_model()
         crops = []
         for i in valid_idx:
-            x1, y1, x2, y2 = insets[i]
-            crop_bgr = frame[y1:y2, x1:x2]
+            x1, y1, x2, y2 = crop_boxes[i]
+            crop_bgr = _apply_mask(frame[y1:y2, x1:x2], masks[i])
             crops.append(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
 
         inputs = self._processor(images=crops, return_tensors="pt").to(self._device)

@@ -46,6 +46,33 @@ def test_list_gallery_groups_and_images(client):
     assert "embedding" not in r.text
 
 
+def test_list_gallery_attaches_source_match_roster(client):
+    # Each exemplar carries the 6-team roster of the match it was pulled from,
+    # so the UI can offer that match as a relabel dropdown.
+    c, _ = client
+    asyncio.run(database.insert_replay({
+        "id": "job-xyz", "event_key": "2026x",
+        "blue_teams": '["1787", "254", "118"]',
+        "red_teams": '["973", "1678", "2056"]',
+    }))
+    asyncio.run(database.insert_gallery_exemplar({
+        "event_key": "2026x", "team": "1787", "alliance_color": "blue",
+        "embedding": np.array([1, 0, 0], np.float32).tobytes(),
+        "legibility": 0.7, "image": b"img1", "verified": 0, "job_id": "job-xyz",
+    }))
+    # An exemplar with no source match -> empty roster, no crash.
+    asyncio.run(database.insert_gallery_exemplar({
+        "event_key": "2026x", "team": "9999", "alliance_color": "red",
+        "embedding": np.array([0, 1, 0], np.float32).tobytes(),
+        "legibility": 0.5, "image": b"img2", "verified": 0,
+    }))
+    body = c.get("/api/gallery?event_key=2026x").json()
+    by_team = {e["team"]: e for e in body["exemplars"]}
+    assert sorted(by_team["1787"]["match_teams"]) == sorted(
+        ["1787", "254", "118", "973", "1678", "2056"])
+    assert by_team["9999"]["match_teams"] == []
+
+
 def test_update_gallery_relabel_and_verify(client):
     c, _ = client
     _seed()

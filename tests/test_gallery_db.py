@@ -42,3 +42,24 @@ def test_insert_and_fetch_gallery_exemplars_by_event(db):
 
 def test_get_gallery_exemplars_empty_for_unknown_event(db):
     assert asyncio.run(db.get_gallery_exemplars("nope")) == []
+
+
+def test_gallery_exemplar_records_source_job_id(db):
+    # The source match (job_id) is persisted so the UI can offer that match's
+    # roster as the relabel dropdown.
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026wamon", "team": "1787", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9, "job_id": "job-abc",
+    }))
+    rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
+    assert rows[0]["job_id"] == "job-abc"
+
+
+def test_gallery_exemplar_job_id_optional(db):
+    # Older deposits without a job_id still insert and read back as None.
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026wamon", "team": "254", "alliance_color": "red",
+        "embedding": _emb_bytes(0, 1, 0), "legibility": 0.8,
+    }))
+    rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
+    assert rows[0]["job_id"] is None

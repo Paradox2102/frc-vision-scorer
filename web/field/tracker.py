@@ -23,6 +23,8 @@ class FieldDetection:
     score: float = 1.0
     track_id: int | None = None
     embedding: Optional[np.ndarray] = None
+    # Masked whole-robot crop (base64 JPEG) behind `embedding`, for the gallery UI.
+    robot_crop_b64: Optional[str] = None
 
 
 @dataclass

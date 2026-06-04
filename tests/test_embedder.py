@@ -1,9 +1,43 @@
 import numpy as np
 import pytest
 
-from web.embedder import RobotEmbedder, cosine_similarity
+from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask, _clamp_box
 
 EMBED_DIM = 384
+
+
+def test_apply_mask_zeros_background():
+    crop = np.full((10, 10, 3), 255, np.uint8)
+    mask = np.zeros((10, 10), bool)
+    mask[2:8, 2:8] = True
+    out = _apply_mask(crop, mask)
+    assert (out[mask] == 255).all()       # robot pixels kept
+    assert (out[~mask] == 0).all()        # background blacked out
+    assert crop[0, 0, 0] == 255           # original untouched (copy made)
+
+
+def test_apply_mask_resizes_to_crop():
+    crop = np.full((20, 20, 3), 200, np.uint8)
+    mask = np.ones((5, 5), bool)          # smaller than crop -> resized up
+    out = _apply_mask(crop, mask)
+    assert out.shape == crop.shape
+    assert (out == 200).all()             # all-true mask keeps everything
+
+
+def test_apply_mask_none_is_passthrough():
+    crop = np.full((4, 4, 3), 7, np.uint8)
+    assert _apply_mask(crop, None) is crop
+
+
+def test_clamp_box_rejects_tiny():
+    assert _clamp_box((0, 0, 3, 3), 100, 100) is None
+    assert _clamp_box((0, 0, 50, 50), 100, 100) == (0, 0, 50, 50)
+
+
+def test_embed_with_mask_returns_none_for_tiny_box(sample_frame):
+    emb = RobotEmbedder()
+    m = np.ones((3, 3), bool)
+    assert emb.embed(sample_frame, (0, 0, 3, 3), mask=m) is None  # no model load
 
 
 def test_cosine_identical_vectors_is_one():
@@ -59,3 +93,21 @@ def test_embed_batch_matches_embed(sample_frame):
     assert len(batched) == 2
     single = emb.embed(sample_frame, boxes[0])
     assert cosine_similarity(batched[0], single) == pytest.approx(1.0, abs=1e-3)
+
+
+@pytest.mark.model
+def test_masked_embedding_differs_from_unmasked(sample_frame):
+    # Masking out half the box must change the appearance signature: the
+    # background pixels it removes genuinely affect DINOv2's CLS token.
+    emb = RobotEmbedder()
+    h, w = sample_frame.shape[:2]
+    box = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    mask = np.zeros((bh, bw), bool)
+    mask[: bh // 2, :] = True            # keep only the top half
+    plain = emb.embed(sample_frame, box)
+    masked = emb.embed(sample_frame, box, mask=mask)
+    assert masked is not None
+    assert masked.shape == (EMBED_DIM,)
+    assert np.linalg.norm(masked) == pytest.approx(1.0, abs=1e-4)
+    assert cosine_similarity(plain, masked) < 0.999

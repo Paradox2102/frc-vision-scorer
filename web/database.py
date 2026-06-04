@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS appearance_gallery (
     legibility REAL,
     image BLOB,
     verified INTEGER DEFAULT 0,
+    job_id TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_gallery_event ON appearance_gallery(event_key, alliance_color);
@@ -145,7 +146,7 @@ async def init_db():
             except Exception:
                 pass  # column already exists
         # Lightweight migrations: add columns to a pre-existing appearance_gallery table.
-        for col_def in ("image BLOB", "verified INTEGER DEFAULT 0"):
+        for col_def in ("image BLOB", "verified INTEGER DEFAULT 0", "job_id TEXT"):
             try:
                 await db.execute(f"ALTER TABLE appearance_gallery ADD COLUMN {col_def}")
             except Exception:
@@ -560,11 +561,11 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO appearance_gallery "
-            "(event_key, team, alliance_color, embedding, legibility, image, verified) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(event_key, team, alliance_color, embedding, legibility, image, verified, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (row["event_key"], row["team"], row["alliance_color"],
              row["embedding"], row.get("legibility"), row.get("image"),
-             int(row.get("verified", 0))))
+             int(row.get("verified", 0)), row.get("job_id")))
         await db.commit()
 
 
@@ -573,7 +574,7 @@ async def get_gallery_exemplars(event_key: str) -> List[Dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, team, alliance_color, embedding, legibility, image, verified "
+            "SELECT id, team, alliance_color, embedding, legibility, image, verified, job_id "
             "FROM appearance_gallery WHERE event_key = ? ORDER BY id", (event_key,))
         return [dict(r) for r in await cursor.fetchall()]
 

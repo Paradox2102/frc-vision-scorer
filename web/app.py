@@ -5368,6 +5368,73 @@ async def get_replay_endpoint(replay_id: str):
     return JSONResponse(content=json.loads(meta_path.read_text()))
 
 
+@app.get("/api/replays/{job_id}/identities")
+async def get_replay_identities(job_id: str):
+    """Robot-slot identities for a job, each with its captured bumper crops as
+    data-URLs. Raw embeddings are NEVER exposed to the client."""
+    ids = await database.get_match_identities(job_id)
+    out = []
+    for r in ids:
+        crops = await database.get_match_crops(job_id, r["slot"])
+        out.append({
+            "slot": r["slot"], "slot_label": r["slot_label"], "alliance": r["alliance"],
+            "team_number": r["team_number"], "confirmed": bool(r["confirmed"]),
+            "source": r["source"], "confidence": r["confidence"],
+            "crops": [
+                "data:image/jpeg;base64," + base64.b64encode(c["image"]).decode()
+                for c in crops if c["image"] is not None
+            ],
+        })
+    return {"job_id": job_id, "robots": out}
+
+
+@app.post("/api/replays/{job_id}/correct")
+async def correct_replay_identity(job_id: str, request: Request):
+    """Correct one robot slot's team. Updates the stored identity, fixes the
+    replay's displayed team list, and mints VERIFIED gallery exemplars from the
+    slot's crops (only when the replay has an event_key)."""
+    body = await request.json()
+    slot = int(body["slot"])
+    team = str(body["team_number"]).strip()
+    ids = {r["slot"]: r for r in await database.get_match_identities(job_id)}
+    rec = ids.get(slot)
+    if rec is None:
+        return JSONResponse(status_code=404, content={"error": "slot not found"})
+    alliance = rec["alliance"]
+    # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence)
+    await database.upsert_match_robot_identity(
+        {**rec, "job_id": job_id, "slot": slot, "team_number": team})
+    # 2. update the replay's team lists for display + mint exemplars
+    replay = await database.get_replay(job_id)
+    minted = 0
+    if replay is not None:
+        key = "blue_teams" if alliance == "blue" else "red_teams"
+        try:
+            teams = json.loads(replay.get(key) or "[]")
+        except Exception:
+            teams = []
+        # replace this slot's old team with the corrected one (best-effort positional)
+        old = rec["team_number"]
+        teams = [team if str(t) == str(old) else t for t in teams]
+        if team not in [str(t) for t in teams]:
+            teams.append(team)
+        await database.update_replay_teams(job_id, key, json.dumps(teams))
+        # 3. mint verified exemplars from this slot's crops (needs event_key + color)
+        event_key = replay.get("event_key")
+        color = alliance if alliance in ("red", "blue") else None
+        if event_key and color:
+            for c in await database.get_match_crops(job_id, slot):
+                if c["embedding"] is None:
+                    continue
+                await database.insert_gallery_exemplar({
+                    "event_key": event_key, "team": team, "alliance_color": color,
+                    "embedding": c["embedding"], "legibility": c["legibility"],
+                    "image": c["image"], "verified": 1})
+                minted += 1
+    return {"status": "ok", "slot": slot, "team_number": team,
+            "verified_exemplars": minted}
+
+
 @app.delete("/api/replays/{replay_id}")
 async def delete_replay_endpoint(replay_id: str):
     row = await database.get_replay(replay_id)

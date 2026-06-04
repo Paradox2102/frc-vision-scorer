@@ -541,6 +541,15 @@ async def delete_replay(replay_id: str) -> None:
         await db.commit()
 
 
+async def update_replay_teams(replay_id: str, key: str, value: str) -> None:
+    """Update one alliance's team list (JSON string) on a replay row."""
+    assert key in ("blue_teams", "red_teams")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE replays SET {key} = ? WHERE id = ?", (value, replay_id))
+        await db.commit()
+
+
 # --- Appearance gallery ---
 
 async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:

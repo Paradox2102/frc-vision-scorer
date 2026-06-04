@@ -47,8 +47,12 @@ class AppearanceGallery:
                 return False  # too similar to an existing viewpoint
         bucket.append(_Exemplar(emb, legibility, verified))
         if len(bucket) > self.max_exemplars:
-            # evict the lowest-legibility exemplar
-            worst = min(range(len(bucket)), key=lambda i: bucket[i].legibility)
+            # Evict the least valuable exemplar: prefer to drop UNVERIFIED ones, and
+            # among equal verified-status the lowest legibility. This protects
+            # human-verified exemplars (corrections) from being capped out by
+            # higher-confidence auto-deposits.
+            worst = min(range(len(bucket)),
+                        key=lambda i: (bucket[i].verified, bucket[i].legibility))
             bucket.pop(worst)
         return True
 
@@ -112,7 +116,9 @@ class AppearanceGallery:
         # loaded sets stay bounded (memory + per-query cost).
         for key, bucket in g._sets.items():
             if len(bucket) > max_exemplars:
-                bucket.sort(key=lambda ex: ex.legibility, reverse=True)
+                # Keep verified exemplars first, then highest legibility, so human
+                # corrections survive the cap when a bucket exceeds max_exemplars.
+                bucket.sort(key=lambda ex: (ex.verified, ex.legibility), reverse=True)
                 g._sets[key] = bucket[:max_exemplars]
         return g
 

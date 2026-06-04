@@ -878,7 +878,8 @@ class InferenceJob:
 
     def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding):
         """Keep the top-3 (by quality) bumper crops per slot for post-match review.
-        Stores a COPY of the embedding (field-path embeddings are EMA-updated in place)."""
+        Defensive copy: the live track's appearance_embedding is rebound by the EMA
+        each frame, so we snapshot a stable copy here to persist at finalize."""
         if not crop_b64:
             return
         emb = None if embedding is None else np.array(embedding, dtype=np.float32, copy=True)

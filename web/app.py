@@ -5435,6 +5435,39 @@ async def correct_replay_identity(job_id: str, request: Request):
             "verified_exemplars": minted}
 
 
+@app.get("/api/gallery")
+async def list_gallery(event_key: str):
+    """List appearance-gallery exemplars for an event. Returns thumbnails as
+    data-URLs; never serializes the raw embedding bytes."""
+    rows = await database.get_gallery_exemplars(event_key)
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "team": r["team"], "alliance_color": r["alliance_color"],
+            "verified": bool(r["verified"]), "legibility": r["legibility"],
+            "image": ("data:image/jpeg;base64," + base64.b64encode(r["image"]).decode())
+                      if r.get("image") else None,
+        })
+    return {"event_key": event_key, "exemplars": out}
+
+
+@app.post("/api/gallery/{gid}")
+async def update_gallery(gid: int, request: Request):
+    """Relabel team/alliance_color or toggle verified on one gallery exemplar."""
+    body = await request.json()
+    await database.update_gallery_exemplar(
+        gid, team=body.get("team"), alliance_color=body.get("alliance_color"),
+        verified=body.get("verified"))
+    return {"status": "ok", "id": gid}
+
+
+@app.delete("/api/gallery/{gid}")
+async def remove_gallery(gid: int):
+    """Delete one gallery exemplar."""
+    await database.delete_gallery_exemplar(gid)
+    return {"status": "deleted", "id": gid}
+
+
 @app.delete("/api/replays/{replay_id}")
 async def delete_replay_endpoint(replay_id: str):
     row = await database.get_replay(replay_id)

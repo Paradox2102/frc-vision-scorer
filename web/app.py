@@ -4539,8 +4539,6 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     for idx, crop_b64 in enumerate(robot_crops_b64):
         try:
             # Decode base64 to PIL Image
-            import io
-            from PIL import Image
             img_bytes = base64.b64decode(crop_b64)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 

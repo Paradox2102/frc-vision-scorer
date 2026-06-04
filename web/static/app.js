@@ -1675,6 +1675,7 @@ class VisionScorer {
 
     async loadReplayIdentities(id) {
         this._replayId = id;
+        const replayId = id;
         const card = document.getElementById('replayReviewCard');
         const grid = document.getElementById('replayReviewGrid');
         if (!card || !grid) return;
@@ -1702,7 +1703,7 @@ class VisionScorer {
                 </div>`;
             }).join('');
             grid.querySelectorAll('.review-save').forEach(btn => {
-                btn.addEventListener('click', () => this.saveIdentityCorrection(btn));
+                btn.addEventListener('click', () => this.saveIdentityCorrection(btn, replayId));
             });
             card.style.display = 'block';
         } catch (e) {
@@ -1710,20 +1711,20 @@ class VisionScorer {
         }
     }
 
-    async saveIdentityCorrection(btn) {
+    async saveIdentityCorrection(btn, replayId) {
         const wrap = btn.closest('.review-robot');
         const slot = Number(btn.dataset.slot);
         const team = wrap.querySelector('.review-team').value.trim();
         const status = wrap.querySelector('.review-status');
         status.textContent = '…';
         try {
-            const resp = await fetch(`/api/replays/${this._replayId}/correct`, {
+            const resp = await fetch(`/api/replays/${replayId}/correct`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ slot, team_number: team }),
             });
-            const data = await resp.json();
+            const data = await resp.json().catch(() => ({}));
             status.textContent = resp.ok
-                ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || 'error'}`;
+                ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || ('HTTP ' + resp.status)}`;
         } catch (e) {
             status.textContent = '✗ ' + e.message;
         }

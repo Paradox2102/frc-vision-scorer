@@ -59,6 +59,48 @@ def test_update_gallery_relabel_and_verify(client):
     assert row["verified"] == 1
 
 
+def test_update_gallery_coerces_nonbool_verified(client):
+    # A non-bool 'verified' value must not 500 (int("yes") would raise);
+    # bool("yes") is True -> stored as 1.
+    c, _ = client
+    _seed()
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    gid = [e for e in rows if e["team"] == "1787"][0]["id"]
+    r = c.post(f"/api/gallery/{gid}", json={"verified": "yes"})
+    assert r.status_code == 200, r.text
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    row = [e for e in rows if e["id"] == gid][0]
+    assert row["verified"] == 1
+
+
+def test_update_gallery_rejects_bad_alliance_color(client):
+    # An invalid alliance_color must 400 and leave the row untouched.
+    c, _ = client
+    _seed()
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    gid = [e for e in rows if e["team"] == "1787"][0]["id"]
+    r = c.post(f"/api/gallery/{gid}", json={"alliance_color": "green"})
+    assert r.status_code == 400, r.text
+    assert "alliance_color" in r.json()["error"]
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    row = [e for e in rows if e["id"] == gid][0]
+    assert row["alliance_color"] == "blue"
+
+
+def test_update_gallery_empty_body_is_noop(client):
+    c, _ = client
+    _seed()
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    gid = [e for e in rows if e["team"] == "1787"][0]["id"]
+    r = c.post(f"/api/gallery/{gid}", json={})
+    assert r.status_code == 200, r.text
+    rows = asyncio.run(database.get_gallery_exemplars("2026x"))
+    row = [e for e in rows if e["id"] == gid][0]
+    assert row["team"] == "1787"
+    assert row["alliance_color"] == "blue"
+    assert row["verified"] == 0
+
+
 def test_delete_gallery_exemplar(client):
     c, _ = client
     _seed()

@@ -5455,9 +5455,18 @@ async def list_gallery(event_key: str):
 async def update_gallery(gid: int, request: Request):
     """Relabel team/alliance_color or toggle verified on one gallery exemplar."""
     body = await request.json()
+    color = body.get("alliance_color")
+    if color is not None and color not in ("red", "blue"):
+        return JSONResponse(status_code=400,
+                            content={"error": "alliance_color must be 'red' or 'blue'"})
+    team = body.get("team")
+    if team is not None:
+        team = str(team).strip()
+    verified = body.get("verified")
+    if verified is not None:
+        verified = bool(verified)
     await database.update_gallery_exemplar(
-        gid, team=body.get("team"), alliance_color=body.get("alliance_color"),
-        verified=body.get("verified"))
+        gid, team=team, alliance_color=color, verified=verified)
     return {"status": "ok", "id": gid}
 
 

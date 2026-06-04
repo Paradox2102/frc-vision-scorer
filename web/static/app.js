@@ -1645,6 +1645,8 @@ class VisionScorer {
 
             // Prime the displays from frame 0
             this.renderReplayFrame(0);
+
+            this.loadReplayIdentities(id);
         } catch (err) {
             labelEl.textContent = `Error: ${err.message}`;
         }
@@ -1669,6 +1671,62 @@ class VisionScorer {
         let idx = Math.round(this.replayVideo.currentTime * fps);
         idx = Math.max(0, Math.min(frames.length - 1, idx));
         this.renderReplayFrame(idx);
+    }
+
+    async loadReplayIdentities(id) {
+        this._replayId = id;
+        const card = document.getElementById('replayReviewCard');
+        const grid = document.getElementById('replayReviewGrid');
+        if (!card || !grid) return;
+        try {
+            const resp = await fetch(`/api/replays/${id}/identities`);
+            if (!resp.ok) { card.style.display = 'none'; return; }
+            const data = await resp.json();
+            const robots = data.robots || [];
+            if (robots.length === 0) { card.style.display = 'none'; return; }
+            grid.innerHTML = robots.map(r => {
+                const imgs = (r.crops || []).map(src =>
+                    `<img class="review-crop" src="${src}" alt="${this.escapeHtml(r.slot_label || '')} crop">`).join('')
+                    || '<span class="empty-state">no image</span>';
+                const badge = r.source === 'gallery' ? '<span class="appearance-badge">appearance</span>' : '';
+                return `
+                <div class="review-robot" data-slot="${r.slot}">
+                    <div class="review-imgs">${imgs}</div>
+                    <div class="review-meta">
+                        <strong>${this.escapeHtml(r.slot_label || ('slot ' + r.slot))}</strong> ${badge}
+                        <input class="review-team" type="text" value="${this.escapeHtml(r.team_number || '')}"
+                               placeholder="team #">
+                        <button class="review-save" data-slot="${r.slot}">Save</button>
+                        <span class="review-status"></span>
+                    </div>
+                </div>`;
+            }).join('');
+            grid.querySelectorAll('.review-save').forEach(btn => {
+                btn.addEventListener('click', () => this.saveIdentityCorrection(btn));
+            });
+            card.style.display = 'block';
+        } catch (e) {
+            card.style.display = 'none';
+        }
+    }
+
+    async saveIdentityCorrection(btn) {
+        const wrap = btn.closest('.review-robot');
+        const slot = Number(btn.dataset.slot);
+        const team = wrap.querySelector('.review-team').value.trim();
+        const status = wrap.querySelector('.review-status');
+        status.textContent = '…';
+        try {
+            const resp = await fetch(`/api/replays/${this._replayId}/correct`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ slot, team_number: team }),
+            });
+            const data = await resp.json();
+            status.textContent = resp.ok
+                ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || 'error'}`;
+        } catch (e) {
+            status.textContent = '✗ ' + e.message;
+        }
     }
 
     renderReplayFrame(idx) {

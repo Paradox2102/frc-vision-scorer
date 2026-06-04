@@ -1281,3 +1281,12 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
 .timing-val { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .timing-row.total .timing-val { color: var(--text-primary); }
 .replay-card-proctime { font-size: 0.78rem; color: var(--text-secondary); margin-top: 0.2rem; }
+
+/* Replay review/correct identities panel */
+.review-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.review-robot { border: 1px solid var(--border, #243); border-radius: 8px; padding: 8px; }
+.review-imgs { display: flex; gap: 4px; flex-wrap: wrap; min-height: 40px; }
+.review-crop { height: 56px; border-radius: 4px; }
+.review-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.review-team { width: 80px; }
+.review-status { font-size: 0.8rem; color: var(--text-secondary, #9bb); }

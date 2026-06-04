@@ -7,12 +7,14 @@ import asyncio
 import base64
 import cv2
 import datetime
+import io
 import json
 import math
 import numpy as np
 import os
 import pytesseract
 import shutil
+from PIL import Image
 import tempfile
 import time
 import urllib.error
@@ -872,7 +874,7 @@ class InferenceJob:
         robot.team_number = None
         robot.team_number_confirmed = False
 
-    def _deposit_to_gallery(self, robot, legibility: float = 0.0) -> None:
+    def _deposit_to_gallery(self, robot, legibility: float = 0.0, image_bytes=None) -> None:
         """Deposit a confirmed robot's appearance into the in-memory event gallery and
         buffer it for persistence at finalize. Only externally-grounded labels (an OCR
         lock or OCR re-affirmation) should call this — never a gallery-driven
@@ -890,6 +892,8 @@ class InferenceJob:
             "alliance_color": color,
             "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
             "legibility": legibility,
+            "image": image_bytes,
+            "verified": 0,
         })
 
     def apply_gallery_matches(self, ocr_crops: list) -> None:
@@ -1047,7 +1051,7 @@ class InferenceJob:
             )
             if (robot.team_number_confirmed and team == robot.team_number
                     and conf >= 0.85):
-                self._deposit_to_gallery(robot, legibility=conf)
+                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
             if not team:
                 continue
             if robot.team_ocr_votes is None:
@@ -1068,7 +1072,7 @@ class InferenceJob:
                     if event.robot_id == slot_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
-                self._deposit_to_gallery(robot, legibility=conf)
+                self._deposit_to_gallery(robot, legibility=conf, image_bytes=_thumbnail_bytes(crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
                   f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
 
@@ -4334,6 +4338,24 @@ def _match_bumper_read_to_roster(
     if cand and dist <= 1 and len(digits) >= 2:
         return cand, roster_alliance.get(cand, alliance_hint), 0.6
     return None, alliance_hint if alliance_hint in ("blue", "red") else "unknown", 0.0
+
+
+def _thumbnail_bytes(crop_b64, max_h=128):
+    """Decode a raw-base64 JPEG bumper crop and return a small JPEG thumbnail (bytes),
+    bounded to max_h pixels tall. Returns None on bad/empty input."""
+    if not crop_b64:
+        return None
+    try:
+        raw = base64.b64decode(crop_b64)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if img.height > max_h:
+            w = max(1, int(img.width * max_h / img.height))
+            img = img.resize((w, max_h))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=80)
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def _ocr_digits_from_crop_b64(crop_b64: str) -> str:

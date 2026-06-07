@@ -33,9 +33,16 @@ team). VLM cadence already ramps to an 8 s audit once confirmed, with a forced r
 every `REREAD_EVERY_N_PASSES` to break wrong locks.
 
 Two gaps:
-- **Slot expiry resets identity.** After `max_occ=90` occluded frames a slot expires
-  (`tracker.py:138`); the re-emerged robot seeds a fresh slot at **zero votes** — team
-  and lock are orphaned. Identity is coupled to the transient slot, not the robot.
+- **Slot expiry mis-binds identity.** After `max_occ=90` occluded frames a slot is
+  flipped `active=False` (`tracker.py:138`) and its `fused_id→slot` mapping is dropped
+  (`:180`). On re-emergence the detection re-seeds into **whatever free slot pops first**
+  (`free_slots.pop(0)`), not necessarily its original slot. The durable state in
+  `robot_tracks[slot_id]` (`app.py:521`) is **not deleted** — so the re-emerged robot can
+  land on a slot whose `RobotTrack` holds *another* robot's stale votes/lock, or its own
+  old one, with no guarantee. The defect is therefore **mis-binding / cross-contamination**
+  (identity follows a reassignable `slot_id`, not the physical robot), not vote deletion.
+  Phase 1 fixes it by re-keying durable state off `slot_id` onto a persistent identity
+  and adding an explicit re-attach match.
 - **Joint same-alliance occlusion is unguarded.** A swap needs appearance, color, and
   Kalman position to all fail together — which is exactly what two red robots occluded
   together produce (appearance similar, color identical, positions ambiguous). The only
@@ -46,8 +53,19 @@ Two gaps:
 **A maximally-confident track is still audited periodically.** Per the
 `reread-audit-deadlock` lesson, a wrong-but-confident lock must always remain
 challengeable. Confidence may *lengthen* the audit interval; it must **never** drive it
-to "never." There is a hard floor (e.g. one audit read per confirmed robot every
-`AUDIT_FLOOR_SECONDS`, default ~30 s) independent of confidence.
+to "never." There is a hard floor: one audit read per confirmed robot every
+`AUDIT_FLOOR_SECONDS` (default ~30 s) independent of confidence.
+
+**Implementation note (corrects a subtlety the plans must honor):** today's audit floor
+is **pass-count-based** — `_is_reread_pass` forces a confirmed re-read every
+`REREAD_EVERY_N_PASSES` *passes* (`app.py:862`), and passes only fire when the VLM
+interval permits. If Phase 2 stretches the confidence-driven interval, passes become
+rare and a pass-count floor would silently drift far past 30 s. So Phase 2 must convert
+the floor to a **per-identity wall-clock timer** ("seconds since last audit read"),
+**independent of** the confidence-driven cadence — not a pass counter. It must also keep
+intact the original rationale of `_is_reread_pass` (a wrong lock holds a roster team
+hostage, so the real robot never reaches `unconfirmed==0` and the lock deadlocks unless
+re-read) — the new timer must not regress that.
 
 ## Phase 1 — Persistent identity (decouple from slots)
 
@@ -70,7 +88,11 @@ slot expiry and re-attach on re-emergence, instead of resetting.
   new identity.
 - **Roster cap stays hard:** at most 3 active+inactive identities per alliance. A
   would-be 4th same-alliance identity is a signal of a tracking error, not a new robot —
-  prefer re-attaching to an existing inactive identity.
+  prefer re-attaching to an existing inactive identity. Note this is **new logic** in the
+  identity layer: today's caps (`reid.choose_canonical_match` `cap_per_alliance`;
+  `MAX_TRACKED_ROBOTS=6` at the SAM2 layer) count only active/visible tracks — none count
+  *inactive persistent identities*, because no such object exists yet. Phase 1 adds it;
+  it is not a reuse of an existing guard.
 
 This subsumes much of `FusedTrackRegistry`'s inactive-track re-link (which already does
 appearance re-link at the fused layer); Phase 1 lifts that persistence up to the

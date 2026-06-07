@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """Assemble a hard-negative-augmented bumper dataset:
-  base positives (Benjamin)  +  subsampled robot-free static-structure crops as
-  background images (empty label files, which YOLO treats as negatives).
+  base positives (Benjamin)  +  subsampled hub/outpost crops (from
+  scripts/crop_negatives_from_boxes.py) + the user's seed crops, all added as
+  background images (empty label files = negatives).
 
-Reads the negatives folder LIVE, so pruning bad crops there and re-running just works.
+Subsamples ~per-event crops spread across that event's boxes for venue + structure
+variety while keeping the background ratio near ~10%. Emits a single review montage
+of exactly the negatives selected.
 
 Usage:
-  .venv/bin/python scripts/build_hardneg_dataset.py \\
-    --base data/bumper_benjamin \\
-    --negs data/hard_negatives/static_negs/2026hop_qm30 \\
-    --out data/bumper_hardneg --per-cluster 5 --val-frac 0.15
+  .venv/bin/python scripts/build_hardneg_dataset.py --per-event 4
 """
 import argparse
-import re
 import shutil
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import cv2
+import numpy as np
+
 SPLITS = ("train", "valid", "test")
-CL_RE = re.compile(r"_cl(\d+)_")
 
 
-def _even_sample(items, k):
-    """Pick up to k items evenly spaced across the (frame-sorted) list."""
+def _even(items, k):
     n = len(items)
     if n <= k:
         return list(items)
@@ -32,31 +33,49 @@ def _even_sample(items, k):
     return [items[int(i * step)] for i in range(k)]
 
 
+def _sample_event(event_dir, per_event):
+    """Pick ~per_event crops from an event, spread across its box subfolders."""
+    boxes = sorted([d for d in event_dir.iterdir() if d.is_dir()])
+    by_box = {b.name: sorted(b.glob("frame*.jpg")) for b in boxes}
+    chosen, i = [], 0
+    # round-robin across boxes, taking evenly-spaced frames, until per_event reached
+    picks_per_box = max(1, per_event // max(1, len(by_box)))
+    for name, crops in by_box.items():
+        chosen.extend(_even(crops, picks_per_box))
+    # if we still need more (few boxes), top up from the largest boxes
+    while len(chosen) < per_event:
+        added = False
+        for name, crops in by_box.items():
+            extra = [c for c in crops if c not in chosen]
+            if extra:
+                chosen.append(extra[len(extra) // 2]); added = True
+            if len(chosen) >= per_event:
+                break
+        if not added:
+            break
+    return chosen[:per_event] if per_event else chosen
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="data/bumper_benjamin")
-    ap.add_argument("--negs", required=True)
+    ap.add_argument("--negs-root", default="data/hard_negatives/boxes")
+    ap.add_argument("--seeds", default="data/hard_negatives/user_negs")
     ap.add_argument("--out", default="data/bumper_hardneg")
-    ap.add_argument("--per-cluster", type=int, default=5)
+    ap.add_argument("--per-event", type=int, default=4)
     ap.add_argument("--val-frac", type=float, default=0.15)
     args = ap.parse_args()
 
-    base = Path(args.base)
-    negs = Path(args.negs)
-    out = Path(args.out)
+    base, out = Path(args.base), Path(args.out)
     if not (base / "train" / "images").exists():
         sys.exit(f"base dataset not found under {base}")
-    if not negs.exists():
-        sys.exit(f"negatives dir not found: {negs}")
-
     if out.exists():
         shutil.rmtree(out)
     for sp in SPLITS:
         (out / sp / "images").mkdir(parents=True, exist_ok=True)
         (out / sp / "labels").mkdir(parents=True, exist_ok=True)
 
-    # 1) copy base positives verbatim
-    pos_counts = {}
+    pos = {}
     for sp in SPLITS:
         imgs = sorted((base / sp / "images").glob("*"))
         for img in imgs:
@@ -64,42 +83,54 @@ def main():
             lbl = base / sp / "labels" / (img.stem + ".txt")
             if lbl.exists():
                 shutil.copy2(lbl, out / sp / "labels" / lbl.name)
-        pos_counts[sp] = len(imgs)
+        pos[sp] = len(imgs)
 
-    # 2) gather + subsample negatives per cluster (exclude *_context.jpg)
-    crops = [p for p in negs.glob("*.jpg") if not p.stem.endswith("_context")]
-    by_cluster = defaultdict(list)
-    for p in crops:
-        m = CL_RE.search(p.name)
-        by_cluster[int(m.group(1)) if m else -1].append(p)
+    # gather negatives: per-event subsample + all seed crops
     chosen = []
-    for cl, items in sorted(by_cluster.items()):
-        items.sort(key=lambda p: p.name)  # frame-ordered
-        chosen.extend(_even_sample(items, args.per_cluster))
+    negs_root = Path(args.negs_root)
+    for ev in sorted([d for d in negs_root.iterdir() if d.is_dir()]) if negs_root.exists() else []:
+        picks = _sample_event(ev, args.per_event)
+        chosen += [(ev.name, p) for p in picks]
+    seeds = Path(args.seeds)
+    if seeds.exists():
+        for s in sorted(seeds.glob("seed_*.png")):
+            chosen.append(("seed", s))
 
-    # 3) split negatives train/val and write as background images (empty labels)
-    neg_counts = {"train": 0, "valid": 0}
+    neg = {"train": 0, "valid": 0}
     val_every = max(2, round(1 / args.val_frac)) if args.val_frac > 0 else 0
-    for i, crop in enumerate(chosen):
+    for i, (tag, crop) in enumerate(chosen):
         sp = "valid" if (val_every and i % val_every == 0) else "train"
-        shutil.copy2(crop, out / sp / "images" / crop.name)
-        (out / sp / "labels" / (crop.stem + ".txt")).write_text("")  # empty == background
-        neg_counts[sp] += 1
+        name = f"neg_{tag}_{crop.parent.name}_{crop.stem}{crop.suffix}"
+        shutil.copy2(crop, out / sp / "images" / name)
+        (out / sp / "labels" / (Path(name).stem + ".txt")).write_text("")
+        neg[sp] += 1
 
-    # 4) yaml (same class scheme as base)
     (out / "bumper_dataset.yaml").write_text(
         f"path: {out.resolve()}\n"
         "train: train/images\nval: valid/images\ntest: test/images\n\n"
         "names:\n  0: blue_bumper\n  1: red_bumper\n\nnc: 2\n"
     )
 
-    train_total = pos_counts["train"] + neg_counts["train"]
-    print(f"base positives: train={pos_counts['train']} valid={pos_counts['valid']} test={pos_counts['test']}")
-    print(f"negatives added: {len(chosen)} (from {len(by_cluster)} clusters, "
-          f"<= {args.per_cluster}/cluster) -> train={neg_counts['train']} valid={neg_counts['valid']}")
-    print(f"train background ratio: {neg_counts['train']}/{train_total} = "
-          f"{100*neg_counts['train']/max(1,train_total):.1f}%")
+    # review montage of selected negatives
+    tiles = []
+    for tag, crop in chosen:
+        t = cv2.resize(cv2.imread(str(crop)), (140, 105))
+        cv2.putText(t, tag.replace("2026", "").replace("_qm", "q")[:13], (2, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
+        tiles.append(t)
+    cols = 10
+    while len(tiles) % cols:
+        tiles.append(np.zeros_like(tiles[0]))
+    rows = [np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)]
+    montage = ROOT / "data" / "hard_negatives" / "selected_negatives.jpg"
+    cv2.imwrite(str(montage), np.vstack(rows))
+
+    train_total = pos["train"] + neg["train"]
+    print(f"positives: train={pos['train']} valid={pos['valid']} test={pos['test']}")
+    print(f"negatives: {len(chosen)} -> train={neg['train']} valid={neg['valid']} "
+          f"(background {100*neg['train']/max(1,train_total):.1f}% of train)")
     print(f"dataset -> {out}/bumper_dataset.yaml")
+    print(f"review montage -> {montage}")
 
 
 if __name__ == "__main__":

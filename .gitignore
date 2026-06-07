@@ -114,7 +114,12 @@ web/replays/
 /data/bumper_benjamin/
 /data/bumper_karthik/
 /data/bumper_merged/
-data/hard_negatives/
+data/hard_negatives/*
 
 /data/bumper_hardneg/
 tools/frame_*.png
+
+# keep the human box annotations (small), but not the crop images under boxes/<tag>/<label>/
+!data/hard_negatives/boxes/
+data/hard_negatives/boxes/*/
+!data/hard_negatives/boxes/*.json

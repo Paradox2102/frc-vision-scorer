@@ -70,18 +70,26 @@ def main():
             cv2.imwrite(str(d / f"frame{fi:08d}.jpg"), crop)
             saved[b["_name"]].append(d / f"frame{fi:08d}.jpg")
 
-    for name, paths in saved.items():
-        tiles = []
+    # One COMBINED contact sheet for the whole event, labeled by box + frame, so
+    # review is a single montage per event rather than one per box.
+    tiles, total = [], 0
+    for name, paths in sorted(saved.items()):
+        total += len(paths)
         for p in paths:
-            tiles.append(cv2.resize(cv2.imread(str(p)), (160, 120)))
-        cols = 6
+            t = cv2.resize(cv2.imread(str(p)), (160, 120))
+            cv2.putText(t, name, (3, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+            cv2.putText(t, p.stem.replace("frame", ""), (3, 114),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
+            tiles.append(t)
+        print(f"  {name}: {len(paths)} crops")
+    if tiles:
+        cols = 8
         while len(tiles) % cols:
             tiles.append(np.zeros_like(tiles[0]))
         rows = [np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)]
-        cv2.imwrite(str(base / name / "_contact.jpg"), np.vstack(rows))
-        print(f"{name}: {len(paths)} crops -> {base / name}  (review _contact.jpg)")
+        cv2.imwrite(str(base / "_contact.jpg"), np.vstack(rows))
     cap.release()
-    print(f"\nReview each _contact.jpg, delete any crop with a robot in front, then build the dataset.")
+    print(f"{args.tag}: {total} crops -> {base}  (review {base}/_contact.jpg)")
 
 
 if __name__ == "__main__":

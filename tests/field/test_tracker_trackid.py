@@ -113,3 +113,39 @@ def test_trackid_reacquires_same_slot_after_coast():
         f"Re-acquired track_id=100 went to slot {tr.last_det_to_slot[0]} "
         f"instead of original slot {slot_100}"
     )
+
+
+def test_expiration_clears_bindings_and_emits_events():
+    tr = FieldTracker(field_length=16.0, max_coast_open=2)
+
+    # Frame 1: Seed track_id=100
+    tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_id = tr.tracks[0].slot_id
+    assert tr._id_to_slot[100] == slot_id
+    
+    # Assert binding events recorded
+    assert len(tr.binding_events) == 1
+    assert tr.binding_events[0]["event"] == "slot_seeded"
+    assert tr.binding_events[0]["track_id"] == 100
+    assert tr.binding_events[0]["slot_id"] == slot_id
+
+    # Frame 2: Miss 1
+    tr.update([], {}, 0.1)
+    assert tr._id_to_slot[100] == slot_id
+    assert len(tr.binding_events) == 0
+
+    # Frame 3: Miss 2
+    tr.update([], {}, 0.1)
+    assert tr._id_to_slot[100] == slot_id
+    assert len(tr.binding_events) == 0
+
+    # Frame 4: Miss 3 -> expires (since budget is 2, expired at missed > 2)
+    tr.update([], {}, 0.1)
+    
+    # Should delete the binding
+    assert 100 not in tr._id_to_slot
+    assert len(tr.binding_events) == 1
+    assert tr.binding_events[0]["event"] == "slot_expired"
+    assert tr.binding_events[0]["track_id"] == 100
+    assert tr.binding_events[0]["slot_id"] == slot_id
+

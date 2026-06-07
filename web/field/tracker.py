@@ -96,11 +96,15 @@ class FieldTracker:
                 sid += 1
         # Maps stable track_id -> slot_id for sticky binding.
         self._id_to_slot: dict[int, int] = {}
+        self.binding_events: list[dict] = []
+        self.assignment_evidence: dict[int, dict] = {}
 
     def _slots(self, alliance):
         return [t for t in self.tracks if t.alliance == alliance]
 
     def update(self, detections, occlusion, dt):
+        self.binding_events = []
+        self.assignment_evidence = {}
         # Predict step for all active tracks
         for t in self.tracks:
             if t.active:
@@ -141,6 +145,15 @@ class FieldTracker:
                 t.kf = None
                 t.box = None
                 t.coasting = False
+                tids_to_del = [tid for tid, sid in self._id_to_slot.items() if sid == t.slot_id]
+                for tid in tids_to_del:
+                    del self._id_to_slot[tid]
+                    self.binding_events.append({
+                        "event": "slot_expired",
+                        "slot_id": t.slot_id,
+                        "track_id": tid,
+                        "alliance": t.alliance,
+                    })
 
         return self._emit()
 
@@ -170,6 +183,12 @@ class FieldTracker:
                     slot.hits += 1
                     slot.coasting = False
                     self.last_det_to_slot[orig_idx] = slot.slot_id
+                    self.binding_events.append({
+                        "event": "slot_rebound",
+                        "slot_id": slot.slot_id,
+                        "track_id": tid,
+                        "alliance": slot.alliance,
+                    })
                     # Remove this slot from active_slots so it won't be
                     # processed again in the distance-matching pass.
                     if slot in active_slots:
@@ -191,6 +210,12 @@ class FieldTracker:
                 slot.active = True
                 self._id_to_slot[tid] = slot.slot_id
                 self.last_det_to_slot[orig_idx] = slot.slot_id
+                self.binding_events.append({
+                    "event": "slot_seeded",
+                    "slot_id": slot.slot_id,
+                    "track_id": tid,
+                    "alliance": slot.alliance,
+                })
             elif point_in_zones(d.pos, self.zones):
                 # Inside a seeding-blocked zone — don't seed, don't add to
                 # remaining (same behavior as anonymous dets in zone).
@@ -247,6 +272,19 @@ class FieldTracker:
                     self.last_det_to_slot[idxs[c]] = t.slot_id
                     if dets[c].track_id is not None:
                         self._id_to_slot[dets[c].track_id] = t.slot_id
+                    
+                    # Store assignment evidence with margin
+                    margin = np.inf
+                    other_costs = [cost[r, j] for j in range(m) if j != c]
+                    valid_others = [v for v in other_costs if np.isfinite(v)]
+                    if valid_others:
+                        margin = float(min(valid_others) - cost[r, c])
+                    
+                    self.assignment_evidence[t.slot_id] = {
+                        "distance": float(cost[r, c]),
+                        "margin": margin,
+                        "detection_idx": idxs[c],
+                    }
 
             # Increment missed for unmatched active slots
             for i, t in enumerate(active_slots):

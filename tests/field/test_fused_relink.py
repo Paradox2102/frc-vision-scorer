@@ -169,3 +169,46 @@ def test_permutation_invariance_and_margins():
     assert obs_a2.relink_margin == 1.0
     assert obs_b2.relink_margin == 1.0
 
+
+def test_explicit_relink_evidence_results():
+    reg = FusedTrackRegistry(app_floor=0.5)
+    
+    # Frame 1: newly created
+    f1 = _obs([("main", 1)], embedding=_e(1, 0, 0))
+    ev1 = reg.assign([f1])
+    assert f1.track_id == 0
+    assert len(ev1) == 1
+    assert ev1[0].type == "newly_created"
+    assert ev1[0].margin == 1.0
+    assert f1.relink_evidence.type == "newly_created"
+    
+    # Frame 2: continued
+    f2 = _obs([("main", 1)], embedding=_e(1, 0.1, 0))
+    ev2 = reg.assign([f2])
+    assert f2.track_id == 0
+    assert len(ev2) == 1
+    assert ev2[0].type == "continued"
+    
+    # Frame 3: inactive. Frame 4: appearance_relinked
+    f3 = _obs([("corner", 1)], embedding=_e(1, 0.05, 0))
+    # We clear active so 0 is inactive by assigning an empty frame
+    reg.assign([])
+    ev4 = reg.assign([f3])
+    assert f3.track_id == 0
+    assert ev4[0].type == "appearance_relinked"
+    assert ev4[0].margin >= 1.0 # only 1 inactive candidate
+    
+    # Frame 5: merged (bridge two different prior IDs)
+    # Create ID 1 first
+    f_new = _obs([("corner", 2)], embedding=_e(0, 1, 0))
+    reg.assign([f_new])
+    assert f_new.track_id == 1
+    
+    # Bridge main:1 and corner:2
+    # But wait, main:1 has id 0, corner:2 has id 1.
+    f_bridge = _obs([("main", 1), ("corner", 2)], embedding=_e(1, 0, 0))
+    ev5 = reg.assign([f_bridge])
+    assert f_bridge.track_id in (0, 1)
+    assert ev5[0].type == "merged"
+
+

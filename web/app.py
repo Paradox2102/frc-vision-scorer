@@ -65,6 +65,7 @@ from web.field.zones import load_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
+from web.field.identity_confidence import ConfidenceConfig, decide_vlm_read
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -228,7 +229,7 @@ EMBED_EMA_ALPHA = 0.3     # weight of the new embedding in the running EMA
 
 LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
-REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
+AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
 VLM_UNCONFIRMED_FAST_INTERVAL_SEC = 0.75
 VLM_UNCONFIRMED_MED_INTERVAL_SEC = 1.25
 VLM_UNCONFIRMED_SLOW_INTERVAL_SEC = 2.0
@@ -705,6 +706,7 @@ class InferenceJob:
         # Detection state
         self.hubs: List[DetectedHub] = []
         self.identity_registry = IdentityRegistry()
+        self.confidence_config = ConfidenceConfig()
         self.robot_identities = self.identity_registry.identities
         self._last_bindings: Dict[int, int] = {}
         self.robot_tracks: Dict[int, RobotTrack] = {}
@@ -1112,30 +1114,6 @@ class InferenceJob:
         print(f"  Corner read: slot {slot_id} += {team} (w={weight:.1f}, "
               f"total={robot.team_ocr_votes[team]:.1f})")
 
-    def _is_reread_pass(self, unconfirmed_count: int) -> bool:
-        """Whether this VLM pass also re-reads already-confirmed slots.
-
-        Re-reading confirmed slots is the only way a wrong lock self-corrects.
-        It must NOT depend solely on `unconfirmed_count == 0`: a wrong lock holds
-        a roster team hostage (locked teams are excluded from assignment in
-        reid.assign_teams_alliance_masked), so the real robot for that team can
-        never confirm — `unconfirmed_count` then never reaches 0 and the bad lock
-        deadlocks forever, its early crop "stuck" on screen all match. So also
-        force a periodic audit every REREAD_EVERY_N_PASSES calls regardless.
-        """
-        if unconfirmed_count == 0:
-            return True
-        return self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0
-
-    def _vlm_interval_seconds(self, unconfirmed_count: int) -> float:
-        """Retry faster while robot identities are missing, then back off to audits."""
-        if unconfirmed_count >= 4:
-            return VLM_UNCONFIRMED_FAST_INTERVAL_SEC
-        if unconfirmed_count >= 2:
-            return VLM_UNCONFIRMED_MED_INTERVAL_SEC
-        if unconfirmed_count == 1:
-            return VLM_UNCONFIRMED_SLOW_INTERVAL_SEC
-        return VLM_CONFIRMED_AUDIT_INTERVAL_SEC
 
     def _handle_confirmed_vlm_contradiction(self, robot, new_team: Optional[str],
                                             confidence: float, raw_read: Optional[str],
@@ -1248,12 +1226,10 @@ class InferenceJob:
                 print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
                       f"(appearance {sim:.2f})")
 
-    def read_fused_bumper_numbers(self, fused, is_reread_pass: bool) -> None:
+    def read_fused_bumper_numbers(self, fused, requested_priorities: dict[int, float]) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
-
-        This is the reliable path for multi-camera tracking: every crop is already
-        in its source camera's coordinates. Do not crop the final fused/track box
-        from the main overhead frame; that box may have come from a corner camera.
+        
+        Accepts requested_priorities: dict mapping identity_id -> priority.
         """
         if not self.match_teams:
             self.vlm_status.update({
@@ -1267,28 +1243,65 @@ class InferenceJob:
             self._ocr_crops_dirty = True
             return
 
-        candidates = []  # (priority, slot_id, cam, crop_b64, source_weight)
+        current_match_time = self._current_frame / (self.video_fps or 10.0)
+
+        # Map slot_id -> obs
+        slot_to_obs = {}
         for i, obs in enumerate(fused):
             slot_id = self.field_tracker.last_det_to_slot.get(i)
-            if slot_id is None:
+            if slot_id is not None:
+                slot_to_obs[slot_id] = obs
+
+        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64)
+        identities_with_crops = set()
+
+        for identity_id, priority in requested_priorities.items():
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident is None or ident.active_slot is None:
                 continue
-            robot = self._get_or_create_slot_track(slot_id)
-            if robot is None:
+            slot_id = ident.active_slot
+            obs = slot_to_obs.get(slot_id)
+            if obs is None:
                 continue
-            if robot.team_number_confirmed and not is_reread_pass:
-                continue
-            # If every camera says the bumper is occluded, skip. Otherwise corner
-            # evidence remains useful even when the main view is blocked.
+
+            # Occlusion check
             if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
                 cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
             ):
                 continue
+
+            has_any_crop = False
             for cam, crop_b64, source_weight in obs.evidence:
                 if crop_b64 is None:
                     continue
-                # Prefer corner-camera crops slightly because they often see
-                # side bumpers more directly; source_weight already encodes that.
-                candidates.append((float(source_weight), slot_id, cam, crop_b64, float(source_weight)))
+                has_any_crop = True
+                candidates.append((
+                    priority,
+                    float(source_weight),
+                    identity_id,
+                    slot_id,
+                    cam,
+                    crop_b64
+                ))
+
+            if has_any_crop:
+                identities_with_crops.add(identity_id)
+            else:
+                # No crops found: backoff
+                ident.last_vlm_time = current_match_time
+                ident.vlm_fail_count += 1
+                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                print(f"  VLM backoff: Identity {identity_id} (slot {slot_id}) has no crops. Backoff until {ident.backoff_until:.2f}")
+
+        # For any requested identity that didn't even have an active slot or obs
+        for identity_id in requested_priorities:
+            if identity_id not in identities_with_crops:
+                ident = self.identity_registry.identities.get(identity_id)
+                if ident and ident.identity_id not in identities_with_crops:
+                    ident.last_vlm_time = current_match_time
+                    ident.vlm_fail_count += 1
+                    ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                    print(f"  VLM backoff: Identity {identity_id} not visible/active. Backoff until {ident.backoff_until:.2f}")
 
         if not candidates:
             print("  VLM skipped: no legible fused bumper crops this pass")
@@ -1303,14 +1316,15 @@ class InferenceJob:
             self._ocr_crops_dirty = True
             return
 
-        candidates.sort(key=lambda c: c[0], reverse=True)
+        # Sort by (priority, source_weight) descending
+        candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
         chosen = candidates[:VLM_TOP_K]
 
-        crops = [c[3] for c in chosen]
+        crops = [c[5] for c in chosen]
         expected = []
-        for _priority, slot_id, _cam, _crop_b64, _source_weight in chosen:
-            robot = self._get_or_create_slot_track(slot_id)
-            alliance = getattr(robot, "alliance", "unknown")
+        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64 in chosen:
+            ident = self.identity_registry.identities.get(identity_id)
+            alliance = getattr(ident, "alliance", "unknown")
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
 
         provider = getattr(self, "team_reader", "local")
@@ -1336,10 +1350,15 @@ class InferenceJob:
 
         ocr_crops = []
         status_results = []
-        for (_priority, slot_id, cam, crop_b64, source_weight), res in zip(chosen, results):
+        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
             robot = self._get_or_create_slot_track(slot_id)
-            if not robot:
+            ident = self.identity_registry.identities.get(identity_id)
+            if not robot or not ident:
                 continue
+
+            # Update VLM attempt time
+            ident.last_vlm_time = current_match_time
+
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
             self._capture_slot_crop(robot.robot_id, crop_b64, conf, robot.appearance_embedding,
@@ -1376,6 +1395,16 @@ class InferenceJob:
                 confidence=conf,
                 vote_weight=vote_weight,
             )
+
+            # Update success/backoff based on whether read succeeded
+            if res.get("error") or not team:
+                ident.vlm_fail_count += 1
+                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+            else:
+                ident.last_success_time = current_match_time
+                ident.vlm_fail_count = 0
+                ident.backoff_until = -999.0
+
             if (robot.team_number_confirmed and team == robot.team_number
                     and conf >= 0.85):
                 self._deposit_to_gallery(robot, legibility=conf,
@@ -1449,13 +1478,13 @@ class InferenceJob:
         confirmed_teams = {r.team_number for r in self.robot_tracks.values()
                            if r.team_number_confirmed and r.team_number}
         remaining_teams = [t for t in self.match_teams if t not in confirmed_teams]
-        if not remaining_teams and self._claude_vision_calls % REREAD_EVERY_N_PASSES != 0:
-            return  # everything confirmed and not a re-read pass
+        if not remaining_teams:
+            return  # everything confirmed
         remaining_blue = [t for t in self.match_blue_teams if t not in confirmed_teams]
         remaining_red = [t for t in self.match_red_teams if t not in confirmed_teams]
 
         # Build candidate crops. Confirmed robots only on re-read passes.
-        is_reread_pass = (self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0)
+        is_reread_pass = True
         candidates = []  # list of (score, canonical_id, box, crop_b64)
         for canonical_id, box in tracked_robots:
             robot = self._get_or_create_slot_track(canonical_id)
@@ -3872,24 +3901,37 @@ class InferenceJob:
 
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
-                # paid-API leftover). It ramps up while identities are missing and then
-                # backs off to audit reads after all robots are confirmed.
-                current_time = time.time()
+                # paid-API leftover). We schedule VLM reads per-identity based on match seconds.
+                current_match_time = processed_frame_num / (self.video_fps or 10.0)
                 unconfirmed_count = sum(
-                    1 for r in self.robot_tracks.values() if not r.team_number_confirmed
+                    1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
                 )
-                vision_interval = self._vlm_interval_seconds(unconfirmed_count)
-                elapsed_since_vlm = current_time - self._claude_vision_last_time
-                should_read = bool(fused) and elapsed_since_vlm >= vision_interval
+                
+                due_priorities = {}
+                for ident in self.identity_registry.identities.values():
+                    if ident.active_slot is None:
+                        continue
+                    decision = decide_vlm_read(
+                        is_confirmed=ident.is_confirmed,
+                        confidence=ident.confidence,
+                        last_vlm_time=ident.last_vlm_time,
+                        last_success_time=ident.last_success_time,
+                        backoff_until=ident.backoff_until,
+                        needs_immediate_read=ident.needs_immediate_read,
+                        current_match_time=current_match_time,
+                        unconfirmed_count=unconfirmed_count,
+                        config=self.confidence_config
+                    )
+                    if decision.due:
+                        due_priorities[ident.identity_id] = decision.priority
+
                 self.vlm_status.update({
-                    "last_interval_sec": vision_interval,
                     "unconfirmed": unconfirmed_count,
+                    "due_count": len(due_priorities),
                 })
-                if should_read:
+                if bool(fused) and len(due_priorities) > 0:
                     self._claude_vision_calls += 1
-                    self._claude_vision_last_time = current_time
-                    is_reread_due = self._is_reread_pass(unconfirmed_count)
-                    self.read_fused_bumper_numbers(fused, is_reread_due)
+                    self.read_fused_bumper_numbers(fused, due_priorities)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()

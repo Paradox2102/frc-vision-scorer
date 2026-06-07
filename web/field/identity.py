@@ -17,6 +17,11 @@ class RobotIdentity:
     last_seen_frame: int = 0
     last_seen_pos: tuple[float, float] | None = None
     confidence: float = 0.5
+    last_vlm_time: float = -999.0
+    last_success_time: float = -999.0
+    backoff_until: float = -999.0
+    vlm_fail_count: int = 0
+    needs_immediate_read: bool = False
 
 @dataclass
 class IdentityObservation:

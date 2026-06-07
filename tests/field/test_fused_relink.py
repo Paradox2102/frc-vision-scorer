@@ -113,3 +113,59 @@ def test_get_embedding_returns_ema_and_none_for_unknown():
     assert emb is not None
     np.testing.assert_array_almost_equal(emb, _e(1, 0, 0))
     assert reg.get_embedding(99999) is None
+
+
+def test_permutation_invariance_and_margins():
+    # Assert identical optimal assignments regardless of input order, and check margins.
+    emb_a = _e(1, 0, 0)
+    emb_b = _e(0, 1, 0)
+    emb_c = _e(0, 0, 1)
+
+    reg = FusedTrackRegistry(app_floor=0.5)
+
+    # Frame 1: Create active tracks for 0, 1, 2
+    f1 = _obs([("main", 1)], embedding=emb_a)
+    f2 = _obs([("main", 2)], embedding=emb_b)
+    f3 = _obs([("main", 3)], embedding=emb_c)
+    reg.assign([f1, f2, f3])
+    assert {f1.track_id, f2.track_id, f3.track_id} == {0, 1, 2}
+
+    # Frame 2: Inactive tracks exist.
+    # Now we have observations corresponding to emb_a and emb_b but with different per-camera IDs.
+    # Observation list order A then B
+    reg_order1 = FusedTrackRegistry(app_floor=0.5)
+    reg_order1._key_to_id = reg._key_to_id.copy()
+    reg_order1._next_id = reg._next_id
+    reg_order1._id_to_embedding = reg._id_to_embedding.copy()
+    reg_order1._id_to_anchor = reg._id_to_anchor.copy()
+    reg_order1._recent_exemplars = {k: list(v) for k, v in reg._recent_exemplars.items()}
+
+    obs_a = _obs([("corner", 1)], embedding=emb_a)
+    obs_b = _obs([("corner", 2)], embedding=emb_b)
+
+    reg_order1.assign([obs_a, obs_b])
+    assert obs_a.track_id == f1.track_id
+    assert obs_b.track_id == f2.track_id
+    
+    # Check margins:
+    # For obs_a: matches to f1 (sim = 1.0), next best is f2 (sim = 0.0). Margin should be 1.0.
+    assert obs_a.relink_margin == 1.0
+    assert obs_b.relink_margin == 1.0
+
+    # Test order B then A
+    reg_order2 = FusedTrackRegistry(app_floor=0.5)
+    reg_order2._key_to_id = reg._key_to_id.copy()
+    reg_order2._next_id = reg._next_id
+    reg_order2._id_to_embedding = reg._id_to_embedding.copy()
+    reg_order2._id_to_anchor = reg._id_to_anchor.copy()
+    reg_order2._recent_exemplars = {k: list(v) for k, v in reg._recent_exemplars.items()}
+
+    obs_a2 = _obs([("corner", 1)], embedding=emb_a)
+    obs_b2 = _obs([("corner", 2)], embedding=emb_b)
+
+    reg_order2.assign([obs_b2, obs_a2])
+    assert obs_a2.track_id == f1.track_id
+    assert obs_b2.track_id == f2.track_id
+    assert obs_a2.relink_margin == 1.0
+    assert obs_b2.relink_margin == 1.0
+

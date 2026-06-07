@@ -114,3 +114,29 @@ def test_summary_preserves_timer_periods_and_autonomous_paths(tmp_path):
     assert saved["periods"][0]["label"] == "auto"
     assert saved["processing_ranges"] == [[95, 330]]
     assert saved["autonomous_paths"]["B1"][0]["field_pos"] == [1.25, 2.5]
+
+
+def test_diagnostics_integration(tmp_path):
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents
+    
+    rec = ReplayRecorder()
+    rec.open_lazy(_frame(), fps=8.0, out_dir=tmp_path)
+    rec.add_frame(_frame(), {"frame_num": 100, "scores": {}, "robots": []})
+    
+    diag = IdentityDiagnosticRecorder()
+    diag.record(DiagnosticEvents.IDENTITY_CREATED)
+    diag.increment("some_counter", 5)
+    
+    artifacts = rec.finalize(status="complete", summary={}, diagnostics=diag)
+    
+    assert "diagnostics_path" in artifacts
+    diag_file = tmp_path / "diagnostics.jsonl"
+    assert diag_file.exists()
+    
+    lines = diag_file.read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["event"] == DiagnosticEvents.IDENTITY_CREATED
+    
+    saved_meta = json.loads((tmp_path / "meta.json").read_text())
+    assert saved_meta["summary"]["diagnostics_path"] == str(diag_file)
+    assert saved_meta["summary"]["diagnostics_summary"]["counters"]["some_counter"] == 5

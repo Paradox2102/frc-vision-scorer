@@ -53,3 +53,71 @@ def test_expand_clamps_to_frame_top():
     assert expand_bumper_to_robot(
         (0, 30, 50, 60), (480, 640, 3), factor=5.0
     )[1] == 0.0
+
+
+def test_box_ios_full_containment_is_one():
+    from web.field.detect_schema import box_ios
+    # smaller box fully inside larger -> IoS == 1.0
+    assert box_ios((0, 0, 10, 10), (0, 0, 20, 20)) == 1.0
+
+
+def test_box_ios_disjoint_is_zero():
+    from web.field.detect_schema import box_ios
+    assert box_ios((0, 0, 10, 10), (100, 100, 110, 110)) == 0.0
+
+
+def test_box_ios_partial_overlap():
+    from web.field.detect_schema import box_ios
+    # overlap 5x10=50; smaller area = 10x10=100 -> 0.5
+    assert box_ios((0, 0, 10, 10), (5, 0, 25, 10)) == 0.5
+
+
+def test_merge_no_bumpers_keeps_all_as_unknown():
+    from web.field.detect_schema import merge_robot_detections
+    fills = [(0, 0, 10, 10), (50, 50, 60, 60)]
+    merged = merge_robot_detections([], fills, ios_thresh=0.5)
+    assert merged == [
+        ((0, 0, 10, 10), "unknown"),
+        ((50, 50, 60, 60), "unknown"),
+    ]
+
+
+def test_merge_passes_bumper_entries_through_unchanged():
+    from web.field.detect_schema import merge_robot_detections
+    bumpers = [((0, 0, 10, 30), "red"), ((40, 0, 50, 30), "blue")]
+    merged = merge_robot_detections(bumpers, [], ios_thresh=0.5)
+    assert merged == bumpers
+
+
+def test_merge_suppresses_fill_overlapping_a_bumper():
+    from web.field.detect_schema import merge_robot_detections
+    bumpers = [((0, 0, 20, 20), "red")]
+    fills = [(0, 0, 10, 10),        # IoS 1.0 with the bumper -> dropped
+             (100, 100, 120, 120)]  # disjoint -> kept as unknown
+    merged = merge_robot_detections(bumpers, fills, ios_thresh=0.5)
+    assert merged == [
+        ((0, 0, 20, 20), "red"),
+        ((100, 100, 120, 120), "unknown"),
+    ]
+
+
+def test_select_gap_fills_caps_per_half():
+    from web.field.detect_schema import select_gap_fills
+    # blue half already full (3 bumpers) -> no blue fill; red has room for one
+    bumper_halves = ["blue", "blue", "blue", "red"]
+    unknown_halves = ["blue", "red", "red"]
+    # index 0 (blue) rejected; index 1 (red) accepted -> red now 2; index 2 (red) accepted -> red 3
+    assert select_gap_fills(bumper_halves, unknown_halves, max_per_half=3) == [1, 2]
+
+
+def test_select_gap_fills_skips_none_territory():
+    from web.field.detect_schema import select_gap_fills
+    # an off-field (None) unknown is never selected
+    assert select_gap_fills([], [None, "blue"], max_per_half=3) == [1]
+
+
+def test_select_gap_fills_stops_at_cap_within_unknowns():
+    from web.field.detect_schema import select_gap_fills
+    # no bumpers; 4 blue unknowns, cap 3 -> first three kept
+    assert select_gap_fills([], ["blue"] * 4, max_per_half=3) == [0, 1, 2]
+

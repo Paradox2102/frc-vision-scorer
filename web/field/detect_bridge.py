@@ -52,6 +52,18 @@ def _camera_ground_dist(calibration, xy):
     return ((xy[0] - cc[0]) ** 2 + (xy[1] - cc[1]) ** 2) ** 0.5
 
 
+def box_exceeds_frac(box, frame_shape, max_box_frac):
+    """True if box spans more than max_box_frac of the frame in either dimension.
+    Calibration-independent backstop against oversized detections."""
+    if frame_shape is None:
+        return False
+    fh, fw = frame_shape[0], frame_shape[1]
+    x1, y1, x2, y2 = box
+    return bool(fw and fh and (
+        (x2 - x1) / fw > max_box_frac or (y2 - y1) / fh > max_box_frac
+    ))
+
+
 def _too_large(box, calibration, field_xy, frame_shape, max_field_width,
                max_box_frac, max_range):
     """True if the box is implausibly large to be a robot. Two independent layers:
@@ -62,11 +74,8 @@ def _too_large(box, calibration, field_xy, frame_shape, max_field_width,
         width_m = _field_footprint_width(box, calibration)
         if width_m is not None and width_m > max_field_width:
             return True
-    if frame_shape is not None:
-        fh, fw = frame_shape[0], frame_shape[1]
-        x1, y1, x2, y2 = box
-        if fw and fh and ((x2 - x1) / fw > max_box_frac or (y2 - y1) / fh > max_box_frac):
-            return True
+    if box_exceeds_frac(box, frame_shape, max_box_frac):
+        return True
     return False
 
 

@@ -140,3 +140,20 @@ def test_field_adjacent_person_filter():
     crowd = (uc - 25, vc - 150, uc + 25, vc)
     keep = field_adjacent_persons([near, crowd], cam, (fm.length_m, fm.width_m), margin=2.0)
     assert near in keep and crowd not in keep
+
+
+def test_box_exceeds_frac_true_when_wide():
+    from web.field.detect_bridge import box_exceeds_frac
+    # box width 700 / frame width 1000 = 0.7 > 0.5
+    assert box_exceeds_frac((0, 0, 700, 50), (480, 1000, 3), 0.5) is True
+
+
+def test_box_exceeds_frac_false_when_small():
+    from web.field.detect_bridge import box_exceeds_frac
+    assert box_exceeds_frac((0, 0, 100, 100), (480, 1000, 3), 0.5) is False
+
+
+def test_box_exceeds_frac_none_frame_is_false():
+    from web.field.detect_bridge import box_exceeds_frac
+    assert box_exceeds_frac((0, 0, 999, 999), None, 0.5) is False
+

@@ -279,3 +279,189 @@ def test_sam2_field_tracker_returns_correct_structure():
     assert set(stub.prompted_obj_ids) == {1, 2}, (
         f"expected obj_ids {{1, 2}} to be prompted, got {stub.prompted_obj_ids}"
     )
+
+
+class AbsentStubPredictor:
+    H = 20
+    W = 60
+    
+    def __init__(self, visibility_schedule: dict[int, list[int]], num_frames: int = 6) -> None:
+        self.schedule = visibility_schedule
+        self.num_frames = num_frames
+        self.add_calls = []
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        if max_frame_num_to_track is None:
+            end = self.num_frames - 1
+        else:
+            end = min(start + max_frame_num_to_track, self.num_frames - 1)
+        for f in range(start, end + 1):
+            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            rects = []
+            for oid in active:
+                if oid in self.schedule.get(f, []):
+                    rects.append((oid * 6, 2, oid * 6 + 4, 6))
+                else:
+                    rects.append((0, 0, 0, 0))
+            yield f, active, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_sam2_tracker_active_vs_lifetime_limits():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    
+    # 6 objects prompted initially at frame 0.
+    # schedule:
+    # Frame 0: all 6 visible
+    # Frame 1: all 6 visible
+    # Frame 2: obj 6 becomes invisible (absent)
+    # Frame 3: obj 6 remains invisible -> retirement window (2 frames) exceeded!
+    # Frame 4: obj 6 retired, so active count is 5.
+    schedule = {
+        0: [1, 2, 3, 4, 5, 6],
+        1: [1, 2, 3, 4, 5, 6],
+        2: [1, 2, 3, 4, 5],
+        3: [1, 2, 3, 4, 5],
+        4: [1, 2, 3, 4, 5],
+        5: [1, 2, 3, 4, 5, 7], # 7 becomes visible
+        6: [1, 2, 3, 4, 5, 7],
+    }
+    
+    stub = AbsentStubPredictor(schedule, num_frames=7)
+    tracker = Sam2FieldTracker(predictor=stub)
+    
+    def detect_fn(local_idx, frame_path):
+        return [((42, 2, 46, 6), "blue")]
+        
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(i*6, 2, i*6+4, 6) for i in range(1, 7)], # 6 boxes
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        max_lifetime_objects=10,
+        retirement_frames=2,
+    )
+    
+    # Assert obj 7 was successfully prompted at frame 5 because obj 6 retired
+    assert (5, 7) in stub.add_calls
+    # Assert obj 7 is tracked in the final frame
+    assert 7 in result[6]
+
+
+def test_sam2_tracker_evidence_generation():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    
+    # schedule:
+    # Frame 0: obj 1, 2 visible
+    # Frame 1: obj 1, 2 visible
+    # Frame 2: obj 1 absent, obj 2 visible
+    # Frame 3: obj 1 visible, obj 2 visible
+    # Frame 4: obj 1, 2, 3 visible (3 is added at frame 2)
+    schedule = {
+        0: [1, 2],
+        1: [1, 2],
+        2: [2],
+        3: [1, 2],
+        4: [1, 2, 3],
+        5: [1, 2, 3],
+    }
+    
+    stub = AbsentStubPredictor(schedule, num_frames=6)
+    tracker = Sam2FieldTracker(predictor=stub)
+    
+    def detect_fn(local_idx, frame_path):
+        # At frame 2, report a new box at position 3
+        return [((18, 2, 22, 6), "red")]
+        
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        max_lifetime_objects=10,
+        retirement_frames=2,
+    )
+    
+    # Frame 0 initial check
+    assert result[0][1]["evidence"]["type"] == "initial"
+    assert result[0][1]["evidence"]["gap_len"] == 0
+    
+    # Frame 1 propagated check
+    assert result[1][1]["evidence"]["type"] == "propagated"
+    assert result[1][1]["evidence"]["gap_len"] == 0
+    
+    # Frame 2 check: obj 1 is absent (not in result[2])
+    assert 1 not in result[2]
+    
+    # Frame 3 check: obj 1 reappears
+    assert result[3][1]["evidence"]["type"] == "reappeared_same_id"
+    assert result[3][1]["evidence"]["gap_len"] == 1  # absent on frame 2
+    
+    # Frame 4 check: obj 3 has been added at frame 2, and first appears on frame 4
+    assert result[4][3]["evidence"]["type"] == "reprompted_new_id"
+    assert result[4][3]["evidence"]["gap_len"] == 0
+    assert result[5][3]["evidence"]["type"] == "propagated"
+
+
+def test_sam2_diagnostics_logging():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    
+    schedule = {
+        0: [1, 2],
+        1: [1, 2],
+        2: [2],  # obj 1 absent
+        3: [1, 2],  # obj 1 reappears
+        4: [1, 2, 3],  # obj 3 added
+        5: [1, 2, 3],
+    }
+    
+    stub = AbsentStubPredictor(schedule, num_frames=6)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = IdentityDiagnosticRecorder()
+    
+    def detect_fn(local_idx, frame_path):
+        return [((18, 2, 22, 6), "red")]
+        
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        max_lifetime_objects=10,
+        retirement_frames=2,
+        diagnostics=diag,
+    )
+    
+    events = diag._events
+    created_events = [e for e in events if e["event"] == "sam2.object_created"]
+    gap_events = [e for e in events if e["event"] == "sam2.mask_gap"]
+    candidate_events = [e for e in events if e["event"] == "sam2.reprompt_candidate"]
+    chunk_events = [e for e in events if e["event"] == "sam2.chunk_complete"]
+    
+    assert len(created_events) == 3  # 2 initial + 1 reprompted
+    assert len(chunk_events) == 2
+    assert len(gap_events) == 1
+    assert len(candidate_events) == 2
+    
+    rejected_events = [e for e in events if e["event"] == "sam2.reprompt_rejected"]
+    assert len(rejected_events) == 1
+    assert rejected_events[0]["reason"] == "below_margin"
+
+

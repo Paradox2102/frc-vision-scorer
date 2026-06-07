@@ -82,13 +82,14 @@ The Benjamin set is bumpers-only. If its images contain fuel balls that are **no
 labeled, training treats those pixels as background and degrades fuel detection.
 
 **Mitigation (decided after inspecting the data):** after merge, sample Benjamin
-images and check for visible-but-unlabeled fuel. If present and material, choose one of:
-- exclude Benjamin images from contributing to the fuel-vs-background signal is not
-  natively supported by YOLO loss, so instead either (a) pseudo-label fuel on Benjamin
-  images using the Karthik-trained fuel detector and review, or (b) accept the cost if
-  fuel is rare in Benjamin images.
-The chosen mitigation is recorded in the implementation plan once the data is seen.
-If fuel is essentially absent from Benjamin images, no action is needed.
+images and check for visible-but-unlabeled fuel. YOLO's loss has no per-image way to
+say "ignore fuel here," so if unlabeled fuel is present and material, pick one of:
+- **(a)** pseudo-label fuel on Benjamin images with a Karthik-only fuel detector, then
+  spot-review the auto-labels before merging; or
+- **(b)** accept the cost if fuel is rare enough in Benjamin images to be noise.
+
+The chosen option is recorded in the implementation plan once the data is seen. If
+fuel is essentially absent from Benjamin images, no action is needed.
 
 ### Training
 A new script `scripts/train_bumper_model.py`, modeled on `scripts/train_yolo_v5.py`:
@@ -120,16 +121,29 @@ A new script `scripts/train_bumper_model.py`, modeled on `scripts/train_yolo_v5.
 
 ### Detection normalization helper
 Centralize the currently-scattered class filtering (`app.py:798`, `:1637`, `:1942`,
-`:2820`, `:2880`, `:3332`, `:3638`) behind one helper that takes raw `sv.Detections`
+`:2820`, `:2880`, `:3332`) behind one helper that takes raw `sv.Detections`
 + the schema and returns:
 - `robot_dets`: list of `(box, color_or_None, conf)`,
 - `ball_boxes`,
 - `hub_boxes` (empty for the new model).
 
+Two related surfaces the planner must also touch:
+- `app.py:3638` hardcodes `"model_classes": {0: "fuel_ball", 1: "robot",
+  2: "hub_opening"}` in `/api/status`; drive it from the loaded schema so it doesn't
+  report stale classes under the new model.
+- `_detect_bumper_color_static` (`app.py:4251`, called at `:4881`) is a **second** HSV
+  color path. It stays on the legacy HSV approach for now (not in SP-B's critical
+  path), but the plan should note it explicitly so it isn't mistaken for dead code or
+  accidentally rewired.
+
 ### Box semantics
 - **Color, field position, and VLM crop** use the **bumper box** as-is. The box bottom
-  is the ground-contact point (field projection unchanged); the bumper box is the team-
-  number crop for the VLM.
+  is the ground-contact point; the bumper box is the team-number crop for the VLM.
+  Field projection's code path is unchanged (`_bottom_center` → box `y2`), but note a
+  small **modeling shift**: a bumper box's `y2` is the bumper's bottom edge, slightly
+  above true wheel/floor contact, versus a full-robot box bottom. Expected to be
+  negligible, but the SP-B integration test should confirm field positions don't drift
+  meaningfully versus the legacy model on the same footage.
 - **SAM2 seeding only** uses an **expanded** box. New `expand_bumper_to_robot(box,
   frame_shape, factor)` grows the box **upward** by `factor` (env
   `ROBOT_BOX_FROM_BUMPER_FACTOR`, default ~3.0 → robot height ≈ 3× bumper-box height),

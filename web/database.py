@@ -113,7 +113,8 @@ CREATE INDEX IF NOT EXISTS idx_gallery_event ON appearance_gallery(event_key, al
 
 CREATE TABLE IF NOT EXISTS match_robot_identity (
     job_id TEXT NOT NULL,
-    slot INTEGER NOT NULL,
+    identity_id INTEGER NOT NULL,
+    slot INTEGER,
     slot_label TEXT,
     alliance TEXT,
     team_number TEXT,
@@ -121,17 +122,26 @@ CREATE TABLE IF NOT EXISTS match_robot_identity (
     source TEXT,
     confidence REAL,
     created_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (job_id, slot)
+    PRIMARY KEY (job_id, identity_id)
+);
+CREATE TABLE IF NOT EXISTS match_robot_binding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    identity_id INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
+    start_frame INTEGER NOT NULL,
+    end_frame INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS match_robot_crop (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
-    slot INTEGER NOT NULL,
+    identity_id INTEGER NOT NULL,
     legibility REAL,
     embedding BLOB,
     image BLOB
 );
-CREATE INDEX IF NOT EXISTS idx_match_crop ON match_robot_crop(job_id, slot);
+CREATE INDEX IF NOT EXISTS idx_match_crop ON match_robot_crop(job_id, identity_id);
 """
 
 
@@ -619,43 +629,77 @@ async def delete_gallery_exemplar(gid):
 # --- Match robot identities & crops ---
 
 async def upsert_match_robot_identity(row: Dict[str, Any]) -> None:
-    """Insert or replace the identity for one robot slot in a job."""
+    """Insert or replace the identity for one robot in a job."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO match_robot_identity "
-            "(job_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (row["job_id"], row["slot"], row.get("slot_label"), row.get("alliance"),
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["job_id"], identity_id, row.get("slot"), row.get("slot_label"), row.get("alliance"),
              row.get("team_number"), int(row.get("confirmed", 0)), row.get("source"),
              row.get("confidence")))
         await db.commit()
 
 
 async def insert_match_robot_crop(row: Dict[str, Any]) -> None:
-    """Insert one captured bumper crop for a robot slot."""
+    """Insert one captured bumper crop for a robot identity."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO match_robot_crop (job_id, slot, legibility, embedding, image) "
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
             "VALUES (?, ?, ?, ?, ?)",
-            (row["job_id"], row["slot"], row.get("legibility"), row.get("embedding"),
+            (row["job_id"], identity_id, row.get("legibility"), row.get("embedding"),
              row.get("image")))
         await db.commit()
 
 
 async def get_match_identities(job_id) -> List[Dict]:
-    """All robot-slot identities for a job, ordered by slot."""
+    """All robot identities for a job, ordered by identity_id."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM match_robot_identity WHERE job_id = ? ORDER BY slot", (job_id,))
+            "SELECT * FROM match_robot_identity WHERE job_id = ? ORDER BY identity_id", (job_id,))
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_match_crops(job_id, slot) -> List[Dict]:
-    """All captured crops for a robot slot, most legible first."""
+async def get_match_crops(job_id, identity_id) -> List[Dict]:
+    """All captured crops for a robot identity, most legible first."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM match_robot_crop WHERE job_id = ? AND slot = ? ORDER BY legibility DESC",
-            (job_id, slot))
+            "SELECT * FROM match_robot_crop WHERE job_id = ? AND identity_id = ? ORDER BY legibility DESC",
+            (job_id, identity_id))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def insert_match_robot_binding(row: Dict[str, Any]) -> None:
+    """Insert a robot slot binding event."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO match_robot_binding (job_id, identity_id, slot, start_frame, end_frame) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (row["job_id"], identity_id, row["slot"], row["start_frame"], row.get("end_frame")))
+        await db.commit()
+
+
+async def get_match_bindings(job_id) -> List[Dict]:
+    """All binding events for a job."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM match_robot_binding WHERE job_id = ? ORDER BY id", (job_id,))
         return [dict(r) for r in await cur.fetchall()]

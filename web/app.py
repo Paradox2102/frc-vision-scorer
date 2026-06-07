@@ -64,6 +64,7 @@ from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import load_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
+from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -703,6 +704,9 @@ class InferenceJob:
 
         # Detection state
         self.hubs: List[DetectedHub] = []
+        self.identity_registry = IdentityRegistry()
+        self.robot_identities = self.identity_registry.identities
+        self._last_bindings: Dict[int, int] = {}
         self.robot_tracks: Dict[int, RobotTrack] = {}
         self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
@@ -834,7 +838,7 @@ class InferenceJob:
         available_teams = [t for t in self.match_teams if t not in confirmed_teams]
 
         for canonical_id, box in tracked_robots:
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_slot_track_if_exists(canonical_id)
             if not robot or robot.team_number_confirmed:
                 continue  # Already confirmed, skip OCR
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
@@ -1083,7 +1087,7 @@ class InferenceJob:
                            remaining_red, source_weight):
         """Read one bumper crop with the VLM and add a (confidence x source_weight)
         vote to the slot's team tally. source_weight > 1 for corner cameras."""
-        robot = self.robot_tracks.get(slot_id)
+        robot = self._get_slot_track_if_exists(slot_id)
         if not robot:
             return
         alliance = getattr(robot, "alliance", "unknown")
@@ -1268,7 +1272,7 @@ class InferenceJob:
             slot_id = self.field_tracker.last_det_to_slot.get(i)
             if slot_id is None:
                 continue
-            robot = self.robot_tracks.get(slot_id)
+            robot = self._get_or_create_slot_track(slot_id)
             if robot is None:
                 continue
             if robot.team_number_confirmed and not is_reread_pass:
@@ -1305,7 +1309,7 @@ class InferenceJob:
         crops = [c[3] for c in chosen]
         expected = []
         for _priority, slot_id, _cam, _crop_b64, _source_weight in chosen:
-            robot = self.robot_tracks.get(slot_id)
+            robot = self._get_or_create_slot_track(slot_id)
             alliance = getattr(robot, "alliance", "unknown")
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
 
@@ -1333,12 +1337,12 @@ class InferenceJob:
         ocr_crops = []
         status_results = []
         for (_priority, slot_id, cam, crop_b64, source_weight), res in zip(chosen, results):
-            robot = self.robot_tracks.get(slot_id)
+            robot = self._get_or_create_slot_track(slot_id)
             if not robot:
                 continue
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
-            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding,
+            self._capture_slot_crop(robot.robot_id, crop_b64, conf, robot.appearance_embedding,
                                     robot_crop_b64=robot.appearance_crop_b64)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
             status_results.append({
@@ -1350,7 +1354,7 @@ class InferenceJob:
                 "error": res.get("error"),
             })
             ocr_crops.append({
-                "robot_id": slot_id,
+                "robot_id": robot.robot_id,
                 "slot": self._slot_label(slot_id),
                 "alliance": res.get("alliance", "unknown"),
                 "source": cam,
@@ -1363,7 +1367,7 @@ class InferenceJob:
                 "via": "ocr",
             })
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=slot_id,
+                frame=self._current_frame, robot_id=robot.robot_id,
                 crop_b64=crop_b64,
                 legibility=0.0,
                 raw_read=res.get("raw_read"),
@@ -1454,7 +1458,7 @@ class InferenceJob:
         is_reread_pass = (self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0)
         candidates = []  # list of (score, canonical_id, box, crop_b64)
         for canonical_id, box in tracked_robots:
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
                 continue
             if robot.team_number_confirmed and not is_reread_pass:
@@ -1484,7 +1488,7 @@ class InferenceJob:
         ocr_crops = []
         for score, canonical_id, box, crop_b64 in chosen:
             expected = "unknown"
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if robot and robot.alliance in ("blue", "red"):
                 expected = robot.alliance
             res = _vision_read_bumpers(
@@ -1494,7 +1498,7 @@ class InferenceJob:
             )[0]
             results.append((canonical_id, box, res))
             ocr_crops.append({
-                "robot_id": canonical_id,
+                "robot_id": robot.robot_id,
                 "slot": self._slot_label(canonical_id),
                 "alliance": res.get("alliance", "unknown"),
                 "source": "main",
@@ -1506,7 +1510,7 @@ class InferenceJob:
                 "legibility": round(score, 4),
             })
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=canonical_id,
+                frame=self._current_frame, robot_id=robot.robot_id,
                 crop_b64=crop_b64,
                 legibility=float(score),
                 raw_read=res.get("raw_read"),
@@ -1522,7 +1526,7 @@ class InferenceJob:
             team = result.get("team_number")
             if not team:
                 continue
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
                 continue
             conf = result.get("confidence", 0.0)
@@ -1540,9 +1544,9 @@ class InferenceJob:
                 old_team = robot.team_number
                 robot.team_number = locked_team
                 robot.team_number_confirmed = True
-                self._clear_team_from_other_robots(canonical_id, locked_team)
+                self._clear_team_from_other_robots(robot.robot_id, locked_team)
                 for event in self.scoring_events:
-                    if event.robot_id == canonical_id:
+                    if event.robot_id == robot.robot_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed (vision): Robot {canonical_id} = Team {locked_team} (was {old_team})")
             tag = "RE-READ" if robot.team_number_confirmed else "read"
@@ -2130,7 +2134,7 @@ class InferenceJob:
         track_outs = track_outs or []
         for det, _crop_b64 in paired:
             t = self._nearest_track_for_detection(det, track_outs)
-            robot = self.robot_tracks.get(t.slot_id) if t is not None else None
+            robot = self._get_or_create_slot_track(t.slot_id) if t is not None else None
             fallback = f"{det.color} bumper" if det.color != "unknown" else "bumper?"
             label, _confirmed = self._team_hud_label(robot, fallback)
             alliance = robot.alliance if robot is not None else det.color
@@ -2625,25 +2629,188 @@ class InferenceJob:
         """Human label for a slot: B1..B3 / R1..R3."""
         return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
 
-    def _get_or_create_slot_track(self, slot_id: int) -> "RobotTrack":
-        """Lazily create the RobotTrack for a field-tracker slot (6 max).
+    def _identity_for_slot(self, slot_id: int) -> Optional[RobotIdentity]:
+        """Find the active identity currently bound to a slot."""
+        if not hasattr(self, "identity_registry") or self.identity_registry is None:
+            self.identity_registry = IdentityRegistry()
+            self.robot_identities = self.identity_registry.identities
+            self._last_bindings = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot == slot_id:
+                return ident
+        return None
 
-        FieldTracker owns position/alliance/box each frame; RobotTrack retains the
-        team votes, scores, and diagnostic fields keyed by slot_id."""
-        track = self.robot_tracks.get(slot_id)
+    def _get_or_create_identity_track(self, identity_id: int, alliance: str) -> "RobotTrack":
+        """Lazily create or retrieve the RobotTrack for a durable identity."""
+        track = self.robot_tracks.get(identity_id)
         if track is None:
             track = RobotTrack(
-                robot_id=slot_id,
-                alliance=self._slot_alliance(slot_id),
+                robot_id=identity_id,
+                alliance=alliance,
                 team_number=None,
                 last_position=(0.0, 0.0),
                 positions_history=deque(maxlen=30),
                 consecutive_tracker=ConsecutiveValueTracker(n_consecutive=3),
             )
-            self.robot_tracks[slot_id] = track
-        elif track.consecutive_tracker is None:
-            track.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            self.robot_tracks[identity_id] = track
+        elif not hasattr(track, "consecutive_tracker") or track.consecutive_tracker is None:
+            try:
+                track.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            except AttributeError:
+                pass
         return track
+
+    def _get_slot_track_if_exists(self, slot_id: int) -> Optional[RobotTrack]:
+        """Retrieve the RobotTrack for a slot if it already exists, without creating it lazily."""
+        ident = self._identity_for_slot(slot_id)
+        if ident is not None:
+            return self.robot_tracks.get(ident.identity_id)
+        return self.robot_tracks.get(slot_id)
+
+    def _get_or_create_slot_track(self, slot_id: int) -> "RobotTrack":
+        """Redirect slot lookup to the active identity's track.
+        If no identity is currently bound to this slot, fall back to creating one."""
+        ident = self._identity_for_slot(slot_id)
+        if ident is not None:
+            return self._get_or_create_identity_track(ident.identity_id, ident.alliance)
+        
+        alliance = self._slot_alliance(slot_id)
+        ident = self.identity_registry.identities.get(slot_id)
+        if ident is None:
+            ident = RobotIdentity(
+                identity_id=slot_id,
+                alliance=alliance,
+                active_slot=slot_id,
+                confidence=0.5
+            )
+            self.identity_registry.identities[slot_id] = ident
+            if slot_id >= self.identity_registry._next_id:
+                self.identity_registry._next_id = slot_id + 1
+        return self._get_or_create_identity_track(ident.identity_id, alliance)
+
+    async def _bind_detection_identity(self, slot_id: int, identity_id: int):
+        ident = self.identity_registry.identities.get(identity_id)
+        if ident is not None:
+            ident.active_slot = slot_id
+            ident.last_seen_frame = self._current_frame
+            if not getattr(self, "_mock_db", False):
+                try:
+                    await database.insert_match_robot_binding({
+                        "job_id": self.job_id,
+                        "identity_id": identity_id,
+                        "slot": slot_id,
+                        "start_frame": self._current_frame,
+                    })
+                except Exception as e:
+                    print(f"Error inserting binding: {e}")
+
+    async def _detach_expired_slots(self):
+        if self.field_tracker is None:
+            return
+        import aiosqlite
+        for event in self.field_tracker.binding_events:
+            if event["event"] == "slot_expired":
+                slot_id = event["slot_id"]
+                for ident in self.identity_registry.identities.values():
+                    if ident.active_slot == slot_id:
+                        ident.active_slot = None
+                        if not getattr(self, "_mock_db", False):
+                            try:
+                                async with aiosqlite.connect(database.DB_PATH) as db:
+                                    await db.execute(
+                                        "UPDATE match_robot_binding SET end_frame = ? WHERE job_id = ? AND identity_id = ? AND slot = ? AND end_frame IS NULL",
+                                        (self._current_frame, self.job_id, ident.identity_id, slot_id)
+                                    )
+                                    await db.commit()
+                            except Exception as e:
+                                print(f"Error updating end_frame: {e}")
+
+    def _visible_identities(self) -> list[RobotIdentity]:
+        """All active identities that are currently visible (not coasting)."""
+        if self.field_tracker is None:
+            return []
+        visible_slots = {t.slot_id for t in self.field_tracker._emit() if t.status == "visible"}
+        return [ident for ident in self.identity_registry.identities.values()
+                if ident.active_slot in visible_slots]
+
+    async def _sync_identity_registry_frame(self, fused: list, ev_list: list, track_outs: list):
+        # 1. Detach expired slots
+        await self._detach_expired_slots()
+
+        # 2. Gather observations
+        observations = []
+        slot_to_fused = {}
+        slot_to_ev = {}
+
+        # From assignment_evidence:
+        for slot_id, evidence in self.field_tracker.assignment_evidence.items():
+            det_idx = evidence["detection_idx"]
+            if det_idx < len(fused):
+                slot_to_fused[slot_id] = fused[det_idx]
+                if det_idx < len(ev_list):
+                    slot_to_ev[slot_id] = ev_list[det_idx]
+
+        # From binding events:
+        for event in self.field_tracker.binding_events:
+            if event["event"] in ("slot_rebound", "slot_seeded"):
+                slot_id = event["slot_id"]
+                track_id = event["track_id"]
+                fused_obs = next((o for o in fused if o.track_id == track_id), None)
+                if fused_obs is not None:
+                    slot_to_fused[slot_id] = fused_obs
+                    for idx, o in enumerate(fused):
+                        if o.track_id == track_id:
+                            if idx < len(ev_list):
+                                slot_to_ev[slot_id] = ev_list[idx]
+                            break
+
+        # Construct IdentityObservation
+        for t in track_outs:
+            slot_id = t.slot_id
+            fused_obs = slot_to_fused.get(slot_id)
+            ev = slot_to_ev.get(slot_id)
+            
+            pos = fused_obs.detection.pos if fused_obs is not None else t.pos
+            alliance = t.alliance
+            emb = fused_obs.detection.embedding if fused_obs is not None else None
+            
+            margin = ev.margin if ev is not None else 1.0
+            ev_type = ev.type if ev is not None else "initial"
+            
+            obs = IdentityObservation(
+                slot_id=slot_id,
+                pos=pos,
+                alliance=alliance,
+                embedding=emb,
+                relink_margin=margin,
+                continuity_evidence=ev_type
+            )
+            observations.append(obs)
+
+        # 3. Call registry update
+        def alliance_side(pos):
+            if self.field_model is not None:
+                return self.field_model.alliance_side(pos)
+            return "blue" if pos[0] < self.field_length / 2.0 else "red"
+
+        self.identity_registry.update_frame(
+            frame_idx=self._current_frame,
+            observations=observations,
+            alliance_side_fn=alliance_side
+        )
+
+        # 4. Bind new slots to identities
+        current_bindings = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot is not None:
+                current_bindings[ident.identity_id] = ident.active_slot
+
+        for ident_id, slot_id in current_bindings.items():
+            prev_slot = self._last_bindings.get(ident_id)
+            if prev_slot != slot_id:
+                await self._bind_detection_identity(slot_id, ident_id)
+
+        self._last_bindings = current_bindings
 
     def _is_robot_on_alliance_side(self, robot_x: float, alliance: str) -> bool:
         """Check if a robot is on its alliance's side of the field.
@@ -3171,7 +3338,8 @@ class InferenceJob:
                                     # tracking (robots can't be there) — a false-positive
                                     # filter.  NOTE: this does NOT save SAM2 VRAM/compute:
                                     # SAM2 hard-resizes every frame to a fixed image_size
-                                    # square, so fewer input rows                                    top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                    # square, so fewer input rows
+                                    top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
                                     top_crop_px = int(crop.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
                                     if top_crop_px > 0:
                                         crop = crop[top_crop_px:, :]
@@ -3435,6 +3603,9 @@ class InferenceJob:
                     )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
+                from web.field.fusion import FusedObservation
+                early_fused = [FusedObservation(detection=d, evidence=[]) for d in early_field_dets]
+                await self._sync_identity_registry_frame(early_fused, [], early_outs)
                 early_robots = []
                 for t in early_outs:
                     if t.state != "visible" or t.box is None:
@@ -3615,12 +3786,14 @@ class InferenceJob:
                            for v in self.views}
                 fused = fuse_detections(per_camera, weights=weights)   # list[FusedObservation]
                 
+                ev_list = []
                 if self.use_sam2:
-                    self.fused_registry.assign(fused)
+                    ev_list = self.fused_registry.assign(fused)
 
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                await self._sync_identity_registry_frame(fused, ev_list, track_outs)
 
                 # 5. Resolve occlusion from every posed camera and merge: a track
                 #    is occluded only if occluded in ALL posed cameras.
@@ -3894,10 +4067,8 @@ class InferenceJob:
                             {
                                 "slot": self._slot_label(t.slot_id),
                                 "alliance": t.alliance,
-                                "team_number": (self.robot_tracks[t.slot_id].team_number
-                                                if t.slot_id in self.robot_tracks else None),
-                                "confirmed": (self.robot_tracks[t.slot_id].team_number_confirmed
-                                              if t.slot_id in self.robot_tracks else False),
+                                "team_number": self._get_or_create_slot_track(t.slot_id).team_number,
+                                "confirmed": self._get_or_create_slot_track(t.slot_id).team_number_confirmed,
                                 "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
                             }
                             for t in track_outs if t.state != "empty"
@@ -3917,9 +4088,12 @@ class InferenceJob:
                     best_vote = 0.0
                     if robot.team_ocr_votes:
                         best_vote_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
+                    ident = self.identity_registry.identities.get(robot.robot_id)
+                    slot_id = ident.active_slot if ident else None
+                    slot_label = self._slot_label(slot_id) if slot_id is not None else "occluded"
                     robots_data.append({
                         "id": robot.robot_id,
-                        "slot": self._slot_label(robot.robot_id),
+                        "slot": slot_label,
                         "alliance": robot.alliance,
                         "team_number": robot.team_number,
                         "confirmed": robot.team_number_confirmed,
@@ -3933,18 +4107,21 @@ class InferenceJob:
                 events_data = []
                 for event in self.scoring_events[-10:]:  # Last 10 events
                     robot = self.robot_tracks.get(event.robot_id)
+                    ident = self.identity_registry.identities.get(event.robot_id)
+                    slot_id = ident.active_slot if ident else None
+                    slot_label = self._slot_label(slot_id) if slot_id is not None else f"Robot {event.robot_id}"
                     events_data.append({
                         "frame": event.frame_num,
                         "timestamp": event.timestamp,
                         "alliance": event.alliance,
                         "robot_id": event.robot_id,
-                        "slot": self._slot_label(event.robot_id),
+                        "slot": slot_label,
                         "team_number": event.team_number,
                         "team_candidate": (robot.team_number if robot else None),
                         "robot_label": (
                             event.team_number
                             or (robot.team_number if robot and robot.team_number else None)
-                            or self._slot_label(event.robot_id)
+                            or slot_label
                         ),
                         "confidence": event.confidence
                     })
@@ -4100,19 +4277,22 @@ class InferenceJob:
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
             try:
-                for slot_id, robot in self.robot_tracks.items():
-                    crops = self._slot_crops.get(slot_id, [])
+                for identity_id, robot in self.robot_tracks.items():
+                    ident = self.identity_registry.identities.get(identity_id)
+                    active_slot = ident.active_slot if ident else None
+                    slot_label = self._slot_label(active_slot) if active_slot is not None else "occluded"
+                    crops = self._slot_crops.get(identity_id, [])
                     await database.upsert_match_robot_identity({
-                        "job_id": self.job_id, "slot": slot_id,
-                        "slot_label": self._slot_label(slot_id),
+                        "job_id": self.job_id, "identity_id": identity_id, "slot": active_slot,
+                        "slot_label": slot_label,
                         "alliance": robot.alliance, "team_number": robot.team_number,
                         "confirmed": int(bool(robot.team_number_confirmed)),
-                        "source": self._slot_source.get(slot_id, "ocr"),
+                        "source": self._slot_source.get(identity_id, "ocr"),
                         "confidence": (crops[0]["quality"] if crops else None),
                     })
                     for c in crops:
                         await database.insert_match_robot_crop({
-                            "job_id": self.job_id, "slot": slot_id,
+                            "job_id": self.job_id, "identity_id": identity_id,
                             "legibility": c["quality"],
                             "embedding": (None if c["embedding"] is None
                                           else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
@@ -6047,11 +6227,17 @@ async def get_replay_identities(job_id: str):
     ids = await database.get_match_identities(job_id)
     out = []
     for r in ids:
-        crops = await database.get_match_crops(job_id, r["slot"])
+        identity_id = r.get("identity_id")
+        if identity_id is None:
+            identity_id = r["slot"]
+        crops = await database.get_match_crops(job_id, identity_id)
         out.append({
-            "slot": r["slot"], "slot_label": r["slot_label"], "alliance": r["alliance"],
+            "slot": r["slot"] if r["slot"] is not None else -1,
+            "slot_label": r["slot_label"] if r["slot_label"] is not None else "occluded",
+            "alliance": r["alliance"],
             "team_number": r["team_number"], "confirmed": bool(r["confirmed"]),
             "source": r["source"], "confidence": r["confidence"],
+            "identity_id": identity_id,
             "crops": [
                 "data:image/jpeg;base64," + base64.b64encode(c["image"]).decode()
                 for c in crops if c["image"] is not None
@@ -6066,16 +6252,31 @@ async def correct_replay_identity(job_id: str, request: Request):
     replay's displayed team list, and mints VERIFIED gallery exemplars from the
     slot's crops (only when the replay has an event_key)."""
     body = await request.json()
-    slot = int(body["slot"])
+    identity_id = body.get("identity_id")
+    slot = body.get("slot")
+    if slot is not None:
+        slot = int(slot)
     team = str(body["team_number"]).strip()
-    ids = {r["slot"]: r for r in await database.get_match_identities(job_id)}
-    rec = ids.get(slot)
+    
+    ids = await database.get_match_identities(job_id)
+    rec = None
+    if identity_id is not None:
+        rec = next((r for r in ids if r.get("identity_id") == int(identity_id)), None)
+    elif slot is not None:
+        rec = next((r for r in ids if r.get("slot") == slot), None)
+        
     if rec is None:
-        return JSONResponse(status_code=404, content={"error": "slot not found"})
+        return JSONResponse(status_code=404, content={"error": "identity not found"})
+        
+    resolved_identity_id = rec.get("identity_id")
+    if resolved_identity_id is None:
+        resolved_identity_id = rec["slot"]
+    resolved_slot = rec.get("slot")
+        
     alliance = rec["alliance"]
     # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence)
     await database.upsert_match_robot_identity(
-        {**rec, "job_id": job_id, "slot": slot, "team_number": team})
+        {**rec, "job_id": job_id, "identity_id": resolved_identity_id, "team_number": team})
     # 2. update the replay's team lists for display + mint exemplars
     replay = await database.get_replay(job_id)
     minted = 0
@@ -6091,11 +6292,11 @@ async def correct_replay_identity(job_id: str, request: Request):
         if team not in [str(t) for t in teams]:
             teams.append(team)
         await database.update_replay_teams(job_id, key, json.dumps(teams))
-        # 3. mint verified exemplars from this slot's crops (needs event_key + color)
+        # 3. mint verified exemplars from this identity's crops (needs event_key + color)
         event_key = replay.get("event_key")
         color = alliance if alliance in ("red", "blue") else None
         if event_key and color:
-            for c in await database.get_match_crops(job_id, slot):
+            for c in await database.get_match_crops(job_id, resolved_identity_id):
                 if c["embedding"] is None:
                     continue
                 await database.insert_gallery_exemplar({
@@ -6103,7 +6304,8 @@ async def correct_replay_identity(job_id: str, request: Request):
                     "embedding": c["embedding"], "legibility": c["legibility"],
                     "image": c["image"], "verified": 1, "job_id": job_id})
                 minted += 1
-    return {"status": "ok", "slot": slot, "team_number": team,
+    return {"status": "ok", "slot": resolved_slot if resolved_slot is not None else -1,
+            "identity_id": resolved_identity_id, "team_number": team,
             "verified_exemplars": minted}
 
 

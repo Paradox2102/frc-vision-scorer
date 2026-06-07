@@ -1157,6 +1157,12 @@ class InferenceJob:
         robot.consecutive_tracker.update(new_team)
         robot.team_number = None
         robot.team_number_confirmed = False
+        ident = self.identity_registry.identities.get(robot.robot_id)
+        if ident:
+            ident.team_number = None
+            ident.is_confirmed = False
+            ident.confidence = 0.4
+            ident.needs_immediate_read = True
 
     def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding, robot_crop_b64=None):
         """Keep the top-3 (by quality) crops per slot for post-match review.
@@ -2827,6 +2833,91 @@ class InferenceJob:
             observations=observations,
             alliance_side_fn=alliance_side
         )
+
+        # 3.5 Update live confidence signals
+        from web.field.identity_confidence import ConfidenceSignals, ConfidenceState, calculate_confidence_update
+        from web.embedder import cosine_similarity
+        
+        team_counts = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.team_number:
+                team_counts[ident.team_number] = team_counts.get(ident.team_number, 0) + 1
+
+        for ident in self.identity_registry.identities.values():
+            is_observed = (ident.active_slot is not None)
+            
+            # Find the observation relink_margin
+            relink_margin = 1.0
+            continuity_evidence = "initial"
+            obs_emb = None
+            if is_observed:
+                # Find matching observation
+                obs = next((o for o in observations if o.slot_id == ident.active_slot), None)
+                if obs is not None:
+                    relink_margin = obs.relink_margin
+                    continuity_evidence = obs.continuity_evidence
+                    obs_emb = obs.embedding
+
+            # Check for appearance divergence
+            appearance_divergent = False
+            if is_observed and obs_emb is not None and ident.appearance_embedding is not None:
+                sim = cosine_similarity(obs_emb, ident.appearance_embedding)
+                if sim < 0.7:
+                    appearance_divergent = True
+
+            roster_uniqueness_ok = True
+            if ident.team_number:
+                roster_uniqueness_ok = (team_counts.get(ident.team_number, 0) <= 1)
+
+            signals = ConfidenceSignals(
+                is_observed=is_observed,
+                relink_margin=relink_margin,
+                has_vlm_read=ident.has_vlm_read,
+                vlm_agrees=ident.vlm_agrees,
+                vlm_contradicts=ident.vlm_contradicts,
+                is_confirmed=ident.is_confirmed,
+                roster_uniqueness_ok=roster_uniqueness_ok
+            )
+
+            state = ConfidenceState(
+                confidence=ident.confidence,
+                is_confirmed=ident.is_confirmed
+            )
+
+            update = calculate_confidence_update(state, signals, self.confidence_config)
+
+            # Log confidence changes crossing thresholds (from or to confirmed/high confidence)
+            old_conf = ident.confidence
+            new_conf = update.new_confidence
+            ident.confidence = new_conf
+
+            if (old_conf < 0.8 and new_conf >= 0.8) or (old_conf >= 0.4 and new_conf < 0.4):
+                print(f"  Identity {ident.identity_id} confidence threshold crossed: {old_conf:.2f} -> {new_conf:.2f} (reasons: {', '.join(update.reasons)})")
+
+            # Reset transient VLM flags
+            ident.has_vlm_read = False
+            ident.vlm_agrees = False
+            ident.vlm_contradicts = False
+
+            # Queue immediate reads on low confidence / bad signals
+            if is_observed:
+                prev_slot = self._last_bindings.get(ident.identity_id)
+                # re-attachment
+                if prev_slot is None:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
+                # low margins
+                if relink_margin < 0.1:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
+                # appearance divergence
+                if appearance_divergent:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: appearance divergent")
+                # roster conflict
+                if not roster_uniqueness_ok:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: roster conflict")
 
         # 4. Bind new slots to identities
         current_bindings = {}

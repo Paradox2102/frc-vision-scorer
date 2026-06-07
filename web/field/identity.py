@@ -22,6 +22,9 @@ class RobotIdentity:
     backoff_until: float = -999.0
     vlm_fail_count: int = 0
     needs_immediate_read: bool = False
+    has_vlm_read: bool = False
+    vlm_agrees: bool = False
+    vlm_contradicts: bool = False
 
 @dataclass
 class IdentityObservation:
@@ -35,11 +38,12 @@ class IdentityObservation:
     continuity_evidence: str = "initial"
 
 class IdentityRegistry:
-    def __init__(self, association_threshold: float = 0.75, app_floor: float = 0.55, ema_alpha: float = 0.3) -> None:
+    def __init__(self, association_threshold: float = 0.75, app_floor: float = 0.55, ema_alpha: float = 0.3, app_update_floor: float = 0.6) -> None:
         self.identities: dict[int, RobotIdentity] = {}
         self.association_threshold = association_threshold
         self.app_floor = app_floor
         self.ema_alpha = ema_alpha
+        self.app_update_floor = app_update_floor
         self._next_id = 0
 
     def get_active_identities(self) -> list[RobotIdentity]:
@@ -155,7 +159,7 @@ class IdentityRegistry:
                         ident.anchor_embedding = obs.embedding
                         ident.recent_exemplars = [obs.embedding]
                     else:
-                        if obs.relink_margin >= 0.05:
+                        if obs.relink_margin >= 0.05 and ident.confidence >= self.app_update_floor:
                             old_emb = ident.appearance_embedding
                             new_emb = obs.embedding
                             blended = (1.0 - self.ema_alpha) * old_emb + self.ema_alpha * new_emb

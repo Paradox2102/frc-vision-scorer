@@ -50,6 +50,22 @@ frames. This is chosen over an inline per-frame gate because SAM2 is a **batch**
 the export, detection, and scoring phases all consume the same ranges without
 duplicating the decision, and lets us know the teleop-end (+3 s) frame before exporting.
 
+This pre-scan is **its own sparse decode pass** (sample ~every 0.5 s), run *before*
+`frame_skip` and the windows exist — it is **not** a modification of the existing SAM2
+export loop (which decodes every kept frame *after* the range is known).
+
+### SAM2 prompt-frame interaction (must address)
+SAM2 today seeds from a fixed prompt frame `EARLY_OCR_FRAME = 200` (`app.py:2664`,
+`2754`) and disables itself if `total_frames <= EARLY_OCR_FRAME` (`app.py:2672`). Frame
+200 lands in the **pre-match dead air** the gate skips, so naively excluding pre-window
+frames would break SAM2 seeding and the early-OCR pass (`app.py:2926`).
+
+Resolution: when an auto window is found, **relocate the SAM2 prompt frame and the early
+OCR to the first active (auto-start) frame** instead of `EARLY_OCR_FRAME` — which is
+where robots are in known starting positions anyway, a *better* seed. Base the
+"too short → disable SAM2" check on **active-window length**, not `total_frames`. When
+the gate falls back to full-video, behavior is unchanged (`EARLY_OCR_FRAME` as today).
+
 ### Pre-scan algorithm
 1. **Sample the clock** at a coarse interval (e.g. every ~0.5 s of video) by decoding
    that frame and OCRing the `match_clock` ROI. Parse `M:SS` → seconds; unparseable →
@@ -77,41 +93,60 @@ where possible; at minimum it is a single sequential read of sparse frames.
 ## Reading the clock
 
 - New `match_clock` OCR region, in the same per-event region system as the scores
-  (`OCR_REGIONS_1080P`, `scale_ocr_regions`, `/api/set-ocr-regions`).
+  (`OCR_REGIONS_1080P`, `scale_ocr_regions`, and the `/api/ocr-regions` POST/GET
+  endpoints, `app.py:3646`/`3666`).
 - **Default region (verified against a real 1920×1080 broadcast frame):**
   `match_clock: (905, 68, 118, 56)` in the 1920×723 overhead-crop reference — the white
-  clock box between the blue and red score boxes. Scales per-video via
-  `scale_ocr_regions` exactly like the score regions. Works with no calibration for the
-  standard layout; overridable per event.
+  clock box between the blue and red score boxes. Read on the **overhead crop** (top
+  `overhead_height` rows), same input contract as `ocr_score`. Scales per-video via
+  `scale_ocr_regions`.
+- **Required backend changes (the override path is NOT free — the spec previously
+  mis-stated this):**
+  1. `set_ocr_regions` (`app.py:3647`) hardcodes `for key in ["red_center",
+     "blue_center"]`, so a posted `match_clock` is silently dropped. Add `match_clock`
+     to that accepted-key set. (The DB layer `save_ocr_regions`/`get_ocr_regions` already
+     serializes arbitrary keys as JSON — verified — so no DB change is needed.)
+  2. `scale_ocr_regions` (`app.py:179`) does `regions = custom_ocr_regions if
+     custom_ocr_regions else OCR_REGIONS_1080P` — custom **replaces** defaults entirely.
+     So an event with custom *score* regions but no clock box would lose the clock
+     default. Change to **merge**: `{**OCR_REGIONS_1080P, **(custom_ocr_regions or {})}`,
+     so the verified clock default applies unless explicitly overridden. (This also makes
+     score defaults survive a clock-only calibration — strictly an improvement.)
 - **Reader:** a `read_match_clock(overhead_frame) -> int | None` method mirroring
-  `ocr_score`: crop ROI → 4× upscale → grayscale → threshold → `pytesseract` with
-  `--psm 7 -c tessedit_char_whitelist=0123456789:`. Parse `M:SS` (and bare `SS`) to total
-  seconds; reject implausible values (> ~3:00 or non-matching) as `None`.
+  `ocr_score` (`app.py:1601`): crop ROI → 4× upscale → grayscale → threshold →
+  `pytesseract` with `--psm 7 -c tessedit_char_whitelist=0123456789:`. Parse `M:SS` (and
+  bare `SS`) to total seconds; reject implausible values (> ~3:00 or non-matching) as
+  `None`.
   - Verified: this region + config reads `1:48, 1:27, 1:06, 0:44, 0:23` across a sample
     match, identical under normal and inverted threshold.
 
 ## Calibration UI (overridable default)
 
 Add a **"Draw Match Clock"** button to the existing OCR setup flow in `index.html`
-(beside "Draw RED/BLUE Score"), drawing a box that saves under the `match_clock` key.
-The save/load path needs no backend change — `/api/set-ocr-regions` already persists
-arbitrary region keys per event. With the verified default in place, this is an override,
-not a requirement.
+(beside "Draw RED/BLUE Score"), drawing a box that POSTs under the `match_clock` key to
+`/api/ocr-regions`. This depends on the backend whitelist change above (point 1) —
+without it the box is saved-to-nothing. With the verified default in place, this is an
+override, not a requirement.
 
 ## Components / files
 
 - `web/app.py`
   - `OCR_REGIONS_1080P`: add `"match_clock": (905, 68, 118, 56)`.
-  - `read_match_clock()` method (mirrors `ocr_score`, `app.py:1601`).
-  - `MatchTimeline` / `compute_active_windows(...)` — the pre-scan: sample clock, build
-    running segments, emit merged active frame ranges (+ fallback). Pure-ish logic split
-    into a testable helper (see Testing) that takes a list of `(frame, seconds|None)`
-    samples and returns active `(start, end)` ranges, separate from the I/O that produces
-    the samples.
+  - `scale_ocr_regions` (`:179`): merge custom over defaults (see Required backend
+    changes #2) so the clock default survives a scores-only calibration.
+  - `set_ocr_regions` (`:3647`): accept the `match_clock` key (Required backend changes #1).
+  - `read_match_clock()` method (mirrors `ocr_score`, `:1601`; operates on the overhead crop).
+  - `compute_active_windows(samples, fps, ...)` — **pure** helper: takes
+    `[(frame, seconds|None), ...]` and returns merged active `(start, end)` frame ranges
+    plus a `fell_back: bool`. This is the unit-tested core, separate from the I/O that
+    decodes frames and produces the samples.
+  - The pre-scan driver (sparse decode + `read_match_clock` → samples → `compute_active_windows`).
   - Processing loop + SAM2 export: consult the active ranges; skip frames outside them.
+    Relocate the SAM2 prompt frame / early OCR to the first active frame and base the
+    SAM2 disable check on active-window length (see SAM2 prompt-frame interaction).
   - A startup log line: windows found (auto/teleop frame ranges) or the fallback warning.
 - `web/static/index.html` (+ its OCR-setup JS): "Draw Match Clock" button + wiring into
-  the existing region-draw/save flow.
+  the existing region-draw/save flow (depends on the `set_ocr_regions` whitelist change).
 
 ## Out of scope
 

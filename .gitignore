@@ -109,3 +109,8 @@ log.md
 
 # Match replay artifacts (recorded HUD videos + metadata, large/user data)
 web/replays/
+
+# Bumper-model datasets (reproducible via scripts/download_bumper_datasets.py)
+/data/bumper_benjamin/
+/data/bumper_karthik/
+/data/bumper_merged/

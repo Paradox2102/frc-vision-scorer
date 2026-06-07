@@ -51,8 +51,8 @@ from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
-from web.field.detect_bridge import to_field_detections, field_adjacent_persons
-from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot
+from web.field.detect_bridge import to_field_detections, field_adjacent_persons, box_exceeds_frac
+from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot, box_ios, merge_robot_detections, select_gap_fills
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
@@ -482,6 +482,12 @@ VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
 
+# Whole-robot gap-fill parameters
+ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
+ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
+ROBOT_FILL_IOS = float(os.environ.get("ROBOT_FILL_IOS", "0.5"))
+ROBOT_FILL_MAX_BOX_FRAC = float(os.environ.get("ROBOT_FILL_MAX_BOX_FRAC", "0.5"))
+
 # Scoring parameters
 BALL_PROXIMITY_FRAMES = 30  # Look back this many frames for ball near robot
 HUB_DISTANCE_HIGH_CONF = 150  # px
@@ -644,6 +650,14 @@ class InferenceJob:
                 f"[detect] bumper model not found at {BUMPER_MODEL_PATH}; "
                 "falling back to existing model robot detections with unknown color"
             )
+
+        # Resolve the whole-robot class ID once
+        self.whole_robot_class_id = 1
+        if self.det_schema is not None:
+            for cid, col in self.det_schema.robot_class_color.items():
+                if col is None:
+                    self.whole_robot_class_id = cid
+                    break
         # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
         # Absolute path so it doesn't depend on CWD (a bare name would trigger a
         # hub auto-download attempt for a non-existent release).
@@ -965,6 +979,21 @@ class InferenceJob:
         if not ok:
             return None
         return base64.b64encode(buf).decode('utf-8')
+
+    def _detect_whole_robots(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
+        """Run YOLO model on the frame, select only the whole-robot class, and filter out boxes that exceed ROBOT_FILL_MAX_BOX_FRAC."""
+        if not ROBOT_FILL_ENABLED:
+            return []
+        results = self.model(frame, conf=ROBOT_FILL_CONF, verbose=False)[0]
+        dets = sv.Detections.from_ultralytics(results)
+        
+        valid_boxes = []
+        for i in range(len(dets)):
+            if int(dets.class_id[i]) == self.whole_robot_class_id:
+                box = tuple(float(v) for v in dets.xyxy[i])
+                if not box_exceeds_frac(box, frame.shape, ROBOT_FILL_MAX_BOX_FRAC):
+                    valid_boxes.append(box)
+        return valid_boxes
 
     def _detect_view(self, view, composite_frame, precomputed_dets=None, frame_num=0):
         """Run YOLO + person detection on one camera view; returns
@@ -3142,18 +3171,16 @@ class InferenceJob:
                                     # tracking (robots can't be there) — a false-positive
                                     # filter.  NOTE: this does NOT save SAM2 VRAM/compute:
                                     # SAM2 hard-resizes every frame to a fixed image_size
-                                    # square, so fewer input rows == same tensor.  It does
-                                    # make robots larger in that square (better mask res).
-                                    top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                    if top_crop_frac > 0:
-                                        top_crop_px = int(crop.shape[0] * top_crop_frac)
+                                    # square, so fewer input rows                                    top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                    top_crop_px = int(crop.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
+                                    if top_crop_px > 0:
                                         crop = crop[top_crop_px:, :]
                                     new_w = int(crop.shape[1] * SAM2_SCALE)
                                     new_h = int(crop.shape[0] * SAM2_SCALE)
                                     small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
                                     fname = os.path.join(view_dirs[view.name].name, f"{local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
+ 
                                     # Seed SAM2 from expanded bumper detections so masks
                                     # cover whole robots while color stays class-derived.
                                     if is_prompt and self.bumper_model is not None:
@@ -3163,16 +3190,51 @@ class InferenceJob:
                                         robots, _balls, _hubs = self.det_schema.split(
                                             sv.Detections.from_ultralytics(res)
                                         )
+                                        bumper_robots = []
                                         for box, color, _confidence in robots:
                                             robot_box = expand_bumper_to_robot(
                                                 box,
                                                 crop.shape,
                                                 ROBOT_BOX_FROM_BUMPER_FACTOR,
                                             )
+                                            bumper_robots.append((robot_box, color))
+                                        
+                                        whole_boxes = self._detect_whole_robots(crop)
+                                        merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
+                                        
+                                        bumper_halves = []
+                                        unknown_halves = []
+                                        unknown_boxes = []
+                                        for box, color in merged:
+                                            x1, y1, x2, y2 = box
+                                            full_box = (x1, y1 + top_crop_px, x2, y2 + top_crop_px)
+                                            uv = ((full_box[0] + full_box[2]) / 2.0, full_box[3])
+                                            xy = view.calibration.image_to_field(uv)
+                                            half = None
+                                            if xy is not None and self.field_model is not None:
+                                                half = self.field_model.alliance_side(xy)
+                                            
+                                            if color != "unknown":
+                                                if half is not None:
+                                                    bumper_halves.append(half)
+                                            else:
+                                                unknown_halves.append(half)
+                                                unknown_boxes.append(box)
+                                        
+                                        keep_indices = select_gap_fills(bumper_halves, unknown_halves, max_per_half=3)
+                                        
+                                        for box, color in merged:
+                                            if color != "unknown":
+                                                view_prompt_boxes[view.name].append(
+                                                    tuple(v * SAM2_SCALE for v in box)
+                                                )
+                                                view_prompt_colors[view.name].append(color)
+                                        
+                                        for idx in keep_indices:
                                             view_prompt_boxes[view.name].append(
-                                                tuple(v * SAM2_SCALE for v in robot_box)
+                                                tuple(v * SAM2_SCALE for v in unknown_boxes[idx])
                                             )
-                                            view_prompt_colors[view.name].append(color)
+                                            view_prompt_colors[view.name].append("unknown")
                                     elif is_prompt:
                                         res = self.model(crop, conf=0.4, verbose=False)[0]
                                         for i in range(len(res.boxes)):
@@ -3245,17 +3307,17 @@ class InferenceJob:
                                     robots, _balls, _hubs = self.det_schema.split(
                                         sv.Detections.from_ultralytics(res)
                                     )
-                                    return [
-                                        (
-                                            expand_bumper_to_robot(
-                                                box,
-                                                img.shape,
-                                                ROBOT_BOX_FROM_BUMPER_FACTOR,
-                                            ),
-                                            color,
+                                    bumper_robots = []
+                                    for box, color, _confidence in robots:
+                                        robot_box = expand_bumper_to_robot(
+                                            box,
+                                            img.shape,
+                                            ROBOT_BOX_FROM_BUMPER_FACTOR,
                                         )
-                                        for box, color, _confidence in robots
-                                    ]
+                                        bumper_robots.append((robot_box, color))
+                                    whole_boxes = self._detect_whole_robots(img)
+                                    merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
+                                    return merged
                                 res = self.model(img, conf=0.4, verbose=False)[0]
                                 return [
                                     tuple(res.boxes.xyxy[i].cpu().numpy())

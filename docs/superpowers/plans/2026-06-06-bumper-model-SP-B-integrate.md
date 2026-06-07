@@ -425,9 +425,10 @@ The HUD draw branch (`:3282-3344`) is rewired in Task 6 (it's coupled to the
 `detect_bumper_color` deletion). After Tasks 4 **and** 6, verify no live `class_id`
 literal remains:
 
-Run: `grep -n "class_id ==\|class_id\[di\] !=\|class_id == [012]" web/app.py`
-Expected after both tasks: only the dead-code `:2186` line (with its added comment) and
-any schema-driven comparisons remain — no bare `== 0/1/2` in a live path. The
+Run: `grep -nE "class_id(\[[^]]*\])? *[!=]= *[012]\b" web/app.py`
+(This matches only **bare-integer** comparisons, so schema-driven lines like
+`int(class_id) == self.det_schema.fuel_class` don't false-positive.)
+Expected after both tasks: only the dead-code `:2186` line remains. The
 grep-verified full inventory is: `798, 1637, 1942, 2186(dead), 2933, 3187, 3204,
 3286/3289/3338/3341/3344, 4870`.
 

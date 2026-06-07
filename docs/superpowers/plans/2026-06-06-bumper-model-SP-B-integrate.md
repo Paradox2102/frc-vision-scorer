@@ -155,11 +155,7 @@ def expand_bumper_to_robot(box, frame_shape, factor: float = 3.0):
     raised by (factor-1)*height and clamped to the frame. frame_shape is (H, W, ...)."""
     x1, y1, x2, y2 = box
     h = y2 - y1
-    new_y1 = y2 - h * factor
-    if frame_shape is not None:
-        new_y1 = max(0.0, new_y1)
-    else:
-        new_y1 = max(0.0, new_y1)
+    new_y1 = max(0.0, y2 - h * factor)   # raise top; clamp to frame top
     return (x1, new_y1, x2, y2)
 ```
 
@@ -453,15 +449,17 @@ git commit -m "feat(detect): SAM2 seeds from expanded robot boxes; seed-time all
 
 - [ ] **Step 1: Drive `/api/status` model_classes from the schema**
 
-At `app.py:3638`, replace the hardcoded dict:
+`/api/status` (`app.py:3632-3643`) is **process-global** — it has no job parameter. The module holds `jobs: Dict[str, InferenceJob]` (keyed by job_id, defined ~`app.py:346`) with no "active job" accessor. So derive the schema from the most-recent job if one exists, else fall back to the legacy dict. First read the handler and pick the most-recently-created job (the dict preserves insertion order, so the last value is newest). Replace the hardcoded `"model_classes": {...}` line with:
 
 ```python
-        "model_classes": {int(k): v for k, v in (job.det_schema.names.items()
-                          if job and getattr(job, "det_schema", None) else
-                          {0: "fuel_ball", 1: "robot", 2: "hub_opening"}.items())},
+        "model_classes": (
+            lambda _j: {int(k): v for k, v in _j.det_schema.names.items()}
+            if (_j is not None and getattr(_j, "det_schema", None) is not None)
+            else {0: "fuel_ball", 1: "robot", 2: "hub_opening"}
+        )(next(reversed(jobs.values()), None) if jobs else None),
 ```
 
-> Read the surrounding handler to get the correct reference to the running job/processor object (it may not be named `job`). Use whatever the handler already uses to reach the processor; fall back to the legacy dict when no job is active.
+> If the handler already exposes a more appropriate processor reference, use that instead — the requirement is just: schema names when a job exists, legacy dict otherwise. Confirm `jobs` is in scope in the handler (it's a module global).
 
 - [ ] **Step 2: Warn when a hubless schema has no static hubs**
 
@@ -518,8 +516,8 @@ Requires the SP-A artifact (`runs/train/frc_bumpers/weights/best.pt`) and static
 
 - [ ] **Step 1: Confirm the full unit suite is green**
 
-Run: `.venv/bin/python -m pytest tests/test_detect_schema.py tests/test_detect_bridge.py tests/test_class_remap.py -v`
-Expected: all PASS.
+Run: `.venv/bin/python -m pytest tests/test_detect_schema.py tests/test_detect_bridge.py -v`
+Expected: all PASS. (These are SP-B's own suites — `tests/test_class_remap.py` belongs to SP-A and is not assumed here.)
 
 - [ ] **Step 2: Run one match with the bumper model**
 

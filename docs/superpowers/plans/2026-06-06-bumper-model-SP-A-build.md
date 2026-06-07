@@ -581,11 +581,13 @@ def main():
     model = YOLO(str(BEST))
     print(f"names={model.names}")
     metrics = model.val(data=str(DATASET_YAML), plots=True)
-    # Per-class mAP50 (index aligns with model.names order).
-    maps = metrics.box.maps  # array of mAP50-95 per class
+    # Per-class metrics. ap50 = AP@0.5 per class (the gate metric); maps = mAP@0.5:0.95.
+    ap50 = metrics.box.ap50          # per-class AP@50
+    maps = metrics.box.maps          # per-class mAP@50-95
     p = metrics.box.p; r = metrics.box.r
     for i, name in model.names.items():
-        print(f"  class {i} {name:12s}  P={p[i]:.3f} R={r[i]:.3f} mAP50-95={maps[i]:.3f}")
+        print(f"  class {i} {name:12s}  P={p[i]:.3f} R={r[i]:.3f} "
+              f"mAP50={ap50[i]:.3f} mAP50-95={maps[i]:.3f}")
     # Confusion matrix: rows/cols include a background column at the end.
     cm = metrics.confusion_matrix.matrix
     print("\nConfusion matrix (rows=true, cols=pred; last index=background):")

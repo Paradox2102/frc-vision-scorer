@@ -137,12 +137,20 @@ Full site inventory (verified against the code):
   schema; left as `==0` it would treat red bumpers as balls and miss all fuel.
 - `app.py:1637` — hub detector (`==2`); with a hubless schema `schema.hub_class` is
   `None`, so this yields no hubs (intended — hubs are static).
+- `app.py:2186` — `detect_ball_in_hub_scores` (`==0`) is **dead code (no callers)**;
+  leave with a comment or delete, do not wire up.
 - `app.py:2820`, `:2880` — SAM2 prompt + re-prompt robot filters (`==1`).
 - `app.py:2933` — the "early OCR" pre-pass robot filter (`==1`) + its color_fn at `:2951`.
-- `app.py:3332` — annotation/HUD class branch.
+- `app.py:3187`, `:3204` — detection→tracked-slot map, both branches use
+  `class_id[di] != 1`; under the bumper schema this drops red robots (class 0). Filter via
+  `schema.robot_class_color` membership.
+- `app.py:3282-3344` — the HUD draw branch hardcodes class meaning throughout
+  (`==0` ball at `:3286`, `==1` robot at `:3289`, `else` hub at `:3332`, ball-box skip at
+  `:3338`, box styling at `:3341`/`:3344`, and the untracked-robot HSV color at `:3326`).
+  The **entire branch** routes through the schema, not just the color call.
 - `app.py:3638` — `/api/status` hardcodes `{0: fuel_ball, 1: robot, 2: hub_opening}`;
   drive from `schema.names`.
-- `app.py:4865` `_detect_robots_in_frame` (used by the `POST /api/detect-robots`
+- `app.py:4870` `_detect_robots_in_frame` (used by the `POST /api/detect-robots`
   endpoint, `:4957`) — `==1` robot filter + `_detect_bumper_color_static` HSV color.
   It receives `model` as a param, so build a `DetectionSchema.from_names(model.names)`
   inside it and use class color.

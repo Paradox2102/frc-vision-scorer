@@ -349,6 +349,11 @@ Every hardcoded `class_id == N` must become a schema call, because the new model
 
 (Read the surrounding lines; keep the rest of the trajectory logic.)
 
+> Also note `detect_ball_in_hub_scores` (`:2186`) has the same `class_id == 0` but is
+> **dead code (no callers — verified)**. Leave it, but add a one-line comment there so
+> the Step 7 completeness grep doesn't flag it as an uncovered live site, OR delete the
+> dead method. Do not wire it up.
+
 - [ ] **Step 3: Hub detector (`:1637`)**
 
 `hub_mask = detections.class_id == 2` → drive from schema; a hubless schema yields none:
@@ -376,7 +381,21 @@ Every hardcoded `class_id == N` must become a schema call, because the new model
 
 Read `:2926-2955` and keep the mask-filter behavior, filtering `early_colors` in lockstep with `early_boxes`.
 
-- [ ] **Step 5: `/api/detect-robots` path (`_detect_robots_in_frame`, `:4865`)**
+- [ ] **Step 5: Detection→tracked-slot map (`:3187` and `:3204`)**
+
+Both branches (SAM2 at `:3187`, non-SAM2 at `:3204`) filter with `detections.class_id[di]
+!= 1` to consider only robots. Under the bumper schema, red robots are class 0, so `!= 1`
+would drop every red robot from the slot map (their HUD labels/boxes break). Replace both
+occurrences:
+
+```python
+                        if int(detections.class_id[di]) not in self.det_schema.robot_class_color:
+                            continue
+```
+
+(`replace_all` is unsafe — the two lines have different indentation; edit each in place.)
+
+- [ ] **Step 6: `/api/detect-robots` path (`_detect_robots_in_frame`, `:4865`)**
 
 It receives `model` and does `class_id==1` + `_detect_bumper_color_static`. Build a schema from the passed model and use class color:
 
@@ -396,9 +415,21 @@ def _detect_robots_in_frame(frame, model, match_teams, blue_teams, red_teams) ->
         ...  # keep the rest of the per-robot dict construction
 ```
 
-Read `:4865-4900` and preserve the result-dict shape; just replace the class filter + color source.
+Read `:4865-4900` and preserve the result-dict shape (`box`, `center`, `confidence`,
+`alliance`, `ocr_raw`, `matched_team`, `ocr_confidence`); just replace the class filter +
+color source.
 
-- [ ] **Step 6: Syntax check + commit**
+- [ ] **Step 7: Completeness grep + syntax check + commit**
+
+The HUD draw branch (`:3282-3344`) is rewired in Task 6 (it's coupled to the
+`detect_bumper_color` deletion). After Tasks 4 **and** 6, verify no live `class_id`
+literal remains:
+
+Run: `grep -n "class_id ==\|class_id\[di\] !=\|class_id == [012]" web/app.py`
+Expected after both tasks: only the dead-code `:2186` line (with its added comment) and
+any schema-driven comparisons remain — no bare `== 0/1/2` in a live path. The
+grep-verified full inventory is: `798, 1637, 1942, 2186(dead), 2933, 3187, 3204,
+3286/3289/3338/3341/3344, 4870`.
 
 Run: `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`
 
@@ -502,15 +533,24 @@ Remove `classify_bumper_color`, `_color_masks`, `_largest_rectangular_band_ratio
 Run: `grep -n "detect_bumper_color\|classify_bumper_color\|_detect_bumper_color_static" web/app.py`
 Expected after edits: **no matches** (all call sites rewired in Tasks 4/5 and Step 4 below).
 
-- [ ] **Step 4: Untracked-robot HUD color (`:3326`)**
+- [ ] **Step 4: Rewire the WHOLE HUD draw branch (`:3282-3344`), not just the color call**
 
-Replace `alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])` with the schema's class color for that detection:
+This branch hardcodes class meaning throughout, so under the bumper schema class 0 (red
+robot) would render as a yellow "ball" and fuel (class 2) would fall into the `else: hub`
+branch. Route every comparison through the schema. Read `:3282-3344` and apply:
 
-```python
-                            alliance = self.det_schema.robot_class_color.get(int(class_id)) or "unknown"
-```
+- `:3286` `if class_id == 0:  # fuel_ball` → `if int(class_id) == self.det_schema.fuel_class:`
+- `:3289` `elif class_id == 1:  # robot` → `elif int(class_id) in self.det_schema.robot_class_color:`
+- `:3326` untracked color: `alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])`
+  → `alliance = self.det_schema.robot_class_color.get(int(class_id)) or "unknown"`
+- `:3332` `else:  # hub_opening` — unchanged (catch-all), but it now only fires for the
+  hub class (or genuinely unknown classes), which is correct.
+- `:3338` `if class_id == 0 and not HUD_DRAW_BALL_BOXES:` → `if int(class_id) == self.det_schema.fuel_class and not HUD_DRAW_BALL_BOXES:`
+- `:3341` / `:3344` `class_id == 1 and i in detection_to_tracked ...` →
+  `int(class_id) in self.det_schema.robot_class_color and i in detection_to_tracked ...`
 
-(Read `:3300-3335` for the exact `class_id`/`i` names.)
+(Guard against `fuel_class is None`: `int(class_id) == self.det_schema.fuel_class` is
+safely `False` when `fuel_class` is `None`, so no extra None-check is needed.)
 
 - [ ] **Step 5: Run unit suites + syntax check**
 

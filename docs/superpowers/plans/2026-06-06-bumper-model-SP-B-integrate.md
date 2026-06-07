@@ -208,16 +208,25 @@ real colors flow.)
   mask filter; filter colors in lockstep.
 
 - [ ] **Step 3: `_detect_robots_in_frame` (`:4865`)** — this standalone helper takes a
-  `model` param. Pass it the bumper model from the caller (`/api/detect-robots`, `:4988`),
-  build `DetectionSchema.from_names(model.names)`, use `schema.split` + class color.
-  (Update the `:4988` call site to pass `job`/processor's `bumper_model` when available,
-  else the existing model.)
+  `model` param and is called by `/api/detect-robots` (`:4957`), which currently
+  instantiates its own `YOLO(MODEL_PATH)` (`:4975`). This endpoint is part of the
+  calibration flow and may run with **no active job**, so do NOT reach into `jobs` for a
+  `bumper_model`. Instead, in the endpoint, load the bumper model directly (mirroring the
+  existing `YOLO(MODEL_PATH)` line): `bumper_model = YOLO(str(BUMPER_MODEL_PATH)) if
+  BUMPER_MODEL_PATH.exists() else None`, and pass it to `_detect_robots_in_frame`. Inside
+  the helper, when a bumper model is given, build `DetectionSchema.from_names(bumper_model.names)`,
+  run it for robots + class color, and use `_ocr_bumper_number` on each; fall back to the
+  existing model's class-1 + `"unknown"` color when no bumper model. Preserve the result-dict
+  keys (`box`, `center`, `confidence`, `alliance`, `ocr_raw`, `matched_team`, `ocr_confidence`).
 
 - [ ] **Step 4: Ball + hub — confirm UNCHANGED.** `update_ball_trajectories` (`:1942`,
   `class_id==0`) and `update_hub_positions` (`:1637`, `class_id==2`) keep reading the
   **existing** model's `detections`. Do **not** modify them. (Hub is also static per
   event; leaving the existing detector running is harmless.) Add a one-line comment at each
   noting they intentionally consume the existing 3-class model, not the bumper model.
+  Also leave a comment at the run-once `self.model(overhead_frame)` pass (`:2993`) that it
+  now feeds **only** ball/hub (+ HUD ball/hub drawing) — robots moved to `self.bumper_model`
+  — so a future reader doesn't delete it thinking robots still come from it.
 
 - [ ] **Step 5: Syntax check + commit** —
   `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`;
@@ -268,30 +277,63 @@ ids `1..N` carry seed color; post-SAM2 color from that map (no HSV).
 
 ---
 
-## Task 6: HUD draw branch — robots from bumper, balls/hubs from existing
+## Task 6: HUD draw branch — robots from tracked slots, balls/hubs from existing
 
-**Files:** Modify `web/app.py` `:3280-3344`
+**Files:** Modify `web/app.py` `:3150-3210` (slot map) and `:3280-3353` (HUD loop)
 
-The HUD loop iterates the **existing** model's `detections` and branches `class_id==0/1/2`.
-Robots (class 1 of the existing model) should no longer be drawn from there — robots are
-drawn from the tracked slots / bumper detections. Cleanest minimal change:
+**Corrected design (a review caught that the original framing was wrong):** in the
+overhead HUD today, tracked robots are drawn **only inside the `class_id==1` branch**
+(`:3291-3322`, plus box styling at `:3341/:3344`). There is **no** separate per-slot draw
+loop — so simply `continue`-ing past class 1 would make robots vanish. We must **add** an
+explicit per-slot draw loop. Fortunately the data is already there:
+`tracked_robot_boxes` (`:3151`, list of `(slot_id, box)` for visible tracks) and
+`track_by_slot` (`:3277`) hold every visible tracked robot, and `t.box` is the
+bumper-derived field-detection box once Task 4 lands. `detection_to_tracked` (`:3173`)
+exists **only** to feed this HUD branch (grep confirms uses at `:3291/:3341/:3344` only).
 
-- [ ] **Step 1:** In the existing-`detections` loop, **skip the robot class** (it's now
-  superseded): `elif class_id == 1: continue` (robots are drawn via the tracked-slot HUD,
-  `_draw_bumper_hud`, already invoked for tracked slots). Keep `class_id==0` (ball) and the
-  `else` (hub) branches drawing as today.
-- [ ] **Step 2:** Robots are drawn from `detection_to_tracked` / track slots. Confirm the
-  per-slot HUD (`_draw_bumper_hud`, fed by `track_by_slot`) still renders every tracked
-  robot with its alliance color (now sourced from the bumper-model color via fusion).
-  Read `:3140-3210` (slot-map build) — the slot map must be built from **bumper-model**
-  robot detections now (see Task 4/Step on `:3187`/`:3204`).
-- [ ] **Step 3: Slot map (`:3187`, `:3204`)** — these `class_id[di] != 1` filters run over
-  `detections` (existing model). They must instead map **bumper-model** robot detections to
-  slots (the boxes that actually seeded tracks). Build the slot map from the bumper
-  detections used in `_detect_view`/SAM2, not the existing model's class-1 boxes. Read the
-  surrounding code and thread the bumper robot boxes through; this is the fiddliest edit —
-  verify HUD labels land on the right robots on a real clip (Task 8).
-- [ ] **Step 4: Syntax + commit** — `feat(detect): HUD robots from bumper-model tracks; balls/hubs from existing model`.
+- [ ] **Step 1: Delete the now-orphaned `detection_to_tracked` build (`:3173-3209`).** It
+  maps the *existing* model's class-1 detections to slots — the wrong source under augment,
+  and only the robot HUD branch consumed it. Remove the whole block (both the SAM2 and
+  non-SAM2 branches).
+
+- [ ] **Step 2: In the existing-`detections` HUD loop (`:3282`), stop drawing robots.**
+  Keep `class_id == 0` (ball) and the `else` (hub) branches exactly as today. Replace the
+  entire `elif class_id == 1:` branch (`:3289-3331`, both the tracked and the
+  `detect_bumper_color` untracked sub-branches) with `elif class_id == 1: continue`. Also
+  drop the class-1 box-styling lines (`:3341`, `:3344`) — robots are styled by the new loop.
+
+- [ ] **Step 3: Add a per-slot robot draw loop** (after the `detections` loop, where
+  `track_by_slot` is in scope). For each visible tracked robot, draw via the existing
+  `_draw_bumper_hud`, recovering the main-view SAM2 mask the same way the old branch did
+  (`:3300-3314`):
+
+```python
+                # Draw tracked robots from their slots (robots come from the bumper
+                # model now, not the existing-model class-1 detections).
+                for slot_id, tbox in tracked_robot_boxes:
+                    robot = self.robot_tracks.get(slot_id)
+                    if robot is None:
+                        continue
+                    label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
+                    t = track_by_slot.get(slot_id)
+                    mask = None
+                    if self.use_sam2:
+                        # (recover the main-view mask exactly as the old class-1 branch did
+                        # at :3300-3314 — registry_track_id -> obs -> sam2_raw[local_idx][det_id])
+                        ...
+                    self._draw_bumper_hud(
+                        annotated_frame, tbox, robot.alliance, label, slot_id=slot_id,
+                        cal=self.calib,
+                        field_pos=t.pos if t else robot.field_position,
+                        vel=t.vel if t else None, mask=mask)
+```
+
+  Copy the mask-recovery block verbatim from the old branch (`:3300-3314`); it already
+  keys off `slot_id`. (Untracked bumper detections were previously drawn via
+  `detect_bumper_color`; that path is deleted. Drawing untracked robots is optional and low
+  value — skip it, or draw from `bumper_dets` with class color if desired.)
+
+- [ ] **Step 4: Syntax + commit** — `feat(detect): draw tracked robots per-slot; balls/hubs from existing model`.
 
 ---
 

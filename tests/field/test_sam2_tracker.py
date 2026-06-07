@@ -209,6 +209,60 @@ def test_reprompt_respects_max_objects_cap():
     assert set(result[5].keys()) == {1, 2}
 
 
+def test_empty_initial_prompt_bootstraps_from_later_detection(tmp_path):
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    for idx in range(RepromptStubPredictor.NUM_FRAMES):
+        (tmp_path / f"{idx:05d}.jpg").touch()
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    calls = []
+
+    def detect_fn(local_idx, frame_path):
+        calls.append(local_idx)
+        if local_idx == 3:
+            return [(stub._rect_for(1), "blue")]
+        return []
+
+    metadata = {}
+    result = tracker.track(
+        frames_dir=str(tmp_path),
+        prompt_idx=0,
+        prompt_boxes=[],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        object_metadata=metadata,
+        max_active_objects=6,
+        max_lifetime_objects=20,
+    )
+
+    assert calls[:4] == [0, 1, 2, 3]
+    assert stub.add_calls[0] == (3, 1)
+    assert 1 in result[3]
+    assert 1 in result[5]
+    assert metadata == {1: "blue"}
+
+
+def test_capped_boundary_does_not_reference_uninitialized_detections():
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diagnostics = IdentityDiagnosticRecorder()
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_args: [stub._rect_for(3)],
+        max_active_objects=2,
+        diagnostics=diagnostics,
+    )
+
+
 def test_no_reprompt_when_detect_fn_absent_is_single_pass():
     """Without reprompt_every/detect_fn, track() runs a single-pass propagation."""
     from web.field.sam2_tracker import Sam2FieldTracker
@@ -463,5 +517,4 @@ def test_sam2_diagnostics_logging():
     rejected_events = [e for e in events if e["event"] == "sam2.reprompt_rejected"]
     assert len(rejected_events) == 1
     assert rejected_events[0]["reason"] == "below_margin"
-
 

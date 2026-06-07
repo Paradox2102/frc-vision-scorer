@@ -323,6 +323,74 @@ class Sam2FieldTracker:
         self._processed_count = 0
 
         reprompting = bool(reprompt_every) and detect_fn is not None
+        detected = []
+
+        def _normalize_detections(items):
+            boxes = []
+            metadata = []
+            for item in items or []:
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and hasattr(item[0], "__len__")
+                    and len(item[0]) == 4
+                ):
+                    boxes.append(item[0])
+                    metadata.append(item[1])
+                else:
+                    boxes.append(item)
+                    metadata.append(None)
+            return boxes, metadata
+
+        # Real SAM2 cannot propagate an empty state. If the prompt frame contains
+        # no robot, search the exported video until the detector finds one, prompt
+        # there, and begin propagation from that frame.
+        bootstrap_idx = prompt_idx
+        if not prompt_boxes and reprompting:
+            for candidate_idx in range(prompt_idx, len(frame_paths)):
+                try:
+                    detected = detect_fn(
+                        candidate_idx, frame_paths[candidate_idx]
+                    ) or []
+                except Exception:
+                    detected = []
+                bootstrap_boxes, bootstrap_metadata = _normalize_detections(detected)
+                if not bootstrap_boxes:
+                    continue
+                for box, metadata in zip(
+                    bootstrap_boxes[:max_active_objects],
+                    bootstrap_metadata[:max_active_objects],
+                ):
+                    if next_obj_id > max_lifetime_objects:
+                        break
+                    predictor.add_new_points_or_box(
+                        state,
+                        frame_idx=candidate_idx,
+                        obj_id=next_obj_id,
+                        box=np.asarray(box, dtype=np.float32),
+                    )
+                    first_prompted_frame[next_obj_id] = candidate_idx
+                    birth_detector_overlap[next_obj_id] = 0.0
+                    if object_metadata is not None:
+                        object_metadata[next_obj_id] = metadata
+                    if diagnostics:
+                        diagnostics.record(
+                            "sam2.object_created",
+                            details={
+                                "object_id": next_obj_id,
+                                "frame_idx": candidate_idx,
+                                "box": list(box),
+                                "bootstrap": True,
+                            },
+                        )
+                    next_obj_id += 1
+                bootstrap_idx = candidate_idx
+                break
+
+            if next_obj_id == 1:
+                if hasattr(predictor, "reset_state"):
+                    predictor.reset_state(state)
+                return results
 
         def _propagate(start_frame_idx=None, max_frame_num_to_track=None):
             # Pass chunk kwargs only when re-prompting, so single-pass callers
@@ -417,8 +485,8 @@ class Sam2FieldTracker:
             if not reprompting:
                 _record_chunk(None, None)
             else:
-                cursor = prompt_idx
-                last_end = prompt_idx - 1
+                cursor = bootstrap_idx
+                last_end = bootstrap_idx - 1
                 while True:
                     last_idx = _record_chunk(cursor, reprompt_every)
                     if last_idx is None or last_idx <= last_end:
@@ -442,6 +510,7 @@ class Sam2FieldTracker:
                                     )
 
                     capped = len(active_objects) >= max_active_objects or (next_obj_id - 1) >= max_lifetime_objects
+                    detected = []
                     if not capped:
                         frame_path = (
                             frame_paths[last_idx] if last_idx < len(frame_paths) else None
@@ -450,24 +519,12 @@ class Sam2FieldTracker:
                             detected = detect_fn(last_idx, frame_path) or []
                         except Exception:
                             detected = []
-                        new_boxes = []
-                        new_metadata = []
-                        for item in detected:
-                            if (
-                                isinstance(item, tuple)
-                                and len(item) == 2
-                                and hasattr(item[0], "__len__")
-                                and len(item[0]) == 4
-                            ):
-                                new_boxes.append(item[0])
-                                new_metadata.append(item[1])
-                            else:
-                                new_boxes.append(item)
-                                new_metadata.append(None)
+                        new_boxes, new_metadata = _normalize_detections(detected)
+                        for box in new_boxes:
                             if diagnostics:
                                 diagnostics.record(
                                     "sam2.reprompt_candidate",
-                                    details={"frame_idx": last_idx, "box": list(new_boxes[-1])}
+                                    details={"frame_idx": last_idx, "box": list(box)}
                                 )
                         
                         existing = {}

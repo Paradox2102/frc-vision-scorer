@@ -86,15 +86,67 @@ def test_database_identity_and_binding_roundtrips(db):
     assert bindings[0]["start_frame"] == 10
     assert bindings[0]["end_frame"] == 100
 
+
+def test_database_migrates_legacy_slot_keyed_identity_tables(tmp_path, monkeypatch):
+    legacy_path = tmp_path / "legacy.db"
+    monkeypatch.setattr(database, "DB_PATH", legacy_path)
+
+    async def create_legacy_db():
+        import aiosqlite
+
+        async with aiosqlite.connect(legacy_path) as conn:
+            await conn.executescript("""
+                CREATE TABLE match_robot_identity (
+                    job_id TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    slot_label TEXT,
+                    alliance TEXT,
+                    team_number TEXT,
+                    confirmed INTEGER DEFAULT 0,
+                    source TEXT,
+                    confidence REAL,
+                    created_at TEXT,
+                    PRIMARY KEY (job_id, slot)
+                );
+                INSERT INTO match_robot_identity
+                    (job_id, slot, slot_label, alliance, team_number, confirmed)
+                VALUES ('legacy-job', 2, 'B3', 'blue', '254', 1);
+                CREATE TABLE match_robot_crop (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    legibility REAL,
+                    embedding BLOB,
+                    image BLOB
+                );
+                CREATE INDEX idx_match_crop ON match_robot_crop(job_id, slot);
+                INSERT INTO match_robot_crop (job_id, slot, legibility)
+                VALUES ('legacy-job', 2, 0.9);
+            """)
+            await conn.commit()
+
+    asyncio.run(create_legacy_db())
+    asyncio.run(database.init_db())
+
+    identities = asyncio.run(database.get_match_identities("legacy-job"))
+    crops = asyncio.run(database.get_match_crops("legacy-job", 2))
+    assert identities[0]["identity_id"] == 2
+    assert identities[0]["slot"] == 2
+    assert crops[0]["identity_id"] == 2
+
 def test_confidence_wiring_and_decisions():
     from unittest.mock import MagicMock
     from web.app import InferenceJob
     from web.field.identity_confidence import ConfidenceConfig
     from web.field.identity import IdentityRegistry, IdentityObservation
+    from web.field.identity_ambiguity import CoOcclusionTracker
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
     
     job = InferenceJob.__new__(InferenceJob)
     job.identity_registry = IdentityRegistry()
     job.confidence_config = ConfidenceConfig(decay_rate=0.01, observation_rise=0.02)
+    job.co_occlusion_tracker = CoOcclusionTracker(re_emergence_window=30)
+    job.identity_diagnostics = IdentityDiagnosticRecorder()
     job._current_frame = 0
     job.video_fps = 10.0
     job._last_bindings = {}
@@ -165,4 +217,3 @@ def test_anchor_update_floor():
     # Embedding SHOULD be updated (blended with EMA)
     # blended = 0.5 * [1, 0, 0] + 0.5 * [0.9806, 0.1961, 0] = [0.9903, 0.0980, 0] -> normalized = [0.9951, 0.0985, 0]
     assert np.allclose(ident.appearance_embedding, [0.9951, 0.0985, 0], atol=1e-3)
-

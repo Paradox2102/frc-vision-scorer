@@ -121,3 +121,33 @@ def test_select_gap_fills_stops_at_cap_within_unknowns():
     # no bumpers; 4 blue unknowns, cap 3 -> first three kept
     assert select_gap_fills([], ["blue"] * 4, max_per_half=3) == [0, 1, 2]
 
+
+def test_bumper_model_path_prefers_hard_negative_checkpoint(tmp_path):
+    from web.app import _resolve_bumper_model_path
+
+    base = tmp_path / "base.pt"
+    hardneg = tmp_path / "hardneg.pt"
+    base.touch()
+    hardneg.touch()
+
+    assert _resolve_bumper_model_path(
+        hardneg_path=hardneg, base_path=base
+    ) == hardneg
+
+
+def test_bumper_model_path_falls_back_and_honors_override(tmp_path):
+    from web.app import _resolve_bumper_model_path
+
+    base = tmp_path / "base.pt"
+    base.touch()
+    missing_hardneg = tmp_path / "missing.pt"
+    override = tmp_path / "custom.pt"
+
+    assert _resolve_bumper_model_path(
+        hardneg_path=missing_hardneg, base_path=base
+    ) == base
+    assert _resolve_bumper_model_path(
+        override=str(override),
+        hardneg_path=missing_hardneg,
+        base_path=base,
+    ) == override

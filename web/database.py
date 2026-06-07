@@ -141,8 +141,69 @@ CREATE TABLE IF NOT EXISTS match_robot_crop (
     embedding BLOB,
     image BLOB
 );
-CREATE INDEX IF NOT EXISTS idx_match_crop ON match_robot_crop(job_id, identity_id);
 """
+
+
+async def _table_columns(db, table: str) -> set[str]:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in await cursor.fetchall()}
+
+
+async def _migrate_identity_tables(db) -> None:
+    identity_columns = await _table_columns(db, "match_robot_identity")
+    if identity_columns and "identity_id" not in identity_columns:
+        await db.execute("ALTER TABLE match_robot_identity RENAME TO match_robot_identity_legacy")
+        await db.execute("""
+            CREATE TABLE match_robot_identity (
+                job_id TEXT NOT NULL,
+                identity_id INTEGER NOT NULL,
+                slot INTEGER,
+                slot_label TEXT,
+                alliance TEXT,
+                team_number TEXT,
+                confirmed INTEGER DEFAULT 0,
+                source TEXT,
+                confidence REAL,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (job_id, identity_id)
+            )
+        """)
+        await db.execute("""
+            INSERT INTO match_robot_identity
+                (job_id, identity_id, slot, slot_label, alliance, team_number,
+                 confirmed, source, confidence, created_at)
+            SELECT job_id, slot, slot, slot_label, alliance, team_number,
+                   confirmed, source, confidence, created_at
+            FROM match_robot_identity_legacy
+        """)
+        await db.execute("DROP TABLE match_robot_identity_legacy")
+
+    crop_columns = await _table_columns(db, "match_robot_crop")
+    if crop_columns and "identity_id" not in crop_columns:
+        await db.execute("DROP INDEX IF EXISTS idx_match_crop")
+        await db.execute("ALTER TABLE match_robot_crop RENAME TO match_robot_crop_legacy")
+        await db.execute("""
+            CREATE TABLE match_robot_crop (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                identity_id INTEGER NOT NULL,
+                legibility REAL,
+                embedding BLOB,
+                image BLOB
+            )
+        """)
+        await db.execute("""
+            INSERT INTO match_robot_crop
+                (id, job_id, identity_id, legibility, embedding, image)
+            SELECT id, job_id, slot, legibility, embedding, image
+            FROM match_robot_crop_legacy
+        """)
+        await db.execute("DROP TABLE match_robot_crop_legacy")
+
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_match_crop "
+        "ON match_robot_crop(job_id, identity_id)"
+    )
 
 
 async def init_db():
@@ -161,6 +222,7 @@ async def init_db():
                 await db.execute(f"ALTER TABLE appearance_gallery ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
+        await _migrate_identity_tables(db)
         await db.commit()
 
 

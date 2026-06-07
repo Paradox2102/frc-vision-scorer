@@ -1,6 +1,10 @@
 import numpy as np
 from web.field.field_model import FieldModel
-from web.field.detect_bridge import to_field_detections, field_adjacent_persons
+from web.field.detect_bridge import (
+    corner_detection_in_alliance_zone,
+    field_adjacent_persons,
+    to_field_detections,
+)
 from tests._field_synth import truth_pinhole_camera
 
 
@@ -157,3 +161,43 @@ def test_box_exceeds_frac_none_frame_is_false():
     from web.field.detect_bridge import box_exceeds_frac
     assert box_exceeds_frac((0, 0, 999, 999), None, 0.5) is False
 
+
+def test_filter_field_robot_boxes_rejects_off_field_and_oversized():
+    from web.field.detect_bridge import filter_field_robot_boxes
+
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    u_ok, v_ok = cam.field_to_image((8.0, 4.0, 0.0))
+    u_off, v_off = cam.field_to_image((30.0, 4.0, 0.0))
+    boxes = [
+        (u_ok - 30, v_ok - 120, u_ok + 30, v_ok),
+        (u_off - 30, v_off - 120, u_off + 30, v_off),
+        (u_ok - 600, v_ok - 120, u_ok + 600, v_ok),
+    ]
+
+    assert filter_field_robot_boxes(
+        boxes,
+        cam,
+        (fm.length_m, fm.width_m),
+        frame_shape=(1080, 1920, 3),
+    ) == [0]
+
+
+def test_corner_views_only_contribute_inside_nearby_alliance_zone():
+    dims = (16.541, 8.069)
+
+    assert corner_detection_in_alliance_zone("corner_left", (4.7, 4.0), dims)
+    assert not corner_detection_in_alliance_zone(
+        "corner_left", (5.0, 4.0), dims
+    )
+    assert corner_detection_in_alliance_zone("corner_right", (11.8, 4.0), dims)
+    assert not corner_detection_in_alliance_zone(
+        "corner_right", (11.5, 4.0), dims
+    )
+
+
+def test_non_corner_views_remain_global():
+    dims = (16.541, 8.069)
+
+    assert corner_detection_in_alliance_zone("main", (8.0, 4.0), dims)
+    assert corner_detection_in_alliance_zone("other", (8.0, 4.0), dims)

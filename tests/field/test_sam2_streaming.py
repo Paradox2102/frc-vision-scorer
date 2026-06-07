@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import cv2
 
-from web.app import InferenceJob
+from web.app import InferenceJob, _restore_sam2_mask_to_view
 from web.field.tracker import FieldDetection
 
 
@@ -65,6 +65,33 @@ def test_inference_job_defaults_vram_budget_from_env_constant():
     import web.app as app_mod
     job = app_mod.InferenceJob("j", "/mock/video.mp4")
     assert job.sam2_max_gpu_frames == app_mod.SAM2_MAX_GPU_FRAMES
+
+
+def test_restore_sam2_mask_reinserts_top_crop_without_vertical_shift():
+    mask = np.zeros((4, 6), dtype=bool)
+    mask[1:3, 2:5] = True
+
+    restored = _restore_sam2_mask_to_view(
+        mask,
+        (10, 12, 3),
+        top_offset_px=2,
+    )
+
+    assert restored.shape == (10, 12)
+    assert not restored[:2].any()
+    ys, xs = np.where(restored)
+    assert ys.min() == 4
+    assert ys.max() == 7
+    assert xs.min() == 4
+    assert xs.max() == 9
+
+
+def test_restore_sam2_mask_without_crop_fills_full_view():
+    mask = np.ones((2, 3), dtype=bool)
+
+    restored = _restore_sam2_mask_to_view(mask, (4, 6, 3))
+
+    assert restored.all()
 
 
 class TestSAM2Streaming(unittest.TestCase):
@@ -245,6 +272,10 @@ class TestSAM2Streaming(unittest.TestCase):
              ), \
              patch(
                  "web.app.database.insert_match_robot_crop",
+                 new=AsyncMock(),
+             ), \
+             patch(
+                 "web.app.database.insert_match_robot_binding",
                  new=AsyncMock(),
              ), \
              patch(

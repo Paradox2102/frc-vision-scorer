@@ -95,6 +95,56 @@ def test_persistent_roster_cap_enforcement():
     # The new observation should not have been bound to any identity
     assert not any(ident.active_slot == 12 for ident in reg.identities.values())
 
+
+def test_cap_eviction_cannot_delete_identity_reserved_by_batch_assignment():
+    reg = IdentityRegistry(association_threshold=0.75)
+    reg.identities = {
+        5: RobotIdentity(
+            identity_id=5,
+            alliance="blue",
+            appearance_embedding=_e(1, 0, 0),
+            anchor_embedding=_e(1, 0, 0),
+            last_seen_frame=1,
+            last_seen_pos=(1.0, 1.0),
+        ),
+        6: RobotIdentity(
+            identity_id=6,
+            alliance="blue",
+            appearance_embedding=_e(0, 1, 0),
+            anchor_embedding=_e(0, 1, 0),
+            last_seen_frame=2,
+            last_seen_pos=(5.0, 1.0),
+        ),
+        7: RobotIdentity(
+            identity_id=7,
+            alliance="blue",
+            appearance_embedding=_e(0, 0, 1),
+            anchor_embedding=_e(0, 0, 1),
+            last_seen_frame=3,
+            last_seen_pos=(9.0, 1.0),
+        ),
+    }
+    reg._next_id = 8
+
+    unmatched = IdentityObservation(
+        slot_id=20,
+        pos=(20.0, 7.0),
+        alliance="blue",
+        embedding=_e(-1, 0, 0),
+    )
+    reserved_for_five = IdentityObservation(
+        slot_id=21,
+        pos=(1.05, 1.0),
+        alliance="blue",
+        embedding=_e(1, 0, 0),
+    )
+
+    reg.update_frame(10, [unmatched, reserved_for_five])
+
+    assert 5 in reg.identities
+    assert reg.identities[5].active_slot == 21
+    assert len(reg.identities) == 3
+
 def test_roster_uniqueness_and_alliance_consistency():
     reg = IdentityRegistry(association_threshold=0.75)
     

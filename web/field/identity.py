@@ -25,6 +25,7 @@ class RobotIdentity:
     has_vlm_read: bool = False
     vlm_agrees: bool = False
     vlm_contradicts: bool = False
+    is_ambiguous: bool = False
 
 @dataclass
 class IdentityObservation:
@@ -52,12 +53,20 @@ class IdentityRegistry:
     def get_inactive_identities(self) -> list[RobotIdentity]:
         return [ident for ident in self.identities.values() if ident.active_slot is None]
 
-    def _enforce_caps_to_limit(self, alliance: str, limit: int) -> bool:
+    def _enforce_caps_to_limit(
+        self,
+        alliance: str,
+        limit: int,
+        protected_ids: set[int] | None = None,
+    ) -> bool:
+        protected_ids = protected_ids or set()
         idents = [ident for ident in self.identities.values() if ident.alliance == alliance]
         while len(idents) > limit:
             provisional_inactive = [
                 ident for ident in idents 
-                if not ident.is_confirmed and ident.active_slot is None
+                if not ident.is_confirmed
+                and ident.active_slot is None
+                and ident.identity_id not in protected_ids
             ]
             if not provisional_inactive:
                 return False
@@ -140,6 +149,7 @@ class IdentityRegistry:
                     assigned_id_map[r] = existing_ids[c]
 
         # Apply assignments or create new identities
+        protected_assignment_ids = set(assigned_id_map.values())
         for r, obs in enumerate(observations):
             if r in assigned_id_map:
                 fused_id = assigned_id_map[r]
@@ -181,7 +191,9 @@ class IdentityRegistry:
                 # Enforce caps (stay under 3 for this alliance)
                 current_count = sum(1 for ident in self.identities.values() if ident.alliance == alliance)
                 if current_count >= 3:
-                    success = self._enforce_caps_to_limit(alliance, 2)
+                    success = self._enforce_caps_to_limit(
+                        alliance, 2, protected_ids=protected_assignment_ids
+                    )
                     if not success:
                         # Reject creation
                         continue

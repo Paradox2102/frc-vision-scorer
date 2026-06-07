@@ -20,6 +20,11 @@ DET_MAX_BOX_FRAC = float(os.environ.get("DET_MAX_BOX_FRAC", "0.5"))
 # wrongly rejecting real, distant robots. Beyond this camera-to-detection ground
 # distance (m), skip the width check and rely on the image-fraction backstop instead.
 DET_FIELD_WIDTH_MAX_RANGE_M = float(os.environ.get("DET_FIELD_WIDTH_MAX_RANGE_M", "8.0"))
+# The oblique corner-camera projections are only reliable in their nearby
+# alliance zone. The 2026 bump/trench boundary is roughly 4.7 m from each end.
+CORNER_ALLIANCE_ZONE_DEPTH_M = float(
+    os.environ.get("CORNER_ALLIANCE_ZONE_DEPTH_M", "4.8")
+)
 
 
 def _bottom_center(box):
@@ -30,6 +35,24 @@ def _bottom_center(box):
 def _on_field(xy, dims, margin):
     L, W = dims
     return -margin <= xy[0] <= L + margin and -margin <= xy[1] <= W + margin
+
+
+def corner_detection_in_alliance_zone(
+    view_name,
+    xy,
+    field_dims,
+    zone_depth=CORNER_ALLIANCE_ZONE_DEPTH_M,
+):
+    """Return whether a camera may contribute this projected field position."""
+    if xy is None:
+        return False
+    x = float(xy[0])
+    field_length = float(field_dims[0])
+    if view_name == "corner_left":
+        return x <= min(float(zone_depth), field_length / 2.0)
+    if view_name == "corner_right":
+        return x >= max(field_length - float(zone_depth), field_length / 2.0)
+    return True
 
 
 def _field_footprint_width(box, calibration):
@@ -106,6 +129,37 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
         color = colors[idx] if idx < len(colors) and colors[idx] else "unknown"
         out.append(FieldDetection(pos=xy, color=color, box=tuple(box), score=1.0))
     return out
+
+
+def filter_field_robot_boxes(
+    robot_boxes,
+    calibration,
+    field_dims,
+    frame_shape=None,
+    margin=DET_FIELD_MARGIN_M,
+):
+    """Return indices of boxes whose ground contact is a plausible field robot.
+
+    This is the geometry-only counterpart to ``to_field_detections`` for paths
+    such as SAM2 prompting that must retain their original box/color metadata.
+    """
+    kept = []
+    for idx, box in enumerate(robot_boxes):
+        xy = calibration.image_to_field(_bottom_center(box))
+        if xy is None or not _on_field(xy, field_dims, margin):
+            continue
+        if _too_large(
+            box,
+            calibration,
+            xy,
+            frame_shape,
+            DET_MAX_ROBOT_WIDTH_M,
+            DET_MAX_BOX_FRAC,
+            DET_FIELD_WIDTH_MAX_RANGE_M,
+        ):
+            continue
+        kept.append(idx)
+    return kept
 
 
 def field_adjacent_persons(person_boxes, calibration, field_dims, margin=2.0):

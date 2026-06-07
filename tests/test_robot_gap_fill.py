@@ -108,3 +108,15 @@ def test_gap_fill_hook_a_logic(mock_yolo):
     # both blue and red halves have 1 bumper, so they have room for gap fills
     keep_indices = select_gap_fills(bumper_halves, unknown_halves, max_per_half=3)
     assert keep_indices == [0, 1]  # Keep both gap fills
+
+
+def test_calibrated_top_exclusion_rejects_above_field_box():
+    view = MagicMock()
+    view.calibration.robot_track_top_crop = 0.3
+
+    assert InferenceJob._below_robot_tracking_top(
+        view, (100, 20, 200, 250), frame_height=1000
+    ) is False
+    assert InferenceJob._below_robot_tracking_top(
+        view, (100, 250, 200, 350), frame_height=1000
+    ) is True

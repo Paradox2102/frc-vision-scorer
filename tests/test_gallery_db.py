@@ -44,6 +44,26 @@ def test_get_gallery_exemplars_empty_for_unknown_event(db):
     assert asyncio.run(db.get_gallery_exemplars("nope")) == []
 
 
+def test_get_gallery_exemplars_filters_to_match_teams(db):
+    for team in ("573", "9785", "581", "1732", "4698", "3297", "254"):
+        asyncio.run(db.insert_gallery_exemplar({
+            "event_key": "2026hop", "team": team, "alliance_color": "blue",
+            "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        }))
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026other", "team": "573", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+    }))
+
+    roster = ["573", 9785, "581", "1732", "4698", "3297", "573"]
+    rows = asyncio.run(db.get_gallery_exemplars("2026hop", teams=roster))
+
+    assert {row["team"] for row in rows} == {
+        "573", "9785", "581", "1732", "4698", "3297",
+    }
+    assert len(rows) == 6
+
+
 def test_gallery_exemplar_records_source_job_id(db):
     # The source match (job_id) is persisted so the UI can offer that match's
     # roster as the relabel dropdown.

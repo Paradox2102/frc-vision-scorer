@@ -170,7 +170,8 @@ def test_yolo_detections_filtering_by_exclusion_masks(monkeypatch):
     job.person_model = lambda *args, **kwargs: [sv.Detections.empty()]
     monkeypatch.setattr(sv.Detections, "from_ultralytics", lambda results: results if isinstance(results, sv.Detections) else sv.Detections.empty())
     job.field_dims = (16.54, 8.07)
-    job.detect_bumper_color = lambda *args: "red"
+    job.bumper_model = None
+    job.det_schema = None
     
     # Run _detect_view
     paired, person_boxes = job._detect_view(view, np.zeros((723, 1920, 3), np.uint8), precomputed_dets=dets)

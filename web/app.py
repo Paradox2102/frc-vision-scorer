@@ -13,6 +13,7 @@ import math
 import numpy as np
 import os
 import pytesseract
+import re
 import shutil
 from PIL import Image
 import tempfile
@@ -51,13 +52,15 @@ from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
+from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot
+from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
-from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color
+from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import load_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
@@ -116,9 +119,19 @@ def _on_field(xy, dims, margin=1.0):
 # Configuration
 PROJECT_ROOT = Path(__file__).parent.parent
 MODEL_PATH = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
+BUMPER_MODEL_PATH = Path(os.environ.get(
+    "FRC_BUMPER_MODEL",
+    str(PROJECT_ROOT / "runs/train/frc_bumpers/weights/best.pt"),
+))
+ROBOT_BOX_FROM_BUMPER_FACTOR = float(
+    os.environ.get("ROBOT_BOX_FROM_BUMPER_FACTOR", "3.0")
+)
 STATIC_DIR = Path(__file__).parent / "static"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+# Frames where the detector fired on likely non-robots (gated by HARD_NEG_LOG=1),
+# accumulated per event/run for hard-negative retraining.
+HARD_NEG_DIR = Path(__file__).resolve().parents[1] / "data" / "hard_negatives"
 REPLAYS_DIR = Path(__file__).parent / "replays"
 REPLAYS_DIR.mkdir(exist_ok=True)
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -167,6 +180,7 @@ MAX_ROBOTS_TOTAL = 6  # Absolute max: 3 blue + 3 red on the field
 OCR_REGIONS_1080P = {
     "blue_center": (775, 63, 120, 66),
     "red_center": (1015, 59, 124, 68),
+    "match_clock": (905, 68, 118, 56),
 }
 
 # Custom OCR regions per event (set via API)
@@ -183,7 +197,7 @@ def scale_ocr_regions(video_width: int, overhead_height: int) -> dict:
     They must be applied to the overhead crop frame, NOT the full frame.
     Reference: 1920x723 (67% of 1920x1080).
     """
-    regions = custom_ocr_regions if custom_ocr_regions else OCR_REGIONS_1080P
+    regions = {**OCR_REGIONS_1080P, **(custom_ocr_regions or {})}
     sx = video_width / 1920.0
     sy = overhead_height / 723.0  # Scale to actual overhead crop height
     scaled = {}
@@ -191,6 +205,12 @@ def scale_ocr_regions(video_width: int, overhead_height: int) -> dict:
         scaled[key] = (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
     return scaled
 OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789"
+MATCH_CLOCK_OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:"
+MATCH_CLOCK_SAMPLE_SECONDS = 0.5
+MATCH_CLOCK_LEAD_SECONDS = 0.5
+MATCH_CLOCK_TAIL_SECONDS = 3.0
+TITLE_SCREEN_FRAMES = 180
+EARLY_OCR_FRAME = 200
 OCR_FRAME_INTERVAL = 5  # OCR every 5th processed frame
 BUMPER_OCR_FRAME_INTERVAL = 15  # Run bumper OCR every 15th processed frame (slower, GPU-heavy)
 OCR_TEAM_CONFIRM_VOTES = 3  # Votes needed to lock in a team number from continuous OCR
@@ -216,6 +236,136 @@ OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by 
 VLM_DIRECT_CONTRADICTION_CONF = 0.9  # exact/high-confidence read that unlocks a wrong confirmed label
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
+
+
+def parse_match_clock_text(text: str) -> Optional[int]:
+    """Parse a broadcast match clock into seconds, rejecting implausible values."""
+    cleaned = re.sub(r"\s+", "", text or "")
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", cleaned)
+    if match:
+        minutes, seconds = map(int, match.groups())
+        if seconds >= 60:
+            return None
+        total = minutes * 60 + seconds
+    elif re.fullmatch(r"\d{1,3}", cleaned):
+        total = int(cleaned)
+    else:
+        return None
+    return total if 0 <= total <= 180 else None
+
+
+def _find_clock_period(
+    samples: List[Tuple[int, Optional[int]]],
+    target_start: int,
+    after_frame: int = -1,
+) -> Optional[dict]:
+    """Find one decreasing countdown, tolerating a single bad OCR sample."""
+    candidates = [
+        i for i, (frame, value) in enumerate(samples)
+        if frame > after_frame
+        and value is not None
+        and target_start - 10 <= value <= target_start + 5
+    ]
+    for start_idx in candidates:
+        start_frame, start_value = samples[start_idx]
+        last_value = start_value
+        previous_frame = start_frame
+        running_start_frame = start_frame
+        running_start_value = start_value
+        end_frame = start_frame
+        decreases = 0
+        bad_samples = 0
+        reached_near_zero = False
+
+        def result():
+            return {
+                "start_frame": running_start_frame,
+                "end_frame": end_frame,
+                "start_seconds": running_start_value,
+                "end_seconds": last_value,
+            }
+
+        for frame, value in samples[start_idx + 1:]:
+            if value is None or value > last_value + 2:
+                bad_samples += 1
+                if bad_samples > 1:
+                    if reached_near_zero:
+                        return result()
+                    break
+                continue
+            bad_samples = 0
+            if value < last_value:
+                if decreases == 0:
+                    running_start_frame = previous_frame
+                    running_start_value = last_value
+                decreases += last_value - value
+            last_value = min(last_value, value)
+            end_frame = frame
+            previous_frame = frame
+            if value <= 2:
+                if decreases >= max(8, int(target_start * 0.6)):
+                    reached_near_zero = True
+                    if value == 0:
+                        return result()
+                else:
+                    break
+        if reached_near_zero:
+            return result()
+    return None
+
+
+def _merge_frame_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[List[int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def compute_active_windows(
+    samples: List[Tuple[int, Optional[int]]],
+    fps: float,
+    total_frames: int,
+    lead_seconds: float = MATCH_CLOCK_LEAD_SECONDS,
+    tail_seconds: float = MATCH_CLOCK_TAIL_SECONDS,
+) -> Tuple[List[Tuple[int, int]], List[dict], bool, Optional[str]]:
+    """Return merged processing ranges, labeled core periods, and fallback state."""
+    full_range = [(0, max(0, total_frames - 1))]
+    if not samples or fps <= 0 or total_frames <= 0:
+        return full_range, [], True, "missing clock samples or video metadata"
+
+    auto = _find_clock_period(samples, 20)
+    if auto is None:
+        return full_range, [], True, "autonomous countdown was not found"
+    teleop = _find_clock_period(samples, 140, after_frame=auto["end_frame"])
+    if teleop is None:
+        return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
+
+    lead_frames = int(round(lead_seconds * fps))
+    tail_frames = int(round(tail_seconds * fps))
+    periods = []
+    padded = []
+    for label, period in (("auto", auto), ("teleop", teleop)):
+        item = dict(period, label=label)
+        if item["end_seconds"] > 0:
+            item["end_frame"] = min(
+                total_frames - 1,
+                item["end_frame"] + int(round(item["end_seconds"] * fps)),
+            )
+            item["end_seconds"] = 0
+        item["processing_start_frame"] = max(0, period["start_frame"] - lead_frames)
+        item["processing_end_frame"] = min(
+            total_frames - 1, item["end_frame"] + tail_frames
+        )
+        periods.append(item)
+        padded.append((item["processing_start_frame"], item["processing_end_frame"]))
+    return _merge_frame_ranges(padded), periods, False, None
+
+
+def frame_in_ranges(frame: int, ranges: List[Tuple[int, int]]) -> bool:
+    return any(start <= frame <= end for start, end in ranges)
 
 # Appearance gallery (per-event re-ID exemplar memory)
 GALLERY_ENABLED = os.environ.get("GALLERY_ENABLED", "1") not in ("0", "false", "False")
@@ -255,6 +405,26 @@ _SAM2_MODELS = {
     "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "checkpoints/sam2.1_hiera_large.pt"),
 }
 SAM2_CONFIG, SAM2_CHECKPOINT = _SAM2_MODELS.get(SAM2_MODEL_SIZE, _SAM2_MODELS["small"])
+# Display metadata for the UI model picker (ordered fast -> precise).
+_SAM2_SIZE_INFO = [
+    ("tiny",      "Tiny",      "~39M params · fastest, coarsest masks"),
+    ("small",     "Small",     "~46M params · default, fast"),
+    ("base_plus", "Base+",     "~81M params · balanced"),
+    ("large",     "Large",     "~224M params · slowest, finest masks"),
+]
+
+
+def _resolve_sam2_model(size: str):
+    """Map a UI size string to (config, checkpoint), falling back to 'small'."""
+    return _SAM2_MODELS.get((size or "").lower(), _SAM2_MODELS["small"])
+
+
+def _sam2_checkpoint_present(size: str) -> bool:
+    """True if the .pt checkpoint for a size is downloaded (paths are repo-relative)."""
+    cfg = _SAM2_MODELS.get((size or "").lower())
+    return bool(cfg) and os.path.exists(cfg[1])
+
+
 # EXPERIMENTAL: torch.compile the SAM2 image encoder via the VOS-optimized predictor
 # for a further ~2x.  Disabled by default — its CUDA-graph capture is incompatible with
 # our multi-chunk re-prompting flow (we read mask tensors every frame and re-enter
@@ -459,6 +629,21 @@ class InferenceJob:
         # field-space FieldTracker (built in process_video once the calibration
         # loads), so neither the ByteTracker nor the embedder is instantiated here.
         self.model = YOLO(str(MODEL_PATH))
+        self.bumper_model = None
+        self.det_schema = None
+        if BUMPER_MODEL_PATH.exists():
+            self.bumper_model = YOLO(str(BUMPER_MODEL_PATH))
+            self.det_schema = DetectionSchema.from_names(self.bumper_model.names)
+            print(
+                f"[detect] bumper model={BUMPER_MODEL_PATH.name} "
+                f"classes={self.bumper_model.names} "
+                f"robots={self.det_schema.robot_class_color}"
+            )
+        else:
+            print(
+                f"[detect] bumper model not found at {BUMPER_MODEL_PATH}; "
+                "falling back to existing model robot detections with unknown color"
+            )
         # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
         # Absolute path so it doesn't depend on CWD (a bare name would trigger a
         # hub auto-download attempt for a non-existent release).
@@ -490,8 +675,17 @@ class InferenceJob:
         self.overhead_height = 0
         self.frame_skip = FRAME_SKIP
         self.target_tracking_fps = None
+        self.processing_ranges: List[Tuple[int, int]] = []
+        self.match_periods: List[dict] = []
+        self.timer_gate_fallback = True
+        self.timer_gate_fallback_reason: Optional[str] = None
+        self.sam2_source_to_local: Dict[int, int] = {}
+        self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
         # Per-run VRAM frame budget; defaults to the env constant, overridable per job.
         self.sam2_max_gpu_frames = SAM2_MAX_GPU_FRAMES
+        # Per-run SAM2 encoder size ("tiny"/"small"/"base_plus"/"large"); defaults to
+        # the env-selected size, overridable per job from the UI.
+        self.model_size = SAM2_MODEL_SIZE
 
         # Detection state
         self.hubs: List[DetectedHub] = []
@@ -500,6 +694,7 @@ class InferenceJob:
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
         self._slot_crops: dict = {}   # slot_id -> list of {quality, crop_b64, embedding} (top-3)
         self._slot_source: dict = {}  # slot_id -> "ocr" | "gallery" (last confirm source)
+        self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -558,6 +753,11 @@ class InferenceJob:
         self.diagnostic = DiagnosticRecorder(
             UPLOAD_DIR / f"diagnostic_{self.job_id}.jsonl",
             ws_send=None,  # wired in Task 7
+        )
+        # Hard-negative capture: no-op unless HARD_NEG_LOG=1. Bucketed per event
+        # (falls back to job_id) so negatives accumulate across runs of an event.
+        self.hard_neg_logger = HardNegativeLogger(
+            HARD_NEG_DIR / (self.event_key or self.job_id)
         )
 
     def extract_team_numbers(self, frame: np.ndarray) -> None:
@@ -682,7 +882,14 @@ class InferenceJob:
                 for team in matching_teams:
                     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + vote_share
 
-    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None, enforce_floor: bool = True):
+    def _bumper_crop_b64(
+        self,
+        frame: np.ndarray,
+        box,
+        robot_id=None,
+        enforce_floor: bool = True,
+        box_is_bumper: bool = False,
+    ):
         """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
         encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
         None when the crop is empty or, when enforce_floor=True, below LEGIBILITY_FLOOR.
@@ -698,7 +905,11 @@ class InferenceJob:
         if x2 <= x1 or y2 <= y1:
             return None
 
-        crop = bumper_crop(frame, (x1, y1, x2, y2))
+        crop = (
+            frame[y1:y2, x1:x2]
+            if box_is_bumper
+            else bumper_crop(frame, (x1, y1, x2, y2))
+        )
         if crop is None or crop.size == 0:
             crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
@@ -755,7 +966,7 @@ class InferenceJob:
             return None
         return base64.b64encode(buf).decode('utf-8')
 
-    def _detect_view(self, view, composite_frame, precomputed_dets=None):
+    def _detect_view(self, view, composite_frame, precomputed_dets=None, frame_num=0):
         """Run YOLO + person detection on one camera view; returns
         (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
         and person_boxes are field-filtered occluder boxes in that view's pixels.
@@ -770,24 +981,56 @@ class InferenceJob:
         else:
             results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
             dets = sv.Detections.from_ultralytics(results)
+        if self.bumper_model is not None:
+            bumper_results = self.bumper_model(
+                frame, conf=DET_CONF_THRESHOLD, verbose=False
+            )[0]
+            bumper_dets = sv.Detections.from_ultralytics(bumper_results)
+            robots, _balls, _hubs = self.det_schema.split(bumper_dets)
+        else:
+            robots = [
+                (
+                    tuple(dets.xyxy[i]),
+                    None,
+                    (
+                        float(dets.confidence[i])
+                        if dets.confidence is not None
+                        else 1.0
+                    ),
+                )
+                for i in range(len(dets))
+                if dets.class_id[i] == 1
+            ]
         robot_boxes = []
-        for i in range(len(dets)):
-            if dets.class_id[i] == 1:
-                box = dets.xyxy[i]
-                cx = (box[0] + box[2]) / 2.0
-                cy = (box[1] + box[3]) / 2.0
-                is_masked = False
-                for (mx, my, mw, mh) in view.masks:
-                    if mx <= cx <= mx + mw and my <= cy <= my + mh:
-                        is_masked = True
-                        break
-                if not is_masked:
-                    robot_boxes.append(box)
-        field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
-                                         color_fn=self.detect_bumper_color)
+        robot_colors = []
+        for box, color, _confidence in robots:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            if any(
+                mx <= cx <= mx + mw and my <= cy <= my + mh
+                for (mx, my, mw, mh) in view.masks
+            ):
+                continue
+            robot_boxes.append(np.asarray(box))
+            robot_colors.append(color)
+        rejected = []
+        field_dets = to_field_detections(
+            robot_boxes, cal, self.field_dims, colors=robot_colors,
+            frame_shape=frame.shape, rejected_out=rejected,
+        )
+        if rejected:
+            self.hard_neg_logger.maybe_log(
+                frame, [d.box for d in field_dets], rejected,
+                view_name=view.name, frame_num=frame_num,
+            )
         paired = []
         for d in field_dets:
-            cb = self._bumper_crop_b64(frame, d.box, enforce_floor=False)
+            cb = self._bumper_crop_b64(
+                frame,
+                d.box,
+                enforce_floor=False,
+                box_is_bumper=self.bumper_model is not None,
+            )
             crop_b64 = cb[0] if cb is not None else None
             paired.append((d, crop_b64))
         person_results = self.person_model(frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
@@ -1138,18 +1381,29 @@ class InferenceJob:
         if errors:
             self.vlm_status["last_error"] = errors[0]
 
-    def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
+    def vision_identify_robots(
+        self, frame: np.ndarray, tracked_robots, boxes_are_bumpers: bool = False
+    ) -> None:
         """Time-tracking wrapper around the bumper-VLM read (accumulates into
         timings['bumper_vlm'], a sub-component of the analysis loop)."""
         _t = time.perf_counter()
         try:
-            return self._vision_identify_robots_impl(frame, tracked_robots)
+            return self._vision_identify_robots_impl(
+                frame,
+                tracked_robots,
+                boxes_are_bumpers=boxes_are_bumpers,
+            )
         finally:
             t = getattr(self, "timings", None)
             if t is not None:
                 t["bumper_vlm"] = t.get("bumper_vlm", 0.0) + (time.perf_counter() - _t)
 
-    def _vision_identify_robots_impl(self, frame: np.ndarray, tracked_robots) -> None:
+    def _vision_identify_robots_impl(
+        self,
+        frame: np.ndarray,
+        tracked_robots,
+        boxes_are_bumpers: bool = False,
+    ) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
         identity can be overturned by the audit (assign_teams_from_votes +
@@ -1179,7 +1433,12 @@ class InferenceJob:
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
                 continue  # bumper hidden by hub/person/robot — don't read it
 
-            cb = self._bumper_crop_b64(frame, box, robot_id=canonical_id)
+            cb = self._bumper_crop_b64(
+                frame,
+                box,
+                robot_id=canonical_id,
+                box_is_bumper=boxes_are_bumpers,
+            )
             if cb is None:
                 continue  # empty crop or below legibility floor (diagnostic recorded)
             crop_b64, score = cb
@@ -1606,11 +1865,49 @@ class InferenceJob:
                 return score
         
         return None
+
+    def read_match_clock(self, overhead_frame: np.ndarray) -> Optional[int]:
+        """Read the configured match-clock ROI from an overhead-crop frame."""
+        if overhead_frame is None or overhead_frame.size == 0:
+            return None
+        region = self.ocr_regions.get("match_clock")
+        if region is None:
+            return None
+        x, y, w, h = region
+        fh, fw = overhead_frame.shape[:2]
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+            return None
+        roi = overhead_frame[y:y + h, x:x + w]
+        roi = cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, thresholded = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(
+            thresholded, config=MATCH_CLOCK_OCR_CONFIG
+        ).strip()
+        return parse_match_clock_text(text)
+
+    def _scan_match_clock(self) -> List[Tuple[int, Optional[int]]]:
+        """Sparse-decode the source video and OCR the clock every half second."""
+        sample_step = max(1, int(round(self.video_fps * MATCH_CLOCK_SAMPLE_SECONDS)))
+        samples = []
+        scan_cap = cv2.VideoCapture(str(self.video_path))
+        try:
+            for frame_idx in range(0, self.total_frames, sample_step):
+                scan_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ok, frame = scan_cap.read()
+                if not ok:
+                    continue
+                overhead = frame[:self.overhead_height, :]
+                samples.append((frame_idx, self.read_match_clock(overhead)))
+        finally:
+            scan_cap.release()
+        return samples
     
     def update_hub_positions(self, detections: sv.Detections) -> None:
         """Update hub positions and bounding boxes from hub_opening detections.
         If event_hub_positions are set, use them for alliance assignment (static).
         Otherwise fall back to midpoint-based initial assignment."""
+        # Hub detections intentionally come from the existing 3-class model.
         hub_mask = detections.class_id == 2
         if not np.any(hub_mask):
             return
@@ -1664,14 +1961,6 @@ class InferenceJob:
         # Fallback: left = red, right = blue
         midpoint = self.video_width / 2
         return "red" if x < midpoint else "blue"
-
-    def detect_bumper_color(self, frame: np.ndarray, box: np.ndarray) -> str:
-        """Detect current-match alliance from the bumper band only.
-
-        Robot paint, LEDs, and mechanisms can be the opposite color from the
-        bumpers, so this delegates to the bumper-focused lower-band classifier.
-        Returns 'blue', 'red', or 'unknown'."""
-        return classify_bumper_color(frame, box).alliance
 
     def _team_hud_label(self, robot, fallback: str) -> tuple[str, bool]:
         """Return a display label and whether the team is confirmed.
@@ -1916,6 +2205,7 @@ class InferenceJob:
         Unmatched detections start new trajectories.
         Trajectories that haven't been seen for BALL_MAX_MISSING frames are marked dead.
         """
+        # Fuel detections intentionally come from the existing 3-class model.
         ball_mask = detections.class_id == 0
         if not np.any(ball_mask):
             # No balls detected — increment missing counter on all active trajectories
@@ -2602,10 +2892,28 @@ class InferenceJob:
             # load line lands in the match log (not just the server console).
             if GALLERY_ENABLED and self.event_key:
                 try:
-                    rows = await database.get_gallery_exemplars(self.event_key)
+                    roster_teams = list(dict.fromkeys(
+                        str(team)
+                        for team in (
+                            self.match_teams
+                            + self.match_blue_teams
+                            + self.match_red_teams
+                        )
+                        if team is not None and str(team)
+                    ))
+                    rows = await database.get_gallery_exemplars(
+                        self.event_key, teams=roster_teams or None
+                    )
                     self.gallery = AppearanceGallery.from_rows(
                         rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
-                    print(f"  Appearance gallery loaded: {len(rows)} exemplars for {self.event_key}")
+                    scope = (
+                        f"match teams {roster_teams}"
+                        if roster_teams else "all event teams (no match roster)"
+                    )
+                    print(
+                        f"  Appearance gallery loaded: {len(rows)} exemplars "
+                        f"for {self.event_key}, {scope}"
+                    )
                 except Exception as e:
                     print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
                     self.gallery = None
@@ -2629,6 +2937,36 @@ class InferenceJob:
             print(f"Video: {self.video_width}x{self.video_height}, overhead: {self.video_width}x{self.overhead_height}")
             print(f"  OCR regions (overhead coords): {self.ocr_regions}")
             print(f"  Using {'custom' if custom_ocr_regions else 'default'} OCR regions")
+
+            scan_t0 = time.perf_counter()
+            clock_samples = self._scan_match_clock()
+            (
+                self.processing_ranges,
+                self.match_periods,
+                self.timer_gate_fallback,
+                self.timer_gate_fallback_reason,
+            ) = compute_active_windows(
+                clock_samples, self.video_fps, self.total_frames
+            )
+            self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
+            if self.timer_gate_fallback:
+                fallback_start = min(TITLE_SCREEN_FRAMES, max(0, self.total_frames - 1))
+                self.processing_ranges = [
+                    (fallback_start, max(0, self.total_frames - 1))
+                ]
+                print(
+                    "  [timer] WARNING: using the legacy post-title-screen range: "
+                    f"{self.timer_gate_fallback_reason}"
+                )
+            else:
+                period_text = ", ".join(
+                    f"{p['label']}={p['start_frame']}-{p['end_frame']}"
+                    for p in self.match_periods
+                )
+                print(
+                    f"  [timer] periods: {period_text}; "
+                    f"processing ranges={self.processing_ranges}"
+                )
             
             # Extract team numbers from early frame (using overhead crop)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 30)
@@ -2636,18 +2974,30 @@ class InferenceJob:
             if ret:
                 early_overhead = early_frame[:self.overhead_height, :]
                 self.extract_team_numbers(early_overhead)
-            # Skip the first 180 frames (title screen / intro graphics)
-            TITLE_SCREEN_FRAMES = 180
-            EARLY_OCR_FRAME = 200
-
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
+            self.sam2_obj_color = {}
             self._replay = ReplayRecorder()
             self.robot_embedder = None
             
-            if self.total_frames <= EARLY_OCR_FRAME:
-                print(f"  [SAM2] Video is too short ({self.total_frames} frames) for early prompt frame {EARLY_OCR_FRAME}. Disabling SAM2.")
+            active_frame_count = sum(
+                end - start + 1 for start, end in self.processing_ranges
+            )
+            auto_period = next(
+                (p for p in self.match_periods if p["label"] == "auto"), None
+            )
+            prompt_source_frame = (
+                auto_period["start_frame"]
+                if auto_period is not None and not self.timer_gate_fallback
+                else EARLY_OCR_FRAME
+            )
+
+            if active_frame_count <= 1 or prompt_source_frame >= self.total_frames:
+                print(
+                    f"  [SAM2] Active video is too short ({active_frame_count} frames) "
+                    f"for prompt frame {prompt_source_frame}. Disabling SAM2."
+                )
             else:
                 try:
                     from web.field.sam2_tracker import Sam2FieldTracker
@@ -2688,8 +3038,8 @@ class InferenceJob:
 
                     # VRAM-fit override: keep all tensors on the GPU and raise
                     # frame_skip so the tracked segment fits within the budget.
-                    if self.sam2_max_gpu_frames > 0 and self.total_frames:
-                        source_frames = max(1, self.total_frames - TITLE_SCREEN_FRAMES)
+                    if self.sam2_max_gpu_frames > 0 and active_frame_count:
+                        source_frames = max(1, active_frame_count)
                         self.frame_skip = max(
                             self.frame_skip,
                             math.ceil(source_frames / self.sam2_max_gpu_frames),
@@ -2703,9 +3053,11 @@ class InferenceJob:
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
                     _t_load = time.perf_counter()
+                    # Per-job encoder size (UI override); falls back to the env default.
+                    job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
                     sam2_tracker = Sam2FieldTracker(
-                        config=SAM2_CONFIG,
-                        checkpoint=SAM2_CHECKPOINT,
+                        config=job_config,
+                        checkpoint=job_checkpoint,
                         device=device,
                         offload_video_to_cpu=offload_vid,
                         offload_state_to_cpu=offload_st,
@@ -2714,7 +3066,7 @@ class InferenceJob:
                     self.robot_embedder = RobotEmbedder()
                     self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
                     self.use_sam2 = True
-                    print(f"  [SAM2] Loaded Sam2FieldTracker ({SAM2_MODEL_SIZE} model, "
+                    print(f"  [SAM2] Loaded Sam2FieldTracker ({self.model_size} model, "
                           f"vos_optimized={SAM2_VOS_OPTIMIZED and device == 'cuda'}) "
                           f"and RobotEmbedder on {device}")
                 except Exception as e:
@@ -2724,9 +3076,19 @@ class InferenceJob:
 
             if self.use_sam2:
                 print(f"  [SAM2] Running pre-computation pass over {len(self.views)} views...")
-                all_frames = list(range(TITLE_SCREEN_FRAMES, self.total_frames, self.frame_skip))
-                # Find the index of the frame in all_frames closest to EARLY_OCR_FRAME
-                prompt_local_idx = min(range(len(all_frames)), key=lambda i: abs(all_frames[i] - EARLY_OCR_FRAME))
+                all_frames = [
+                    frame
+                    for start, end in self.processing_ranges
+                    for frame in range(start, end + 1, self.frame_skip)
+                ]
+                self.sam2_source_to_local = {
+                    source_frame: local_idx
+                    for local_idx, source_frame in enumerate(all_frames)
+                }
+                prompt_local_idx = min(
+                    range(len(all_frames)),
+                    key=lambda i: abs(all_frames[i] - prompt_source_frame),
+                )
                 prompt_frame = all_frames[prompt_local_idx]
                 SAM2_SCALE = 0.5
                 
@@ -2755,19 +3117,23 @@ class InferenceJob:
                 # but decoding is linear instead of seek-thrashing and happens only once.
                 view_dirs = {v.name: tempfile.TemporaryDirectory() for v in self.views}
                 view_prompt_boxes: dict[str, list] = {v.name: [] for v in self.views}
+                view_prompt_colors: dict[str, list] = {v.name: [] for v in self.views}
                 EXPORT_PCT = 25.0  # share of the progress bar spent exporting frames
                 export_t0 = time.perf_counter()
                 exported = 0
                 cap_pre = cv2.VideoCapture(str(self.video_path))
                 try:
-                    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
-                    fpos = TITLE_SCREEN_FRAMES
+                    first_export_frame = all_frames[0]
+                    export_frame_set = set(all_frames)
+                    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, first_export_frame)
+                    fpos = first_export_frame
                     local_idx = 0
-                    while fpos < self.total_frames:
+                    last_export_frame = all_frames[-1]
+                    while fpos <= last_export_frame:
                         ok, fr = cap_pre.read()
                         if not ok:
                             break
-                        if (fpos - TITLE_SCREEN_FRAMES) % self.frame_skip == 0:
+                        if fpos in export_frame_set:
                             is_prompt = (fpos == prompt_frame)
                             for view in self.views:
                                 try:
@@ -2788,13 +3154,32 @@ class InferenceJob:
                                     fname = os.path.join(view_dirs[view.name].name, f"{local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-                                    # Detect YOLO prompt boxes on the prompt frame.
-                                    if is_prompt:
+                                    # Seed SAM2 from expanded bumper detections so masks
+                                    # cover whole robots while color stays class-derived.
+                                    if is_prompt and self.bumper_model is not None:
+                                        res = self.bumper_model(
+                                            crop, conf=0.4, verbose=False
+                                        )[0]
+                                        robots, _balls, _hubs = self.det_schema.split(
+                                            sv.Detections.from_ultralytics(res)
+                                        )
+                                        for box, color, _confidence in robots:
+                                            robot_box = expand_bumper_to_robot(
+                                                box,
+                                                crop.shape,
+                                                ROBOT_BOX_FROM_BUMPER_FACTOR,
+                                            )
+                                            view_prompt_boxes[view.name].append(
+                                                tuple(v * SAM2_SCALE for v in robot_box)
+                                            )
+                                            view_prompt_colors[view.name].append(color)
+                                    elif is_prompt:
                                         res = self.model(crop, conf=0.4, verbose=False)[0]
                                         for i in range(len(res.boxes)):
                                             if int(res.boxes.cls[i]) == 1:
                                                 box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
                                                 view_prompt_boxes[view.name].append(tuple(box))
+                                                view_prompt_colors[view.name].append(None)
                                 except Exception as e:
                                     print(f"  [SAM2] Error exporting frame {local_idx} for view {view.name}: {e}")
                             local_idx += 1
@@ -2816,6 +3201,10 @@ class InferenceJob:
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
                     prompt_boxes_scaled = view_prompt_boxes[view.name]
+                    self.sam2_obj_color[view.name] = {
+                        i + 1: color
+                        for i, color in enumerate(view_prompt_colors[view.name])
+                    }
                     base_pct = EXPORT_PCT + (view_idx / N) * (100.0 - EXPORT_PCT)
                     span_pct = (100.0 - EXPORT_PCT) / N
                     print(f"  [SAM2] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
@@ -2849,12 +3238,30 @@ class InferenceJob:
                                 img = cv2.imread(frame_path)
                                 if img is None:
                                     return []
+                                if self.bumper_model is not None:
+                                    res = self.bumper_model(
+                                        img, conf=0.4, verbose=False
+                                    )[0]
+                                    robots, _balls, _hubs = self.det_schema.split(
+                                        sv.Detections.from_ultralytics(res)
+                                    )
+                                    return [
+                                        (
+                                            expand_bumper_to_robot(
+                                                box,
+                                                img.shape,
+                                                ROBOT_BOX_FROM_BUMPER_FACTOR,
+                                            ),
+                                            color,
+                                        )
+                                        for box, color, _confidence in robots
+                                    ]
                                 res = self.model(img, conf=0.4, verbose=False)[0]
-                                boxes = []
-                                for i in range(len(res.boxes)):
-                                    if int(res.boxes.cls[i]) == 1:
-                                        boxes.append(tuple(res.boxes.xyxy[i].cpu().numpy()))
-                                return boxes
+                                return [
+                                    tuple(res.boxes.xyxy[i].cpu().numpy())
+                                    for i in range(len(res.boxes))
+                                    if int(res.boxes.cls[i]) == 1
+                                ]
                             return detect_fn
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
@@ -2869,6 +3276,7 @@ class InferenceJob:
                             prompt_boxes=prompt_boxes_scaled,
                             reprompt_every=reprompt_every,
                             detect_fn=make_detect_fn(),
+                            object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
                             progress_cb=make_progress_cb(base_pct, span_pct, view.name)
                         )
@@ -2895,23 +3303,47 @@ class InferenceJob:
                     self.fused_registry = FusedTrackRegistry()
             # -------------------------------------
 
-            # Early vision OCR pass on frame 200 to identify robots before main loop.
+            # Early vision OCR pass at the autonomous start when timer gating succeeds.
             # Seeds the field tracker's slots from this frame so VLM reads bind to
             # slot ids (the same identity the main loop uses).
-            cap.set(cv2.CAP_PROP_POS_FRAMES, EARLY_OCR_FRAME)
+            early_ocr_source_frame = prompt_source_frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, early_ocr_source_frame)
             ret, early_ocr_frame = cap.read()
             if ret and self.match_teams:
-                print(f"  Early vision OCR on frame {EARLY_OCR_FRAME}...")
+                print(f"  Early vision OCR on frame {early_ocr_source_frame}...")
                 early_overhead = early_ocr_frame[:self.overhead_height, :]
-                results = self.model(early_overhead, conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                detections = sv.Detections.from_ultralytics(results)
-                robot_mask = detections.class_id == 1
-                early_boxes = [detections.xyxy[i] for i in range(len(detections))
-                               if robot_mask[i]]
+                if self.bumper_model is not None:
+                    results = self.bumper_model(
+                        early_overhead, conf=DET_CONF_THRESHOLD, verbose=False
+                    )[0]
+                    robots, _balls, _hubs = self.det_schema.split(
+                        sv.Detections.from_ultralytics(results)
+                    )
+                else:
+                    results = self.model(
+                        early_overhead, conf=DET_CONF_THRESHOLD, verbose=False
+                    )[0]
+                    detections = sv.Detections.from_ultralytics(results)
+                    robots = [
+                        (
+                            tuple(detections.xyxy[i]),
+                            None,
+                            (
+                                float(detections.confidence[i])
+                                if detections.confidence is not None
+                                else 1.0
+                            ),
+                        )
+                        for i in range(len(detections))
+                        if detections.class_id[i] == 1
+                    ]
+                early_boxes = [np.asarray(box) for box, _color, _conf in robots]
+                early_colors = [color for _box, color, _conf in robots]
                 main_view = next((v for v in self.views if v.name == "main"), None)
                 if main_view:
                     filtered_early_boxes = []
-                    for box in early_boxes:
+                    filtered_early_colors = []
+                    for box, color in zip(early_boxes, early_colors):
                         cx = (box[0] + box[2]) / 2.0
                         cy = (box[1] + box[3]) / 2.0
                         is_masked = False
@@ -2921,11 +3353,24 @@ class InferenceJob:
                                 break
                         if not is_masked:
                             filtered_early_boxes.append(box)
+                            filtered_early_colors.append(color)
                     early_boxes = filtered_early_boxes
+                    early_colors = filtered_early_colors
+                early_rejected = []
                 early_field_dets = to_field_detections(
-                    early_boxes, self.calib, early_overhead, self.field_dims,
-                    color_fn=self.detect_bumper_color,
+                    early_boxes,
+                    self.calib,
+                    self.field_dims,
+                    colors=early_colors,
+                    frame_shape=early_overhead.shape,
+                    rejected_out=early_rejected,
                 )
+                if early_rejected:
+                    self.hard_neg_logger.maybe_log(
+                        early_overhead, [d.box for d in early_field_dets],
+                        early_rejected, view_name="main",
+                        frame_num=early_ocr_source_frame,
+                    )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
                 early_robots = []
@@ -2940,12 +3385,32 @@ class InferenceJob:
                     robot.last_position = (float(cx), float(cy))
                     early_robots.append((t.slot_id, t.box))
                 if early_robots:
-                    self.vision_identify_robots(early_overhead, early_robots)
+                    self.vision_identify_robots(
+                        early_overhead,
+                        early_robots,
+                        boxes_are_bumpers=self.bumper_model is not None,
+                    )
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
+            first_processing_frame = self.processing_ranges[0][0]
+            last_processing_frame = self.processing_ranges[-1][1]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_processing_frame)
 
-            frame_num = TITLE_SCREEN_FRAMES
+            frame_num = first_processing_frame
             processed_frame_num = 0
+            analysis_frame_set = {
+                frame
+                for start, end in self.processing_ranges
+                for frame in range(start, end + 1, self.frame_skip)
+            }
+            auto_core = next(
+                (
+                    (p["start_frame"], p["end_frame"])
+                    for p in self.match_periods
+                    if p["label"] == "auto"
+                ),
+                None,
+            )
+            previous_processed_source_frame = None
             self._inference_start_time = time.time()
             robots_data = []
             events_data = []
@@ -2955,16 +3420,30 @@ class InferenceJob:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                if frame_num > last_processing_frame:
+                    break
                 
-                # Skip frames
-                if (frame_num - TITLE_SCREEN_FRAMES) % self.frame_skip != 0:
+                if frame_num not in analysis_frame_set:
                     frame_num += 1
                     continue
+
+                if (
+                    previous_processed_source_frame is not None
+                    and frame_num - previous_processed_source_frame > self.frame_skip * 2
+                ):
+                    self.ball_trajectories.clear()
+                    self.recent_ball_detections.clear()
+                    self._ball_score_cooldown.clear()
+                    print(
+                        f"  [timer] resumed processing at frame {frame_num}; "
+                        "reset transient ball state across skipped gap"
+                    )
                 
                 # Crop overhead portion
                 overhead_frame = frame[:self.overhead_height, :]
                 
-                # Run YOLO
+                # Existing 3-class YOLO intentionally feeds fuel/hub detection
+                # and their HUD annotations; robots come from the bumper model.
                 results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
                 
@@ -2976,7 +3455,7 @@ class InferenceJob:
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
                 
                 if self.use_sam2:
-                    local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
+                    local_idx = self.sam2_source_to_local.get(frame_num)
                     SAM2_SCALE = 0.5
                     for view in self.views:
                         paired = []
@@ -3014,8 +3493,10 @@ class InferenceJob:
                             if xy is None or not _on_field(xy, self.field_dims):
                                 continue
                             
-                            # Detect bumper color on the full resolution view crop frame
-                            color = self.detect_bumper_color(view_frame, np.array([fx1, fy1, fx2, fy2]))
+                            color = (
+                                self.sam2_obj_color.get(view.name, {}).get(obj_id)
+                                or "unknown"
+                            )
                             
                             det_embed = None
                             robot_crop_b64 = None
@@ -3064,7 +3545,7 @@ class InferenceJob:
                 else:
                     for view in self.views:
                         pre = detections if view.name == "main" else None
-                        paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
+                        paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre, frame_num=frame_num)
                         per_camera[view.name] = paired
                         person_boxes_by_cam[view.name] = pboxes
 
@@ -3141,48 +3622,18 @@ class InferenceJob:
                         robot.positions_history.append((processed_frame_num, float(cx), float(cy)))
                         robot.last_seen_frame = frame_num
                         tracked_robot_boxes.append((t.slot_id, t.box))
+                        if auto_core and auto_core[0] <= frame_num <= auto_core[1]:
+                            self.autonomous_paths[self._slot_label(t.slot_id)].append({
+                                "frame_num": frame_num,
+                                "timestamp": round(
+                                    frame_num / (self.video_fps or 1.0), 4
+                                ),
+                                "field_pos": [
+                                    round(float(t.pos[0]), 4),
+                                    round(float(t.pos[1]), 4),
+                                ],
+                            })
                     # Coasting tracks keep their stale last_position untouched.
-
-                # Map detection index -> slot_id for the annotation pass (a track's
-                # box is the same ndarray its field detection was built from).
-                detection_to_tracked = {}  # det_index -> slot_id
-                
-                if self.use_sam2:
-                    slot_to_main_box = {}
-                    for obs in fused:
-                        if obs.track_id is not None:
-                            for cam, det_id in obs.members:
-                                if cam == "main":
-                                    main_det = next((d for (d, _) in per_camera.get("main", []) if d.track_id == det_id), None)
-                                    if main_det is not None and main_det.box is not None:
-                                        slot_to_main_box[obs.track_id] = main_det.box
-                                    break
-                    
-                    for di in range(len(detections)):
-                        if detections.class_id[di] != 1:
-                            continue
-                        db = detections.xyxy[di]
-                        best_slot = None
-                        best_iou = 0.3
-                        for registry_track_id, sbox in slot_to_main_box.items():
-                            iou = _box_iou(db, sbox)
-                            if iou > best_iou:
-                                best_iou = iou
-                                resolved_slot = self.field_tracker._id_to_slot.get(registry_track_id)
-                                if resolved_slot is not None:
-                                    best_slot = resolved_slot
-                        if best_slot is not None:
-                            detection_to_tracked[di] = best_slot
-                else:
-                    for slot_id, tbox in tracked_robot_boxes:
-                        for di in range(len(detections)):
-                            if detections.class_id[di] != 1:
-                                continue
-                            db = detections.xyxy[di]
-                            if (abs(db[0] - tbox[0]) < 1 and abs(db[1] - tbox[1]) < 1 and
-                                    abs(db[2] - tbox[2]) < 1 and abs(db[3] - tbox[3]) < 1):
-                                detection_to_tracked[di] = slot_id
-                                break
 
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
@@ -3262,48 +3713,7 @@ class InferenceJob:
                         color = (0, 255, 255)  # Yellow
                         label = "ball"
                     elif class_id == 1:  # robot
-                        # Use the detection→tracked mapping built above
-                        if i in detection_to_tracked:
-                            slot_id = detection_to_tracked[i]
-                            robot = self.robot_tracks[slot_id]
-                            alliance = robot.alliance
-                            label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
-                            t = track_by_slot.get(slot_id)
-                            
-                            # Find main view mask for this slot
-                            mask = None
-                            if self.use_sam2:
-                                local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
-                                registry_track_id = next((k for k, v in self.field_tracker._id_to_slot.items() if v == slot_id), None)
-                                if registry_track_id is not None:
-                                    obs = next((o for o in fused if o.track_id == registry_track_id), None)
-                                    if obs is not None:
-                                        for cam, det_id in obs.members:
-                                            if cam == "main" and "main" in self.sam2_raw:
-                                                view_raw = self.sam2_raw["main"]
-                                                if local_idx in view_raw and det_id in view_raw[local_idx]:
-                                                    mask2d = view_raw[local_idx][det_id].get("mask")
-                                                    if mask2d is not None:
-                                                        crop_h, crop_w = overhead_frame.shape[:2]
-                                                        mask = cv2.resize(mask2d.astype(np.uint8), (crop_w, crop_h), interpolation=cv2.INTER_NEAREST).astype(bool)
-                                                break
-
-                            self._draw_bumper_hud(
-                                annotated_frame, box, alliance, label, slot_id=slot_id,
-                                cal=self.calib,
-                                field_pos=t.pos if t else robot.field_position,
-                                vel=t.vel if t else None,
-                                mask=mask,
-                            )
-                            continue
-                        else:
-                            # Untracked robot detection — use bumper color for display only
-                            alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])
-                            color = (255, 0, 0) if alliance == "blue" else (0, 0, 255) if alliance == "red" else (200, 200, 200)
-                            confirmed = False
-                            label = "robot"
-                            self._draw_bumper_hud(annotated_frame, box, alliance, label)
-                            continue
+                        continue
                     else:  # hub_opening
                         color = (0, 255, 0)  # Green
                         label = "hub"
@@ -3313,19 +3723,73 @@ class InferenceJob:
                     if class_id == 0 and not HUD_DRAW_BALL_BOXES:
                         continue
 
-                    if class_id == 1 and i in detection_to_tracked and confirmed:
-                        # Confirmed robot: thick solid box
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
-                    elif class_id == 1 and i in detection_to_tracked:
-                        # Tentative/unidentified robot: thin box with corner ticks
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 1)
-                    else:
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
                     # Label with background for readability
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                     cv2.rectangle(annotated_frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 0), -1)
                     cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Robots are drawn from visible tracker slots. Their boxes and
+                # alliance colors originate from the bumper-model path.
+                for slot_id, box in tracked_robot_boxes:
+                    robot = self.robot_tracks.get(slot_id)
+                    if robot is None:
+                        continue
+                    label, _confirmed = self._team_hud_label(
+                        robot, self._slot_label(slot_id)
+                    )
+                    track = track_by_slot.get(slot_id)
+                    mask = None
+                    if self.use_sam2:
+                        local_idx = self.sam2_source_to_local.get(frame_num)
+                        registry_track_id = next(
+                            (
+                                track_id
+                                for track_id, mapped_slot in
+                                self.field_tracker._id_to_slot.items()
+                                if mapped_slot == slot_id
+                            ),
+                            None,
+                        )
+                        if registry_track_id is not None:
+                            obs = next(
+                                (
+                                    item for item in fused
+                                    if item.track_id == registry_track_id
+                                ),
+                                None,
+                            )
+                            if obs is not None:
+                                for camera, det_id in obs.members:
+                                    if camera != "main" or "main" not in self.sam2_raw:
+                                        continue
+                                    entry = self.sam2_raw["main"].get(
+                                        local_idx, {}
+                                    ).get(det_id)
+                                    if entry is not None:
+                                        mask2d = entry.get("mask")
+                                        if mask2d is not None:
+                                            crop_h, crop_w = overhead_frame.shape[:2]
+                                            mask = cv2.resize(
+                                                mask2d.astype(np.uint8),
+                                                (crop_w, crop_h),
+                                                interpolation=cv2.INTER_NEAREST,
+                                            ).astype(bool)
+                                    break
+                    self._draw_bumper_hud(
+                        annotated_frame,
+                        box,
+                        robot.alliance,
+                        label,
+                        slot_id=slot_id,
+                        cal=self.calib,
+                        field_pos=(
+                            track.pos if track else robot.field_position
+                        ),
+                        vel=track.vel if track else None,
+                        mask=mask,
+                    )
                 
                 # Draw hubs
                 for hub in self.hubs:
@@ -3339,8 +3803,10 @@ class InferenceJob:
                 for region_key, (rx, ry, rw, rh) in self.ocr_regions.items():
                     if "blue" in region_key:
                         rect_color = (255, 0, 0)  # Blue in BGR
-                    else:
+                    elif "red" in region_key:
                         rect_color = (0, 0, 255)  # Red in BGR
+                    else:
+                        rect_color = (0, 255, 255)  # Yellow in BGR
                     cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
                     cv2.putText(annotated_frame, region_key,
                                (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
@@ -3447,6 +3913,7 @@ class InferenceJob:
                         break
 
                 self._current_frame = frame_num
+                previous_processed_source_frame = frame_num
 
                 if self._stopped:
                     break
@@ -3488,6 +3955,8 @@ class InferenceJob:
                     "robots": robots_data,
                     "scoring_events": events_data,
                     "final_scores": self.alliance_scores,
+                    "periods": self.match_periods,
+                    "autonomous_paths": dict(self.autonomous_paths),
                     "processing_sec": self.timings.get("total"),
                     "timings": self.timings,
                 }))
@@ -3533,6 +4002,11 @@ class InferenceJob:
                         "robots": [r for f in rec.frames[:1] for r in f["robots"]],
                         "processing_sec": timings.get("total"),
                         "timings": timings,
+                        "periods": self.match_periods,
+                        "processing_ranges": self.processing_ranges,
+                        "timer_gate_fallback": self.timer_gate_fallback,
+                        "timer_gate_fallback_reason": self.timer_gate_fallback_reason,
+                        "autonomous_paths": dict(self.autonomous_paths),
                     }
                     artifacts = rec.finalize(status=status, summary=summary)
                     import json as _json
@@ -3607,10 +4081,22 @@ async def calibrate_page():
 @app.get("/api/status")
 async def status():
     """Return model and system status"""
+    latest_job = jobs[next(reversed(jobs))] if jobs else None
+    bumper_classes = (
+        dict(latest_job.bumper_model.names)
+        if latest_job is not None and latest_job.bumper_model is not None
+        else None
+    )
     return {
-        "model": "YOLO26s Hub-Zone",
-        "model_path": str(MODEL_PATH),
-        "model_classes": {0: "fuel_ball", 1: "robot", 2: "hub_opening"},
+        "model": "YOLO26s Hub-Zone + YOLOv8m Bumpers",
+        "model_path": {
+            "fuel_hub_model": str(MODEL_PATH),
+            "bumper_model": str(BUMPER_MODEL_PATH),
+        },
+        "model_classes": {
+            "fuel_hub_model": {0: "fuel_ball", 1: "robot", 2: "hub_opening"},
+            "bumper_model": bumper_classes,
+        },
         "status": "ready",
         "has_event": current_event is not None,
         "event_key": current_event['event_key'] if current_event else None,
@@ -3622,11 +4108,11 @@ async def status():
 async def set_ocr_regions(request: Request):
     """Set custom OCR regions for score reading. 
     Coordinates are in the overhead crop coordinate space (1920x723 for 1080p).
-    Body: {"red_center": [x, y, w, h], "blue_center": [x, y, w, h]}"""
+    Body keys: red_center, blue_center, and optional match_clock."""
     global custom_ocr_regions
     body = await request.json()
     custom_ocr_regions = {}
-    for key in ["red_center", "blue_center"]:
+    for key in ["red_center", "blue_center", "match_clock"]:
         if key in body:
             coords = body[key]
             custom_ocr_regions[key] = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
@@ -3641,7 +4127,7 @@ async def set_ocr_regions(request: Request):
 @app.get("/api/ocr-regions")
 async def get_ocr_regions():
     """Get current OCR regions."""
-    regions = custom_ocr_regions if custom_ocr_regions else OCR_REGIONS_1080P
+    regions = {**OCR_REGIONS_1080P, **(custom_ocr_regions or {})}
     return {"regions": {k: list(v) for k, v in regions.items()}, "custom": custom_ocr_regions is not None}
 
 
@@ -4221,11 +4707,6 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     # Claude Vision fallback (disabled for now)
     # return _claude_vision_read_bumpers(robot_crops_b64, match_teams, blue_teams, red_teams)
-
-
-def _detect_bumper_color_static(frame: np.ndarray, box) -> str:
-    """Static version of bumper color detection for use outside InferenceJob."""
-    return classify_bumper_color(frame, box).alliance
 
 
 def _claude_vision_read_bumpers(robot_crops_b64: list, match_teams: list,
@@ -4837,23 +5318,45 @@ def _ocr_bumper_number(frame: np.ndarray, box, match_teams: list) -> dict:
     return {"ocr_raw": raw, "matched_team": best_match, "confidence": best_match_confidence}
 
 
-def _detect_robots_in_frame(frame: np.ndarray, model, match_teams: list,
-                            blue_teams: list, red_teams: list) -> list:
+def _detect_robots_in_frame(
+    frame: np.ndarray,
+    model,
+    match_teams: list,
+    blue_teams: list,
+    red_teams: list,
+    bumper_model=None,
+) -> list:
     """Detect robots in a single frame. Returns list of robot dicts."""
-    results = model(frame, verbose=False)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    robot_mask = detections.class_id == 1
-    robot_dets = detections[robot_mask]
+    if bumper_model is not None:
+        results = bumper_model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        schema = DetectionSchema.from_names(bumper_model.names)
+        robot_dets, _balls, _hubs = schema.split(
+            sv.Detections.from_ultralytics(results)
+        )
+    else:
+        results = model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(results)
+        robot_dets = [
+            (
+                tuple(detections.xyxy[i]),
+                None,
+                (
+                    float(detections.confidence[i])
+                    if detections.confidence is not None
+                    else 1.0
+                ),
+            )
+            for i in range(len(detections))
+            if detections.class_id[i] == 1
+        ]
 
     robots = []
-    for i in range(len(robot_dets)):
-        box = robot_dets.xyxy[i]
-        conf = float(robot_dets.confidence[i])
+    for box, class_color, conf in robot_dets:
         x1, y1, x2, y2 = map(int, box)
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
 
-        alliance = _detect_bumper_color_static(frame, box)
+        alliance = class_color or "unknown"
 
         if alliance == "blue":
             candidate_teams = blue_teams
@@ -4948,6 +5451,9 @@ async def detect_robots(request: Request):
         return JSONResponse(status_code=400, content={"error": "No frames provided"})
 
     model = YOLO(str(MODEL_PATH))
+    bumper_model = (
+        YOLO(str(BUMPER_MODEL_PATH)) if BUMPER_MODEL_PATH.exists() else None
+    )
     all_robots = []
     frame_dims = None
 
@@ -4960,7 +5466,14 @@ async def detect_robots(request: Request):
         if frame_dims is None:
             frame_dims = (frame.shape[1], frame.shape[0])
 
-        robots = _detect_robots_in_frame(frame, model, match_teams, blue_teams, red_teams)
+        robots = _detect_robots_in_frame(
+            frame,
+            model,
+            match_teams,
+            blue_teams,
+            red_teams,
+            bumper_model=bumper_model,
+        )
         for r in robots:
             r["frame_index"] = frame_idx
             r.pop("frame_source", None)
@@ -5227,12 +5740,34 @@ async def get_diagnostic(key: str):
     return StreamingResponse(iter_file(), media_type="application/x-ndjson")
 
 
+@app.get("/api/sam2_models")
+async def sam2_models():
+    """List selectable SAM2 encoder sizes and whether each checkpoint is downloaded.
+
+    The UI uses `available` to disable sizes whose .pt file is missing, since picking
+    one would silently degrade to Kalman tracking.
+    """
+    return {
+        "default": SAM2_MODEL_SIZE,
+        "models": [
+            {
+                "size": size,
+                "label": label,
+                "detail": detail,
+                "available": _sam2_checkpoint_present(size),
+            }
+            for size, label, detail in _SAM2_SIZE_INFO
+        ],
+    }
+
+
 @app.post("/api/infer")
 async def infer(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
     team_reader: str = Form("local"),
     sam2_max_gpu_frames: Optional[int] = Form(None),
+    model_size: Optional[str] = Form(None),
 ):
     """Start inference job"""
     job_id = str(uuid.uuid4())
@@ -5276,6 +5811,14 @@ async def infer(
         # Per-run VRAM frame budget (UI override); falls back to env default when omitted.
         if sam2_max_gpu_frames is not None:
             job.sam2_max_gpu_frames = max(0, int(sam2_max_gpu_frames))
+        # Per-run SAM2 encoder size (UI override); ignore unknown values and warn (but
+        # don't fail the job) if the chosen checkpoint isn't downloaded — SAM2 init would
+        # otherwise silently fall back to Kalman tracking.
+        if model_size and model_size.lower() in _SAM2_MODELS:
+            job.model_size = model_size.lower()
+            if not _sam2_checkpoint_present(job.model_size):
+                print(f"  [SAM2] WARNING: '{job.model_size}' checkpoint not found at "
+                      f"{_SAM2_MODELS[job.model_size][1]}; SAM2 will fall back to Kalman tracking.")
         jobs[job_id] = job
         
         return {"job_id": job_id}

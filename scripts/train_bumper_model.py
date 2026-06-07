@@ -20,7 +20,7 @@ BASE_MODEL = "yolov8m.pt"
 EPOCHS = 100
 PATIENCE = 20
 IMG_SIZE = 640
-BATCH_SIZE = 16        # yolov8m@640; auto-reduces if the GPU is shared / low on VRAM
+BATCH_SIZE = -1        # AutoBatch: use the full (now-exclusive) GPU (~60% VRAM target)
 DEVICE = 0
 WORKERS = 8
 

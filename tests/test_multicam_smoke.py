@@ -72,8 +72,9 @@ def test_corner_cameras_add_occluded_field_coverage():
             res = model(crop, conf=DET_CONF, verbose=False)[0]
             dets = sv.Detections.from_ultralytics(res)
             boxes = [dets.xyxy[i] for i in range(len(dets)) if dets.class_id[i] == 1]
-            fdets = to_field_detections(boxes, v.calibration, crop, dims,
-                                        color_fn=lambda f, b: "unknown")
+            fdets = to_field_detections(
+                boxes, v.calibration, dims, colors=["unknown"] * len(boxes)
+            )
             per_camera[v.name] = [(d, None) for d in fdets]
             if v.name != "main":
                 corner_onfield += len(fdets)

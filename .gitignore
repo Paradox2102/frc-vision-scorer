@@ -114,3 +114,7 @@ web/replays/
 /data/bumper_benjamin/
 /data/bumper_karthik/
 /data/bumper_merged/
+data/hard_negatives/
+
+/data/bumper_hardneg/
+tools/frame_*.png

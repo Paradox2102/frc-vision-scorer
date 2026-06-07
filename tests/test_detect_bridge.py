@@ -4,18 +4,15 @@ from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from tests._field_synth import truth_pinhole_camera
 
 
-def _color_stub(frame, box):
-    return "blue"
-
-
 def test_box_maps_to_field_point():
     fm = FieldModel.load("2026-rebuilt-welded")
     cam = truth_pinhole_camera()
     gx, gy = 8.0, 4.0
     u, v = cam.field_to_image((gx, gy, 0.0))     # ground point
     box = (u - 30, v - 120, u + 30, v)           # bottom-center == (u, v)
-    dets = to_field_detections([box], cam, frame=None, field_dims=(fm.length_m, fm.width_m),
-                               color_fn=_color_stub)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"]
+    )
     assert len(dets) == 1
     assert np.hypot(dets[0].pos[0] - gx, dets[0].pos[1] - gy) < 0.10
     assert dets[0].color == "blue"
@@ -26,8 +23,112 @@ def test_off_field_box_dropped():
     cam = truth_pinhole_camera()
     u, v = cam.field_to_image((30.0, 4.0, 0.0))  # way off field (x=30 > 16.5)
     box = (u - 30, v - 120, u + 30, v)
-    dets = to_field_detections([box], cam, None, (fm.length_m, fm.width_m), _color_stub)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"]
+    )
     assert dets == []
+
+
+def test_oversized_field_footprint_dropped():
+    """A box whose bottom edge spans ~5 m of carpet implies a 5 m-wide 'robot' —
+    physically impossible (FRC robot + bumpers ~1.1 m), so it must be rejected even
+    though its bottom-center lands on the field."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    ul, vl = cam.field_to_image((6.0, 4.0, 0.0))   # bottom-left  ~ field x=6
+    ur, vr = cam.field_to_image((11.0, 4.0, 0.0))  # bottom-right ~ field x=11
+    y2 = max(vl, vr)
+    box = (min(ul, ur), y2 - 120, max(ul, ur), y2)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"]
+    )
+    assert dets == []
+
+
+def test_far_oblique_detection_not_width_rejected():
+    """Regression: at long range the ground-plane projection is ill-conditioned and
+    inflates the apparent footprint, so the field-width filter must NOT fire there —
+    it was killing real robots in the oblique corner cameras. The image-fraction
+    backstop still guards genuinely-huge boxes."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    # bottom corners 4 m apart on carpet, far downrange (camDist > the near-range gate)
+    ul, vl = cam.field_to_image((6.0, 7.8, 0.0))
+    ur, vr = cam.field_to_image((10.0, 7.8, 0.0))
+    y2 = max(vl, vr)
+    box = (min(ul, ur), y2 - 60, max(ul, ur), y2)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"],
+        frame_shape=(1080, 1920, 3),
+    )
+    assert len(dets) == 1   # kept: too far to trust the width measurement
+
+
+def test_oversized_image_fraction_dropped():
+    """A box spanning >50% of the frame width is rejected via the image-space backstop
+    (defense for cameras with poor calibration where field footprint can't be trusted)."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    u, v = cam.field_to_image((8.0, 4.0, 0.0))
+    box = (u - 600, v - 120, u + 600, v)           # 1200 px wide == 62% of 1920
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"],
+        frame_shape=(1080, 1920, 3),
+    )
+    assert dets == []
+
+
+def test_normal_robot_footprint_kept():
+    """A box implying a ~0.9 m footprint on the carpet survives the size filter."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    ul, vl = cam.field_to_image((8.0, 4.0, 0.0))
+    ur, vr = cam.field_to_image((8.9, 4.0, 0.0))
+    y2 = max(vl, vr)
+    box = (min(ul, ur), y2 - 120, max(ul, ur), y2)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["red"],
+        frame_shape=(1080, 1920, 3),
+    )
+    assert len(dets) == 1
+
+
+def test_rejected_out_records_reasons():
+    """rejected_out collects dropped boxes with a reason, for hard-negative mining."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    # an off-field box
+    uo, vo = cam.field_to_image((30.0, 4.0, 0.0))
+    off = (uo - 30, vo - 120, uo + 30, vo)
+    # an oversized (on-field bottom-center) box
+    ul, vl = cam.field_to_image((6.0, 4.0, 0.0))
+    ur, vr = cam.field_to_image((11.0, 4.0, 0.0))
+    y2 = max(vl, vr)
+    big = (min(ul, ur), y2 - 120, max(ul, ur), y2)
+    # a normal robot
+    un, vn = cam.field_to_image((8.0, 4.0, 0.0))
+    ok = (un - 30, vn - 120, un + 30, vn)
+
+    rejected = []
+    dets = to_field_detections(
+        [off, big, ok], cam, (fm.length_m, fm.width_m),
+        colors=["blue", "blue", "red"], rejected_out=rejected,
+    )
+    assert len(dets) == 1
+    reasons = sorted(r["reason"] for r in rejected)
+    assert reasons == ["off_field", "too_large"]
+    assert all("box" in r for r in rejected)
+
+
+def test_missing_color_becomes_unknown():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    u, v = cam.field_to_image((8.0, 4.0, 0.0))
+    box = (u - 30, v - 120, u + 30, v)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=[None]
+    )
+    assert dets[0].color == "unknown"
 
 
 def test_field_adjacent_person_filter():

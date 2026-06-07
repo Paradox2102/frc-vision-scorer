@@ -569,13 +569,25 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
         await db.commit()
 
 
-async def get_gallery_exemplars(event_key: str) -> List[Dict]:
-    """All gallery exemplars for an event."""
+async def get_gallery_exemplars(
+    event_key: str, teams: Optional[List[str]] = None
+) -> List[Dict]:
+    """Gallery exemplars for an event, optionally limited to specific teams."""
+    team_filter = list(dict.fromkeys(
+        str(team) for team in (teams or [])
+        if team is not None and str(team)
+    ))
+    where = "event_key = ?"
+    params: List[Any] = [event_key]
+    if team_filter:
+        where += f" AND team IN ({','.join('?' for _ in team_filter)})"
+        params.extend(team_filter)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, team, alliance_color, embedding, legibility, image, verified, job_id "
-            "FROM appearance_gallery WHERE event_key = ? ORDER BY id", (event_key,))
+            f"FROM appearance_gallery WHERE {where} ORDER BY id", params)
         return [dict(r) for r in await cursor.fetchall()]
 
 

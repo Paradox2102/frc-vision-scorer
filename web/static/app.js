@@ -58,6 +58,7 @@ class VisionScorer {
 
         // Upload form
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
+        this.populateSam2Models();
         this.startInferenceBtn.addEventListener('click', () => this.startInference());
         this.pauseInferenceBtn.addEventListener('click', () => this.pauseInference());
         this.resumeInferenceBtn.addEventListener('click', () => this.resumeInference());
@@ -336,6 +337,7 @@ class VisionScorer {
         document.getElementById('ocrMarkBlueHub').onclick = () => this.startHubMark('blue');
         document.getElementById('ocrDrawRed').onclick = () => this.startOcrDraw('red');
         document.getElementById('ocrDrawBlue').onclick = () => this.startOcrDraw('blue');
+        document.getElementById('ocrDrawClock').onclick = () => this.startOcrDraw('clock');
         document.getElementById('ocrSaveBtn').onclick = () => this.saveOcrRegions();
         document.getElementById('ocrSkipBtn').onclick = () => {
             document.getElementById('ocrSetupSection').style.display = 'none';
@@ -347,7 +349,7 @@ class VisionScorer {
             }
         };
         
-        this.ocrRegions = { red_center: null, blue_center: null };
+        this.ocrRegions = { red_center: null, blue_center: null, match_clock: null };
         this.hubPositions = { blue: null, red: null };
         this.ocrDrawMode = null;  // 'red', 'blue' for score regions
         this.hubMarkMode = null;  // 'red', 'blue' for hub clicks
@@ -444,19 +446,23 @@ class VisionScorer {
         document.getElementById('ocrMarkBlueHub').classList.toggle('active', alliance === 'blue');
         document.getElementById('ocrDrawRed').classList.remove('active');
         document.getElementById('ocrDrawBlue').classList.remove('active');
+        document.getElementById('ocrDrawClock').classList.remove('active');
     }
 
-    startOcrDraw(alliance) {
-        this.ocrDrawMode = alliance;
+    startOcrDraw(kind) {
+        this.ocrDrawMode = kind;
         this.hubMarkMode = null;
         const canvas = document.getElementById('ocrCanvas');
         canvas.style.cursor = 'crosshair';
         document.getElementById('ocrStatus').textContent = 
-            `Draw a box around the ${alliance.toUpperCase()} alliance score number.`;
+            kind === 'clock'
+                ? 'Draw a box around the match clock.'
+                : `Draw a box around the ${kind.toUpperCase()} alliance score number.`;
         
         // Highlight active button
-        document.getElementById('ocrDrawRed').classList.toggle('active', alliance === 'red');
-        document.getElementById('ocrDrawBlue').classList.toggle('active', alliance === 'blue');
+        document.getElementById('ocrDrawRed').classList.toggle('active', kind === 'red');
+        document.getElementById('ocrDrawBlue').classList.toggle('active', kind === 'blue');
+        document.getElementById('ocrDrawClock').classList.toggle('active', kind === 'clock');
         document.getElementById('ocrMarkRedHub').classList.remove('active');
         document.getElementById('ocrMarkBlueHub').classList.remove('active');
     }
@@ -502,7 +508,8 @@ class VisionScorer {
         
         // Draw current selection
         const ctx = canvas.getContext('2d');
-        ctx.strokeStyle = this.ocrDrawMode === 'red' ? '#e74c3c' : '#3498db';
+        ctx.strokeStyle = this.ocrDrawMode === 'red' ? '#e74c3c'
+            : this.ocrDrawMode === 'blue' ? '#3498db' : '#f1c40f';
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 3]);
         ctx.strokeRect(this.ocrDragStart.x, this.ocrDragStart.y, 
@@ -528,13 +535,16 @@ class VisionScorer {
         
         if (rw < 5 || rh < 5) return; // Too small
         
-        const key = this.ocrDrawMode + '_center';
+        const key = this.ocrDrawMode === 'clock'
+            ? 'match_clock'
+            : this.ocrDrawMode + '_center';
         this.ocrRegions[key] = [Math.round(rx), Math.round(ry), Math.round(rw), Math.round(rh)];
         
         this.ocrDrawMode = null;
         canvas.style.cursor = 'default';
         document.getElementById('ocrDrawRed').classList.remove('active');
         document.getElementById('ocrDrawBlue').classList.remove('active');
+        document.getElementById('ocrDrawClock').classList.remove('active');
         
         this.redrawOcrCanvas();
         this.checkSetupComplete();
@@ -591,8 +601,10 @@ class VisionScorer {
         // Draw saved score regions
         for (const [key, region] of Object.entries(this.ocrRegions)) {
             if (!region) continue;
-            const color = key.startsWith('red') ? '#e74c3c' : '#3498db';
-            const label = key.startsWith('red') ? 'RED SCORE' : 'BLUE SCORE';
+            const color = key.startsWith('red') ? '#e74c3c'
+                : key.startsWith('blue') ? '#3498db' : '#f1c40f';
+            const label = key.startsWith('red') ? 'RED SCORE'
+                : key.startsWith('blue') ? 'BLUE SCORE' : 'MATCH CLOCK';
             const [rx, ry, rw, rh] = region;
             
             ctx.strokeStyle = color;
@@ -746,6 +758,32 @@ class VisionScorer {
 
     // --- Video Inference (existing logic) ---
 
+    async populateSam2Models() {
+        const select = document.getElementById('sam2ModelSize');
+        if (!select) return;
+        try {
+            const resp = await fetch('/api/sam2_models');
+            const data = await resp.json();
+            select.replaceChildren();
+            for (const m of data.models) {
+                const opt = document.createElement('option');
+                opt.value = m.size;
+                const tag = m.available ? '' : '  — needs download';
+                opt.textContent = `${m.label} (${m.detail})${tag}`;
+                opt.disabled = !m.available;
+                if (m.size === data.default && m.available) opt.selected = true;
+                select.appendChild(opt);
+            }
+            // If the env default isn't downloaded, fall back to the first available size.
+            if (select.selectedOptions.length === 0 || select.selectedOptions[0].disabled) {
+                const firstAvailable = Array.from(select.options).find((o) => !o.disabled);
+                if (firstAvailable) firstAvailable.selected = true;
+            }
+        } catch (err) {
+            console.error('Failed to load SAM2 model list:', err);
+        }
+    }
+
     async handleSubmit(e) {
         e.preventDefault();
 
@@ -768,6 +806,10 @@ class VisionScorer {
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
             formData.append('sam2_max_gpu_frames', vramBudget);
+        }
+        const modelSize = document.getElementById('sam2ModelSize')?.value;
+        if (modelSize) {
+            formData.append('model_size', modelSize);
         }
 
         this.setStatus('Uploading...', 0);

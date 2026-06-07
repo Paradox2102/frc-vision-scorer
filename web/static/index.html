@@ -57,6 +57,7 @@
                                 <span class="setup-label">2. Draw score regions:</span>
                                 <button class="btn-red" id="ocrDrawRed">Draw RED Score</button>
                                 <button class="btn-blue" id="ocrDrawBlue">Draw BLUE Score</button>
+                                <button class="btn-secondary" id="ocrDrawClock">Draw Match Clock</button>
                             </div>
                             <div class="setup-group">
                                 <button class="btn-primary" id="ocrSaveBtn" disabled>Save & Continue</button>
@@ -103,6 +104,16 @@
                                     <input type="radio" name="teamReader" value="deepseek">
                                     <span>DeepSeek V4</span>
                                 </label>
+                            </div>
+                            <div class="input-group">
+                                <label for="sam2ModelSize">SAM2 model size:</label>
+                                <select id="sam2ModelSize">
+                                    <!-- options populated from /api/sam2_models -->
+                                </select>
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    Smaller = faster, coarser masks; larger = slower, finer masks.
+                                    Sizes marked “needs download” have no checkpoint on disk yet.
+                                </small>
                             </div>
                             <div class="input-group">
                                 <label for="sam2MaxGpuFrames">SAM2 VRAM budget (frames):</label>

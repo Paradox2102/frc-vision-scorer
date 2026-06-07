@@ -155,9 +155,11 @@ def test_reprompt_adds_new_robot_and_tracks_it_forward():
     new_box = stub._rect_for(3)       # (18,2,22,6) — unmatched -> new robot
     calls: list[int] = []
 
+    metadata = {1: "blue", 2: "red"}
+
     def detect_fn(local_idx, frame_path):
         calls.append(local_idx)
-        return [overlap_box, new_box]
+        return [(overlap_box, "blue"), (new_box, "red")]
 
     result = tracker.track(
         frames_dir="ignored_by_stub",
@@ -165,6 +167,7 @@ def test_reprompt_adds_new_robot_and_tracks_it_forward():
         prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],  # objs 1, 2
         reprompt_every=2,
         detect_fn=detect_fn,
+        object_metadata=metadata,
         max_objects=6,
     )
 
@@ -179,6 +182,7 @@ def test_reprompt_adds_new_robot_and_tracks_it_forward():
     # The new robot was added exactly once; the overlapping box was deduped.
     assert (2, 3) in stub.add_calls
     assert stub.add_calls == [(0, 1), (0, 2), (2, 3)]
+    assert metadata == {1: "blue", 2: "red", 3: "red"}
 
 
 def test_reprompt_respects_max_objects_cap():

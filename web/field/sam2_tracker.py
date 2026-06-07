@@ -186,6 +186,20 @@ class Sam2FieldTracker:
             import torch  # noqa: F401 — imported for side-effects (device check)
             from sam2.build_sam import build_sam2_video_predictor  # type: ignore[import]
 
+            # SAM2's connected-components CUDA kernel (`sam2._C`) is an optional
+            # native extension our pip install doesn't compile.  Without it,
+            # SAM2 skips mask hole-filling (fill_hole_area=8) and warns once per
+            # frame.  We track robots by bounding box (mask_to_box uses the
+            # mask's outer extent), so filling ≤8px interior holes can't change
+            # any result — silence just this message to keep analysis logs clean.
+            import warnings
+
+            warnings.filterwarnings(
+                "ignore",
+                message=r"(?s).*Skipping the post-processing step due to the error above.*",
+                category=UserWarning,
+            )
+
             self._predictor = build_sam2_video_predictor(
                 config, checkpoint, device=device, vos_optimized=vos_optimized
             )
@@ -204,6 +218,7 @@ class Sam2FieldTracker:
         *,
         reprompt_every: int | None = None,
         detect_fn=None,
+        object_metadata=None,
         max_objects: int | None = None,
         new_obj_ios_thresh: float = 0.5,
         progress_cb=None,
@@ -225,9 +240,9 @@ class Sam2FieldTracker:
                 overlap a tracked object is added as a *new* object and tracked
                 forward.  ``None`` (the default) runs a single forward pass —
                 the original single-prompt behavior.
-            detect_fn: Callable ``(local_idx, frame_path) -> list[(x1,y1,x2,y2)]``
-                returning robot boxes (in frame-pixel coordinates) for the given
-                boundary frame.  Only used when ``reprompt_every`` is set.
+            detect_fn: Callable returning boxes or ``(box, metadata)`` pairs.
+            object_metadata: Optional mutable ``{obj_id: metadata}`` map. Initial
+                prompt metadata may be pre-populated; re-prompted objects are added.
             max_objects: Hard cap on the total number of tracked objects.  Once
                 reached, re-prompting stops adding new objects (prevents false
                 detections from spawning phantom tracks).  ``None`` = no cap.
@@ -343,9 +358,23 @@ class Sam2FieldTracker:
                             frame_paths[last_idx] if last_idx < len(frame_paths) else None
                         )
                         try:
-                            new_boxes = detect_fn(last_idx, frame_path) or []
+                            detected = detect_fn(last_idx, frame_path) or []
                         except Exception:
-                            new_boxes = []
+                            detected = []
+                        new_boxes = []
+                        new_metadata = []
+                        for item in detected:
+                            if (
+                                isinstance(item, tuple)
+                                and len(item) == 2
+                                and hasattr(item[0], "__len__")
+                                and len(item[0]) == 4
+                            ):
+                                new_boxes.append(item[0])
+                                new_metadata.append(item[1])
+                            else:
+                                new_boxes.append(item)
+                                new_metadata.append(None)
                         existing = {
                             oid: entry["mask"]
                             for oid, entry in results.get(last_idx, {}).items()
@@ -373,6 +402,8 @@ class Sam2FieldTracker:
                                     obj_id=next_obj_id,
                                     box=np.asarray(new_boxes[j], dtype=np.float32),
                                 )
+                                if object_metadata is not None:
+                                    object_metadata[next_obj_id] = new_metadata[j]
                                 next_obj_id += 1
 
                     cursor = last_idx + 1

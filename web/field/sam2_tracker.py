@@ -11,10 +11,21 @@ The module is split into two tiers:
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
+
+# Mask-shape plausibility knobs. A robot's SAM2 mask is a compact blob that
+# stands on the carpet — roughly as wide as it is tall and widest near its
+# base. Field fixtures (radio/antenna on a stand) segment as a blob-on-a-stick:
+# tall, thin, and *top*-heavy. We only reject a mask when it is BOTH tall-thin
+# AND top-heavy, so a legitimately tall-but-bottom-heavy robot (e.g. a raised
+# climber hook) is never dropped.
+MASK_MAX_ASPECT = float(os.environ.get("SAM2_MASK_MAX_ASPECT", "2.0"))
+MASK_MIN_BASE_RATIO = float(os.environ.get("SAM2_MASK_MIN_BASE_RATIO", "0.35"))
+MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
 
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -27,6 +38,48 @@ def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     if xs.size == 0:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def plausible_robot_mask(
+    mask: np.ndarray,
+    max_aspect: float = MASK_MAX_ASPECT,
+    min_base_ratio: float = MASK_MIN_BASE_RATIO,
+    base_band_frac: float = MASK_BASE_BAND_FRAC,
+) -> bool:
+    """Return False for a mask whose shape is geometrically impossible for a robot.
+
+    A robot stands on the carpet: its mask is a solid blob, roughly as wide as
+    it is tall, and widest near its base. The field-side radio/antenna segments
+    as a blob-on-a-stick — tall, thin, and *top*-heavy (the wide part is up high,
+    only a thin stalk reaches the ground).
+
+    We reject only when BOTH hold, so that a tall-but-bottom-heavy robot (e.g. a
+    raised climber hook) is preserved:
+
+    1. The bounding box is tall and thin (height/width > ``max_aspect``).
+    2. The mask is top-heavy: the widest row in its base band is a small
+       fraction (< ``min_base_ratio``) of the widest row overall.
+    """
+    box = mask_to_box(mask)
+    if box is None:
+        return False
+    x1, y1, x2, y2 = box
+    h = y2 - y1
+    w = x2 - x1
+    if h <= 0 or w <= 0:
+        return False
+    if h / w <= max_aspect:
+        return True  # not tall-and-thin -> shape is robot-plausible
+
+    # Tall and thin: distinguish a bottom-heavy robot from a top-heavy stalk by
+    # comparing the width of the base band against the widest row overall.
+    row_widths = mask[y1:y2, x1:x2].sum(axis=1)
+    widest = int(row_widths.max())
+    if widest == 0:
+        return False
+    band = max(1, int(round(h * base_band_frac)))
+    base_width = int(row_widths[-band:].max())
+    return (base_width / widest) >= min_base_ratio
 
 
 def bottom_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -436,7 +489,19 @@ class Sam2FieldTracker:
                                     details={"object_id": oid_int, "frame_idx": f_idx_int}
                                 )
                         continue  # object not visible this frame
-                    
+
+                    if not plausible_robot_mask(mask2d):
+                        # Shape impossible for a robot (e.g. field radio on a stand).
+                        # Skip storing it; the slot coasts and retires like a gap.
+                        if diagnostics:
+                            diagnostics.record(
+                                "sam2.mask_rejected",
+                                reason="mask_implausible",
+                                details={"object_id": oid_int, "frame_idx": f_idx_int,
+                                         "box": [int(v) for v in box]},
+                            )
+                        continue
+
                     prev_lv = last_visible_frame.get(oid_int)
                     last_visible_frame[oid_int] = f_idx_int
                     if oid_int not in first_prompted_frame:

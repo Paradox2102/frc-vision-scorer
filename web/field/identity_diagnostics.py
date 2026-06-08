@@ -18,6 +18,7 @@ class DiagnosticEvents:
     SAM2_REPROMPT_CANDIDATE = "sam2.reprompt_candidate"
     SAM2_REPROMPT_REJECTED = "sam2.reprompt_rejected"
     SAM2_MASK_GAP = "sam2.mask_gap"
+    SAM2_MASK_REJECTED = "sam2.mask_rejected"
     SAM2_CHUNK_COMPLETE = "sam2.chunk_complete"
 
     # Fusion
@@ -78,6 +79,7 @@ class DiagnosticReasons:
     VLM_TOP_K_STARVATION = "vlm_top_k_starvation"
     UNREADABLE_RESULT = "unreadable_result"
     REATTACH_CONFIDENT = "reattach_confident"
+    MASK_IMPLAUSIBLE = "mask_implausible"
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}

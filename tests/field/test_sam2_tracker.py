@@ -518,3 +518,128 @@ def test_sam2_diagnostics_logging():
     assert len(rejected_events) == 1
     assert rejected_events[0]["reason"] == "below_margin"
 
+
+# ---------------------------------------------------------------------------
+# Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
+# SAM2 mask is geometrically impossible for a robot.
+# ---------------------------------------------------------------------------
+
+
+def _solid_robot_mask(H: int = 60, W: int = 30) -> np.ndarray:
+    """A compact, bottom-heavy blob — what a robot's mask looks like."""
+    m = np.zeros((H, W), bool)
+    m[40:56, 6:24] = True  # 16 tall x 18 wide solid block sitting low
+    return m
+
+
+def _tadpole_mask(H: int = 60, W: int = 30) -> np.ndarray:
+    """A blob-on-a-stick: wide blob at the TOP, thin tail to the bottom.
+
+    This is the field-side radio/antenna shape — tall, top-heavy, and the
+    contact point with the carpet is a thin stalk, not a wide robot base.
+    """
+    m = np.zeros((H, W), bool)
+    m[2:10, 10:22] = True     # 8 tall x 12 wide blob at the top
+    m[10:H - 4, 14:17] = True  # thin 3px-wide tail running down
+    return m
+
+
+def _climber_robot_mask(H: int = 60, W: int = 30) -> np.ndarray:
+    """A robot with a tall thin climber hook raised: tall, but BOTTOM-heavy.
+
+    Must NOT be rejected — distinguishes 'tall+top-heavy' (radio) from
+    'tall+bottom-heavy' (legitimate climbing robot).
+    """
+    m = np.zeros((H, W), bool)
+    m[36:56, 6:24] = True  # wide chassis sitting low (bottom-heavy)
+    m[5:36, 14:17] = True  # thin hook extending up
+    return m
+
+
+def test_plausible_robot_mask_accepts_solid_blob():
+    from web.field.sam2_tracker import plausible_robot_mask
+    assert plausible_robot_mask(_solid_robot_mask()) is True
+
+
+def test_plausible_robot_mask_accepts_small_distant_robot():
+    from web.field.sam2_tracker import plausible_robot_mask
+    m = np.zeros((20, 20), bool)
+    m[8:12, 8:12] = True  # tiny solid square — far-away robot
+    assert plausible_robot_mask(m) is True
+
+
+def test_plausible_robot_mask_rejects_radio_tadpole():
+    from web.field.sam2_tracker import plausible_robot_mask
+    assert plausible_robot_mask(_tadpole_mask()) is False
+
+
+def test_plausible_robot_mask_accepts_climbing_robot():
+    from web.field.sam2_tracker import plausible_robot_mask
+    # Tall and thin overall, but bottom-heavy — a real robot climbing.
+    assert plausible_robot_mask(_climber_robot_mask()) is True
+
+
+def test_plausible_robot_mask_accepts_solid_vertical_sliver():
+    from web.field.sam2_tracker import plausible_robot_mask
+    # A robot mostly occluded to a tall thin strip is still solid (well-filled)
+    # and uniform-width, not a top-heavy stalk.
+    m = np.zeros((60, 30), bool)
+    m[5:55, 13:20] = True
+    assert plausible_robot_mask(m) is True
+
+
+def test_plausible_robot_mask_empty_is_implausible():
+    from web.field.sam2_tracker import plausible_robot_mask
+    assert plausible_robot_mask(np.zeros((10, 10), bool)) is False
+
+
+class MaskStubPredictor:
+    """Emits explicit per-object masks each frame (obj 1 tadpole, obj 2 solid)."""
+
+    H = 60
+    W = 30
+
+    def __init__(self) -> None:
+        self.prompted_obj_ids: list[int] = []
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        self.prompted_obj_ids.append(obj_id)
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        obj_ids = [1, 2]
+        for f_idx in range(3):
+            masks = [_tadpole_mask(self.H, self.W), _solid_robot_mask(self.H, self.W)]
+            arr = np.stack([m.astype(np.float32) for m in masks])[:, None, :, :]
+            yield f_idx, obj_ids, FakeTensor(arr)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_tracker_drops_implausible_mask_object():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+
+    stub = MaskStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = IdentityDiagnosticRecorder()
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(10, 2, 22, 56), (6, 40, 24, 56)],
+        diagnostics=diag,
+    )
+
+    # obj 1 (radio tadpole) is rejected on every frame; obj 2 (robot) survives.
+    for f_idx in range(3):
+        assert 1 not in result[f_idx], f"radio tadpole should be dropped at frame {f_idx}"
+        assert 2 in result[f_idx], f"solid robot should survive at frame {f_idx}"
+
+    rejected = [e for e in diag._events if e["event"] == "sam2.mask_rejected"]
+    assert rejected, "expected a sam2.mask_rejected diagnostic for the implausible mask"
+    assert rejected[0]["reason"] == "mask_implausible"
+

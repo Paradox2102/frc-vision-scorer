@@ -123,6 +123,15 @@ obtain `new_boxes`, and use it for two independent purposes:
 So `capped` no longer gates *whether the detector runs*; it gates only *new-object
 addition*.
 
+**Caveat on what culling relieves.** The real `capped` condition is two-termed:
+`len(active_objects) >= max_active_objects OR (next_obj_id - 1) >=
+max_lifetime_objects` (lines 577/644). A cull removes an object from
+`active_objects`, relieving only the **first** term; the lifetime cap
+(`max_lifetime_objects = MAX_TRACKED_ROBOTS * 3 = 18` in production) is never
+relieved (`next_obj_id` only increments). This is acceptable: in a normal match
+the lifetime cap does not bind, so freeing an active slot is what unblocks
+re-seeding. The slot-freeing claim below is precise for the active-roster cap.
+
 ### Component 1 — Per-object corroboration & stationarity state (in `track`)
 
 Maintain, keyed by object id, across re-prompts:
@@ -135,8 +144,11 @@ Maintain, keyed by object id, across re-prompts:
 
 ### Component 2 — Corroboration check at the re-prompt boundary (in `track`)
 
-After computing `new_boxes` (the `_normalize_detections` output already produced at
-line 587), for each currently-active object with a latest mask in `existing`:
+After the load-bearing decouple above makes `new_boxes` available at every
+re-prompt boundary (it is the `_normalize_detections` output, currently produced
+only inside the `if not capped:` block at line 587 — the decouple lifts it out so
+it is in scope unconditionally), for each currently-active object with a latest
+mask in `existing`:
 
 1. Build the object's mask (already in `existing[oid]`).
 2. Compute `best_ios = max(_ios(existing[oid], box_mask(b)) for b in new_boxes)`

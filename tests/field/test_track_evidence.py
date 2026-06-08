@@ -135,3 +135,40 @@ def test_classify_read_beats_person_overlap():
     for f in range(10):
         e.observe_frame(f, overlapped_person=True)
     assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "robot"
+
+
+from web.field.track_evidence import (
+    track_verdicts, slot_label_to_id, prune_replay_frames, MatchEvidence)
+
+
+def test_slot_label_to_id_roundtrip():
+    assert [slot_label_to_id(s) for s in ("B1", "B2", "B3", "R1", "R2", "R3")] == [0, 1, 2, 3, 4, 5]
+    assert slot_label_to_id("??") is None
+
+
+def test_track_verdicts_maps_each_track():
+    m = MatchEvidence()
+    m.confirm(track_id=1, frame=0, team_read=True)          # robot
+    for f in range(10):                                     # human: overlap, no read/motion
+        m.observe(track_id=2, frame=f, field_xy=(5.0, 5.0), overlapped_person=True)
+    for f in range(10):                                     # static: parked, no evidence
+        m.observe(track_id=3, frame=f, field_xy=(8.0, 8.0), overlapped_person=False)
+    v = track_verdicts(m, motion_confirm_m=0.75, person_overlap_frac=0.5)
+    assert v == {1: "robot", 2: "human", 3: "static"}
+
+
+def test_prune_replay_frames_drops_non_robot_rows():
+    frames = [{"frame_num": 7, "robots": [
+        {"slot": "B1", "alliance": "blue"},
+        {"slot": "R1", "alliance": "red"},
+    ]}]
+    binding_log = [{"frame_num": 7, "bindings": {1: 0, 9: 3}}]
+    verdicts = {1: "robot", 9: "human"}
+    out = prune_replay_frames(frames, binding_log, verdicts)
+    assert [r["slot"] for r in out[0]["robots"]] == ["B1"]
+
+
+def test_prune_keeps_rows_with_unknown_binding():
+    frames = [{"frame_num": 1, "robots": [{"slot": "B2", "alliance": "blue"}]}]
+    out = prune_replay_frames(frames, [{"frame_num": 1, "bindings": {}}], {})
+    assert len(out[0]["robots"]) == 1

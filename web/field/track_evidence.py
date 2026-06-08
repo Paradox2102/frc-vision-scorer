@@ -124,3 +124,44 @@ def classify_track(evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
     if evidence.net_displacement_m() > motion_confirm_m:
         return "robot"
     return "static"
+
+
+def track_verdicts(match_evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
+                   person_overlap_frac: float = PERSON_OVERLAP_FRAC) -> dict:
+    """{track_id: 'robot'|'human'|'static'} for every track in the registry."""
+    return {tid: classify_track(te, motion_confirm_m, person_overlap_frac)
+            for tid, te in match_evidence.by_track.items()}
+
+
+_SLOT_LABELS = {"B1": 0, "B2": 1, "B3": 2, "R1": 3, "R2": 4, "R3": 5}
+
+
+def slot_label_to_id(label):
+    """'B1'..'R3' -> 0..5, or None if unrecognized."""
+    return _SLOT_LABELS.get(label)
+
+
+def prune_replay_frames(frames, binding_log, verdicts):
+    """Return new frame records with human/static-track rows removed.
+
+    A replay robot row is keyed by slot label only; `binding_log` (per frame,
+    {track_id: slot_id}) recovers which track held that slot, and `verdicts`
+    gives that track's whole-match verdict. A row is KEPT iff its track's verdict
+    is 'robot'. Rows whose slot has no known binding/verdict are KEPT (conservative
+    — never hide a row we cannot classify). Input is not mutated."""
+    by_frame = {}
+    for entry in binding_log:
+        slot_to_track = {sid: tid for tid, sid in entry.get("bindings", {}).items()}
+        by_frame[entry["frame_num"]] = slot_to_track
+    out = []
+    for fr in frames:
+        slot_to_track = by_frame.get(fr.get("frame_num"), {})
+        kept = []
+        for row in fr.get("robots", []):
+            sid = slot_label_to_id(row.get("slot"))
+            tid = slot_to_track.get(sid) if sid is not None else None
+            verdict = verdicts.get(tid) if tid is not None else None
+            if verdict in (None, "robot"):   # keep robots and unclassifiable rows
+                kept.append(row)
+        out.append({**fr, "robots": kept})
+    return out

@@ -4049,10 +4049,10 @@ class InferenceJob:
                         def make_detect_fn():
                             def detect_fn(local_idx, frame_path):
                                 if not frame_path:
-                                    return []
+                                    return None
                                 img = cv2.imread(frame_path)
                                 if img is None:
-                                    return []
+                                    return None
                                 if self.bumper_model is not None:
                                     res = self.bumper_model(
                                         img, conf=0.4, verbose=False
@@ -4137,6 +4137,41 @@ class InferenceJob:
                         eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
                         reprompt_every = max(1, int(round(REPROMPT_SECONDS * eff_fps)))
 
+                        # Build a projector mapping a SAM2 mask box (tracker/0.5x
+                        # top-cropped pixel coords) to field meters, for the
+                        # mask-hijack cull's stationarity test. Exported frames are
+                        # ALREADY top-cropped, so we recover the CROPPED full-res
+                        # height and reconstruct the consumer's offset
+                        # (original_h * tc) via cropped_full_h * tc / (1 - tc).
+                        _sam2_scale = 0.5
+                        _top_crop = (
+                            (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
+                            if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                        )
+                        _exported = sorted(
+                            f for f in os.listdir(tmp_dir_obj.name)
+                            if f.endswith(".jpg") or f.endswith(".jpeg")
+                        )
+                        _cropped_full_h = None
+                        if _exported:
+                            _img0 = cv2.imread(os.path.join(tmp_dir_obj.name, _exported[0]))
+                            if _img0 is not None:
+                                _cropped_full_h = int(round(_img0.shape[0] / _sam2_scale))
+                        _y_off = (
+                            int(_cropped_full_h * _top_crop / max(1.0 - _top_crop, 1e-6))
+                            if (_cropped_full_h is not None and _top_crop > 0) else 0
+                        )
+
+                        def _make_project_fn(cal, y_off, scale):
+                            def _project(box):
+                                x1, y1, x2, y2 = box
+                                fx1, fx2 = x1 / scale, x2 / scale
+                                fy2 = y2 / scale + y_off
+                                return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
+                            return _project
+
+                        _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
+
                         t0 = time.perf_counter()
                         view_tracks = await asyncio.to_thread(
                             sam2_tracker.track,
@@ -4151,6 +4186,7 @@ class InferenceJob:
                             max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
                             progress_cb=make_progress_cb(base_pct, span_pct, view.name),
                             diagnostics=self.identity_diagnostics,
+                            project_fn=_project_fn,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed

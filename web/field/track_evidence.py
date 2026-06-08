@@ -141,6 +141,26 @@ def slot_label_to_id(label):
     return _SLOT_LABELS.get(label)
 
 
+def identity_evidence(identity_log) -> dict:
+    """Synthesize a TrackEvidence per identity_id from per-frame identity snapshots,
+    so the slice-1/2 classify_track can be reused at identity granularity. A snapshot
+    with confirmed=True maps to the strong read/appearance signal."""
+    out: dict = {}
+    for s in identity_log:
+        iid = s["identity_id"]
+        te = out.get(iid)
+        if te is None:
+            te = TrackEvidence(track_id=iid)
+            out[iid] = te
+        te.observe_frame(s["frame_num"], bool(s.get("person_overlap")))
+        pos = s.get("pos")
+        if pos is not None:
+            te.add_position(s["frame_num"], pos[0], pos[1])
+        if s.get("confirmed"):
+            te.confirm(s["frame_num"], team_read=True)
+    return out
+
+
 def prune_replay_frames(frames, binding_log, verdicts):
     """Return new frame records with human/static-track rows removed.
 

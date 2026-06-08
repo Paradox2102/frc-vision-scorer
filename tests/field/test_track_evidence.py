@@ -172,3 +172,23 @@ def test_prune_keeps_rows_with_unknown_binding():
     frames = [{"frame_num": 1, "robots": [{"slot": "B2", "alliance": "blue"}]}]
     out = prune_replay_frames(frames, [{"frame_num": 1, "bindings": {}}], {})
     assert len(out[0]["robots"]) == 1
+
+
+from web.field.track_evidence import identity_evidence, classify_track
+
+
+def test_identity_evidence_aggregates_and_classifies():
+    log = []
+    # identity 1: confirmed robot, parked (no motion) -> robot via confirmed
+    for f in range(6):
+        log.append({"frame_num": f, "identity_id": 1, "slot_id": 0, "alliance": "blue",
+                    "pos": [2.0, 4.0], "person_overlap": False, "confirmed": (f >= 4)})
+    # identity 2: moving ref (overlap, no confirm) -> human
+    for f in range(10):
+        log.append({"frame_num": f, "identity_id": 2, "slot_id": 3, "alliance": "red",
+                    "pos": [2.0 + 0.5 * f, 7.0], "person_overlap": True, "confirmed": False})
+    ev = identity_evidence(log)
+    assert set(ev) == {1, 2}
+    assert ev[1].ever_team_read is True
+    assert classify_track(ev[1]) == "robot"
+    assert classify_track(ev[2]) == "human"

@@ -21,6 +21,19 @@ SRC = ROOT / "web/uploads/43d5f2e2-4ff6-4c22-bcf6-74c0fa40c705.mp4"
 JOB_ID = "rerun-43d5f2e2-slice3"
 
 
+# Match 2026hop_qm72 — resolved from TBA via the teams the original run read
+# (4174@blue, 1625@red). The roster is fetched live from TBA at runtime (like the app).
+MATCH_KEY = "2026hop_qm72"
+
+
+async def _fetch_roster():
+    from web import tba
+    m = await tba.get_match(MATCH_KEY)
+    blue = [k.replace("frc", "") for k in m["alliances"]["blue"]["team_keys"]]
+    red = [k.replace("frc", "") for k in m["alliances"]["red"]["team_keys"]]
+    return blue, red
+
+
 def make_job():
     job = InferenceJob(JOB_ID, SRC)
     job.event_key = EVENT
@@ -39,6 +52,12 @@ def main():
               f"camera_center={getattr(job.calib, 'camera_center', None) is not None} "
               f"views={[v.name for v in getattr(job, 'views', [])]}")
         return 0 if ok else 1
+    # Set the match roster from TBA so the bumper-number reader actually runs.
+    blue, red = asyncio.run(_fetch_roster())
+    job.match_blue_teams = blue
+    job.match_red_teams = red
+    job.match_teams = blue + red
+    print(f"roster set: blue={blue} red={red}")
     asyncio.run(job.process_video())
     print(f"status={job.status} error={getattr(job, 'error', None)}")
     rec = getattr(job, "_replay", None)

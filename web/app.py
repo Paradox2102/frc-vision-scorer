@@ -740,6 +740,7 @@ class InferenceJob:
         self.video_fps = 0
         self._match_evidence = MatchEvidence()
         self._binding_log: list[dict] = []   # [{"frame_num": int, "bindings": {track_id: slot_id}}]
+        self._identity_log: list[dict] = []   # per-frame identity snapshots for re-resolution
         self._evidence_frame = 0             # current processed frame, set at loop TOP
         self.total_frames = 0
         self.overhead_height = 0
@@ -3033,7 +3034,7 @@ class InferenceJob:
         return [ident for ident in self.identity_registry.identities.values()
                 if ident.active_slot in visible_slots]
 
-    async def _sync_identity_registry_frame(self, fused: list, ev_list: list, track_outs: list):
+    async def _sync_identity_registry_frame(self, fused: list, ev_list: list, track_outs: list, main_person_boxes=None, log_frame_num=None):
         self.identity_diagnostics.set_context(
             source_frame=self._current_frame,
             processed_frame=self._current_frame,
@@ -3241,6 +3242,29 @@ class InferenceJob:
                 await self._bind_detection_identity(slot_id, ident_id)
 
         self._last_bindings = current_bindings
+
+        if log_frame_num is not None:
+            try:
+                for ident in self.identity_registry.identities.values():
+                    slot = ident.active_slot
+                    if slot is None:
+                        continue
+                    fobs = slot_to_fused.get(slot)
+                    box = fobs.detection.box if (fobs is not None and fobs.detection is not None) else None
+                    overlap = bool(box is not None and main_person_boxes and any(
+                        box_ios(tuple(box), tuple(pb)) >= PERSON_OVERLAP_IOS
+                        for pb in main_person_boxes))
+                    self._identity_log.append({
+                        "frame_num": log_frame_num,
+                        "identity_id": ident.identity_id,
+                        "slot_id": slot,
+                        "alliance": ident.alliance,
+                        "pos": list(ident.last_seen_pos) if ident.last_seen_pos is not None else None,
+                        "person_overlap": overlap,
+                        "confirmed": bool(ident.is_confirmed or ident.team_number is not None),
+                    })
+            except Exception:
+                pass
 
     def _get_display_team_number(self, robot) -> Optional[str]:
         ident = self.identity_registry.identities.get(robot.robot_id)
@@ -4183,7 +4207,8 @@ class InferenceJob:
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
                 from web.field.fusion import FusedObservation
                 early_fused = [FusedObservation(detection=d, evidence=[]) for d in early_field_dets]
-                await self._sync_identity_registry_frame(early_fused, [], early_outs)
+                await self._sync_identity_registry_frame(
+                    early_fused, [], early_outs, log_frame_num=early_ocr_source_frame)
                 early_robots = []
                 for t in early_outs:
                     if t.state != "visible" or t.box is None:
@@ -4388,7 +4413,10 @@ class InferenceJob:
                         fused, frame_num, person_boxes_by_cam.get("main", []))
                 except Exception:
                     pass
-                await self._sync_identity_registry_frame(fused, ev_list, track_outs)
+                await self._sync_identity_registry_frame(
+                    fused, ev_list, track_outs,
+                    main_person_boxes=person_boxes_by_cam.get("main", []),
+                    log_frame_num=frame_num)
 
                 # 5. Resolve occlusion from every posed camera and merge: a track
                 #    is occluded only if occluded in ALL posed cameras.

@@ -36,7 +36,7 @@ MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
 # DEFAULT OFF: detector-absence + stationarity cannot distinguish a trench from a
 # real robot parked in a persistent detector blind spot. Enable only after the
 # acceptance + adversarial replay tests (plan Task 6) show no false culls.
-CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "0") not in ("0", "false", "False")
+CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "1") not in ("0", "false", "False")
 # Absences required *within the evidence window* before a stationary object is culled.
 CULL_UNCORROBORATED_REPROMPTS = int(os.environ.get("CULL_UNCORROBORATED_REPROMPTS", "3"))
 # Sliding-window length of corroboration outcomes kept per object. Must be >= K;
@@ -758,6 +758,10 @@ class Sam2FieldTracker:
                                     and is_stationary(win, cull_stationary_m)):
                                 culled_set.add(oid)
                                 if diagnostics:
+                                    # Uncapped counter so the cull count survives
+                                    # event-list truncation (max_events) over a full
+                                    # match — the at-a-glance on/off comparison signal.
+                                    diagnostics.increment("sam2_objects_culled")
                                     diagnostics.record(
                                         "sam2.object_culled",
                                         reason="detector_absent_stationary",

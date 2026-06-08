@@ -82,6 +82,7 @@ class DiagnosticReasons:
     UNREADABLE_RESULT = "unreadable_result"
     REATTACH_CONFIDENT = "reattach_confident"
     MASK_IMPLAUSIBLE = "mask_implausible"
+    DETECTOR_ABSENT_STATIONARY = "detector_absent_stationary"
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}

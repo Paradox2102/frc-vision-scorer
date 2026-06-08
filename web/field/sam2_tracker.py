@@ -760,10 +760,10 @@ class Sam2FieldTracker:
                                 if diagnostics:
                                     diagnostics.record(
                                         "sam2.object_culled",
+                                        reason="detector_absent_stationary",
                                         details={
                                             "object_id": oid,
                                             "frame_idx": last_idx,
-                                            "reason": "detector_absent_stationary",
                                             "absences": sum(1 for c in hist if not c),
                                             "window": len(hist),
                                         },

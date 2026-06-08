@@ -694,7 +694,7 @@ def test_cull_removes_uncorroborated_stationary_object():
     assert 2 not in result[stub.NUM_FRAMES - 1]
     culled = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
     assert any(e["details"]["object_id"] == 2
-               and e["details"]["reason"] == "detector_absent_stationary"
+               and e.get("reason") == "detector_absent_stationary"
                for e in culled)
 
 
@@ -731,7 +731,7 @@ def test_cull_spares_corroborated_stationary_object():
     assert 2 in result[stub.NUM_FRAMES - 1]
 
 
-def test_cull_survives_intermittent_corroboration():
+def test_cull_fires_despite_one_early_corroboration():
     from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
     stub = CullStubPredictor()
     tracker = Sam2FieldTracker(predictor=stub)

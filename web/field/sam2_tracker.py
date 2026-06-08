@@ -587,6 +587,8 @@ class Sam2FieldTracker:
                 frame_entry: dict[int, dict] = {}
                 for i, obj_id in enumerate(obj_ids):
                     oid_int = int(obj_id)
+                    if oid_int in culled_set:
+                        continue  # culled hijack mask — stop emitting it
                     if bool_arr.ndim == 4:
                         mask2d = bool_arr[i, 0].astype(bool)
                     elif bool_arr.ndim == 3:
@@ -730,8 +732,50 @@ class Sam2FieldTracker:
                                         details={"frame_idx": last_idx, "box": list(box)},
                                     )
 
-                    # ---- Hijack cull (filled in a later task) ----
-                    # if cull_enabled and detector_available and existing: ...
+                    # ---- Hijack cull (windowed detector-absence + stationary) ----
+                    if cull_enabled and detector_available and existing:
+                        h, w = next(iter(existing.values())).shape
+                        for oid, mask in list(existing.items()):
+                            corroborated = mask_corroborated(
+                                mask, new_boxes, (w, h),
+                                ios_thresh=cull_corrob_ios,
+                                mask_color=(existing_colors.get(oid)
+                                            if existing_colors else None),
+                                new_colors=new_metadata,
+                            )
+                            hist = corroboration_history.setdefault(
+                                oid, deque(maxlen=cull_evidence_window))
+                            hist.append(bool(corroborated))
+
+                            box = results[last_visible_frame[oid]][oid]["box"]
+                            pos = project_fn(box) if project_fn is not None else bottom_center(box)
+                            win = field_pos_window.setdefault(oid, [])
+                            win.append(pos)
+                            if len(win) > cull_evidence_window:
+                                del win[0]
+
+                            if (absent_enough(hist, cull_uncorroborated_reprompts)
+                                    and is_stationary(win, cull_stationary_m)):
+                                culled_set.add(oid)
+                                if diagnostics:
+                                    diagnostics.record(
+                                        "sam2.object_culled",
+                                        details={
+                                            "object_id": oid,
+                                            "frame_idx": last_idx,
+                                            "reason": "detector_absent_stationary",
+                                            "absences": sum(1 for c in hist if not c),
+                                            "window": len(hist),
+                                        },
+                                    )
+
+                        if culled_set:
+                            active_objects = [o for o in active_objects if o not in culled_set]
+                            for o in list(culled_set):
+                                existing.pop(o, None)
+                                existing_colors.pop(o, None)
+                            capped = (len(active_objects) >= max_active_objects
+                                      or (next_obj_id - 1) >= max_lifetime_objects)
 
                     # ---- New-object seeding (unchanged logic, gated on capped) ----
                     if not capped and detector_available and new_boxes:

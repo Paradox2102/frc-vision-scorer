@@ -20,6 +20,7 @@ class DiagnosticEvents:
     SAM2_MASK_GAP = "sam2.mask_gap"
     SAM2_MASK_REJECTED = "sam2.mask_rejected"
     SAM2_CHUNK_COMPLETE = "sam2.chunk_complete"
+    SAM2_OBJECT_CULLED = "sam2.object_culled"
 
     # Fusion
     FUSION_ASSIGNMENT = "fusion.assignment"
@@ -74,6 +75,7 @@ class DiagnosticReasons:
     BELOW_MARGIN = "below_margin"
     ALLIANCE_CONFLICT = "alliance_conflict"
     ROSTER_CAP = "roster_cap"
+    LIFETIME_CAP = "lifetime_cap"
     IDENTITY_ALREADY_ACTIVE = "identity_already_active"
     NO_USABLE_CROP = "no_usable_crop"
     VLM_TOP_K_STARVATION = "vlm_top_k_starvation"

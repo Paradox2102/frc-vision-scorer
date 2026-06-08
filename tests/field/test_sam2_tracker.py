@@ -656,6 +656,181 @@ def test_detector_exception_is_unavailable_no_candidates_no_seed():
 
 
 # ---------------------------------------------------------------------------
+# Sliding-window hijack cull — stationary + detector-absent objects are culled.
+# ---------------------------------------------------------------------------
+
+
+def _ident_diag():
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    return IdentityDiagnosticRecorder()
+
+
+def _culled_ids(diagnostics):
+    return {e["details"]["object_id"]
+            for e in diagnostics._events
+            if e.get("event") == "sam2.object_culled"}
+
+
+def test_cull_removes_uncorroborated_stationary_object():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_corrob_ios=0.3, cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+    culled = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
+    assert any(e["details"]["object_id"] == 2
+               and e["details"]["reason"] == "detector_absent_stationary"
+               for e in culled)
+
+
+def test_cull_spares_moving_object_even_if_uncorroborated():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor(moving={2})
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1, 0), stub._rect_for(2, 0)],
+        reprompt_every=2, detect_fn=lambda *_a: [], max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_cull_spares_corroborated_stationary_object():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=lambda *_a: [stub._rect_for(2)],
+        max_active_objects=6, cull_enabled=True, cull_uncorroborated_reprompts=3,
+        cull_evidence_window=5, cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_cull_survives_intermittent_corroboration():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    seen = {"n": 0}
+
+    def detect_fn(local_idx, frame_path):
+        seen["n"] += 1
+        return [stub._rect_for(2)] if seen["n"] == 1 else []
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+
+
+def test_detector_outage_does_not_cull():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=lambda *_a: None,
+        max_active_objects=6, cull_enabled=True, cull_uncorroborated_reprompts=3,
+        cull_evidence_window=5, cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert _culled_ids(diag) == set()
+    assert 1 in result[stub.NUM_FRAMES - 1] and 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_cull_frees_active_slot_and_real_robot_reseeds():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor(moving={3})
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(3, local_idx), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+    assert 3 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_cull_does_not_reseed_when_lifetime_capped():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor(moving={3})
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(3, local_idx), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=2,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "lifetime_cap" for e in diag._events)
+
+
+def test_none_projection_is_conservative():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=lambda *_a: [], max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: None, diagnostics=diag,
+    )
+    assert _culled_ids(diag) == set()
+
+
+# ---------------------------------------------------------------------------
 # Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
 # SAM2 mask is geometrically impossible for a robot.
 # ---------------------------------------------------------------------------

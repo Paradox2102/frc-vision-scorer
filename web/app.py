@@ -533,6 +533,8 @@ DET_CONF_THRESHOLD = 0.35
 
 PERSON_OVERLAP_IOS = float(os.environ.get("PERSON_OVERLAP_IOS", "0.3"))
 
+BACKWARD_CONFIRM_ENABLED = os.environ.get("BACKWARD_CONFIRM_ENABLED", "1") == "1"
+
 # Whole-robot gap-fill parameters
 ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
 ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
@@ -3540,6 +3542,25 @@ class InferenceJob:
         except Exception:
             pass
 
+    def _apply_track_verdicts(self) -> None:
+        """Slice 2: after the whole match is processed, classify each track from the
+        accumulated evidence and retroactively drop human/static-track rows from the
+        recorded replay frames (refs / parked structures stop appearing as robots).
+        Pruning only; does not re-bind slots (that is slice 3)."""
+        from web.field.track_evidence import track_verdicts, prune_replay_frames
+        rec = getattr(self, "_replay", None)
+        if rec is None or not getattr(self, "_match_evidence", None):
+            return
+        verdicts = track_verdicts(self._match_evidence)
+        rec.frames = prune_replay_frames(rec.frames, self._binding_log, verdicts)
+        try:
+            self.identity_diagnostics.gauge(
+                "track_verdicts",
+                {str(k): list(verdicts.values()).count(k)
+                 for k in ("robot", "human", "static")})
+        except Exception:
+            pass
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
@@ -4875,6 +4896,11 @@ class InferenceJob:
                     self.identity_diagnostics.gauge(
                         "deferred_attributions", len(self.deferred_attributions)
                     )
+                    if BACKWARD_CONFIRM_ENABLED:
+                        try:
+                            self._apply_track_verdicts()
+                        except Exception as e:
+                            print(f"[backward-confirm] verdict pass skipped: {e}")
                     artifacts = rec.finalize(
                         status=status,
                         summary=summary,

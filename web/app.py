@@ -766,7 +766,11 @@ class InferenceJob:
         self.identity_registry = IdentityRegistry()
         self.confidence_config = ConfidenceConfig()
         self.co_occlusion_tracker = CoOcclusionTracker()
-        self.identity_diagnostics = IdentityDiagnosticRecorder()
+        # max_events raised well above a full multi-view match's event volume so
+        # late-match diagnostics (e.g. sam2.object_culled) aren't truncated — the
+        # detailed record needed to compare cull on/off runs. The uncapped
+        # "sam2_objects_culled" counter is the truncation-proof backstop.
+        self.identity_diagnostics = IdentityDiagnosticRecorder(max_events=100000)
         self.identity_diagnostics.set_context(job_id=self.job_id)
         self.robot_identities = self.identity_registry.identities
         self._last_bindings: Dict[int, int] = {}

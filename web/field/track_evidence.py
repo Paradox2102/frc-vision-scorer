@@ -134,6 +134,7 @@ def track_verdicts(match_evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
 
 
 _SLOT_LABELS = {"B1": 0, "B2": 1, "B3": 2, "R1": 3, "R2": 4, "R3": 5}
+_ID_TO_SLOT_LABEL = {v: k for k, v in _SLOT_LABELS.items()}
 
 
 def slot_label_to_id(label):
@@ -159,6 +160,31 @@ def identity_evidence(identity_log) -> dict:
         if s.get("confirmed"):
             te.confirm(s["frame_num"], team_read=True)
     return out
+
+
+def reresolve_frames(identity_log, slot_team_map, verdicts, frame_nums):
+    """Rebuild per-frame replay rows from identity snapshots. Only robot-verdict
+    identities that hold a final slot (in slot_team_map) are emitted; each carries
+    its FINAL slot label and FINAL team (retroactive) with the snapshot's position."""
+    by_frame: dict = {fn: [] for fn in frame_nums}
+    for s in identity_log:
+        iid = s["identity_id"]
+        if verdicts.get(iid) != "robot":
+            continue
+        final = slot_team_map.get(iid)
+        if final is None:
+            continue
+        fn = s["frame_num"]
+        if fn not in by_frame:
+            continue
+        by_frame[fn].append({
+            "slot": _ID_TO_SLOT_LABEL.get(final["slot_id"]),
+            "alliance": final.get("alliance") or s.get("alliance"),
+            "team_number": final.get("team_number"),
+            "confirmed": bool(final.get("confirmed")),
+            "field_pos": s.get("pos"),
+        })
+    return [{"frame_num": fn, "robots": by_frame[fn]} for fn in frame_nums]
 
 
 def prune_replay_frames(frames, binding_log, verdicts):

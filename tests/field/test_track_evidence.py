@@ -192,3 +192,24 @@ def test_identity_evidence_aggregates_and_classifies():
     assert ev[1].ever_team_read is True
     assert classify_track(ev[1]) == "robot"
     assert classify_track(ev[2]) == "human"
+
+
+from web.field.track_evidence import reresolve_frames
+
+
+def test_reresolve_emits_consistent_slot_and_retro_team():
+    identity_log = [
+        {"frame_num": 0, "identity_id": 1, "slot_id": 0, "alliance": "blue", "pos": [1.0, 4.0]},
+        {"frame_num": 1, "identity_id": 1, "slot_id": 0, "alliance": "blue", "pos": [1.1, 4.0]},
+        {"frame_num": 2, "identity_id": 1, "slot_id": 0, "alliance": "blue", "pos": [1.2, 4.0]},
+        {"frame_num": 1, "identity_id": 9, "slot_id": 3, "alliance": "red", "pos": [8.0, 7.0]},
+    ]
+    slot_team_map = {1: {"slot_id": 0, "team_number": "254", "confirmed": True, "alliance": "blue"}}
+    verdicts = {1: "robot", 9: "human"}
+    frames = reresolve_frames(identity_log, slot_team_map, verdicts, frame_nums=[0, 1, 2])
+    assert [f["frame_num"] for f in frames] == [0, 1, 2]
+    for f in frames:
+        assert len(f["robots"]) == 1
+        r = f["robots"][0]
+        assert r["slot"] == "B1" and r["team_number"] == "254" and r["confirmed"] is True
+    assert frames[0]["robots"][0]["field_pos"] == [1.0, 4.0]

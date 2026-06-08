@@ -194,6 +194,40 @@ def test_identity_evidence_aggregates_and_classifies():
     assert classify_track(ev[2]) == "human"
 
 
+from web.field.track_evidence import slot_evidence, reresolve_frames_by_slot, classify_track
+
+
+def test_slot_evidence_aggregates_by_slot():
+    log = []
+    for f in range(10):  # slot 0: robot (moves), DIFFERENT identity_ids over time
+        log.append({"frame_num": f, "identity_id": 100 + f, "slot_id": 0, "alliance": "blue",
+                    "pos": [2.0 + 0.5 * f, 4.0], "person_overlap": False, "confirmed": False})
+    for f in range(10):  # slot 3: ref (overlap, no motion/confirm) -> human
+        log.append({"frame_num": f, "identity_id": 200 + f, "slot_id": 3, "alliance": "red",
+                    "pos": [8.0, 7.0], "person_overlap": True, "confirmed": False})
+    sev = slot_evidence(log)
+    assert set(sev) == {0, 3}
+    assert classify_track(sev[0]) == "robot"
+    assert classify_track(sev[3]) == "human"
+
+
+def test_reresolve_by_slot_full_coverage_and_retro_team():
+    log = [
+        {"frame_num": 0, "identity_id": 11, "slot_id": 0, "alliance": "blue", "pos": [1.0, 4.0]},
+        {"frame_num": 1, "identity_id": 12, "slot_id": 0, "alliance": "blue", "pos": [1.1, 4.0]},
+        {"frame_num": 2, "identity_id": 13, "slot_id": 0, "alliance": "blue", "pos": [1.2, 4.0]},
+        {"frame_num": 1, "identity_id": 99, "slot_id": 3, "alliance": "red", "pos": [8.0, 7.0]},
+    ]
+    slot_meta = {0: {"team_number": "254", "confirmed": True, "alliance": "blue"}}
+    slot_verdicts = {0: "robot", 3: "human"}
+    frames = reresolve_frames_by_slot(log, slot_meta, slot_verdicts, frame_nums=[0, 1, 2])
+    assert [len(f["robots"]) for f in frames] == [1, 1, 1]
+    for f in frames:
+        r = f["robots"][0]
+        assert r["slot"] == "B1" and r["team_number"] == "254" and r["confirmed"] is True
+    assert frames[0]["robots"][0]["field_pos"] == [1.0, 4.0]
+
+
 from web.field.track_evidence import reresolve_frames
 
 

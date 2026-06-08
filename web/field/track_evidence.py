@@ -142,17 +142,14 @@ def slot_label_to_id(label):
     return _SLOT_LABELS.get(label)
 
 
-def identity_evidence(identity_log) -> dict:
-    """Synthesize a TrackEvidence per identity_id from per-frame identity snapshots,
-    so the slice-1/2 classify_track can be reused at identity granularity. A snapshot
-    with confirmed=True maps to the strong read/appearance signal."""
+def _evidence_keyed(identity_log, key_field):
     out: dict = {}
     for s in identity_log:
-        iid = s["identity_id"]
-        te = out.get(iid)
+        k = s[key_field]
+        te = out.get(k)
         if te is None:
-            te = TrackEvidence(track_id=iid)
-            out[iid] = te
+            te = TrackEvidence(track_id=k)
+            out[k] = te
         te.observe_frame(s["frame_num"], bool(s.get("person_overlap")))
         pos = s.get("pos")
         if pos is not None:
@@ -160,6 +157,17 @@ def identity_evidence(identity_log) -> dict:
         if s.get("confirmed"):
             te.confirm(s["frame_num"], team_read=True)
     return out
+
+
+def identity_evidence(identity_log) -> dict:
+    """{identity_id: TrackEvidence}."""
+    return _evidence_keyed(identity_log, "identity_id")
+
+
+def slot_evidence(identity_log) -> dict:
+    """{slot_id: TrackEvidence} — aggregates every snapshot that occupied each slot,
+    across identity_id churn. slot_id is the stable whole-match unit."""
+    return _evidence_keyed(identity_log, "slot_id")
 
 
 def reresolve_frames(identity_log, slot_team_map, verdicts, frame_nums):
@@ -182,6 +190,29 @@ def reresolve_frames(identity_log, slot_team_map, verdicts, frame_nums):
             "alliance": final.get("alliance") or s.get("alliance"),
             "team_number": final.get("team_number"),
             "confirmed": bool(final.get("confirmed")),
+            "field_pos": s.get("pos"),
+        })
+    return [{"frame_num": fn, "robots": by_frame[fn]} for fn in frame_nums]
+
+
+def reresolve_frames_by_slot(identity_log, slot_meta, slot_verdicts, frame_nums):
+    """Rebuild rows keyed by stable slot_id. Emit each snapshot at its own slot when
+    that slot's whole-match verdict is 'robot'; team/alliance from slot_meta (final
+    canonical, keyed by slot_id), position from the snapshot. Non-robot slots excluded."""
+    by_frame: dict = {fn: [] for fn in frame_nums}
+    for s in identity_log:
+        sid = s["slot_id"]
+        if slot_verdicts.get(sid) != "robot":
+            continue
+        fn = s["frame_num"]
+        if fn not in by_frame:
+            continue
+        meta = slot_meta.get(sid, {})
+        by_frame[fn].append({
+            "slot": _ID_TO_SLOT_LABEL.get(sid),
+            "alliance": meta.get("alliance") or s.get("alliance"),
+            "team_number": meta.get("team_number"),
+            "confirmed": bool(meta.get("confirmed")),
             "field_pos": s.get("pos"),
         })
     return [{"frame_num": fn, "robots": by_frame[fn]} for fn in frame_nums]

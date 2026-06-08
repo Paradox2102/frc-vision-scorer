@@ -3253,7 +3253,8 @@ class InferenceJob:
                     if slot is None:
                         continue
                     fobs = slot_to_fused.get(slot)
-                    box = fobs.detection.box if (fobs is not None and fobs.detection is not None) else None
+                    det = fobs.detection if fobs is not None else None
+                    box = det.box if det is not None else None
                     overlap = bool(box is not None and main_person_boxes and any(
                         box_ios(tuple(box), tuple(pb)) >= PERSON_OVERLAP_IOS
                         for pb in main_person_boxes))
@@ -3265,6 +3266,10 @@ class InferenceJob:
                         "pos": list(ident.last_seen_pos) if ident.last_seen_pos is not None else None,
                         "person_overlap": overlap,
                         "confirmed": bool(ident.is_confirmed or ident.team_number is not None),
+                        # Per-frame appearance (DINOv2) of the slot's object, for the
+                        # appearance-based slot-swap stitcher. In-memory only; the rerun
+                        # script strips it before JSON and dumps embeddings to .npz.
+                        "embedding": det.embedding if (det is not None and det.embedding is not None) else None,
                     })
             except Exception:
                 pass

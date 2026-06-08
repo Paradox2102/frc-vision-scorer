@@ -45,11 +45,25 @@ def main():
     if rec is not None:
         print(f"frames={len(rec.frames)} identity_log={len(getattr(job, '_identity_log', []))}")
     import json as _json
+    import numpy as _np
     log = getattr(job, "_identity_log", [])
-    outp = ROOT / "web/replays" / JOB_ID / "identity_log.json"
-    if outp.parent.exists():
-        outp.write_text(_json.dumps(log))
-        print(f"identity_log dumped: {len(log)} entries -> {outp}")
+    outdir = ROOT / "web/replays" / JOB_ID
+    if outdir.exists():
+        # Separate embeddings (numpy, not JSON-serializable) into a .npz aligned by
+        # entry index; strip them from the JSON metadata dump.
+        embs, emb_idx = [], []
+        meta = []
+        for i, e in enumerate(log):
+            emb = e.get("embedding")
+            if emb is not None:
+                embs.append(_np.asarray(emb, dtype=_np.float32))
+                emb_idx.append(i)
+            meta.append({k: v for k, v in e.items() if k != "embedding"})
+        (outdir / "identity_log.json").write_text(_json.dumps(meta))
+        if embs:
+            _np.savez_compressed(outdir / "identity_embeddings.npz",
+                                 embeddings=_np.stack(embs), entry_index=_np.asarray(emb_idx))
+        print(f"identity_log dumped: {len(meta)} entries, {len(embs)} with embeddings -> {outdir}")
     return 0
 
 

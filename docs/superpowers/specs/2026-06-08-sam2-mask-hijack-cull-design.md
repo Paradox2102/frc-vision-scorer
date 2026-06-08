@@ -1,8 +1,41 @@
 # Detector-Absence Cull for Hijacked SAM2 Masks
 
 **Date:** 2026-06-08
-**Status:** Design — pending spec review
+**Status:** Design — revised after adversarial review (see Revision section)
 **Branch context:** `feat/bumper-model`
+
+## Revision 2026-06-08 (post-adversarial-review)
+
+A Codex adversarial review of the implementation plan surfaced five issues that
+change the predicate and safety posture below. The original predicate (a
+reset-on-corroboration integer counter, detector-exception-as-empty, enabled by
+default) is **superseded** by:
+
+1. **Tri-state detector.** A detector exception or unreadable frame is *detector
+   unavailable* and contributes **no** absence evidence (was: treated as empty →
+   would cull every stationary robot during an outage).
+2. **Sliding-window evidence.** Corroboration outcomes accumulate in a bounded
+   per-object window; cull when ≥ K of the window are absences (was: any single
+   corroboration reset the counter to zero → a robot crossing the trench, or a
+   periodic false positive, immortalized the hijack).
+3. **Lifetime-cap honesty.** Culling frees only the *active* count, never the
+   lifetime cap (`next_obj_id` never decreases). Re-acquisition is guaranteed only
+   when the active cap is the binding one (true for ≤18 lifetime objects in a
+   6-robot match). The lifetime-bound case is an explicit, tested limitation, not a
+   silent failure. No ID-reservation/predictor-rebuild is added (YAGNI).
+4. **Correct top-crop projection.** `project_fn` recovers the consumer's y-offset
+   as `cropped_full_h · tc/(1-tc)` (= `original_h · tc`), not `cropped_full_h · tc`.
+5. **Default OFF + acceptance gate.** Detector-absence + stationarity cannot
+   distinguish a trench from a real robot parked in a *persistent* detector blind
+   spot. `CULL_HIJACK_ENABLED` defaults to `0`; it is enabled only after acceptance
+   + adversarial replay tests show zero false culls. If they don't, the escalation
+   is an independent positive hijack signal (appearance discontinuity at the
+   transfer frame — see Alternatives Considered).
+
+The Cull Predicate, Configuration, and Testing sections below are read through
+these revisions. The implementation plan
+(`docs/superpowers/plans/2026-06-08-sam2-mask-hijack-cull.md`) encodes the revised
+design.
 
 ## Problem
 

@@ -51,6 +51,12 @@ from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
+from web.field.overlay_geometry import (
+    bump_wireframe_edges,
+    hub_wireframe_edges,
+    tower_wireframe_edges,
+    trench_wireframe_edges,
+)
 from web.field.detect_bridge import (
     to_field_detections,
     field_adjacent_persons,
@@ -58,7 +64,14 @@ from web.field.detect_bridge import (
     corner_detection_in_alliance_zone,
     filter_field_robot_boxes,
 )
-from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot, box_ios, merge_robot_detections, select_gap_fills
+from web.field.detect_schema import (
+    DetectionSchema,
+    expand_bumper_to_robot,
+    box_ios,
+    merge_robot_detections,
+    plausible_bumper_box,
+    select_gap_fills,
+)
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
@@ -67,7 +80,7 @@ from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
 from web.field.bumper import bumper_band_box, bumper_crop
-from web.field.zones import load_zones, save_zones
+from web.field.zones import load_zones, prism_bounding_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
@@ -727,6 +740,7 @@ class InferenceJob:
         self.calib = None
         self.field_model = None
         self.hub_prisms = []
+        self.hub_no_robot_zones = []
         self.field_tracker: Optional[FieldTracker] = None
         self.radar: Optional[Radar] = None
         self.field_tracking = False
@@ -1116,6 +1130,8 @@ class InferenceJob:
         robot_boxes = []
         robot_colors = []
         for box, color, _confidence in robots:
+            if self.bumper_model is not None and not plausible_bumper_box(box):
+                continue
             if not self._below_robot_tracking_top(view, box, frame.shape[0]):
                 continue
             cx = (box[0] + box[2]) / 2.0
@@ -1130,7 +1146,9 @@ class InferenceJob:
         rejected = []
         field_dets = to_field_detections(
             robot_boxes, cal, self.field_dims, colors=robot_colors,
-            frame_shape=frame.shape, rejected_out=rejected,
+            frame_shape=frame.shape,
+            blocked_zones=self.hub_no_robot_zones,
+            rejected_out=rejected,
         )
         field_dets = [
             det
@@ -2996,6 +3014,64 @@ class InferenceJob:
                 self.identity_registry._next_id = slot_id + 1
         return self._get_or_create_identity_track(ident.identity_id, alliance)
 
+    def _canonical_identity_slots(self) -> dict[int, int]:
+        """Map at most three current identities per alliance onto the six slots.
+
+        Active bindings win. Inactive identities occupy the remaining alliance
+        slots so occlusion never creates an extra UI row.
+        """
+        assignments = {}
+        identities = list(self.identity_registry.identities.values())
+        for alliance, slots in (("blue", range(3)), ("red", range(3, 6))):
+            slot_set = set(slots)
+            alliance_ids = [i for i in identities if i.alliance == alliance]
+            used_ids = set()
+            for ident in alliance_ids:
+                if ident.active_slot in slot_set and ident.active_slot not in assignments:
+                    assignments[ident.active_slot] = ident.identity_id
+                    used_ids.add(ident.identity_id)
+            remaining = [i for i in alliance_ids if i.identity_id not in used_ids]
+            remaining.sort(
+                key=lambda i: (
+                    not bool(getattr(i, "is_confirmed", False)),
+                    -int(getattr(i, "last_seen_frame", 0)),
+                    i.identity_id,
+                )
+            )
+            free_slots = [slot for slot in slots if slot not in assignments]
+            for slot, ident in zip(free_slots, remaining):
+                assignments[slot] = ident.identity_id
+        return assignments
+
+    def _canonical_robot_rows(self) -> list[dict]:
+        """Serialize exactly the fixed 3v3 roster slots for live/final results."""
+        assignments = self._canonical_identity_slots()
+        rows = []
+        for slot_id in range(6):
+            identity_id = assignments.get(slot_id)
+            robot = self.robot_tracks.get(identity_id) if identity_id is not None else None
+            best_vote_team = None
+            best_vote = 0.0
+            if robot is not None and robot.team_ocr_votes:
+                best_vote_team, best_vote = max(
+                    robot.team_ocr_votes.items(), key=lambda kv: kv[1]
+                )
+            rows.append({
+                "id": identity_id,
+                "slot": self._slot_label(slot_id),
+                "slot_id": slot_id,
+                "alliance": self._slot_alliance(slot_id),
+                "team_number": (
+                    self._get_display_team_number(robot) if robot is not None else None
+                ),
+                "confirmed": bool(robot and robot.team_number_confirmed),
+                "team_candidate": best_vote_team,
+                "team_candidate_votes": best_vote,
+                "scores": robot.scores if robot is not None else 0,
+                "position": robot.last_position if robot is not None else None,
+            })
+        return rows
+
     async def _bind_detection_identity(self, slot_id: int, identity_id: int):
         ident = self.identity_registry.identities.get(identity_id)
         if ident is not None:
@@ -3544,7 +3620,9 @@ class InferenceJob:
             self.field_model = FieldModel.load(cal.field_season)
             self.field_dims = (self.field_model.length_m, self.field_model.width_m)
             self.hub_prisms = hub_prisms(self.field_model)
+            self.hub_no_robot_zones = prism_bounding_zones(self.hub_prisms)
             static_zones = load_zones(self.event_key)
+            static_zones = static_zones + self.hub_no_robot_zones
             if static_zones:
                 print(f"  Static-structure zones (field m): {static_zones}")
             self.field_tracker = FieldTracker(self.field_model.length_m, zones=static_zones)
@@ -3942,6 +4020,8 @@ class InferenceJob:
                                         )
                                         bumper_robots = []
                                         for box, color, _confidence in robots:
+                                            if not plausible_bumper_box(box):
+                                                continue
                                             robot_box = expand_bumper_to_robot(
                                                 box,
                                                 crop.shape,
@@ -3969,6 +4049,7 @@ class InferenceJob:
                                                 crop.shape[1],
                                                 crop.shape[2],
                                             ),
+                                            blocked_zones=self.hub_no_robot_zones,
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
                                         
@@ -4080,6 +4161,8 @@ class InferenceJob:
                                     )
                                     bumper_robots = []
                                     for box, color, _confidence in robots:
+                                        if not plausible_bumper_box(box):
+                                            continue
                                         robot_box = expand_bumper_to_robot(
                                             box,
                                             img.shape,
@@ -4121,6 +4204,7 @@ class InferenceJob:
                                             int(round(img.shape[1] / SAM2_SCALE)),
                                             3,
                                         ),
+                                        blocked_zones=self.hub_no_robot_zones,
                                     )
                                     return [merged[idx] for idx in keep]
                                 res = self.model(img, conf=0.4, verbose=False)[0]
@@ -4245,6 +4329,10 @@ class InferenceJob:
                     robots, _balls, _hubs = self.det_schema.split(
                         sv.Detections.from_ultralytics(results)
                     )
+                    robots = [
+                        robot for robot in robots
+                        if plausible_bumper_box(robot[0])
+                    ]
                 else:
                     results = self.model(
                         early_overhead, conf=DET_CONF_THRESHOLD, verbose=False
@@ -4293,6 +4381,7 @@ class InferenceJob:
                     self.field_dims,
                     colors=early_colors,
                     frame_shape=early_overhead.shape,
+                    blocked_zones=self.hub_no_robot_zones,
                     rejected_out=early_rejected,
                 )
                 if early_rejected:
@@ -4430,6 +4519,7 @@ class InferenceJob:
                                 cal,
                                 self.field_dims,
                                 frame_shape=view_frame.shape,
+                                blocked_zones=self.hub_no_robot_zones,
                             ):
                                 continue
                             uv = ((fx1 + fx2) / 2.0, fy2)
@@ -4847,26 +4937,7 @@ class InferenceJob:
                 frame_b64 = base64.b64encode(buffer).decode('utf-8')
                 
                 # Prepare robot data
-                robots_data = []
-                for robot in self.robot_tracks.values():
-                    best_vote_team = None
-                    best_vote = 0.0
-                    if robot.team_ocr_votes:
-                        best_vote_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
-                    ident = self.identity_registry.identities.get(robot.robot_id)
-                    slot_id = ident.active_slot if ident else None
-                    slot_label = self._slot_label(slot_id) if slot_id is not None else "occluded"
-                    robots_data.append({
-                        "id": robot.robot_id,
-                        "slot": slot_label,
-                        "alliance": robot.alliance,
-                        "team_number": self._get_display_team_number(robot),
-                        "confirmed": robot.team_number_confirmed,
-                        "team_candidate": best_vote_team,
-                        "team_candidate_votes": best_vote,
-                        "scores": robot.scores,
-                        "position": robot.last_position
-                    })
+                robots_data = self._canonical_robot_rows()
                 
                 # Prepare scoring events
                 events_data = []
@@ -5061,14 +5132,14 @@ class InferenceJob:
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
             try:
-                for identity_id, robot in self.robot_tracks.items():
-                    ident = self.identity_registry.identities.get(identity_id)
-                    active_slot = ident.active_slot if ident else None
-                    slot_label = self._slot_label(active_slot) if active_slot is not None else "occluded"
+                for slot_id, identity_id in self._canonical_identity_slots().items():
+                    robot = self.robot_tracks.get(identity_id)
+                    if robot is None:
+                        continue
                     crops = self._slot_crops.get(identity_id, [])
                     await database.upsert_match_robot_identity({
-                        "job_id": self.job_id, "identity_id": identity_id, "slot": active_slot,
-                        "slot_label": slot_label,
+                        "job_id": self.job_id, "identity_id": identity_id, "slot": slot_id,
+                        "slot_label": self._slot_label(slot_id),
                         "alliance": robot.alliance, "team_number": robot.team_number,
                         "confirmed": int(bool(robot.team_number_confirmed)),
                         "source": self._slot_source.get(identity_id, "ocr"),
@@ -5510,7 +5581,7 @@ async def calibration_refine_tag(request: Request):
 
 
 def _draw_field_overlay(frame, cal, fm):
-    """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
+    """Draw the reprojected field, hubs, and bumps using cal.field_to_image.
     Field lines are SAMPLED into polylines (a straight field line projects to a curved
     image line under lens distortion, so a 2-point segment can't trace it).
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
@@ -5526,8 +5597,9 @@ def _draw_field_overlay(frame, cal, fm):
         # polyline conversion can't overflow (and we don't draw garbage segments).
         return (np.isfinite(u) and np.isfinite(v)
                 and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
-    def seg(p0, p1, color, thick, n=24):
-        (x0, y0), (x1, y1) = p0, p1
+    def seg3(p0, p1, color, thick, n=24):
+        x0, y0, z0 = p0
+        x1, y1, z1 = p1
         run = []
         def flush():
             if len(run) >= 2:
@@ -5535,12 +5607,16 @@ def _draw_field_overlay(frame, cal, fm):
             run.clear()
         for t in range(n + 1):
             u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
-                                       y0 + (y1 - y0) * t / n, 0.0))
+                                       y0 + (y1 - y0) * t / n,
+                                       z0 + (z1 - z0) * t / n))
             if _ok(u, v):
                 run.append((int(u), int(v)))
             else:
                 flush()   # break the polyline across the blown-up region
         flush()
+    def seg(p0, p1, color, thick, n=24):
+        seg3((p0[0], p0[1], 0.0), (p1[0], p1[1], 0.0),
+             color, thick, n)
     for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
         seg(a, b, (0, 255, 0), 2)
     x = 0.0
@@ -5549,6 +5625,15 @@ def _draw_field_overlay(frame, cal, fm):
     y = 0.0
     while y <= W + 1e-6:
         seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
+    prisms = hub_prisms(fm)
+    for a, b in hub_wireframe_edges(prisms):
+        seg3(a, b, (255, 220, 0), 2, n=12)
+    for a, b in bump_wireframe_edges(prisms, W):
+        seg3(a, b, (0, 140, 255), 2, n=8)
+    for a, b in tower_wireframe_edges(fm):
+        seg3(a, b, (255, 0, 255), 2, n=8)
+    for a, b in trench_wireframe_edges(fm):
+        seg3(a, b, (180, 80, 255), 2, n=8)
     return fp
 
 
@@ -7009,6 +7094,34 @@ async def get_replay_identities(job_id: str):
     """Robot-slot identities for a job, each with its captured bumper crops as
     data-URLs. Raw embeddings are NEVER exposed to the client."""
     ids = await database.get_match_identities(job_id)
+    canonical = []
+    for alliance, slots in (("blue", range(3)), ("red", range(3, 6))):
+        candidates = [r for r in ids if r.get("alliance") == alliance]
+        by_slot = {}
+        used_identity_ids = set()
+        for row in candidates:
+            slot = row.get("slot")
+            if slot in slots and slot not in by_slot:
+                by_slot[slot] = row
+                used_identity_ids.add(row.get("identity_id"))
+        remaining = [
+            row for row in candidates
+            if row.get("identity_id") not in used_identity_ids
+        ]
+        remaining.sort(
+            key=lambda row: (
+                not bool(row.get("confirmed")),
+                -(float(row.get("confidence") or 0.0)),
+                int(row.get("identity_id") or 0),
+            )
+        )
+        for slot, row in zip((s for s in slots if s not in by_slot), remaining):
+            row = dict(row)
+            row["slot"] = slot
+            row["slot_label"] = InferenceJob._slot_label(slot)
+            by_slot[slot] = row
+        canonical.extend(by_slot[slot] for slot in slots if slot in by_slot)
+    ids = canonical
     out = []
     for r in ids:
         identity_id = r.get("identity_id")
@@ -7149,6 +7262,15 @@ async def remove_gallery(gid: int):
     """Delete one gallery exemplar."""
     await database.delete_gallery_exemplar(gid)
     return {"status": "deleted", "id": gid}
+
+
+@app.delete("/api/gallery")
+async def clear_gallery(event_key: str):
+    """Delete ALL gallery exemplars for an event (troubleshooting reset). The
+    gallery regenerates from match processing, so this is a cache clear, not
+    permanent data loss."""
+    removed = await database.clear_gallery_exemplars(event_key)
+    return {"status": "cleared", "event_key": event_key, "removed": removed}
 
 
 @app.delete("/api/replays/{replay_id}")

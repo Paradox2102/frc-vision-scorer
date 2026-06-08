@@ -192,12 +192,14 @@ class VisionScorer {
                     <button class="btn-small" id="galleryExpandAll">Expand all</button>
                     <button class="btn-small" id="galleryCollapseAll">Collapse all</button>
                     <span class="gallery-toolbar-count">${teams.length} team${teams.length === 1 ? '' : 's'}</span>
+                    <button class="btn-small gallery-clear-all" id="galleryClearAll">Clear all</button>
                 </div>
                 ${rows}`;
 
             grid.querySelectorAll('.gallery-group-head').forEach(h => h.addEventListener('click', () => this.toggleGalleryGroup(h)));
             grid.querySelector('#galleryExpandAll').addEventListener('click', () => this.setAllGalleryGroups(true));
             grid.querySelector('#galleryCollapseAll').addEventListener('click', () => this.setAllGalleryGroups(false));
+            grid.querySelector('#galleryClearAll').addEventListener('click', () => this.clearGallery());
             grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
             grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
         } catch (e) {
@@ -268,6 +270,24 @@ class VisionScorer {
             }
         }
         await fetch(`/api/gallery/${id}`, { method: 'DELETE' });
+    }
+
+    async clearGallery() {
+        // Wipe every exemplar for the loaded event. Confirmed because it's the
+        // whole gallery at once (unlike single-card deletes); the gallery
+        // regenerates on the next run, so this is a troubleshooting reset.
+        const key = document.getElementById('galleryEventKey').value.trim();
+        if (!key) return;
+        const grid = document.getElementById('galleryGrid');
+        const n = grid.querySelectorAll('.review-robot').length;
+        if (!confirm(`Delete all ${n} gallery exemplar${n === 1 ? '' : 's'} for event "${key}"? They regenerate on the next run.`)) return;
+        try {
+            const resp = await fetch(`/api/gallery?event_key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+            if (!resp.ok) { alert('Failed to clear gallery'); return; }
+            this.loadGallery();   // reload -> "No exemplars"
+        } catch (e) {
+            alert('Failed to clear gallery');
+        }
     }
 
     // --- Event Loading ---
@@ -1045,20 +1065,20 @@ class VisionScorer {
     }
 
     updateRobotTable(tableBody, robots, alliance) {
-        if (robots.length === 0) {
-            tableBody.innerHTML = '<tr><td colspan="3" class="empty-state">No robots detected</td></tr>';
-            return;
-        }
-
-        robots.sort((a, b) => (b.scores || 0) - (a.scores || 0));
-
-        const rows = robots.map(robot => {
-            const label = robot.slot || (robot.id != null ? `Robot ${robot.id}` : '—');
-            const goals = robot.scores != null ? robot.scores : '—';
+        const prefix = alliance === 'blue' ? 'B' : 'R';
+        const bySlot = new Map(
+            robots
+                .filter(r => typeof r.slot === 'string' && r.slot.match(/^[BR][1-3]$/))
+                .map(r => [r.slot, r])
+        );
+        const rows = [1, 2, 3].map(index => {
+            const label = `${prefix}${index}`;
+            const robot = bySlot.get(label);
+            const goals = robot && robot.scores != null ? robot.scores : 0;
             return `
                 <tr>
                     <td>${label}</td>
-                    <td>${robot.team_number || '—'}</td>
+                    <td>${robot && robot.team_number ? robot.team_number : '—'}</td>
                     <td class="goal-count">${goals}</td>
                 </tr>
             `;

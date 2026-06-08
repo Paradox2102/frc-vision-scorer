@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 from web.field.tracker import FieldDetection
+from web.field.zones import point_in_zones
 
 # Field-boundary slack (m) when deciding a detection's footprint is "on the field".
 # Tightened from the original 1.0 m, which let field-edge clutter (scoreboard side
@@ -154,6 +155,7 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
                         max_field_width=DET_MAX_ROBOT_WIDTH_M,
                         max_box_frac=DET_MAX_BOX_FRAC,
                         width_max_range=DET_FIELD_WIDTH_MAX_RANGE_M,
+                        blocked_zones=None,
                         rejected_out=None):
     """Project image boxes to field-space detections, dropping off-field and
     implausibly-large boxes. If `rejected_out` is a list, each dropped box is
@@ -166,6 +168,11 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
             if rejected_out is not None:
                 rejected_out.append({"box": tuple(float(v) for v in box),
                                      "reason": "off_field", "field_xy": xy})
+            continue
+        if point_in_zones(xy, blocked_zones):
+            if rejected_out is not None:
+                rejected_out.append({"box": tuple(float(v) for v in box),
+                                     "reason": "static_structure", "field_xy": xy})
             continue
         if _too_large(box, calibration, xy, frame_shape, max_field_width,
                       max_box_frac, width_max_range):
@@ -184,6 +191,7 @@ def filter_field_robot_boxes(
     field_dims,
     frame_shape=None,
     margin=DET_FIELD_MARGIN_M,
+    blocked_zones=None,
 ):
     """Return indices of boxes whose ground contact is a plausible field robot.
 
@@ -194,6 +202,8 @@ def filter_field_robot_boxes(
     for idx, box in enumerate(robot_boxes):
         xy = calibration.image_to_field(_bottom_center(box))
         if xy is None or not _on_field(xy, field_dims, margin):
+            continue
+        if point_in_zones(xy, blocked_zones):
             continue
         if _too_large(
             box,

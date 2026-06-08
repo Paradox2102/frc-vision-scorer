@@ -17,15 +17,33 @@ def test_single_camera_passthrough():
 
 
 def test_merges_two_cameras_same_robot():
+    main_box = (10, 20, 30, 40)
+    corner_box = (400, 200, 700, 500)
     per_cam = {
-        "main": [(_det(5.0, 3.0, "blue"), b"m")],
-        "corner_left": [(_det(5.2, 3.1, "blue"), b"c")],
+        "main": [(_det(5.0, 3.0, "blue", main_box), b"m")],
+        "corner_left": [(_det(5.2, 3.1, "blue", corner_box), b"c")],
     }
     fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
     assert len(fused) == 1
     obs = fused[0]
-    assert 5.0 < obs.detection.pos[0] <= 5.2
+    assert obs.detection.pos == (5.0, 3.0)
+    assert obs.detection.box == main_box
     assert {e[0] for e in obs.evidence} == {"main", "corner_left"}
+
+
+def test_corner_only_detection_has_no_main_view_box():
+    per_cam = {
+        "corner_left": [(_det(3.0, 2.0, "blue", (400, 200, 700, 500)), b"c")],
+    }
+    fused = fuse_detections(
+        per_cam,
+        weights={"corner_left": 2.5},
+        radius_m=0.6,
+    )
+
+    assert len(fused) == 1
+    assert fused[0].detection.pos == (3.0, 2.0)
+    assert fused[0].detection.box is None
 
 
 def test_keeps_distinct_robots_separate():

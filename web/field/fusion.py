@@ -54,15 +54,27 @@ def fuse_detections(per_camera: dict, weights: dict, radius_m: float = 0.6) -> l
 def _merge(cluster) -> FusedObservation:
     ws = np.array([c[3] for c in cluster], float)
     pos = np.array([c[1].pos for c in cluster], float)
-    avg = (pos * ws[:, None]).sum(axis=0) / ws.sum()
+    # Main is the reference geometry. Corner cameras are deliberately weighted
+    # higher for identity evidence, but their low, oblique ground projection is
+    # less stable and must not drag a valid main-camera position across the field.
+    # Corner geometry is still used when main is genuinely occluded.
+    main_members = [c for c in cluster if c[0] == "main"]
+    if main_members:
+        main_ws = np.array([c[3] for c in main_members], float)
+        main_pos = np.array([c[1].pos for c in main_members], float)
+        avg = (main_pos * main_ws[:, None]).sum(axis=0) / main_ws.sum()
+    else:
+        avg = (pos * ws[:, None]).sum(axis=0) / ws.sum()
     # weighted color vote, ignoring "unknown"
     votes = {}
     for cam, det, crop, w in cluster:
         if det.color and det.color != "unknown":
             votes[det.color] = votes.get(det.color, 0.0) + w
     color = max(votes, key=votes.get) if votes else "unknown"
-    # representative box: highest-weight cluster member
-    box = max(cluster, key=lambda c: c[3])[1].box
+    # Boxes are camera-local pixels. Only a main-camera box may enter the field
+    # tracker because its output is drawn/cropped in main-view coordinates.
+    # Corner-only observations remain visible in their own HUD panels and radar.
+    box = main_members[0][1].box if main_members else None
     evidence = [(cam, crop, w) for (cam, det, crop, w) in cluster]
     members = [(cam, det.track_id) for (cam, det, crop, w) in cluster]
 

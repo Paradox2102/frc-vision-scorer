@@ -688,6 +688,19 @@ async def delete_gallery_exemplar(gid):
         await db.commit()
 
 
+async def clear_gallery_exemplars(event_key: str) -> int:
+    """Delete every gallery exemplar for an event. Returns the count removed.
+
+    The gallery is a regenerable per-event cache (rebuilt from match processing),
+    so a full clear is a routine troubleshooting reset, not data loss.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM appearance_gallery WHERE event_key = ?", (event_key,))
+        await db.commit()
+        return cur.rowcount
+
+
 # --- Match robot identities & crops ---
 
 async def upsert_match_robot_identity(row: Dict[str, Any]) -> None:

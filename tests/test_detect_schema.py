@@ -1,6 +1,10 @@
 import numpy as np
 
-from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot
+from web.field.detect_schema import (
+    DetectionSchema,
+    expand_bumper_to_robot,
+    plausible_bumper_box,
+)
 
 
 def test_schema_bumper_model_two_class():
@@ -53,6 +57,15 @@ def test_expand_clamps_to_frame_top():
     assert expand_bumper_to_robot(
         (0, 30, 50, 60), (480, 640, 3), factor=5.0
     )[1] == 0.0
+
+
+def test_plausible_bumper_box_rejects_vertical_field_line():
+    assert not plausible_bumper_box((100, 100, 130, 280))
+
+
+def test_plausible_bumper_box_keeps_square_and_wide_bumpers():
+    assert plausible_bumper_box((100, 100, 160, 180))
+    assert plausible_bumper_box((100, 100, 260, 160))
 
 
 def test_box_ios_full_containment_is_one():

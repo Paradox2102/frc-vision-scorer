@@ -152,7 +152,8 @@
 </div>
 
 <div class="overlay-section">
-  <h2>Overlay (reprojected field + tags)</h2>
+  <h2>Overlay (field structures + tags)</h2>
+  <p class="hint">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
   <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
   <img id="overlayImg" src="" alt="">
 </div>
@@ -168,6 +169,9 @@ let pendingPixel = null;  // {u, v} awaiting a map click
 let heldOut = new Set();  // ids marked as held-out for validation
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
+const TAG_RADIUS = 9;
+const TAG_MIN_SPACING = 22;
+let tagDisplayPositions = {}; // display-only positions; calibration coordinates stay exact
 let zones = [];           // [[xmin,ymin,xmax,ymax], ...] in field meters
 let zoneDrag = null;      // {x0,y0,x1,y1} in map pixels while dragging
 let frameMasks = [];      // [[x,y,w,h], ...] in actual cropped frame coordinates
@@ -213,6 +217,44 @@ function fieldToMap(x, y){
   return [MAP_PAD + x * mapScale,
           MAP_PAD + (field.width - y) * mapScale];
 }
+
+function layoutTagMarkers(){
+  tagDisplayPositions = {};
+  for (const [id, t] of Object.entries(tagMap)){
+    const [x,y] = fieldToMap(t.x, t.y);
+    tagDisplayPositions[id] = {x,y};
+  }
+
+  // Keep each field element's original tag pattern, but uniformly enlarge it
+  // around its center just enough to make neighboring markers clickable.
+  const groups = [
+    ['2','3','4','5','8','9','10','11'],       // red hub
+    ['18','19','20','21','24','25','26','27'], // blue hub
+    ['1','12'], ['6','7'], ['17','28'], ['22','23'], // trenches
+    ['13','14'], ['15','16'], ['29','30'], ['31','32'], // wall structures
+  ];
+  for (const ids of groups){
+    const points = ids.filter(id => tagDisplayPositions[id]).map(id => tagDisplayPositions[id]);
+    if (points.length < 2) continue;
+    const cx = points.reduce((sum,p) => sum+p.x, 0) / points.length;
+    const cy = points.reduce((sum,p) => sum+p.y, 0) / points.length;
+    let nearest = Infinity;
+    for (let i=0; i<points.length; i++){
+      for (let j=i+1; j<points.length; j++){
+        nearest = Math.min(nearest, Math.hypot(points[i].x-points[j].x,
+                                               points[i].y-points[j].y));
+      }
+    }
+    const scale = Math.max(1, TAG_MIN_SPACING / nearest);
+    for (const id of ids){
+      const p = tagDisplayPositions[id];
+      if (!p) continue;
+      p.x = cx + (p.x-cx)*scale;
+      p.y = cy + (p.y-cy)*scale;
+    }
+  }
+}
+
 function drawMap(){
   const canvas = document.getElementById('mapCanvas');
   const targetW = 520;
@@ -230,17 +272,21 @@ function drawMap(){
   const m1 = fieldToMap(field.length/2, 0), m2 = fieldToMap(field.length/2, field.width);
   ctx.beginPath(); ctx.moveTo(m1[0],m1[1]); ctx.lineTo(m2[0],m2[1]);
   ctx.strokeStyle='#334'; ctx.stroke();
+  layoutTagMarkers();
   // tags
   const used = usedIds();
   for (const [id, t] of Object.entries(tagMap)){
-    const [mx,my] = fieldToMap(t.x, t.y);
+    const p = tagDisplayPositions[id];
+    const mx=p.x, my=p.y;
     const isUsed = used.has(parseInt(id));
-    ctx.beginPath(); ctx.arc(mx,my,7,0,2*Math.PI);
+    ctx.beginPath(); ctx.arc(mx,my,TAG_RADIUS,0,2*Math.PI);
     ctx.fillStyle = isUsed ? 'rgba(96,255,144,0.9)' : 'rgba(150,160,180,0.55)';
-    ctx.fill(); ctx.strokeStyle='#0a0a14'; ctx.lineWidth=1; ctx.stroke();
-    ctx.font='10px monospace'; ctx.fillStyle = isUsed ? '#d8ffe8' : '#aab';
-    ctx.fillText(id, mx+8, my+3);
+    ctx.fill(); ctx.strokeStyle='#0a0a14'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.font='bold 10px monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle = isUsed ? '#102818' : '#10131d';
+    ctx.fillText(id, mx, my+0.5);
   }
+  ctx.textAlign='start'; ctx.textBaseline='alphabetic';
   drawZonesOnMap(ctx);
   if (pendingPixel){
     ctx.fillStyle='#ffd060'; ctx.font='12px sans-serif';
@@ -406,10 +452,10 @@ document.getElementById('mapCanvas').addEventListener('click', async function(e)
   if (document.getElementById('zoneMode').checked) return;  // drawing zones, not picking tags
   const rect = this.getBoundingClientRect();
   const mx = e.clientX-rect.left, my = e.clientY-rect.top;
-  // nearest tag marker within 14px
-  let best=null, bestD=14*14;
-  for (const [id,t] of Object.entries(tagMap)){
-    const [tx,ty]=fieldToMap(t.x,t.y); const d=(tx-mx)**2+(ty-my)**2;
+  // Select against the spread-out display markers, not their physical anchors.
+  let best=null, bestD=(TAG_RADIUS+5)**2;
+  for (const [id,p] of Object.entries(tagDisplayPositions)){
+    const d=(p.x-mx)**2+(p.y-my)**2;
     if (d<bestD){ bestD=d; best=parseInt(id); }
   }
   if (best===null) return;

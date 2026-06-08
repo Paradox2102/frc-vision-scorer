@@ -46,6 +46,14 @@ class DetectionSchema:
         return robots, balls, hubs
 
 
+def plausible_bumper_box(box, min_width_height_ratio=0.5):
+    """Return whether a detection has a physically plausible bumper shape."""
+    x1, y1, x2, y2 = (float(v) for v in box)
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    return height > 0.0 and width / height >= float(min_width_height_ratio)
+
+
 def expand_bumper_to_robot(box, frame_shape, factor=3.0):
     """Grow a bumper box upward while preserving its footprint and bottom edge."""
     x1, y1, x2, y2 = (float(v) for v in box)
@@ -111,4 +119,3 @@ def select_gap_fills(bumper_halves, unknown_halves, max_per_half=3):
             counts[h] += 1
             keep.append(idx)
     return keep
-

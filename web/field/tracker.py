@@ -19,7 +19,7 @@ ALLIANCES = ("blue", "red")
 class FieldDetection:
     pos: tuple
     color: str
-    box: tuple
+    box: Optional[tuple]
     score: float = 1.0
     track_id: int | None = None
     embedding: Optional[np.ndarray] = None

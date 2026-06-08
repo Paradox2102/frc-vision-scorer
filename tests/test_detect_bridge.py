@@ -161,6 +161,26 @@ def test_missing_color_becomes_unknown():
     assert dets[0].color == "unknown"
 
 
+def test_detection_inside_blocked_structure_zone_is_dropped():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    u, v = cam.field_to_image((8.0, 4.0, 0.0))
+    box = (u - 30, v - 120, u + 30, v)
+    rejected = []
+
+    dets = to_field_detections(
+        [box],
+        cam,
+        (fm.length_m, fm.width_m),
+        colors=["blue"],
+        blocked_zones=[(7.5, 3.5, 8.5, 4.5)],
+        rejected_out=rejected,
+    )
+
+    assert dets == []
+    assert rejected[0]["reason"] == "static_structure"
+
+
 def test_field_adjacent_person_filter():
     fm = FieldModel.load("2026-rebuilt-welded")
     cam = truth_pinhole_camera()

@@ -534,6 +534,9 @@ DET_CONF_THRESHOLD = 0.35
 PERSON_OVERLAP_IOS = float(os.environ.get("PERSON_OVERLAP_IOS", "0.3"))
 
 BACKWARD_CONFIRM_ENABLED = os.environ.get("BACKWARD_CONFIRM_ENABLED", "1") == "1"
+# Re-resolution must retain at least this fraction of the live replay rows, else it
+# falls back to the slice-2 prune (guards against identity-churn gutting the replay).
+RERESOLVE_MIN_KEEP_FRAC = float(os.environ.get("RERESOLVE_MIN_KEEP_FRAC", "0.5"))
 
 # Whole-robot gap-fill parameters
 ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
@@ -3606,11 +3609,19 @@ class InferenceJob:
                 "alliance": self._slot_alliance(slot_id),
             }
         frame_nums = [f["frame_num"] for f in rec.frames]
+        orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
         rebuilt = reresolve_frames(self._identity_log, slot_team_map, verdicts, frame_nums)
-        if any(f["robots"] for f in rebuilt):
+        rebuilt_rows = sum(len(f["robots"]) for f in rebuilt)
+        # Catastrophic-drop guard: re-resolution must retain most of the live rows.
+        # Identity_id churn (hundreds of ids for 6 robots) can make final-canonical
+        # keying drop ~all rows; a near-empty rebuild is worse than the slice-2 prune,
+        # so fall back instead of shipping a gutted replay.
+        if rebuilt_rows >= max(1, orig_rows) * RERESOLVE_MIN_KEEP_FRAC:
             orig = {f["frame_num"]: f for f in rec.frames}
             rec.frames = [{**orig.get(f["frame_num"], {}), **f} for f in rebuilt]
         else:
+            print(f"[backward-confirm] re-resolution kept {rebuilt_rows}/{orig_rows} rows "
+                  f"(< {RERESOLVE_MIN_KEEP_FRAC:.0%}); falling back to slice-2 prune")
             self._apply_track_verdicts()
         try:
             self.identity_diagnostics.gauge("reresolve_verdicts",

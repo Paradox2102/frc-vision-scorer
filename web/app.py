@@ -74,6 +74,7 @@ from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservat
 from web.field.identity_confidence import ConfidenceConfig, decide_vlm_read
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
+from web.field.track_evidence import MatchEvidence
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -530,6 +531,8 @@ VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
 
+PERSON_OVERLAP_IOS = float(os.environ.get("PERSON_OVERLAP_IOS", "0.3"))
+
 # Whole-robot gap-fill parameters
 ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
 ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
@@ -733,6 +736,9 @@ class InferenceJob:
         self.video_width = 0
         self.video_height = 0
         self.video_fps = 0
+        self._match_evidence = MatchEvidence()
+        self._binding_log: list[dict] = []   # [{"frame_num": int, "bindings": {track_id: slot_id}}]
+        self._evidence_frame = 0             # current processed frame, set at loop TOP
         self.total_frames = 0
         self.overhead_height = 0
         self.frame_skip = FRAME_SKIP
@@ -1274,6 +1280,37 @@ class InferenceJob:
             "job_id": self.job_id,
         })
 
+    def _record_frame_evidence(self, fused, frame_num, main_person_boxes):
+        """Slice-1 whole-match evidence. No behavior change; consumed by the
+        backward-confirmation classifier (slice 2+). All keys are fused track_ids.
+        Position is the RAW fused measurement (det.pos): a coasting track is absent
+        from `fused`, so still frames contribute no motion sample — intended."""
+        for obs in fused:
+            tid = obs.track_id
+            if tid is None:
+                continue
+            det = obs.detection
+            fxy = det.pos if det is not None else None
+            box = det.box if det is not None else None
+            color = det.color if det is not None else None
+            overlapped = bool(box is not None and main_person_boxes and any(
+                box_ios(tuple(box), tuple(pb)) >= PERSON_OVERLAP_IOS
+                for pb in main_person_boxes))
+            self._match_evidence.observe(tid, frame_num, fxy, overlapped_person=overlapped)
+            if color in ("red", "blue"):
+                self._match_evidence.confirm(tid, frame_num, bumper_color=True)
+        self._binding_log.append({
+            "frame_num": frame_num,
+            "bindings": dict(self.field_tracker._id_to_slot),  # {track_id: slot_id}
+        })
+
+    def _track_id_for_slot(self, slot_id):
+        # _id_to_slot is {track_id: slot_id}; invert. Returns None when the slot is
+        # not currently bound to a fused track (confirmation then drops — acceptable
+        # for slice 1; these sites normally run on frames where the slot IS bound).
+        return next((tid for tid, s in self.field_tracker._id_to_slot.items()
+                     if s == slot_id), None)
+
     def apply_gallery_matches(self, ocr_crops: list) -> None:
         """Query the gallery for unconfirmed tracks, cast votes, and annotate any
         matching ocr_crops cards so the UI distinguishes appearance recovery."""
@@ -1299,6 +1336,12 @@ class InferenceJob:
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
                         event.team_number = robot.team_number
+                try:
+                    tid = self._track_id_for_slot(slot_id)
+                    if tid is not None:
+                        self._match_evidence.confirm(tid, self._evidence_frame, appearance=True)
+                except Exception:
+                    pass
                 print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
                       f"(appearance {sim:.2f})")
 
@@ -1528,6 +1571,12 @@ class InferenceJob:
                     if event.robot_id == identity_id:
                         event.team_number = locked_team
                 print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
+                try:
+                    tid = self._track_id_for_slot(slot_id)
+                    if tid is not None:
+                        self._match_evidence.confirm(tid, self._evidence_frame, team_read=True)
+                except Exception:
+                    pass
                 self._deposit_to_gallery(robot, legibility=conf,
                                          image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
@@ -4168,6 +4217,8 @@ class InferenceJob:
                     frame_num += 1
                     continue
 
+                self._evidence_frame = frame_num
+
                 if (
                     previous_processed_source_frame is not None
                     and frame_num - previous_processed_source_frame > self.frame_skip * 2
@@ -4311,6 +4362,11 @@ class InferenceJob:
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                try:
+                    self._record_frame_evidence(
+                        fused, frame_num, person_boxes_by_cam.get("main", []))
+                except Exception:
+                    pass
                 await self._sync_identity_registry_frame(fused, ev_list, track_outs)
 
                 # 5. Resolve occlusion from every posed camera and merge: a track

@@ -87,3 +87,51 @@ def test_match_evidence_confirm_before_observe_autocreates():
     m = MatchEvidence()
     m.confirm(track_id=9, frame=1, appearance=True)  # confirmation can precede observe
     assert m.by_track[9].ever_appearance_match
+
+
+from web.field.track_evidence import classify_track
+
+
+def _te(**kw):
+    e = TrackEvidence(track_id=kw.pop("track_id", 1))
+    for k, v in kw.items():
+        setattr(e, k, v)
+    return e
+
+
+def test_classify_read_track_is_robot_even_if_stationary():
+    e = _te(ever_team_read=True)  # no motion, no positions
+    assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "robot"
+
+
+def test_classify_moving_ref_is_human_not_robot():
+    e = TrackEvidence(track_id=1)
+    for f in range(10):
+        e.observe_frame(f, overlapped_person=True)        # 100% overlap
+    for f in range(10):
+        e.add_position(f, 2.0 + 0.5 * f, 4.0)             # ~4.5 m of motion
+    assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "human"
+
+
+def test_classify_moving_robot_is_robot():
+    e = TrackEvidence(track_id=1)
+    for f in range(10):
+        e.observe_frame(f, overlapped_person=False)
+    for f in range(10):
+        e.add_position(f, 2.0 + 0.5 * f, 4.0)
+    assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "robot"
+
+
+def test_classify_never_moving_no_evidence_is_static():
+    e = TrackEvidence(track_id=1)
+    for f in range(10):
+        e.observe_frame(f, overlapped_person=False)
+        e.add_position(f, 5.0, 5.0)                        # parked
+    assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "static"
+
+
+def test_classify_read_beats_person_overlap():
+    e = TrackEvidence(track_id=1, ever_appearance_match=True)
+    for f in range(10):
+        e.observe_frame(f, overlapped_person=True)
+    assert classify_track(e, motion_confirm_m=0.75, person_overlap_frac=0.5) == "robot"

@@ -5,7 +5,11 @@ and reusable by the classifier (slice 2) and backward pass (slice 3).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+MOTION_CONFIRM_M = float(os.environ.get("MOTION_CONFIRM_M", "0.75"))
+PERSON_OVERLAP_FRAC = float(os.environ.get("PERSON_OVERLAP_FRAC", "0.5"))
 
 
 def _median(vals):
@@ -105,3 +109,18 @@ class MatchEvidence:
         self._track(track_id).confirm(
             frame, team_read=team_read, appearance=appearance,
             bumper_color=bumper_color)
+
+
+def classify_track(evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
+                   person_overlap_frac: float = PERSON_OVERLAP_FRAC) -> str:
+    """Whole-match verdict: 'robot' | 'human' | 'static'. Precedence matters:
+    person-overlap is checked BEFORE motion so a *moving ref* is classified human
+    (motion cannot exclude refs); a read/appearance-confirmed track is robot even
+    under occlusion."""
+    if evidence.ever_team_read or evidence.ever_appearance_match:
+        return "robot"
+    if evidence.person_overlap_frac() >= person_overlap_frac:
+        return "human"
+    if evidence.net_displacement_m() > motion_confirm_m:
+        return "robot"
+    return "static"

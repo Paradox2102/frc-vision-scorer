@@ -551,6 +551,83 @@ def test_sam2_diagnostics_logging():
     assert rejected_events[0]["reason"] == "below_margin"
 
 
+class CullStubPredictor:
+    """Reprompt stub with controllable per-object motion, for cull tests.
+
+    Object ``oid`` lives at x in [10*oid, 10*oid+4). An oid in ``moving`` drifts
+    +3 px in x per frame (its projected position changes across boundaries);
+    others are static. Honours start_frame_idx / max_frame_num_to_track.
+    """
+    H = 20
+    W = 200
+    NUM_FRAMES = 12
+
+    def __init__(self, moving=()):
+        self.moving = set(moving)
+        self.add_calls: list[tuple[int, int]] = []
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+
+    def _rect_for(self, oid: int, f: int = 0) -> tuple[int, int, int, int]:
+        x0 = oid * 10 + (3 * f if oid in self.moving else 0)
+        return (x0, 2, x0 + 4, 6)
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        end = (self.NUM_FRAMES - 1 if max_frame_num_to_track is None
+               else min(start + max_frame_num_to_track, self.NUM_FRAMES - 1))
+        for f in range(start, end + 1):
+            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            rects = [self._rect_for(oid, f) for oid in active]
+            yield f, active, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_detector_runs_at_capped_boundary_when_cull_enabled():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    calls = []
+
+    def detect_fn(local_idx, frame_path):
+        calls.append(local_idx)
+        return []
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=2, cull_enabled=True,
+    )
+    assert calls, "detect_fn must run at capped boundaries when cull enabled"
+
+
+def test_detector_skipped_at_capped_boundary_when_cull_disabled():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    calls = []
+
+    def detect_fn(local_idx, frame_path):
+        calls.append(local_idx)
+        return []
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=2, cull_enabled=False,
+    )
+    assert calls == [], "detect_fn must NOT run at capped boundaries when cull disabled"
+
+
 # ---------------------------------------------------------------------------
 # Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
 # SAM2 mask is geometrically impossible for a robot.

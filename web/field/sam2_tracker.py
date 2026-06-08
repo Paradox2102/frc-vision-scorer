@@ -12,6 +12,7 @@ The module is split into two tiers:
 from __future__ import annotations
 
 import os
+from collections import deque
 from contextlib import contextmanager
 from typing import Any
 
@@ -26,6 +27,27 @@ import numpy as np
 MASK_MAX_ASPECT = float(os.environ.get("SAM2_MASK_MAX_ASPECT", "2.0"))
 MASK_MIN_BASE_RATIO = float(os.environ.get("SAM2_MASK_MIN_BASE_RATIO", "0.35"))
 MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
+
+# Hijack-cull knobs (detector-absence + stationary). A SAM2 object whose mask has
+# drifted onto a static field structure stays "visible" forever, so the existing
+# absence-based retirement never fires. These drive a second retirement trigger.
+# See docs/superpowers/specs/2026-06-08-sam2-mask-hijack-cull-design.md.
+#
+# DEFAULT OFF: detector-absence + stationarity cannot distinguish a trench from a
+# real robot parked in a persistent detector blind spot. Enable only after the
+# acceptance + adversarial replay tests (plan Task 6) show no false culls.
+CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "0") not in ("0", "false", "False")
+# Absences required *within the evidence window* before a stationary object is culled.
+CULL_UNCORROBORATED_REPROMPTS = int(os.environ.get("CULL_UNCORROBORATED_REPROMPTS", "3"))
+# Sliding-window length of corroboration outcomes kept per object. Must be >= K;
+# the slack (W - K) is how many intermittent corroborations the cull tolerates
+# without resetting suspicion.
+CULL_EVIDENCE_WINDOW = int(os.environ.get("CULL_EVIDENCE_WINDOW", "5"))
+# Min IoS of a fresh detection vs the mask to count as corroboration (lenient ->
+# conservative culling).
+CULL_CORROB_IOS = float(os.environ.get("CULL_CORROB_IOS", "0.3"))
+# Max field-position span over the window to count as stationary.
+CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -348,6 +370,12 @@ class Sam2FieldTracker:
         max_lifetime_objects: int = 20,
         retirement_frames: int = 15,
         new_obj_ios_thresh: float = 0.5,
+        cull_enabled: bool = CULL_HIJACK_ENABLED,
+        cull_uncorroborated_reprompts: int = CULL_UNCORROBORATED_REPROMPTS,
+        cull_evidence_window: int = CULL_EVIDENCE_WINDOW,
+        cull_corrob_ios: float = CULL_CORROB_IOS,
+        cull_stationary_m: float = CULL_STATIONARY_M,
+        project_fn=None,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
     ) -> dict[int, dict[int, dict]]:
@@ -381,6 +409,26 @@ class Sam2FieldTracker:
             new_obj_ios_thresh: A detection whose best intersection-over-smaller
                 against any tracked mask is below this threshold is treated as a
                 new robot.  Passed to :func:`match_new_detections`.
+            cull_enabled: When True, run ``detect_fn`` at every chunk boundary
+                (even when the roster is capped) so the hijack cull has
+                corroboration data. When False the kill switch fully reverts to
+                the original behavior (detector runs only when seeding). Also note
+                the detector contract: ``detect_fn`` returning ``None`` (or raising)
+                is treated as detector-unavailable for that boundary — it
+                contributes no absence evidence. An empty list means the detector
+                ran and found nothing (counts as absence).
+            cull_uncorroborated_reprompts: Absences within the evidence window
+                required before a stationary object is culled (cull groundwork).
+            cull_evidence_window: Sliding-window length of corroboration outcomes
+                kept per object (cull groundwork).
+            cull_corrob_ios: Min IoS of a fresh detection vs the mask to count as
+                corroboration (cull groundwork).
+            cull_stationary_m: Max field-position span over the window to count as
+                stationary (cull groundwork).
+            project_fn: Callable mapping a mask box (tracker pixel coords) to field
+                meters ``(x, y)``, or None when unprojectable; measures stationarity
+                in field space so camera pan can't disguise a static structure as
+                moving. When None, falls back to pixel bottom-center.
             progress_cb: Optional callback taking (processed_count, total_frames).
             diagnostics: Optional IdentityDiagnosticRecorder-like object.
 
@@ -415,6 +463,9 @@ class Sam2FieldTracker:
         last_visible_frame: dict[int, int] = {}
         birth_detector_overlap: dict[int, float] = {}
         retired_set: set[int] = set()
+        culled_set: set[int] = set()
+        corroboration_history: dict[int, deque] = {}
+        field_pos_window: dict[int, list] = {}
 
         # Prompt each robot box on the prompt frame.  Object IDs are 1-based.
         next_obj_id = 1
@@ -620,10 +671,12 @@ class Sam2FieldTracker:
                         break  # no forward progress -> end of video
                     last_end = last_idx
 
-                    # Re-prompt at the chunk boundary: register robots that have
-                    # newly come into view (not overlapping any tracked mask).
+                    # Re-prompt at the chunk boundary. Recompute the active set
+                    # (excluding culled), retiring absent objects.
                     active_objects = []
                     for oid in range(1, next_obj_id):
+                        if oid in culled_set:
+                            continue
                         lv = last_visible_frame.get(oid)
                         if lv is not None and (last_idx - lv) <= retirement_frames:
                             active_objects.append(oid)
@@ -633,128 +686,134 @@ class Sam2FieldTracker:
                                 if diagnostics:
                                     diagnostics.record(
                                         "sam2.object_retired",
-                                        details={"object_id": oid, "frame_idx": last_idx}
+                                        details={"object_id": oid, "frame_idx": last_idx},
                                     )
 
-                    capped = len(active_objects) >= max_active_objects or (next_obj_id - 1) >= max_lifetime_objects
-                    detected = []
-                    if not capped:
+                    capped = (len(active_objects) >= max_active_objects
+                              or (next_obj_id - 1) >= max_lifetime_objects)
+
+                    # Latest mask + color per active object (for corroboration & seeding).
+                    existing = {}
+                    existing_colors = {}
+                    for oid in active_objects:
+                        lv = last_visible_frame.get(oid)
+                        if lv is not None and oid in results.get(lv, {}):
+                            existing[oid] = results[lv][oid]["mask"]
+                            if object_metadata is not None:
+                                existing_colors[oid] = object_metadata.get(oid)
+
+                    # Tri-state detector. detector_available is False when the
+                    # detector could not run (detect_fn raised or returned None);
+                    # such boundaries contribute NO absence evidence. Run the
+                    # detector when seeding (not capped) OR for corroboration
+                    # (cull_enabled) — guarded so the kill switch fully reverts.
+                    run_detector = detect_fn is not None and (not capped or cull_enabled)
+                    detector_available = False
+                    new_boxes, new_metadata = [], []
+                    if run_detector:
                         frame_path = (
                             frame_paths[last_idx] if last_idx < len(frame_paths) else None
                         )
                         try:
-                            detected = detect_fn(last_idx, frame_path) or []
+                            detected = detect_fn(last_idx, frame_path)
                         except Exception:
-                            detected = []
-                        new_boxes, new_metadata = _normalize_detections(detected)
-                        for box in new_boxes:
+                            detected = None
+                        if detected is None:
+                            detector_available = False
+                        else:
+                            detector_available = True
+                            new_boxes, new_metadata = _normalize_detections(detected)
                             if diagnostics:
-                                diagnostics.record(
-                                    "sam2.reprompt_candidate",
-                                    details={"frame_idx": last_idx, "box": list(box)}
-                                )
-                        
-                        existing = {}
-                        existing_colors = {}
-                        for oid in active_objects:
-                            lv = last_visible_frame.get(oid)
-                            if lv is not None and oid in results.get(lv, {}):
-                                existing[oid] = results[lv][oid]["mask"]
-                                if object_metadata is not None:
-                                    existing_colors[oid] = object_metadata.get(oid)
+                                for box in new_boxes:
+                                    diagnostics.record(
+                                        "sam2.reprompt_candidate",
+                                        details={"frame_idx": last_idx, "box": list(box)},
+                                    )
 
-                        if new_boxes:
-                            # Use any tracked mask's shape for the frame size; fall
-                            # back to a detection-derived size if nothing tracked.
-                            if existing:
-                                h, w = next(iter(existing.values())).shape
-                            else:
-                                w = max(int(b[2]) for b in new_boxes) + 1
-                                h = max(int(b[3]) for b in new_boxes) + 1
-                            int_boxes = [
-                                (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
-                                for b in new_boxes
+                    # ---- Hijack cull (filled in a later task) ----
+                    # if cull_enabled and detector_available and existing: ...
+
+                    # ---- New-object seeding (unchanged logic, gated on capped) ----
+                    if not capped and detector_available and new_boxes:
+                        if existing:
+                            h, w = next(iter(existing.values())).shape
+                        else:
+                            w = max(int(b[2]) for b in new_boxes) + 1
+                            h = max(int(b[3]) for b in new_boxes) + 1
+                        int_boxes = [
+                            (int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in new_boxes
+                        ]
+                        matched_indices = match_new_detections(
+                            existing, int_boxes, (w, h),
+                            ios_thresh=new_obj_ios_thresh,
+                            existing_colors=existing_colors,
+                            new_colors=new_metadata,
+                        )
+                        if diagnostics:
+                            for idx, box_val in enumerate(new_boxes):
+                                if idx not in matched_indices:
+                                    diagnostics.record(
+                                        "sam2.reprompt_rejected",
+                                        reason="below_margin",
+                                        details={"frame_idx": last_idx, "box": list(box_val)},
+                                    )
+                        for j in matched_indices:
+                            active_objects = [
+                                oid for oid in range(1, next_obj_id)
+                                if oid not in culled_set
+                                and last_visible_frame.get(oid) is not None
+                                and (last_idx - last_visible_frame[oid]) <= retirement_frames
                             ]
-                            
-                            matched_indices = match_new_detections(
-                                existing,
-                                int_boxes,
-                                (w, h),
-                                ios_thresh=new_obj_ios_thresh,
-                                existing_colors=existing_colors,
-                                new_colors=new_metadata,
-                            )
-                            
-                            # Log overlapping rejections
-                            if diagnostics:
-                                for idx, box_val in enumerate(new_boxes):
-                                    if idx not in matched_indices:
-                                        diagnostics.record(
-                                            "sam2.reprompt_rejected",
-                                            reason="below_margin",
-                                            details={"frame_idx": last_idx, "box": list(box_val)}
-                                        )
-                            
-                            for j in matched_indices:
-                                # Re-check caps inside loop
-                                active_objects = []
-                                for oid in range(1, next_obj_id):
-                                    lv = last_visible_frame.get(oid)
-                                    if lv is not None and (last_idx - lv) <= retirement_frames:
-                                        active_objects.append(oid)
-                                
-                                cap_reached = len(active_objects) >= max_active_objects or (next_obj_id - 1) >= max_lifetime_objects
-                                if cap_reached:
-                                    reason = "roster_cap" if len(active_objects) >= max_active_objects else "lifetime_cap"
-                                    if diagnostics:
-                                        diagnostics.record(
-                                            "sam2.reprompt_rejected",
-                                            reason=reason,
-                                            details={"frame_idx": last_idx, "box": list(new_boxes[j])}
-                                        )
-                                    continue
-                                    
-                                # Calculate best IoS overlap for the birth evidence
-                                box_mask = np.zeros((h, w), bool)
-                                bx1, by1, bx2, by2 = int_boxes[j]
-                                box_mask[by1:by2, bx1:bx2] = True
-                                best_ios = 0.0
-                                for oid, existing_mask in existing.items():
-                                    if existing_colors and new_metadata:
-                                        e_col = existing_colors.get(oid)
-                                        n_col = new_metadata[j]
-                                        if e_col in {"red", "blue"} and n_col in {"red", "blue"} and e_col != n_col:
-                                            continue
-                                    score = _ios(existing_mask, box_mask)
-                                    if score > best_ios:
-                                        best_ios = score
-                                
-                                predictor.add_new_points_or_box(
-                                    state,
-                                    frame_idx=last_idx,
-                                    obj_id=next_obj_id,
-                                    box=np.asarray(new_boxes[j], dtype=np.float32),
-                                )
-                                first_prompted_frame[next_obj_id] = last_idx
-                                birth_detector_overlap[next_obj_id] = best_ios
+                            cap_reached = (len(active_objects) >= max_active_objects
+                                           or (next_obj_id - 1) >= max_lifetime_objects)
+                            if cap_reached:
+                                reason = ("roster_cap" if len(active_objects) >= max_active_objects
+                                          else "lifetime_cap")
                                 if diagnostics:
                                     diagnostics.record(
-                                        "sam2.object_created",
-                                        details={"object_id": next_obj_id, "frame_idx": last_idx, "box": list(new_boxes[j])}
+                                        "sam2.reprompt_rejected",
+                                        reason=reason,
+                                        details={"frame_idx": last_idx, "box": list(new_boxes[j])},
                                     )
-                                if object_metadata is not None:
-                                    object_metadata[next_obj_id] = new_metadata[j]
-                                next_obj_id += 1
-                    else:
-                        # Capped at chunk boundary -> reject all new detections
-                        if diagnostics and detected:
-                            reason = "roster_cap" if len(active_objects) >= max_active_objects else "lifetime_cap"
-                            for item in detected:
-                                box_val = item[0] if isinstance(item, tuple) else item
+                                continue
+                            box_mask = np.zeros((h, w), bool)
+                            bx1, by1, bx2, by2 = int_boxes[j]
+                            box_mask[by1:by2, bx1:bx2] = True
+                            best_ios = 0.0
+                            for oid, existing_mask in existing.items():
+                                if existing_colors and new_metadata:
+                                    e_col = existing_colors.get(oid)
+                                    n_col = new_metadata[j]
+                                    if (e_col in {"red", "blue"} and n_col in {"red", "blue"}
+                                            and e_col != n_col):
+                                        continue
+                                score = _ios(existing_mask, box_mask)
+                                if score > best_ios:
+                                    best_ios = score
+                            predictor.add_new_points_or_box(
+                                state, frame_idx=last_idx, obj_id=next_obj_id,
+                                box=np.asarray(new_boxes[j], dtype=np.float32),
+                            )
+                            first_prompted_frame[next_obj_id] = last_idx
+                            birth_detector_overlap[next_obj_id] = best_ios
+                            if diagnostics:
+                                diagnostics.record(
+                                    "sam2.object_created",
+                                    details={"object_id": next_obj_id, "frame_idx": last_idx,
+                                             "box": list(new_boxes[j])},
+                                )
+                            if object_metadata is not None:
+                                object_metadata[next_obj_id] = new_metadata[j]
+                            next_obj_id += 1
+                    elif capped and detector_available and new_boxes:
+                        if diagnostics:
+                            reason = ("roster_cap" if len(active_objects) >= max_active_objects
+                                      else "lifetime_cap")
+                            for box_val in new_boxes:
                                 diagnostics.record(
                                     "sam2.reprompt_rejected",
                                     reason=reason,
-                                    details={"frame_idx": last_idx, "box": list(box_val)}
+                                    details={"frame_idx": last_idx, "box": list(box_val)},
                                 )
 
                     cursor = last_idx + 1

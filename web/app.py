@@ -3585,6 +3585,39 @@ class InferenceJob:
         except Exception:
             pass
 
+    def _reresolve_replay_frames(self) -> None:
+        """Slice 3: rebuild replay frames from whole-match identities (consistent
+        slot per identity, retroactive team, parked back-fill, human/static excluded).
+        Supersedes the slice-2 row prune. No-ops/falls back rather than emptying."""
+        from web.field.track_evidence import identity_evidence, classify_track, reresolve_frames
+        rec = getattr(self, "_replay", None)
+        if rec is None or not getattr(self, "_identity_log", None):
+            return self._apply_track_verdicts()   # fall back to slice-2 prune
+        ev = identity_evidence(self._identity_log)
+        verdicts = {iid: classify_track(te) for iid, te in ev.items()}
+        assignments = self._canonical_identity_slots()        # {slot_id: identity_id}
+        slot_team_map = {}
+        for slot_id, iid in assignments.items():
+            robot = self.robot_tracks.get(iid)
+            slot_team_map[iid] = {
+                "slot_id": slot_id,
+                "team_number": self._get_display_team_number(robot) if robot is not None else None,
+                "confirmed": bool(robot and robot.team_number_confirmed),
+                "alliance": self._slot_alliance(slot_id),
+            }
+        frame_nums = [f["frame_num"] for f in rec.frames]
+        rebuilt = reresolve_frames(self._identity_log, slot_team_map, verdicts, frame_nums)
+        if any(f["robots"] for f in rebuilt):
+            orig = {f["frame_num"]: f for f in rec.frames}
+            rec.frames = [{**orig.get(f["frame_num"], {}), **f} for f in rebuilt]
+        else:
+            self._apply_track_verdicts()
+        try:
+            self.identity_diagnostics.gauge("reresolve_verdicts",
+                {k: list(verdicts.values()).count(k) for k in ("robot", "human", "static")})
+        except Exception:
+            pass
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
@@ -4926,9 +4959,9 @@ class InferenceJob:
                     )
                     if BACKWARD_CONFIRM_ENABLED:
                         try:
-                            self._apply_track_verdicts()
+                            self._reresolve_replay_frames()
                         except Exception as e:
-                            print(f"[backward-confirm] verdict pass skipped: {e}")
+                            print(f"[backward-confirm] re-resolution skipped: {e}")
                     artifacts = rec.finalize(
                         status=status,
                         summary=summary,

@@ -152,6 +152,35 @@ def match_new_detections(
     return unmatched
 
 
+def mask_corroborated(
+    mask: np.ndarray,
+    new_boxes: list[tuple[int, int, int, int]],
+    wh: tuple[int, int],
+    ios_thresh: float = 0.3,
+    mask_color: Any | None = None,
+    new_colors: list[Any] | None = None,
+) -> bool:
+    """Return True if any fresh detector box backs ``mask`` (IoS >= ios_thresh).
+
+    The per-object complement of :func:`match_new_detections`. Used as the
+    per-boundary corroboration test for the hijack cull. Color-conflicting
+    detections are ignored (a blue box cannot corroborate a red mask).
+    """
+    if not new_boxes:
+        return False
+    w, h = wh
+    for idx, (x1, y1, x2, y2) in enumerate(new_boxes):
+        if mask_color in {"red", "blue"} and new_colors and idx < len(new_colors):
+            n_col = new_colors[idx]
+            if n_col in {"red", "blue"} and n_col != mask_color:
+                continue
+        box_mask = np.zeros((h, w), bool)
+        box_mask[int(y1):int(y2), int(x1):int(x2)] = True
+        if _ios(mask, box_mask) >= ios_thresh:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Stateful SAM2 wrapper
 # ---------------------------------------------------------------------------

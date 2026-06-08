@@ -26,6 +26,38 @@ def test_match_new_detections_flags_unmatched():
     assert unmatched == [1]  # index of the second box only (the unmatched/new one)
 
 
+def test_mask_corroborated_true_when_box_overlaps():
+    from web.field.sam2_tracker import mask_corroborated
+    mask = np.zeros((20, 60), bool)
+    mask[2:6, 6:10] = True
+    assert mask_corroborated(mask, [(6, 2, 10, 6)], (60, 20), ios_thresh=0.3) is True
+
+
+def test_mask_corroborated_false_when_no_box_overlaps():
+    from web.field.sam2_tracker import mask_corroborated
+    mask = np.zeros((20, 60), bool)
+    mask[2:6, 6:10] = True
+    assert mask_corroborated(mask, [(40, 2, 44, 6)], (60, 20), ios_thresh=0.3) is False
+
+
+def test_mask_corroborated_false_when_no_boxes():
+    from web.field.sam2_tracker import mask_corroborated
+    mask = np.zeros((20, 60), bool)
+    mask[2:6, 6:10] = True
+    assert mask_corroborated(mask, [], (60, 20), ios_thresh=0.3) is False
+
+
+def test_mask_corroborated_ignores_color_conflicting_box():
+    from web.field.sam2_tracker import mask_corroborated
+    mask = np.zeros((20, 60), bool)
+    mask[2:6, 6:10] = True
+    box = (6, 2, 10, 6)
+    assert mask_corroborated(mask, [box], (60, 20), ios_thresh=0.3,
+                             mask_color="red", new_colors=["blue"]) is False
+    assert mask_corroborated(mask, [box], (60, 20), ios_thresh=0.3,
+                             mask_color="red", new_colors=["red"]) is True
+
+
 def _rect_mask(x1, y1, x2, y2, wh=(10, 10)):
     m = np.zeros((wh[1], wh[0]), bool); m[y1:y2, x1:x2] = True; return m
 

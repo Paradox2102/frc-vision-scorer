@@ -3589,33 +3589,28 @@ class InferenceJob:
             pass
 
     def _reresolve_replay_frames(self) -> None:
-        """Slice 3: rebuild replay frames from whole-match identities (consistent
-        slot per identity, retroactive team, parked back-fill, human/static excluded).
-        Supersedes the slice-2 row prune. No-ops/falls back rather than emptying."""
-        from web.field.track_evidence import identity_evidence, classify_track, reresolve_frames
+        """Slice 3b: rebuild replay frames keyed by stable slot_id (identity_id churns
+        — hundreds per match). Per-slot verdict excludes ref/static slots; retroactive
+        team per slot. Slot-churn correction is the stitcher's job. Guarded fallback."""
+        from web.field.track_evidence import slot_evidence, classify_track, reresolve_frames_by_slot
         rec = getattr(self, "_replay", None)
         if rec is None or not getattr(self, "_identity_log", None):
-            return self._apply_track_verdicts()   # fall back to slice-2 prune
-        ev = identity_evidence(self._identity_log)
-        verdicts = {iid: classify_track(te) for iid, te in ev.items()}
+            return self._apply_track_verdicts()
+        sev = slot_evidence(self._identity_log)
+        slot_verdicts = {sid: classify_track(te) for sid, te in sev.items()}
         assignments = self._canonical_identity_slots()        # {slot_id: identity_id}
-        slot_team_map = {}
+        slot_meta = {}
         for slot_id, iid in assignments.items():
             robot = self.robot_tracks.get(iid)
-            slot_team_map[iid] = {
-                "slot_id": slot_id,
+            slot_meta[slot_id] = {
                 "team_number": self._get_display_team_number(robot) if robot is not None else None,
                 "confirmed": bool(robot and robot.team_number_confirmed),
                 "alliance": self._slot_alliance(slot_id),
             }
         frame_nums = [f["frame_num"] for f in rec.frames]
         orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
-        rebuilt = reresolve_frames(self._identity_log, slot_team_map, verdicts, frame_nums)
+        rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts, frame_nums)
         rebuilt_rows = sum(len(f["robots"]) for f in rebuilt)
-        # Catastrophic-drop guard: re-resolution must retain most of the live rows.
-        # Identity_id churn (hundreds of ids for 6 robots) can make final-canonical
-        # keying drop ~all rows; a near-empty rebuild is worse than the slice-2 prune,
-        # so fall back instead of shipping a gutted replay.
         if rebuilt_rows >= max(1, orig_rows) * RERESOLVE_MIN_KEEP_FRAC:
             orig = {f["frame_num"]: f for f in rec.frames}
             rec.frames = [{**orig.get(f["frame_num"], {}), **f} for f in rebuilt]
@@ -3624,8 +3619,8 @@ class InferenceJob:
                   f"(< {RERESOLVE_MIN_KEEP_FRAC:.0%}); falling back to slice-2 prune")
             self._apply_track_verdicts()
         try:
-            self.identity_diagnostics.gauge("reresolve_verdicts",
-                {k: list(verdicts.values()).count(k) for k in ("robot", "human", "static")})
+            self.identity_diagnostics.gauge("reresolve_slot_verdicts",
+                {k: list(slot_verdicts.values()).count(k) for k in ("robot", "human", "static")})
         except Exception:
             pass
 

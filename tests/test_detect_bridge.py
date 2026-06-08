@@ -82,6 +82,32 @@ def test_oversized_image_fraction_dropped():
     assert dets == []
 
 
+def test_far_leaked_wide_box_dropped():
+    """A SAM2 mask that leaks horizontally onto adjacent field structure produces a
+    box several times wider than any robot could appear at that range. Beyond the
+    near-range footprint cutoff and under 50% of frame, the OLD checks let it through.
+    The forward-projected expected-width check (well-conditioned at range) rejects it.
+
+    Mirrors the real failure: R1 at ~14 m with a box ~3.6x the widest a 2 m robot
+    could project to. The 4 m far box in test_far_oblique_detection_not_width_rejected
+    (~2x) must still be kept — this only fires on gross leaks.
+    """
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    # ~7.2 m-wide bottom edge at a far point (≈3.5x a 2 m broadside robot here)
+    ul, vl = cam.field_to_image((5.0, 7.8, 0.0))
+    ur, vr = cam.field_to_image((12.2, 7.8, 0.0))
+    y2 = max(vl, vr)
+    box = (min(ul, ur), y2 - 60, max(ul, ur), y2)
+    # sanity: under the 50% frame backstop, so only the new check can catch it
+    assert (max(ul, ur) - min(ul, ur)) / 1920.0 < 0.5
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["red"],
+        frame_shape=(1080, 1920, 3),
+    )
+    assert dets == []
+
+
 def test_normal_robot_footprint_kept():
     """A box implying a ~0.9 m footprint on the carpet survives the size filter."""
     fm = FieldModel.load("2026-rebuilt-welded")

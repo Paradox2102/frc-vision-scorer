@@ -25,6 +25,16 @@ DET_FIELD_WIDTH_MAX_RANGE_M = float(os.environ.get("DET_FIELD_WIDTH_MAX_RANGE_M"
 CORNER_ALLIANCE_ZONE_DEPTH_M = float(
     os.environ.get("CORNER_ALLIANCE_ZONE_DEPTH_M", "4.8")
 )
+# Range-stable width backstop. The footprint check above is disabled past
+# DET_FIELD_WIDTH_MAX_RANGE_M because back-projecting box corners to the carpet is
+# ill-conditioned near the horizon — which leaves long-range boxes with NO width
+# sanity. A SAM2 mask that leaks horizontally onto adjacent field structure then
+# passes as a robot far wider than physically possible. Instead, FORWARD-project a
+# max-robot-width carpet segment at the detection's field position (well-conditioned
+# at any range) and reject a box wider than this factor times that expected width.
+# 3.0 clears a genuine robot (and the ~2x far box guarded by the oblique-range
+# regression test) with margin, while catching the ~3.5x+ leaks.
+DET_MAX_WIDTH_PX_FACTOR = float(os.environ.get("DET_MAX_WIDTH_PX_FACTOR", "3.0"))
 
 
 def _bottom_center(box):
@@ -75,6 +85,37 @@ def _camera_ground_dist(calibration, xy):
     return ((xy[0] - cc[0]) ** 2 + (xy[1] - cc[1]) ** 2) ** 0.5
 
 
+def _expected_robot_pixel_width(field_xy, calibration, robot_width_m):
+    """Pixel width of a ``robot_width_m`` carpet segment at ``field_xy``, oriented
+    broadside to the camera (worst-case widest as the camera sees it).
+
+    Returns None if the calibration cannot forward-project (no pose / no method /
+    degenerate geometry). Unlike back-projecting box corners (image->field), this
+    forward projection (field->image) has no horizon singularity, so it stays
+    well-conditioned at long range — exactly where the footprint check is disabled.
+    """
+    cc = getattr(calibration, "camera_center", None)
+    f2i = getattr(calibration, "field_to_image", None)
+    if cc is None or f2i is None or field_xy is None:
+        return None
+    dx = float(field_xy[0]) - float(cc[0])
+    dy = float(field_xy[1]) - float(cc[1])
+    n = (dx * dx + dy * dy) ** 0.5
+    if n < 1e-6:
+        return None
+    ux, uy = -dy / n, dx / n  # unit vector broadside to the camera viewing ray
+    half = float(robot_width_m) / 2.0
+    try:
+        left = f2i((field_xy[0] - ux * half, field_xy[1] - uy * half, 0.0))
+        right = f2i((field_xy[0] + ux * half, field_xy[1] + uy * half, 0.0))
+        if left is None or right is None:
+            return None
+        lx, ly, rx, ry = float(left[0]), float(left[1]), float(right[0]), float(right[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return ((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5
+
+
 def box_exceeds_frac(box, frame_shape, max_box_frac):
     """True if box spans more than max_box_frac of the frame in either dimension.
     Calibration-independent backstop against oversized detections."""
@@ -88,14 +129,20 @@ def box_exceeds_frac(box, frame_shape, max_box_frac):
 
 
 def _too_large(box, calibration, field_xy, frame_shape, max_field_width,
-               max_box_frac, max_range):
-    """True if the box is implausibly large to be a robot. Two independent layers:
+               max_box_frac, max_range, width_px_factor=DET_MAX_WIDTH_PX_FACTOR):
+    """True if the box is implausibly large to be a robot. Three independent layers:
     a carpet-footprint cap (only applied at near range, where the ground projection
-    is well-conditioned) and an image-fraction backstop (calibration-independent)."""
+    is well-conditioned), a forward-projected expected-width cap (well-conditioned at
+    ANY range — catches leaked/oversized boxes the footprint cap can't at distance),
+    and an image-fraction backstop (calibration-independent)."""
     dist = _camera_ground_dist(calibration, field_xy)
     if dist is not None and dist <= max_range:
         width_m = _field_footprint_width(box, calibration)
         if width_m is not None and width_m > max_field_width:
+            return True
+    expected_px = _expected_robot_pixel_width(field_xy, calibration, max_field_width)
+    if expected_px is not None and expected_px > 0:
+        if (box[2] - box[0]) > expected_px * width_px_factor:
             return True
     if box_exceeds_frac(box, frame_shape, max_box_frac):
         return True

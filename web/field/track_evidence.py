@@ -79,3 +79,29 @@ class TrackEvidence:
                 if d > best:
                     best = d
         return best
+
+
+class MatchEvidence:
+    """Per-job registry of TrackEvidence keyed by fused track_id."""
+
+    def __init__(self) -> None:
+        self.by_track: dict = {}
+
+    def _track(self, track_id: int) -> TrackEvidence:
+        te = self.by_track.get(track_id)
+        if te is None:
+            te = TrackEvidence(track_id=int(track_id))
+            self.by_track[track_id] = te
+        return te
+
+    def observe(self, track_id, frame, field_xy, *, overlapped_person) -> None:
+        te = self._track(track_id)
+        te.observe_frame(frame, overlapped_person)
+        if field_xy is not None:
+            te.add_position(frame, field_xy[0], field_xy[1])
+
+    def confirm(self, track_id, frame, *, team_read=False, appearance=False,
+                bumper_color=False) -> None:
+        self._track(track_id).confirm(
+            frame, team_read=team_read, appearance=appearance,
+            bumper_color=bumper_color)

@@ -1,5 +1,5 @@
 import math
-from web.field.track_evidence import TrackEvidence
+from web.field.track_evidence import MatchEvidence, TrackEvidence
 
 
 def _ev(positions):
@@ -56,3 +56,34 @@ def test_confirm_bumper_color_is_not_confident_frame():
     e.confirm(3, bumper_color=True)
     assert e.ever_bumper_color is True
     assert e.first_confident_frame is None
+
+
+def test_match_evidence_aggregates_per_track():
+    m = MatchEvidence()
+    m.observe(track_id=1, frame=0, field_xy=(2.0, 4.0), overlapped_person=False)
+    m.observe(track_id=1, frame=1, field_xy=(2.6, 4.0), overlapped_person=False)
+    m.observe(track_id=2, frame=0, field_xy=(8.0, 4.0), overlapped_person=True)
+    assert set(m.by_track) == {1, 2}
+    assert len(m.by_track[1].field_positions) == 2
+    assert m.by_track[2].person_overlap_frames == 1
+
+
+def test_match_evidence_tolerates_missing_position():
+    m = MatchEvidence()
+    m.observe(track_id=1, frame=0, field_xy=None, overlapped_person=False)
+    assert m.by_track[1].frames_seen == [0]
+    assert m.by_track[1].field_positions == []  # coasting frame: no motion sample
+
+
+def test_match_evidence_confirm_routes_to_track():
+    m = MatchEvidence()
+    m.observe(track_id=3, frame=2, field_xy=(5.0, 5.0), overlapped_person=False)
+    m.confirm(track_id=3, frame=2, team_read=True)
+    assert m.by_track[3].ever_team_read
+    assert m.by_track[3].first_confident_frame == 2
+
+
+def test_match_evidence_confirm_before_observe_autocreates():
+    m = MatchEvidence()
+    m.confirm(track_id=9, frame=1, appearance=True)  # confirmation can precede observe
+    assert m.by_track[9].ever_appearance_match

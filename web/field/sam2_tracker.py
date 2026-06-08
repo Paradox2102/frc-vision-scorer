@@ -181,6 +181,39 @@ def mask_corroborated(
     return False
 
 
+def is_stationary(positions, max_span_m: float) -> bool:
+    """Return True if all known field positions lie within ``max_span_m``.
+
+    ``positions`` is a list of (x, y) field-meter points, possibly containing
+    ``None`` (unprojectable box). ``None`` entries are ignored. With fewer than
+    two known positions we cannot confirm stationarity, so we return False
+    (conservative — refuse to cull when motion is unmeasurable).
+    """
+    pts = [p for p in positions if p is not None]
+    if len(pts) < 2:
+        return False
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    span = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+    return span < max_span_m
+
+
+def absent_enough(history, k: int) -> bool:
+    """Return True if a bounded corroboration ``history`` shows >= ``k`` absences.
+
+    ``history`` is an iterable of booleans over the last N *available* re-prompt
+    boundaries (True = the mask was corroborated by a fresh detection that
+    boundary, False = absent). Counting absences within a bounded window — rather
+    than resetting a counter to zero on any single corroboration — means one
+    intermittent overlap (a robot crossing the trench, or a whole-robot false
+    positive on it) cannot indefinitely preserve a hijacked mask. The caller sizes
+    the window (maxlen) with slack over ``k`` so a genuinely-present robot,
+    corroborated on most boundaries, never reaches ``k`` absences.
+    """
+    absent = sum(1 for c in history if not c)
+    return absent >= k
+
+
 # ---------------------------------------------------------------------------
 # Stateful SAM2 wrapper
 # ---------------------------------------------------------------------------

@@ -588,6 +588,56 @@ def _climber_robot_mask(H: int = 60, W: int = 30) -> np.ndarray:
     return m
 
 
+def test_is_stationary_true_for_fixed_positions():
+    from web.field.sam2_tracker import is_stationary
+    assert is_stationary([(10.0, 5.0), (10.1, 5.0), (9.95, 5.05)], 0.5) is True
+
+
+def test_is_stationary_false_for_moving_positions():
+    from web.field.sam2_tracker import is_stationary
+    assert is_stationary([(10.0, 5.0), (11.0, 5.0), (12.0, 5.0)], 0.5) is False
+
+
+def test_is_stationary_false_when_insufficient_known_positions():
+    from web.field.sam2_tracker import is_stationary
+    assert is_stationary([(10.0, 5.0)], 0.5) is False
+    assert is_stationary([None, (10.0, 5.0)], 0.5) is False
+    assert is_stationary([None, None], 0.5) is False
+
+
+def test_is_stationary_ignores_none_entries():
+    from web.field.sam2_tracker import is_stationary
+    assert is_stationary([(10.0, 5.0), None, (10.2, 5.1)], 0.5) is True
+
+
+def test_absent_enough_true_for_persistent_absence():
+    from web.field.sam2_tracker import absent_enough
+    assert absent_enough([False, False, False], k=3) is True
+    assert absent_enough([False, False, False, False], k=3) is True
+
+
+def test_absent_enough_true_despite_one_intermittent_hit():
+    from web.field.sam2_tracker import absent_enough
+    assert absent_enough([True, False, False, False], k=3) is True
+
+
+def test_absent_enough_false_when_mostly_corroborated():
+    from web.field.sam2_tracker import absent_enough
+    assert absent_enough([True, True, True], k=3) is False
+    assert absent_enough([True, True, False, True], k=3) is False
+
+
+def test_absent_enough_false_before_window_fills():
+    from web.field.sam2_tracker import absent_enough
+    assert absent_enough([False, False], k=3) is False
+
+
+# ---------------------------------------------------------------------------
+# Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
+# SAM2 mask is geometrically impossible for a robot.
+# ---------------------------------------------------------------------------
+
+
 def test_plausible_robot_mask_accepts_solid_blob():
     from web.field.sam2_tracker import plausible_robot_mask
     assert plausible_robot_mask(_solid_robot_mask()) is True

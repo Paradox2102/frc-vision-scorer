@@ -28,6 +28,32 @@ class TrackEvidence:
     ever_bumper_color: bool = False
     first_confident_frame: "int | None" = None
 
+    def observe_frame(self, frame: int, overlapped_person: bool) -> None:
+        self.frames_seen.append(int(frame))
+        if overlapped_person:
+            self.person_overlap_frames += 1
+
+    def person_overlap_frac(self) -> float:
+        n = len(self.frames_seen)
+        return (self.person_overlap_frames / n) if n else 0.0
+
+    def _mark_confident(self, frame: int) -> None:
+        if self.first_confident_frame is None or frame < self.first_confident_frame:
+            self.first_confident_frame = int(frame)
+
+    def confirm(self, frame: int, *, team_read: bool = False,
+                appearance: bool = False, bumper_color: bool = False) -> None:
+        # team_read / appearance are strong robot evidence -> set first_confident_frame.
+        # bumper_color is weak (red/blue field structure fires it) -> recorded only.
+        if team_read:
+            self.ever_team_read = True
+            self._mark_confident(frame)
+        if appearance:
+            self.ever_appearance_match = True
+            self._mark_confident(frame)
+        if bumper_color:
+            self.ever_bumper_color = True
+
     def add_position(self, frame: int, x: float, y: float) -> None:
         self.field_positions.append((int(frame), float(x), float(y)))
 

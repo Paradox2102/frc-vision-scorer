@@ -3703,7 +3703,21 @@ class InferenceJob:
             print(f"  Using {'custom' if custom_ocr_regions else 'default'} OCR regions")
 
             scan_t0 = time.perf_counter()
-            clock_samples = self._scan_match_clock()
+            # The clock scan is a ~minute-long synchronous decode+OCR loop. Run it
+            # OFF the event loop (asyncio.to_thread) — running it inline blocks the
+            # loop long enough that uvicorn can't service the WebSocket keepalive,
+            # so the browser drops the connection ("connection error" in the UI)
+            # even though the job keeps running. Tell the client what's happening
+            # first, since no progress streams during the scan.
+            if self.websocket:
+                try:
+                    await self.websocket.send_json({
+                        "type": "status", "status": "processing",
+                        "message": "Scanning match clock…", "progress": 0.0,
+                    })
+                except Exception:
+                    pass
+            clock_samples = await asyncio.to_thread(self._scan_match_clock)
             (
                 self.processing_ranges,
                 self.match_periods,

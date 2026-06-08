@@ -628,6 +628,33 @@ def test_detector_skipped_at_capped_boundary_when_cull_disabled():
     assert calls == [], "detect_fn must NOT run at capped boundaries when cull disabled"
 
 
+def test_detector_exception_is_unavailable_no_candidates_no_seed():
+    """A detect_fn that raises is treated as detector-unavailable: no reprompt
+    candidates are logged and no new objects are seeded that boundary."""
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = IdentityDiagnosticRecorder()
+
+    def detect_fn(local_idx, frame_path):
+        raise RuntimeError("detector blew up")
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1)],          # one object, NOT capped
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=6, cull_enabled=True,   # run_detector True even though not capped
+        diagnostics=diag,
+    )
+
+    # No reprompt candidates were logged (detector was unavailable every boundary).
+    assert not any(e.get("event") == "sam2.reprompt_candidate" for e in diag._events)
+    # Only the initial prompt object was ever added; nothing seeded at re-prompt.
+    assert stub.add_calls == [(0, 1)]
+
+
 # ---------------------------------------------------------------------------
 # Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
 # SAM2 mask is geometrically impossible for a robot.

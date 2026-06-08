@@ -805,6 +805,9 @@ class Sam2FieldTracker:
                             if object_metadata is not None:
                                 object_metadata[next_obj_id] = new_metadata[j]
                             next_obj_id += 1
+                    # Reachable only when cull_enabled (otherwise the detector is
+                    # not run while capped, matching pre-cull behavior). Logs the
+                    # rejections for boxes the full roster can't accept.
                     elif capped and detector_available and new_boxes:
                         if diagnostics:
                             reason = ("roster_cap" if len(active_objects) >= max_active_objects

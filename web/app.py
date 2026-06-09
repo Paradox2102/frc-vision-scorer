@@ -5483,12 +5483,21 @@ async def save_calibration_masks(request: Request):
     camera = body.get("camera", "main")
     masks = body.get("masks", [])
 
-    cal = field_store.load(event, camera)
-    if cal is None:
+    version_id = body.get("version_id")
+    versions = field_store.load_versions(event, camera)
+    if not versions:
+        # No calibration yet — create a default base version (mirrors today's
+        # "no calibration -> default" branch).
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
-
+        cal.masks = [tuple(m) for m in masks]
+        field_store.save_version(event, camera, cal, start_match=None)
+        return {"status": "ok", "masks": cal.masks}
+    target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
+    if target is None:
+        target = max(versions, key=lambda v: v.get("created_at") or "")
+    cal = target["calibration"]
     cal.masks = [tuple(m) for m in masks]
-    field_store.save(event, camera, cal)
+    field_store.update_version(event, camera, target["version_id"], cal)
     return {"status": "ok", "masks": cal.masks}
 
 
@@ -5505,12 +5514,19 @@ async def save_robot_track_top_crop(request: Request):
     camera = body.get("camera", "main")
     crop = max(0.0, min(0.5, float(body.get("robot_track_top_crop", 0.0))))
 
-    cal = field_store.load(event, camera)
-    if cal is None:
+    version_id = body.get("version_id")
+    versions = field_store.load_versions(event, camera)
+    if not versions:
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
-
+        cal.robot_track_top_crop = crop
+        field_store.save_version(event, camera, cal, start_match=None)
+        return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
+    target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
+    if target is None:
+        target = max(versions, key=lambda v: v.get("created_at") or "")
+    cal = target["calibration"]
     cal.robot_track_top_crop = crop
-    field_store.save(event, camera, cal)
+    field_store.update_version(event, camera, target["version_id"], cal)
     return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
 
 
@@ -5539,14 +5555,21 @@ async def calibration_manual(request: Request):
     corr = {f"pt{i}": (np.array([[p["u"], p["v"]]], float),
                        np.array([[p["x"], p["y"], p["z"]]], float))
             for i, p in enumerate(pts)}
-    existing = field_store.load(event, camera)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    vs = field_store.load_versions(event, camera)
+    prev = select_epoch(vs, start_match) if vs else None
+    existing = prev["calibration"] if prev else None
     image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
     season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
     try:
         cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size, field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    field_store.save(event, camera, cal)
+    if existing is not None:
+        cal.masks = existing.masks
+        cal.robot_track_top_crop = existing.robot_track_top_crop
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     return {"status": "ok", "rms_error": cal.rms_error}
 
 
@@ -5587,7 +5610,14 @@ async def calibration_auto(request: Request):
                                     field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    field_store.save(event, camera, cal)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    vs = field_store.load_versions(event, camera)
+    prev = select_epoch(vs, start_match) if vs else None
+    if prev is not None:
+        cal.masks = prev["calibration"].masks
+        cal.robot_track_top_crop = prev["calibration"].robot_track_top_crop
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
 
 
@@ -5749,12 +5779,16 @@ async def calibration_solve_homography(request: Request):
                                                  "2026-rebuilt-welded")
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    existing = field_store.load(event, camera)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    vs = field_store.load_versions(event, camera)
+    prev = select_epoch(vs, start_match) if vs else None
+    existing = prev["calibration"] if prev else None
     if existing and hasattr(existing, "masks"):
         cal.masks = existing.masks
     if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save(event, camera, cal)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
 
     # Build overlay on the same frame/timestamp.
     fm = FieldModel.load("2026-rebuilt-welded")
@@ -5818,12 +5852,16 @@ async def calibration_solve_tags(request: Request):
                                                 field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    existing = field_store.load(event, camera)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    vs = field_store.load_versions(event, camera)
+    prev = select_epoch(vs, start_match) if vs else None
+    existing = prev["calibration"] if prev else None
     if existing and hasattr(existing, "masks"):
         cal.masks = existing.masks
     if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save(event, camera, cal)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}

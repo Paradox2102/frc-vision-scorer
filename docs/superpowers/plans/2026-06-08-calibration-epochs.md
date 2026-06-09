@@ -536,14 +536,19 @@ def _verify_calibration_alignment(self) -> bool:
 
 Initialize `self.needs_calibration = None` in `__init__`. Confirm `detect_tags` is imported in app.py (it is used by `/api/calibration/frame`); confirm `tag_alignment_error` import is added.
 
-- [ ] **Step 3: Wire the call** — after the timer phase computes `self.processing_ranges` (~line 3876) and **before** the SAM2 pre-computation pass (~line 3905):
+- [ ] **Step 3: Wire the call** — after the timer phase computes `self.processing_ranges` (~line 3876) and **before** the SAM2 pre-computation pass (~line 3905). **Mirror the existing init-abort path** (lines 3794-3800) so the client is notified over the WebSocket — an early `return` from inside the later `try` reaches neither the "complete" send (end of `try`) nor the "error" send (in `except`), so you MUST send explicitly:
 
 ```python
             if not self._verify_calibration_alignment():
-                return   # status/error already set; skip the SAM2 pass entirely
+                # _verify_calibration_alignment already set self.status="error",
+                # self.error, and self.needs_calibration. Notify the client and stop
+                # before the SAM2 pass (mirrors the _init_field_tracking abort at ~3799).
+                await self._send_ws({"type": "error", "error": self.error,
+                                     "needs_calibration": self.needs_calibration})
+                return
 ```
 
-(Match the surrounding indentation inside `process_video`. The early `return` lands in `process_video`'s normal completion path — the `finally`/`_replay` finalize block still runs and records the errored status, consistent with other `self.status="error"` paths.)
+(Match the surrounding indentation inside `process_video`. `_send_ws` is the job's WS helper, line ~2145. Note: `self._replay` is created later — at ~3909, after this point — so no replay row is written on a drift abort; that's consistent with the existing `_init_field_tracking` abort, which also writes none. The `finally` block guards on `getattr(self,"_replay",None)`, so the early return is safe.)
 
 - [ ] **Step 4: Verify parse + import**
 

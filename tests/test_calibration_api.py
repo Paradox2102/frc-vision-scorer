@@ -134,8 +134,13 @@ def test_init_field_tracking_rejects_homography(monkeypatch):
 
     homog = CameraCalibration(mode="homography", H=np.eye(3),
                               image_size=(100, 100), field_season="2026-rebuilt-welded")
-    monkeypatch.setattr(field_store, "load", lambda e, c: homog)
-    job = SimpleNamespace(event_key="evt", camera="main", error=None, calib=None,
+    # _init_field_tracking selects the epoch via load_versions/select_epoch, so the
+    # homography cal must be returned as the (single) version to reach the pose-free guard.
+    monkeypatch.setattr(field_store, "load_versions",
+                        lambda e, c: [{"calibration": homog, "start_match": None,
+                                       "label": "legacy", "created_at": "", "version_id": "legacy"}])
+    job = SimpleNamespace(event_key="evt", camera="main", match_key=None,
+                          _calib_version_id=None, error=None, calib=None,
                           field_model=None, field_dims=None, hub_prisms=None,
                           field_tracker=None, radar=None, field_tracking=False)
     assert InferenceJob._init_field_tracking(job) is False

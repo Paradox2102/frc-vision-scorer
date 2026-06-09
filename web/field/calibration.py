@@ -254,6 +254,25 @@ def holdout_field_error(cal: "CameraCalibration", held: dict) -> float:
     return float(np.mean(errs)) if errs else float("inf")
 
 
+def tag_alignment_error(cal, detected_tags, field_model):
+    """(mean field error in meters, n_tags) between auto-detected AprilTags and
+    their calibrated positions.
+
+    detected_tags: {tag_id: corners (4,2)} from detect_tags(). Builds correspondences
+    only for tags the field model knows, pairing detector corners to
+    field_model.tag_corners_3d(tid) the SAME way solve_camera_from_tags does, then
+    reuses holdout_field_error (height-aware). Returns (inf, 0) when no usable tags.
+    """
+    held = {}
+    for tid, corners in detected_tags.items():
+        if tid in field_model.tags:
+            held[tid] = (np.asarray(corners, float).reshape(-1, 2),
+                         field_model.tag_corners_3d(tid))
+    if not held:
+        return float("inf"), 0
+    return holdout_field_error(cal, held), len(held)
+
+
 def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:
     errs = []
     for (c2d, c3d) in correspondences.values():

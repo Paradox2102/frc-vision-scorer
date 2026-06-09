@@ -74,6 +74,10 @@ projection object — don't bloat it):
   created_at, version_id}`. Globs `calibration_{event}_{camera}__*.json` **and**
   the legacy `calibration_{event}_{camera}.json` (→ a version with
   `start_match=None`, meaning "covers from the beginning").
+- `update_version(event, camera, version_id, cal) -> None` — overwrite an
+  **existing** version's calibration in place (for property edits like masks /
+  top-crop), without changing its `start_match`/`created_at` or creating a new
+  epoch.
 - Keep `load(event, camera)` returning the most-recent version's calibration for
   any caller that doesn't need epoch selection (back-compat).
 
@@ -110,17 +114,32 @@ camera yields meters of error even though pixel-reprojection RMS would stay low.
 
 ### 4. Match-time validation + epoch selection (`InferenceJob`, `web/app.py`)
 
-`self.match_key` is already set on the job (line 762, from the TBA roster).
-`_init_field_tracking` changes to load **candidate versions** per camera
-(`load_versions`) and build provisional `CameraView`s using each camera's
-**selected epoch** (`select_epoch(versions, self.match_key)`) so the rest of setup
-(occlusion, radar) has working calibrations. If a camera has no versions, behave as
-today (field tracking disabled with the existing clear error).
+`self.match_key` is already set on the job (line 762, from the TBA roster) — so
+epoch **selection** can happen at init; only **validation** (which needs frames)
+waits for the timer phase.
+
+`_init_field_tracking` currently does `cal = field_store.load(self.event_key,
+self.camera)` for the single main camera, sets `self.calib = cal`, applies a
+pose-free rejection guard (`cal.camera_center is None` → homography/no-pose →
+"re-calibrate" error, lines ~3679-3694), then builds `self.views` via `load_views`.
+The rework:
+- Load **versions** per camera (`load_versions`) and choose each camera's epoch
+  with `select_epoch(versions, self.match_key)`.
+- Set `self.calib` to the **selected main-camera epoch's** calibration (not the raw
+  `load()`), and apply the *same* pose-free guard to it — so the calibration the
+  occlusion/radar path uses is the same one validation will check.
+- Build `self.views` so each `CameraView.calibration` is its camera's selected
+  epoch. (Either extend `load_views` to take a per-camera version map, or build the
+  views from the selected versions directly.)
+- If a camera has no versions, behave as today (field tracking disabled with the
+  existing clear error). If `self.match_key` is None, fall back to the most-recent
+  version per camera (+ warn).
 
 New step in `process_video`, **after** the timer/clock phase
-(`compute_active_windows` → `self.processing_ranges`, ~line 3792) and **before** the
-SAM2 pre-computation pass (~line 3819), so we sample frames from inside an active
-match window and abort before any expensive compute:
+(`compute_active_windows` → `self.processing_ranges`, ~line 3876) and **before** the
+SAM2 pre-computation pass (~line 3905), so we sample frames from inside an active
+match window and abort before any expensive compute. It validates the **already
+selected** `self.calib` (the main-camera epoch chosen at init):
 
 ```
 verify calibration alignment:
@@ -148,16 +167,41 @@ Config (env knobs, matching existing style):
 | `CALIB_CHECK_MIN_TAGS` | `2` | min auto-detected tags needed to validate (else "no tags") |
 | `CALIB_CHECK_SAMPLE_FRAMES` | `5` | frames sampled across the active window before giving up on tags |
 
-### 5. Recalibration save (existing `/api/calibration/*` save paths)
+### 5. Recalibration save (existing `/api/calibration/*` endpoints)
 
-The manual/auto solve endpoints currently call `field_store.save(...)` (overwrite).
-Change them to `save_version(event, camera, cal, start_match, label=None)`:
+Six endpoints currently call `field_store.save(event, camera, cal)` (overwrite).
+They split into two kinds and must be handled differently:
+
+**Geometry solves → create a new epoch** (`save_version`): these produce a fresh
+camera calibration and are the real recalibration paths —
+- `POST /api/calibration/solve-tags` (line ~5917, `solve_camera_from_tags` — the
+  **primary** pinhole resection for the broadcast/main camera, the one this whole
+  feature targets),
+- `POST /api/calibration/solve-homography` (~5848),
+- `POST /api/calibration/manual` (~5640) and `POST /api/calibration/auto` (~5681)
+  (`solve_pose` against existing intrinsics).
+
+Change these to `save_version(event, camera, cal, start_match, label=None)`:
 - `start_match` comes from the request (the match the user is calibrating against);
-  if absent, default to the current match key context or `None` (legacy/whole-event).
+  if absent, default to `None` (legacy/whole-event epoch).
 - `label` optional. No required input — recalibrating just adds a version.
 
-This is the minimal authoring hook so epochs can be created now (Spec 2 adds the
-match selector / download / richer UI around it).
+**Property edits → update an existing version in place** (`update_version`, NOT a
+new epoch): these `load → modify one field → save` an existing calibration —
+- `POST /api/calibration/masks` (~5582, sets `cal.masks`),
+- `POST /api/calibration/robot-track-top-crop` (~5604, sets
+  `cal.robot_track_top_crop`).
+
+These must read the target version (default the latest; accept an optional
+`version_id` in the body so Spec 2's UI can target a specific epoch), modify the
+field, and `update_version(...)` it **in place**. They must operate on the
+**versioned store**, not the legacy single file — otherwise an edited mask/top-crop
+would desync from the versioned pose (inference loads versions; a legacy-file edit
+would be invisible). If no version exists yet, create one (`save_version` with
+`start_match=None`) as today's "no calibration → default" branch does.
+
+This is the minimal authoring hook so epochs can be created and edited now (Spec 2
+adds the match selector / download / richer per-version UI around it).
 
 ## Data Flow
 
@@ -215,16 +259,36 @@ inference (match_key known):
 
 ## Files Touched
 
-- `web/field/store.py` — `save_version`, `load_versions`, `CalibrationVersion`;
-  keep `save`/`load`.
+- `web/field/store.py` — `save_version`, `load_versions`, `update_version`,
+  `CalibrationVersion`; keep `save`/`load`.
 - `web/field/match_order.py` (new) — `match_sort_key`, `select_epoch`.
 - `web/field/calibration.py` — `tag_alignment_error`.
 - `web/field/camera_view.py` — `load_views` (or a new `load_view_candidates`) to
-  expose per-camera versions for selection.
-- `web/app.py` — `_init_field_tracking` (load candidates, select provisional epoch);
-  `process_video` (post-timer `verify_calibration_alignment`, abort on drift);
-  the `/api/calibration/*` save endpoints (→ `save_version`); config constants.
+  expose per-camera versions for selection / accept a per-camera version map.
+- `web/app.py` —
+  - `_init_field_tracking`: load versions per camera, select epoch via
+    `self.match_key`, set `self.calib` to the selected main epoch (+ existing
+    pose-free guard), build views from selected epochs.
+  - `process_video`: post-timer `verify_calibration_alignment` (validate
+    `self.calib`, abort on drift).
+  - Geometry-solve endpoints (`solve-tags`, `solve-homography`, `manual`, `auto`)
+    → `save_version`; property-edit endpoints (`masks`, `robot-track-top-crop`)
+    → `update_version` on the versioned store.
+  - Config constants.
 - Tests under `tests/field/` and `tests/` (run via `.venv/bin/python -m pytest`).
+
+## Implementation notes
+
+- `tag_alignment_error` must pair detected tag corners to `tag_corners_3d` the
+  **same way `solve_camera_from_tags` does** (the field model flags its 2D↔3D
+  corner ordering as provisional/PnP-reconciled) — reuse the same pairing so the
+  scorer and the solver agree; don't invent a different one.
+- `holdout_field_error` already returns `inf` when there are no usable points, which
+  gives the `(inf, 0)` contract for free — `tag_alignment_error` is essentially a
+  correspondence-builder around it.
+- Keep AprilTag detection on a single sequential path on the inference thread (the
+  detector is a non-thread-safe singleton); the existing `_scan_match_clock` runs
+  via `asyncio.to_thread`, so run the sampling/detection similarly off the loop.
 
 ## Risks & Mitigations
 

@@ -21,10 +21,15 @@ def save(event_key: str, camera: str, cal: CameraCalibration) -> None:
 
 
 def load(event_key: str, camera: str) -> CameraCalibration | None:
-    p = _path(event_key, camera)
-    if not p.exists():
+    """Most-recent calibration for back-compat callers that don't need epoch
+    selection (spec: keep `load` returning the latest version). Considers both
+    the versioned files and the legacy single file (via `load_versions`); returns
+    None only if neither exists. Callers that need match-ordered epoch selection
+    should use `load_versions` + `select_epoch` instead."""
+    versions = load_versions(event_key, camera)
+    if not versions:
         return None
-    return CameraCalibration.from_json(json.loads(p.read_text()))
+    return max(versions, key=lambda v: v.get("created_at") or "")["calibration"]
 
 
 def load_intrinsics(event_key: str, camera: str):

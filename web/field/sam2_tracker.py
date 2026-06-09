@@ -36,7 +36,7 @@ MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
 # DEFAULT OFF: detector-absence + stationarity cannot distinguish a trench from a
 # real robot parked in a persistent detector blind spot. Enable only after the
 # acceptance + adversarial replay tests (plan Task 6) show no false culls.
-CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "1") not in ("0", "false", "False")
+CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "0") not in ("0", "false", "False")
 # Absences required *within the evidence window* before a stationary object is culled.
 CULL_UNCORROBORATED_REPROMPTS = int(os.environ.get("CULL_UNCORROBORATED_REPROMPTS", "3"))
 # Sliding-window length of corroboration outcomes kept per object. Must be >= K;
@@ -370,6 +370,7 @@ class Sam2FieldTracker:
         max_lifetime_objects: int = 20,
         retirement_frames: int = 15,
         new_obj_ios_thresh: float = 0.5,
+        propagate_backward: bool = False,
         cull_enabled: bool = CULL_HIJACK_ENABLED,
         cull_uncorroborated_reprompts: int = CULL_UNCORROBORATED_REPROMPTS,
         cull_evidence_window: int = CULL_EVIDENCE_WINDOW,
@@ -409,6 +410,10 @@ class Sam2FieldTracker:
             new_obj_ios_thresh: A detection whose best intersection-over-smaller
                 against any tracked mask is below this threshold is treated as a
                 new robot.  Passed to :func:`match_new_detections`.
+            propagate_backward: When True and the initial prompt/bootstrap frame
+                is after frame zero, first propagate those objects backward to
+                recover the beginning of the exported clip. Re-prompted objects
+                remain forward-only.
             cull_enabled: When True, run ``detect_fn`` at every chunk boundary
                 (even when the roster is capped) so the hijack cull has
                 corroboration data. When False the kill switch fully reverts to
@@ -558,14 +563,21 @@ class Sam2FieldTracker:
                     predictor.reset_state(state)
                 return results
 
-        def _propagate(start_frame_idx=None, max_frame_num_to_track=None):
+        def _propagate(
+            start_frame_idx=None,
+            max_frame_num_to_track=None,
+            *,
+            reverse=False,
+        ):
             # Pass chunk kwargs only when re-prompting, so single-pass callers
             # (and the simple test stub) keep the original zero-arg signature.
-            if reprompting:
+            if reprompting or reverse:
                 kwargs = {
                     "start_frame_idx": start_frame_idx,
                     "max_frame_num_to_track": max_frame_num_to_track,
                 }
+                if reverse:
+                    kwargs["reverse"] = True
             else:
                 kwargs = {}
             if self._real_torch:
@@ -651,7 +663,7 @@ class Sam2FieldTracker:
                 self._processed_count += 1
                 if progress_cb is not None:
                     try:
-                        progress_cb(self._processed_count, total_frames)
+                        progress_cb(self._processed_count, total_work_frames)
                     except Exception:
                         pass
             if diagnostics and last_idx is not None:
@@ -661,7 +673,54 @@ class Sam2FieldTracker:
                 )
             return last_idx
 
+        total_work_frames = total_frames
+        if propagate_backward and bootstrap_idx > 0:
+            # Both directions emit the prompt frame, so it is counted twice.
+            total_work_frames += bootstrap_idx + 1
+
         try:
+            if propagate_backward and bootstrap_idx > 0:
+                for f_idx, obj_ids, mask_logits in _propagate(
+                    bootstrap_idx,
+                    bootstrap_idx,
+                    reverse=True,
+                ):
+                    f_idx_int = int(f_idx)
+                    bool_arr = (mask_logits > 0).cpu().numpy()
+                    frame_entry: dict[int, dict] = {}
+                    for i, obj_id in enumerate(obj_ids):
+                        oid_int = int(obj_id)
+                        if bool_arr.ndim == 4:
+                            mask2d = bool_arr[i, 0].astype(bool)
+                        elif bool_arr.ndim == 3:
+                            mask2d = bool_arr[i].astype(bool)
+                        else:
+                            mask2d = bool_arr.astype(bool)
+                        box = mask_to_box(mask2d)
+                        if box is None or not plausible_robot_mask(mask2d):
+                            continue
+                        frame_entry[oid_int] = {
+                            "box": box,
+                            "mask": mask2d,
+                            "evidence": {
+                                "type": "propagated",
+                                "gap_len": 0,
+                                "detector_overlap": birth_detector_overlap.get(
+                                    oid_int, 0.0
+                                ),
+                            },
+                        }
+                    results[f_idx_int] = frame_entry
+                    self._processed_count += 1
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(
+                                self._processed_count,
+                                total_work_frames,
+                            )
+                        except Exception:
+                            pass
+
             if not reprompting:
                 _record_chunk(None, None)
             else:

@@ -83,6 +83,36 @@ def box_ios(a, b):
     return inter / smaller
 
 
+def box_coverage(box, occluder):
+    """Fraction of ``box`` covered by ``occluder`` (0.0-1.0).
+
+    Unlike IoS, the denominator is always the candidate box. This lets a person
+    veto a person-shaped robot candidate without rejecting a larger real robot
+    just because a person occupies a small part of it.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box)
+    ox1, oy1, ox2, oy2 = (float(v) for v in occluder)
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if area <= 0.0:
+        return 0.0
+    ix1, iy1 = max(x1, ox1), max(y1, oy1)
+    ix2, iy2 = min(x2, ox2), min(y2, oy2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    return intersection / area
+
+
+def reject_person_candidates(candidates, person_boxes, coverage_thresh=0.6):
+    """Drop candidate tuples whose first element is strongly covered by a person."""
+    return [
+        candidate
+        for candidate in candidates
+        if not any(
+            box_coverage(candidate[0], person_box) >= coverage_thresh
+            for person_box in person_boxes
+        )
+    ]
+
+
 def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh):
     """Combine bumper-derived robot boxes with whole-robot gap-fill boxes.
 

@@ -159,14 +159,29 @@ class RepromptStubPredictor:
         x0 = oid * 6
         return (x0, 2, x0 + 4, 6)
 
-    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+    def propagate_in_video(
+        self,
+        state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
         start = 0 if start_frame_idx is None else start_frame_idx
-        if max_frame_num_to_track is None:
-            end = self.NUM_FRAMES - 1
+        if reverse:
+            end = max(0, start - (max_frame_num_to_track or start))
+            frame_range = range(start, end - 1, -1)
         else:
-            end = min(start + max_frame_num_to_track, self.NUM_FRAMES - 1)
-        for f in range(start, end + 1):
-            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            if max_frame_num_to_track is None:
+                end = self.NUM_FRAMES - 1
+            else:
+                end = min(start + max_frame_num_to_track, self.NUM_FRAMES - 1)
+            frame_range = range(start, end + 1)
+        for f in frame_range:
+            active = sorted(
+                oid
+                for oid, af in state["objs"].items()
+                if af <= f or reverse
+            )
             rects = [self._rect_for(oid) for oid in active]
             yield f, active, _make_mask_array(self.H, self.W, rects)
 
@@ -274,6 +289,26 @@ def test_empty_initial_prompt_bootstraps_from_later_detection(tmp_path):
     assert 1 in result[3]
     assert 1 in result[5]
     assert metadata == {1: "blue"}
+
+
+def test_initial_prompt_propagates_backward_before_forward():
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=3,
+        prompt_boxes=[stub._rect_for(1)],
+        reprompt_every=2,
+        detect_fn=lambda *_args: [],
+        propagate_backward=True,
+    )
+
+    assert set(result) == {0, 1, 2, 3, 4, 5}
+    assert all(1 in result[frame_idx] for frame_idx in range(6))
+    assert stub.add_calls == [(3, 1)]
 
 
 def test_capped_boundary_does_not_reference_uninitialized_detections():
@@ -1003,4 +1038,3 @@ def test_tracker_drops_implausible_mask_object():
     rejected = [e for e in diag._events if e["event"] == "sam2.mask_rejected"]
     assert rejected, "expected a sam2.mask_rejected diagnostic for the implausible mask"
     assert rejected[0]["reason"] == "mask_implausible"
-

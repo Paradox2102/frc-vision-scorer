@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS replays (
 CREATE TABLE IF NOT EXISTS appearance_gallery (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL,
+    source_match_key TEXT,
     team TEXT NOT NULL,
     alliance_color TEXT NOT NULL,
     embedding BLOB NOT NULL,
@@ -217,7 +218,12 @@ async def init_db():
             except Exception:
                 pass  # column already exists
         # Lightweight migrations: add columns to a pre-existing appearance_gallery table.
-        for col_def in ("image BLOB", "verified INTEGER DEFAULT 0", "job_id TEXT"):
+        for col_def in (
+            "image BLOB",
+            "verified INTEGER DEFAULT 0",
+            "job_id TEXT",
+            "source_match_key TEXT",
+        ):
             try:
                 await db.execute(f"ALTER TABLE appearance_gallery ADD COLUMN {col_def}")
             except Exception:
@@ -633,9 +639,11 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO appearance_gallery "
-            "(event_key, team, alliance_color, embedding, legibility, image, verified, job_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (row["event_key"], row["team"], row["alliance_color"],
+            "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["event_key"], row.get("source_match_key"),
+             row["team"], row["alliance_color"],
              row["embedding"], row.get("legibility"), row.get("image"),
              int(row.get("verified", 0)), row.get("job_id")))
         await db.commit()
@@ -658,8 +666,84 @@ async def get_gallery_exemplars(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, team, alliance_color, embedding, legibility, image, verified, job_id "
+            "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id "
             f"FROM appearance_gallery WHERE {where} ORDER BY id", params)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_previous_gallery_exemplars(
+    event_key: str,
+    current_match_key: str,
+    teams: Optional[List[str]] = None,
+) -> List[Dict]:
+    """Return exemplars sourced only from matches before ``current_match_key``.
+
+    Rows without match provenance are intentionally excluded: they cannot be
+    proven to come from an earlier match.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT m.comp_level, m.match_number, m.set_number
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE e.event_key = ? AND m.tba_match_key = ?
+            """,
+            (event_key, current_match_key),
+        )
+        current = await cursor.fetchone()
+        if current is None:
+            return []
+
+        level_order = {"qm": 1, "sf": 2, "f": 3}
+
+        def match_rank(row) -> tuple[int, int, int]:
+            level = row["comp_level"]
+            match_number = int(row["match_number"])
+            set_number = int(row["set_number"] or 1)
+            if level == "qm":
+                return (level_order[level], match_number, set_number)
+            return (level_order.get(level, 4), set_number, match_number)
+
+        current_rank = match_rank(current)
+        cursor = await db.execute(
+            """
+            SELECT m.tba_match_key, m.comp_level, m.match_number, m.set_number
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE e.event_key = ?
+            """,
+            (event_key,),
+        )
+        previous_keys = [
+            row["tba_match_key"]
+            for row in await cursor.fetchall()
+            if match_rank(row) < current_rank
+        ]
+        if not previous_keys:
+            return []
+
+        team_filter = list(dict.fromkeys(
+            str(team) for team in (teams or [])
+            if team is not None and str(team)
+        ))
+        where = (
+            f"event_key = ? AND source_match_key IN "
+            f"({','.join('?' for _ in previous_keys)})"
+        )
+        params: List[Any] = [event_key, *previous_keys]
+        if team_filter:
+            where += f" AND team IN ({','.join('?' for _ in team_filter)})"
+            params.extend(team_filter)
+
+        cursor = await db.execute(
+            "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id "
+            f"FROM appearance_gallery WHERE {where} ORDER BY id",
+            params,
+        )
         return [dict(r) for r in await cursor.fetchall()]
 
 

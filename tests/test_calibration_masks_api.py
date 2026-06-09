@@ -172,10 +172,17 @@ def test_yolo_detections_filtering_by_exclusion_masks(monkeypatch):
     job.field_dims = (16.54, 8.07)
     job.bumper_model = None
     job.det_schema = None
+    job.hub_no_robot_zones = []
     
     # Run _detect_view
-    paired, person_boxes = job._detect_view(view, np.zeros((723, 1920, 3), np.uint8), precomputed_dets=dets)
+    paired, person_boxes, person_boxes_all = job._detect_view(
+        view,
+        np.zeros((723, 1920, 3), np.uint8),
+        precomputed_dets=dets,
+    )
     
     assert len(paired) == 1
+    assert person_boxes == []
+    assert person_boxes_all == []
     # Verify the only remaining detection is the one at (1.0, 1.0, 2.0, 2.0)
     assert paired[0][0].box == (1.0, 1.0, 2.0, 2.0)

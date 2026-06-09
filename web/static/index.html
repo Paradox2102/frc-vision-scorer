@@ -106,6 +106,16 @@
                                 </label>
                             </div>
                             <div class="input-group">
+                                <label for="trackingBackend">Segmentation tracker:</label>
+                                <select id="trackingBackend">
+                                    <!-- options populated from /api/sam2_models -->
+                                </select>
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    SAM 3.1 is experimental and requires CUDA plus access to Meta's
+                                    gated Hugging Face checkpoint. It is intended for H100-class runs.
+                                </small>
+                            </div>
+                            <div class="input-group">
                                 <label for="sam2ModelSize">SAM2 model size:</label>
                                 <select id="sam2ModelSize">
                                     <!-- options populated from /api/sam2_models -->

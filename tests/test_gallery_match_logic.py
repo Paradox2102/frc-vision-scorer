@@ -60,3 +60,24 @@ def test_verified_match_uses_higher_weight():
     verdict, team, sim = _apply_gallery_vote(t, g)
     assert verdict == "confirm" and team == "1787"
     assert t.team_ocr_votes["1787"] == GALLERY_VERIFIED_VOTE_WEIGHT  # verified weight, not strong_w
+
+
+def test_current_match_deposit_is_not_added_to_query_gallery():
+    from web.app import InferenceJob
+
+    g = AppearanceGallery()
+    job = InferenceJob.__new__(InferenceJob)
+    job.gallery = g
+    job.event_key = "2026x"
+    job.match_key = "2026x_qm2"
+    job.job_id = "job-2"
+    job.use_sam2 = True
+    job._pending_gallery_rows = []
+
+    robot = FakeTrack("blue", _unit(1, 0, 0))
+    robot.team_number = "1787"
+    robot.team_number_confirmed = True
+    job._deposit_to_gallery(robot, legibility=0.9)
+
+    assert g.query(robot.appearance_embedding, "blue") == []
+    assert job._pending_gallery_rows[0]["source_match_key"] == "2026x_qm2"

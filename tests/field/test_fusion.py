@@ -52,6 +52,49 @@ def test_keeps_distinct_robots_separate():
     assert len(fused) == 2
 
 
+def test_merges_same_camera_duplicate_masks_on_one_robot():
+    first = FieldDetection(
+        pos=(6.70, 3.40), color="red", box=(690, 410, 890, 535), track_id=1)
+    duplicate = FieldDetection(
+        pos=(6.74, 3.43), color="red", box=(700, 418, 885, 530), track_id=3)
+    fused = fuse_detections(
+        {"main": [(first, b"a"), (duplicate, b"b")]},
+        weights={"main": 1.0},
+    )
+
+    assert len(fused) == 1
+    assert fused[0].detection.color == "red"
+    assert fused[0].members == [("main", 1)]
+
+
+def test_keeps_nearby_same_camera_robots_when_boxes_do_not_overlap():
+    left = _det(6.70, 3.40, "red", (600, 400, 700, 520))
+    right = _det(6.95, 3.42, "red", (720, 400, 820, 520))
+
+    fused = fuse_detections(
+        {"main": [(left, b"a"), (right, b"b")]},
+        weights={"main": 1.0},
+    )
+
+    assert len(fused) == 2
+
+
+def test_same_camera_duplicate_cluster_uses_color_majority():
+    box = (690, 410, 890, 535)
+    per_cam = {
+        "main": [
+            (FieldDetection((6.70, 3.40), "red", box, track_id=1), b"a"),
+            (FieldDetection((6.72, 3.41), "blue", box, track_id=2), b"b"),
+            (FieldDetection((6.74, 3.43), "red", box, track_id=3), b"c"),
+        ],
+    }
+
+    fused = fuse_detections(per_cam, weights={"main": 1.0})
+
+    assert len(fused) == 1
+    assert fused[0].detection.color == "red"
+
+
 def test_color_vote_resolves_unknown():
     per_cam = {
         "main": [(_det(2, 2, "unknown"), b"m")],
@@ -77,3 +120,52 @@ def test_members_two_cameras_same_robot():
     fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
     assert len(fused) == 1
     assert set(fused[0].members) == {("main", 2), ("corner_left", 1)}
+
+
+def test_hub_occluded_main_yields_position_to_visible_corner():
+    per_cam = {
+        "main": [(_det(5.0, 3.0), b"m")],
+        "corner_left": [(_det(5.3, 3.1), b"c")],
+    }
+
+    fused = fuse_detections(
+        per_cam,
+        weights={"main": 1.0, "corner_left": 2.5},
+        is_hub_occluded=lambda cam, _pos: cam == "main",
+    )
+
+    assert fused[0].detection.pos == (5.3, 3.1)
+    assert fused[0].detection.box == (0, 0, 10, 10)
+    assert {camera for camera, _crop, _weight in fused[0].evidence} == {
+        "main", "corner_left",
+    }
+
+
+def test_visible_main_remains_position_reference():
+    per_cam = {
+        "main": [(_det(5.0, 3.0), b"m")],
+        "corner_left": [(_det(5.3, 3.1), b"c")],
+    }
+
+    fused = fuse_detections(
+        per_cam,
+        weights={"main": 1.0, "corner_left": 2.5},
+        is_hub_occluded=lambda _cam, _pos: False,
+    )
+
+    assert fused[0].detection.pos == (5.0, 3.0)
+
+
+def test_all_hub_occluded_views_fall_back_to_existing_main_preference():
+    per_cam = {
+        "main": [(_det(5.0, 3.0), b"m")],
+        "corner_left": [(_det(5.3, 3.1), b"c")],
+    }
+
+    fused = fuse_detections(
+        per_cam,
+        weights={"main": 1.0, "corner_left": 2.5},
+        is_hub_occluded=lambda _cam, _pos: True,
+    )
+
+    assert fused[0].detection.pos == (5.0, 3.0)

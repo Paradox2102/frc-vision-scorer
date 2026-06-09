@@ -77,6 +77,49 @@ def test_none_ignored():
     assert conf is True
 
 
+def test_confirmed_lock_is_not_permanent_overridden_by_sustained_different_read():
+    # Reproduces the 8005->4174 field bug: a wrong lock must self-correct once a
+    # different value is read consistently, without an explicit unlock() call.
+    tracker = ConsecutiveValueTracker(n_consecutive=3, n_override=2)
+    for _ in range(3):
+        tracker.update("8005")
+    assert (tracker.locked_value, tracker.confirmed) == ("8005", True)
+
+    # One contradicting read is not enough to flip a confirmed lock.
+    val, conf = tracker.update("4174")
+    assert val == "8005"
+    assert conf is True
+
+    # A second consecutive contradicting read overrides the wrong lock.
+    val, conf = tracker.update("4174")
+    assert val == "4174"
+    assert conf is True
+
+
+def test_override_requires_consecutive_agreement_noise_does_not_flip():
+    tracker = ConsecutiveValueTracker(n_consecutive=3, n_override=2)
+    for _ in range(3):
+        tracker.update("8005")
+
+    # Alternating noise never reaches n_override in a row, so the lock holds.
+    tracker.update("4174")
+    tracker.update("9999")
+    val, conf = tracker.update("4174")
+    assert val == "8005"
+    assert conf is True
+
+
+def test_reaffirming_locked_value_keeps_it():
+    tracker = ConsecutiveValueTracker(n_consecutive=3, n_override=2)
+    for _ in range(3):
+        tracker.update("2102")
+    # Repeated agreeing reads keep the lock (and never error).
+    for _ in range(5):
+        val, conf = tracker.update("2102")
+    assert val == "2102"
+    assert conf is True
+
+
 def test_unlock_on_contradiction():
     tracker = ConsecutiveValueTracker(n_consecutive=3)
 

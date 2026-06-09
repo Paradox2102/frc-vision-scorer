@@ -780,10 +780,19 @@ class VisionScorer {
 
     async populateSam2Models() {
         const select = document.getElementById('sam2ModelSize');
-        if (!select) return;
+        const backendSelect = document.getElementById('trackingBackend');
+        if (!select || !backendSelect) return;
         try {
             const resp = await fetch('/api/sam2_models');
             const data = await resp.json();
+            backendSelect.replaceChildren();
+            for (const backend of data.backends || []) {
+                const opt = document.createElement('option');
+                opt.value = backend.id;
+                opt.textContent = `${backend.label} (${backend.detail})`;
+                if (backend.id === data.default_backend) opt.selected = true;
+                backendSelect.appendChild(opt);
+            }
             select.replaceChildren();
             for (const m of data.models) {
                 const opt = document.createElement('option');
@@ -799,8 +808,13 @@ class VisionScorer {
                 const firstAvailable = Array.from(select.options).find((o) => !o.disabled);
                 if (firstAvailable) firstAvailable.selected = true;
             }
+            const syncModelControls = () => {
+                select.disabled = backendSelect.value !== 'sam2';
+            };
+            backendSelect.addEventListener('change', syncModelControls);
+            syncModelControls();
         } catch (err) {
-            console.error('Failed to load SAM2 model list:', err);
+            console.error('Failed to load tracker model list:', err);
         }
     }
 
@@ -827,9 +841,16 @@ class VisionScorer {
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
             formData.append('sam2_max_gpu_frames', vramBudget);
         }
+        const trackingBackend = document.getElementById('trackingBackend')?.value;
+        if (trackingBackend) {
+            formData.append('tracking_backend', trackingBackend);
+        }
         const modelSize = document.getElementById('sam2ModelSize')?.value;
         if (modelSize) {
             formData.append('model_size', modelSize);
+        }
+        if (this.selectedMatch?.key) {
+            formData.append('match_key', this.selectedMatch.key);
         }
 
         this.setStatus('Uploading...', 0);
@@ -2065,11 +2086,19 @@ class VisionScorer {
             ctx.lineWidth = 1.5;
             ctx.strokeStyle = 'rgba(0,0,0,0.4)';
             ctx.stroke();
+            // Confirmed team renders solid; a leading-but-unconfirmed VLM read
+            // (team_candidate) renders dimmed with a "?" so reads are visible
+            // immediately instead of waiting for the lock.
             if (r.team_number) {
                 ctx.fillStyle = '#e8eaf0';
                 ctx.font = 'bold 10px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.fillText(String(r.team_number), px, py - 10);
+            } else if (r.team_candidate) {
+                ctx.fillStyle = 'rgba(232,234,240,0.6)';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(String(r.team_candidate) + '?', px, py - 10);
             }
         }
     }

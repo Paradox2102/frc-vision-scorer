@@ -2,8 +2,10 @@ import numpy as np
 
 from web.field.detect_schema import (
     DetectionSchema,
+    box_coverage,
     expand_bumper_to_robot,
     plausible_bumper_box,
+    reject_person_candidates,
 )
 
 
@@ -83,6 +85,27 @@ def test_box_ios_partial_overlap():
     from web.field.detect_schema import box_ios
     # overlap 5x10=50; smaller area = 10x10=100 -> 0.5
     assert box_ios((0, 0, 10, 10), (5, 0, 25, 10)) == 0.5
+
+
+def test_box_coverage_uses_candidate_area_not_smaller_area():
+    assert box_coverage((0, 0, 20, 20), (0, 0, 10, 20)) == 0.5
+
+
+def test_reject_person_candidates_drops_person_shaped_box():
+    candidates = [
+        ((10, 20, 50, 100), "red"),
+        ((100, 100, 180, 180), "blue"),
+    ]
+    people = [(5, 10, 55, 110)]
+    assert reject_person_candidates(candidates, people) == [
+        ((100, 100, 180, 180), "blue")
+    ]
+
+
+def test_reject_person_candidates_keeps_partially_occluded_robot():
+    candidates = [((0, 0, 100, 100), "red")]
+    people = [(0, 0, 30, 100)]
+    assert reject_person_candidates(candidates, people) == candidates
 
 
 def test_merge_no_bumpers_keeps_all_as_unknown():

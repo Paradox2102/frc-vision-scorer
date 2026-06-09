@@ -11,7 +11,7 @@ def test_aligned_tags_near_zero_error():
     detected = {tid: img for tid, (img, _obj) in corr.items()}
     err_m, n = tag_alignment_error(cam, detected, fm)
     assert n >= 4
-    assert err_m < 0.50               # truth pinhole camera: ~0.38 m (oblique side-wall tags degrade the average)
+    assert err_m < 0.10               # median: ~0.000 m (oblique side-wall tags no longer inflate the result)
 
 def test_shifted_tags_large_error():
     fm = FieldModel.load("2026-rebuilt-welded")

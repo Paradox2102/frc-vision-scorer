@@ -255,22 +255,33 @@ def holdout_field_error(cal: "CameraCalibration", held: dict) -> float:
 
 
 def tag_alignment_error(cal, detected_tags, field_model):
-    """(mean field error in meters, n_tags) between auto-detected AprilTags and
-    their calibrated positions.
+    """(median per-tag field error in meters, n_tags) between auto-detected
+    AprilTags and their calibrated positions.
 
-    detected_tags: {tag_id: corners (4,2)} from detect_tags(). Builds correspondences
-    only for tags the field model knows, pairing detector corners to
-    field_model.tag_corners_3d(tid) the SAME way solve_camera_from_tags does, then
-    reuses holdout_field_error (height-aware). Returns (inf, 0) when no usable tags.
+    detected_tags: {tag_id: corners (4,2)} from detect_tags(). For each tag known to
+    the field model, projects its detected corners to field coords at the tag's own
+    height and takes the mean corner distance to the known position; returns the
+    MEDIAN of those per-tag errors. Median (not mean) is used because a few tags at
+    extreme camera obliquity (~90deg) have an ill-conditioned image->field ray-cast
+    that inflates a mean — the median stays representative of the well-conditioned
+    tags. Returns (inf, 0) when no usable tags.
     """
-    held = {}
+    per_tag = []
     for tid, corners in detected_tags.items():
-        if tid in field_model.tags:
-            held[tid] = (np.asarray(corners, float).reshape(-1, 2),
-                         field_model.tag_corners_3d(tid))
-    if not held:
+        if tid not in field_model.tags:
+            continue
+        img = np.asarray(corners, float).reshape(-1, 2)
+        obj = field_model.tag_corners_3d(tid)
+        dists = []
+        for (u, v), p in zip(img, obj):
+            xy = cal.image_to_field((float(u), float(v)), z=float(p[2]))
+            if xy is not None:
+                dists.append(float(np.hypot(xy[0] - p[0], xy[1] - p[1])))
+        if dists:
+            per_tag.append(float(np.mean(dists)))
+    if not per_tag:
         return float("inf"), 0
-    return holdout_field_error(cal, held), len(held)
+    return float(np.median(per_tag)), len(per_tag)
 
 
 def _reprojection_rms(cal: "CameraCalibration", correspondences: dict) -> float:

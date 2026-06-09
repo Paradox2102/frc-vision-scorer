@@ -45,6 +45,7 @@ from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
+from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
 from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error
 from web.field.apriltag_detect import detect_tags
@@ -692,6 +693,11 @@ class InferenceJob:
         self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
+        # Match this job processes; drives calibration-epoch selection. The
+        # __init__ plumbing that populates this from the job request lands in a
+        # separate change; None here means select_epoch() falls back to latest.
+        self.match_key = getattr(self, "match_key", None)
+        self._calib_version_id = None
         self._log_file = None
         self._log_path: Optional[Path] = None
         self.websocket: Optional[WebSocket] = None
@@ -3601,12 +3607,20 @@ class InferenceJob:
                           "camera before running inference.")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
-        cal = field_store.load(self.event_key, self.camera)
-        if cal is None:
+        versions = field_store.load_versions(self.event_key, self.camera)
+        if not versions:
             self.error = (f"No calibration found for event '{self.event_key}' "
                           f"camera '{self.camera}'. Calibrate the camera first.")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
+        chosen = select_epoch(versions, self.match_key)
+        cal = chosen["calibration"]
+        self._calib_version_id = chosen["version_id"]
+        if self.match_key is None:
+            print(f"  [calib] no match_key — using latest version {chosen['version_id']}")
+        else:
+            print(f"  [calib] match {self.match_key}: epoch {chosen['version_id']} "
+                  f"(start_match={chosen['start_match']})")
         if cal.camera_center is None:
             # Homography (or any pose-free) calibration has no camera center, so
             # occlusion ray-casting can't run. Require a pose-bearing solve.
@@ -3627,7 +3641,13 @@ class InferenceJob:
                 print(f"  Static-structure zones (field m): {static_zones}")
             self.field_tracker = FieldTracker(self.field_model.length_m, zones=static_zones)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
-            self.views = load_views(self.event_key)  # main first; corners if calibrated
+            selection = {}
+            for _name in load_layout().keys():
+                _vs = field_store.load_versions(self.event_key, _name)
+                _pick = select_epoch(_vs, self.match_key)
+                if _pick is not None:
+                    selection[_name] = _pick["version_id"]
+            self.views = load_views(self.event_key, selection=selection)  # main first; corners if calibrated
             print(f"  Cameras active: {[v.name for v in self.views]}")
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"

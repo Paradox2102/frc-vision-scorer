@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Negative Box Annotator</title>
+<title>Hard-Negative Box Annotator</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 0; background: #1e1e1e; color: #eee; }
   header { padding: 10px 16px; background: #2b2b2b; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
@@ -27,11 +27,18 @@
 </head>
 <body>
 <header>
-  <h1>Box Annotator</h1>
+  <h1>Hard-Negative Box Annotator</h1>
+  <select id="batchSel" title="annotation batch">
+    <option value="equipment">tablet/radio batch</option>
+    <option value="all">all frames</option>
+    <option value="legacy">hub/outpost batch</option>
+  </select>
   <select id="frameSel" title="frame to annotate"></select>
   <span>label:</span>
   <button class="quick" data-lbl="hub">hub</button>
   <button class="quick" data-lbl="outpost">outpost</button>
+  <button class="quick" data-lbl="tablet">tablet</button>
+  <button class="quick" data-lbl="radio">radio</button>
   <input class="lbl" id="curLabel" value="hub" title="label for the next box">
   <button id="submit">Submit &amp; save</button>
   <span id="status"></span>
@@ -41,19 +48,40 @@
   <div id="side">
     <p class="hint" id="dims"></p>
     <table id="tbl"><thead><tr><th>label</th><th>x1,y1,x2,y2</th><th></th></tr></thead><tbody></tbody></table>
-    <p class="hint">Drag to draw a box around each hub / outpost (the composite has two views — box both). Coords are original pixels. Submit saves to the server; reopening a frame reloads your boxes.</p>
+    <p class="hint">Drag one box around each complete false-positive assembly. For a
+      tablet or fieldside radio, include its full pole/stand in the same box. Box
+      repeated views separately. Do not box an assembly while a robot overlaps it.
+      Coords are original pixels. Submit saves to the server; reopening a frame
+      reloads your boxes.</p>
   </div>
 </div>
 <script>
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
-const sel = document.getElementById('frameSel'), status = document.getElementById('status');
-let img = null, scale = 1, boxes = [], drag = null, frameName = null;
+const sel = document.getElementById('frameSel'), batchSel = document.getElementById('batchSel');
+const status = document.getElementById('status');
+let img = null, scale = 1, boxes = [], drag = null, frameName = null, allFrames = [];
 
 async function init() {
-  const frames = await (await fetch('/api/frames')).json();
+  allFrames = await (await fetch('/api/frames')).json();
+  selectBatch();
+}
+
+function selectBatch() {
+  const frames = allFrames.filter(name => {
+    if (batchSel.value === 'equipment') return name.startsWith('frame_equipment_');
+    if (batchSel.value === 'legacy') return !name.startsWith('frame_equipment_');
+    return true;
+  });
   sel.innerHTML = frames.map(f => `<option>${f}</option>`).join('');
   if (frames.length) loadFrame(frames[0]);
+  else {
+    frameName = null;
+    boxes = [];
+    status.textContent = 'No frames in this batch.';
+    sync();
+  }
 }
+batchSel.addEventListener('change', selectBatch);
 sel.addEventListener('change', () => loadFrame(sel.value));
 
 async function loadFrame(name) {

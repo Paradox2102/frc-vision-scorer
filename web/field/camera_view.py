@@ -24,16 +24,36 @@ class CameraView:
         return crop
 
 
-def load_views(event_key: str) -> list["CameraView"]:
+def load_views(event_key: str, selection: dict | None = None) -> list["CameraView"]:
     """Build the list of calibrated CameraViews for an event. Cameras without a
     saved calibration are omitted. 'main' is always ordered first so it remains the
-    reference view for fusion."""
+    reference view for fusion.
+
+    selection: optional {camera_name: version_id} map. When provided, each named
+    camera uses the specified calibration version. Cameras not in the map (and
+    cameras when selection is None) default to the latest version by created_at
+    (with version_id as a microsecond-resolution tie-breaker).
+
+    Falls back to the legacy field_store.load() when no versioned records exist,
+    for backward compatibility with the single-file calibration format.
+    """
     layout = load_layout()
     views = []
     for name, cl in layout.items():
-        cal = field_store.load(event_key, name)
-        if cal is None:
-            continue
+        versions = field_store.load_versions(event_key, name)
+        if versions:
+            chosen = None
+            if selection and name in selection:
+                chosen = next((v for v in versions if v["version_id"] == selection[name]), None)
+            if chosen is None:
+                chosen = max(versions,
+                             key=lambda v: (v.get("created_at") or "", v.get("version_id") or ""))
+            cal = chosen["calibration"]
+        else:
+            # Legacy fallback: single-file calibration (supports test mocks of field_store.load)
+            cal = field_store.load(event_key, name)
+            if cal is None:
+                continue
         masks = cal.masks if (hasattr(cal, "masks") and cal.masks) else cl.masks
         views.append(CameraView(name=name, crop=cl.crop, masks=tuple(masks), calibration=cal))
     views.sort(key=lambda v: (v.name != "main", v.name))  # main first, then stable

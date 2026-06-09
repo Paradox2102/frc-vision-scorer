@@ -5557,8 +5557,7 @@ async def calibration_manual(request: Request):
             for i, p in enumerate(pts)}
     start_match = body.get("start_match")
     label = body.get("label")
-    vs = field_store.load_versions(event, camera)
-    prev = select_epoch(vs, start_match) if vs else None
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
     existing = prev["calibration"] if prev else None
     image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
     season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
@@ -5612,8 +5611,7 @@ async def calibration_auto(request: Request):
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
     label = body.get("label")
-    vs = field_store.load_versions(event, camera)
-    prev = select_epoch(vs, start_match) if vs else None
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
     if prev is not None:
         cal.masks = prev["calibration"].masks
         cal.robot_track_top_crop = prev["calibration"].robot_track_top_crop
@@ -5781,12 +5779,10 @@ async def calibration_solve_homography(request: Request):
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
     label = body.get("label")
-    vs = field_store.load_versions(event, camera)
-    prev = select_epoch(vs, start_match) if vs else None
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
     existing = prev["calibration"] if prev else None
-    if existing and hasattr(existing, "masks"):
+    if existing is not None:
         cal.masks = existing.masks
-    if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
     field_store.save_version(event, camera, cal, start_match=start_match, label=label)
 
@@ -5854,12 +5850,10 @@ async def calibration_solve_tags(request: Request):
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
     label = body.get("label")
-    vs = field_store.load_versions(event, camera)
-    prev = select_epoch(vs, start_match) if vs else None
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
     existing = prev["calibration"] if prev else None
-    if existing and hasattr(existing, "masks"):
+    if existing is not None:
         cal.masks = existing.masks
-    if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
     field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     holdout_err = holdout_field_error(cal, held) if held else None

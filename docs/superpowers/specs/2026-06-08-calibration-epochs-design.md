@@ -289,6 +289,17 @@ inference (match_key known):
 - Keep AprilTag detection on a single sequential path on the inference thread (the
   detector is a non-thread-safe singleton); the existing `_scan_match_clock` runs
   via `asyncio.to_thread`, so run the sampling/detection similarly off the loop.
+- `load_views(event_key)` takes only `event_key` today (`camera_view.py:27`). The
+  per-camera epoch selection is a **real signature/behavior change** — pick ONE
+  path (extend `load_views` to accept a `{camera: version_id}` map, or add
+  `load_view_candidates` and build views in `_init_field_tracking`) and use it
+  everywhere, so no two callers diverge.
+- The geometry-solve endpoints currently copy `existing.masks` /
+  `robot_track_top_crop` forward onto the freshly-solved `cal` (so a re-solve keeps
+  authored masks/crop). When these become `save_version` (a NEW epoch), source that
+  carry-forward from the **selected/latest version** (via `load_versions` /
+  `select_epoch`), not the legacy `load()`, or a new epoch silently drops
+  previously-authored masks/top-crop.
 
 ## Risks & Mitigations
 

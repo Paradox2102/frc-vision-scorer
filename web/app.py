@@ -47,7 +47,7 @@ from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
-from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error
+from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error, tag_alignment_error
 from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
@@ -541,6 +541,15 @@ HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball 
 # much faster, and adequate for bumper-digit transcription.
 VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 
+# Match-start calibration drift check: sample a few in-match frames from the main
+# view, auto-detect AprilTags, and verify the selected calibration epoch still
+# reprojects them accurately. If the camera moved/zoomed since calibration the job
+# aborts (needs recalibration) BEFORE the expensive SAM2 pass.
+CALIB_CHECK_ENABLED = os.environ.get("CALIB_CHECK_ENABLED", "1") not in ("0", "false", "False")
+CALIB_DRIFT_MAX_M = float(os.environ.get("CALIB_DRIFT_MAX_M", "0.5"))
+CALIB_CHECK_MIN_TAGS = int(os.environ.get("CALIB_CHECK_MIN_TAGS", "2"))
+CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5"))
+
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
@@ -698,6 +707,7 @@ class InferenceJob:
         # separate change; None here means select_epoch() falls back to latest.
         self.match_key = getattr(self, "match_key", None)
         self._calib_version_id = None
+        self.needs_calibration = None
         self._log_file = None
         self._log_path: Optional[Path] = None
         self.websocket: Optional[WebSocket] = None
@@ -3731,6 +3741,54 @@ class InferenceJob:
         except Exception:
             pass
 
+    def _verify_calibration_alignment(self) -> bool:
+        """Validate self.calib against auto-detected AprilTags in sampled in-match
+        frames (main view). Returns True to proceed. On drift, sets self.error +
+        self.status='error' + self.needs_calibration and returns False. No tags -> warn
+        + proceed. detect_tags must stay on one sequential path."""
+        if not CALIB_CHECK_ENABLED or self.calib is None:
+            return True
+        main_view = next((v for v in self.views if v.name == "main"), None)
+        if main_view is None or not self.processing_ranges:
+            return True
+        lo, hi = self.processing_ranges[0]
+        n = max(1, CALIB_CHECK_SAMPLE_FRAMES)
+        frame_idxs = [int(lo + (hi - lo) * i / (n - 1)) for i in range(n)] if n > 1 else [lo]
+        best_err, best_n = float("inf"), 0
+        cap = cv2.VideoCapture(str(self.video_path))
+        try:
+            for fidx in frame_idxs:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                crop = main_view.extract(frame)
+                detected = detect_tags(crop)
+                err_m, ntags = tag_alignment_error(self.calib, detected, self.field_model)
+                if ntags >= CALIB_CHECK_MIN_TAGS and err_m < best_err:
+                    best_err, best_n = err_m, ntags
+        finally:
+            cap.release()
+        if best_n < CALIB_CHECK_MIN_TAGS:
+            print(f"  [calib] WARNING: could not validate calibration — <{CALIB_CHECK_MIN_TAGS} "
+                  f"AprilTags detected across {n} sampled frames; proceeding unvalidated.")
+            return True
+        # best_err is finite here: the guard above returns when best_n < MIN_TAGS,
+        # which is the only case best_err stays inf (no frame ever updated it).
+        if best_err > CALIB_DRIFT_MAX_M:
+            self.status = "error"
+            self.error = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
+                          f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). "
+                          f"The camera likely moved/zoomed — recalibrate for this match "
+                          f"(it will be saved as a new calibration version).")
+            self.needs_calibration = {"event": self.event_key, "camera": self.camera,
+                                      "match_key": self.match_key, "error_m": round(best_err, 3),
+                                      "epoch": self._calib_version_id}
+            print(f"  FIELD TRACKING ABORTED: {self.error}")
+            return False
+        print(f"  [calib] OK: {best_n} tags align to {best_err:.3f} m (epoch {self._calib_version_id})")
+        return True
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
@@ -3850,6 +3908,21 @@ class InferenceJob:
             if ret:
                 early_overhead = early_frame[:self.overhead_height, :]
                 self.extract_team_numbers(early_overhead)
+
+            # Run off the event loop (like the clock scan above): the seek+decode+
+            # detect_tags work is synchronous and would otherwise block uvicorn's
+            # WebSocket keepalive while it runs.
+            if not await asyncio.to_thread(self._verify_calibration_alignment):
+                # _verify_calibration_alignment set self.status="error", self.error,
+                # self.needs_calibration. Notify the client and stop before the SAM2 pass
+                # (mirrors the _init_field_tracking abort at the top of process_video).
+                if self.websocket:
+                    try:
+                        await self.websocket.send_json({"type": "error", "error": self.error,
+                                                        "needs_calibration": self.needs_calibration})
+                    except Exception:
+                        pass
+                return
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}

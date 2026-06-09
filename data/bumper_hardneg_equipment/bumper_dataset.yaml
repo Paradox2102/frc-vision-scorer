@@ -1,0 +1,10 @@
+path: /home/nick/frc-vision-scorer/data/bumper_hardneg_equipment
+train: train/images
+val: valid/images
+test: test/images
+
+names:
+  0: blue_bumper
+  1: red_bumper
+
+nc: 2

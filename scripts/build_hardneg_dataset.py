@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--seeds", default="data/hard_negatives/user_negs")
     ap.add_argument("--out", default="data/bumper_hardneg")
     ap.add_argument("--per-event", type=int, default=4)
+    ap.add_argument("--equipment-per-box", type=int, default=4,
+                    help="evenly-spaced crops per tagged tablet/radio assembly")
     ap.add_argument("--val-frac", type=float, default=0.15)
     args = ap.parse_args()
 
@@ -88,9 +90,19 @@ def main():
     # gather negatives: per-event subsample + all seed crops
     chosen = []
     negs_root = Path(args.negs_root)
-    for ev in sorted([d for d in negs_root.iterdir() if d.is_dir()]) if negs_root.exists() else []:
+    event_dirs = (
+        sorted(d for d in negs_root.iterdir() if d.is_dir())
+        if negs_root.exists() else []
+    )
+    for ev in (d for d in event_dirs if not d.name.startswith("equipment_")):
         picks = _sample_event(ev, args.per_event)
         chosen += [(ev.name, p) for p in picks]
+    # Equipment annotations were explicitly pruned by a human. Sample each tagged
+    # assembly independently so events with several tablets/radios retain coverage.
+    for ev in (d for d in event_dirs if d.name.startswith("equipment_")):
+        for box_dir in sorted(d for d in ev.iterdir() if d.is_dir()):
+            picks = _even(sorted(box_dir.glob("frame*.jpg")), args.equipment_per_box)
+            chosen += [(ev.name, p) for p in picks]
     seeds = Path(args.seeds)
     if seeds.exists():
         for s in sorted(seeds.glob("seed_*.png")):

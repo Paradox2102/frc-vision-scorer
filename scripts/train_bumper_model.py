@@ -43,6 +43,8 @@ def main():
                     help="path to an existing dataset yaml (e.g. a hard-negative "
                          "augmented set). Default: regenerate + train on Benjamin.")
     ap.add_argument("--name", default="frc_bumpers", help="run name under runs/train/")
+    ap.add_argument("--weights", default=BASE_MODEL,
+                    help="initial checkpoint (default: yolov8m.pt)")
     args = ap.parse_args()
 
     if args.data:
@@ -54,7 +56,7 @@ def main():
         _write_dataset_yaml()
         data_yaml = str(DATASET_YAML)
 
-    model = YOLO(BASE_MODEL)
+    model = YOLO(args.weights)
     model.train(
         data=data_yaml,
         epochs=EPOCHS, patience=PATIENCE, imgsz=IMG_SIZE, batch=BATCH_SIZE,

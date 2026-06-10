@@ -33,12 +33,17 @@ MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
 # absence-based retirement never fires. These drive a second retirement trigger.
 # See docs/superpowers/specs/2026-06-08-sam2-mask-hijack-cull-design.md.
 #
-# DEFAULT ON since the 2026-06-10 qm72 gate: the corner_right trench mask was
-# culled in ~12s (vs ~80s of slot pollution without), with identical scores and
-# confirmed-team count vs the cull-off baseline — no false-cull signal. The
-# main-view culls hit the same static junk eviction was already killing, just
-# earlier (evictions 6 -> 0 because the cull preempts them).
-CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "1") not in ("0", "false", "False")
+# DEFAULT OFF — reverted 2026-06-10 after the qm24 gate FAILED. The qm72 gate
+# passed (trench culled ~12s vs ~80s, outcomes neutral), but on qm24 the cull
+# killed corner-view objects at the FIRST evidence opportunity (~f80) that the
+# eviction path had let live for 500+ frames of identity evidence — confirmed
+# teams collapsed 4 -> 1. This is the design doc's predicted failure: absence +
+# stationarity cannot distinguish static junk from a real robot parked in a
+# corner camera's detector blind spot. Needs a positive hijack signal
+# (appearance discontinuity at the transfer frame) or a corner-blind-spot
+# exemption before default-on. Per-job override: cull_hijack_enabled on
+# /api/infer (used by the qm72 trench workaround until then).
+CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "0") not in ("0", "false", "False")
 # Absences required *within the evidence window* before a stationary object is culled.
 CULL_UNCORROBORATED_REPROMPTS = int(os.environ.get("CULL_UNCORROBORATED_REPROMPTS", "3"))
 # Sliding-window length of corroboration outcomes kept per object. Must be >= K;

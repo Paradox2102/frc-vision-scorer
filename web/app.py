@@ -464,6 +464,15 @@ SAM2_PROMPT_OFFSET_SECONDS = max(
 )
 MAX_TRACKED_ROBOTS = 6         # FRC match maximum (3 per alliance); caps phantom tracks
 
+# Resolution of the JPEG frames exported for SAM2 tracking, as a fraction of the
+# view-crop resolution. SAM2 resizes every input to a fixed 1024² square, so this
+# does NOT change SAM2's compute or VRAM — but 0.5 hands SAM2 a ~960px-wide image,
+# *below* its native input, discarding detail for small/far robots (sliver-prone
+# masks past midfield). Raising it costs only export disk/decode time plus mask
+# RAM in sam2_raw (output masks come back at export resolution: 1.0 is 4x the
+# bool-mask memory of 0.5). Env-tunable for A/B.
+SAM2_EXPORT_SCALE = float(os.environ.get("SAM2_EXPORT_SCALE", "0.5") or "0.5")
+
 # Honor the per-camera calibrated top exclusion by default. This prevents stands,
 # outposts, and other above-field structures from becoming robot tracks. It remains
 # disableable for camera layouts where cropping materially hurts SAM2.
@@ -822,6 +831,14 @@ class InferenceJob:
         # Per-run SAM2 encoder size ("tiny"/"small"/"base_plus"/"large"); defaults to
         # the env-selected size, overridable per job from the UI.
         self.model_size = SAM2_MODEL_SIZE
+        # Per-run SAM2 frame-export scale; defaults to the env constant,
+        # overridable per job for A/B runs without a server restart.
+        self.sam2_export_scale = SAM2_EXPORT_SCALE
+        # Per-run hijack-cull override; None defers to the tracker's
+        # CULL_HIJACK_ENABLED env default (currently off pending the qm72 gate).
+        self.cull_hijack_enabled: Optional[bool] = None
+        # Per-run re-anchor override; None defers to SAM2_REANCHOR_ENABLED.
+        self.reanchor_enabled: Optional[bool] = None
         # SAM3 remains opt-in until it has been benchmarked on the event hardware.
         self.tracking_backend = TRACKING_BACKEND
 
@@ -4201,7 +4218,8 @@ class InferenceJob:
                     f"(~{SAM2_PROMPT_OFFSET_SECONDS:.1f}s after active start), "
                     "then propagating backward."
                 )
-                SAM2_SCALE = 0.5
+                SAM2_SCALE = self.sam2_export_scale
+                print(f"  [SAM2] Frame-export scale: {SAM2_SCALE}")
                 
                 N = len(self.views)
                 loop = asyncio.get_running_loop()
@@ -4443,7 +4461,7 @@ class InferenceJob:
                         # ALREADY top-cropped, so we recover the CROPPED full-res
                         # height and reconstruct the consumer's offset
                         # (original_h * tc) via cropped_full_h * tc / (1 - tc).
-                        _sam2_scale = 0.5
+                        _sam2_scale = self.sam2_export_scale
                         _top_crop = (
                             (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
                             if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
@@ -4505,6 +4523,11 @@ class InferenceJob:
                             diagnostics=self.identity_diagnostics,
                             project_fn=_project_fn,
                             seed_gate_fn=_seed_gate_fn,
+                            # None defers to the tracker's env-knob defaults.
+                            **({"cull_enabled": self.cull_hijack_enabled}
+                               if self.cull_hijack_enabled is not None else {}),
+                            **({"reanchor_enabled": self.reanchor_enabled}
+                               if self.reanchor_enabled is not None else {}),
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -4718,7 +4741,7 @@ class InferenceJob:
                 
                 if self.use_sam2:
                     local_idx = self.sam2_source_to_local.get(frame_num)
-                    SAM2_SCALE = 0.5
+                    SAM2_SCALE = self.sam2_export_scale
                     for view in self.views:
                         paired = []
                         view_raw = self.sam2_raw.get(view.name, {})
@@ -7316,6 +7339,9 @@ async def infer(
     tracking_backend: Optional[str] = Form(None),
     model_size: Optional[str] = Form(None),
     match_key: Optional[str] = Form(None),
+    sam2_export_scale: Optional[float] = Form(None),
+    cull_hijack_enabled: Optional[bool] = Form(None),
+    reanchor_enabled: Optional[bool] = Form(None),
 ):
     """Start inference job"""
     job_id = str(uuid.uuid4())
@@ -7370,6 +7396,14 @@ async def infer(
             if not _sam2_checkpoint_present(job.model_size):
                 print(f"  [SAM2] WARNING: '{job.model_size}' checkpoint not found at "
                       f"{_SAM2_MODELS[job.model_size][1]}; SAM2 will fall back to Kalman tracking.")
+        # Per-run export scale for A/B runs. Clamped: below 0.25 starves SAM2 of
+        # pixels; above 1.0 only upsamples (no information) and inflates mask RAM.
+        if sam2_export_scale is not None:
+            job.sam2_export_scale = min(1.0, max(0.25, float(sam2_export_scale)))
+        if cull_hijack_enabled is not None:
+            job.cull_hijack_enabled = bool(cull_hijack_enabled)
+        if reanchor_enabled is not None:
+            job.reanchor_enabled = bool(reanchor_enabled)
         jobs[job_id] = job
         
         return {"job_id": job_id}

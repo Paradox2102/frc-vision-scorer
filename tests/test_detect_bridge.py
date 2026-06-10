@@ -161,7 +161,12 @@ def test_missing_color_becomes_unknown():
     assert dets[0].color == "unknown"
 
 
-def test_detection_inside_blocked_structure_zone_is_dropped():
+def test_detection_inside_blocked_structure_zone_is_kept():
+    """Zones gate SEEDING (FieldTracker._assign), not detection: a robot that
+    drives into a zone must keep feeding its existing track, and a zone-parked
+    robot must keep corroborating its SAM2 mask (else eviction would see it as
+    detector-absent). Zone hits are also NOT logged to rejected_out — a parked
+    robot logged as a hard negative would poison the mining set."""
     fm = FieldModel.load("2026-rebuilt-welded")
     cam = truth_pinhole_camera()
     u, v = cam.field_to_image((8.0, 4.0, 0.0))
@@ -177,8 +182,9 @@ def test_detection_inside_blocked_structure_zone_is_dropped():
         rejected_out=rejected,
     )
 
-    assert dets == []
-    assert rejected[0]["reason"] == "static_structure"
+    assert len(dets) == 1
+    assert dets[0].color == "blue"
+    assert rejected == []
 
 
 def test_field_adjacent_person_filter():
@@ -229,17 +235,18 @@ def test_filter_field_robot_boxes_rejects_off_field_and_oversized():
     ) == [0]
 
 
-def test_corner_views_only_contribute_inside_nearby_alliance_zone():
+def test_corner_views_contribute_up_to_midline_margin():
+    """The old hard 4.8 m cutoff left center field covered by only the main
+    camera. Corner evidence is now admitted with a decaying weight out to the
+    midline (+margin); only the far half stays out of bounds."""
     dims = (16.541, 8.069)
 
     assert corner_detection_in_alliance_zone("corner_left", (4.7, 4.0), dims)
-    assert not corner_detection_in_alliance_zone(
-        "corner_left", (5.0, 4.0), dims
-    )
+    assert corner_detection_in_alliance_zone("corner_left", (8.2, 4.0), dims)
+    assert not corner_detection_in_alliance_zone("corner_left", (10.0, 4.0), dims)
     assert corner_detection_in_alliance_zone("corner_right", (11.8, 4.0), dims)
-    assert not corner_detection_in_alliance_zone(
-        "corner_right", (11.5, 4.0), dims
-    )
+    assert corner_detection_in_alliance_zone("corner_right", (8.3, 4.0), dims)
+    assert not corner_detection_in_alliance_zone("corner_right", (6.5, 4.0), dims)
 
 
 def test_non_corner_views_remain_global():
@@ -247,3 +254,28 @@ def test_non_corner_views_remain_global():
 
     assert corner_detection_in_alliance_zone("main", (8.0, 4.0), dims)
     assert corner_detection_in_alliance_zone("other", (8.0, 4.0), dims)
+
+
+def test_corner_detection_weight_falloff_shape():
+    from web.field.detect_bridge import corner_detection_weight
+    dims = (16.541, 8.069)
+
+    # Full trust within the near alliance band.
+    assert corner_detection_weight("corner_left", (3.0, 4.0), dims) == 1.0
+    assert corner_detection_weight("corner_left", (4.7, 4.0), dims) == 1.0
+    # Monotone decay beyond the band toward the midline.
+    w6 = corner_detection_weight("corner_left", (6.0, 4.0), dims)
+    w8 = corner_detection_weight("corner_left", (8.2, 4.0), dims)
+    assert 0.0 < w8 < w6 < 1.0
+    # Hard zero past midline + margin (far half stays out of bounds).
+    assert corner_detection_weight("corner_left", (9.5, 4.0), dims) == 0.0
+    # Mirrored for corner_right (distance measured from the far end wall).
+    assert corner_detection_weight("corner_right", (13.0, 4.0), dims) == 1.0
+    w10 = corner_detection_weight("corner_right", (10.0, 4.0), dims)
+    w83 = corner_detection_weight("corner_right", (8.3, 4.0), dims)
+    assert 0.0 < w83 < w10 < 1.0
+    assert corner_detection_weight("corner_right", (7.0, 4.0), dims) == 0.0
+    # Non-corner views are never attenuated.
+    assert corner_detection_weight("main", (8.0, 4.0), dims) == 1.0
+    # Unprojectable position contributes nothing.
+    assert corner_detection_weight("corner_left", None, dims) == 0.0

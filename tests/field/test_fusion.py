@@ -169,3 +169,35 @@ def test_all_hub_occluded_views_fall_back_to_existing_main_preference():
     )
 
     assert fused[0].detection.pos == (5.0, 3.0)
+
+
+def test_member_weight_scales_with_detection_score():
+    """A detection's score (e.g. corner-camera falloff weight) attenuates its
+    fusion influence: position averaging and color votes both follow it."""
+    # Two corner detections of the same robot, conflicting colors. The full-score
+    # member must win the color vote despite equal camera weights.
+    per_cam = {
+        "corner_left": [(FieldDetection(pos=(8.0, 4.0), color="red", box=None, score=1.0), b"a")],
+        "corner_right": [(FieldDetection(pos=(8.4, 4.0), color="blue", box=None, score=0.2), b"b")],
+    }
+    fused = fuse_detections(per_cam, weights={"corner_left": 1.0, "corner_right": 1.0}, radius_m=0.6)
+    assert len(fused) == 1
+    obs = fused[0]
+    assert obs.detection.color == "red"
+    # Weighted position: (8.0*1.0 + 8.4*0.2) / 1.2 = 8.0667 — pulled mostly to
+    # the full-score member, not the midpoint (8.2).
+    assert abs(obs.detection.pos[0] - 8.0667) < 1e-3
+    # Evidence carries the effective (camera * score) weight.
+    weights = {cam: w for (cam, _crop, w) in obs.evidence}
+    assert abs(weights["corner_left"] - 1.0) < 1e-9
+    assert abs(weights["corner_right"] - 0.2) < 1e-9
+
+
+def test_default_score_keeps_existing_weighting():
+    """score defaults to 1.0, so paths that never set it are unchanged."""
+    per_cam = {
+        "main": [(FieldDetection(pos=(5.0, 3.0), color="blue", box=(1, 2, 3, 4)), b"m")],
+        "corner_left": [(FieldDetection(pos=(5.2, 3.1), color="blue", box=None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
+    assert fused[0].evidence == [("main", b"m", 1.0), ("corner_left", b"c", 2.5)]

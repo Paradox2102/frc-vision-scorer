@@ -816,6 +816,57 @@ def test_match_new_detections_small_mask_still_claims_small_box():
     assert unmatched == []
 
 
+def test_seed_gate_fn_blocks_seeding_with_diagnostic():
+    """A detection failing seed_gate_fn (e.g. inside a static-structure zone)
+    is never seeded as a new object, with a visible static_structure rejection."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    gated_box = stub._rect_for(3)
+
+    def detect_fn(local_idx, frame_path):
+        return [gated_box]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1)],
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=6,
+        seed_gate_fn=lambda box: tuple(box) != tuple(gated_box),
+        diagnostics=diag,
+    )
+    assert all(oid != 2 for (_f, oid) in stub.add_calls)
+    assert 2 not in result[5]
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "static_structure" for e in diag._events)
+
+
+def test_seed_gated_box_still_corroborates_mask():
+    """A gate-blocked detection must still corroborate an existing mask —
+    a robot parked inside a zone is detector-PRESENT, never cull/evict bait."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Only obj 1's own box, but the gate blocks ALL seeding.
+        return [stub._rect_for(1)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1)],
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=6, cull_enabled=True,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, seed_gate_fn=lambda box: False,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    # Stationary + corroborated by the gated box -> never culled.
+    assert _culled_ids(diag) == set()
+
+
 def test_detector_exception_is_unavailable_no_candidates_no_seed():
     """A detect_fn that raises is treated as detector-unavailable: no reprompt
     candidates are logged and no new objects are seeded that boundary."""

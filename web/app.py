@@ -67,7 +67,7 @@ from web.field.detect_bridge import (
     to_field_detections,
     field_adjacent_persons,
     box_exceeds_frac,
-    corner_detection_in_alliance_zone,
+    corner_detection_weight,
     filter_field_robot_boxes,
 )
 from web.field.detect_schema import (
@@ -87,7 +87,7 @@ from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
 from web.field.bumper import bumper_band_box, bumper_crop
-from web.field.zones import load_zones, prism_bounding_zones, save_zones
+from web.field.zones import load_zones, point_in_zones, prism_bounding_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
@@ -1202,16 +1202,19 @@ class InferenceJob:
         field_dets = to_field_detections(
             robot_boxes, cal, self.field_dims, colors=robot_colors,
             frame_shape=frame.shape,
-            blocked_zones=self.hub_no_robot_zones,
             rejected_out=rejected,
         )
-        field_dets = [
-            det
-            for det in field_dets
-            if corner_detection_in_alliance_zone(
-                view.name, det.pos, self.field_dims
-            )
-        ]
+        # Corner-camera range falloff: attenuate (via det.score, which scales
+        # the fusion weight) instead of hard-dropping, so center-field robots
+        # keep corner coverage; only the far half (weight 0) is discarded.
+        weighted = []
+        for det in field_dets:
+            w = corner_detection_weight(view.name, det.pos, self.field_dims)
+            if w <= 0.0:
+                continue
+            det.score = w
+            weighted.append(det)
+        field_dets = weighted
         if rejected:
             self.hard_neg_logger.maybe_log(
                 frame, [d.box for d in field_dets], rejected,
@@ -4422,6 +4425,10 @@ class InferenceJob:
                                         )
                                         for box, _color in merged
                                     ]
+                                    # No blocked_zones: detect_fn output also
+                                    # corroborates existing masks (a zone-parked
+                                    # robot must stay detector-present); seeding
+                                    # inside zones is blocked by seed_gate_fn.
                                     keep = filter_field_robot_boxes(
                                         full_boxes,
                                         view.calibration,
@@ -4431,7 +4438,6 @@ class InferenceJob:
                                             int(round(img.shape[1] / SAM2_SCALE)),
                                             3,
                                         ),
-                                        blocked_zones=self.hub_no_robot_zones,
                                     )
                                     return [merged[idx] for idx in keep]
                                 res = self.model(img, conf=0.4, verbose=False)[0]
@@ -4501,6 +4507,19 @@ class InferenceJob:
 
                         _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
 
+                        # Seed gate: a detection projecting into a static zone
+                        # cannot found a NEW SAM2 object (a robot is never born
+                        # inside a field element) but still corroborates masks.
+                        def _make_seed_gate_fn(project, zones):
+                            def _gate(box):
+                                xy = project(box)
+                                return xy is None or not point_in_zones(xy, zones)
+                            return _gate
+
+                        _seed_gate_fn = _make_seed_gate_fn(
+                            _project_fn, self.hub_no_robot_zones
+                        )
+
                         t0 = time.perf_counter()
                         view_tracks = await asyncio.to_thread(
                             sam2_tracker.track,
@@ -4520,6 +4539,7 @@ class InferenceJob:
                             progress_cb=make_progress_cb(base_pct, span_pct, view.name),
                             diagnostics=self.identity_diagnostics,
                             project_fn=_project_fn,
+                            seed_gate_fn=_seed_gate_fn,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -4630,7 +4650,6 @@ class InferenceJob:
                     self.field_dims,
                     colors=early_colors,
                     frame_shape=early_overhead.shape,
-                    blocked_zones=self.hub_no_robot_zones,
                     rejected_out=early_rejected,
                 )
                 if early_rejected:
@@ -4781,19 +4800,21 @@ class InferenceJob:
                                 PERSON_ROBOT_REJECT_COVERAGE,
                             ):
                                 continue
+                            # No blocked_zones here: these are tracked masks
+                            # (post-seeding evidence); zones gate seeding only.
                             if not filter_field_robot_boxes(
                                 [full_box],
                                 cal,
                                 self.field_dims,
                                 frame_shape=view_frame.shape,
-                                blocked_zones=self.hub_no_robot_zones,
                             ):
                                 continue
                             uv = ((fx1 + fx2) / 2.0, fy2)
                             xy = cal.image_to_field(uv)
-                            if not corner_detection_in_alliance_zone(
+                            corner_weight = corner_detection_weight(
                                 view.name, xy, self.field_dims
-                            ):
+                            )
+                            if corner_weight <= 0.0:
                                 continue
                             
                             color = (
@@ -4827,7 +4848,7 @@ class InferenceJob:
                                 pos=xy,
                                 color=color,
                                 box=full_box,
-                                score=1.0,
+                                score=corner_weight,
                                 track_id=obj_id,
                                 embedding=det_embed,
                                 robot_crop_b64=robot_crop_b64,

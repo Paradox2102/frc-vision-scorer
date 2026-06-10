@@ -49,12 +49,15 @@ def fuse_detections(
     same_camera_ios: float = 0.7,
     is_hub_occluded: Optional[Callable[[str, tuple], bool]] = None,
 ) -> list:
-    # flatten to (camera, det, crop, weight)
+    # flatten to (camera, det, crop, weight). The effective weight is the
+    # camera's vote weight scaled by the detection's own score (1.0 unless a
+    # producer attenuated it, e.g. the corner-camera range falloff) — so far
+    # corner evidence supplements without overriding near/main evidence.
     items = []
     for cam, dets in per_camera.items():
         w = float(weights.get(cam, 1.0))
         for (det, crop) in dets:
-            items.append((cam, det, crop, w))
+            items.append((cam, det, crop, w * float(det.score or 1.0)))
 
     used = [False] * len(items)
     out = []

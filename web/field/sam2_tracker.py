@@ -426,6 +426,7 @@ class Sam2FieldTracker:
         cull_corrob_ios: float = CULL_CORROB_IOS,
         cull_stationary_m: float = CULL_STATIONARY_M,
         evict_when_capped: bool = EVICT_WHEN_CAPPED,
+        seed_gate_fn=None,
         project_fn=None,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
@@ -487,6 +488,12 @@ class Sam2FieldTracker:
                 evidence bar as the cull) to claim its slot. Without this, one
                 stale mask pinning the roster makes the tracker permanently
                 blind to new robots.
+            seed_gate_fn: Optional ``(box) -> bool``; a detection for which it
+                returns False is never seeded as a NEW object (rejection reason
+                ``static_structure``) but still corroborates existing masks.
+                Used for static-structure zones: a real robot is never *born*
+                inside a field element, but one parked there must keep counting
+                as detector-present.
             project_fn: Callable mapping a mask box (tracker pixel coords) to field
                 meters ``(x, y)``, or None when unprojectable; measures stationarity
                 in field space so camera pan can't disguise a static structure as
@@ -584,6 +591,13 @@ class Sam2FieldTracker:
                 except Exception:
                     detected = []
                 bootstrap_boxes, bootstrap_metadata = _normalize_detections(detected)
+                if seed_gate_fn is not None:
+                    gated = [
+                        (b, m) for b, m in zip(bootstrap_boxes, bootstrap_metadata)
+                        if seed_gate_fn(b)
+                    ]
+                    bootstrap_boxes = [b for b, _m in gated]
+                    bootstrap_metadata = [m for _b, m in gated]
                 if not bootstrap_boxes:
                     continue
                 for box, metadata in zip(
@@ -942,6 +956,17 @@ class Sam2FieldTracker:
                                         details={"frame_idx": last_idx, "box": list(box_val)},
                                     )
                         for j in new_indices:
+                            if seed_gate_fn is not None and not seed_gate_fn(new_boxes[j]):
+                                # Zone-gated: corroboration already counted this
+                                # box above; it just can't found a new object.
+                                if diagnostics:
+                                    diagnostics.record(
+                                        "sam2.reprompt_rejected",
+                                        reason="static_structure",
+                                        details={"frame_idx": last_idx,
+                                                 "box": list(new_boxes[j])},
+                                    )
+                                continue
                             active_objects = [
                                 oid for oid in range(1, next_obj_id)
                                 if oid not in culled_set

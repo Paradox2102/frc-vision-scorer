@@ -86,6 +86,7 @@ class DiagnosticReasons:
     DETECTOR_ABSENT_STATIONARY = "detector_absent_stationary"
     ALREADY_TRACKED = "already_tracked"
     EVICTED_FOR_NEW_DETECTION = "evicted_for_new_detection"
+    STATIC_STRUCTURE = "static_structure"
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}

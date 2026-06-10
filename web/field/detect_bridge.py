@@ -1,5 +1,6 @@
 """Adapter: YOLO image boxes -> field-space detections / field-adjacent persons."""
 from __future__ import annotations
+import math
 import os
 from web.field.tracker import FieldDetection
 from web.field.zones import point_in_zones
@@ -26,6 +27,14 @@ DET_FIELD_WIDTH_MAX_RANGE_M = float(os.environ.get("DET_FIELD_WIDTH_MAX_RANGE_M"
 CORNER_ALLIANCE_ZONE_DEPTH_M = float(
     os.environ.get("CORNER_ALLIANCE_ZONE_DEPTH_M", "4.8")
 )
+# Beyond the trusted band, corner evidence decays exponentially with this scale
+# rather than vanishing — the old hard cutoff left center field covered by the
+# main camera alone (hub-occluded in places), so a midfield robot the main view
+# missed was invisible system-wide even while a corner camera tracked it.
+CORNER_ZONE_FALLOFF_M = float(os.environ.get("CORNER_ZONE_FALLOFF_M", "2.0"))
+# Corner evidence is hard-zeroed past the field midline plus this margin: the
+# far half is extreme range for an oblique corner view and mostly hub-occluded.
+CORNER_MIDLINE_MARGIN_M = float(os.environ.get("CORNER_MIDLINE_MARGIN_M", "1.0"))
 # Range-stable width backstop. The footprint check above is disabled past
 # DET_FIELD_WIDTH_MAX_RANGE_M because back-projecting box corners to the carpet is
 # ill-conditioned near the horizon — which leaves long-range boxes with NO width
@@ -48,22 +57,49 @@ def _on_field(xy, dims, margin):
     return -margin <= xy[0] <= L + margin and -margin <= xy[1] <= W + margin
 
 
+def corner_detection_weight(
+    view_name,
+    xy,
+    field_dims,
+    zone_depth=CORNER_ALLIANCE_ZONE_DEPTH_M,
+    falloff_m=CORNER_ZONE_FALLOFF_M,
+    midline_margin_m=CORNER_MIDLINE_MARGIN_M,
+):
+    """Confidence weight (0..1) of a corner camera's evidence at field point xy.
+
+    1.0 within ``zone_depth`` of the camera's own end wall (the band where the
+    oblique ground projection is well-conditioned), decaying exponentially with
+    ``falloff_m`` beyond it, and 0.0 past the field midline + margin. Non-corner
+    views are never attenuated. The weight multiplies the detection's fusion
+    influence (position average, color vote, embedding average) so distant
+    corner evidence supplements the main camera without overriding it.
+    """
+    if view_name not in ("corner_left", "corner_right"):
+        return 1.0
+    if xy is None:
+        return 0.0
+    field_length = float(field_dims[0])
+    x = float(xy[0])
+    dist_from_end = x if view_name == "corner_left" else field_length - x
+    if dist_from_end > field_length / 2.0 + float(midline_margin_m):
+        return 0.0
+    if dist_from_end <= float(zone_depth):
+        return 1.0
+    return math.exp(-(dist_from_end - float(zone_depth)) / float(falloff_m))
+
+
 def corner_detection_in_alliance_zone(
     view_name,
     xy,
     field_dims,
     zone_depth=CORNER_ALLIANCE_ZONE_DEPTH_M,
 ):
-    """Return whether a camera may contribute this projected field position."""
-    if xy is None:
-        return False
-    x = float(xy[0])
-    field_length = float(field_dims[0])
-    if view_name == "corner_left":
-        return x <= min(float(zone_depth), field_length / 2.0)
-    if view_name == "corner_right":
-        return x >= max(field_length - float(zone_depth), field_length / 2.0)
-    return True
+    """Return whether a camera may contribute this projected field position.
+
+    Thin wrapper over :func:`corner_detection_weight` — true wherever the
+    weight is nonzero (anywhere up to the midline + margin for corner views).
+    """
+    return corner_detection_weight(view_name, xy, field_dims, zone_depth) > 0.0
 
 
 def _field_footprint_width(box, calibration):
@@ -159,7 +195,14 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
                         rejected_out=None):
     """Project image boxes to field-space detections, dropping off-field and
     implausibly-large boxes. If `rejected_out` is a list, each dropped box is
-    appended as {"box", "reason", "field_xy"} for hard-negative mining."""
+    appended as {"box", "reason", "field_xy"} for hard-negative mining.
+
+    ``blocked_zones`` is accepted for call-site compatibility but detections
+    inside a zone are KEPT: zones gate slot *seeding* (FieldTracker._assign),
+    not detection. Dropping here killed existing tracks that drove into a zone
+    and starved zone-parked robots of the detector corroboration that protects
+    them from the SAM2 hijack cull / capped-roster eviction."""
+    del blocked_zones  # seed-time concern; see docstring
     out = []
     for idx, box in enumerate(robot_boxes):
         uv = _bottom_center(box)
@@ -168,11 +211,6 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
             if rejected_out is not None:
                 rejected_out.append({"box": tuple(float(v) for v in box),
                                      "reason": "off_field", "field_xy": xy})
-            continue
-        if point_in_zones(xy, blocked_zones):
-            if rejected_out is not None:
-                rejected_out.append({"box": tuple(float(v) for v in box),
-                                     "reason": "static_structure", "field_xy": xy})
             continue
         if _too_large(box, calibration, xy, frame_shape, max_field_width,
                       max_box_frac, width_max_range):

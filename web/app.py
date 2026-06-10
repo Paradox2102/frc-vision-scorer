@@ -2284,23 +2284,44 @@ class InferenceJob:
         self._last_frame_stream_time = now
         return True
 
-    def _ensure_frame_sender(self) -> asyncio.Queue:
-        queue = getattr(self, "_frame_send_queue", None)
+    # Websocket send channels. Each kind gets a bounded queue drained by a
+    # background sender so a slow client never back-pressures inference:
+    #   frame  — latest-only; the newest frame supersedes any unsent one
+    #   status — latest-only; progress is latest-wins
+    #   diag   — bounded backlog, sheds oldest under pressure; the JSONL file
+    #            is the canonical record, the websocket copy is best-effort
+    # Terminal messages (complete / error / final status) bypass the queues
+    # via _send_ws after _stop_ws_senders has drained them.
+    _WS_QUEUE_DEPTH = {"frame": 1, "status": 1, "diag": 64}
+
+    @property
+    def _frame_send_queue(self):
+        return getattr(self, "_ws_queues", {}).get("frame")
+
+    @property
+    def _frame_sender_task(self):
+        return getattr(self, "_ws_sender_tasks", {}).get("frame")
+
+    def _ws_queue(self, kind: str) -> asyncio.Queue:
+        queues = getattr(self, "_ws_queues", None)
+        if queues is None:
+            queues = self._ws_queues = {}
+            self._ws_sender_tasks = {}
+            self._ws_drop_counts = {}
+        queue = queues.get(kind)
         if queue is None:
-            queue = self._frame_send_queue = asyncio.Queue(maxsize=1)
-        task = getattr(self, "_frame_sender_task", None)
+            queue = queues[kind] = asyncio.Queue(maxsize=self._WS_QUEUE_DEPTH[kind])
+        task = self._ws_sender_tasks.get(kind)
         if task is None or task.done():
-            self._frame_sender_task = asyncio.get_running_loop().create_task(
-                self._frame_sender_loop(queue)
+            self._ws_sender_tasks[kind] = asyncio.get_running_loop().create_task(
+                self._ws_sender_loop(queue)
             )
         return queue
 
-    def _enqueue_frame_payload(self, payload) -> None:
-        """Queue a frame for the sender task without ever blocking the frame
-        loop. The queue holds only the newest frame; when a stale frame is
-        dropped, its unsent VLM crops are carried into the replacement so a
-        slow client still sees every crops batch."""
-        queue = self._ensure_frame_sender()
+    def _enqueue_ws(self, kind: str, payload) -> None:
+        """Queue a payload for its kind's sender without ever blocking the
+        inference loop; when the queue is full the oldest payload is shed."""
+        queue = self._ws_queue(kind)
         while True:
             try:
                 queue.put_nowait(payload)
@@ -2310,36 +2331,51 @@ class InferenceJob:
                     dropped = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     continue
-                if (payload is not None and dropped is not None
+                self._ws_drop_counts[kind] = self._ws_drop_counts.get(kind, 0) + 1
+                # A dropped frame's unsent VLM crops ride along on the
+                # replacement so a slow client still sees every crops batch.
+                if (kind == "frame" and payload is not None and dropped is not None
                         and dropped.get("ocr_crops") is not None
                         and payload.get("ocr_crops") is None):
                     payload["ocr_crops"] = dropped["ocr_crops"]
 
-    async def _frame_sender_loop(self, queue: asyncio.Queue) -> None:
+    def _enqueue_frame_payload(self, payload) -> None:
+        self._enqueue_ws("frame", payload)
+
+    async def _ws_sender_loop(self, queue: asyncio.Queue) -> None:
         while True:
             payload = await queue.get()
             if payload is None:  # stop sentinel
                 return
             await self._send_ws(payload)
 
-    async def _stop_frame_sender(self, drain: bool = True) -> None:
-        """Stop the sender task. With drain=True any pending frame is sent
+    async def _stop_ws_senders(self, drain: bool = True) -> None:
+        """Stop every sender task. With drain=True pending payloads are sent
         first (call before the `complete` message so ordering holds); with
-        drain=False the task is cancelled immediately."""
-        task = getattr(self, "_frame_sender_task", None)
-        self._frame_sender_task = None
-        if task is None or task.done():
+        drain=False the tasks are cancelled immediately."""
+        tasks = getattr(self, "_ws_sender_tasks", None)
+        if not tasks:
             return
-        if drain:
-            queue = self._frame_send_queue
-            await queue.put(None)  # blocks until pending frame is consumed
-            await task
-        else:
-            task.cancel()
+        queues = self._ws_queues
+        self._ws_sender_tasks = {}
+        pending = {k: t for k, t in tasks.items() if t is not None and not t.done()}
+        for kind, task in pending.items():
+            if drain:
+                await queues[kind].put(None)  # blocks until backlog is consumed
+            else:
+                task.cancel()
+        for task in pending.values():
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        diag_drops = getattr(self, "_ws_drop_counts", {}).get("diag", 0)
+        if diag_drops:
+            print(f"  [ws] shed {diag_drops} diagnostic record(s) under "
+                  f"backpressure (JSONL on disk is complete)")
+
+    async def _stop_frame_sender(self, drain: bool = True) -> None:
+        await self._stop_ws_senders(drain=drain)
 
     async def _warn_degraded(self, component: str, message: str) -> None:
         """Surface a quality-degrading failure (SAM2 fallback, gallery disabled,
@@ -2383,12 +2419,12 @@ class InferenceJob:
 
     async def _diagnostic_ws_send(self, record: dict) -> None:
         """Push one diagnostic record over the existing websocket. Best-effort:
-        the JSONL file is the canonical record. Disconnect-class exceptions are
-        DEBUG-logged; anything unexpected is WARN-logged via print()."""
+        the JSONL file is the canonical record, so records ride the bounded
+        diag queue and shed oldest if a slow client falls behind."""
         msg_type = ("diagnostic_snapshot"
                    if record.get("type") == "snapshot"
                    else "diagnostic_event")
-        await self._send_ws({"type": msg_type, "record": record})
+        self._enqueue_ws("diag", {"type": msg_type, "record": record})
 
     def audit_overturn_confirmations(self) -> None:
         """Let a wrong locked identity self-correct. For each confirmed robot,
@@ -4369,7 +4405,8 @@ class InferenceJob:
                 loop = asyncio.get_running_loop()
 
                 async def safe_send_status(msg: str, pct: float):
-                    await self._send_ws({
+                    # Latest-wins queue: progress updates never wait on the client.
+                    self._enqueue_ws("status", {
                         "type": "status",
                         "status": "processing",
                         "message": msg,
@@ -5464,7 +5501,7 @@ class InferenceJob:
                     while self._paused and not self._stopped:
                         now = loop.time()
                         if self.websocket and (now - last_status_sent >= 1.0):
-                            await self._send_ws({
+                            self._enqueue_ws("status", {
                                 "type": "status",
                                 "status": "paused",
                                 "frame_num": self._pause_frame
@@ -5483,7 +5520,7 @@ class InferenceJob:
             self.status = "completed"
 
             # Deliver any in-flight frame before the complete message.
-            await self._stop_frame_sender(drain=True)
+            await self._stop_ws_senders(drain=True)
             await self._send_ws(jsonify({
                 "type": "complete",
                 "total_frames": self.total_frames,
@@ -5509,7 +5546,7 @@ class InferenceJob:
             })
         finally:
             try:
-                await self._stop_frame_sender(drain=False)
+                await self._stop_ws_senders(drain=False)
             except Exception:
                 pass
             try:

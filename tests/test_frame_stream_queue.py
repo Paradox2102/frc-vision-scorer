@@ -89,6 +89,60 @@ def test_dropped_frame_carries_ocr_crops_forward():
     assert queued["ocr_crops"] == crops  # not lost with the dropped frame
 
 
+def test_status_queue_keeps_only_latest():
+    """Progress status is latest-wins; a slow client sees fewer, fresher updates."""
+    async def run():
+        ws = RecordingWebSocket(delay=10.0)
+        job = _make_job(ws)
+        job._enqueue_ws("status", {"type": "status", "progress": 0})
+        await asyncio.sleep(0.05)  # sender blocked on the first status
+        for n in range(1, 6):
+            job._enqueue_ws("status", {"type": "status", "progress": n})
+        queued = job._ws_queues["status"].get_nowait()
+        await job._stop_ws_senders(drain=False)
+        return queued
+
+    queued = asyncio.run(run())
+    assert queued["progress"] == 5
+
+
+def test_diag_queue_bounded_drops_oldest():
+    """Diagnostics shed oldest under backpressure; JSONL stays canonical."""
+    async def run():
+        ws = RecordingWebSocket(delay=10.0)
+        job = _make_job(ws)
+        job._enqueue_ws("diag", {"type": "diagnostic_event", "n": 0})
+        await asyncio.sleep(0.05)  # sender blocked on record 0
+        for n in range(1, 80):
+            job._enqueue_ws("diag", {"type": "diagnostic_event", "n": n})
+        oldest_kept = job._ws_queues["diag"].get_nowait()
+        depth = job._ws_queues["diag"].qsize() + 1
+        drops = job._ws_drop_counts.get("diag", 0)
+        await job._stop_ws_senders(drain=False)
+        return oldest_kept, depth, drops
+
+    oldest_kept, depth, drops = asyncio.run(run())
+    assert depth == 64               # bounded backlog
+    assert drops == 15               # 79 enqueued into 64 slots
+    assert oldest_kept["n"] == 16    # records 1-15 were shed, oldest first
+
+
+def test_stop_ws_senders_drains_all_kinds():
+    async def run():
+        ws = RecordingWebSocket()
+        job = _make_job(ws)
+        job._enqueue_frame_payload({"type": "frame", "frame_num": 1})
+        job._enqueue_ws("status", {"type": "status", "progress": 50})
+        job._enqueue_ws("diag", {"type": "diagnostic_event", "n": 7})
+        await job._stop_ws_senders(drain=True)
+        return ws, job
+
+    ws, job = asyncio.run(run())
+    types = sorted(m["type"] for m in ws.messages)
+    assert types == ["diagnostic_event", "frame", "status"]
+    assert job._frame_sender_task is None
+
+
 def test_sender_delivers_then_stops_cleanly():
     async def run():
         ws = RecordingWebSocket()

@@ -3899,15 +3899,24 @@ class InferenceJob:
         # which is the only case best_err stays inf (no frame ever updated it).
         if best_err > CALIB_DRIFT_MAX_M:
             self.status = "error"
+            _calib_url = (f"/calibrate?match={self.match_key}&camera={self.camera}"
+                          if self.match_key else "/calibrate")
             self.error = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
                           f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). "
-                          f"The camera likely moved/zoomed — recalibrate for this match "
-                          f"(it will be saved as a new calibration version).")
+                          f"The camera likely moved/zoomed — recalibrate at {_calib_url} "
+                          f"(saved as a new version applying from this match onward).")
             self.needs_calibration = {"event": self.event_key, "camera": self.camera,
                                       "match_key": self.match_key, "error_m": round(best_err, 3),
                                       "epoch": self._calib_version_id}
+            if self.match_key:
+                # Persist the failure so the calibrate page can flag this match
+                # in its selector until a new epoch covers it (or a check passes).
+                field_store.record_drift(self.event_key, self.camera, self.match_key,
+                                         best_err, self._calib_version_id)
             print(f"  FIELD TRACKING ABORTED: {self.error}")
             return False
+        if self.match_key:
+            field_store.clear_drift(self.event_key, self.camera, self.match_key)
         print(f"  [calib] OK: {best_n} tags align to {best_err:.3f} m (epoch {self._calib_version_id})")
         return True
 
@@ -5786,15 +5795,76 @@ async def calibration_auto(request: Request):
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
 
 
-@app.post("/api/calibration/frame")
-async def calibration_frame(request: Request):
-    """Grab a frame from a LOCAL video, cropped to the requested camera's region
-    from the composite layout (masks applied). Body: {timestamp?: seconds
-    (default 75), video_path?, camera?}.
-    Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
-    Pixel coords are crop-local (origin at the camera crop's top-left)."""
-    body = await request.json()
+# Stream URLs resolved for calibration frame grabs, keyed by YouTube video id.
+# yt-dlp resolution takes seconds; URLs stay valid for hours, cache for 10 min.
+_calib_stream_cache: dict = {}
+
+
+def _match_stream_url(match_key: str):
+    """Resolve a direct video stream URL for one of the loaded event's matches.
+    Returns (stream_url, None) on success or (None, error_message)."""
+    if not current_event:
+        return None, "No event loaded — load the event first."
+    m = next((mm for mm in current_event.get('matches', [])
+              if mm.get('key') == match_key), None)
+    if m is None:
+        return None, f"Match '{match_key}' is not in the loaded event."
+    vk = m.get('video_key')
+    if not vk:
+        return None, f"Match '{match_key}' has no YouTube video on TBA."
+    cached = _calib_stream_cache.get(vk)
+    if cached and cached[1] > time.time():
+        return cached[0], None
+    ydl_opts = {
+        'format': 'bestvideo[height<=1080]/best[height<=1080]/bestvideo/best',
+        'format_sort': ['res:1080', 'vcodec:h264'],
+        'quiet': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vk}",
+                                    download=False)
+        stream_url = info.get('url')
+        if not stream_url:
+            for fmt in info.get('requested_formats', []):
+                if fmt.get('vcodec') != 'none':
+                    stream_url = fmt['url']
+                    break
+        if not stream_url:
+            return None, "Could not resolve a video stream URL for the match."
+        _calib_stream_cache[vk] = (stream_url, time.time() + 600)
+        return stream_url, None
+    except Exception as e:
+        return None, f"Stream resolve failed: {e}"
+
+
+def _read_composite_frame(body: dict):
+    """Read the full composite frame a calibration request refers to.
+    Source precedence: match_key (the loaded event's YouTube video for that
+    match, single-frame ffmpeg extract — needed when recalibrating a moved
+    camera against footage from that match) > video_path (local file restricted
+    to data/test_footage/) > CALIB_TEST_VIDEO.
+    Returns (frame_bgr, None) on success or (None, error_message)."""
+    import subprocess
     ts = float(body.get("timestamp", 75))
+    match_key = body.get("match_key")
+    if match_key:
+        stream_url, err = _match_stream_url(match_key)
+        if err:
+            return None, err
+        frame_path = UPLOAD_DIR / f"calib_frame_{uuid.uuid4().hex[:8]}.jpg"
+        try:
+            subprocess.run(['ffmpeg', '-ss', str(ts), '-i', stream_url,
+                            '-frames:v', '1', '-q:v', '2', str(frame_path), '-y'],
+                           capture_output=True, timeout=45)
+            frame = cv2.imread(str(frame_path)) if frame_path.exists() else None
+        except subprocess.TimeoutExpired:
+            return None, "Frame extraction from the match video timed out."
+        finally:
+            frame_path.unlink(missing_ok=True)
+        if frame is None:
+            return None, "ffmpeg could not extract a frame from the match video."
+        return frame, None
     # video_path is restricted to data/test_footage/ with a video extension to
     # prevent arbitrary local-file / URL reads via cv2.VideoCapture.
     raw = body.get("video_path")
@@ -5806,20 +5876,83 @@ async def calibration_frame(request: Request):
         try:
             candidate.relative_to(allowed_dir)
         except ValueError:
-            return JSONResponse(status_code=400,
-                                content={"error": "video_path outside allowed directory"})
+            return None, "video_path outside allowed directory"
         if candidate.suffix.lower() not in {".mp4", ".mov", ".mkv"}:
-            return JSONResponse(status_code=400, content={"error": "unsupported video extension"})
+            return None, "unsupported video extension"
         path = candidate
     if not path.exists():
-        return JSONResponse(status_code=400, content={"error": "video not found"})
+        return None, "video not found"
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     ok, frame = cap.read()
     cap.release()
     if not ok or frame is None:
-        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+        return None, "could not read frame"
+    return frame, None
+
+
+@app.get("/api/calibration/versions")
+async def get_calibration_versions(event: str, camera: str = "main"):
+    """Calibration version metadata for (event, camera), oldest first."""
+    versions = field_store.load_versions(event, camera)
+    return {"versions": [
+        {"version_id": v["version_id"], "start_match": v["start_match"],
+         "label": v["label"], "created_at": v["created_at"],
+         "rms_error": getattr(v["calibration"], "rms_error", None),
+         "mode": getattr(v["calibration"], "mode", None)}
+        for v in versions]}
+
+
+@app.get("/api/calibration/drift")
+async def get_calibration_drift(event: str):
+    """Failed drift-check records for the event, keyed camera -> match_key.
+    Each entry gains ``recalibrated``: True once a DIFFERENT epoch now covers
+    that match (a new version was anchored at/before it), so the UI can stop
+    flagging it without waiting for the match to be reprocessed."""
+    raw = field_store.load_drift(event)
+    out = {}
+    for camera, entries in raw.items():
+        versions = field_store.load_versions(event, camera)
+        cam_out = {}
+        for mk, rec in entries.items():
+            cover = select_epoch(versions, mk)
+            cam_out[mk] = {**rec, "recalibrated":
+                           bool(cover and cover["version_id"] != rec.get("epoch"))}
+        out[camera] = cam_out
+    return {"drift": out}
+
+
+@app.get("/api/calibration/epoch")
+async def get_calibration_epoch(event: str, camera: str = "main",
+                                match: str | None = None):
+    """The calibration version whose epoch covers ``match`` (latest version when
+    match is omitted), including the stored solve inputs (``source``) so the
+    calibrate page can restore correspondences and re-preview the solve."""
+    versions = field_store.load_versions(event, camera)
+    v = select_epoch(versions, match or None)
+    if v is None:
+        return {"version": None}
+    return {"version": {
+        "version_id": v["version_id"], "start_match": v["start_match"],
+        "label": v["label"], "created_at": v["created_at"],
+        "rms_error": getattr(v["calibration"], "rms_error", None),
+        "mode": getattr(v["calibration"], "mode", None),
+        "source": v.get("source")}}
+
+
+@app.post("/api/calibration/frame")
+async def calibration_frame(request: Request):
+    """Grab a frame cropped to the requested camera's region from the composite
+    layout (masks applied). Body: {timestamp?: seconds (default 75), match_key?,
+    video_path?, camera?} — match_key reads the loaded event's video for that
+    match (see _read_composite_frame for source precedence).
+    Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
+    Pixel coords are crop-local (origin at the camera crop's top-left)."""
+    body = await request.json()
+    frame, err = await asyncio.to_thread(_read_composite_frame, body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     camera = body.get("camera", "main")
     layout = load_layout()
     cl = layout.get(camera)
@@ -5842,23 +5975,18 @@ async def calibration_frame(request: Request):
 
 @app.post("/api/calibration/refine-tag")
 async def calibration_refine_tag(request: Request):
-    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, u, v, id}.
-    Reads the configured CALIB_TEST_VIDEO at the timestamp, crops to the camera's
-    composite region, runs tag detection in an upscaled ROI around (u,v), and
-    returns {corners: [[u,v]x4]} in crop-pixel coords, or {corners: null}."""
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key?, u, v, id}.
+    Reads the same source frame the page grabbed (match video / video_path /
+    CALIB_TEST_VIDEO), crops to the camera's composite region, runs tag detection
+    in an upscaled ROI around (u,v), and returns {corners: [[u,v]x4]} in
+    crop-pixel coords, or {corners: null}."""
     from web.field.apriltag_detect import detect_tags_in_roi
     body = await request.json()
     camera = body.get("camera", "main")
     tid = int(body["id"])
-    ts = float(body.get("timestamp", 75))
-    path = CALIB_TEST_VIDEO
-    cap = cv2.VideoCapture(str(path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    ok, frame = cap.read()
-    cap.release()
-    if not ok or frame is None:
-        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+    frame, err = await asyncio.to_thread(_read_composite_frame, body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     cl = load_layout().get(camera)
     if cl is None:
         return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
@@ -5953,16 +6081,12 @@ async def calibration_solve_homography(request: Request):
         cal.robot_track_top_crop = existing.robot_track_top_crop
     field_store.save_version(event, camera, cal, start_match=start_match, label=label)
 
-    # Build overlay on the same frame/timestamp.
+    # Build overlay on the same frame/timestamp (and same source video).
     fm = FieldModel.load("2026-rebuilt-welded")
-    ts = float(body.get("timestamp", 75))
-    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    okf, frame = cap.read(); cap.release()
+    frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     overlay_b64 = None
     cl = load_layout().get(camera)
-    if okf and frame is not None and cl is not None:
+    if frame is not None and cl is not None:
         cx, cy, cw, ch = cl.crop
         main = frame[cy:cy + ch, cx:cx + cw].copy()
         for (mx, my, mw_, mh_) in cl.masks:
@@ -6022,23 +6146,27 @@ async def calibration_solve_tags(request: Request):
     if existing is not None:
         cal.masks = existing.masks
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
+    # dry_run solves + renders the overlay without persisting — used by the
+    # calibrate page to re-preview a saved epoch's stored correspondences.
+    if not body.get("dry_run"):
+        field_store.save_version(
+            event, camera, cal, start_match=start_match, label=label,
+            source={"auto_tags": auto, "manual_tags": manual,
+                    "holdout_ids": sorted(holdout_ids),
+                    "timestamp": float(body.get("timestamp", 75)),
+                    "match_key": body.get("match_key")})
     holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
     overlay_b64 = None
-    ts = float(body.get("timestamp", 75))
-    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    okf, frame = cap.read(); cap.release()
+    frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     cl = load_layout().get(camera)
     # Overlay is a best-effort visualization. A poorly-conditioned calibration can
     # make projection blow up; never let drawing failures sink the solve result
     # (the caller still needs rms_error + holdout_error_m to judge the calibration).
     try:
-        if okf and frame is not None and cl is not None:
+        if frame is not None and cl is not None:
             cx, cy, cw, ch = cl.crop
             main = frame[cy:cy + ch, cx:cx + cw].copy()
             for (mx, my, mw_, mh_) in cl.masks:
@@ -6994,6 +7122,7 @@ async def load_event(request: Request):
             "match_count": len(event_data['matches']),
             "matches": event_data['matches'],
             "teams": event_data['teams'],
+            "timezone": event_data.get('timezone'),
             "has_ocr_regions": saved_regions is not None,
             "has_hub_positions": saved_hubs is not None,
         }
@@ -7014,6 +7143,7 @@ async def get_current_event():
         "event_name": current_event['event_name'],
         "matches": current_event['matches'],
         "teams": current_event['teams'],
+        "timezone": current_event.get('timezone'),
         "has_ocr_regions": custom_ocr_regions is not None,
         "has_hub_positions": event_hub_positions is not None,
     }

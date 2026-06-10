@@ -692,18 +692,42 @@ class VisionScorer {
             this.eventSection.style.display = 'block';
         });
 
-        // Populate match dropdown
+        // Populate match dropdown — grouped by comp level, split by day within a level
         const select = document.getElementById('matchSelect');
         select.innerHTML = '<option value="">-- Choose a match --</option>';
 
-        let currentLevel = '';
+        const tz = this.eventData.timezone;
+        const calendarDate = (match) => {
+            if (!match.time) return null;
+            const opts = { year: 'numeric', month: '2-digit', day: '2-digit' };
+            if (tz) opts.timeZone = tz;
+            // en-CA locale formats as YYYY-MM-DD, so dates sort chronologically as strings
+            return new Intl.DateTimeFormat('en-CA', opts).format(new Date(match.time * 1000));
+        };
+        const prettyDate = (match) => {
+            const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+            if (tz) opts.timeZone = tz;
+            return new Intl.DateTimeFormat('en-US', opts).format(new Date(match.time * 1000));
+        };
+
+        // Number the event's distinct match days chronologically: Day 1, Day 2, ...
+        const dayNumbers = new Map();
+        const allDates = [...new Set(this.eventData.matches.map(calendarDate).filter(Boolean))].sort();
+        for (const d of allDates) dayNumbers.set(d, dayNumbers.size + 1);
+
+        let currentGroupKey = null;
+        let currentGroup = null;
         for (const match of this.eventData.matches) {
             const levelLabel = { qm: 'Qualifications', sf: 'Semifinals', f: 'Finals' }[match.comp_level] || match.comp_level;
-            if (match.comp_level !== currentLevel) {
-                const optgroup = document.createElement('optgroup');
-                optgroup.label = levelLabel;
-                select.appendChild(optgroup);
-                currentLevel = match.comp_level;
+            const date = calendarDate(match);
+            const groupKey = `${match.comp_level}|${date || ''}`;
+            if (groupKey !== currentGroupKey) {
+                currentGroup = document.createElement('optgroup');
+                currentGroup.label = date
+                    ? `${levelLabel} — Day ${dayNumbers.get(date)} (${prettyDate(match)})`
+                    : levelLabel;
+                select.appendChild(currentGroup);
+                currentGroupKey = groupKey;
             }
 
             const opt = document.createElement('option');
@@ -715,13 +739,7 @@ class VisionScorer {
             opt.textContent = `${match.label} — Blue: ${blueTeams} vs Red: ${redTeams}${scoreStr}`;
             opt.dataset.matchData = JSON.stringify(match);
 
-            // Append to last optgroup
-            const groups = select.querySelectorAll('optgroup');
-            if (groups.length > 0) {
-                groups[groups.length - 1].appendChild(opt);
-            } else {
-                select.appendChild(opt);
-            }
+            currentGroup.appendChild(opt);
         }
     }
 

@@ -162,7 +162,7 @@ def test_inseparable_evidence_triggers_vlm_and_resolves(base_job):
         
         # Trigger read_fused_bumper_numbers with priorities
         priorities = {0: 10.0, 1: 10.0}
-        base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities)
+        asyncio.run(base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities))
         
     # Verify co-occlusion event is resolved and ambiguity cleared
     assert not base_job.co_occlusion_tracker.get_active_events()
@@ -216,7 +216,7 @@ def test_unreadable_crops_remains_ambiguous(base_job):
         fused_obs1.evidence = [("main", "crop1_b64", 1.0)]
         fused_obs2.evidence = [("main", "crop2_b64", 1.0)]
         priorities = {0: 10.0, 1: 10.0}
-        base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities)
+        asyncio.run(base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities))
         
     # Verify still active/unresolved
     assert len(base_job.co_occlusion_tracker.get_active_events()) == 1
@@ -243,7 +243,7 @@ def test_confirmation_uses_identity_id_when_slot_differs(base_job):
     with patch("web.app._vision_read_bumpers", return_value=[
         {"team_number": "2199", "confidence": 0.95}
     ]):
-        base_job.read_fused_bumper_numbers([fused], {4: 10.0})
+        asyncio.run(base_job.read_fused_bumper_numbers([fused], {4: 10.0}))
 
     assert robot.team_ocr_votes["2199"] == 2.5
     assert robot.team_number == "2199"

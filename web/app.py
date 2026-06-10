@@ -309,6 +309,11 @@ VLM_BATCH_READS = os.environ.get("VLM_BATCH_READS", "1") not in ("0", "false", "
 # (sqrt-damped in blend_read_confidence): a wavering read loses its
 # full-weight vote instead of riding the 0.95 exact-roster-match ladder.
 VLM_LOGPROB_CONFIDENCE = os.environ.get("VLM_LOGPROB_CONFIDENCE", "1") not in ("0", "false", "False")
+# Live-view frame streaming: display sends are rate-capped and pushed through
+# a latest-only queue so a slow websocket client never back-pressures the
+# inference loop. The replay recorder keeps its own full-rate copy.
+FRAME_STREAM_INTERVAL_SEC = float(os.environ.get("FRAME_STREAM_INTERVAL_SEC", "0.1"))
+FRAME_STREAM_JPEG_QUALITY = int(os.environ.get("FRAME_STREAM_JPEG_QUALITY", "70"))
 # Never schedule a read for a slot whose bumper is occluded in EVERY camera.
 VLM_OCCLUSION_GATE = os.environ.get("VLM_OCCLUSION_GATE", "1") not in ("0", "false", "False")
 AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
@@ -1520,10 +1525,14 @@ class InferenceJob:
                 print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
                       f"(appearance {sim:.2f})")
 
-    def read_fused_bumper_numbers(self, fused, requested_priorities: dict[int, float]) -> None:
+    async def read_fused_bumper_numbers(self, fused, requested_priorities: dict[int, float]) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
-        
+
         Accepts requested_priorities: dict mapping identity_id -> priority.
+
+        The VLM generate runs on a worker thread (CUDA releases the GIL) so the
+        event loop keeps servicing websocket keepalives and pause/stop during a
+        100-500ms read; all identity-state mutation stays on the loop.
         """
         if not self.match_teams:
             self.vlm_status.update({
@@ -1641,7 +1650,8 @@ class InferenceJob:
             "last_error": None,
         })
         try:
-            results = _vision_read_bumpers(
+            results = await asyncio.to_thread(
+                _vision_read_bumpers,
                 crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
                 expected_alliances=expected,
                 provider=provider,
@@ -2237,6 +2247,90 @@ class InferenceJob:
             frame=frame, robots_state=robots_state,
             roster=roster, identified=identified,
         )
+
+    def _frame_stream_due(self, now: float) -> bool:
+        """Rate-cap live-view frame sends to FRAME_STREAM_INTERVAL_SEC."""
+        last = getattr(self, "_last_frame_stream_time", None)
+        if last is not None and (now - last) < FRAME_STREAM_INTERVAL_SEC:
+            return False
+        self._last_frame_stream_time = now
+        return True
+
+    def _ensure_frame_sender(self) -> asyncio.Queue:
+        queue = getattr(self, "_frame_send_queue", None)
+        if queue is None:
+            queue = self._frame_send_queue = asyncio.Queue(maxsize=1)
+        task = getattr(self, "_frame_sender_task", None)
+        if task is None or task.done():
+            self._frame_sender_task = asyncio.get_running_loop().create_task(
+                self._frame_sender_loop(queue)
+            )
+        return queue
+
+    def _enqueue_frame_payload(self, payload) -> None:
+        """Queue a frame for the sender task without ever blocking the frame
+        loop. The queue holds only the newest frame; when a stale frame is
+        dropped, its unsent VLM crops are carried into the replacement so a
+        slow client still sees every crops batch."""
+        queue = self._ensure_frame_sender()
+        while True:
+            try:
+                queue.put_nowait(payload)
+                return
+            except asyncio.QueueFull:
+                try:
+                    dropped = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+                if (payload is not None and dropped is not None
+                        and dropped.get("ocr_crops") is not None
+                        and payload.get("ocr_crops") is None):
+                    payload["ocr_crops"] = dropped["ocr_crops"]
+
+    async def _frame_sender_loop(self, queue: asyncio.Queue) -> None:
+        while True:
+            payload = await queue.get()
+            if payload is None:  # stop sentinel
+                return
+            await self._send_ws(payload)
+
+    async def _stop_frame_sender(self, drain: bool = True) -> None:
+        """Stop the sender task. With drain=True any pending frame is sent
+        first (call before the `complete` message so ordering holds); with
+        drain=False the task is cancelled immediately."""
+        task = getattr(self, "_frame_sender_task", None)
+        self._frame_sender_task = None
+        if task is None or task.done():
+            return
+        if drain:
+            queue = self._frame_send_queue
+            await queue.put(None)  # blocks until pending frame is consumed
+            await task
+        else:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _warn_degraded(self, component: str, message: str) -> None:
+        """Surface a quality-degrading failure (SAM2 fallback, gallery disabled,
+        evidence loss) to the client. One websocket message per component;
+        repeats only bump the count so a per-frame failure can't spam."""
+        warnings = getattr(self, "degradation_warnings", None)
+        if warnings is None:
+            warnings = self.degradation_warnings = []
+        existing = next((w for w in warnings if w["component"] == component), None)
+        if existing is not None:
+            existing["count"] += 1
+            return
+        warnings.append({"component": component, "message": message, "count": 1})
+        print(f"  [DEGRADED] {component}: {message}")
+        await self._send_ws({
+            "type": "degradation_warning",
+            "component": component,
+            "message": message,
+        })
 
     async def _send_ws(self, payload: dict) -> bool:
         """Serialize websocket writes and isolate transport failures from inference."""
@@ -4000,7 +4094,10 @@ class InferenceJob:
                         f"for {self.event_key} before {self.match_key or 'unknown match'}, {scope}"
                     )
                 except Exception as e:
-                    print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
+                    await self._warn_degraded(
+                        "gallery",
+                        f"Appearance gallery load failed ({e}); appearance recovery disabled",
+                    )
                     self.gallery = None
             # Per-phase processing timers (seconds). `total` is filled at the end.
             self.timings = {}
@@ -4205,8 +4302,11 @@ class InferenceJob:
                     backend_label = (
                         "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
                     )
-                    print(f"  [{backend_label}] Failed to initialize tracker/embedder: "
-                          f"{e}. Falling back to Kalman tracking.")
+                    await self._warn_degraded(
+                        "sam2",
+                        f"[{backend_label}] Failed to initialize tracker/embedder: "
+                        f"{e}. Falling back to Kalman tracking.",
+                    )
                     self.use_sam2 = False
                     self.robot_embedder = None
 
@@ -4565,7 +4665,10 @@ class InferenceJob:
                         tmp_dir_obj.cleanup()
 
                 if not self.sam2_raw:
-                    print("  [SAM2] No views produced tracklets — falling back to Kalman tracking.")
+                    await self._warn_degraded(
+                        "sam2",
+                        "No views produced tracklets — falling back to Kalman tracking.",
+                    )
                     self.use_sam2 = False
                 else:
                     self.fused_registry = FusedTrackRegistry()
@@ -4917,8 +5020,12 @@ class InferenceJob:
                         frame_num,
                         person_evidence_boxes_by_cam.get("main", []),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    await self._warn_degraded(
+                        "frame_evidence",
+                        f"Frame evidence recording failed ({e}); backward "
+                        f"re-resolution will be incomplete for this run.",
+                    )
                 await self._sync_identity_registry_frame(
                     fused, ev_list, track_outs,
                     main_person_boxes=person_evidence_boxes_by_cam.get("main", []),
@@ -5065,7 +5172,7 @@ class InferenceJob:
                 })
                 if bool(fused) and len(due_priorities) > 0:
                     self._claude_vision_calls += 1
-                    self.read_fused_bumper_numbers(fused, due_priorities)
+                    await self.read_fused_bumper_numbers(fused, due_priorities)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -5274,10 +5381,6 @@ class InferenceJob:
                 except Exception as e:
                     print(f"[replay] frame record error: {e}")
 
-                # Encode frame
-                _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                
                 # Prepare robot data
                 robots_data = self._canonical_robot_rows()
                 
@@ -5304,13 +5407,18 @@ class InferenceJob:
                         "confidence": event.confidence
                     })
                 
-                # Send frame data via WebSocket
-                if self.websocket:
+                # Stream frame data via the latest-only queue: encode only when
+                # a display send is due, and never wait on the client.
+                if self.websocket and self._frame_stream_due(time.perf_counter()):
+                    _, buffer = cv2.imencode(
+                        '.jpg', annotated_frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, FRAME_STREAM_JPEG_QUALITY])
+                    frame_b64 = base64.b64encode(buffer).decode('utf-8')
                     # Only stream the VLM crops on frames where a fresh batch exists,
                     # to avoid resending the same images every frame.
                     ocr_crops_payload = self.last_ocr_crops if self._ocr_crops_dirty else None
                     self._ocr_crops_dirty = False
-                    sent = await self._send_ws(jsonify({
+                    self._enqueue_frame_payload(jsonify({
                         "type": "frame",
                         "frame_num": frame_num,
                         "processed_frame_num": processed_frame_num,
@@ -5323,8 +5431,6 @@ class InferenceJob:
                         "ocr_crops": ocr_crops_payload,
                         "vlm_status": self.vlm_status,
                     }))
-                    if sent:
-                        await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
 
                 self._current_frame = frame_num
                 previous_processed_source_frame = frame_num
@@ -5357,6 +5463,8 @@ class InferenceJob:
             self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
             self.status = "completed"
 
+            # Deliver any in-flight frame before the complete message.
+            await self._stop_frame_sender(drain=True)
             await self._send_ws(jsonify({
                 "type": "complete",
                 "total_frames": self.total_frames,
@@ -5367,6 +5475,7 @@ class InferenceJob:
                 "autonomous_paths": dict(self.autonomous_paths),
                 "processing_sec": self.timings.get("total"),
                 "timings": self.timings,
+                "degradation_warnings": getattr(self, "degradation_warnings", []),
             }))
         
         except Exception as e:
@@ -5380,6 +5489,10 @@ class InferenceJob:
                 "error": str(e)
             })
         finally:
+            try:
+                await self._stop_frame_sender(drain=False)
+            except Exception:
+                pass
             try:
                 self.diagnostic.close()
             except Exception:

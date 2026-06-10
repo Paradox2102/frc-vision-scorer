@@ -33,10 +33,12 @@ MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
 # absence-based retirement never fires. These drive a second retirement trigger.
 # See docs/superpowers/specs/2026-06-08-sam2-mask-hijack-cull-design.md.
 #
-# DEFAULT OFF: detector-absence + stationarity cannot distinguish a trench from a
-# real robot parked in a persistent detector blind spot. Enable only after the
-# acceptance + adversarial replay tests (plan Task 6) show no false culls.
-CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "0") not in ("0", "false", "False")
+# DEFAULT ON since the 2026-06-10 qm72 gate: the corner_right trench mask was
+# culled in ~12s (vs ~80s of slot pollution without), with identical scores and
+# confirmed-team count vs the cull-off baseline — no false-cull signal. The
+# main-view culls hit the same static junk eviction was already killing, just
+# earlier (evictions 6 -> 0 because the cull preempts them).
+CULL_HIJACK_ENABLED = os.environ.get("CULL_HIJACK_ENABLED", "1") not in ("0", "false", "False")
 # Absences required *within the evidence window* before a stationary object is culled.
 CULL_UNCORROBORATED_REPROMPTS = int(os.environ.get("CULL_UNCORROBORATED_REPROMPTS", "3"))
 # Sliding-window length of corroboration outcomes kept per object. Must be >= K;
@@ -62,6 +64,30 @@ EVICT_WHEN_CAPPED = os.environ.get("SAM2_EVICT_WHEN_CAPPED", "1") not in ("0", "
 # for a degenerate sliver mask sitting inside a full-size detection, which let a
 # collapsed mask block its own replacement.
 SEED_MIN_MASK_AREA_FRAC = float(os.environ.get("SAM2_SEED_MIN_MASK_AREA_FRAC", "0.1"))
+
+# Re-anchoring: a tracked mask that has collapsed to a sliver (area below
+# SEED_MIN_MASK_AREA_FRAC of an overlapping fresh detection's box) is
+# re-prompted under its SAME object id with that detection box, instead of the
+# detection seeding a churned replacement id. Attacks propagation decay at the
+# source (SAM2 re-conditions its memory on the fresh prompt) where the sliver
+# guard / cull / eviction only treat the symptom. Color-conflicting detections
+# never re-anchor. DEFAULT OFF pending A/B.
+REANCHOR_ENABLED = os.environ.get("SAM2_REANCHOR_ENABLED", "0") not in ("0", "false", "False")
+# Min IoS (over smaller) of the degraded mask vs the detection box to re-anchor.
+# A sliver inside the box scores ~1.0; this floor exists so a sliver that has
+# drifted AWAY from the detection (different robot) is not captured.
+REANCHOR_IOS = float(os.environ.get("SAM2_REANCHOR_IOS", "0.5"))
+# v2 guards (qm72 v1 failure: SAM2 never deletes retired objects, so a dead
+# object's mask can flicker back as a noise sliver ANYWHERE and capture a live
+# robot's detection — all 3 v1 re-anchors were such zombie identity transfers).
+# Recency: the object must have had a stored mask within this many boundaries
+# (a genuine collapse is fresh; a zombie has been sliver/absent for many).
+REANCHOR_MAX_BOUNDARY_GAP = int(os.environ.get("SAM2_REANCHOR_MAX_BOUNDARY_GAP", "1"))
+# Locality: the detection must be near the object's last recorded extent —
+# field meters when a projector is available, else tracker pixels. Over one
+# 2s boundary gap a fast robot can outrun 2 m; those churn (safe) by design.
+REANCHOR_MAX_JUMP_M = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_M", "2.0"))
+REANCHOR_MAX_JUMP_PX = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_PX", "100"))
 
 # Color backfill: an object whose metadata color is unknown (seeded from a
 # colorless whole-robot gap-fill) inherits the color of the bumper detections
@@ -455,6 +481,11 @@ class Sam2FieldTracker:
         cull_corrob_ios: float = CULL_CORROB_IOS,
         cull_stationary_m: float = CULL_STATIONARY_M,
         evict_when_capped: bool = EVICT_WHEN_CAPPED,
+        reanchor_enabled: bool = REANCHOR_ENABLED,
+        reanchor_ios: float = REANCHOR_IOS,
+        reanchor_max_boundary_gap: int = REANCHOR_MAX_BOUNDARY_GAP,
+        reanchor_max_jump_m: float = REANCHOR_MAX_JUMP_M,
+        reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
         seed_gate_fn=None,
         project_fn=None,
         progress_cb=None,
@@ -517,6 +548,13 @@ class Sam2FieldTracker:
                 evidence bar as the cull) to claim its slot. Without this, one
                 stale mask pinning the roster makes the tracker permanently
                 blind to new robots.
+            reanchor_enabled: When True, an unmatched detection that strongly
+                overlaps a color-consistent SLIVER mask (area below
+                ``SEED_MIN_MASK_AREA_FRAC`` of the box) re-prompts that mask's
+                existing object id with the detection box instead of seeding a
+                new id — preserving identity across propagation collapse.
+            reanchor_ios: Min IoS (over smaller) of the sliver mask vs the
+                detection box required to re-anchor.
             seed_gate_fn: Optional ``(box) -> bool``; a detection for which it
                 returns False is never seeded as a NEW object (rejection reason
                 ``static_structure``) but still corroborates existing masks.
@@ -566,6 +604,17 @@ class Sam2FieldTracker:
         field_pos_window: dict[int, list] = {}
         # oid -> (pending color, consecutive colored-corroboration count)
         color_backfill_votes: dict[int, tuple] = {}
+        # Re-anchor v2 bookkeeping. boundary_no counts processed re-prompt
+        # boundaries; boundary_mask_record[oid] = (boundary_no, area_px, box)
+        # is the object's extent at the most recent boundary where its mask was
+        # actually fresh (visible within the current chunk) — prompt boxes seed
+        # it. Recency + locality guards read it before any re-anchor.
+        boundary_no = 0
+        boundary_mask_record: dict[int, tuple] = {}
+
+        def _box_area(box) -> float:
+            return max(0.0, float(box[2]) - float(box[0])) * \
+                   max(0.0, float(box[3]) - float(box[1]))
 
         # Prompt each robot box on the prompt frame.  Object IDs are 1-based.
         next_obj_id = 1
@@ -578,6 +627,8 @@ class Sam2FieldTracker:
             )
             first_prompted_frame[next_obj_id] = prompt_idx
             birth_detector_overlap[next_obj_id] = 0.0
+            boundary_mask_record[next_obj_id] = (
+                0, _box_area(box), tuple(int(v) for v in box))
             if diagnostics:
                 diagnostics.record(
                     "sam2.object_created",
@@ -645,6 +696,8 @@ class Sam2FieldTracker:
                     )
                     first_prompted_frame[next_obj_id] = candidate_idx
                     birth_detector_overlap[next_obj_id] = 0.0
+                    boundary_mask_record[next_obj_id] = (
+                        0, _box_area(box), tuple(int(v) for v in box))
                     if object_metadata is not None:
                         object_metadata[next_obj_id] = metadata
                     if diagnostics:
@@ -834,6 +887,7 @@ class Sam2FieldTracker:
                     if last_idx is None or last_idx <= last_end:
                         break  # no forward progress -> end of video
                     last_end = last_idx
+                    boundary_no += 1
 
                     # Re-prompt at the chunk boundary. Recompute the active set
                     # (excluding culled), retiring absent objects.
@@ -1017,6 +1071,96 @@ class Sam2FieldTracker:
                                         details={"frame_idx": last_idx, "box": list(box_val)},
                                     )
                         for j in new_indices:
+                            if reanchor_enabled and existing:
+                                # A detection is only in new_indices because no
+                                # healthy mask claimed it — but a color-consistent
+                                # SLIVER underneath it is the same robot whose
+                                # propagation collapsed. Re-prompt that object id
+                                # with the fresh box instead of churning a new id.
+                                bx1, by1, bx2, by2 = int_boxes[j]
+                                reanchor_box_mask = np.zeros((h, w), bool)
+                                reanchor_box_mask[by1:by2, bx1:bx2] = True
+                                reanchor_box_area = int(reanchor_box_mask.sum())
+                                best_oid = None
+                                best_score = 0.0
+                                for oid, existing_mask in existing.items():
+                                    if existing_colors and new_metadata:
+                                        e_col = existing_colors.get(oid)
+                                        n_col = new_metadata[j]
+                                        if (e_col in {"red", "blue"}
+                                                and n_col in {"red", "blue"}
+                                                and e_col != n_col):
+                                            continue
+                                    if (int(existing_mask.sum())
+                                            >= SEED_MIN_MASK_AREA_FRAC * reanchor_box_area):
+                                        continue  # healthy mask -> not degraded
+                                    # Recency guard: the object must have had a
+                                    # fresh stored mask within the last
+                                    # reanchor_max_boundary_gap boundaries. A
+                                    # zombie (retired mask flickering back as
+                                    # noise) has a much older snapshot.
+                                    rec = boundary_mask_record.get(oid)
+                                    if rec is None:
+                                        continue
+                                    rec_no, rec_area, rec_box = rec
+                                    if boundary_no - rec_no > reanchor_max_boundary_gap:
+                                        continue
+                                    # The snapshot itself must have been healthy
+                                    # (a sliver persisting across boundaries is
+                                    # not a fresh collapse).
+                                    if rec_area < SEED_MIN_MASK_AREA_FRAC * reanchor_box_area:
+                                        continue
+                                    # Locality guard: the detection must be near
+                                    # the last healthy extent — field meters when
+                                    # projectable, else tracker pixels.
+                                    p_prev = p_det = None
+                                    if project_fn is not None:
+                                        p_prev = project_fn(rec_box)
+                                        p_det = project_fn(int_boxes[j])
+                                    if p_prev is not None and p_det is not None:
+                                        jump = ((p_prev[0] - p_det[0]) ** 2
+                                                + (p_prev[1] - p_det[1]) ** 2) ** 0.5
+                                        if jump > reanchor_max_jump_m:
+                                            continue
+                                    else:
+                                        cxp = (rec_box[0] + rec_box[2]) / 2.0
+                                        cyp = (rec_box[1] + rec_box[3]) / 2.0
+                                        cxd = (int_boxes[j][0] + int_boxes[j][2]) / 2.0
+                                        cyd = (int_boxes[j][1] + int_boxes[j][3]) / 2.0
+                                        jump = ((cxp - cxd) ** 2 + (cyp - cyd) ** 2) ** 0.5
+                                        if jump > reanchor_max_jump_px:
+                                            continue
+                                    score = _ios(existing_mask, reanchor_box_mask)
+                                    if score >= reanchor_ios and score > best_score:
+                                        best_oid = oid
+                                        best_score = score
+                                if best_oid is not None:
+                                    predictor.add_new_points_or_box(
+                                        state, frame_idx=last_idx, obj_id=best_oid,
+                                        box=np.asarray(new_boxes[j], dtype=np.float32),
+                                    )
+                                    # The fresh prompt re-conditions the object;
+                                    # sliver-era absence evidence is stale, and the
+                                    # restored extent must be visible to the rest
+                                    # of this boundary (so a second detection over
+                                    # the same robot can't also re-anchor it).
+                                    corroboration_history.pop(best_oid, None)
+                                    existing[best_oid] = reanchor_box_mask
+                                    boundary_mask_record[best_oid] = (
+                                        boundary_no, float(reanchor_box_area),
+                                        tuple(int_boxes[j]))
+                                    if diagnostics:
+                                        diagnostics.increment("sam2_objects_reanchored")
+                                        diagnostics.record(
+                                            "sam2.object_reanchored",
+                                            details={
+                                                "object_id": best_oid,
+                                                "frame_idx": last_idx,
+                                                "box": list(new_boxes[j]),
+                                                "ios": round(best_score, 3),
+                                            },
+                                        )
+                                    continue
                             if seed_gate_fn is not None and not seed_gate_fn(new_boxes[j]):
                                 # Zone-gated: corroboration already counted this
                                 # box above; it just can't found a new object.
@@ -1092,6 +1236,9 @@ class Sam2FieldTracker:
                             )
                             first_prompted_frame[next_obj_id] = last_idx
                             birth_detector_overlap[next_obj_id] = best_ios
+                            boundary_mask_record[next_obj_id] = (
+                                boundary_no, _box_area(new_boxes[j]),
+                                tuple(int_boxes[j]))
                             if diagnostics:
                                 diagnostics.record(
                                     "sam2.object_created",
@@ -1101,6 +1248,19 @@ class Sam2FieldTracker:
                             if object_metadata is not None:
                                 object_metadata[next_obj_id] = new_metadata[j]
                             next_obj_id += 1
+
+                    # Refresh re-anchor snapshots — only for objects whose mask
+                    # was actually emitted within the chunk that just ended. A
+                    # stale mask (absent object) must let its snapshot age out
+                    # so the recency guard can refuse a later zombie sliver.
+                    for oid, m in existing.items():
+                        lv = last_visible_frame.get(oid)
+                        if lv is None or (last_idx - lv) >= reprompt_every:
+                            continue
+                        mb = mask_to_box(m)
+                        if mb is not None:
+                            boundary_mask_record[oid] = (
+                                boundary_no, float(int(m.sum())), mb)
 
                     cursor = last_idx + 1
         finally:

@@ -21,6 +21,7 @@ class DiagnosticEvents:
     SAM2_MASK_REJECTED = "sam2.mask_rejected"
     SAM2_CHUNK_COMPLETE = "sam2.chunk_complete"
     SAM2_OBJECT_CULLED = "sam2.object_culled"
+    SAM2_OBJECT_REANCHORED = "sam2.object_reanchored"
     SAM2_DETECTOR_ERROR = "sam2.detector_error"
     SAM2_COLOR_BACKFILLED = "sam2.color_backfilled"
 

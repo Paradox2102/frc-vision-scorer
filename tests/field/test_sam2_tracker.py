@@ -1337,3 +1337,315 @@ def test_tracker_drops_implausible_mask_object():
     rejected = [e for e in diag._events if e["event"] == "sam2.mask_rejected"]
     assert rejected, "expected a sam2.mask_rejected diagnostic for the implausible mask"
     assert rejected[0]["reason"] == "mask_implausible"
+
+
+# ---------------------------------------------------------------------------
+# Re-anchoring — a degraded (sliver) mask is re-prompted under its SAME obj_id
+# when a fresh detection corroborates it, instead of seeding a churned new id.
+# ---------------------------------------------------------------------------
+
+class ReanchorStubPredictor:
+    """Reprompt stub whose object 1 collapses to a 1px sliver after a frame.
+
+    Object ``oid`` lives at x in [10*oid, 10*oid+4). From ``collapse_after``
+    (inclusive) onward, object ``collapse_oid``'s mask is a 1x1 sliver at its
+    box's top-left UNLESS add_new_points_or_box has been called again for that
+    obj_id at frame >= collapse_after, which restores the full box from that
+    frame (modelling SAM2 re-conditioning on a fresh prompt).
+    """
+    H = 20
+    W = 200
+    NUM_FRAMES = 12
+
+    def __init__(self, collapse_oid=1, collapse_after=2):
+        self.collapse_oid = collapse_oid
+        self.collapse_after = collapse_after
+        self.add_calls: list[tuple[int, int]] = []
+        self._restored_at: int | None = None
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        first = obj_id not in state["objs"]
+        if first:
+            state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+        if (not first and obj_id == self.collapse_oid
+                and frame_idx >= self.collapse_after):
+            self._restored_at = frame_idx
+
+    def _rect_for(self, oid: int, f: int = 0) -> tuple[int, int, int, int]:
+        x0 = oid * 10
+        if (oid == self.collapse_oid and f >= self.collapse_after
+                and (self._restored_at is None or f < self._restored_at)):
+            return (x0, 2, x0 + 1, 3)  # collapsed sliver
+        return (x0, 2, x0 + 4, 6)
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        end = (self.NUM_FRAMES - 1 if max_frame_num_to_track is None
+               else min(start + max_frame_num_to_track, self.NUM_FRAMES - 1))
+        for f in range(start, end + 1):
+            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            rects = [self._rect_for(oid, f) for oid in active]
+            yield f, active, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def _reanchored_ids(diagnostics):
+    return {e["details"]["object_id"]
+            for e in diagnostics._events
+            if e.get("event") == "sam2.object_reanchored"}
+
+
+def test_reanchor_restores_collapsed_mask_under_same_id():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # The detector keeps seeing the full robot at obj 1's spot.
+        return [(stub._rect_for(1, 0), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        diagnostics=diag,
+    )
+
+    # Re-anchored: same obj id prompted again, no churned replacement id.
+    reanchors = [(f, oid) for (f, oid) in stub.add_calls[1:] if oid == 1]
+    assert reanchors, "expected a second add_new_points_or_box for obj 1"
+    assert 1 in _reanchored_ids(diag)
+    created = [e for e in diag._events if e["event"] == "sam2.object_created"]
+    assert len(created) == 1, "no new object id may be seeded for the sliver's box"
+    # After the re-anchor the mask is full-size again under id 1.
+    last_frame = max(result)
+    assert 1 in result[last_frame]
+    x1, y1, x2, y2 = result[last_frame][1]["box"]
+    assert (x2 - x1) >= 4, "mask should be restored to full width"
+
+
+def test_reanchor_disabled_seeds_replacement_id():
+    """Without re-anchoring the sliver cannot claim the detection
+    (SEED_MIN_MASK_AREA_FRAC), so the box churns a NEW object id."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1, 0), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=False,
+        diagnostics=diag,
+    )
+    created = [e for e in diag._events if e["event"] == "sam2.object_created"]
+    assert len(created) >= 2, "churn path: sliver's box seeds replacement id(s)"
+    assert _reanchored_ids(diag) == set()
+
+
+def test_reanchor_refuses_color_conflicting_detection():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # A BLUE detection over the collapsed RED object's spot.
+        return [(stub._rect_for(1, 0), "blue")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        diagnostics=diag,
+    )
+    assert _reanchored_ids(diag) == set(), \
+        "a blue box must never re-anchor a red object"
+
+
+def test_reanchor_leaves_healthy_masks_alone():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ReanchorStubPredictor(collapse_oid=99, collapse_after=99)  # nothing collapses
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1, 0), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        diagnostics=diag,
+    )
+    assert _reanchored_ids(diag) == set()
+    assert len(stub.add_calls) == 1, "healthy mask must not be re-prompted"
+
+
+# ---------------------------------------------------------------------------
+# Re-anchor v2 guards: recency (fresh collapse only) + locality (near the last
+# healthy extent). Modelled on the qm72 v1 failure where retired objects'
+# noise slivers captured live robots' detections across the frame.
+# ---------------------------------------------------------------------------
+
+class ZombieStubPredictor:
+    """Obj 1 is healthy at x=10 for frames [0, gone_from), then its mask is
+    EMPTY until ``sliver_from``, after which a 1px noise sliver appears at
+    ``sliver_x`` (far from home). A second add_new_points_or_box for obj 1
+    'restores' a full box at the sliver site (so a wrongful re-anchor is
+    observable). Obj 2 is a healthy robot parked at ``sliver_x`` throughout.
+    """
+    H = 20
+    W = 200
+    NUM_FRAMES = 12
+
+    def __init__(self, gone_from=3, sliver_from=9, sliver_x=80):
+        self.gone_from = gone_from
+        self.sliver_from = sliver_from
+        self.sliver_x = sliver_x
+        self.add_calls: list[tuple[int, int]] = []
+        self._restored_at: int | None = None
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        first = obj_id not in state["objs"]
+        if first:
+            state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+        if not first and obj_id == 1:
+            self._restored_at = frame_idx
+
+    def _rect_for(self, oid: int, f: int) -> tuple[int, int, int, int] | None:
+        if oid == 1:
+            if self._restored_at is not None and f >= self._restored_at:
+                return (self.sliver_x, 2, self.sliver_x + 4, 6)
+            if f < self.gone_from:
+                return (10, 2, 14, 6)
+            if f >= self.sliver_from:
+                return (self.sliver_x, 2, self.sliver_x + 1, 3)
+            return None  # mask empty
+        return (self.sliver_x, 2, self.sliver_x + 4, 6)  # obj 2: parked robot
+
+    def propagate_in_video(self, state, start_frame_idx=None, max_frame_num_to_track=None):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        end = (self.NUM_FRAMES - 1 if max_frame_num_to_track is None
+               else min(start + max_frame_num_to_track, self.NUM_FRAMES - 1))
+        for f in range(start, end + 1):
+            active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+            rects, oids = [], []
+            for oid in active:
+                r = self._rect_for(oid, f)
+                if r is not None:
+                    rects.append(r)
+                    oids.append(oid)
+                else:
+                    rects.append((0, 0, 0, 0))  # empty mask row
+                    oids.append(oid)
+            yield f, oids, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_reanchor_refuses_zombie_resurrection():
+    """A long-dead object's noise sliver must NOT capture a live robot's
+    detection — the v1 failure mode (qm72: retired obj re-anchored 900+
+    frames later onto a robot across the frame)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ZombieStubPredictor(gone_from=3, sliver_from=9, sliver_x=80)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # The detector sees the real parked robot at the sliver site.
+        return [((80, 2, 84, 6), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        reanchor_max_jump_px=30.0,
+        diagnostics=diag,
+    )
+    assert 1 not in _reanchored_ids(diag), \
+        "zombie sliver must not be re-anchored onto another robot"
+
+
+def test_reanchor_refuses_drifted_sliver():
+    """A sliver that drifted far from the object's last healthy position must
+    not capture a detection there, even if the collapse is recent."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    class DriftStub(ZombieStubPredictor):
+        def _rect_for(self, oid, f):
+            if oid == 1:
+                if self._restored_at is not None and f >= self._restored_at:
+                    return (self.sliver_x, 2, self.sliver_x + 4, 6)
+                if f < 3:
+                    return (10, 2, 14, 6)
+                return (self.sliver_x, 2, self.sliver_x + 1, 3)  # drifted sliver
+            return (self.sliver_x, 2, self.sliver_x + 4, 6)
+
+    stub = DriftStub(sliver_x=80)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [((80, 2, 84, 6), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        reanchor_max_jump_px=30.0,
+        diagnostics=diag,
+    )
+    assert 1 not in _reanchored_ids(diag), \
+        "a far-drifted sliver must not be re-anchored (locality guard)"
+
+
+def test_reanchor_in_place_collapse_still_rescued():
+    """The guards must not break the intended case: a fresh in-place collapse
+    (healthy one boundary ago, detection at the same spot) re-anchors."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=4)
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1, 0), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[(10, 2, 14, 6)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "red"},
+        reanchor_enabled=True,
+        reanchor_max_jump_px=30.0,
+        diagnostics=diag,
+    )
+    assert 1 in _reanchored_ids(diag)

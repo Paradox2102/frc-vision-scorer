@@ -476,11 +476,14 @@ TRACKING_BACKEND = os.environ.get("TRACKING_BACKEND", "sam2").lower()
 if TRACKING_BACKEND not in {"sam2", "sam3"}:
     TRACKING_BACKEND = "sam2"
 SAM2_MODEL_SIZE = os.environ.get("SAM2_MODEL_SIZE", "small").lower()
+# Config paths are resolved by SAM2's hydra search path (package-relative); the
+# checkpoint paths are OURS and must be absolute — a CWD-relative path silently
+# fell back to Kalman tracking when the server was started from web/ (start.sh).
 _SAM2_MODELS = {
-    "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  "checkpoints/sam2.1_hiera_tiny.pt"),
-    "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  "checkpoints/sam2.1_hiera_small.pt"),
-    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "checkpoints/sam2.1_hiera_base_plus.pt"),
-    "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "checkpoints/sam2.1_hiera_large.pt"),
+    "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_tiny.pt")),
+    "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_small.pt")),
+    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_base_plus.pt")),
+    "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_large.pt")),
 }
 SAM2_CONFIG, SAM2_CHECKPOINT = _SAM2_MODELS.get(SAM2_MODEL_SIZE, _SAM2_MODELS["small"])
 # Display metadata for the UI model picker (ordered fast -> precise).

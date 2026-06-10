@@ -92,7 +92,13 @@ from web.field.zones import load_zones, point_in_zones, prism_bounding_zones, sa
 from web.replay_recorder import ReplayRecorder
 from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
-from web.field.identity_confidence import ConfidenceConfig, decide_vlm_read
+from web.field.identity_confidence import (
+    ConfidenceConfig,
+    blend_read_confidence,
+    decide_vlm_read,
+    digit_token_conf,
+    occlusion_blocks_read,
+)
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
 from web.field.track_evidence import MatchEvidence
@@ -296,6 +302,15 @@ EMBED_EMA_ALPHA = 0.3     # weight of the new embedding in the running EMA
 
 LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
+# One padded generate over all due crops instead of one generate per crop
+# (2-4x read throughput; same model, same prompts). Kill-switch for A/B.
+VLM_BATCH_READS = os.environ.get("VLM_BATCH_READS", "1") not in ("0", "false", "False")
+# Fold the model's own per-digit token probability into read confidence
+# (sqrt-damped in blend_read_confidence): a wavering read loses its
+# full-weight vote instead of riding the 0.95 exact-roster-match ladder.
+VLM_LOGPROB_CONFIDENCE = os.environ.get("VLM_LOGPROB_CONFIDENCE", "1") not in ("0", "false", "False")
+# Never schedule a read for a slot whose bumper is occluded in EVERY camera.
+VLM_OCCLUSION_GATE = os.environ.get("VLM_OCCLUSION_GATE", "1") not in ("0", "false", "False")
 AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
 VLM_UNCONFIRMED_FAST_INTERVAL_SEC = 0.75
 VLM_UNCONFIRMED_MED_INTERVAL_SEC = 1.25
@@ -1644,8 +1659,9 @@ class InferenceJob:
             if not robot or not ident:
                 continue
 
-            # Update VLM attempt time
+            # Update VLM attempt time + position (novelty-gate reference)
             ident.last_vlm_time = current_match_time
+            ident.last_vlm_pos = getattr(robot, "field_position", None)
 
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
@@ -4995,6 +5011,28 @@ class InferenceJob:
                 for ident in self.identity_registry.identities.values():
                     if ident.active_slot is None:
                         continue
+                    # Occlusion gate: a bumper hidden in EVERY camera cannot
+                    # be read — at best a wasted call, at worst a garbage-crop
+                    # contradiction against a correct lock. The
+                    # needs_immediate_read flag is NOT cleared, so the read
+                    # fires on the first visible frame.
+                    if VLM_OCCLUSION_GATE and occlusion_blocks_read(
+                            (self._occ or {}).get(ident.active_slot)):
+                        self.identity_diagnostics.increment(
+                            "vlm_scheduled.occluded_skip")
+                        continue
+                    # Novelty inputs: a failed read of an unmoved robot is
+                    # the same unreadable view again (decide_vlm_read gates
+                    # it, bounded by novelty_skip_max_sec).
+                    last_failed = (ident.last_vlm_time > ident.last_success_time)
+                    moved = True
+                    slot_track = self._get_slot_track_if_exists(ident.active_slot)
+                    cur_pos = getattr(slot_track, "field_position", None)
+                    if ident.last_vlm_pos is not None and cur_pos is not None:
+                        moved = (
+                            (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
+                            + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
+                        ) ** 0.5 >= self.confidence_config.novelty_min_move_m
                     decision = decide_vlm_read(
                         is_confirmed=ident.is_confirmed,
                         confidence=ident.confidence,
@@ -5004,7 +5042,9 @@ class InferenceJob:
                         needs_immediate_read=ident.needs_immediate_read,
                         current_match_time=current_match_time,
                         unconfirmed_count=unconfirmed_count,
-                        config=self.confidence_config
+                        config=self.confidence_config,
+                        last_read_failed=last_failed,
+                        moved_since_read=moved,
                     )
                     if decision.due:
                         due_priorities[ident.identity_id] = decision.priority
@@ -6404,6 +6444,12 @@ def _get_qwen_vl():
             )
         except TypeError:
             _qwen_vl_processor = AutoProcessor.from_pretrained(VLM_MODEL_NAME)
+        # Batched generation on a decoder-only model requires LEFT padding —
+        # right-padded rows would generate from pad tokens.
+        try:
+            _qwen_vl_processor.tokenizer.padding_side = "left"
+        except AttributeError:
+            pass
         print(f"VLM loaded: {VLM_MODEL_NAME} ({torch.cuda.memory_allocated() / 1e9:.1f} GB VRAM)")
     return _qwen_vl_model, _qwen_vl_processor
 
@@ -6623,8 +6669,14 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                            expected_alliances: Optional[list] = None) -> list:
     """Use the local VLM (VLM_MODEL_NAME, default Qwen3-VL) to read bumper numbers from robot crops.
 
-    Processes each crop individually (Qwen VL handles multi-image differently from Claude).
-    Returns list of {"team_number": str|None, "alliance": str, "confidence": float}.
+    All due crops go through ONE padded generate call (VLM_BATCH_READS) —
+    prompts differ only in the alliance hint, so they batch cleanly; a batch
+    failure falls back to per-crop calls. With VLM_LOGPROB_CONFIDENCE, the
+    model's per-digit token probability is folded into the roster-match
+    confidence (blend_read_confidence) so a wavering read loses vote weight.
+
+    Returns list of {"team_number": str|None, "alliance": str,
+    "confidence": float, "raw_read": str|None, "digit_prob": float|None}.
     """
     import torch
     try:
@@ -6635,14 +6687,17 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
         return [{"team_number": None, "alliance": "unknown", "confidence": 0}] * len(robot_crops_b64)
 
     teams_str = ", ".join(match_teams)
-    blue_str = ", ".join(blue_teams)
-    red_str = ", ".join(red_teams)
     expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
 
-    results = []
+    def _error_entry(e):
+        return {"team_number": None, "alliance": "unknown", "confidence": 0,
+                "raw_read": None, "error": str(e)}
+
+    # ---- Phase 1: one (messages, context) item per decodable crop ----
+    results: list = [None] * len(robot_crops_b64)
+    items = []  # (idx, messages, expected_alliance, candidate_str, img_size)
     for idx, crop_b64 in enumerate(robot_crops_b64):
         try:
-            # Decode base64 to PIL Image
             img_bytes = base64.b64decode(crop_b64)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
@@ -6683,88 +6738,134 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 '{"team": "<the digits, or null if you cannot read them>", '
                 '"color": "red" or "blue"}.'
             )
-
             messages = [
                 {"role": "user", "content": [
                     {"type": "image", "image": img},
                     {"type": "text", "text": prompt},
                 ]}
             ]
-
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs, max_new_tokens=64)
-
-            # Trim input tokens from output
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0].strip()
-
-            print(f"    Qwen input image: {img.size}, raw output: {output_text}")
-
-            # Parse JSON from response
-            team = None
-            color = "unknown"
-            try:
-                # Handle markdown code blocks
-                clean = output_text
-                if "```" in clean:
-                    clean = clean.split("```")[1]
-                    if clean.startswith("json"):
-                        clean = clean[4:]
-                    clean = clean.strip()
-                # Find JSON object
-                start = clean.find("{")
-                end = clean.rfind("}") + 1
-                if start >= 0 and end > start:
-                    parsed = json.loads(clean[start:end])
-                    team = parsed.get("team")
-                    color = parsed.get("color", "unknown")
-                    if team is not None:
-                        team = str(team)
-            except (json.JSONDecodeError, Exception):
-                pass
-
-            print(f"    Qwen parsed: team={team}, color={color}, expected={expected_alliance}, candidates={candidate_str}")
-
-            read = "".join(ch for ch in team if ch.isdigit()) if team else ""
-            model_color = color if color in ("blue", "red") else "unknown"
-            matched, alliance, confidence = _match_bumper_read_to_roster(
-                read, model_color, expected_alliance,
-                match_teams, blue_teams, red_teams,
-            )
-            if read and not matched:
-                print(f"    Qwen read '{read}' — no roster match for alliance hint {expected_alliance}/{model_color}")
-
-            results.append({
-                "team_number": matched,
-                "alliance": alliance,
-                "confidence": confidence,
-                "raw_read": read,
-            })
-
+            items.append((idx, messages, expected_alliance, candidate_str, img.size))
         except Exception as e:
             print(f"  Qwen VL error on crop: {e}")
-            results.append({
-                "team_number": None,
-                "alliance": "unknown",
-                "confidence": 0,
-                "raw_read": None,
-                "error": str(e),
-            })
+            results[idx] = _error_entry(e)
 
+    # ---- Phase 2: one batched generate (per-crop fallback on failure) ----
+    def _generate(batch):
+        """batch: list of phase-1 items -> list of (output_text, digit_prob)."""
+        msgs = [m for (_i, m, _a, _c, _s) in batch]
+        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                 for m in msgs]
+        image_inputs, video_inputs = process_vision_info(msgs)
+        inputs = processor(
+            text=texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(model.device)
+        with torch.no_grad():
+            gen = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                return_dict_in_generate=True,
+                output_scores=VLM_LOGPROB_CONFIDENCE,
+            )
+        # Left padding makes the prompt length uniform across rows.
+        in_len = inputs.input_ids.shape[1]
+        trimmed = gen.sequences[:, in_len:]
+        outs = processor.batch_decode(
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        digit_probs = [None] * len(batch)
+        if VLM_LOGPROB_CONFIDENCE and gen.scores:
+            tok = processor.tokenizer
+            stop_ids = {tid for tid in (tok.eos_token_id, tok.pad_token_id)
+                        if tid is not None}
+            for b in range(len(batch)):
+                probs, tok_texts = [], []
+                for t, step_logits in enumerate(gen.scores):
+                    if t >= trimmed.shape[1]:
+                        break
+                    tid = int(trimmed[b, t])
+                    if tid in stop_ids:
+                        break
+                    probs.append(
+                        torch.softmax(step_logits[b].float(), dim=-1)[tid].item())
+                    tok_texts.append(tok.decode([tid]))
+                digit_probs[b] = digit_token_conf(probs, tok_texts)
+        return [(o.strip(), dp) for o, dp in zip(outs, digit_probs)]
+
+    decoded: list = [None] * len(items)
+    if items:
+        batched = VLM_BATCH_READS and len(items) > 1
+        if batched:
+            try:
+                decoded = _generate(items)
+            except Exception as e:
+                print(f"  Qwen VL batched generate failed ({e!r}); falling back to per-crop")
+        if any(d is None for d in decoded):
+            for k, item in enumerate(items):
+                if decoded[k] is not None:
+                    continue
+                try:
+                    decoded[k] = _generate([item])[0]
+                except Exception as e:
+                    print(f"  Qwen VL error on crop: {e}")
+                    results[item[0]] = _error_entry(e)
+
+    # ---- Phase 3: parse + roster-match each output ----
+    for item, out in zip(items, decoded):
+        idx, _messages, expected_alliance, candidate_str, img_size = item
+        if out is None:
+            if results[idx] is None:
+                results[idx] = _error_entry("no VLM output")
+            continue
+        output_text, digit_prob = out
+        print(f"    Qwen input image: {img_size}, raw output: {output_text}")
+
+        team = None
+        color = "unknown"
+        try:
+            clean = output_text
+            if "```" in clean:
+                clean = clean.split("```")[1]
+                if clean.startswith("json"):
+                    clean = clean[4:]
+                clean = clean.strip()
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(clean[start:end])
+                team = parsed.get("team")
+                color = parsed.get("color", "unknown")
+                if team is not None:
+                    team = str(team)
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        print(f"    Qwen parsed: team={team}, color={color}, "
+              f"expected={expected_alliance}, candidates={candidate_str}, "
+              f"digit_prob={None if digit_prob is None else round(digit_prob, 3)}")
+
+        read = "".join(ch for ch in team if ch.isdigit()) if team else ""
+        model_color = color if color in ("blue", "red") else "unknown"
+        matched, alliance, confidence = _match_bumper_read_to_roster(
+            read, model_color, expected_alliance,
+            match_teams, blue_teams, red_teams,
+        )
+        confidence = blend_read_confidence(confidence, digit_prob)
+        if read and not matched:
+            print(f"    Qwen read '{read}' — no roster match for alliance hint {expected_alliance}/{model_color}")
+
+        results[idx] = {
+            "team_number": matched,
+            "alliance": alliance,
+            "confidence": confidence,
+            "raw_read": read,
+            "digit_prob": digit_prob,
+        }
+
+    results = [r if r is not None else _error_entry("skipped") for r in results]
     identified = sum(1 for r in results if r["team_number"])
     print(f"  Qwen VL: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")

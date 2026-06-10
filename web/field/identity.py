@@ -19,6 +19,9 @@ class RobotIdentity:
     confidence: float = 0.5
     last_vlm_time: float = -999.0
     last_success_time: float = -999.0
+    # Field position at the last VLM attempt — the novelty gate skips a failed
+    # retry until the robot has moved enough to present a new view.
+    last_vlm_pos: tuple[float, float] | None = None
     backoff_until: float = -999.0
     vlm_fail_count: int = 0
     needs_immediate_read: bool = False

@@ -72,6 +72,7 @@ from web.field.detect_bridge import (
 )
 from web.field.detect_schema import (
     DetectionSchema,
+    bumper_admissible,
     expand_bumper_to_robot,
     box_ios,
     merge_robot_detections,
@@ -448,9 +449,13 @@ GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4
 # auto-deposited ones so corrections reliably override bad OCR.
 GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGHT", "2.0"))
 
-# SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
-# to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
-REPROMPT_SECONDS = 2.0
+# SAM2 periodic re-prompting: re-run the detector every REPROMPT_SECONDS of
+# tracked footage to catch robots that start occluded (e.g. behind the hub) and
+# emerge mid-match. This is the new-robot ACQUISITION LATENCY: a robot is
+# invisible until the next boundary. Env-tunable for A/B; note the cull and
+# eviction evidence windows are counted in boundaries, so halving this also
+# halves their time horizons.
+REPROMPT_SECONDS = float(os.environ.get("REPROMPT_SECONDS", "2.0") or "2.0")
 # Seed after robots have begun moving out of their often-obscured starting
 # positions, then run the initial SAM propagation backward to the active start.
 SAM2_PROMPT_OFFSET_SECONDS = max(
@@ -1129,6 +1134,42 @@ class InferenceJob:
                 if not box_exceeds_frac(box, frame.shape, ROBOT_FILL_MAX_BOX_FRAC):
                     valid_boxes.append(box)
         return valid_boxes
+
+    def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4):
+        """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
+        frame (already top-cropped): bumper detections — admitted by shape OR
+        by whole-robot corroboration — expanded to robot boxes, merged with
+        whole-robot gap fills, person candidates vetoed.
+
+        Returns [(box_xyxy, color)] in the input frame's pixel coords. Field
+        filtering and any coordinate scaling are the caller's concern (they
+        differ between the prompt-seeding and re-prompt paths).
+        """
+        whole_boxes = self._detect_whole_robots(frame)
+        bumper_robots = []
+        if self.bumper_model is not None:
+            res = self.bumper_model(frame, conf=conf, verbose=False)[0]
+            robots, _balls, _hubs = self.det_schema.split(
+                sv.Detections.from_ultralytics(res)
+            )
+            for box, color, _confidence in robots:
+                if not bumper_admissible(box, whole_boxes):
+                    continue
+                robot_box = expand_bumper_to_robot(
+                    box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR
+                )
+                bumper_robots.append((robot_box, color))
+        merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
+        person_res = self.person_model(
+            frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
+        )[0]
+        person_dets = sv.Detections.from_ultralytics(person_res)
+        person_boxes = [
+            tuple(person_dets.xyxy[i]) for i in range(len(person_dets))
+        ]
+        return reject_person_candidates(
+            merged, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
+        )
 
     @staticmethod
     def _below_robot_tracking_top(view, box, frame_height: int) -> bool:
@@ -4212,42 +4253,8 @@ class InferenceJob:
  
                                     # Seed SAM2 from expanded bumper detections so masks
                                     # cover whole robots while color stays class-derived.
-                                    if is_prompt and self.bumper_model is not None:
-                                        res = self.bumper_model(
-                                            crop, conf=0.4, verbose=False
-                                        )[0]
-                                        robots, _balls, _hubs = self.det_schema.split(
-                                            sv.Detections.from_ultralytics(res)
-                                        )
-                                        bumper_robots = []
-                                        for box, color, _confidence in robots:
-                                            if not plausible_bumper_box(box):
-                                                continue
-                                            robot_box = expand_bumper_to_robot(
-                                                box,
-                                                crop.shape,
-                                                ROBOT_BOX_FROM_BUMPER_FACTOR,
-                                            )
-                                            bumper_robots.append((robot_box, color))
-                                        
-                                        whole_boxes = self._detect_whole_robots(crop)
-                                        merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
-                                        person_res = self.person_model(
-                                            crop,
-                                            classes=[0],
-                                            conf=DET_CONF_THRESHOLD,
-                                            verbose=False,
-                                        )[0]
-                                        person_dets = sv.Detections.from_ultralytics(person_res)
-                                        person_boxes = [
-                                            tuple(person_dets.xyxy[i])
-                                            for i in range(len(person_dets))
-                                        ]
-                                        merged = reject_person_candidates(
-                                            merged,
-                                            person_boxes,
-                                            PERSON_ROBOT_REJECT_COVERAGE,
-                                        )
+                                    if is_prompt:
+                                        merged = self._sam2_robot_candidates(crop)
                                         full_boxes = [
                                             (
                                                 box[0],
@@ -4303,13 +4310,6 @@ class InferenceJob:
                                                 tuple(v * SAM2_SCALE for v in unknown_boxes[idx])
                                             )
                                             view_prompt_colors[view.name].append("unknown")
-                                    elif is_prompt:
-                                        res = self.model(crop, conf=0.4, verbose=False)[0]
-                                        for i in range(len(res.boxes)):
-                                            if int(res.boxes.cls[i]) == 1:
-                                                box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
-                                                view_prompt_boxes[view.name].append(tuple(box))
-                                                view_prompt_colors[view.name].append(None)
                                 except Exception as e:
                                     print(f"  [SAM2] Error exporting frame {local_idx} for view {view.name}: {e}")
                             local_idx += 1
@@ -4348,6 +4348,7 @@ class InferenceJob:
                             base_pct,
                         )
 
+                    _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
                     try:
                         def make_progress_cb(b_pct, sp_pct, v_name):
                             def progress_cb(current, total):
@@ -4358,117 +4359,69 @@ class InferenceJob:
                                 )
                             return progress_cb
 
-                        # Periodic re-prompting: re-run YOLO at chunk boundaries so
-                        # robots that start occluded (e.g. behind the hub) get picked
-                        # up once they emerge.  detect_fn runs on the exact JPEG SAM2
-                        # tracks, so returned boxes are already in SAM2 (0.5x) coords.
-                        def make_detect_fn():
+                        # Periodic re-prompting: re-run the detector cascade at chunk
+                        # boundaries so robots that start occluded (e.g. behind the
+                        # hub) get picked up once they emerge.  Detection runs on the
+                        # FULL-RESOLUTION source frame (decoded on demand — one seek
+                        # per ~2s of footage), not the 0.5x JPEG export SAM2 tracks:
+                        # the re-acquisition path exists for the hard cases, so it
+                        # must not have the worst recall of the three detect paths.
+                        # Returned boxes are scaled into SAM2 (0.5x, top-cropped)
+                        # coords to match the masks.
+                        def make_detect_fn(detect_caps):
+                            state = {"cap": None, "pos": None}
+                            detect_caps.append(state)
+
                             def detect_fn(local_idx, frame_path):
-                                if not frame_path:
+                                if local_idx is None or local_idx >= len(all_frames):
                                     return None
-                                img = cv2.imread(frame_path)
-                                if img is None:
+                                source_frame = all_frames[local_idx]
+                                if state["cap"] is None:
+                                    state["cap"] = cv2.VideoCapture(str(self.video_path))
+                                cap_l = state["cap"]
+                                if state["pos"] != source_frame:
+                                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                                ok, fr = cap_l.read()
+                                state["pos"] = source_frame + 1
+                                if not ok or fr is None:
                                     return None
-                                if self.bumper_model is not None:
-                                    res = self.bumper_model(
-                                        img, conf=0.4, verbose=False
-                                    )[0]
-                                    robots, _balls, _hubs = self.det_schema.split(
-                                        sv.Detections.from_ultralytics(res)
-                                    )
-                                    bumper_robots = []
-                                    for box, color, _confidence in robots:
-                                        if not plausible_bumper_box(box):
-                                            continue
-                                        robot_box = expand_bumper_to_robot(
-                                            box,
-                                            img.shape,
-                                            ROBOT_BOX_FROM_BUMPER_FACTOR,
-                                        )
-                                        bumper_robots.append((robot_box, color))
-                                    whole_boxes = self._detect_whole_robots(img)
-                                    merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
-                                    person_res = self.person_model(
-                                        img,
-                                        classes=[0],
-                                        conf=DET_CONF_THRESHOLD,
-                                        verbose=False,
-                                    )[0]
-                                    person_dets = sv.Detections.from_ultralytics(person_res)
-                                    person_boxes = [
-                                        tuple(person_dets.xyxy[i])
-                                        for i in range(len(person_dets))
-                                    ]
-                                    merged = reject_person_candidates(
-                                        merged,
-                                        person_boxes,
-                                        PERSON_ROBOT_REJECT_COVERAGE,
-                                    )
-                                    top_crop_frac = (
-                                        getattr(
-                                            view.calibration,
-                                            "robot_track_top_crop",
-                                            0.0,
-                                        )
-                                        or 0.0
-                                    ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                    full_h = int(
-                                        round(img.shape[0] / SAM2_SCALE)
-                                    )
-                                    y_offset = int(
-                                        full_h * top_crop_frac
-                                        / max(1.0 - top_crop_frac, 1e-6)
-                                    ) if top_crop_frac > 0 else 0
-                                    full_boxes = [
-                                        (
-                                            box[0] / SAM2_SCALE,
-                                            box[1] / SAM2_SCALE + y_offset,
-                                            box[2] / SAM2_SCALE,
-                                            box[3] / SAM2_SCALE + y_offset,
-                                        )
-                                        for box, _color in merged
-                                    ]
-                                    # No blocked_zones: detect_fn output also
-                                    # corroborates existing masks (a zone-parked
-                                    # robot must stay detector-present); seeding
-                                    # inside zones is blocked by seed_gate_fn.
-                                    keep = filter_field_robot_boxes(
-                                        full_boxes,
-                                        view.calibration,
-                                        self.field_dims,
-                                        frame_shape=(
-                                            full_h + y_offset,
-                                            int(round(img.shape[1] / SAM2_SCALE)),
-                                            3,
-                                        ),
-                                    )
-                                    return [merged[idx] for idx in keep]
-                                res = self.model(img, conf=0.4, verbose=False)[0]
-                                boxes = [
-                                    tuple(res.boxes.xyxy[i].cpu().numpy())
-                                    for i in range(len(res.boxes))
-                                    if int(res.boxes.cls[i]) == 1
-                                ]
+                                crop = view.extract(fr)
+                                top_crop_frac = (
+                                    getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0
+                                ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                top_crop_px = (
+                                    int(crop.shape[0] * top_crop_frac)
+                                    if top_crop_frac > 0 else 0
+                                )
+                                if top_crop_px:
+                                    crop = crop[top_crop_px:, :]
+                                merged = self._sam2_robot_candidates(crop)
+                                # Field-filter in full-view coords (restore the
+                                # top-crop offset). No blocked_zones: detect_fn
+                                # output also corroborates existing masks (a
+                                # zone-parked robot must stay detector-present);
+                                # seeding inside zones is blocked by seed_gate_fn.
                                 full_boxes = [
-                                    (
-                                        box[0] / SAM2_SCALE,
-                                        box[1] / SAM2_SCALE,
-                                        box[2] / SAM2_SCALE,
-                                        box[3] / SAM2_SCALE,
-                                    )
-                                    for box in boxes
+                                    (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
+                                    for b, _c in merged
                                 ]
                                 keep = filter_field_robot_boxes(
                                     full_boxes,
                                     view.calibration,
                                     self.field_dims,
                                     frame_shape=(
-                                        int(round(img.shape[0] / SAM2_SCALE)),
-                                        int(round(img.shape[1] / SAM2_SCALE)),
+                                        crop.shape[0] + top_crop_px,
+                                        crop.shape[1],
                                         3,
                                     ),
                                 )
-                                return [boxes[idx] for idx in keep]
+                                return [
+                                    (
+                                        tuple(v * SAM2_SCALE for v in merged[idx][0]),
+                                        merged[idx][1],
+                                    )
+                                    for idx in keep
+                                ]
                             return detect_fn
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
@@ -4530,7 +4483,7 @@ class InferenceJob:
                             prompt_idx=prompt_local_idx,
                             prompt_boxes=prompt_boxes_scaled,
                             reprompt_every=reprompt_every,
-                            detect_fn=make_detect_fn(),
+                            detect_fn=make_detect_fn(_detect_caps),
                             object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
                             max_active_objects=MAX_TRACKED_ROBOTS,
@@ -4558,6 +4511,9 @@ class InferenceJob:
                     except Exception as e:
                         print(f"  [SAM2] Error during propagation for view {view.name}: {e}")
                     finally:
+                        for _state in _detect_caps:
+                            if _state.get("cap") is not None:
+                                _state["cap"].release()
                         tmp_dir_obj.cleanup()
 
                 if not self.sam2_raw:

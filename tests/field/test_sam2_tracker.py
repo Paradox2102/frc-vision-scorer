@@ -842,6 +842,98 @@ def test_seed_gate_fn_blocks_seeding_with_diagnostic():
                and e.get("reason") == "static_structure" for e in diag._events)
 
 
+def test_color_backfill_after_two_consecutive_corroborations():
+    """An unknown-colored object inherits the color of the bumper detections
+    that corroborate its mask on 2 consecutive evidence boundaries — so a robot
+    seeded from a colorless whole-robot gap-fill stops being 'unknown' forever."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    metadata = {1: "blue", 2: "unknown"}
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(2), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata=metadata, max_active_objects=6,
+        diagnostics=diag,
+    )
+    assert metadata[2] == "red"
+    assert metadata[1] == "blue"
+    assert any(e.get("event") == "sam2.color_backfilled"
+               and e["details"]["object_id"] == 2
+               and e["details"]["color"] == "red" for e in diag._events)
+
+
+def test_color_backfill_requires_two_votes():
+    """A single colored corroboration is not enough to commit a color."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    metadata = {1: "blue", 2: "unknown"}
+    calls = {"n": 0}
+
+    def detect_fn(local_idx, frame_path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [(stub._rect_for(2), "red")]
+        return []
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata=metadata, max_active_objects=6,
+    )
+    assert metadata[2] == "unknown"
+
+
+def test_color_backfill_conflict_resets_votes():
+    """Alternating colors (two robots overlapping the mask) never backfill."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    # Objects 1 and 2 prompted; obj 2 is the unknown one under test.
+    metadata = {1: "blue", 2: "unknown"}
+    calls = {"n": 0}
+
+    def detect_fn(local_idx, frame_path):
+        calls["n"] += 1
+        color = "red" if calls["n"] % 2 else "blue"
+        return [(stub._rect_for(2), color)]  # always corroborates obj 2's mask
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata=metadata, max_active_objects=6,
+    )
+    assert metadata[2] == "unknown"
+
+
+def test_color_backfill_never_overrides_definite_color():
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    metadata = {1: "red", 2: "blue"}
+
+    def detect_fn(local_idx, frame_path):
+        # Persistent contradicting color corroborating obj 2's mask.
+        return [(stub._rect_for(2), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata=metadata, max_active_objects=6,
+    )
+    assert metadata[2] == "blue"
+
+
 def test_seed_gated_box_still_corroborates_mask():
     """A gate-blocked detection must still corroborate an existing mask —
     a robot parked inside a zone is detector-PRESENT, never cull/evict bait."""

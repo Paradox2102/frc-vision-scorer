@@ -63,6 +63,13 @@ EVICT_WHEN_CAPPED = os.environ.get("SAM2_EVICT_WHEN_CAPPED", "1") not in ("0", "
 # collapsed mask block its own replacement.
 SEED_MIN_MASK_AREA_FRAC = float(os.environ.get("SAM2_SEED_MIN_MASK_AREA_FRAC", "0.1"))
 
+# Color backfill: an object whose metadata color is unknown (seeded from a
+# colorless whole-robot gap-fill) inherits the color of the bumper detections
+# that corroborate its mask on this many CONSECUTIVE colored boundaries.
+# Mirrors the team-lock n_override pattern: one read can be a neighbor's
+# bumper clipping the mask; two agreeing in a row is deliberate evidence.
+COLOR_BACKFILL_VOTES = int(os.environ.get("SAM2_COLOR_BACKFILL_VOTES", "2"))
+
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the tight bounding box of nonzero pixels as (x1, y1, x2, y2).
@@ -223,6 +230,28 @@ def mask_corroborated(
         if _ios(mask, box_mask) >= ios_thresh:
             return True
     return False
+
+
+def corroborating_colors(
+    mask: np.ndarray,
+    new_boxes: list[tuple[int, int, int, int]],
+    wh: tuple[int, int],
+    ios_thresh: float = 0.3,
+    new_colors: list[Any] | None = None,
+) -> set:
+    """Definite colors ('red'/'blue') of fresh detections corroborating ``mask``."""
+    out: set = set()
+    if not new_boxes or not new_colors:
+        return out
+    w, h = wh
+    for idx, (x1, y1, x2, y2) in enumerate(new_boxes):
+        if idx >= len(new_colors) or new_colors[idx] not in ("red", "blue"):
+            continue
+        box_mask = np.zeros((h, w), bool)
+        box_mask[int(y1):int(y2), int(x1):int(x2)] = True
+        if _ios(mask, box_mask) >= ios_thresh:
+            out.add(new_colors[idx])
+    return out
 
 
 def is_stationary(positions, max_span_m: float) -> bool:
@@ -535,6 +564,8 @@ class Sam2FieldTracker:
         culled_set: set[int] = set()
         corroboration_history: dict[int, deque] = {}
         field_pos_window: dict[int, list] = {}
+        # oid -> (pending color, consecutive colored-corroboration count)
+        color_backfill_votes: dict[int, tuple] = {}
 
         # Prompt each robot box on the prompt frame.  Object IDs are 1-based.
         next_obj_id = 1
@@ -896,6 +927,36 @@ class Sam2FieldTracker:
                             hist = corroboration_history.setdefault(
                                 oid, deque(maxlen=cull_evidence_window))
                             hist.append(bool(corroborated))
+
+                            # Color backfill for unknown-colored objects: commit
+                            # the corroborating bumper color after enough
+                            # CONSECUTIVE agreeing boundaries; mixed colors (two
+                            # robots overlapping the mask) reset the votes. A
+                            # definite color is never overridden.
+                            if (object_metadata is not None
+                                    and object_metadata.get(oid) not in ("red", "blue")):
+                                definite = corroborating_colors(
+                                    mask, new_boxes, (w, h),
+                                    ios_thresh=cull_corrob_ios,
+                                    new_colors=new_metadata,
+                                )
+                                if len(definite) == 1:
+                                    c = next(iter(definite))
+                                    prev_c, votes = color_backfill_votes.get(oid, (None, 0))
+                                    votes = votes + 1 if prev_c == c else 1
+                                    color_backfill_votes[oid] = (c, votes)
+                                    if votes >= COLOR_BACKFILL_VOTES:
+                                        object_metadata[oid] = c
+                                        existing_colors[oid] = c
+                                        if diagnostics:
+                                            diagnostics.record(
+                                                "sam2.color_backfilled",
+                                                details={"object_id": oid,
+                                                         "color": c,
+                                                         "frame_idx": last_idx},
+                                            )
+                                elif len(definite) > 1:
+                                    color_backfill_votes.pop(oid, None)
 
                             box = results[last_visible_frame[oid]][oid]["box"]
                             pos = project_fn(box) if project_fn is not None else bottom_center(box)

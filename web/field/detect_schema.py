@@ -54,6 +54,20 @@ def plausible_bumper_box(box, min_width_height_ratio=0.5):
     return height > 0.0 and width / height >= float(min_width_height_ratio)
 
 
+def bumper_admissible(box, whole_robot_boxes, min_width_height_ratio=0.5,
+                      corrob_ios=0.5):
+    """Whether a bumper detection may become a robot candidate.
+
+    A plausibly-shaped bumper always qualifies. A sliver that fails the shape
+    check (e.g. a ball-occluded bumper fragment) is admitted only when a
+    whole-robot detection overlaps it — two-detector agreement is itself the
+    plausibility evidence the shape check was standing in for.
+    """
+    if plausible_bumper_box(box, min_width_height_ratio):
+        return True
+    return any(box_ios(box, wb) >= corrob_ios for wb in whole_robot_boxes)
+
+
 def expand_bumper_to_robot(box, frame_shape, factor=3.0):
     """Grow a bumper box upward while preserving its footprint and bottom edge."""
     x1, y1, x2, y2 = (float(v) for v in box)

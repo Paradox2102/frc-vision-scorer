@@ -187,3 +187,26 @@ def test_bumper_model_path_falls_back_and_honors_override(tmp_path):
         hardneg_path=missing_hardneg,
         base_path=base,
     ) == override
+
+
+def test_bumper_admissible_accepts_plausible_shape():
+    from web.field.detect_schema import bumper_admissible
+    # Wide bumper (w/h >= 0.5): admissible regardless of whole-robot boxes.
+    assert bumper_admissible((10, 10, 50, 20), []) is True
+
+
+def test_bumper_admissible_rejects_sliver_without_corroboration():
+    from web.field.detect_schema import bumper_admissible
+    # Tall sliver (w/h < 0.5), no whole-robot box anywhere near it.
+    assert bumper_admissible((10, 10, 14, 30), []) is False
+    assert bumper_admissible((10, 10, 14, 30), [(100, 100, 160, 160)]) is False
+
+
+def test_bumper_admissible_accepts_corroborated_sliver():
+    """A ball-occluded bumper fragment fails the shape check but is admitted
+    when a whole-robot detection overlaps it — two-detector agreement IS the
+    plausibility evidence."""
+    from web.field.detect_schema import bumper_admissible
+    sliver = (10, 10, 14, 30)            # w/h = 0.2
+    whole = (0, 0, 60, 60)               # whole-robot box covering it
+    assert bumper_admissible(sliver, [whole]) is True

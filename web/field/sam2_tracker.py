@@ -49,6 +49,20 @@ CULL_CORROB_IOS = float(os.environ.get("CULL_CORROB_IOS", "0.3"))
 # Max field-position span over the window to count as stationary.
 CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 
+# Capped-roster eviction. When the active roster is full and a fresh detection
+# matches no tracked mask, the least-corroborated *stationary* active object may
+# be evicted to make room. Uses the same evidence bar as the hijack cull
+# (>= CULL_UNCORROBORATED_REPROMPTS absences in the window AND stationary), but
+# is triggered on demand by concrete new evidence rather than spontaneously, so
+# it is safe to default on while the spontaneous cull stays opt-in.
+EVICT_WHEN_CAPPED = os.environ.get("SAM2_EVICT_WHEN_CAPPED", "1") not in ("0", "false", "False")
+
+# A tracked mask may only claim (suppress) a fresh detection when its area is at
+# least this fraction of the detection box's area. IoS-over-smaller scores 1.0
+# for a degenerate sliver mask sitting inside a full-size detection, which let a
+# collapsed mask block its own replacement.
+SEED_MIN_MASK_AREA_FRAC = float(os.environ.get("SAM2_SEED_MIN_MASK_AREA_FRAC", "0.1"))
+
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the tight bounding box of nonzero pixels as (x1, y1, x2, y2).
@@ -135,6 +149,7 @@ def match_new_detections(
     ios_thresh: float = 0.5,
     existing_colors: dict[int, Any] | None = None,
     new_colors: list[Any] | None = None,
+    min_mask_area_frac: float = SEED_MIN_MASK_AREA_FRAC,
 ) -> list[int]:
     """Return indices of new_boxes that are genuinely new robots (not already tracked).
 
@@ -150,15 +165,20 @@ def match_new_detections(
         ios_thresh: minimum IoS to consider a detection already tracked.
         existing_colors: mapping of object-id -> color string.
         new_colors: list of color strings for each new box.
+        min_mask_area_frac: an existing mask smaller than this fraction of a
+            box's area cannot claim that box (a degenerate sliver scores IoS
+            1.0 inside any box and would otherwise block its own replacement).
 
     Returns:
         List of integer indices into new_boxes for unmatched (new) robots.
     """
     w, h = wh
+    mask_areas = {oid: int(m.sum()) for oid, m in existing_masks.items()}
     unmatched: list[int] = []
     for idx, (x1, y1, x2, y2) in enumerate(new_boxes):
         box_mask = np.zeros((h, w), bool)
         box_mask[y1:y2, x1:x2] = True
+        box_area = int(box_mask.sum())
         best_ios = 0.0
         for oid, existing in existing_masks.items():
             if existing_colors and new_colors and idx < len(new_colors):
@@ -166,6 +186,8 @@ def match_new_detections(
                 n_col = new_colors[idx]
                 if e_col in {"red", "blue"} and n_col in {"red", "blue"} and e_col != n_col:
                     continue  # conflicting colors -> treat as non-overlapping
+            if mask_areas[oid] < min_mask_area_frac * box_area:
+                continue  # degenerate sliver mask cannot claim a full-size box
             score = _ios(existing, box_mask)
             if score > best_ios:
                 best_ios = score
@@ -234,6 +256,33 @@ def absent_enough(history, k: int) -> bool:
     """
     absent = sum(1 for c in history if not c)
     return absent >= k
+
+
+def pick_evictable(active_objects, corroboration_history, field_pos_window,
+                   k: int, stationary_m: float) -> int | None:
+    """Return the active object best justified for eviction, or None.
+
+    An object is evictable only when its bounded corroboration history shows
+    >= ``k`` detector absences AND its recent field positions are stationary —
+    the same evidence bar as the spontaneous hijack cull, applied on demand
+    when a fresh unmatched detection needs a roster slot. A moving object is
+    never evictable (it could be a real robot in a detector blind spot), and
+    neither is one without history yet. Among evictable objects the one with
+    the most absences wins; ties go to the smaller (older) object id.
+    """
+    best = None
+    best_absent = -1
+    for oid in active_objects:
+        hist = corroboration_history.get(oid)
+        if not hist or not absent_enough(hist, k):
+            continue
+        if not is_stationary(field_pos_window.get(oid, []), stationary_m):
+            continue
+        absent = sum(1 for c in hist if not c)
+        if absent > best_absent:
+            best = oid
+            best_absent = absent
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +425,7 @@ class Sam2FieldTracker:
         cull_evidence_window: int = CULL_EVIDENCE_WINDOW,
         cull_corrob_ios: float = CULL_CORROB_IOS,
         cull_stationary_m: float = CULL_STATIONARY_M,
+        evict_when_capped: bool = EVICT_WHEN_CAPPED,
         project_fn=None,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
@@ -414,14 +464,15 @@ class Sam2FieldTracker:
                 is after frame zero, first propagate those objects backward to
                 recover the beginning of the exported clip. Re-prompted objects
                 remain forward-only.
-            cull_enabled: When True, run ``detect_fn`` at every chunk boundary
-                (even when the roster is capped) so the hijack cull has
-                corroboration data. When False the kill switch fully reverts to
-                the original behavior (detector runs only when seeding). Also note
-                the detector contract: ``detect_fn`` returning ``None`` (or raising)
-                is treated as detector-unavailable for that boundary — it
-                contributes no absence evidence. An empty list means the detector
-                ran and found nothing (counts as absence).
+            cull_enabled: When True, a stationary object whose mask goes
+                detector-uncorroborated for enough boundaries is culled
+                spontaneously. The detector itself ALWAYS runs at every chunk
+                boundary regardless of this flag (corroboration evidence is
+                always collected). Detector contract: ``detect_fn`` returning
+                ``None`` (or raising) is treated as detector-unavailable for
+                that boundary — it contributes no absence evidence. An empty
+                list means the detector ran and found nothing (counts as
+                absence).
             cull_uncorroborated_reprompts: Absences within the evidence window
                 required before a stationary object is culled (cull groundwork).
             cull_evidence_window: Sliding-window length of corroboration outcomes
@@ -430,6 +481,12 @@ class Sam2FieldTracker:
                 corroboration (cull groundwork).
             cull_stationary_m: Max field-position span over the window to count as
                 stationary (cull groundwork).
+            evict_when_capped: When True (default) and the active roster is
+                full, a fresh detection that matches no tracked mask may evict
+                the least-corroborated *stationary* active object (same
+                evidence bar as the cull) to claim its slot. Without this, one
+                stale mask pinning the roster makes the tracker permanently
+                blind to new robots.
             project_fn: Callable mapping a mask box (tracker pixel coords) to field
                 meters ``(x, y)``, or None when unprojectable; measures stationarity
                 in field space so camera pan can't disguise a static structure as
@@ -495,6 +552,7 @@ class Sam2FieldTracker:
 
         reprompting = bool(reprompt_every) and detect_fn is not None
         detected = []
+        detect_fn_error_logged = False  # first-error print guard (one line per track())
 
         def _normalize_detections(items):
             boxes = []
@@ -750,9 +808,6 @@ class Sam2FieldTracker:
                                         details={"object_id": oid, "frame_idx": last_idx},
                                     )
 
-                    capped = (len(active_objects) >= max_active_objects
-                              or (next_obj_id - 1) >= max_lifetime_objects)
-
                     # Latest mask + color per active object (for corroboration & seeding).
                     existing = {}
                     existing_colors = {}
@@ -765,10 +820,15 @@ class Sam2FieldTracker:
 
                     # Tri-state detector. detector_available is False when the
                     # detector could not run (detect_fn raised or returned None);
-                    # such boundaries contribute NO absence evidence. Run the
-                    # detector when seeding (not capped) OR for corroboration
-                    # (cull_enabled) — guarded so the kill switch fully reverts.
-                    run_detector = detect_fn is not None and (not capped or cull_enabled)
+                    # such boundaries contribute NO absence evidence. The detector
+                    # ALWAYS runs at a boundary: one YOLO pass per chunk is
+                    # negligible next to SAM2 propagation, corroboration evidence
+                    # must accumulate even while the roster is capped, and a
+                    # capped boundary must log what it rejects. (Skipping it while
+                    # capped once hid a match-long seeding blackout: stale masks
+                    # pinned the roster, so a robot crossing the open field was
+                    # never even looked for.)
+                    run_detector = detect_fn is not None
                     detector_available = False
                     new_boxes, new_metadata = [], []
                     if run_detector:
@@ -777,8 +837,21 @@ class Sam2FieldTracker:
                         )
                         try:
                             detected = detect_fn(last_idx, frame_path)
-                        except Exception:
+                        except Exception as exc:
+                            # Unavailable for this boundary, but never silently:
+                            # a persistent detect_fn bug would otherwise disable
+                            # re-prompting for the whole video with no trace.
                             detected = None
+                            if not detect_fn_error_logged:
+                                detect_fn_error_logged = True
+                                print(f"  [SAM2] detect_fn failed at frame {last_idx} "
+                                      f"(further errors suppressed): {exc!r}")
+                            if diagnostics:
+                                diagnostics.increment("sam2_detector_errors")
+                                diagnostics.record(
+                                    "sam2.detector_error",
+                                    details={"frame_idx": last_idx, "error": repr(exc)},
+                                )
                         if detected is None:
                             detector_available = False
                         else:
@@ -791,8 +864,12 @@ class Sam2FieldTracker:
                                         details={"frame_idx": last_idx, "box": list(box)},
                                     )
 
-                    # ---- Hijack cull (windowed detector-absence + stationary) ----
-                    if cull_enabled and detector_available and existing:
+                    # ---- Corroboration bookkeeping (windowed detector-absence +
+                    # stationarity), maintained whenever the detector ran. The
+                    # spontaneous hijack cull stays gated behind cull_enabled;
+                    # capped-roster eviction below reuses the same evidence on
+                    # demand. ----
+                    if detector_available and existing:
                         h, w = next(iter(existing.values())).shape
                         for oid, mask in list(existing.items()):
                             corroborated = mask_corroborated(
@@ -813,7 +890,8 @@ class Sam2FieldTracker:
                             if len(win) > cull_evidence_window:
                                 del win[0]
 
-                            if (absent_enough(hist, cull_uncorroborated_reprompts)
+                            if (cull_enabled
+                                    and absent_enough(hist, cull_uncorroborated_reprompts)
                                     and is_stationary(win, cull_stationary_m)):
                                 culled_set.add(oid)
                                 if diagnostics:
@@ -837,11 +915,10 @@ class Sam2FieldTracker:
                             for o in list(culled_set):
                                 existing.pop(o, None)
                                 existing_colors.pop(o, None)
-                            capped = (len(active_objects) >= max_active_objects
-                                      or (next_obj_id - 1) >= max_lifetime_objects)
 
-                    # ---- New-object seeding (unchanged logic, gated on capped) ----
-                    if not capped and detector_available and new_boxes:
+                    # ---- New-object seeding (caps re-checked per seed; a capped
+                    # roster may evict an evidently-stale object to make room) ----
+                    if detector_available and new_boxes:
                         if existing:
                             h, w = next(iter(existing.values())).shape
                         else:
@@ -850,7 +927,7 @@ class Sam2FieldTracker:
                         int_boxes = [
                             (int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in new_boxes
                         ]
-                        matched_indices = match_new_detections(
+                        new_indices = match_new_detections(
                             existing, int_boxes, (w, h),
                             ios_thresh=new_obj_ios_thresh,
                             existing_colors=existing_colors,
@@ -858,24 +935,50 @@ class Sam2FieldTracker:
                         )
                         if diagnostics:
                             for idx, box_val in enumerate(new_boxes):
-                                if idx not in matched_indices:
+                                if idx not in new_indices:
                                     diagnostics.record(
                                         "sam2.reprompt_rejected",
-                                        reason="below_margin",
+                                        reason="already_tracked",
                                         details={"frame_idx": last_idx, "box": list(box_val)},
                                     )
-                        for j in matched_indices:
+                        for j in new_indices:
                             active_objects = [
                                 oid for oid in range(1, next_obj_id)
                                 if oid not in culled_set
                                 and last_visible_frame.get(oid) is not None
                                 and (last_idx - last_visible_frame[oid]) <= retirement_frames
                             ]
-                            cap_reached = (len(active_objects) >= max_active_objects
-                                           or (next_obj_id - 1) >= max_lifetime_objects)
-                            if cap_reached:
-                                reason = ("roster_cap" if len(active_objects) >= max_active_objects
-                                          else "lifetime_cap")
+                            roster_capped = len(active_objects) >= max_active_objects
+                            lifetime_capped = (next_obj_id - 1) >= max_lifetime_objects
+                            if roster_capped and not lifetime_capped and evict_when_capped:
+                                # An unmatched detection is concrete evidence a
+                                # roster slot is wrongly held. Evict the least-
+                                # corroborated stationary object (same evidence
+                                # bar as the cull) rather than going blind.
+                                victim = pick_evictable(
+                                    active_objects, corroboration_history,
+                                    field_pos_window,
+                                    cull_uncorroborated_reprompts,
+                                    cull_stationary_m,
+                                )
+                                if victim is not None:
+                                    culled_set.add(victim)
+                                    existing.pop(victim, None)
+                                    existing_colors.pop(victim, None)
+                                    roster_capped = False
+                                    if diagnostics:
+                                        diagnostics.increment("sam2_objects_culled")
+                                        diagnostics.record(
+                                            "sam2.object_culled",
+                                            reason="evicted_for_new_detection",
+                                            details={
+                                                "object_id": victim,
+                                                "frame_idx": last_idx,
+                                                "for_box": list(new_boxes[j]),
+                                            },
+                                        )
+                            if roster_capped or lifetime_capped:
+                                reason = "roster_cap" if roster_capped else "lifetime_cap"
                                 if diagnostics:
                                     diagnostics.record(
                                         "sam2.reprompt_rejected",
@@ -912,19 +1015,6 @@ class Sam2FieldTracker:
                             if object_metadata is not None:
                                 object_metadata[next_obj_id] = new_metadata[j]
                             next_obj_id += 1
-                    # Reachable only when cull_enabled (otherwise the detector is
-                    # not run while capped, matching pre-cull behavior). Logs the
-                    # rejections for boxes the full roster can't accept.
-                    elif capped and detector_available and new_boxes:
-                        if diagnostics:
-                            reason = ("roster_cap" if len(active_objects) >= max_active_objects
-                                      else "lifetime_cap")
-                            for box_val in new_boxes:
-                                diagnostics.record(
-                                    "sam2.reprompt_rejected",
-                                    reason=reason,
-                                    details={"frame_idx": last_idx, "box": list(box_val)},
-                                )
 
                     cursor = last_idx + 1
         finally:

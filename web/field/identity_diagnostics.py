@@ -21,6 +21,7 @@ class DiagnosticEvents:
     SAM2_MASK_REJECTED = "sam2.mask_rejected"
     SAM2_CHUNK_COMPLETE = "sam2.chunk_complete"
     SAM2_OBJECT_CULLED = "sam2.object_culled"
+    SAM2_DETECTOR_ERROR = "sam2.detector_error"
 
     # Fusion
     FUSION_ASSIGNMENT = "fusion.assignment"
@@ -83,6 +84,8 @@ class DiagnosticReasons:
     REATTACH_CONFIDENT = "reattach_confident"
     MASK_IMPLAUSIBLE = "mask_implausible"
     DETECTOR_ABSENT_STATIONARY = "detector_absent_stationary"
+    ALREADY_TRACKED = "already_tracked"
+    EVICTED_FOR_NEW_DETECTION = "evicted_for_new_detection"
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}

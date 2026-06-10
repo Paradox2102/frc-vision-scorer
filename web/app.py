@@ -4512,7 +4512,10 @@ class InferenceJob:
                             object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
                             max_active_objects=MAX_TRACKED_ROBOTS,
-                            max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
+                            # Capped-roster eviction (sam2_tracker) re-seeds robots
+                            # under fresh ids, so lifetime id churn is higher than the
+                            # old 3x budget; qm24 hit 20 ids by the final frame.
+                            max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
                             propagate_backward=True,
                             progress_cb=make_progress_cb(base_pct, span_pct, view.name),
                             diagnostics=self.identity_diagnostics,

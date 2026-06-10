@@ -233,14 +233,16 @@ def test_reprompt_adds_new_robot_and_tracks_it_forward():
 
 
 def test_reprompt_respects_max_objects_cap():
-    """No new objects are added once the robot cap is reached."""
+    """No new objects are added once the cap is reached and the tracked
+    objects are corroborated (healthy masks are never evicted)."""
     from web.field.sam2_tracker import Sam2FieldTracker
 
     stub = RepromptStubPredictor()
     tracker = Sam2FieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
-        return [stub._rect_for(3)]  # a new robot every boundary
+        # Corroborate both tracked objects; report one genuinely new robot.
+        return [stub._rect_for(1), stub._rect_for(2), stub._rect_for(3)]
 
     result = tracker.track(
         frames_dir="ignored_by_stub",
@@ -583,7 +585,7 @@ def test_sam2_diagnostics_logging():
     
     rejected_events = [e for e in events if e["event"] == "sam2.reprompt_rejected"]
     assert len(rejected_events) == 1
-    assert rejected_events[0]["reason"] == "below_margin"
+    assert rejected_events[0]["reason"] == "already_tracked"
 
 
 class CullStubPredictor:
@@ -644,7 +646,10 @@ def test_detector_runs_at_capped_boundary_when_cull_enabled():
     assert calls, "detect_fn must run at capped boundaries when cull enabled"
 
 
-def test_detector_skipped_at_capped_boundary_when_cull_disabled():
+def test_detector_runs_at_capped_boundary_even_when_cull_disabled():
+    """The detector always runs at chunk boundaries. Skipping it while the
+    roster was capped (the old behavior) made the tracker blind to new robots
+    for as long as stale masks pinned the active set — with zero diagnostics."""
     from web.field.sam2_tracker import Sam2FieldTracker
     stub = CullStubPredictor()
     tracker = Sam2FieldTracker(predictor=stub)
@@ -660,7 +665,155 @@ def test_detector_skipped_at_capped_boundary_when_cull_disabled():
         reprompt_every=2, detect_fn=detect_fn,
         max_active_objects=2, cull_enabled=False,
     )
-    assert calls == [], "detect_fn must NOT run at capped boundaries when cull disabled"
+    assert calls, "detect_fn must run at capped boundaries even with cull disabled"
+
+
+def test_capped_unmatched_detection_logs_roster_cap_rejection():
+    """With the roster capped by corroborated (healthy) objects, an unmatched
+    detection is rejected with a visible roster_cap diagnostic — not silently."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Corroborate both tracked objects; report one unmatched new robot.
+        return [stub._rect_for(1), stub._rect_for(2), stub._rect_for(15)]
+
+    from web.field.sam2_tracker import bottom_center
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        max_active_objects=2, cull_enabled=False,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "roster_cap" for e in diag._events)
+    assert _culled_ids(diag) == set(), "corroborated objects must never be evicted"
+
+
+def test_eviction_frees_slot_for_uncorroborated_stationary_object():
+    """An unmatched fresh detection evicts the least-corroborated stationary
+    object when the roster is capped — even with the spontaneous cull disabled."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Obj 1 corroborated every boundary; obj 2 never; one new robot at 15.
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    evicted = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
+    assert any(e.get("reason") == "evicted_for_new_detection"
+               and e["details"]["object_id"] == 2 for e in evicted)
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+    assert 3 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_no_eviction_of_moving_uncorroborated_object():
+    """A moving object is never evicted even if uncorroborated (it could be a
+    real robot in a detector blind spot); the new detection is cap-rejected."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor(moving={2})
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1, 0), stub._rect_for(2, 0)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert _culled_ids(diag) == set()
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+
+
+def test_eviction_disabled_via_flag():
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, cull_enabled=False, evict_when_capped=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert _culled_ids(diag) == set()
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+
+
+def test_pick_evictable_prefers_most_absent_stationary():
+    from collections import deque
+    from web.field.sam2_tracker import pick_evictable
+    hist = {
+        1: deque([True, True, True], maxlen=5),          # corroborated
+        2: deque([False, False, False], maxlen=5),        # absent, stationary
+        3: deque([True, False, False, False], maxlen=5),  # absent (3), stationary
+    }
+    wins = {
+        1: [(1.0, 1.0), (1.0, 1.0)],
+        2: [(2.0, 2.0), (2.0, 2.0)],
+        3: [(3.0, 3.0), (3.0, 3.0)],
+    }
+    # Both 2 and 3 meet the bar with 3 absences; the earlier id wins the tie.
+    assert pick_evictable([1, 2, 3], hist, wins, k=3, stationary_m=0.5) == 2
+    # A moving object never qualifies.
+    wins[2] = [(2.0, 2.0), (9.0, 9.0)]
+    assert pick_evictable([1, 2, 3], hist, wins, k=3, stationary_m=0.5) == 3
+    # No history yet -> not evictable.
+    assert pick_evictable([1], hist, wins, k=3, stationary_m=0.5) is None
+
+
+def test_match_new_detections_ignores_sliver_mask():
+    """A degenerate sliver mask must not suppress seeding of a full-size
+    detection covering it (IoS-over-smaller would score 1.0)."""
+    sliver = np.zeros((40, 40), bool)
+    sliver[10:12, 10:12] = True  # 4 px residue of a collapsed mask
+    unmatched = match_new_detections({1: sliver}, [(0, 0, 30, 30)], (40, 40),
+                                     ios_thresh=0.5)
+    assert unmatched == [0], "sliver mask must not claim a full-size detection"
+
+
+def test_match_new_detections_small_mask_still_claims_small_box():
+    """A legitimately small (distant-robot) mask still claims a matching
+    small detection — the sliver guard is relative to box area."""
+    small = np.zeros((40, 40), bool)
+    small[10:14, 10:14] = True  # 16 px solid mask
+    unmatched = match_new_detections({1: small}, [(9, 9, 15, 15)], (40, 40),
+                                     ios_thresh=0.5)
+    assert unmatched == []
 
 
 def test_detector_exception_is_unavailable_no_candidates_no_seed():
@@ -688,6 +841,9 @@ def test_detector_exception_is_unavailable_no_candidates_no_seed():
     assert not any(e.get("event") == "sam2.reprompt_candidate" for e in diag._events)
     # Only the initial prompt object was ever added; nothing seeded at re-prompt.
     assert stub.add_calls == [(0, 1)]
+    # The failure is visible: a detector_error event per failed boundary.
+    errors = [e for e in diag._events if e.get("event") == "sam2.detector_error"]
+    assert errors and "detector blew up" in errors[0]["details"]["error"]
 
 
 # ---------------------------------------------------------------------------

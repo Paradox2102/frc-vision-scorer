@@ -649,6 +649,27 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
         await db.commit()
 
 
+async def insert_gallery_exemplars(rows: List[Dict[str, Any]]) -> None:
+    """Insert many appearance-gallery exemplars in one transaction.
+
+    Same SQL as insert_gallery_exemplar; batching avoids one connection +
+    fsync'd commit per row at job finalize."""
+    if not rows:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO appearance_gallery "
+            "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(row["event_key"], row.get("source_match_key"),
+              row["team"], row["alliance_color"],
+              row["embedding"], row.get("legibility"), row.get("image"),
+              int(row.get("verified", 0)), row.get("job_id"))
+             for row in rows])
+        await db.commit()
+
+
 async def get_gallery_exemplars(
     event_key: str, teams: Optional[List[str]] = None
 ) -> List[Dict]:
@@ -818,6 +839,49 @@ async def insert_match_robot_crop(row: Dict[str, Any]) -> None:
             "VALUES (?, ?, ?, ?, ?)",
             (row["job_id"], identity_id, row.get("legibility"), row.get("embedding"),
              row.get("image")))
+        await db.commit()
+
+
+def _identity_key(row: Dict[str, Any]):
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
+    return identity_id
+
+
+async def upsert_match_robot_identities(rows: List[Dict[str, Any]]) -> None:
+    """Batch variant of upsert_match_robot_identity: one transaction for all rows."""
+    if not rows:
+        return
+    params = [
+        (row["job_id"], _identity_key(row), row.get("slot"), row.get("slot_label"),
+         row.get("alliance"), row.get("team_number"), int(row.get("confirmed", 0)),
+         row.get("source"), row.get("confidence"))
+        for row in rows
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR REPLACE INTO match_robot_identity "
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
+        await db.commit()
+
+
+async def insert_match_robot_crops(rows: List[Dict[str, Any]]) -> None:
+    """Batch variant of insert_match_robot_crop: one transaction for all rows."""
+    if not rows:
+        return
+    params = [
+        (row["job_id"], _identity_key(row), row.get("legibility"),
+         row.get("embedding"), row.get("image"))
+        for row in rows
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
+            "VALUES (?, ?, ?, ?, ?)", params)
         await db.commit()
 
 

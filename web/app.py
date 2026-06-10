@@ -1127,7 +1127,9 @@ class InferenceJob:
         # Upscale so the bumper crop is at least ~384px tall (existing behavior).
         if crop.shape[0] < 384:
             scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            # LINEAR over CUBIC: 3-6x faster and the VLM is insensitive to
+            # upscale interpolation (unlike the OCR preprocess paths).
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
         crop_b64 = base64.b64encode(buf).decode('utf-8')
         return crop_b64, score
@@ -1151,7 +1153,8 @@ class InferenceJob:
             return None
         if crop.shape[0] < 192:
             scale = max(2, int(np.ceil(192 / max(1, crop.shape[0]))))
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            # LINEAR over CUBIC: runs per detection per frame; display-only image.
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
             return None
@@ -2247,6 +2250,31 @@ class InferenceJob:
             frame=frame, robots_state=robots_state,
             roster=roster, identified=identified,
         )
+
+    def _recent_events_data(self) -> list:
+        """Display rows for the last 10 scoring events."""
+        events_data = []
+        for event in self.scoring_events[-10:]:
+            robot = self.robot_tracks.get(event.robot_id)
+            ident = self.identity_registry.identities.get(event.robot_id)
+            slot_id = ident.active_slot if ident else None
+            slot_label = self._slot_label(slot_id) if slot_id is not None else f"Robot {event.robot_id}"
+            events_data.append({
+                "frame": event.frame_num,
+                "timestamp": event.timestamp,
+                "alliance": event.alliance,
+                "robot_id": event.robot_id,
+                "slot": slot_label,
+                "team_number": event.team_number,
+                "team_candidate": (robot.team_number if robot else None),
+                "robot_label": (
+                    event.team_number
+                    or (robot.team_number if robot and robot.team_number else None)
+                    or slot_label
+                ),
+                "confidence": event.confidence
+            })
+        return events_data
 
     def _frame_stream_due(self, now: float) -> bool:
         """Rate-cap live-view frame sends to FRAME_STREAM_INTERVAL_SEC."""
@@ -4813,8 +4841,6 @@ class InferenceJob:
             )
             previous_processed_source_frame = None
             self._inference_start_time = time.time()
-            robots_data = []
-            events_data = []
 
             _loop_t0 = time.perf_counter()
             while True:
@@ -4890,6 +4916,7 @@ class InferenceJob:
                             tuple(pdets.xyxy[i]) for i in range(len(pdets))
                         ]
 
+                        embed_candidates = []
                         for obj_id, info in view_raw.get(local_idx, {}).items():
                             x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
                             fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
@@ -4931,9 +4958,9 @@ class InferenceJob:
                                 self.sam2_obj_color.get(view.name, {}).get(obj_id)
                                 or "unknown"
                             )
-                            
-                            det_embed = None
-                            robot_crop_b64 = None
+
+                            box_s = None
+                            sub_mask = None
                             if small_frame is not None:
                                 # small_frame is the full-crop at 0.5x; index it with the
                                 # offset-corrected box scaled back to 0.5x (== raw box when
@@ -4943,14 +4970,28 @@ class InferenceJob:
                                 # SAM2 mask is in raw 0.5x top-cropped coords (same space
                                 # as info["box"]); slice the box region out as a box-local
                                 # mask so the signature covers the robot, not the field.
-                                sub_mask = None
                                 mask2d = info.get("mask")
                                 if mask2d is not None:
                                     sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
                                     if sub_mask.size == 0:
                                         sub_mask = None
-                                det_embed = self.robot_embedder.embed(
-                                    small_frame, box_s, mask=sub_mask)
+                            embed_candidates.append(
+                                (obj_id, full_box, xy, corner_weight, color,
+                                 box_s, sub_mask))
+
+                        # One DINOv2 forward pass for every robot in this view
+                        # (embed() is embed_batch([box])[0], so semantics match).
+                        det_embeds = [None] * len(embed_candidates)
+                        if small_frame is not None and embed_candidates:
+                            det_embeds = self.robot_embedder.embed_batch(
+                                small_frame,
+                                [c[5] for c in embed_candidates],
+                                masks=[c[6] for c in embed_candidates])
+
+                        for (obj_id, full_box, xy, corner_weight, color, box_s,
+                             sub_mask), det_embed in zip(embed_candidates, det_embeds):
+                            robot_crop_b64 = None
+                            if small_frame is not None:
                                 robot_crop_b64 = self._masked_robot_crop_b64(
                                     small_frame, box_s, sub_mask)
 
@@ -4967,7 +5008,8 @@ class InferenceJob:
                             cb = self._bumper_crop_b64(view_frame, det.box, enforce_floor=False)
                             crop_b64 = cb[0] if cb is not None else None
                             paired.append((det, crop_b64))
-                            
+
+
                         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
                         
                         per_camera[view.name] = paired
@@ -5381,35 +5423,12 @@ class InferenceJob:
                 except Exception as e:
                     print(f"[replay] frame record error: {e}")
 
-                # Prepare robot data
-                robots_data = self._canonical_robot_rows()
-                
-                # Prepare scoring events
-                events_data = []
-                for event in self.scoring_events[-10:]:  # Last 10 events
-                    robot = self.robot_tracks.get(event.robot_id)
-                    ident = self.identity_registry.identities.get(event.robot_id)
-                    slot_id = ident.active_slot if ident else None
-                    slot_label = self._slot_label(slot_id) if slot_id is not None else f"Robot {event.robot_id}"
-                    events_data.append({
-                        "frame": event.frame_num,
-                        "timestamp": event.timestamp,
-                        "alliance": event.alliance,
-                        "robot_id": event.robot_id,
-                        "slot": slot_label,
-                        "team_number": event.team_number,
-                        "team_candidate": (robot.team_number if robot else None),
-                        "robot_label": (
-                            event.team_number
-                            or (robot.team_number if robot and robot.team_number else None)
-                            or slot_label
-                        ),
-                        "confidence": event.confidence
-                    })
-                
-                # Stream frame data via the latest-only queue: encode only when
-                # a display send is due, and never wait on the client.
+                # Stream frame data via the latest-only queue: build display
+                # rows and encode only when a send is due, and never wait on
+                # the client.
                 if self.websocket and self._frame_stream_due(time.perf_counter()):
+                    robots_data = self._canonical_robot_rows()
+                    events_data = self._recent_events_data()
                     _, buffer = cv2.imencode(
                         '.jpg', annotated_frame,
                         [cv2.IMWRITE_JPEG_QUALITY, FRAME_STREAM_JPEG_QUALITY])
@@ -5468,8 +5487,8 @@ class InferenceJob:
             await self._send_ws(jsonify({
                 "type": "complete",
                 "total_frames": self.total_frames,
-                "robots": robots_data,
-                "scoring_events": events_data,
+                "robots": self._canonical_robot_rows(),
+                "scoring_events": self._recent_events_data(),
                 "final_scores": self.alliance_scores,
                 "periods": self.match_periods,
                 "autonomous_paths": dict(self.autonomous_paths),
@@ -5569,20 +5588,21 @@ class InferenceJob:
                 print(f"[replay] finalize error: {e}")
             try:
                 if self._pending_gallery_rows:
-                    for row in self._pending_gallery_rows:
-                        await database.insert_gallery_exemplar(row)
+                    await database.insert_gallery_exemplars(self._pending_gallery_rows)
                     print(f"  Appearance gallery: persisted {len(self._pending_gallery_rows)} "
                           f"new exemplars for {self.event_key}")
                     self._pending_gallery_rows = []
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
             try:
+                identity_rows = []
+                crop_rows = []
                 for slot_id, identity_id in self._canonical_identity_slots().items():
                     robot = self.robot_tracks.get(identity_id)
                     if robot is None:
                         continue
                     crops = self._slot_crops.get(identity_id, [])
-                    await database.upsert_match_robot_identity({
+                    identity_rows.append({
                         "job_id": self.job_id, "identity_id": identity_id, "slot": slot_id,
                         "slot_label": self._slot_label(slot_id),
                         "alliance": robot.alliance, "team_number": robot.team_number,
@@ -5591,13 +5611,15 @@ class InferenceJob:
                         "confidence": (crops[0]["quality"] if crops else None),
                     })
                     for c in crops:
-                        await database.insert_match_robot_crop({
+                        crop_rows.append({
                             "job_id": self.job_id, "identity_id": identity_id,
                             "legibility": c["quality"],
                             "embedding": (None if c["embedding"] is None
                                           else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
                             "image": _thumbnail_bytes(c.get("robot_crop_b64") or c["crop_b64"]),
                         })
+                await database.upsert_match_robot_identities(identity_rows)
+                await database.insert_match_robot_crops(crop_rows)
             except Exception as e:
                 print(f"  Match-identity capture failed ({e})")
 

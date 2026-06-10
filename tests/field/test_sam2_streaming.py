@@ -231,9 +231,12 @@ class TestSAM2Streaming(unittest.TestCase):
         }
         mock_sam2_tracker_cls.return_value = mock_sam2_tracker
         
-        # Mock embedder returning mock embedding
+        # Mock embedder returning one embedding per box (batched API)
         mock_embedder = MagicMock()
         mock_embedder.embed.return_value = np.zeros(384, dtype=np.float32)
+        mock_embedder.embed_batch.side_effect = (
+            lambda frame, boxes, masks=None:
+                [np.zeros(384, dtype=np.float32)] * len(boxes))
         mock_embedder_cls.return_value = mock_embedder
         
         # Setup VideoCapture to run for a few frames
@@ -309,4 +312,5 @@ class TestSAM2Streaming(unittest.TestCase):
             assert isinstance(track_kwargs.get("object_metadata"), dict)
             assert track_kwargs.get("max_objects") == 6
             # Verify DINOv2 embedding was extracted during the loop
-            mock_embedder.embed.assert_called()
+            # (one batched forward pass per view instead of per-object embed()).
+            mock_embedder.embed_batch.assert_called()

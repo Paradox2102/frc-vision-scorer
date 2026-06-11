@@ -826,8 +826,33 @@ class VisionScorer {
                 const firstAvailable = Array.from(select.options).find((o) => !o.disabled);
                 if (firstAvailable) firstAvailable.selected = true;
             }
+            // Reader availability: the vLLM option only makes sense when the
+            // server is actually up (web/start_all.sh starts both).
+            const vllmRadio = document.getElementById('vllmReaderRadio');
+            const vllmHint = document.getElementById('vllmReaderHint');
+            if (vllmRadio) {
+                vllmRadio.disabled = !data.vllm_available;
+                if (vllmHint) {
+                    vllmHint.textContent = data.vllm_available ? '● online' : '○ offline';
+                    vllmHint.classList.toggle('reader-hint-up', !!data.vllm_available);
+                }
+                if (data.vllm_available && !document.querySelector('input[name="teamReader"]:checked:not(:disabled)')) {
+                    vllmRadio.checked = true;
+                }
+            }
+            // Show only the controls that apply to the selected backend.
+            const sam3Group = document.getElementById('sam3ChunkGroup');
+            const sam2Groups = [
+                document.getElementById('sam2ModelGroup'),
+                document.getElementById('sam2VramGroup'),
+            ];
             const syncModelControls = () => {
-                select.disabled = backendSelect.value !== 'sam2';
+                const isSam2 = backendSelect.value === 'sam2';
+                select.disabled = !isSam2;
+                if (sam3Group) sam3Group.style.display = isSam2 ? 'none' : '';
+                for (const g of sam2Groups) {
+                    if (g) g.style.display = isSam2 ? '' : 'none';
+                }
             };
             backendSelect.addEventListener('change', syncModelControls);
             syncModelControls();
@@ -866,6 +891,10 @@ class VisionScorer {
         const modelSize = document.getElementById('sam2ModelSize')?.value;
         if (modelSize) {
             formData.append('model_size', modelSize);
+        }
+        const chunkFrames = parseInt(document.getElementById('sam3ChunkFrames')?.value, 10);
+        if (trackingBackend === 'sam3' && Number.isFinite(chunkFrames) && chunkFrames > 0) {
+            formData.append('config_json', JSON.stringify({ sam3_chunk_frames: chunkFrames }));
         }
         if (this.selectedMatch?.key) {
             formData.append('match_key', this.selectedMatch.key);
@@ -1053,6 +1082,11 @@ class VisionScorer {
 
         this.hudFrame.textContent = `${data.frame_num} / ${data.total_frames}`;
         this.hudFps.textContent = data.fps.toFixed(1);
+        const hudBackend = document.getElementById('hudBackend');
+        if (hudBackend && data.backend) {
+            hudBackend.textContent = data.backend === 'sam3' ? 'SAM 3' : 'SAM 2.1';
+            hudBackend.classList.toggle('hud-backend-sam3', data.backend === 'sam3');
+        }
         if (this.hudReader && data.vlm_status) {
             const status = data.vlm_status;
             const provider = status.provider || 'local';
@@ -1114,10 +1148,21 @@ class VisionScorer {
             const label = `${prefix}${index}`;
             const robot = bySlot.get(label);
             const goals = robot && robot.scores != null ? robot.scores : 0;
+            // Confirmed identities render solid with a check; a leading-but-
+            // unconfirmed candidate renders dimmed with a "?" so operators can
+            // tell a locked read from a guess at a glance.
+            let teamCell = '—';
+            if (robot && robot.team_number) {
+                teamCell = robot.confirmed
+                    ? `<span class="team-confirmed">${robot.team_number} ✓</span>`
+                    : `<span class="team-tentative">${robot.team_number}</span>`;
+            } else if (robot && robot.team_candidate) {
+                teamCell = `<span class="team-candidate">${robot.team_candidate}?</span>`;
+            }
             return `
                 <tr>
                     <td>${label}</td>
-                    <td>${robot && robot.team_number ? robot.team_number : '—'}</td>
+                    <td>${teamCell}</td>
                     <td class="goal-count">${goals}</td>
                 </tr>
             `;
@@ -1281,7 +1326,7 @@ class VisionScorer {
         if (!timings || timings.total == null) return '<p class="empty-state">No timing data</p>';
         const labels = {
             model_load: 'Model load', frame_export: 'Frame export',
-            sam2_tracking: 'SAM2 tracking', analysis_loop: 'Analysis loop',
+            sam2_tracking: 'Tracker propagation', analysis_loop: 'Analysis loop',
             bumper_vlm: '↳ Bumper VLM',
         };
         const topLevel = ['model_load', 'frame_export', 'sam2_tracking', 'analysis_loop'];

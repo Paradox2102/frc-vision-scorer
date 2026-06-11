@@ -101,6 +101,10 @@
                                     <span>Local GPU</span>
                                 </label>
                                 <label>
+                                    <input type="radio" name="teamReader" value="vllm" id="vllmReaderRadio">
+                                    <span>vLLM Server <span id="vllmReaderHint" class="reader-hint"></span></span>
+                                </label>
+                                <label>
                                     <input type="radio" name="teamReader" value="deepseek">
                                     <span>DeepSeek V4</span>
                                 </label>
@@ -111,12 +115,22 @@
                                     <!-- options populated from /api/sam2_models -->
                                 </select>
                                 <small style="color:#889;display:block;margin-top:4px;">
-                                    SAM 3.1 is experimental and requires CUDA plus access to Meta's
-                                    gated Hugging Face checkpoint. It is intended for H100-class runs.
+                                    SAM 3 is the default: best identity in full-match A/B testing
+                                    (6/6 confirmed on qm24) at roughly half the wall-clock.
+                                    SAM 2.1 remains as the legacy fallback.
                                 </small>
                             </div>
-                            <div class="input-group">
-                                <label for="sam2ModelSize">SAM2 model size:</label>
+                            <div class="input-group" id="sam3ChunkGroup">
+                                <label for="sam3ChunkFrames">SAM 3 chunk window (frames):</label>
+                                <input type="number" id="sam3ChunkFrames" min="16" max="2000" step="50" placeholder="400 (default)">
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    Frames per GPU-resident tracking window (~14&nbsp;MiB each).
+                                    A VRAM-fit knob, not a speed knob — identity was flat from
+                                    150–800 in testing. Drop to ~350 when the vLLM reader shares the GPU.
+                                </small>
+                            </div>
+                            <div class="input-group" id="sam2ModelGroup">
+                                <label for="sam2ModelSize">Model size (SAM 2 only):</label>
                                 <select id="sam2ModelSize">
                                     <!-- options populated from /api/sam2_models -->
                                 </select>
@@ -125,8 +139,8 @@
                                     Sizes marked “needs download” have no checkpoint on disk yet.
                                 </small>
                             </div>
-                            <div class="input-group">
-                                <label for="sam2MaxGpuFrames">SAM2 VRAM budget (frames):</label>
+                            <div class="input-group" id="sam2VramGroup">
+                                <label for="sam2MaxGpuFrames">VRAM budget (SAM 2 only, frames):</label>
                                 <input type="number" id="sam2MaxGpuFrames" min="0" step="100" placeholder="0 = auto (CPU offload)">
                                 <small style="color:#889;display:block;margin-top:4px;">
                                     &gt; 0 keeps SAM2 tensors on the GPU (no CPU offload, much faster per frame)
@@ -160,6 +174,7 @@
                 <div class="video-column">
                     <div class="hud-overlay">
                         <div class="hud-left">
+                            <span class="hud-item"><span class="hud-label">Tracker</span> <span id="hudBackend" class="hud-backend">—</span></span>
                             <span class="hud-item"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
                             <span class="hud-item"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
                             <span class="hud-item"><span class="hud-label">Reader</span> <span id="hudReader">local idle</span></span>

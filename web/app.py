@@ -5562,6 +5562,7 @@ class InferenceJob:
                         "total_frames": self.total_frames,
                         "fps": self.video_fps,
                         "frame_data": frame_b64,
+                        "backend": self.tracking_backend,
                         "scores": self.alliance_scores,
                         "robots": robots_data,
                         "scoring_events": events_data,
@@ -7813,19 +7814,28 @@ async def sam2_models():
     The UI uses `available` to disable sizes whose .pt file is missing, since picking
     one would silently degrade to Kalman tracking.
     """
+    def _vllm_server_up() -> bool:
+        try:
+            req = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+            with urllib.request.urlopen(req, timeout=1.5):
+                return True
+        except Exception:
+            return False
+
     return {
         "default": SAM2_MODEL_SIZE,
         "default_backend": TRACKING_BACKEND,
+        "vllm_available": await asyncio.to_thread(_vllm_server_up),
         "backends": [
+            {
+                "id": "sam3",
+                "label": "SAM 3",
+                "detail": "instance tracking — best identity, default",
+            },
             {
                 "id": "sam2",
                 "label": "SAM 2.1",
-                "detail": "Fast Hiera models; current production default",
-            },
-            {
-                "id": "sam3",
-                "label": "SAM 3.1",
-                "detail": "Object Multiplex; CUDA/H100-oriented, gated checkpoint",
+                "detail": "Hiera VOS — legacy fallback",
             },
         ],
         "models": [

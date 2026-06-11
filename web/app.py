@@ -639,6 +639,71 @@ app = FastAPI(title="FRC Vision Scorer")
 # Global state for inference jobs
 jobs: Dict[str, "InferenceJob"] = {}
 
+# One job runs at a time by default: SAM2 + the VLM saturate the GPU, and a
+# concurrent job forces SAM2 state offload to CPU (5-6x slower corners) and
+# confounds A/B timing. Extra submissions queue FIFO-ish and the waiting
+# client gets "queued" heartbeats. Raise for multi-GPU / spare-VRAM setups.
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1") or "1")
+_job_slots = asyncio.Semaphore(max(1, MAX_CONCURRENT_JOBS))
+_QUEUE_POLL_SECONDS = 2.0
+# Finished jobs kept in `jobs` for inspection; older ones are pruned at the
+# next submit so completed jobs stop pinning their YOLO models and frame
+# state in memory across a long event day.
+JOB_RETENTION = int(os.environ.get("JOB_RETENTION", "4") or "4")
+
+
+def _prune_finished_jobs() -> None:
+    """Drop all but the newest JOB_RETENTION finished jobs (insertion order).
+    Jobs that are still initializing/queued/processing are never pruned."""
+    finished = [job_id for job_id, job in jobs.items()
+                if job.status in ("completed", "error")]
+    for job_id in finished[:max(0, len(finished) - JOB_RETENTION)]:
+        jobs.pop(job_id, None)
+
+
+async def _run_job_serialized(job: "InferenceJob") -> None:
+    """Run process_video once a job slot frees up.
+
+    While queued, the client gets a heartbeat every poll; a stop request or a
+    dead websocket abandons the run before it starts. With multiple waiters,
+    ordering is best-effort (each poll rejoins the semaphore queue)."""
+    waited = False
+    while True:
+        try:
+            await asyncio.wait_for(_job_slots.acquire(), timeout=_QUEUE_POLL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            waited = True
+            if job._stopped:
+                job.status = "error"
+                job.error = "stopped while queued"
+                await job._send_ws({"type": "error", "error": job.error})
+                return
+            job.status = "queued"
+            sent = await job._send_ws({
+                "type": "status", "status": "queued",
+                "message": "Waiting for a free job slot…",
+            })
+            if not sent and job.websocket is None:
+                job.status = "error"
+                job.error = "client disconnected while queued"
+                print(f"  [queue] job {job.job_id} abandoned: client disconnected")
+                return
+    try:
+        if job._stopped:
+            job.status = "error"
+            job.error = "stopped while queued"
+            await job._send_ws({"type": "error", "error": job.error})
+            return
+        if waited:
+            await job._send_ws({"type": "status", "status": "processing",
+                                "message": "Job slot free — starting…",
+                                "progress": 0.0})
+        await job.process_video()
+    finally:
+        _job_slots.release()
+
+
 # Global state for current event session
 current_event: Optional[Dict] = None
 
@@ -5722,12 +5787,15 @@ async def set_ocr_regions(request: Request):
     Body keys: red_center, blue_center, and optional match_clock."""
     global custom_ocr_regions
     body = await request.json()
-    custom_ocr_regions = {}
+    # Build locally, assign once: a running job reads this global between
+    # awaits and must never observe a partially-built region dict.
+    regions_update = {}
     for key in ["red_center", "blue_center", "match_clock"]:
         if key in body:
             coords = body[key]
-            custom_ocr_regions[key] = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
-    
+            regions_update[key] = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
+    custom_ocr_regions = regions_update
+
     # Persist to database for this event
     if current_event:
         from database import save_ocr_regions
@@ -7707,6 +7775,7 @@ async def infer(
         # Create job; every per-job knob flows through the validated config.
         job = InferenceJob(
             job_id, video_path, match_key=match_key, config=job_config)
+        _prune_finished_jobs()  # finished jobs stop pinning models in memory
         jobs[job_id] = job
         
         return {"job_id": job_id}
@@ -8095,7 +8164,7 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
         pass
 
     try:
-        await job.process_video()
+        await _run_job_serialized(job)
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for job {job_id}")
     except Exception as e:

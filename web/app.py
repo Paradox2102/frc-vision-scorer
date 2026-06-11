@@ -41,6 +41,7 @@ import supervision as sv
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
+from web.job_config import JobConfig
 from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
@@ -755,10 +756,17 @@ class InferenceJob:
     """Manages a single video inference job"""
     
     def __init__(self, job_id: str, video_path: Path, team_reader: str = "local",
-                 match_key: Optional[str] = None):
+                 match_key: Optional[str] = None,
+                 config: Optional[JobConfig] = None):
         self.job_id = job_id
         self.video_path = video_path
-        self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
+        # Per-job knob values (override > env > default), validated at submit.
+        # Legacy callers that don't pass a config get pure env/defaults.
+        self.config = config if config is not None else JobConfig()
+        if config is not None:
+            self.team_reader = self.config.team_reader
+        else:
+            self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
         # Match this job processes; drives calibration-epoch selection. The
@@ -846,21 +854,18 @@ class InferenceJob:
         self.timer_gate_fallback_reason: Optional[str] = None
         self.sam2_source_to_local: Dict[int, int] = {}
         self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
-        # Per-run VRAM frame budget; defaults to the env constant, overridable per job.
-        self.sam2_max_gpu_frames = SAM2_MAX_GPU_FRAMES
-        # Per-run SAM2 encoder size ("tiny"/"small"/"base_plus"/"large"); defaults to
-        # the env-selected size, overridable per job from the UI.
-        self.model_size = SAM2_MODEL_SIZE
-        # Per-run SAM2 frame-export scale; defaults to the env constant,
-        # overridable per job for A/B runs without a server restart.
-        self.sam2_export_scale = SAM2_EXPORT_SCALE
-        # Per-run hijack-cull override; None defers to the tracker's
-        # CULL_HIJACK_ENABLED env default (currently off pending the qm72 gate).
-        self.cull_hijack_enabled: Optional[bool] = None
-        # Per-run re-anchor override; None defers to SAM2_REANCHOR_ENABLED.
-        self.reanchor_enabled: Optional[bool] = None
+        # Per-job A/B knobs, all resolved through self.config (override > env >
+        # default). The attributes survive because downstream plumbing and the
+        # job-control endpoints read them directly.
+        self.sam2_max_gpu_frames = self.config.sam2_max_gpu_frames
+        self.model_size = self.config.sam2_model_size
+        self.sam2_export_scale = self.config.sam2_export_scale
+        # JobConfig consults the same env vars the tracker defaults read, so
+        # passing these explicitly is equivalent to the old None-defers logic.
+        self.cull_hijack_enabled: Optional[bool] = self.config.cull_hijack_enabled
+        self.reanchor_enabled: Optional[bool] = self.config.reanchor_enabled
         # SAM3 remains opt-in until it has been benchmarked on the event hardware.
-        self.tracking_backend = TRACKING_BACKEND
+        self.tracking_backend = self.config.tracking_backend
 
         # Detection state
         self.hubs: List[DetectedHub] = []
@@ -2279,7 +2284,7 @@ class InferenceJob:
     def _frame_stream_due(self, now: float) -> bool:
         """Rate-cap live-view frame sends to FRAME_STREAM_INTERVAL_SEC."""
         last = getattr(self, "_last_frame_stream_time", None)
-        if last is not None and (now - last) < FRAME_STREAM_INTERVAL_SEC:
+        if last is not None and (now - last) < self.config.frame_stream_interval_sec:
             return False
         self._last_frame_stream_time = now
         return True
@@ -4114,6 +4119,9 @@ class InferenceJob:
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
+        # A/B provenance: knobs differing from code defaults (env or per-job).
+        _nd = self.config.non_defaults()
+        print(f"  [config] {_nd if _nd else 'all defaults'}")
         # Gate on calibration / loaded event (decision 7). No fallback to the old
         # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
         if not self._init_field_tracking():
@@ -4128,7 +4136,7 @@ class InferenceJob:
             self._open_log_file()
             # Load the per-event appearance gallery AFTER the log file is open so the
             # load line lands in the match log (not just the server console).
-            if GALLERY_ENABLED and self.event_key:
+            if self.config.gallery_enabled and self.event_key:
                 try:
                     roster_teams = list(dict.fromkeys(
                         str(team)
@@ -4284,7 +4292,7 @@ class InferenceJob:
                     target_tracking_fps = (
                         self.target_tracking_fps
                         if self.target_tracking_fps is not None
-                        else SAM2_TRACK_FPS
+                        else self.config.sam2_track_fps
                     )
                     if device == "cuda":
                         try:
@@ -4351,11 +4359,11 @@ class InferenceJob:
                             device=device,
                             offload_video_to_cpu=offload_vid,
                             offload_state_to_cpu=offload_st,
-                            vos_optimized=(SAM2_VOS_OPTIMIZED and device == "cuda"),
+                            vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
                         )
                         model_detail = (
                             f"{self.model_size} model, "
-                            f"vos_optimized={SAM2_VOS_OPTIMIZED and device == 'cuda'}"
+                            f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
                         )
                     self.robot_embedder = RobotEmbedder()
                     self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
@@ -4386,7 +4394,7 @@ class InferenceJob:
                     for local_idx, source_frame in enumerate(all_frames)
                 }
                 prompt_target_frame = prompt_source_frame + int(
-                    round(SAM2_PROMPT_OFFSET_SECONDS * max(self.video_fps, 0.0))
+                    round(self.config.sam2_prompt_offset_seconds * max(self.video_fps, 0.0))
                 )
                 prompt_local_idx = min(
                     range(len(all_frames)),
@@ -4395,7 +4403,7 @@ class InferenceJob:
                 prompt_frame = all_frames[prompt_local_idx]
                 print(
                     f"  [SAM2] Seeding at source frame {prompt_frame} "
-                    f"(~{SAM2_PROMPT_OFFSET_SECONDS:.1f}s after active start), "
+                    f"(~{self.config.sam2_prompt_offset_seconds:.1f}s after active start), "
                     "then propagating backward."
                 )
                 SAM2_SCALE = self.sam2_export_scale
@@ -4634,7 +4642,7 @@ class InferenceJob:
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
                         eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
-                        reprompt_every = max(1, int(round(REPROMPT_SECONDS * eff_fps)))
+                        reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
 
                         # Build a projector mapping a SAM2 mask box (tracker/0.5x
                         # top-cropped pixel coords) to field meters, for the
@@ -5468,7 +5476,7 @@ class InferenceJob:
                     events_data = self._recent_events_data()
                     _, buffer = cv2.imencode(
                         '.jpg', annotated_frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, FRAME_STREAM_JPEG_QUALITY])
+                        [cv2.IMWRITE_JPEG_QUALITY, self.config.frame_stream_jpeg_quality])
                     frame_b64 = base64.b64encode(buffer).decode('utf-8')
                     # Only stream the VLM crops on frames where a fresh batch exists,
                     # to avoid resending the same images every frame.
@@ -5532,6 +5540,8 @@ class InferenceJob:
                 "processing_sec": self.timings.get("total"),
                 "timings": self.timings,
                 "degradation_warnings": getattr(self, "degradation_warnings", []),
+                # A/B provenance: every knob that differed from the code default.
+                "config": self.config.non_defaults(),
             }))
         
         except Exception as e:
@@ -7615,10 +7625,52 @@ async def infer(
     sam2_export_scale: Optional[float] = Form(None),
     cull_hijack_enabled: Optional[bool] = Form(None),
     reanchor_enabled: Optional[bool] = Form(None),
+    config_json: Optional[str] = Form(None),
 ):
-    """Start inference job"""
+    """Start inference job.
+
+    Per-job knobs arrive either as the legacy named form fields above or as
+    `config_json`, a JSON object of {knob_name: value} validated against the
+    JobConfig registry — a bad knob fails the submit with 400 instead of
+    failing minutes into inference. config_json wins over named fields.
+    """
     job_id = str(uuid.uuid4())
-    
+
+    # Resolve and validate the job config BEFORE touching the video source.
+    overrides: dict = {}
+    if team_reader and team_reader != "local":
+        overrides["team_reader"] = team_reader
+    if sam2_max_gpu_frames is not None:
+        overrides["sam2_max_gpu_frames"] = sam2_max_gpu_frames
+    if tracking_backend:
+        overrides["tracking_backend"] = tracking_backend.lower()
+    if model_size:
+        overrides["sam2_model_size"] = model_size.lower()
+    if sam2_export_scale is not None:
+        overrides["sam2_export_scale"] = sam2_export_scale
+    if cull_hijack_enabled is not None:
+        overrides["cull_hijack_enabled"] = cull_hijack_enabled
+    if reanchor_enabled is not None:
+        overrides["reanchor_enabled"] = reanchor_enabled
+    if config_json:
+        try:
+            extra = json.loads(config_json)
+        except ValueError:
+            return JSONResponse(status_code=400,
+                                content={"error": "config_json is not valid JSON"})
+        if not isinstance(extra, dict):
+            return JSONResponse(status_code=400,
+                                content={"error": "config_json must be a JSON object"})
+        overrides.update(extra)
+    try:
+        job_config = JobConfig(overrides)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    if not _sam2_checkpoint_present(job_config.sam2_model_size):
+        print(f"  [SAM2] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
+              f"{_SAM2_MODELS[job_config.sam2_model_size][1]}; "
+              f"SAM2 will fall back to Kalman tracking.")
+
     try:
         # Handle video source
         if video_file:
@@ -7652,31 +7704,9 @@ async def infer(
         else:
             return JSONResponse(status_code=400, content={"error": "No video file or YouTube URL provided"})
         
-        # Create job
-        team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
+        # Create job; every per-job knob flows through the validated config.
         job = InferenceJob(
-            job_id, video_path, team_reader=team_reader, match_key=match_key)
-        # Per-run VRAM frame budget (UI override); falls back to env default when omitted.
-        if sam2_max_gpu_frames is not None:
-            job.sam2_max_gpu_frames = max(0, int(sam2_max_gpu_frames))
-        if tracking_backend and tracking_backend.lower() in {"sam2", "sam3"}:
-            job.tracking_backend = tracking_backend.lower()
-        # Per-run SAM2 encoder size (UI override); ignore unknown values and warn (but
-        # don't fail the job) if the chosen checkpoint isn't downloaded — SAM2 init would
-        # otherwise silently fall back to Kalman tracking.
-        if model_size and model_size.lower() in _SAM2_MODELS:
-            job.model_size = model_size.lower()
-            if not _sam2_checkpoint_present(job.model_size):
-                print(f"  [SAM2] WARNING: '{job.model_size}' checkpoint not found at "
-                      f"{_SAM2_MODELS[job.model_size][1]}; SAM2 will fall back to Kalman tracking.")
-        # Per-run export scale for A/B runs. Clamped: below 0.25 starves SAM2 of
-        # pixels; above 1.0 only upsamples (no information) and inflates mask RAM.
-        if sam2_export_scale is not None:
-            job.sam2_export_scale = min(1.0, max(0.25, float(sam2_export_scale)))
-        if cull_hijack_enabled is not None:
-            job.cull_hijack_enabled = bool(cull_hijack_enabled)
-        if reanchor_enabled is not None:
-            job.reanchor_enabled = bool(reanchor_enabled)
+            job_id, video_path, match_key=match_key, config=job_config)
         jobs[job_id] = job
         
         return {"job_id": job_id}

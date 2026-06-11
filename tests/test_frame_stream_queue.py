@@ -8,6 +8,7 @@ import asyncio
 import time
 
 from web.app import InferenceJob
+from web.job_config import JobConfig
 
 
 class RecordingWebSocket:
@@ -25,6 +26,7 @@ def _make_job(websocket):
     job = InferenceJob.__new__(InferenceJob)
     job.websocket = websocket
     job._websocket_send_lock = asyncio.Lock()
+    job.config = JobConfig()
     return job
 
 

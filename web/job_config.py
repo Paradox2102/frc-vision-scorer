@@ -37,7 +37,7 @@ class Knob:
 
 KNOBS = [
     # --- tracking backend ---
-    Knob("tracking_backend", "TRACKING_BACKEND", str, "sam2",
+    Knob("tracking_backend", "TRACKING_BACKEND", str, "sam3",
          choices=("sam2", "sam3")),
     Knob("sam2_model_size", "SAM2_MODEL_SIZE", str, "small",
          choices=("tiny", "small", "base_plus", "large")),
@@ -50,6 +50,9 @@ KNOBS = [
          min=0.0),
     Knob("reprompt_seconds", "REPROMPT_SECONDS", float, 2.0, min=0.1),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False),
+    # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
+    # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.
+    Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 400, min=16, max=2000),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
     # --- identity / VLM ---

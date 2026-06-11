@@ -13,7 +13,7 @@ def test_defaults_without_env(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.tracking_backend == "sam2"
+    assert cfg.tracking_backend == "sam3"
     assert cfg.sam2_model_size == "small"
     assert cfg.sam2_track_fps == 8.0
     assert cfg.sam2_export_scale == 0.5

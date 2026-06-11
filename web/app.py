@@ -507,7 +507,9 @@ ROBOT_TRACK_TOP_CROP_ENABLED = os.environ.get(
 # `SAM2_MODEL_SIZE=large python web/app.py` when maximum mask fidelity is needed.
 # All variants resize every frame to a 1024² square, so per-frame VRAM (and thus the
 # SAM2_MAX_GPU_FRAMES budget below) is identical across sizes — only compute differs.
-TRACKING_BACKEND = os.environ.get("TRACKING_BACKEND", "sam2").lower()
+# sam3 default since the June 10 A/B: better identity (qm24 6/6, qm72 5/6 vs
+# 4/3 and 4/4), identical scores, half the wall-clock on both matches.
+TRACKING_BACKEND = os.environ.get("TRACKING_BACKEND", "sam3").lower()
 if TRACKING_BACKEND not in {"sam2", "sam3"}:
     TRACKING_BACKEND = "sam2"
 SAM2_MODEL_SIZE = os.environ.get("SAM2_MODEL_SIZE", "small").lower()
@@ -4412,10 +4414,12 @@ class InferenceJob:
                             compile_model=(SAM3_COMPILE and device == "cuda"),
                             max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
                             use_fa3=SAM3_USE_FA3,
+                            chunk_frames=self.config.sam3_chunk_frames,
                         )
                         model_detail = (
-                            f"Object Multiplex, compile={SAM3_COMPILE}, "
-                            f"flash-attn-3={SAM3_USE_FA3}"
+                            f"video model w/ instance prompts, "
+                            f"chunk={self.config.sam3_chunk_frames} frames, "
+                            f"compile={SAM3_COMPILE}"
                         )
                     else:
                         from web.field.sam2_tracker import Sam2FieldTracker

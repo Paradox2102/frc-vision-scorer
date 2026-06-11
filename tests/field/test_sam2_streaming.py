@@ -4,6 +4,11 @@ import numpy as np
 import cv2
 
 from web.app import InferenceJob, _restore_sam2_mask_to_view
+from web.job_config import JobConfig
+
+# These tests exercise the SAM2 path specifically; pin the backend so the
+# sam3 default (June 10 A/B) cannot route them to the real SAM3 model.
+SAM2_CFG = JobConfig({"tracking_backend": "sam2"})
 from web.field.tracker import FieldDetection
 
 
@@ -98,7 +103,7 @@ class TestSAM2Streaming(unittest.TestCase):
     @patch("web.app.YOLO")
     def test_sam2_fallback_on_import_error(self, mock_yolo):
         """If SAM2 fails to load, the job gracefully falls back to Kalman tracking."""
-        job = InferenceJob("test_job", "/mock/path/video.mp4")
+        job = InferenceJob("test_job", "/mock/path/video.mp4", config=SAM2_CFG)
         
         # Setup mock views and tracking ready
         job.views = [MagicMock(name="main")]
@@ -159,7 +164,7 @@ class TestSAM2Streaming(unittest.TestCase):
         mock_model_instance.names = {0: "blue_bumper", 1: "red_bumper"}
         mock_yolo.return_value = mock_model_instance
         
-        job = InferenceJob("test_job", "/mock/path/video.mp4")
+        job = InferenceJob("test_job", "/mock/path/video.mp4", config=SAM2_CFG)
         
         # Mock views
         mock_view = MagicMock()

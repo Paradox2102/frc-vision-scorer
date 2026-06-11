@@ -54,7 +54,7 @@ KNOBS = [
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
-         choices=("local", "deepseek")),
+         choices=("local", "deepseek", "vllm")),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True),
     # --- live-view streaming ---
     Knob("frame_stream_interval_sec", "FRAME_STREAM_INTERVAL_SEC", float, 0.1,

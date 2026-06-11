@@ -596,6 +596,10 @@ HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball 
 # Default is the 4B Instruct variant: drop-in with the 8B (same processor/chat API),
 # much faster, and adequate for bumper-digit transcription.
 VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
+# team_reader="vllm": same model served by a vLLM OpenAI-compatible server
+# (web/start_vllm.sh). Continuous batching replaces VLM_BATCH_READS, and the
+# weights live in the vLLM process, so job pruning here never reloads them.
+VLM_SERVER_URL = os.environ.get("VLM_SERVER_URL", "http://127.0.0.1:8006/v1")
 
 # Match-start calibration drift check: sample a few in-match frames from the main
 # view, auto-detect AprilTags, and verify the selected calibration epoch still
@@ -831,7 +835,7 @@ class InferenceJob:
         if config is not None:
             self.team_reader = self.config.team_reader
         else:
-            self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
+            self.team_reader = team_reader if team_reader in ("local", "deepseek", "vllm") else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
         # Match this job processes; drives calibration-epoch selection. The
@@ -6534,6 +6538,14 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
             robot_crops_b64, match_teams, blue_teams, red_teams,
             expected_alliances=expected_alliances,
         )
+    if provider == "vllm":
+        try:
+            return _vllm_read_bumpers(
+                robot_crops_b64, match_teams, blue_teams, red_teams,
+                expected_alliances=expected_alliances,
+            )
+        except Exception as e:
+            print(f"  vLLM provider failed ({e!r}); falling back to in-process Qwen")
     try:
         return _qwen_vl_read_bumpers(
             robot_crops_b64, match_teams, blue_teams, red_teams,
@@ -7118,6 +7130,149 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     results = [r if r is not None else _error_entry("skipped") for r in results]
     identified = sum(1 for r in results if r["team_number"])
     print(f"  Qwen VL: identified {identified}/{len(robot_crops_b64)} robots: "
+          f"{[r['team_number'] for r in results]}")
+    return results
+
+
+def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
+                       blue_teams: list, red_teams: list,
+                       expected_alliances: Optional[list] = None) -> list:
+    """Read bumper numbers via a vLLM OpenAI-compatible server (VLM_SERVER_URL).
+
+    Same model and prompt as _qwen_vl_read_bumpers, but crops go out as
+    concurrent HTTP requests and the server's continuous batching replaces the
+    hand-rolled padded-generate batch. Per-token logprobs come back in the
+    response, so digit_token_conf/blend_read_confidence apply unchanged.
+    """
+    teams_str = ", ".join(match_teams)
+    expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
+
+    def _error_entry(e):
+        return {"team_number": None, "alliance": "unknown", "confidence": 0,
+                "raw_read": None, "error": str(e)}
+
+    def _read_one(idx: int, crop_b64: str) -> dict:
+        img_bytes = base64.b64decode(crop_b64)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        # Same upscale as the in-process path so the model sees identical pixels.
+        min_dim = 512
+        if img.width < min_dim or img.height < min_dim:
+            scale = max(min_dim / img.width, min_dim / img.height)
+            img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92)
+        data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        expected_alliance = (
+            expected_alliances[idx]
+            if idx < len(expected_alliances) and expected_alliances[idx] in ("blue", "red")
+            else "unknown"
+        )
+        candidate_teams = (
+            red_teams if expected_alliance == "red"
+            else blue_teams if expected_alliance == "blue"
+            else match_teams
+        )
+        candidate_str = ", ".join(candidate_teams)
+        hint = (
+            f"Computer vision sees {expected_alliance.upper()} bumper pixels, so partial or uncertain reads "
+            f"should be matched only against these {expected_alliance} alliance teams: {candidate_str}.\n"
+            if expected_alliance in ("blue", "red")
+            else f"Possible current-match teams are: {teams_str}.\n"
+        )
+        prompt = (
+            "This image shows ONE FRC robot from a side or elevated camera angle. "
+            "Around the base of the robot is a bumper: a solid RED or BLUE band with a "
+            "WHITE team number printed on it. FRC team numbers are 1 to 5 digits "
+            "(for example 294, 2485, 4322).\n\n"
+            f"{hint}"
+            "Carefully read the WHITE digits on the bumper, left to right. Report the "
+            "exact number you SEE. Do not use robot paint or mechanisms for alliance color; "
+            "only the bumper band matters. If the digits are clear, report them even if the "
+            "color looks surprising.\n\n"
+            'Reply with ONLY compact JSON and nothing else: '
+            '{"team": "<the digits, or null if you cannot read them>", '
+            '"color": "red" or "blue"}.'
+        )
+        payload = {
+            "model": VLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": data_uri}},
+                {"type": "text", "text": prompt},
+            ]}],
+            "temperature": 0,
+            "max_tokens": 64,
+            "logprobs": VLM_LOGPROB_CONFIDENCE,
+        }
+        req = urllib.request.Request(
+            f"{VLM_SERVER_URL}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        choice = body["choices"][0]
+        output_text = (choice["message"]["content"] or "").strip()
+
+        digit_prob = None
+        lp_content = ((choice.get("logprobs") or {}).get("content")) or []
+        if VLM_LOGPROB_CONFIDENCE and lp_content:
+            probs = [math.exp(t["logprob"]) for t in lp_content]
+            tok_texts = [t.get("token", "") for t in lp_content]
+            digit_prob = digit_token_conf(probs, tok_texts)
+
+        team = None
+        color = "unknown"
+        try:
+            clean = output_text
+            if "```" in clean:
+                clean = clean.split("```")[1]
+                if clean.startswith("json"):
+                    clean = clean[4:]
+                clean = clean.strip()
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(clean[start:end])
+                team = parsed.get("team")
+                color = parsed.get("color", "unknown")
+                if team is not None:
+                    team = str(team)
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        read = "".join(ch for ch in team if ch.isdigit()) if team else ""
+        model_color = color if color in ("blue", "red") else "unknown"
+        matched, alliance, confidence = _match_bumper_read_to_roster(
+            read, model_color, expected_alliance,
+            match_teams, blue_teams, red_teams,
+        )
+        confidence = blend_read_confidence(confidence, digit_prob)
+        print(f"    vLLM read: raw={output_text!r} -> team={matched}, "
+              f"digit_prob={None if digit_prob is None else round(digit_prob, 3)}")
+        return {
+            "team_number": matched,
+            "alliance": alliance,
+            "confidence": confidence,
+            "raw_read": read,
+            "digit_prob": digit_prob,
+        }
+
+    results: list = [None] * len(robot_crops_b64)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(robot_crops_b64), VLM_TOP_K)) as pool:
+        futures = {pool.submit(_read_one, i, c): i
+                   for i, c in enumerate(robot_crops_b64)}
+        for fut, i in futures.items():
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                print(f"  vLLM read error on crop {i}: {e}")
+                results[i] = _error_entry(e)
+
+    identified = sum(1 for r in results if r["team_number"])
+    print(f"  vLLM: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")
     return results
 

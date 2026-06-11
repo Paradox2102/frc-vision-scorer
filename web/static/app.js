@@ -58,6 +58,7 @@ class VisionScorer {
 
         // Upload form
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
+        this.populateSam2Models();
         this.startInferenceBtn.addEventListener('click', () => this.startInference());
         this.pauseInferenceBtn.addEventListener('click', () => this.pauseInference());
         this.resumeInferenceBtn.addEventListener('click', () => this.resumeInference());
@@ -191,12 +192,14 @@ class VisionScorer {
                     <button class="btn-small" id="galleryExpandAll">Expand all</button>
                     <button class="btn-small" id="galleryCollapseAll">Collapse all</button>
                     <span class="gallery-toolbar-count">${teams.length} team${teams.length === 1 ? '' : 's'}</span>
+                    <button class="btn-small gallery-clear-all" id="galleryClearAll">Clear all</button>
                 </div>
                 ${rows}`;
 
             grid.querySelectorAll('.gallery-group-head').forEach(h => h.addEventListener('click', () => this.toggleGalleryGroup(h)));
             grid.querySelector('#galleryExpandAll').addEventListener('click', () => this.setAllGalleryGroups(true));
             grid.querySelector('#galleryCollapseAll').addEventListener('click', () => this.setAllGalleryGroups(false));
+            grid.querySelector('#galleryClearAll').addEventListener('click', () => this.clearGallery());
             grid.querySelectorAll('.g-save').forEach(b => b.addEventListener('click', () => this.saveGalleryExemplar(b)));
             grid.querySelectorAll('.g-del').forEach(b => b.addEventListener('click', () => this.deleteGalleryExemplar(b)));
         } catch (e) {
@@ -269,6 +272,24 @@ class VisionScorer {
         await fetch(`/api/gallery/${id}`, { method: 'DELETE' });
     }
 
+    async clearGallery() {
+        // Wipe every exemplar for the loaded event. Confirmed because it's the
+        // whole gallery at once (unlike single-card deletes); the gallery
+        // regenerates on the next run, so this is a troubleshooting reset.
+        const key = document.getElementById('galleryEventKey').value.trim();
+        if (!key) return;
+        const grid = document.getElementById('galleryGrid');
+        const n = grid.querySelectorAll('.review-robot').length;
+        if (!confirm(`Delete all ${n} gallery exemplar${n === 1 ? '' : 's'} for event "${key}"? They regenerate on the next run.`)) return;
+        try {
+            const resp = await fetch(`/api/gallery?event_key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+            if (!resp.ok) { alert('Failed to clear gallery'); return; }
+            this.loadGallery();   // reload -> "No exemplars"
+        } catch (e) {
+            alert('Failed to clear gallery');
+        }
+    }
+
     // --- Event Loading ---
 
     async checkExistingEvent() {
@@ -336,6 +357,7 @@ class VisionScorer {
         document.getElementById('ocrMarkBlueHub').onclick = () => this.startHubMark('blue');
         document.getElementById('ocrDrawRed').onclick = () => this.startOcrDraw('red');
         document.getElementById('ocrDrawBlue').onclick = () => this.startOcrDraw('blue');
+        document.getElementById('ocrDrawClock').onclick = () => this.startOcrDraw('clock');
         document.getElementById('ocrSaveBtn').onclick = () => this.saveOcrRegions();
         document.getElementById('ocrSkipBtn').onclick = () => {
             document.getElementById('ocrSetupSection').style.display = 'none';
@@ -347,7 +369,7 @@ class VisionScorer {
             }
         };
         
-        this.ocrRegions = { red_center: null, blue_center: null };
+        this.ocrRegions = { red_center: null, blue_center: null, match_clock: null };
         this.hubPositions = { blue: null, red: null };
         this.ocrDrawMode = null;  // 'red', 'blue' for score regions
         this.hubMarkMode = null;  // 'red', 'blue' for hub clicks
@@ -444,19 +466,23 @@ class VisionScorer {
         document.getElementById('ocrMarkBlueHub').classList.toggle('active', alliance === 'blue');
         document.getElementById('ocrDrawRed').classList.remove('active');
         document.getElementById('ocrDrawBlue').classList.remove('active');
+        document.getElementById('ocrDrawClock').classList.remove('active');
     }
 
-    startOcrDraw(alliance) {
-        this.ocrDrawMode = alliance;
+    startOcrDraw(kind) {
+        this.ocrDrawMode = kind;
         this.hubMarkMode = null;
         const canvas = document.getElementById('ocrCanvas');
         canvas.style.cursor = 'crosshair';
         document.getElementById('ocrStatus').textContent = 
-            `Draw a box around the ${alliance.toUpperCase()} alliance score number.`;
+            kind === 'clock'
+                ? 'Draw a box around the match clock.'
+                : `Draw a box around the ${kind.toUpperCase()} alliance score number.`;
         
         // Highlight active button
-        document.getElementById('ocrDrawRed').classList.toggle('active', alliance === 'red');
-        document.getElementById('ocrDrawBlue').classList.toggle('active', alliance === 'blue');
+        document.getElementById('ocrDrawRed').classList.toggle('active', kind === 'red');
+        document.getElementById('ocrDrawBlue').classList.toggle('active', kind === 'blue');
+        document.getElementById('ocrDrawClock').classList.toggle('active', kind === 'clock');
         document.getElementById('ocrMarkRedHub').classList.remove('active');
         document.getElementById('ocrMarkBlueHub').classList.remove('active');
     }
@@ -502,7 +528,8 @@ class VisionScorer {
         
         // Draw current selection
         const ctx = canvas.getContext('2d');
-        ctx.strokeStyle = this.ocrDrawMode === 'red' ? '#e74c3c' : '#3498db';
+        ctx.strokeStyle = this.ocrDrawMode === 'red' ? '#e74c3c'
+            : this.ocrDrawMode === 'blue' ? '#3498db' : '#f1c40f';
         ctx.lineWidth = 2;
         ctx.setLineDash([5, 3]);
         ctx.strokeRect(this.ocrDragStart.x, this.ocrDragStart.y, 
@@ -528,13 +555,16 @@ class VisionScorer {
         
         if (rw < 5 || rh < 5) return; // Too small
         
-        const key = this.ocrDrawMode + '_center';
+        const key = this.ocrDrawMode === 'clock'
+            ? 'match_clock'
+            : this.ocrDrawMode + '_center';
         this.ocrRegions[key] = [Math.round(rx), Math.round(ry), Math.round(rw), Math.round(rh)];
         
         this.ocrDrawMode = null;
         canvas.style.cursor = 'default';
         document.getElementById('ocrDrawRed').classList.remove('active');
         document.getElementById('ocrDrawBlue').classList.remove('active');
+        document.getElementById('ocrDrawClock').classList.remove('active');
         
         this.redrawOcrCanvas();
         this.checkSetupComplete();
@@ -591,8 +621,10 @@ class VisionScorer {
         // Draw saved score regions
         for (const [key, region] of Object.entries(this.ocrRegions)) {
             if (!region) continue;
-            const color = key.startsWith('red') ? '#e74c3c' : '#3498db';
-            const label = key.startsWith('red') ? 'RED SCORE' : 'BLUE SCORE';
+            const color = key.startsWith('red') ? '#e74c3c'
+                : key.startsWith('blue') ? '#3498db' : '#f1c40f';
+            const label = key.startsWith('red') ? 'RED SCORE'
+                : key.startsWith('blue') ? 'BLUE SCORE' : 'MATCH CLOCK';
             const [rx, ry, rw, rh] = region;
             
             ctx.strokeStyle = color;
@@ -660,18 +692,42 @@ class VisionScorer {
             this.eventSection.style.display = 'block';
         });
 
-        // Populate match dropdown
+        // Populate match dropdown — grouped by comp level, split by day within a level
         const select = document.getElementById('matchSelect');
         select.innerHTML = '<option value="">-- Choose a match --</option>';
 
-        let currentLevel = '';
+        const tz = this.eventData.timezone;
+        const calendarDate = (match) => {
+            if (!match.time) return null;
+            const opts = { year: 'numeric', month: '2-digit', day: '2-digit' };
+            if (tz) opts.timeZone = tz;
+            // en-CA locale formats as YYYY-MM-DD, so dates sort chronologically as strings
+            return new Intl.DateTimeFormat('en-CA', opts).format(new Date(match.time * 1000));
+        };
+        const prettyDate = (match) => {
+            const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+            if (tz) opts.timeZone = tz;
+            return new Intl.DateTimeFormat('en-US', opts).format(new Date(match.time * 1000));
+        };
+
+        // Number the event's distinct match days chronologically: Day 1, Day 2, ...
+        const dayNumbers = new Map();
+        const allDates = [...new Set(this.eventData.matches.map(calendarDate).filter(Boolean))].sort();
+        for (const d of allDates) dayNumbers.set(d, dayNumbers.size + 1);
+
+        let currentGroupKey = null;
+        let currentGroup = null;
         for (const match of this.eventData.matches) {
             const levelLabel = { qm: 'Qualifications', sf: 'Semifinals', f: 'Finals' }[match.comp_level] || match.comp_level;
-            if (match.comp_level !== currentLevel) {
-                const optgroup = document.createElement('optgroup');
-                optgroup.label = levelLabel;
-                select.appendChild(optgroup);
-                currentLevel = match.comp_level;
+            const date = calendarDate(match);
+            const groupKey = `${match.comp_level}|${date || ''}`;
+            if (groupKey !== currentGroupKey) {
+                currentGroup = document.createElement('optgroup');
+                currentGroup.label = date
+                    ? `${levelLabel} — Day ${dayNumbers.get(date)} (${prettyDate(match)})`
+                    : levelLabel;
+                select.appendChild(currentGroup);
+                currentGroupKey = groupKey;
             }
 
             const opt = document.createElement('option');
@@ -683,13 +739,7 @@ class VisionScorer {
             opt.textContent = `${match.label} — Blue: ${blueTeams} vs Red: ${redTeams}${scoreStr}`;
             opt.dataset.matchData = JSON.stringify(match);
 
-            // Append to last optgroup
-            const groups = select.querySelectorAll('optgroup');
-            if (groups.length > 0) {
-                groups[groups.length - 1].appendChild(opt);
-            } else {
-                select.appendChild(opt);
-            }
+            currentGroup.appendChild(opt);
         }
     }
 
@@ -746,6 +796,46 @@ class VisionScorer {
 
     // --- Video Inference (existing logic) ---
 
+    async populateSam2Models() {
+        const select = document.getElementById('sam2ModelSize');
+        const backendSelect = document.getElementById('trackingBackend');
+        if (!select || !backendSelect) return;
+        try {
+            const resp = await fetch('/api/sam2_models');
+            const data = await resp.json();
+            backendSelect.replaceChildren();
+            for (const backend of data.backends || []) {
+                const opt = document.createElement('option');
+                opt.value = backend.id;
+                opt.textContent = `${backend.label} (${backend.detail})`;
+                if (backend.id === data.default_backend) opt.selected = true;
+                backendSelect.appendChild(opt);
+            }
+            select.replaceChildren();
+            for (const m of data.models) {
+                const opt = document.createElement('option');
+                opt.value = m.size;
+                const tag = m.available ? '' : '  — needs download';
+                opt.textContent = `${m.label} (${m.detail})${tag}`;
+                opt.disabled = !m.available;
+                if (m.size === data.default && m.available) opt.selected = true;
+                select.appendChild(opt);
+            }
+            // If the env default isn't downloaded, fall back to the first available size.
+            if (select.selectedOptions.length === 0 || select.selectedOptions[0].disabled) {
+                const firstAvailable = Array.from(select.options).find((o) => !o.disabled);
+                if (firstAvailable) firstAvailable.selected = true;
+            }
+            const syncModelControls = () => {
+                select.disabled = backendSelect.value !== 'sam2';
+            };
+            backendSelect.addEventListener('change', syncModelControls);
+            syncModelControls();
+        } catch (err) {
+            console.error('Failed to load tracker model list:', err);
+        }
+    }
+
     async handleSubmit(e) {
         e.preventDefault();
 
@@ -768,6 +858,17 @@ class VisionScorer {
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
             formData.append('sam2_max_gpu_frames', vramBudget);
+        }
+        const trackingBackend = document.getElementById('trackingBackend')?.value;
+        if (trackingBackend) {
+            formData.append('tracking_backend', trackingBackend);
+        }
+        const modelSize = document.getElementById('sam2ModelSize')?.value;
+        if (modelSize) {
+            formData.append('model_size', modelSize);
+        }
+        if (this.selectedMatch?.key) {
+            formData.append('match_key', this.selectedMatch.key);
         }
 
         this.setStatus('Uploading...', 0);
@@ -1003,20 +1104,20 @@ class VisionScorer {
     }
 
     updateRobotTable(tableBody, robots, alliance) {
-        if (robots.length === 0) {
-            tableBody.innerHTML = '<tr><td colspan="3" class="empty-state">No robots detected</td></tr>';
-            return;
-        }
-
-        robots.sort((a, b) => (b.scores || 0) - (a.scores || 0));
-
-        const rows = robots.map(robot => {
-            const label = robot.slot || (robot.id != null ? `Robot ${robot.id}` : '—');
-            const goals = robot.scores != null ? robot.scores : '—';
+        const prefix = alliance === 'blue' ? 'B' : 'R';
+        const bySlot = new Map(
+            robots
+                .filter(r => typeof r.slot === 'string' && r.slot.match(/^[BR][1-3]$/))
+                .map(r => [r.slot, r])
+        );
+        const rows = [1, 2, 3].map(index => {
+            const label = `${prefix}${index}`;
+            const robot = bySlot.get(label);
+            const goals = robot && robot.scores != null ? robot.scores : 0;
             return `
                 <tr>
                     <td>${label}</td>
-                    <td>${robot.team_number || '—'}</td>
+                    <td>${robot && robot.team_number ? robot.team_number : '—'}</td>
                     <td class="goal-count">${goals}</td>
                 </tr>
             `;
@@ -2003,11 +2104,19 @@ class VisionScorer {
             ctx.lineWidth = 1.5;
             ctx.strokeStyle = 'rgba(0,0,0,0.4)';
             ctx.stroke();
+            // Confirmed team renders solid; a leading-but-unconfirmed VLM read
+            // (team_candidate) renders dimmed with a "?" so reads are visible
+            // immediately instead of waiting for the lock.
             if (r.team_number) {
                 ctx.fillStyle = '#e8eaf0';
                 ctx.font = 'bold 10px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.fillText(String(r.team_number), px, py - 10);
+            } else if (r.team_candidate) {
+                ctx.fillStyle = 'rgba(232,234,240,0.6)';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(String(r.team_candidate) + '?', px, py - 10);
             }
         }
     }

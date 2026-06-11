@@ -69,6 +69,20 @@ def test_two_distinct_robots_two_slots():
     assert len({o.slot_id for o in outs}) == 2
 
 
+def test_duplicate_sam2_masks_on_one_robot_use_one_slot():
+    tracker = FieldTracker(FIELD_LEN)
+    reg = FusedTrackRegistry()
+    outs = _step(tracker, reg, {
+        "main": [
+            (_det(6.70, 3.40, 1, "red", (690, 410, 890, 535)), b"a"),
+            (_det(6.74, 3.43, 3, "red", (700, 418, 885, 530)), b"b"),
+        ],
+    })
+
+    assert len(outs) == 1
+    assert outs[0].alliance == "red"
+
+
 def test_abrupt_position_swap_keeps_slot_by_track_id():
     # The real teeth: two BLUE robots (same alliance -> same matching pool) swap
     # positions ABRUPTLY in one frame — the constant-velocity model can't predict

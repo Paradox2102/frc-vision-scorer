@@ -5,7 +5,7 @@ likely a Qwen-VL pass on this bumper crop will yield a valid roster read.
 Higher is better. Combines three signals:
 
   1. **color strength** — fraction of pixels matching red or blue bumper HSV
-     ranges (reuses the band tuned for `detect_bumper_color`).
+     ranges (reuses the bumper-band geometry).
   2. **text contrast** — fraction of near-white pixels inside / next to the
      colored band (the digits sit on the bumper).
   3. **sharpness** — variance of the Laplacian; rejects motion blur.

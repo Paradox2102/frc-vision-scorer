@@ -161,6 +161,8 @@ async def load_event_data(url_or_key: str) -> Dict:
         matches.append({
             'key': m['key'],
             'comp_level': m['comp_level'],
+            # Unix epoch seconds; actual > scheduled > predicted, null if none known
+            'time': m.get('actual_time') or m.get('time') or m.get('predicted_time'),
             'match_number': m['match_number'],
             'set_number': m.get('set_number', 1),
             'label': format_match_label(m),
@@ -180,6 +182,7 @@ async def load_event_data(url_or_key: str) -> Dict:
         'location': f"{event_info.get('city', '')}, {event_info.get('state_prov', '')}".strip(', '),
         'start_date': event_info.get('start_date'),
         'end_date': event_info.get('end_date'),
+        'timezone': event_info.get('timezone'),
         'teams': teams,
         'matches': matches,
     }

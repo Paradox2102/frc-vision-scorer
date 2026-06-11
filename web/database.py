@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS replays (
 CREATE TABLE IF NOT EXISTS appearance_gallery (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL,
+    source_match_key TEXT,
     team TEXT NOT NULL,
     alliance_color TEXT NOT NULL,
     embedding BLOB NOT NULL,
@@ -113,7 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_gallery_event ON appearance_gallery(event_key, al
 
 CREATE TABLE IF NOT EXISTS match_robot_identity (
     job_id TEXT NOT NULL,
-    slot INTEGER NOT NULL,
+    identity_id INTEGER NOT NULL,
+    slot INTEGER,
     slot_label TEXT,
     alliance TEXT,
     team_number TEXT,
@@ -121,18 +123,88 @@ CREATE TABLE IF NOT EXISTS match_robot_identity (
     source TEXT,
     confidence REAL,
     created_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (job_id, slot)
+    PRIMARY KEY (job_id, identity_id)
+);
+CREATE TABLE IF NOT EXISTS match_robot_binding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    identity_id INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
+    start_frame INTEGER NOT NULL,
+    end_frame INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS match_robot_crop (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
-    slot INTEGER NOT NULL,
+    identity_id INTEGER NOT NULL,
     legibility REAL,
     embedding BLOB,
     image BLOB
 );
-CREATE INDEX IF NOT EXISTS idx_match_crop ON match_robot_crop(job_id, slot);
 """
+
+
+async def _table_columns(db, table: str) -> set[str]:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in await cursor.fetchall()}
+
+
+async def _migrate_identity_tables(db) -> None:
+    identity_columns = await _table_columns(db, "match_robot_identity")
+    if identity_columns and "identity_id" not in identity_columns:
+        await db.execute("ALTER TABLE match_robot_identity RENAME TO match_robot_identity_legacy")
+        await db.execute("""
+            CREATE TABLE match_robot_identity (
+                job_id TEXT NOT NULL,
+                identity_id INTEGER NOT NULL,
+                slot INTEGER,
+                slot_label TEXT,
+                alliance TEXT,
+                team_number TEXT,
+                confirmed INTEGER DEFAULT 0,
+                source TEXT,
+                confidence REAL,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (job_id, identity_id)
+            )
+        """)
+        await db.execute("""
+            INSERT INTO match_robot_identity
+                (job_id, identity_id, slot, slot_label, alliance, team_number,
+                 confirmed, source, confidence, created_at)
+            SELECT job_id, slot, slot, slot_label, alliance, team_number,
+                   confirmed, source, confidence, created_at
+            FROM match_robot_identity_legacy
+        """)
+        await db.execute("DROP TABLE match_robot_identity_legacy")
+
+    crop_columns = await _table_columns(db, "match_robot_crop")
+    if crop_columns and "identity_id" not in crop_columns:
+        await db.execute("DROP INDEX IF EXISTS idx_match_crop")
+        await db.execute("ALTER TABLE match_robot_crop RENAME TO match_robot_crop_legacy")
+        await db.execute("""
+            CREATE TABLE match_robot_crop (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                identity_id INTEGER NOT NULL,
+                legibility REAL,
+                embedding BLOB,
+                image BLOB
+            )
+        """)
+        await db.execute("""
+            INSERT INTO match_robot_crop
+                (id, job_id, identity_id, legibility, embedding, image)
+            SELECT id, job_id, slot, legibility, embedding, image
+            FROM match_robot_crop_legacy
+        """)
+        await db.execute("DROP TABLE match_robot_crop_legacy")
+
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_match_crop "
+        "ON match_robot_crop(job_id, identity_id)"
+    )
 
 
 async def init_db():
@@ -146,11 +218,17 @@ async def init_db():
             except Exception:
                 pass  # column already exists
         # Lightweight migrations: add columns to a pre-existing appearance_gallery table.
-        for col_def in ("image BLOB", "verified INTEGER DEFAULT 0", "job_id TEXT"):
+        for col_def in (
+            "image BLOB",
+            "verified INTEGER DEFAULT 0",
+            "job_id TEXT",
+            "source_match_key TEXT",
+        ):
             try:
                 await db.execute(f"ALTER TABLE appearance_gallery ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
+        await _migrate_identity_tables(db)
         await db.commit()
 
 
@@ -561,21 +639,132 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO appearance_gallery "
-            "(event_key, team, alliance_color, embedding, legibility, image, verified, job_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (row["event_key"], row["team"], row["alliance_color"],
+            "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["event_key"], row.get("source_match_key"),
+             row["team"], row["alliance_color"],
              row["embedding"], row.get("legibility"), row.get("image"),
              int(row.get("verified", 0)), row.get("job_id")))
         await db.commit()
 
 
-async def get_gallery_exemplars(event_key: str) -> List[Dict]:
-    """All gallery exemplars for an event."""
+async def insert_gallery_exemplars(rows: List[Dict[str, Any]]) -> None:
+    """Insert many appearance-gallery exemplars in one transaction.
+
+    Same SQL as insert_gallery_exemplar; batching avoids one connection +
+    fsync'd commit per row at job finalize."""
+    if not rows:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO appearance_gallery "
+            "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(row["event_key"], row.get("source_match_key"),
+              row["team"], row["alliance_color"],
+              row["embedding"], row.get("legibility"), row.get("image"),
+              int(row.get("verified", 0)), row.get("job_id"))
+             for row in rows])
+        await db.commit()
+
+
+async def get_gallery_exemplars(
+    event_key: str, teams: Optional[List[str]] = None
+) -> List[Dict]:
+    """Gallery exemplars for an event, optionally limited to specific teams."""
+    team_filter = list(dict.fromkeys(
+        str(team) for team in (teams or [])
+        if team is not None and str(team)
+    ))
+    where = "event_key = ?"
+    params: List[Any] = [event_key]
+    if team_filter:
+        where += f" AND team IN ({','.join('?' for _ in team_filter)})"
+        params.extend(team_filter)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, team, alliance_color, embedding, legibility, image, verified, job_id "
-            "FROM appearance_gallery WHERE event_key = ? ORDER BY id", (event_key,))
+            "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id "
+            f"FROM appearance_gallery WHERE {where} ORDER BY id", params)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_previous_gallery_exemplars(
+    event_key: str,
+    current_match_key: str,
+    teams: Optional[List[str]] = None,
+) -> List[Dict]:
+    """Return exemplars sourced only from matches before ``current_match_key``.
+
+    Rows without match provenance are intentionally excluded: they cannot be
+    proven to come from an earlier match.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT m.comp_level, m.match_number, m.set_number
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE e.event_key = ? AND m.tba_match_key = ?
+            """,
+            (event_key, current_match_key),
+        )
+        current = await cursor.fetchone()
+        if current is None:
+            return []
+
+        level_order = {"qm": 1, "sf": 2, "f": 3}
+
+        def match_rank(row) -> tuple[int, int, int]:
+            level = row["comp_level"]
+            match_number = int(row["match_number"])
+            set_number = int(row["set_number"] or 1)
+            if level == "qm":
+                return (level_order[level], match_number, set_number)
+            return (level_order.get(level, 4), set_number, match_number)
+
+        current_rank = match_rank(current)
+        cursor = await db.execute(
+            """
+            SELECT m.tba_match_key, m.comp_level, m.match_number, m.set_number
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE e.event_key = ?
+            """,
+            (event_key,),
+        )
+        previous_keys = [
+            row["tba_match_key"]
+            for row in await cursor.fetchall()
+            if match_rank(row) < current_rank
+        ]
+        if not previous_keys:
+            return []
+
+        team_filter = list(dict.fromkeys(
+            str(team) for team in (teams or [])
+            if team is not None and str(team)
+        ))
+        where = (
+            f"event_key = ? AND source_match_key IN "
+            f"({','.join('?' for _ in previous_keys)})"
+        )
+        params: List[Any] = [event_key, *previous_keys]
+        if team_filter:
+            where += f" AND team IN ({','.join('?' for _ in team_filter)})"
+            params.extend(team_filter)
+
+        cursor = await db.execute(
+            "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
+            "image, verified, job_id "
+            f"FROM appearance_gallery WHERE {where} ORDER BY id",
+            params,
+        )
         return [dict(r) for r in await cursor.fetchall()]
 
 
@@ -604,46 +793,136 @@ async def delete_gallery_exemplar(gid):
         await db.commit()
 
 
+async def clear_gallery_exemplars(event_key: str) -> int:
+    """Delete every gallery exemplar for an event. Returns the count removed.
+
+    The gallery is a regenerable per-event cache (rebuilt from match processing),
+    so a full clear is a routine troubleshooting reset, not data loss.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM appearance_gallery WHERE event_key = ?", (event_key,))
+        await db.commit()
+        return cur.rowcount
+
+
 # --- Match robot identities & crops ---
 
 async def upsert_match_robot_identity(row: Dict[str, Any]) -> None:
-    """Insert or replace the identity for one robot slot in a job."""
+    """Insert or replace the identity for one robot in a job."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO match_robot_identity "
-            "(job_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (row["job_id"], row["slot"], row.get("slot_label"), row.get("alliance"),
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["job_id"], identity_id, row.get("slot"), row.get("slot_label"), row.get("alliance"),
              row.get("team_number"), int(row.get("confirmed", 0)), row.get("source"),
              row.get("confidence")))
         await db.commit()
 
 
 async def insert_match_robot_crop(row: Dict[str, Any]) -> None:
-    """Insert one captured bumper crop for a robot slot."""
+    """Insert one captured bumper crop for a robot identity."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO match_robot_crop (job_id, slot, legibility, embedding, image) "
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
             "VALUES (?, ?, ?, ?, ?)",
-            (row["job_id"], row["slot"], row.get("legibility"), row.get("embedding"),
+            (row["job_id"], identity_id, row.get("legibility"), row.get("embedding"),
              row.get("image")))
         await db.commit()
 
 
+def _identity_key(row: Dict[str, Any]):
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
+    return identity_id
+
+
+async def upsert_match_robot_identities(rows: List[Dict[str, Any]]) -> None:
+    """Batch variant of upsert_match_robot_identity: one transaction for all rows."""
+    if not rows:
+        return
+    params = [
+        (row["job_id"], _identity_key(row), row.get("slot"), row.get("slot_label"),
+         row.get("alliance"), row.get("team_number"), int(row.get("confirmed", 0)),
+         row.get("source"), row.get("confidence"))
+        for row in rows
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR REPLACE INTO match_robot_identity "
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
+        await db.commit()
+
+
+async def insert_match_robot_crops(rows: List[Dict[str, Any]]) -> None:
+    """Batch variant of insert_match_robot_crop: one transaction for all rows."""
+    if not rows:
+        return
+    params = [
+        (row["job_id"], _identity_key(row), row.get("legibility"),
+         row.get("embedding"), row.get("image"))
+        for row in rows
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
+            "VALUES (?, ?, ?, ?, ?)", params)
+        await db.commit()
+
+
 async def get_match_identities(job_id) -> List[Dict]:
-    """All robot-slot identities for a job, ordered by slot."""
+    """All robot identities for a job, ordered by identity_id."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM match_robot_identity WHERE job_id = ? ORDER BY slot", (job_id,))
+            "SELECT * FROM match_robot_identity WHERE job_id = ? ORDER BY identity_id", (job_id,))
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_match_crops(job_id, slot) -> List[Dict]:
-    """All captured crops for a robot slot, most legible first."""
+async def get_match_crops(job_id, identity_id) -> List[Dict]:
+    """All captured crops for a robot identity, most legible first."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM match_robot_crop WHERE job_id = ? AND slot = ? ORDER BY legibility DESC",
-            (job_id, slot))
+            "SELECT * FROM match_robot_crop WHERE job_id = ? AND identity_id = ? ORDER BY legibility DESC",
+            (job_id, identity_id))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def insert_match_robot_binding(row: Dict[str, Any]) -> None:
+    """Insert a robot slot binding event."""
+    identity_id = row.get("identity_id")
+    if identity_id is None:
+        identity_id = row.get("slot")
+    if identity_id is None:
+        raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO match_robot_binding (job_id, identity_id, slot, start_frame, end_frame) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (row["job_id"], identity_id, row["slot"], row["start_frame"], row.get("end_frame")))
+        await db.commit()
+
+
+async def get_match_bindings(job_id) -> List[Dict]:
+    """All binding events for a job."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM match_robot_binding WHERE job_id = ? ORDER BY id", (job_id,))
         return [dict(r) for r in await cur.fetchall()]

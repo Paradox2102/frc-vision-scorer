@@ -21,7 +21,7 @@ from web.field.tracker import FieldTracker
 from web.field.occlusion import hub_prisms, resolve_occlusion
 from web.field.detect_bridge import to_field_detections, field_adjacent_persons
 from web.field.radar import Radar
-from web.app import MODEL_PATH, CALIB_MAIN_CROP_FRAC, _detect_bumper_color_static
+from web.app import MODEL_PATH, CALIB_MAIN_CROP_FRAC
 
 VIDEO = ROOT / "data/test_footage/qual1_first_champs_2026.mp4"
 if not VIDEO.exists():
@@ -53,7 +53,9 @@ for fi in range(200, 700, 5):
     res = robot_model(main, conf=0.4, verbose=False)[0]
     rboxes = [res.boxes.xyxy[i].cpu().numpy() for i in range(len(res.boxes))
               if int(res.boxes.cls[i]) == 1]
-    dets = to_field_detections(rboxes, cal, main, dims, color_fn=_detect_bumper_color_static)
+    dets = to_field_detections(
+        rboxes, cal, dims, colors=["unknown"] * len(rboxes)
+    )
     pres = person_model(main, classes=[0], conf=0.35, verbose=False)[0]
     pboxes = [tuple(pres.boxes.xyxy[i].cpu().numpy()) for i in range(len(pres.boxes))]
     persons = field_adjacent_persons(pboxes, cal, dims)

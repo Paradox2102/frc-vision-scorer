@@ -34,7 +34,7 @@ from web.field import store as field_store
 from web.field.field_model import FieldModel
 from web.field.tracker import FieldTracker
 from web.field.detect_bridge import to_field_detections
-from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO, _detect_bumper_color_static
+from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO
 from web.field.spike_metrics import count_id_switches, continuity_stats
 
 VIDEO = ROOT / "data/test_footage/qual1_first_champs_2026.mp4"
@@ -186,8 +186,9 @@ def main():
         rboxes = [res.boxes.xyxy[i].cpu().numpy() for i in range(len(res.boxes))
                   if int(res.boxes.cls[i]) == 1]
 
-        dets = to_field_detections(rboxes, cal, main, dims,
-                                   color_fn=_detect_bumper_color_static)
+        dets = to_field_detections(
+            rboxes, cal, dims, colors=["unknown"] * len(rboxes)
+        )
         outs = trk.update(dets, {}, dt=stride / fps)
 
         bline_uv = {}

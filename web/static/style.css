@@ -1303,6 +1303,8 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
     margin-bottom: 10px;
 }
 .gallery-toolbar-count { margin-left: auto; font-size: 0.82rem; color: var(--text-secondary); }
+.btn-small.gallery-clear-all { color: var(--red-alliance); border-color: var(--red-alliance); }
+.btn-small.gallery-clear-all:hover { background: var(--red-alliance); color: #fff; border-color: var(--red-alliance); }
 
 .gallery-group {
     border: 1px solid var(--border-color);

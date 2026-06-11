@@ -113,3 +113,102 @@ def test_get_embedding_returns_ema_and_none_for_unknown():
     assert emb is not None
     np.testing.assert_array_almost_equal(emb, _e(1, 0, 0))
     assert reg.get_embedding(99999) is None
+
+
+def test_permutation_invariance_and_margins():
+    # Assert identical optimal assignments regardless of input order, and check margins.
+    emb_a = _e(1, 0, 0)
+    emb_b = _e(0, 1, 0)
+    emb_c = _e(0, 0, 1)
+
+    reg = FusedTrackRegistry(app_floor=0.5)
+
+    # Frame 1: Create active tracks for 0, 1, 2
+    f1 = _obs([("main", 1)], embedding=emb_a)
+    f2 = _obs([("main", 2)], embedding=emb_b)
+    f3 = _obs([("main", 3)], embedding=emb_c)
+    reg.assign([f1, f2, f3])
+    assert {f1.track_id, f2.track_id, f3.track_id} == {0, 1, 2}
+
+    # Frame 2: Inactive tracks exist.
+    # Now we have observations corresponding to emb_a and emb_b but with different per-camera IDs.
+    # Observation list order A then B
+    reg_order1 = FusedTrackRegistry(app_floor=0.5)
+    reg_order1._key_to_id = reg._key_to_id.copy()
+    reg_order1._next_id = reg._next_id
+    reg_order1._id_to_embedding = reg._id_to_embedding.copy()
+    reg_order1._id_to_anchor = reg._id_to_anchor.copy()
+    reg_order1._recent_exemplars = {k: list(v) for k, v in reg._recent_exemplars.items()}
+
+    obs_a = _obs([("corner", 1)], embedding=emb_a)
+    obs_b = _obs([("corner", 2)], embedding=emb_b)
+
+    reg_order1.assign([obs_a, obs_b])
+    assert obs_a.track_id == f1.track_id
+    assert obs_b.track_id == f2.track_id
+    
+    # Check margins:
+    # For obs_a: matches to f1 (sim = 1.0), next best is f2 (sim = 0.0). Margin should be 1.0.
+    assert obs_a.relink_margin == 1.0
+    assert obs_b.relink_margin == 1.0
+
+    # Test order B then A
+    reg_order2 = FusedTrackRegistry(app_floor=0.5)
+    reg_order2._key_to_id = reg._key_to_id.copy()
+    reg_order2._next_id = reg._next_id
+    reg_order2._id_to_embedding = reg._id_to_embedding.copy()
+    reg_order2._id_to_anchor = reg._id_to_anchor.copy()
+    reg_order2._recent_exemplars = {k: list(v) for k, v in reg._recent_exemplars.items()}
+
+    obs_a2 = _obs([("corner", 1)], embedding=emb_a)
+    obs_b2 = _obs([("corner", 2)], embedding=emb_b)
+
+    reg_order2.assign([obs_b2, obs_a2])
+    assert obs_a2.track_id == f1.track_id
+    assert obs_b2.track_id == f2.track_id
+    assert obs_a2.relink_margin == 1.0
+    assert obs_b2.relink_margin == 1.0
+
+
+def test_explicit_relink_evidence_results():
+    reg = FusedTrackRegistry(app_floor=0.5)
+    
+    # Frame 1: newly created
+    f1 = _obs([("main", 1)], embedding=_e(1, 0, 0))
+    ev1 = reg.assign([f1])
+    assert f1.track_id == 0
+    assert len(ev1) == 1
+    assert ev1[0].type == "newly_created"
+    assert ev1[0].margin == 1.0
+    assert f1.relink_evidence.type == "newly_created"
+    
+    # Frame 2: continued
+    f2 = _obs([("main", 1)], embedding=_e(1, 0.1, 0))
+    ev2 = reg.assign([f2])
+    assert f2.track_id == 0
+    assert len(ev2) == 1
+    assert ev2[0].type == "continued"
+    
+    # Frame 3: inactive. Frame 4: appearance_relinked
+    f3 = _obs([("corner", 1)], embedding=_e(1, 0.05, 0))
+    # We clear active so 0 is inactive by assigning an empty frame
+    reg.assign([])
+    ev4 = reg.assign([f3])
+    assert f3.track_id == 0
+    assert ev4[0].type == "appearance_relinked"
+    assert ev4[0].margin >= 1.0 # only 1 inactive candidate
+    
+    # Frame 5: merged (bridge two different prior IDs)
+    # Create ID 1 first
+    f_new = _obs([("corner", 2)], embedding=_e(0, 1, 0))
+    reg.assign([f_new])
+    assert f_new.track_id == 1
+    
+    # Bridge main:1 and corner:2
+    # But wait, main:1 has id 0, corner:2 has id 1.
+    f_bridge = _obs([("main", 1), ("corner", 2)], embedding=_e(1, 0, 0))
+    ev5 = reg.assign([f_bridge])
+    assert f_bridge.track_id in (0, 1)
+    assert ev5[0].type == "merged"
+
+

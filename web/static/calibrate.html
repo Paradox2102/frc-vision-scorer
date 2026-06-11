@@ -72,7 +72,19 @@
       <option value="corner_right">corner_right</option>
     </select>
   </label>
+  <label>Applies from match:
+    <select id="matchSel">
+      <option value="">event start (test video)</option>
+    </select>
+  </label>
 </div>
+<p class="hint" style="margin:-8px 0 14px;">
+  Pick a match when the camera moved mid-event: frames are grabbed from <b>that match's
+  video</b>, and the solved calibration is saved as a new version applying from that match
+  onward (earlier matches keep their old calibration). Matches without a ▶ have no
+  TBA-linked video, so frames fall back to the default test video. ❌ marks matches
+  where the drift check failed for this camera — recalibrate from there.
+</p>
 
 <div class="canvases">
   <div class="canvas-col">
@@ -151,8 +163,17 @@
   <span id="statusLine" class="rms-info">—</span>
 </div>
 
+<div class="points-section">
+  <h2>Saved calibration versions <span style="font-weight:normal;color:#889;font-size:.8em;">— this event &amp; camera</span></h2>
+  <p class="hint">Each version applies from its start match until the next version's start
+    match (in qual→playoff order). “event start” covers everything before the earliest
+    anchored version.</p>
+  <ul id="versionList" style="margin:0;padding-left:18px;color:#bcd;font-family:monospace;font-size:.85em;"></ul>
+</div>
+
 <div class="overlay-section">
-  <h2>Overlay (reprojected field + tags)</h2>
+  <h2>Overlay (field structures + tags)</h2>
+  <p class="hint">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
   <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
   <img id="overlayImg" src="" alt="">
 </div>
@@ -168,16 +189,86 @@ let pendingPixel = null;  // {u, v} awaiting a map click
 let heldOut = new Set();  // ids marked as held-out for validation
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
+const TAG_RADIUS = 9;
+const TAG_MIN_SPACING = 22;
+let tagDisplayPositions = {}; // display-only positions; calibration coordinates stay exact
 let zones = [];           // [[xmin,ymin,xmax,ymax], ...] in field meters
 let zoneDrag = null;      // {x0,y0,x1,y1} in map pixels while dragging
 let frameMasks = [];      // [[x,y,w,h], ...] in actual cropped frame coordinates
 let frameDrag = null;      // {x0,y0,x1,y1} in canvas pixels while dragging
+let eventMatches = [];    // matches of the loaded event (from /api/event/current)
+let driftMap = {};        // {camera: {match_key: {error_m, epoch, recalibrated}}}
 
-(async function init(){ await fetchCurrentEvent(); await fetchTagMap(); drawMap(); await loadZones(); await grabFrame(); })();
+(async function init(){ await fetchCurrentEvent(); await loadDrift(); populateMatchSelector(); await fetchTagMap(); drawMap(); await loadZones(); await refreshForSelection(); })();
 
-// Switching camera re-grabs (which resets autoTags/manualTags/pendingPixel) so each
-// camera keeps its own independent working correspondence set.
-document.getElementById('camera').addEventListener('change', function(){ grabFrame(); });
+// Switching camera or match restores the covering epoch's saved correspondences
+// (or grabs a fresh frame when that epoch has none). Drift markers in the match
+// list are per camera, so a camera switch also relabels the options.
+document.getElementById('camera').addEventListener('change', function(){ populateMatchSelector(); refreshForSelection(); });
+document.getElementById('matchSel').addEventListener('change', function(){ refreshForSelection(); });
+
+// The match a frame-grab/solve refers to ('' = none selected), and whether that
+// match has a TBA-linked video we can pull frames from.
+function selectedMatch(){ return document.getElementById('matchSel').value; }
+function selectedMatchVideoKey(){
+  const k = selectedMatch();
+  const m = eventMatches.find(m => m.key === k);
+  return m ? m.video_key : null;
+}
+
+// FRC match order (qual before playoff, then set/match number) — mirrors the
+// server's match_order.match_sort_key so the dropdown lists matches in epoch order.
+const LEVEL_RANK = {qm:0, ef:1, qf:2, sf:3, f:4};
+function matchSortKey(m){
+  return [(LEVEL_RANK[m.comp_level] ?? 99),
+          m.comp_level==='qm' ? 0 : (m.set_number||0),
+          m.match_number||0];
+}
+function matchLabel(m){
+  const lvl = m.comp_level === 'qm' ? `Qual ${m.match_number}`
+    : `${(m.comp_level||'').toUpperCase()}${m.set_number||''}-${m.match_number}`;
+  // A recorded drift failure for the selected camera flags the match with ❌
+  // until a new calibration epoch covers it (or a later drift check passes).
+  const cam = document.getElementById('camera').value;
+  const rec = (driftMap[cam] || {})[m.key];
+  const bad = rec && !rec.recalibrated;
+  const icon = bad ? '❌ ' : (m.video_key ? '▶ ' : '');
+  const suffix = bad ? `  — drift ${rec.error_m} m` : '';
+  return icon + lvl + `  (${m.key})` + suffix;
+}
+
+async function loadDrift(){
+  const event = document.getElementById('event').value.trim();
+  if (!event) return;
+  try {
+    const r = await fetch('/api/calibration/drift?event=' + encodeURIComponent(event));
+    const j = await r.json();
+    driftMap = j.drift || {};
+  } catch(e){ /* keep whatever we had */ }
+}
+function populateMatchSelector(){
+  const sel = document.getElementById('matchSel');
+  const keep = sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  const sorted = eventMatches.slice().sort((a,b) => {
+    const ka = matchSortKey(a), kb = matchSortKey(b);
+    for (let i=0;i<3;i++){ if (ka[i]!==kb[i]) return ka[i]-kb[i]; }
+    return 0;
+  });
+  for (const m of sorted){
+    const o = document.createElement('option');
+    o.value = m.key; o.textContent = matchLabel(m);
+    sel.appendChild(o);
+  }
+  // Preselect from ?match= / ?camera= (the drift-check error names both) or
+  // restore the previous selection across event refetches.
+  const params = new URLSearchParams(location.search);
+  const want = keep || params.get('match');
+  if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
+  const cam = params.get('camera');
+  if (cam && [...document.getElementById('camera').options].some(o => o.value === cam))
+    document.getElementById('camera').value = cam;
+}
 
 async function fetchCurrentEvent(){
   // Save the calibration under the EVENT THE APP HAS LOADED — otherwise inference
@@ -192,6 +283,8 @@ async function fetchCurrentEvent(){
       document.getElementById('event').title = 'Auto-filled from the loaded event ('
         + (j.event_name || j.event_key) + ')';
     }
+    eventMatches = j.matches || [];
+    populateMatchSelector();
   } catch(e){ /* keep the manual default */ }
 }
 
@@ -213,6 +306,44 @@ function fieldToMap(x, y){
   return [MAP_PAD + x * mapScale,
           MAP_PAD + (field.width - y) * mapScale];
 }
+
+function layoutTagMarkers(){
+  tagDisplayPositions = {};
+  for (const [id, t] of Object.entries(tagMap)){
+    const [x,y] = fieldToMap(t.x, t.y);
+    tagDisplayPositions[id] = {x,y};
+  }
+
+  // Keep each field element's original tag pattern, but uniformly enlarge it
+  // around its center just enough to make neighboring markers clickable.
+  const groups = [
+    ['2','3','4','5','8','9','10','11'],       // red hub
+    ['18','19','20','21','24','25','26','27'], // blue hub
+    ['1','12'], ['6','7'], ['17','28'], ['22','23'], // trenches
+    ['13','14'], ['15','16'], ['29','30'], ['31','32'], // wall structures
+  ];
+  for (const ids of groups){
+    const points = ids.filter(id => tagDisplayPositions[id]).map(id => tagDisplayPositions[id]);
+    if (points.length < 2) continue;
+    const cx = points.reduce((sum,p) => sum+p.x, 0) / points.length;
+    const cy = points.reduce((sum,p) => sum+p.y, 0) / points.length;
+    let nearest = Infinity;
+    for (let i=0; i<points.length; i++){
+      for (let j=i+1; j<points.length; j++){
+        nearest = Math.min(nearest, Math.hypot(points[i].x-points[j].x,
+                                               points[i].y-points[j].y));
+      }
+    }
+    const scale = Math.max(1, TAG_MIN_SPACING / nearest);
+    for (const id of ids){
+      const p = tagDisplayPositions[id];
+      if (!p) continue;
+      p.x = cx + (p.x-cx)*scale;
+      p.y = cy + (p.y-cy)*scale;
+    }
+  }
+}
+
 function drawMap(){
   const canvas = document.getElementById('mapCanvas');
   const targetW = 520;
@@ -230,17 +361,21 @@ function drawMap(){
   const m1 = fieldToMap(field.length/2, 0), m2 = fieldToMap(field.length/2, field.width);
   ctx.beginPath(); ctx.moveTo(m1[0],m1[1]); ctx.lineTo(m2[0],m2[1]);
   ctx.strokeStyle='#334'; ctx.stroke();
+  layoutTagMarkers();
   // tags
   const used = usedIds();
   for (const [id, t] of Object.entries(tagMap)){
-    const [mx,my] = fieldToMap(t.x, t.y);
+    const p = tagDisplayPositions[id];
+    const mx=p.x, my=p.y;
     const isUsed = used.has(parseInt(id));
-    ctx.beginPath(); ctx.arc(mx,my,7,0,2*Math.PI);
+    ctx.beginPath(); ctx.arc(mx,my,TAG_RADIUS,0,2*Math.PI);
     ctx.fillStyle = isUsed ? 'rgba(96,255,144,0.9)' : 'rgba(150,160,180,0.55)';
-    ctx.fill(); ctx.strokeStyle='#0a0a14'; ctx.lineWidth=1; ctx.stroke();
-    ctx.font='10px monospace'; ctx.fillStyle = isUsed ? '#d8ffe8' : '#aab';
-    ctx.fillText(id, mx+8, my+3);
+    ctx.fill(); ctx.strokeStyle='#0a0a14'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.font='bold 10px monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle = isUsed ? '#102818' : '#10131d';
+    ctx.fillText(id, mx, my+0.5);
   }
+  ctx.textAlign='start'; ctx.textBaseline='alphabetic';
   drawZonesOnMap(ctx);
   if (pendingPixel){
     ctx.fillStyle='#ffd060'; ctx.font='12px sans-serif';
@@ -276,31 +411,80 @@ function usedIds(){
 }
 
 // ---- Frame ----
-async function grabFrame(){
-  const ts = parseFloat(document.getElementById('timestamp').value) || 75;
-  if (manualTags.length && !confirm('Grabbing a new frame clears manual tags. Continue?')) return;
-  setStatus('Grabbing frame…','rms-info');
+// The source of the frame currently on screen. Solve overlays and tag refines
+// must read THIS frame (not the live selector/timestamp inputs) so pixel
+// correspondences always line up with what the user is looking at.
+let currentFrameSource = {match_key: null, timestamp: 75};
+
+async function grabFrame(opts){
+  opts = opts || {};
+  const ts = (opts.ts != null) ? opts.ts
+           : (parseFloat(document.getElementById('timestamp').value) || 75);
+  if (!opts.silent && manualTags.length &&
+      !confirm('Grabbing a new frame clears manual tags. Continue?')) return;
+  // Only ask the server for the match's video when TBA actually has one;
+  // otherwise fall back to the default source (the epoch anchor still applies).
+  const mk = (opts.matchKey !== undefined) ? opts.matchKey
+           : (selectedMatchVideoKey() ? selectedMatch() : null);
+  setStatus(mk ? `Grabbing frame from ${mk}… (first grab resolves the stream, ~5 s)`
+               : 'Grabbing frame…','rms-info');
   try {
     const r = await fetch('/api/calibration/frame', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({timestamp:ts, camera: document.getElementById('camera').value})});
+      body:JSON.stringify({timestamp:ts, camera: document.getElementById('camera').value,
+        match_key: mk})});
     const j = await r.json();
     if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return; }
     autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null;
-    const img = new Image();
-    img.onload = async function(){
-      frameW = img.naturalWidth; frameH = img.naturalHeight;
-      const canvas = document.getElementById('frameCanvas');
-      const maxW = 760; fScale = Math.min(1, maxW / frameW);
-      canvas.width = Math.round(frameW*fScale); canvas.height = Math.round(frameH*fScale);
-      baseImg = img;
-      await loadMasks();
-      await loadTopCrop();
-      redrawFrame(); drawMap(); renderRows();
-      setStatus(`Frame grabbed. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
-    };
-    img.src = 'data:image/jpeg;base64,' + j.frame;
+    currentFrameSource = {match_key: mk, timestamp: ts};
+    await new Promise(resolve => {
+      const img = new Image();
+      img.onload = async function(){
+        frameW = img.naturalWidth; frameH = img.naturalHeight;
+        const canvas = document.getElementById('frameCanvas');
+        const maxW = 760; fScale = Math.min(1, maxW / frameW);
+        canvas.width = Math.round(frameW*fScale); canvas.height = Math.round(frameH*fScale);
+        baseImg = img;
+        await loadMasks();
+        await loadTopCrop();
+        redrawFrame(); drawMap(); renderRows();
+        setStatus(`Frame grabbed. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
+        resolve();
+      };
+      img.onerror = resolve;
+      img.src = 'data:image/jpeg;base64,' + j.frame;
+    });
   } catch(e){ setStatus('Fetch error: '+e.message,'rms-err'); }
+}
+
+// On page load / camera switch / match switch: if the covering epoch stored its
+// solve inputs, restore them onto the SAME frame they were clicked on and re-run
+// a dry-run solve so the overlay preview appears. Otherwise just grab fresh.
+async function refreshForSelection(){
+  loadVersions();
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  let epoch = null;
+  if (event && camera){
+    try {
+      const r = await fetch(`/api/calibration/epoch?event=${encodeURIComponent(event)}`
+        + `&camera=${encodeURIComponent(camera)}`
+        + `&match=${encodeURIComponent(selectedMatch())}`);
+      if (r.ok) epoch = (await r.json()).version;
+    } catch(e){ /* fall through to a fresh grab */ }
+  }
+  const src = epoch && epoch.source;
+  if (!src){ await grabFrame({silent:true}); return; }
+  if (src.timestamp != null) document.getElementById('timestamp').value = src.timestamp;
+  await grabFrame({matchKey: src.match_key || null, ts: src.timestamp, silent: true});
+  autoTags = src.auto_tags || {};
+  manualTags = src.manual_tags || [];
+  heldOut = new Set(src.holdout_ids || []);
+  pendingPixel = null;
+  redrawFrame(); drawMap(); renderRows();
+  const span = epoch.start_match ? `from ${epoch.start_match} →` : 'event start →';
+  setStatus(`Loaded epoch ${epoch.version_id} (${span}) — rendering preview…`,'rms-info');
+  await solve({dryRun: true});
 }
 
 function redrawFrame(){
@@ -406,10 +590,10 @@ document.getElementById('mapCanvas').addEventListener('click', async function(e)
   if (document.getElementById('zoneMode').checked) return;  // drawing zones, not picking tags
   const rect = this.getBoundingClientRect();
   const mx = e.clientX-rect.left, my = e.clientY-rect.top;
-  // nearest tag marker within 14px
-  let best=null, bestD=14*14;
-  for (const [id,t] of Object.entries(tagMap)){
-    const [tx,ty]=fieldToMap(t.x,t.y); const d=(tx-mx)**2+(ty-my)**2;
+  // Select against the spread-out display markers, not their physical anchors.
+  let best=null, bestD=(TAG_RADIUS+5)**2;
+  for (const [id,p] of Object.entries(tagDisplayPositions)){
+    const d=(p.x-mx)**2+(p.y-my)**2;
     if (d<bestD){ bestD=d; best=parseInt(id); }
   }
   if (best===null) return;
@@ -419,13 +603,15 @@ document.getElementById('mapCanvas').addEventListener('click', async function(e)
   // Try ROI refine first: snap to sub-pixel corners; fall back to the center click.
   const px = pendingPixel; pendingPixel = null;
   const camera = document.getElementById('camera').value;
-  const ts = parseFloat(document.getElementById('timestamp').value) || 75;
   setStatus(`Refining tag ${best}…`, 'rms-info');
   let refined = null;
   try {
+    // Refine against the frame on screen (currentFrameSource), not the live inputs.
     const rr = await fetch('/api/calibration/refine-tag', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({camera, timestamp: ts, u: px.u, v: px.v, id: best})});
+      body: JSON.stringify({camera, timestamp: currentFrameSource.timestamp,
+        u: px.u, v: px.v, id: best,
+        match_key: currentFrameSource.match_key})});
     const jj = await rr.json();
     refined = jj.corners;   // [[u,v]x4] or null
   } catch(e) { /* fall through to manual */ }
@@ -472,18 +658,25 @@ function renderRows(){
   });
 }
 
-async function solve(){
+async function solve(opts){
+  opts = opts || {};
   const nPoints = Object.keys(autoTags).length*4 + manualTags.length;
   if (nPoints < 8){ setStatus(`Need ≥ 8 points; have ${nPoints}. Add more tags.`,'rms-err'); return; }
   const event = document.getElementById('event').value.trim() || 'test';
   const camera = document.getElementById('camera').value.trim() || 'main';
-  const ts = parseFloat(document.getElementById('timestamp').value) || 75;
-  setStatus('Solving…','rms-info');
+  const startMatch = selectedMatch() || null;   // null = applies from event start
+  if (!opts.dryRun) setStatus('Solving…','rms-info');
   try {
+    // Overlay + stored source must describe the frame on screen, hence
+    // currentFrameSource rather than the live timestamp/match inputs.
     const r = await fetch('/api/calibration/solve-tags',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({event,camera,timestamp:ts,image_size:[frameW,frameH],
-        auto_tags:autoTags, manual_tags:manualTags, holdout_ids:[...heldOut]})});
+      body:JSON.stringify({event,camera,timestamp:currentFrameSource.timestamp,
+        image_size:[frameW,frameH],
+        auto_tags:autoTags, manual_tags:manualTags, holdout_ids:[...heldOut],
+        start_match: startMatch,
+        match_key: currentFrameSource.match_key,
+        dry_run: !!opts.dryRun})});
     const j = await r.json();
     if (j.error){ setStatus('Solve error: '+j.error,'rms-err'); return; }
     const rms = parseFloat(j.rms_error);
@@ -493,6 +686,15 @@ async function solve(){
       const he = parseFloat(j.holdout_error_m);
       msg += ` · held-out ${he.toFixed(2)} m`;
       if (he>0.5) cls='rms-bad'; else if (he>0.3 && cls==='rms-good') cls='rms-warn';
+    }
+    if (opts.dryRun){
+      msg += ' · preview of the saved epoch (not re-saved)';
+    } else {
+      msg += startMatch ? ` · saved as new version from ${startMatch} →`
+                        : ' · saved as new version (event start)';
+      loadVersions();
+      // The new epoch may resolve recorded drift failures — refresh the ❌ marks.
+      loadDrift().then(populateMatchSelector);
     }
     setStatus(msg, cls);
     if (j.overlay){ const img=document.getElementById('overlayImg');
@@ -669,6 +871,31 @@ async function saveTopCrop(){
     document.getElementById('topCropStatus').textContent =
       j.error ? ('Save error: '+j.error) : `Saved top crop ${(j.robot_track_top_crop*100).toFixed(0)}% for ${camera} ✓`;
   } catch(e){ document.getElementById('topCropStatus').textContent = 'Save error: '+e.message; }
+}
+
+async function loadVersions(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  const ul = document.getElementById('versionList'); ul.replaceChildren();
+  if (!event || !camera) return;
+  try {
+    const r = await fetch(`/api/calibration/versions?event=${encodeURIComponent(event)}&camera=${encodeURIComponent(camera)}`);
+    const j = await r.json();
+    const versions = j.versions || [];
+    if (!versions.length){
+      const li = document.createElement('li');
+      li.textContent = 'No calibration versions yet for this camera.';
+      li.style.color = '#556'; ul.appendChild(li); return;
+    }
+    versions.forEach(v => {
+      const li = document.createElement('li');
+      const from = v.start_match ? `from ${v.start_match} →` : 'event start →';
+      const rms = v.rms_error != null ? ` · RMS ${Number(v.rms_error).toFixed(2)} px` : '';
+      const label = v.label ? ` · “${v.label}”` : '';
+      li.textContent = `${from}  ${v.version_id}${rms}${label}  (${v.created_at || 'n/a'})`;
+      ul.appendChild(li);
+    });
+  } catch(e){ /* leave the list empty */ }
 }
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');

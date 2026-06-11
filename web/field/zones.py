@@ -29,6 +29,21 @@ def point_in_zones(xy, zones) -> bool:
     return False
 
 
+def prism_bounding_zones(prisms, margin=0.2) -> list:
+    """Convert static prism footprints to rectangular no-robot zones."""
+    zones = []
+    for prism in prisms:
+        xs = prism.footprint[:, 0]
+        ys = prism.footprint[:, 1]
+        zones.append((
+            float(xs.min()) - margin,
+            float(ys.min()) - margin,
+            float(xs.max()) + margin,
+            float(ys.max()) + margin,
+        ))
+    return zones
+
+
 def _path(event_key: str) -> Path:
     safe = "".join(c for c in event_key if c.isalnum() or c in "_-")
     return UPLOAD_DIR / f"zones_{safe}.json"

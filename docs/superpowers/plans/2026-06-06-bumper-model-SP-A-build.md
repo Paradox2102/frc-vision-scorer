@@ -1,4 +1,38 @@
-# SP-A: Build the Bumper/Fuel Detection Model — Implementation Plan
+# SP-A: Build the Bumper Detection Model — Implementation Plan
+
+## ✅ STATUS: COMPLETE (2026-06-06) — as-built differs from the original plan below
+
+**What was actually built:** a **2-class** YOLOv8m **bumper** detector
+(`{0: blue_bumper, 1: red_bumper}`) trained on the **Benjamin dataset only**.
+Weights: `runs/train/frc_bumpers/weights/best.pt`. Full write-up:
+`runs/train/frc_bumpers/EVAL.md`.
+
+**Result — GO:** overall mAP50 **0.977** (blue 0.970 / red 0.984), **0 red↔blue swaps**
+on 748 val instances. Inference ~6 ms/image on the 3090.
+
+**Why it diverged from the original 3-class merge plan (below):**
+- **Karthik (`frc-bumpers-red-blue`) was rejected as a bumper source** — on download it
+  proved to be a *fuel* dataset (~18k fuel labels, only ~10 robot labels). It also had no
+  published Roboflow version; we forked it to `2102frcrobots` and generated v1 to inspect.
+- **Benjamin (`frc-bumpers-h0p1g` v4)** is the clean red/blue **bumper** source (545 imgs,
+  1004 red + 1159 blue boxes) — but bumpers only, no fuel (REEFSCAPE footage).
+- The two datasets are mirror images (each unlabeled for the other's class), so merging
+  poisons both. Per user decision (robot tracking is the priority), we trained **Benjamin
+  bumpers only** and **keep the existing model for fuel** (hub is static, not needed).
+
+**Consequences for SP-B:** the detector is **2-class (no fuel/hub)**, so SP-B is now an
+**"augment"** integration — robots + alliance color from this model; fuel from the
+existing model; no hub. The SP-B plan has been rewritten accordingly.
+
+**Tasks actually executed:** download script (`scripts/download_bumper_datasets.py`),
+train (`scripts/train_bumper_model.py`), eval (`scripts/eval_bumper_model.py`).
+**Dropped (not needed for single-source Benjamin):** `web/training/class_remap.py`, the
+merge script, and the fuel-label inspection (no merge, no fuel training). `DetectionSchema`
+is name-driven, so Benjamin's `blue=0/red=1` order needs no remap.
+
+---
+
+# (Original plan — superseded above; kept for provenance)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -13,6 +13,7 @@ import math
 import numpy as np
 import os
 import pytesseract
+import re
 import shutil
 from PIL import Image
 import tempfile
@@ -40,27 +41,68 @@ import supervision as sv
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
+from web.job_config import JobConfig
 from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
+from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
-from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error
+from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error, tag_alignment_error
 from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
-from web.field.occlusion import _merge_occlusion, hub_prisms, resolve_occlusion
-from web.field.detect_bridge import to_field_detections, field_adjacent_persons
+from web.field.occlusion import (
+    _merge_occlusion,
+    hub_prisms,
+    occluded_by_hub,
+    resolve_occlusion,
+)
+from web.field.overlay_geometry import (
+    bump_wireframe_edges,
+    hub_wireframe_edges,
+    tower_wireframe_edges,
+    trench_wireframe_edges,
+)
+from web.field.detect_bridge import (
+    to_field_detections,
+    field_adjacent_persons,
+    box_exceeds_frac,
+    corner_detection_weight,
+    filter_field_robot_boxes,
+)
+from web.field.detect_schema import (
+    DetectionSchema,
+    bumper_admissible,
+    expand_bumper_to_robot,
+    box_ios,
+    merge_robot_detections,
+    plausible_bumper_box,
+    reject_person_candidates,
+    select_gap_fills,
+)
+from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
-from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color
-from web.field.zones import load_zones, save_zones
+from web.field.bumper import bumper_band_box, bumper_crop
+from web.field.zones import load_zones, point_in_zones, prism_bounding_zones, save_zones
 from web.replay_recorder import ReplayRecorder
 from web import database
+from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
+from web.field.identity_confidence import (
+    ConfidenceConfig,
+    blend_read_confidence,
+    decide_vlm_read,
+    digit_token_conf,
+    occlusion_blocks_read,
+)
+from web.field.identity_ambiguity import CoOcclusionTracker
+from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
+from web.field.track_evidence import MatchEvidence
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -112,13 +154,60 @@ def _on_field(xy, dims, margin=1.0):
     return -margin <= xy[0] <= L + margin and -margin <= xy[1] <= W + margin
 
 
+def _restore_sam2_mask_to_view(
+    mask2d: np.ndarray,
+    view_shape,
+    top_offset_px: int = 0,
+) -> np.ndarray:
+    """Map a SAM2 mask from its top-cropped frame back into full-view pixels."""
+    full_h, full_w = int(view_shape[0]), int(view_shape[1])
+    top_offset_px = max(0, min(int(top_offset_px), full_h))
+    tracked_h = full_h - top_offset_px
+    restored = np.zeros((full_h, full_w), dtype=bool)
+    if tracked_h <= 0 or mask2d is None or np.asarray(mask2d).size == 0:
+        return restored
+    resized = cv2.resize(
+        np.asarray(mask2d, dtype=np.uint8),
+        (full_w, tracked_h),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+    restored[top_offset_px:, :] = resized
+    return restored
+
+
 
 # Configuration
 PROJECT_ROOT = Path(__file__).parent.parent
 MODEL_PATH = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
+BUMPER_MODEL_HARDNEG_PATH = (
+    PROJECT_ROOT / "runs/train/frc_bumpers_equipment_hardneg/weights/best.pt"
+)
+BUMPER_MODEL_BASE_PATH = PROJECT_ROOT / "runs/train/frc_bumpers/weights/best.pt"
+
+
+def _resolve_bumper_model_path(
+    override: Optional[str] = None,
+    hardneg_path: Path = BUMPER_MODEL_HARDNEG_PATH,
+    base_path: Path = BUMPER_MODEL_BASE_PATH,
+) -> Path:
+    """Prefer the latest hard-negative retrain, with a base-model fallback."""
+    if override:
+        return Path(override).expanduser()
+    if hardneg_path.exists():
+        return hardneg_path
+    return base_path
+
+
+BUMPER_MODEL_PATH = _resolve_bumper_model_path(os.environ.get("FRC_BUMPER_MODEL"))
+ROBOT_BOX_FROM_BUMPER_FACTOR = float(
+    os.environ.get("ROBOT_BOX_FROM_BUMPER_FACTOR", "3.0")
+)
 STATIC_DIR = Path(__file__).parent / "static"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+# Frames where the detector fired on likely non-robots (gated by HARD_NEG_LOG=1),
+# accumulated per event/run for hard-negative retraining.
+HARD_NEG_DIR = Path(__file__).resolve().parents[1] / "data" / "hard_negatives"
 REPLAYS_DIR = Path(__file__).parent / "replays"
 REPLAYS_DIR.mkdir(exist_ok=True)
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -167,6 +256,7 @@ MAX_ROBOTS_TOTAL = 6  # Absolute max: 3 blue + 3 red on the field
 OCR_REGIONS_1080P = {
     "blue_center": (775, 63, 120, 66),
     "red_center": (1015, 59, 124, 68),
+    "match_clock": (905, 68, 118, 56),
 }
 
 # Custom OCR regions per event (set via API)
@@ -183,7 +273,7 @@ def scale_ocr_regions(video_width: int, overhead_height: int) -> dict:
     They must be applied to the overhead crop frame, NOT the full frame.
     Reference: 1920x723 (67% of 1920x1080).
     """
-    regions = custom_ocr_regions if custom_ocr_regions else OCR_REGIONS_1080P
+    regions = {**OCR_REGIONS_1080P, **(custom_ocr_regions or {})}
     sx = video_width / 1920.0
     sy = overhead_height / 723.0  # Scale to actual overhead crop height
     scaled = {}
@@ -191,6 +281,12 @@ def scale_ocr_regions(video_width: int, overhead_height: int) -> dict:
         scaled[key] = (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
     return scaled
 OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789"
+MATCH_CLOCK_OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:"
+MATCH_CLOCK_SAMPLE_SECONDS = 0.5
+MATCH_CLOCK_LEAD_SECONDS = 0.5
+MATCH_CLOCK_TAIL_SECONDS = 3.0
+TITLE_SCREEN_FRAMES = 180
+EARLY_OCR_FRAME = 200
 OCR_FRAME_INTERVAL = 5  # OCR every 5th processed frame
 BUMPER_OCR_FRAME_INTERVAL = 15  # Run bumper OCR every 15th processed frame (slower, GPU-heavy)
 OCR_TEAM_CONFIRM_VOTES = 3  # Votes needed to lock in a team number from continuous OCR
@@ -207,7 +303,21 @@ EMBED_EMA_ALPHA = 0.3     # weight of the new embedding in the running EMA
 
 LEGIBILITY_FLOOR = 0.005       # crops below this are not worth a Qwen call
 VLM_TOP_K = 6                  # max crops to send to Qwen per pass (whole field)
-REREAD_EVERY_N_PASSES = 4      # include confirmed robots once every Nth pass (self-correction)
+# One padded generate over all due crops instead of one generate per crop
+# (2-4x read throughput; same model, same prompts). Kill-switch for A/B.
+VLM_BATCH_READS = os.environ.get("VLM_BATCH_READS", "1") not in ("0", "false", "False")
+# Fold the model's own per-digit token probability into read confidence
+# (sqrt-damped in blend_read_confidence): a wavering read loses its
+# full-weight vote instead of riding the 0.95 exact-roster-match ladder.
+VLM_LOGPROB_CONFIDENCE = os.environ.get("VLM_LOGPROB_CONFIDENCE", "1") not in ("0", "false", "False")
+# Live-view frame streaming: display sends are rate-capped and pushed through
+# a latest-only queue so a slow websocket client never back-pressures the
+# inference loop. The replay recorder keeps its own full-rate copy.
+FRAME_STREAM_INTERVAL_SEC = float(os.environ.get("FRAME_STREAM_INTERVAL_SEC", "0.1"))
+FRAME_STREAM_JPEG_QUALITY = int(os.environ.get("FRAME_STREAM_JPEG_QUALITY", "70"))
+# Never schedule a read for a slot whose bumper is occluded in EVERY camera.
+VLM_OCCLUSION_GATE = os.environ.get("VLM_OCCLUSION_GATE", "1") not in ("0", "false", "False")
+AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
 VLM_UNCONFIRMED_FAST_INTERVAL_SEC = 0.75
 VLM_UNCONFIRMED_MED_INTERVAL_SEC = 1.25
 VLM_UNCONFIRMED_SLOW_INTERVAL_SEC = 2.0
@@ -216,6 +326,136 @@ OVERTURN_VOTE_MARGIN = 3.0     # competitor team's votes must exceed current by 
 VLM_DIRECT_CONTRADICTION_CONF = 0.9  # exact/high-confidence read that unlocks a wrong confirmed label
 CORNER_VOTE_WEIGHT = 2.5       # corner-camera reads out-weigh a same-modality main read
 CORNER_READ_INTERVAL = 15      # process-frames between corner-camera bumper read passes
+
+
+def parse_match_clock_text(text: str) -> Optional[int]:
+    """Parse a broadcast match clock into seconds, rejecting implausible values."""
+    cleaned = re.sub(r"\s+", "", text or "")
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", cleaned)
+    if match:
+        minutes, seconds = map(int, match.groups())
+        if seconds >= 60:
+            return None
+        total = minutes * 60 + seconds
+    elif re.fullmatch(r"\d{1,3}", cleaned):
+        total = int(cleaned)
+    else:
+        return None
+    return total if 0 <= total <= 180 else None
+
+
+def _find_clock_period(
+    samples: List[Tuple[int, Optional[int]]],
+    target_start: int,
+    after_frame: int = -1,
+) -> Optional[dict]:
+    """Find one decreasing countdown, tolerating a single bad OCR sample."""
+    candidates = [
+        i for i, (frame, value) in enumerate(samples)
+        if frame > after_frame
+        and value is not None
+        and target_start - 10 <= value <= target_start + 5
+    ]
+    for start_idx in candidates:
+        start_frame, start_value = samples[start_idx]
+        last_value = start_value
+        previous_frame = start_frame
+        running_start_frame = start_frame
+        running_start_value = start_value
+        end_frame = start_frame
+        decreases = 0
+        bad_samples = 0
+        reached_near_zero = False
+
+        def result():
+            return {
+                "start_frame": running_start_frame,
+                "end_frame": end_frame,
+                "start_seconds": running_start_value,
+                "end_seconds": last_value,
+            }
+
+        for frame, value in samples[start_idx + 1:]:
+            if value is None or value > last_value + 2:
+                bad_samples += 1
+                if bad_samples > 1:
+                    if reached_near_zero:
+                        return result()
+                    break
+                continue
+            bad_samples = 0
+            if value < last_value:
+                if decreases == 0:
+                    running_start_frame = previous_frame
+                    running_start_value = last_value
+                decreases += last_value - value
+            last_value = min(last_value, value)
+            end_frame = frame
+            previous_frame = frame
+            if value <= 2:
+                if decreases >= max(8, int(target_start * 0.6)):
+                    reached_near_zero = True
+                    if value == 0:
+                        return result()
+                else:
+                    break
+        if reached_near_zero:
+            return result()
+    return None
+
+
+def _merge_frame_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    merged: List[List[int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def compute_active_windows(
+    samples: List[Tuple[int, Optional[int]]],
+    fps: float,
+    total_frames: int,
+    lead_seconds: float = MATCH_CLOCK_LEAD_SECONDS,
+    tail_seconds: float = MATCH_CLOCK_TAIL_SECONDS,
+) -> Tuple[List[Tuple[int, int]], List[dict], bool, Optional[str]]:
+    """Return merged processing ranges, labeled core periods, and fallback state."""
+    full_range = [(0, max(0, total_frames - 1))]
+    if not samples or fps <= 0 or total_frames <= 0:
+        return full_range, [], True, "missing clock samples or video metadata"
+
+    auto = _find_clock_period(samples, 20)
+    if auto is None:
+        return full_range, [], True, "autonomous countdown was not found"
+    teleop = _find_clock_period(samples, 140, after_frame=auto["end_frame"])
+    if teleop is None:
+        return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
+
+    lead_frames = int(round(lead_seconds * fps))
+    tail_frames = int(round(tail_seconds * fps))
+    periods = []
+    padded = []
+    for label, period in (("auto", auto), ("teleop", teleop)):
+        item = dict(period, label=label)
+        if item["end_seconds"] > 0:
+            item["end_frame"] = min(
+                total_frames - 1,
+                item["end_frame"] + int(round(item["end_seconds"] * fps)),
+            )
+            item["end_seconds"] = 0
+        item["processing_start_frame"] = max(0, period["start_frame"] - lead_frames)
+        item["processing_end_frame"] = min(
+            total_frames - 1, item["end_frame"] + tail_frames
+        )
+        periods.append(item)
+        padded.append((item["processing_start_frame"], item["processing_end_frame"]))
+    return _merge_frame_ranges(padded), periods, False, None
+
+
+def frame_in_ranges(frame: int, ranges: List[Tuple[int, int]]) -> bool:
+    return any(start <= frame <= end for start, end in ranges)
 
 # Appearance gallery (per-event re-ID exemplar memory)
 GALLERY_ENABLED = os.environ.get("GALLERY_ENABLED", "1") not in ("0", "false", "False")
@@ -230,16 +470,36 @@ GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4
 # auto-deposited ones so corrections reliably override bad OCR.
 GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGHT", "2.0"))
 
-# SAM2 periodic re-prompting: re-run YOLO every REPROMPT_SECONDS of tracked footage
-# to catch robots that start occluded (e.g. behind the hub) and emerge mid-match.
-REPROMPT_SECONDS = 2.0
+# SAM2 periodic re-prompting: re-run the detector every REPROMPT_SECONDS of
+# tracked footage to catch robots that start occluded (e.g. behind the hub) and
+# emerge mid-match. This is the new-robot ACQUISITION LATENCY: a robot is
+# invisible until the next boundary. Env-tunable for A/B; note the cull and
+# eviction evidence windows are counted in boundaries, so halving this also
+# halves their time horizons.
+REPROMPT_SECONDS = float(os.environ.get("REPROMPT_SECONDS", "2.0") or "2.0")
+# Seed after robots have begun moving out of their often-obscured starting
+# positions, then run the initial SAM propagation backward to the active start.
+SAM2_PROMPT_OFFSET_SECONDS = max(
+    0.0,
+    float(os.environ.get("SAM2_PROMPT_OFFSET_SECONDS", "3.0") or "3.0"),
+)
 MAX_TRACKED_ROBOTS = 6         # FRC match maximum (3 per alliance); caps phantom tracks
 
-# Robot-tracking top crop: DISABLED for now. SAM2 resizes every frame to a fixed
-# square, so cropping the top distorts robot aspect ratio (squished into 1024x1024)
-# which may hurt tracking more than the airspace false-positive filtering helps.
-# The calibration field/API/UI are kept; flip this to re-enable and revisit.
-ROBOT_TRACK_TOP_CROP_ENABLED = False
+# Resolution of the JPEG frames exported for SAM2 tracking, as a fraction of the
+# view-crop resolution. SAM2 resizes every input to a fixed 1024² square, so this
+# does NOT change SAM2's compute or VRAM — but 0.5 hands SAM2 a ~960px-wide image,
+# *below* its native input, discarding detail for small/far robots (sliver-prone
+# masks past midfield). Raising it costs only export disk/decode time plus mask
+# RAM in sam2_raw (output masks come back at export resolution: 1.0 is 4x the
+# bool-mask memory of 0.5). Env-tunable for A/B.
+SAM2_EXPORT_SCALE = float(os.environ.get("SAM2_EXPORT_SCALE", "0.5") or "0.5")
+
+# Honor the per-camera calibrated top exclusion by default. This prevents stands,
+# outposts, and other above-field structures from becoming robot tracks. It remains
+# disableable for camera layouts where cropping materially hurts SAM2.
+ROBOT_TRACK_TOP_CROP_ENABLED = os.environ.get(
+    "ROBOT_TRACK_TOP_CROP_ENABLED", "1"
+) not in ("0", "false", "False")
 
 # SAM2 model size — the single biggest speed lever.  Robots are large, high-contrast
 # blobs, so the "small" Hiera encoder tracks them well at ~3-5x the throughput of the
@@ -247,20 +507,49 @@ ROBOT_TRACK_TOP_CROP_ENABLED = False
 # `SAM2_MODEL_SIZE=large python web/app.py` when maximum mask fidelity is needed.
 # All variants resize every frame to a 1024² square, so per-frame VRAM (and thus the
 # SAM2_MAX_GPU_FRAMES budget below) is identical across sizes — only compute differs.
+TRACKING_BACKEND = os.environ.get("TRACKING_BACKEND", "sam2").lower()
+if TRACKING_BACKEND not in {"sam2", "sam3"}:
+    TRACKING_BACKEND = "sam2"
 SAM2_MODEL_SIZE = os.environ.get("SAM2_MODEL_SIZE", "small").lower()
+# Config paths are resolved by SAM2's hydra search path (package-relative); the
+# checkpoint paths are OURS and must be absolute — a CWD-relative path silently
+# fell back to Kalman tracking when the server was started from web/ (start.sh).
 _SAM2_MODELS = {
-    "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  "checkpoints/sam2.1_hiera_tiny.pt"),
-    "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  "checkpoints/sam2.1_hiera_small.pt"),
-    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "checkpoints/sam2.1_hiera_base_plus.pt"),
-    "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "checkpoints/sam2.1_hiera_large.pt"),
+    "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_tiny.pt")),
+    "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_small.pt")),
+    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_base_plus.pt")),
+    "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  str(PROJECT_ROOT / "checkpoints/sam2.1_hiera_large.pt")),
 }
 SAM2_CONFIG, SAM2_CHECKPOINT = _SAM2_MODELS.get(SAM2_MODEL_SIZE, _SAM2_MODELS["small"])
+# Display metadata for the UI model picker (ordered fast -> precise).
+_SAM2_SIZE_INFO = [
+    ("tiny",      "Tiny",      "~39M params · fastest, coarsest masks"),
+    ("small",     "Small",     "~46M params · default, fast"),
+    ("base_plus", "Base+",     "~81M params · balanced"),
+    ("large",     "Large",     "~224M params · slowest, finest masks"),
+]
+
+
+def _resolve_sam2_model(size: str):
+    """Map a UI size string to (config, checkpoint), falling back to 'small'."""
+    return _SAM2_MODELS.get((size or "").lower(), _SAM2_MODELS["small"])
+
+
+def _sam2_checkpoint_present(size: str) -> bool:
+    """True if the .pt checkpoint for a size is downloaded (paths are repo-relative)."""
+    cfg = _SAM2_MODELS.get((size or "").lower())
+    return bool(cfg) and os.path.exists(cfg[1])
+
+
 # EXPERIMENTAL: torch.compile the SAM2 image encoder via the VOS-optimized predictor
 # for a further ~2x.  Disabled by default — its CUDA-graph capture is incompatible with
 # our multi-chunk re-prompting flow (we read mask tensors every frame and re-enter
 # propagate_in_video per chunk, which trips "accessing tensor output of CUDAGraphs that
 # has been overwritten").  Only safe with reprompt disabled.  Enable via SAM2_VOS_OPTIMIZED=1.
 SAM2_VOS_OPTIMIZED = os.environ.get("SAM2_VOS_OPTIMIZED", "0") not in ("0", "false", "False")
+SAM3_COMPILE = os.environ.get("SAM3_COMPILE", "0") not in ("0", "false", "False")
+SAM3_USE_FA3 = os.environ.get("SAM3_USE_FA3", "0") not in ("0", "false", "False")
+SAM3_CHECKPOINT = os.environ.get("SAM3_CHECKPOINT") or None
 
 # SAM2 tracking frame rate — the single biggest *controllable* speed lever.  Total SAM2
 # time is near-linear in the number of tracked frames, and frame count = source_fps /
@@ -308,9 +597,34 @@ HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball 
 # much faster, and adequate for bumper-digit transcription.
 VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 
+# Match-start calibration drift check: sample a few in-match frames from the main
+# view, auto-detect AprilTags, and verify the selected calibration epoch still
+# reprojects them accurately. If the camera moved/zoomed since calibration the job
+# aborts (needs recalibration) BEFORE the expensive SAM2 pass.
+CALIB_CHECK_ENABLED = os.environ.get("CALIB_CHECK_ENABLED", "1") not in ("0", "false", "False")
+CALIB_DRIFT_MAX_M = float(os.environ.get("CALIB_DRIFT_MAX_M", "0.5"))
+CALIB_CHECK_MIN_TAGS = int(os.environ.get("CALIB_CHECK_MIN_TAGS", "2"))
+CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5"))
+
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
+
+PERSON_OVERLAP_IOS = float(os.environ.get("PERSON_OVERLAP_IOS", "0.3"))
+PERSON_ROBOT_REJECT_COVERAGE = float(
+    os.environ.get("PERSON_ROBOT_REJECT_COVERAGE", "0.6")
+)
+
+BACKWARD_CONFIRM_ENABLED = os.environ.get("BACKWARD_CONFIRM_ENABLED", "1") == "1"
+# Re-resolution must retain at least this fraction of the live replay rows, else it
+# falls back to the slice-2 prune (guards against identity-churn gutting the replay).
+RERESOLVE_MIN_KEEP_FRAC = float(os.environ.get("RERESOLVE_MIN_KEEP_FRAC", "0.5"))
+
+# Whole-robot gap-fill parameters
+ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
+ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
+ROBOT_FILL_IOS = float(os.environ.get("ROBOT_FILL_IOS", "0.5"))
+ROBOT_FILL_MAX_BOX_FRAC = float(os.environ.get("ROBOT_FILL_MAX_BOX_FRAC", "0.5"))
 
 # Scoring parameters
 BALL_PROXIMITY_FRAMES = 30  # Look back this many frames for ball near robot
@@ -324,6 +638,71 @@ app = FastAPI(title="FRC Vision Scorer")
 
 # Global state for inference jobs
 jobs: Dict[str, "InferenceJob"] = {}
+
+# One job runs at a time by default: SAM2 + the VLM saturate the GPU, and a
+# concurrent job forces SAM2 state offload to CPU (5-6x slower corners) and
+# confounds A/B timing. Extra submissions queue FIFO-ish and the waiting
+# client gets "queued" heartbeats. Raise for multi-GPU / spare-VRAM setups.
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1") or "1")
+_job_slots = asyncio.Semaphore(max(1, MAX_CONCURRENT_JOBS))
+_QUEUE_POLL_SECONDS = 2.0
+# Finished jobs kept in `jobs` for inspection; older ones are pruned at the
+# next submit so completed jobs stop pinning their YOLO models and frame
+# state in memory across a long event day.
+JOB_RETENTION = int(os.environ.get("JOB_RETENTION", "4") or "4")
+
+
+def _prune_finished_jobs() -> None:
+    """Drop all but the newest JOB_RETENTION finished jobs (insertion order).
+    Jobs that are still initializing/queued/processing are never pruned."""
+    finished = [job_id for job_id, job in jobs.items()
+                if job.status in ("completed", "error")]
+    for job_id in finished[:max(0, len(finished) - JOB_RETENTION)]:
+        jobs.pop(job_id, None)
+
+
+async def _run_job_serialized(job: "InferenceJob") -> None:
+    """Run process_video once a job slot frees up.
+
+    While queued, the client gets a heartbeat every poll; a stop request or a
+    dead websocket abandons the run before it starts. With multiple waiters,
+    ordering is best-effort (each poll rejoins the semaphore queue)."""
+    waited = False
+    while True:
+        try:
+            await asyncio.wait_for(_job_slots.acquire(), timeout=_QUEUE_POLL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            waited = True
+            if job._stopped:
+                job.status = "error"
+                job.error = "stopped while queued"
+                await job._send_ws({"type": "error", "error": job.error})
+                return
+            job.status = "queued"
+            sent = await job._send_ws({
+                "type": "status", "status": "queued",
+                "message": "Waiting for a free job slot…",
+            })
+            if not sent and job.websocket is None:
+                job.status = "error"
+                job.error = "client disconnected while queued"
+                print(f"  [queue] job {job.job_id} abandoned: client disconnected")
+                return
+    try:
+        if job._stopped:
+            job.status = "error"
+            job.error = "stopped while queued"
+            await job._send_ws({"type": "error", "error": job.error})
+            return
+        if waited:
+            await job._send_ws({"type": "status", "status": "processing",
+                                "message": "Job slot free — starting…",
+                                "progress": 0.0})
+        await job.process_video()
+    finally:
+        _job_slots.release()
+
 
 # Global state for current event session
 current_event: Optional[Dict] = None
@@ -441,15 +820,30 @@ def _apply_gallery_vote(robot, gallery,
 class InferenceJob:
     """Manages a single video inference job"""
     
-    def __init__(self, job_id: str, video_path: Path, team_reader: str = "local"):
+    def __init__(self, job_id: str, video_path: Path, team_reader: str = "local",
+                 match_key: Optional[str] = None,
+                 config: Optional[JobConfig] = None):
         self.job_id = job_id
         self.video_path = video_path
-        self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
+        # Per-job knob values (override > env > default), validated at submit.
+        # Legacy callers that don't pass a config get pure env/defaults.
+        self.config = config if config is not None else JobConfig()
+        if config is not None:
+            self.team_reader = self.config.team_reader
+        else:
+            self.team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
+        # Match this job processes; drives calibration-epoch selection. The
+        # __init__ plumbing that populates this from the job request lands in a
+        # separate change; None here means select_epoch() falls back to latest.
+        self.match_key = getattr(self, "match_key", None)
+        self._calib_version_id = None
+        self.needs_calibration = None
         self._log_file = None
         self._log_path: Optional[Path] = None
         self.websocket: Optional[WebSocket] = None
+        self._websocket_send_lock = asyncio.Lock()
         self._paused = False
         self._stopped = False
         self._pause_frame = 0
@@ -459,6 +853,29 @@ class InferenceJob:
         # field-space FieldTracker (built in process_video once the calibration
         # loads), so neither the ByteTracker nor the embedder is instantiated here.
         self.model = YOLO(str(MODEL_PATH))
+        self.bumper_model = None
+        self.det_schema = None
+        if BUMPER_MODEL_PATH.exists():
+            self.bumper_model = YOLO(str(BUMPER_MODEL_PATH))
+            self.det_schema = DetectionSchema.from_names(self.bumper_model.names)
+            print(
+                f"[detect] bumper model={BUMPER_MODEL_PATH.name} "
+                f"classes={self.bumper_model.names} "
+                f"robots={self.det_schema.robot_class_color}"
+            )
+        else:
+            print(
+                f"[detect] bumper model not found at {BUMPER_MODEL_PATH}; "
+                "falling back to existing model robot detections with unknown color"
+            )
+
+        # Resolve the whole-robot class ID once
+        self.whole_robot_class_id = 1
+        if self.det_schema is not None:
+            for cid, col in self.det_schema.robot_class_color.items():
+                if col is None:
+                    self.whole_robot_class_id = cid
+                    break
         # Person detector for occlusion reasoning (run per processed frame, classes=[0]).
         # Absolute path so it doesn't depend on CWD (a bare name would trigger a
         # hub auto-download attempt for a non-existent release).
@@ -468,10 +885,12 @@ class InferenceJob:
         # Snapshot the active event key at construction; calibration + field model
         # are loaded at the top of process_video() (decision 7 gate).
         self.event_key = (current_event or {}).get('event_key')
+        self.match_key = match_key
         self.camera = "main"
         self.calib = None
         self.field_model = None
         self.hub_prisms = []
+        self.hub_no_robot_zones = []
         self.field_tracker: Optional[FieldTracker] = None
         self.radar: Optional[Radar] = None
         self.field_tracking = False
@@ -486,20 +905,56 @@ class InferenceJob:
         self.video_width = 0
         self.video_height = 0
         self.video_fps = 0
+        self._match_evidence = MatchEvidence()
+        self._binding_log: list[dict] = []   # [{"frame_num": int, "bindings": {track_id: slot_id}}]
+        self._identity_log: list[dict] = []   # per-frame identity snapshots for re-resolution
+        self._evidence_frame = 0             # current processed frame, set at loop TOP
         self.total_frames = 0
         self.overhead_height = 0
         self.frame_skip = FRAME_SKIP
         self.target_tracking_fps = None
-        # Per-run VRAM frame budget; defaults to the env constant, overridable per job.
-        self.sam2_max_gpu_frames = SAM2_MAX_GPU_FRAMES
+        self.processing_ranges: List[Tuple[int, int]] = []
+        self.match_periods: List[dict] = []
+        self.timer_gate_fallback = True
+        self.timer_gate_fallback_reason: Optional[str] = None
+        self.sam2_source_to_local: Dict[int, int] = {}
+        self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
+        # Per-job A/B knobs, all resolved through self.config (override > env >
+        # default). The attributes survive because downstream plumbing and the
+        # job-control endpoints read them directly.
+        self.sam2_max_gpu_frames = self.config.sam2_max_gpu_frames
+        self.model_size = self.config.sam2_model_size
+        self.sam2_export_scale = self.config.sam2_export_scale
+        # JobConfig consults the same env vars the tracker defaults read, so
+        # passing these explicitly is equivalent to the old None-defers logic.
+        self.cull_hijack_enabled: Optional[bool] = self.config.cull_hijack_enabled
+        self.reanchor_enabled: Optional[bool] = self.config.reanchor_enabled
+        # SAM3 remains opt-in until it has been benchmarked on the event hardware.
+        self.tracking_backend = self.config.tracking_backend
 
         # Detection state
         self.hubs: List[DetectedHub] = []
+        self.identity_registry = IdentityRegistry()
+        self.confidence_config = ConfidenceConfig()
+        self.co_occlusion_tracker = CoOcclusionTracker()
+        # max_events raised well above a full multi-view match's event volume so
+        # late-match diagnostics (e.g. sam2.object_culled) aren't truncated — the
+        # detailed record needed to compare cull on/off runs. The uncapped
+        # "sam2_objects_culled" counter is the truncation-proof backstop.
+        self.identity_diagnostics = IdentityDiagnosticRecorder(max_events=100000)
+        self.identity_diagnostics.set_context(job_id=self.job_id)
+        self.robot_identities = self.identity_registry.identities
+        self._last_bindings: Dict[int, int] = {}
         self.robot_tracks: Dict[int, RobotTrack] = {}
         self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
+        self._gallery_deposits = AppearanceGallery(
+            dedup_sim=GALLERY_DEDUP_SIM,
+            max_exemplars=GALLERY_MAX_EXEMPLARS,
+        )
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
         self._slot_crops: dict = {}   # slot_id -> list of {quality, crop_b64, embedding} (top-3)
         self._slot_source: dict = {}  # slot_id -> "ocr" | "gallery" (last confirm source)
+        self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -507,6 +962,7 @@ class InferenceJob:
         self.alliance_scores = {"blue": 0, "red": 0}
         self.last_alliance_scores = {"blue": 0, "red": 0}
         self.scoring_events: List[ScoringEvent] = []
+        self.deferred_attributions: List[dict] = []
         self.recent_ball_detections: deque = deque(maxlen=BALL_PROXIMITY_FRAMES)
         self.last_ocr_crops: list = []     # crops fed to the VLM + reads, for UI spot-check
         self._ocr_crops_dirty = False      # only stream crops on frames where a new batch exists
@@ -558,6 +1014,11 @@ class InferenceJob:
         self.diagnostic = DiagnosticRecorder(
             UPLOAD_DIR / f"diagnostic_{self.job_id}.jsonl",
             ws_send=None,  # wired in Task 7
+        )
+        # Hard-negative capture: no-op unless HARD_NEG_LOG=1. Bucketed per event
+        # (falls back to job_id) so negatives accumulate across runs of an event.
+        self.hard_neg_logger = HardNegativeLogger(
+            HARD_NEG_DIR / (self.event_key or self.job_id)
         )
 
     def extract_team_numbers(self, frame: np.ndarray) -> None:
@@ -620,7 +1081,7 @@ class InferenceJob:
         available_teams = [t for t in self.match_teams if t not in confirmed_teams]
 
         for canonical_id, box in tracked_robots:
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_slot_track_if_exists(canonical_id)
             if not robot or robot.team_number_confirmed:
                 continue  # Already confirmed, skip OCR
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
@@ -662,7 +1123,7 @@ class InferenceJob:
                 if robot.consecutive_tracker is None:
                     robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
                 locked_team, confirmed = robot.consecutive_tracker.update(team)
-                if confirmed and locked_team:
+                if confirmed and locked_team and locked_team != robot.team_number:
                     already_assigned = any(
                         r.team_number == locked_team and r.team_number_confirmed
                         for r in self.robot_tracks.values() if r.robot_id != canonical_id
@@ -682,7 +1143,14 @@ class InferenceJob:
                 for team in matching_teams:
                     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + vote_share
 
-    def _bumper_crop_b64(self, frame: np.ndarray, box, robot_id=None, enforce_floor: bool = True):
+    def _bumper_crop_b64(
+        self,
+        frame: np.ndarray,
+        box,
+        robot_id=None,
+        enforce_floor: bool = True,
+        box_is_bumper: bool = False,
+    ):
         """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
         encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
         None when the crop is empty or, when enforce_floor=True, below LEGIBILITY_FLOOR.
@@ -698,7 +1166,11 @@ class InferenceJob:
         if x2 <= x1 or y2 <= y1:
             return None
 
-        crop = bumper_crop(frame, (x1, y1, x2, y2))
+        crop = (
+            frame[y1:y2, x1:x2]
+            if box_is_bumper
+            else bumper_crop(frame, (x1, y1, x2, y2))
+        )
         if crop is None or crop.size == 0:
             crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
@@ -725,7 +1197,9 @@ class InferenceJob:
         # Upscale so the bumper crop is at least ~384px tall (existing behavior).
         if crop.shape[0] < 384:
             scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            # LINEAR over CUBIC: 3-6x faster and the VLM is insensitive to
+            # upscale interpolation (unlike the OCR preprocess paths).
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
         crop_b64 = base64.b64encode(buf).decode('utf-8')
         return crop_b64, score
@@ -749,16 +1223,80 @@ class InferenceJob:
             return None
         if crop.shape[0] < 192:
             scale = max(2, int(np.ceil(192 / max(1, crop.shape[0]))))
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            # LINEAR over CUBIC: runs per detection per frame; display-only image.
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
             return None
         return base64.b64encode(buf).decode('utf-8')
 
-    def _detect_view(self, view, composite_frame, precomputed_dets=None):
+    def _detect_whole_robots(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
+        """Run YOLO model on the frame, select only the whole-robot class, and filter out boxes that exceed ROBOT_FILL_MAX_BOX_FRAC."""
+        if not ROBOT_FILL_ENABLED:
+            return []
+        results = self.model(frame, conf=ROBOT_FILL_CONF, verbose=False)[0]
+        dets = sv.Detections.from_ultralytics(results)
+        
+        valid_boxes = []
+        for i in range(len(dets)):
+            if int(dets.class_id[i]) == self.whole_robot_class_id:
+                box = tuple(float(v) for v in dets.xyxy[i])
+                if not box_exceeds_frac(box, frame.shape, ROBOT_FILL_MAX_BOX_FRAC):
+                    valid_boxes.append(box)
+        return valid_boxes
+
+    def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4):
+        """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
+        frame (already top-cropped): bumper detections — admitted by shape OR
+        by whole-robot corroboration — expanded to robot boxes, merged with
+        whole-robot gap fills, person candidates vetoed.
+
+        Returns [(box_xyxy, color)] in the input frame's pixel coords. Field
+        filtering and any coordinate scaling are the caller's concern (they
+        differ between the prompt-seeding and re-prompt paths).
+        """
+        whole_boxes = self._detect_whole_robots(frame)
+        bumper_robots = []
+        if self.bumper_model is not None:
+            res = self.bumper_model(frame, conf=conf, verbose=False)[0]
+            robots, _balls, _hubs = self.det_schema.split(
+                sv.Detections.from_ultralytics(res)
+            )
+            for box, color, _confidence in robots:
+                if not bumper_admissible(box, whole_boxes):
+                    continue
+                robot_box = expand_bumper_to_robot(
+                    box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR
+                )
+                bumper_robots.append((robot_box, color))
+        merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
+        person_res = self.person_model(
+            frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
+        )[0]
+        person_dets = sv.Detections.from_ultralytics(person_res)
+        person_boxes = [
+            tuple(person_dets.xyxy[i]) for i in range(len(person_dets))
+        ]
+        return reject_person_candidates(
+            merged, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
+        )
+
+    @staticmethod
+    def _below_robot_tracking_top(view, box, frame_height: int) -> bool:
+        if not ROBOT_TRACK_TOP_CROP_ENABLED:
+            return True
+        frac = (
+            getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0
+        )
+        if frac <= 0.0:
+            return True
+        return float(box[3]) >= float(frame_height) * frac
+
+    def _detect_view(self, view, composite_frame, precomputed_dets=None, frame_num=0):
         """Run YOLO + person detection on one camera view; returns
-        (paired, person_boxes) where paired is a list of (FieldDetection, crop_b64_or_None)
-        and person_boxes are field-filtered occluder boxes in that view's pixels.
+        (paired, person_boxes, person_boxes_all), where ``person_boxes`` are
+        field-filtered for occlusion geometry and ``person_boxes_all`` retain
+        near-wall people for negative filtering and backward evidence.
 
         precomputed_dets: an sv.Detections already run on this view's frame (the main
         loop computes robot/ball detections on the main overhead frame for hub/ball/
@@ -770,31 +1308,84 @@ class InferenceJob:
         else:
             results = self.model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
             dets = sv.Detections.from_ultralytics(results)
-        robot_boxes = []
-        for i in range(len(dets)):
-            if dets.class_id[i] == 1:
-                box = dets.xyxy[i]
-                cx = (box[0] + box[2]) / 2.0
-                cy = (box[1] + box[3]) / 2.0
-                is_masked = False
-                for (mx, my, mw, mh) in view.masks:
-                    if mx <= cx <= mx + mw and my <= cy <= my + mh:
-                        is_masked = True
-                        break
-                if not is_masked:
-                    robot_boxes.append(box)
-        field_dets = to_field_detections(robot_boxes, cal, frame, self.field_dims,
-                                         color_fn=self.detect_bumper_color)
-        paired = []
-        for d in field_dets:
-            cb = self._bumper_crop_b64(frame, d.box, enforce_floor=False)
-            crop_b64 = cb[0] if cb is not None else None
-            paired.append((d, crop_b64))
-        person_results = self.person_model(frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        person_results = self.person_model(
+            frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
+        )[0]
         pdets = sv.Detections.from_ultralytics(person_results)
         person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
+        if self.bumper_model is not None:
+            bumper_results = self.bumper_model(
+                frame, conf=DET_CONF_THRESHOLD, verbose=False
+            )[0]
+            bumper_dets = sv.Detections.from_ultralytics(bumper_results)
+            robots, _balls, _hubs = self.det_schema.split(bumper_dets)
+        else:
+            robots = [
+                (
+                    tuple(dets.xyxy[i]),
+                    None,
+                    (
+                        float(dets.confidence[i])
+                        if dets.confidence is not None
+                        else 1.0
+                    ),
+                )
+                for i in range(len(dets))
+                if dets.class_id[i] == 1
+            ]
+        robots = reject_person_candidates(
+            robots, person_boxes_all, PERSON_ROBOT_REJECT_COVERAGE
+        )
+        robot_boxes = []
+        robot_colors = []
+        for box, color, _confidence in robots:
+            if self.bumper_model is not None and not plausible_bumper_box(box):
+                continue
+            if not self._below_robot_tracking_top(view, box, frame.shape[0]):
+                continue
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            if any(
+                mx <= cx <= mx + mw and my <= cy <= my + mh
+                for (mx, my, mw, mh) in view.masks
+            ):
+                continue
+            robot_boxes.append(np.asarray(box))
+            robot_colors.append(color)
+        rejected = []
+        field_dets = to_field_detections(
+            robot_boxes, cal, self.field_dims, colors=robot_colors,
+            frame_shape=frame.shape,
+            rejected_out=rejected,
+        )
+        # Corner-camera range falloff: attenuate (via det.score, which scales
+        # the fusion weight) instead of hard-dropping, so center-field robots
+        # keep corner coverage; only the far half (weight 0) is discarded.
+        weighted = []
+        for det in field_dets:
+            w = corner_detection_weight(view.name, det.pos, self.field_dims)
+            if w <= 0.0:
+                continue
+            det.score = w
+            weighted.append(det)
+        field_dets = weighted
+        if rejected:
+            self.hard_neg_logger.maybe_log(
+                frame, [d.box for d in field_dets], rejected,
+                view_name=view.name, frame_num=frame_num,
+            )
+        paired = []
+        for d in field_dets:
+            cb = self._bumper_crop_b64(
+                frame,
+                d.box,
+                enforce_floor=False,
+                box_is_bumper=self.bumper_model is not None,
+            )
+            crop_b64 = cb[0] if cb is not None else None
+            paired.append((d, crop_b64))
         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
-        return paired, person_boxes
+        return paired, person_boxes, person_boxes_all
 
     def _remaining_rosters(self):
         """(remaining_all, remaining_blue, remaining_red) — match roster minus
@@ -811,7 +1402,7 @@ class InferenceJob:
                            remaining_red, source_weight):
         """Read one bumper crop with the VLM and add a (confidence x source_weight)
         vote to the slot's team tally. source_weight > 1 for corner cameras."""
-        robot = self.robot_tracks.get(slot_id)
+        robot = self._get_slot_track_if_exists(slot_id)
         if not robot:
             return
         alliance = getattr(robot, "alliance", "unknown")
@@ -836,30 +1427,6 @@ class InferenceJob:
         print(f"  Corner read: slot {slot_id} += {team} (w={weight:.1f}, "
               f"total={robot.team_ocr_votes[team]:.1f})")
 
-    def _is_reread_pass(self, unconfirmed_count: int) -> bool:
-        """Whether this VLM pass also re-reads already-confirmed slots.
-
-        Re-reading confirmed slots is the only way a wrong lock self-corrects.
-        It must NOT depend solely on `unconfirmed_count == 0`: a wrong lock holds
-        a roster team hostage (locked teams are excluded from assignment in
-        reid.assign_teams_alliance_masked), so the real robot for that team can
-        never confirm — `unconfirmed_count` then never reaches 0 and the bad lock
-        deadlocks forever, its early crop "stuck" on screen all match. So also
-        force a periodic audit every REREAD_EVERY_N_PASSES calls regardless.
-        """
-        if unconfirmed_count == 0:
-            return True
-        return self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0
-
-    def _vlm_interval_seconds(self, unconfirmed_count: int) -> float:
-        """Retry faster while robot identities are missing, then back off to audits."""
-        if unconfirmed_count >= 4:
-            return VLM_UNCONFIRMED_FAST_INTERVAL_SEC
-        if unconfirmed_count >= 2:
-            return VLM_UNCONFIRMED_MED_INTERVAL_SEC
-        if unconfirmed_count == 1:
-            return VLM_UNCONFIRMED_SLOW_INTERVAL_SEC
-        return VLM_CONFIRMED_AUDIT_INTERVAL_SEC
 
     def _handle_confirmed_vlm_contradiction(self, robot, new_team: Optional[str],
                                             confidence: float, raw_read: Optional[str],
@@ -903,6 +1470,12 @@ class InferenceJob:
         robot.consecutive_tracker.update(new_team)
         robot.team_number = None
         robot.team_number_confirmed = False
+        ident = self.identity_registry.identities.get(robot.robot_id)
+        if ident:
+            ident.team_number = None
+            ident.is_confirmed = False
+            ident.confidence = 0.4
+            ident.needs_immediate_read = True
 
     def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding, robot_crop_b64=None):
         """Keep the top-3 (by quality) crops per slot for post-match review.
@@ -922,20 +1495,36 @@ class InferenceJob:
         del bucket[3:]
 
     def _deposit_to_gallery(self, robot, legibility: float = 0.0, image_bytes=None) -> None:
-        """Deposit a confirmed robot's appearance into the in-memory event gallery and
-        buffer it for persistence at finalize. Only externally-grounded labels (an OCR
-        lock or OCR re-affirmation) should call this — never a gallery-driven
-        confirmation, to avoid self-reinforcement."""
-        if self.gallery is None or robot is None:
+        """Stage a confirmed robot appearance for future matches.
+
+        The query gallery is a frozen snapshot of previous matches. Current-match
+        deposits must never be added to it, or a robot can confirm itself.
+        """
+        if self.gallery is None or robot is None or not getattr(self, "use_sam2", False):
             return
         color = robot.alliance if robot.alliance in ("red", "blue") else None
         if color is None or not robot.team_number or robot.appearance_embedding is None:
             return
-        stored = self.gallery.add(robot.team_number, color, robot.appearance_embedding, legibility)
-        if not stored or not self.event_key:
-            return  # rejected as near-duplicate, or no event to persist under
+        if not self.event_key or not self.match_key:
+            return
+        deposits = getattr(self, "_gallery_deposits", None)
+        if deposits is None:
+            deposits = AppearanceGallery(
+                dedup_sim=GALLERY_DEDUP_SIM,
+                max_exemplars=GALLERY_MAX_EXEMPLARS,
+            )
+            self._gallery_deposits = deposits
+        if not deposits.add(
+            robot.team_number,
+            color,
+            robot.appearance_embedding,
+            legibility,
+        ):
+            return
         self._pending_gallery_rows.append({
-            "event_key": self.event_key, "team": robot.team_number,
+            "event_key": self.event_key,
+            "source_match_key": self.match_key,
+            "team": robot.team_number,
             "alliance_color": color,
             "embedding": np.asarray(robot.appearance_embedding, dtype=np.float32).tobytes(),
             "legibility": legibility,
@@ -944,10 +1533,41 @@ class InferenceJob:
             "job_id": self.job_id,
         })
 
+    def _record_frame_evidence(self, fused, frame_num, main_person_boxes):
+        """Slice-1 whole-match evidence. No behavior change; consumed by the
+        backward-confirmation classifier (slice 2+). All keys are fused track_ids.
+        Position is the RAW fused measurement (det.pos): a coasting track is absent
+        from `fused`, so still frames contribute no motion sample — intended."""
+        for obs in fused:
+            tid = obs.track_id
+            if tid is None:
+                continue
+            det = obs.detection
+            fxy = det.pos if det is not None else None
+            box = det.box if det is not None else None
+            color = det.color if det is not None else None
+            overlapped = bool(box is not None and main_person_boxes and any(
+                box_ios(tuple(box), tuple(pb)) >= PERSON_OVERLAP_IOS
+                for pb in main_person_boxes))
+            self._match_evidence.observe(tid, frame_num, fxy, overlapped_person=overlapped)
+            if color in ("red", "blue"):
+                self._match_evidence.confirm(tid, frame_num, bumper_color=True)
+        self._binding_log.append({
+            "frame_num": frame_num,
+            "bindings": dict(self.field_tracker._id_to_slot),  # {track_id: slot_id}
+        })
+
+    def _track_id_for_slot(self, slot_id):
+        # _id_to_slot is {track_id: slot_id}; invert. Returns None when the slot is
+        # not currently bound to a fused track (confirmation then drops — acceptable
+        # for slice 1; these sites normally run on frames where the slot IS bound).
+        return next((tid for tid, s in self.field_tracker._id_to_slot.items()
+                     if s == slot_id), None)
+
     def apply_gallery_matches(self, ocr_crops: list) -> None:
         """Query the gallery for unconfirmed tracks, cast votes, and annotate any
         matching ocr_crops cards so the UI distinguishes appearance recovery."""
-        if self.gallery is None:
+        if self.gallery is None or not getattr(self, "use_sam2", False):
             return
         by_slot = {c["robot_id"]: c for c in ocr_crops}
         for slot_id, robot in self.robot_tracks.items():
@@ -969,15 +1589,23 @@ class InferenceJob:
                 for event in self.scoring_events:
                     if event.robot_id == slot_id:
                         event.team_number = robot.team_number
+                try:
+                    tid = self._track_id_for_slot(slot_id)
+                    if tid is not None:
+                        self._match_evidence.confirm(tid, self._evidence_frame, appearance=True)
+                except Exception:
+                    pass
                 print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
                       f"(appearance {sim:.2f})")
 
-    def read_fused_bumper_numbers(self, fused, is_reread_pass: bool) -> None:
+    async def read_fused_bumper_numbers(self, fused, requested_priorities: dict[int, float]) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
-        This is the reliable path for multi-camera tracking: every crop is already
-        in its source camera's coordinates. Do not crop the final fused/track box
-        from the main overhead frame; that box may have come from a corner camera.
+        Accepts requested_priorities: dict mapping identity_id -> priority.
+
+        The VLM generate runs on a worker thread (CUDA releases the GIL) so the
+        event loop keeps servicing websocket keepalives and pause/stop during a
+        100-500ms read; all identity-state mutation stays on the loop.
         """
         if not self.match_teams:
             self.vlm_status.update({
@@ -991,28 +1619,65 @@ class InferenceJob:
             self._ocr_crops_dirty = True
             return
 
-        candidates = []  # (priority, slot_id, cam, crop_b64, source_weight)
+        current_match_time = self._current_frame / (self.video_fps or 10.0)
+
+        # Map slot_id -> obs
+        slot_to_obs = {}
         for i, obs in enumerate(fused):
             slot_id = self.field_tracker.last_det_to_slot.get(i)
-            if slot_id is None:
+            if slot_id is not None:
+                slot_to_obs[slot_id] = obs
+
+        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64)
+        identities_with_crops = set()
+
+        for identity_id, priority in requested_priorities.items():
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident is None or ident.active_slot is None:
                 continue
-            robot = self.robot_tracks.get(slot_id)
-            if robot is None:
+            slot_id = ident.active_slot
+            obs = slot_to_obs.get(slot_id)
+            if obs is None:
                 continue
-            if robot.team_number_confirmed and not is_reread_pass:
-                continue
-            # If every camera says the bumper is occluded, skip. Otherwise corner
-            # evidence remains useful even when the main view is blocked.
+
+            # Occlusion check
             if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
                 cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
             ):
                 continue
+
+            has_any_crop = False
             for cam, crop_b64, source_weight in obs.evidence:
                 if crop_b64 is None:
                     continue
-                # Prefer corner-camera crops slightly because they often see
-                # side bumpers more directly; source_weight already encodes that.
-                candidates.append((float(source_weight), slot_id, cam, crop_b64, float(source_weight)))
+                has_any_crop = True
+                candidates.append((
+                    priority,
+                    float(source_weight),
+                    identity_id,
+                    slot_id,
+                    cam,
+                    crop_b64
+                ))
+
+            if has_any_crop:
+                identities_with_crops.add(identity_id)
+            else:
+                # No crops found: backoff
+                ident.last_vlm_time = current_match_time
+                ident.vlm_fail_count += 1
+                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                print(f"  VLM backoff: Identity {identity_id} (slot {slot_id}) has no crops. Backoff until {ident.backoff_until:.2f}")
+
+        # For any requested identity that didn't even have an active slot or obs
+        for identity_id in requested_priorities:
+            if identity_id not in identities_with_crops:
+                ident = self.identity_registry.identities.get(identity_id)
+                if ident and ident.identity_id not in identities_with_crops:
+                    ident.last_vlm_time = current_match_time
+                    ident.vlm_fail_count += 1
+                    ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                    print(f"  VLM backoff: Identity {identity_id} not visible/active. Backoff until {ident.backoff_until:.2f}")
 
         if not candidates:
             print("  VLM skipped: no legible fused bumper crops this pass")
@@ -1027,14 +1692,24 @@ class InferenceJob:
             self._ocr_crops_dirty = True
             return
 
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        chosen = candidates[:VLM_TOP_K]
+        # Sort by (priority, source_weight) descending
+        candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+        chosen = []
+        chosen_identities = set()
+        for candidate in candidates:
+            identity_id = candidate[2]
+            if identity_id in chosen_identities:
+                continue
+            chosen.append(candidate)
+            chosen_identities.add(identity_id)
+            if len(chosen) >= VLM_TOP_K:
+                break
 
-        crops = [c[3] for c in chosen]
+        crops = [c[5] for c in chosen]
         expected = []
-        for _priority, slot_id, _cam, _crop_b64, _source_weight in chosen:
-            robot = self.robot_tracks.get(slot_id)
-            alliance = getattr(robot, "alliance", "unknown")
+        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64 in chosen:
+            ident = self.identity_registry.identities.get(identity_id)
+            alliance = getattr(ident, "alliance", "unknown")
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
 
         provider = getattr(self, "team_reader", "local")
@@ -1048,7 +1723,8 @@ class InferenceJob:
             "last_error": None,
         })
         try:
-            results = _vision_read_bumpers(
+            results = await asyncio.to_thread(
+                _vision_read_bumpers,
                 crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
                 expected_alliances=expected,
                 provider=provider,
@@ -1060,13 +1736,19 @@ class InferenceJob:
 
         ocr_crops = []
         status_results = []
-        for (_priority, slot_id, cam, crop_b64, source_weight), res in zip(chosen, results):
-            robot = self.robot_tracks.get(slot_id)
-            if not robot:
+        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
+            robot = self._get_or_create_slot_track(slot_id)
+            ident = self.identity_registry.identities.get(identity_id)
+            if not robot or not ident:
                 continue
+
+            # Update VLM attempt time + position (novelty-gate reference)
+            ident.last_vlm_time = current_match_time
+            ident.last_vlm_pos = getattr(robot, "field_position", None)
+
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
-            self._capture_slot_crop(slot_id, crop_b64, conf, robot.appearance_embedding,
+            self._capture_slot_crop(robot.robot_id, crop_b64, conf, robot.appearance_embedding,
                                     robot_crop_b64=robot.appearance_crop_b64)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
             status_results.append({
@@ -1078,7 +1760,7 @@ class InferenceJob:
                 "error": res.get("error"),
             })
             ocr_crops.append({
-                "robot_id": slot_id,
+                "robot_id": robot.robot_id,
                 "slot": self._slot_label(slot_id),
                 "alliance": res.get("alliance", "unknown"),
                 "source": cam,
@@ -1091,7 +1773,7 @@ class InferenceJob:
                 "via": "ocr",
             })
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=slot_id,
+                frame=self._current_frame, robot_id=robot.robot_id,
                 crop_b64=crop_b64,
                 legibility=0.0,
                 raw_read=res.get("raw_read"),
@@ -1100,6 +1782,26 @@ class InferenceJob:
                 confidence=conf,
                 vote_weight=vote_weight,
             )
+
+            # Update success/backoff based on whether read succeeded
+            if res.get("error") or not team:
+                ident.vlm_fail_count += 1
+                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+            else:
+                previous_team = ident.team_number
+                ident.last_success_time = current_match_time
+                ident.vlm_fail_count = 0
+                ident.backoff_until = -999.0
+                ident.has_vlm_read = True
+                ident.vlm_agrees = previous_team is not None and team == previous_team
+                ident.vlm_contradicts = (
+                    ident.is_confirmed
+                    and previous_team is not None
+                    and team != previous_team
+                )
+                if not ident.is_ambiguous:
+                    ident.needs_immediate_read = False
+
             if (robot.team_number_confirmed and team == robot.team_number
                     and conf >= 0.85):
                 self._deposit_to_gallery(robot, legibility=conf,
@@ -1109,26 +1811,156 @@ class InferenceJob:
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
+            vote_total = robot.team_ocr_votes[team]
             self._handle_confirmed_vlm_contradiction(
                 robot, team, conf, res.get("raw_read"), cam
             )
             if robot.consecutive_tracker is None:
                 robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
             locked_team, confirmed = robot.consecutive_tracker.update(team)
-            if confirmed and locked_team:
+            if confirmed and locked_team and locked_team != robot.team_number:
                 old_team = robot.team_number
+                if old_team and robot.team_ocr_votes:
+                    # Drop the overridden team's stale votes so a later un-confirm
+                    # can't resurrect the wrong identity from leftover tallies.
+                    robot.team_ocr_votes.pop(old_team, None)
                 robot.team_number = locked_team
                 robot.team_number_confirmed = True
-                self._slot_source[slot_id] = "ocr"
-                self._clear_team_from_other_robots(slot_id, locked_team)
+                ident.team_number = locked_team
+                ident.is_confirmed = True
+                self._slot_source[identity_id] = "ocr"
+                self._clear_team_from_other_robots(robot.robot_id, locked_team)
                 for event in self.scoring_events:
-                    if event.robot_id == slot_id:
+                    if event.robot_id == identity_id:
                         event.team_number = locked_team
-                print(f"  Consecutive-lock confirmed: Robot {slot_id} = Team {locked_team} (was {old_team})")
+                verb = "overridden" if old_team else "confirmed"
+                print(f"  Consecutive-lock {verb}: Robot {slot_id} = Team {locked_team} (was {old_team})")
+                try:
+                    tid = self._track_id_for_slot(slot_id)
+                    if tid is not None:
+                        self._match_evidence.confirm(tid, self._evidence_frame, team_read=True)
+                except Exception:
+                    pass
                 self._deposit_to_gallery(robot, legibility=conf,
                                          image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
-                  f"(w={vote_weight:.1f}, total={robot.team_ocr_votes[team]:.1f})")
+                  f"(w={vote_weight:.1f}, total={vote_total:.1f})")
+
+        # Co-occlusion resolution. Reads identify the robot occupying each slot;
+        # translate those team labels back to durable identities before changing
+        # any binding.
+        pass_reads = {}
+        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
+            team_val = res.get("team_number")
+            conf_val = float(res.get("confidence", 0.0))
+            if team_val and conf_val >= 0.85:
+                pass_reads[identity_id] = team_val
+
+        for event in list(self.co_occlusion_tracker.get_active_events()):
+            if event.status != "pending_vlm":
+                continue
+            event_reads = {id: pass_reads[id] for id in event.identity_ids if id in pass_reads}
+            expected_teams = {
+                ident.team_number: ident.identity_id
+                for ident in (
+                    self.identity_registry.identities.get(identity_id)
+                    for identity_id in event.identity_ids
+                )
+                if ident is not None and ident.team_number
+            }
+            complete = len(event_reads) == len(event.identity_ids)
+            unique = len(set(event_reads.values())) == len(event_reads)
+            roster_valid = set(expected_teams).issubset(set(event_reads.values()))
+            if not (complete and unique and roster_valid):
+                self.identity_diagnostics.record(
+                    DiagnosticEvents.OCCLUSION_GROUP_UNRESOLVED,
+                    reason=(DiagnosticReasons.UNREADABLE_RESULT
+                            if not complete else DiagnosticReasons.ALLIANCE_CONFLICT),
+                    event_id=event.event_id,
+                    reads=event_reads,
+                )
+                continue
+
+            resolved_slots = {}
+            resolved_teams = {}
+            for observed_identity_id, team_num in event_reads.items():
+                observed_ident = self.identity_registry.identities.get(observed_identity_id)
+                if observed_ident is None or observed_ident.active_slot is None:
+                    resolved_slots = {}
+                    break
+                target_identity_id = expected_teams.get(team_num, observed_identity_id)
+                if target_identity_id in resolved_slots:
+                    resolved_slots = {}
+                    break
+                resolved_slots[target_identity_id] = observed_ident.active_slot
+                resolved_teams[target_identity_id] = team_num
+            if len(resolved_slots) != len(event.identity_ids):
+                continue
+
+            for identity_id, slot_id in resolved_slots.items():
+                ident_obj = self.identity_registry.identities[identity_id]
+                ident_obj.active_slot = slot_id
+                ident_obj.is_ambiguous = False
+                ident_obj.needs_immediate_read = False
+                ident_obj.confidence = max(ident_obj.confidence, 0.85)
+                if ident_obj.team_number is None:
+                    ident_obj.team_number = resolved_teams[identity_id]
+                    ident_obj.is_confirmed = True
+                robot_track = self._get_or_create_identity_track(
+                    identity_id, ident_obj.alliance
+                )
+                robot_track.team_number = ident_obj.team_number
+                robot_track.team_number_confirmed = ident_obj.is_confirmed
+                self._slot_source[slot_id] = "ocr"
+
+            self._last_bindings.update(resolved_slots)
+            self.co_occlusion_tracker.resolve_event(event.event_id, resolved_slots)
+            self.identity_diagnostics.increment("occlusion_groups_resolved")
+            self.identity_diagnostics.record(
+                DiagnosticEvents.OCCLUSION_GROUP_RESOLVED,
+                event_id=event.event_id,
+                mapping=resolved_slots,
+                reads=event_reads,
+            )
+            print(f"  Co-occlusion event {event.event_id} resolved: {resolved_slots}")
+
+            remaining_deferred = []
+            for attrib in self.deferred_attributions:
+                if attrib["alliance"] != event.alliance:
+                    remaining_deferred.append(attrib)
+                    continue
+                matched_ident_id = next(
+                    (
+                        identity_id
+                        for identity_id, slot_id in resolved_slots.items()
+                        if slot_id == attrib["slot_id"]
+                    ),
+                    None,
+                )
+                if matched_ident_id is None:
+                    remaining_deferred.append(attrib)
+                    continue
+                ident_obj = self.identity_registry.identities[matched_ident_id]
+                robot_track = self._get_or_create_identity_track(
+                    matched_ident_id, ident_obj.alliance
+                )
+                robot_track.scores += 1
+                self.scoring_events.append(ScoringEvent(
+                    frame_num=attrib["frame_num"],
+                    timestamp=attrib["timestamp"],
+                    alliance=attrib["alliance"],
+                    robot_id=matched_ident_id,
+                    team_number=ident_obj.team_number,
+                    confidence="high",
+                    distance_to_hub=attrib["distance_to_hub"],
+                ))
+                self.identity_diagnostics.increment("scoring_backfilled")
+                self.identity_diagnostics.record(
+                    DiagnosticEvents.SCORING_BACKFILLED,
+                    identity_id=matched_ident_id,
+                    event_id=event.event_id,
+                )
+            self.deferred_attributions = remaining_deferred
 
         self.apply_gallery_matches(ocr_crops)
         self.last_ocr_crops = ocr_crops
@@ -1138,18 +1970,29 @@ class InferenceJob:
         if errors:
             self.vlm_status["last_error"] = errors[0]
 
-    def vision_identify_robots(self, frame: np.ndarray, tracked_robots) -> None:
+    def vision_identify_robots(
+        self, frame: np.ndarray, tracked_robots, boxes_are_bumpers: bool = False
+    ) -> None:
         """Time-tracking wrapper around the bumper-VLM read (accumulates into
         timings['bumper_vlm'], a sub-component of the analysis loop)."""
         _t = time.perf_counter()
         try:
-            return self._vision_identify_robots_impl(frame, tracked_robots)
+            return self._vision_identify_robots_impl(
+                frame,
+                tracked_robots,
+                boxes_are_bumpers=boxes_are_bumpers,
+            )
         finally:
             t = getattr(self, "timings", None)
             if t is not None:
                 t["bumper_vlm"] = t.get("bumper_vlm", 0.0) + (time.perf_counter() - _t)
 
-    def _vision_identify_robots_impl(self, frame: np.ndarray, tracked_robots) -> None:
+    def _vision_identify_robots_impl(
+        self,
+        frame: np.ndarray,
+        tracked_robots,
+        boxes_are_bumpers: bool = False,
+    ) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
         identity can be overturned by the audit (assign_teams_from_votes +
@@ -1162,16 +2005,16 @@ class InferenceJob:
         confirmed_teams = {r.team_number for r in self.robot_tracks.values()
                            if r.team_number_confirmed and r.team_number}
         remaining_teams = [t for t in self.match_teams if t not in confirmed_teams]
-        if not remaining_teams and self._claude_vision_calls % REREAD_EVERY_N_PASSES != 0:
-            return  # everything confirmed and not a re-read pass
+        if not remaining_teams:
+            return  # everything confirmed
         remaining_blue = [t for t in self.match_blue_teams if t not in confirmed_teams]
         remaining_red = [t for t in self.match_red_teams if t not in confirmed_teams]
 
         # Build candidate crops. Confirmed robots only on re-read passes.
-        is_reread_pass = (self._claude_vision_calls % REREAD_EVERY_N_PASSES == 0)
+        is_reread_pass = True
         candidates = []  # list of (score, canonical_id, box, crop_b64)
         for canonical_id, box in tracked_robots:
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
                 continue
             if robot.team_number_confirmed and not is_reread_pass:
@@ -1179,7 +2022,12 @@ class InferenceJob:
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
                 continue  # bumper hidden by hub/person/robot — don't read it
 
-            cb = self._bumper_crop_b64(frame, box, robot_id=canonical_id)
+            cb = self._bumper_crop_b64(
+                frame,
+                box,
+                robot_id=canonical_id,
+                box_is_bumper=boxes_are_bumpers,
+            )
             if cb is None:
                 continue  # empty crop or below legibility floor (diagnostic recorded)
             crop_b64, score = cb
@@ -1196,7 +2044,7 @@ class InferenceJob:
         ocr_crops = []
         for score, canonical_id, box, crop_b64 in chosen:
             expected = "unknown"
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if robot and robot.alliance in ("blue", "red"):
                 expected = robot.alliance
             res = _vision_read_bumpers(
@@ -1206,7 +2054,7 @@ class InferenceJob:
             )[0]
             results.append((canonical_id, box, res))
             ocr_crops.append({
-                "robot_id": canonical_id,
+                "robot_id": robot.robot_id,
                 "slot": self._slot_label(canonical_id),
                 "alliance": res.get("alliance", "unknown"),
                 "source": "main",
@@ -1218,7 +2066,7 @@ class InferenceJob:
                 "legibility": round(score, 4),
             })
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=canonical_id,
+                frame=self._current_frame, robot_id=robot.robot_id,
                 crop_b64=crop_b64,
                 legibility=float(score),
                 raw_read=res.get("raw_read"),
@@ -1234,7 +2082,7 @@ class InferenceJob:
             team = result.get("team_number")
             if not team:
                 continue
-            robot = self.robot_tracks.get(canonical_id)
+            robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
                 continue
             conf = result.get("confidence", 0.0)
@@ -1248,15 +2096,18 @@ class InferenceJob:
             if robot.consecutive_tracker is None:
                 robot.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
             locked_team, confirmed = robot.consecutive_tracker.update(team)
-            if confirmed and locked_team:
+            if confirmed and locked_team and locked_team != robot.team_number:
                 old_team = robot.team_number
+                if old_team and robot.team_ocr_votes:
+                    robot.team_ocr_votes.pop(old_team, None)
                 robot.team_number = locked_team
                 robot.team_number_confirmed = True
-                self._clear_team_from_other_robots(canonical_id, locked_team)
+                self._clear_team_from_other_robots(robot.robot_id, locked_team)
                 for event in self.scoring_events:
-                    if event.robot_id == canonical_id:
+                    if event.robot_id == robot.robot_id:
                         event.team_number = locked_team
-                print(f"  Consecutive-lock confirmed (vision): Robot {canonical_id} = Team {locked_team} (was {old_team})")
+                verb = "overridden" if old_team else "confirmed"
+                print(f"  Consecutive-lock {verb} (vision): Robot {canonical_id} = Team {locked_team} (was {old_team})")
             tag = "RE-READ" if robot.team_number_confirmed else "read"
             print(f"  Vision {tag}: Robot {canonical_id} += {team} "
                   f"(w={weight}, total={robot.team_ocr_votes[team]:.1f})")
@@ -1470,25 +2321,180 @@ class InferenceJob:
             roster=roster, identified=identified,
         )
 
+    def _recent_events_data(self) -> list:
+        """Display rows for the last 10 scoring events."""
+        events_data = []
+        for event in self.scoring_events[-10:]:
+            robot = self.robot_tracks.get(event.robot_id)
+            ident = self.identity_registry.identities.get(event.robot_id)
+            slot_id = ident.active_slot if ident else None
+            slot_label = self._slot_label(slot_id) if slot_id is not None else f"Robot {event.robot_id}"
+            events_data.append({
+                "frame": event.frame_num,
+                "timestamp": event.timestamp,
+                "alliance": event.alliance,
+                "robot_id": event.robot_id,
+                "slot": slot_label,
+                "team_number": event.team_number,
+                "team_candidate": (robot.team_number if robot else None),
+                "robot_label": (
+                    event.team_number
+                    or (robot.team_number if robot and robot.team_number else None)
+                    or slot_label
+                ),
+                "confidence": event.confidence
+            })
+        return events_data
+
+    def _frame_stream_due(self, now: float) -> bool:
+        """Rate-cap live-view frame sends to FRAME_STREAM_INTERVAL_SEC."""
+        last = getattr(self, "_last_frame_stream_time", None)
+        if last is not None and (now - last) < self.config.frame_stream_interval_sec:
+            return False
+        self._last_frame_stream_time = now
+        return True
+
+    # Websocket send channels. Each kind gets a bounded queue drained by a
+    # background sender so a slow client never back-pressures inference:
+    #   frame  — latest-only; the newest frame supersedes any unsent one
+    #   status — latest-only; progress is latest-wins
+    #   diag   — bounded backlog, sheds oldest under pressure; the JSONL file
+    #            is the canonical record, the websocket copy is best-effort
+    # Terminal messages (complete / error / final status) bypass the queues
+    # via _send_ws after _stop_ws_senders has drained them.
+    _WS_QUEUE_DEPTH = {"frame": 1, "status": 1, "diag": 64}
+
+    @property
+    def _frame_send_queue(self):
+        return getattr(self, "_ws_queues", {}).get("frame")
+
+    @property
+    def _frame_sender_task(self):
+        return getattr(self, "_ws_sender_tasks", {}).get("frame")
+
+    def _ws_queue(self, kind: str) -> asyncio.Queue:
+        queues = getattr(self, "_ws_queues", None)
+        if queues is None:
+            queues = self._ws_queues = {}
+            self._ws_sender_tasks = {}
+            self._ws_drop_counts = {}
+        queue = queues.get(kind)
+        if queue is None:
+            queue = queues[kind] = asyncio.Queue(maxsize=self._WS_QUEUE_DEPTH[kind])
+        task = self._ws_sender_tasks.get(kind)
+        if task is None or task.done():
+            self._ws_sender_tasks[kind] = asyncio.get_running_loop().create_task(
+                self._ws_sender_loop(queue)
+            )
+        return queue
+
+    def _enqueue_ws(self, kind: str, payload) -> None:
+        """Queue a payload for its kind's sender without ever blocking the
+        inference loop; when the queue is full the oldest payload is shed."""
+        queue = self._ws_queue(kind)
+        while True:
+            try:
+                queue.put_nowait(payload)
+                return
+            except asyncio.QueueFull:
+                try:
+                    dropped = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+                self._ws_drop_counts[kind] = self._ws_drop_counts.get(kind, 0) + 1
+                # A dropped frame's unsent VLM crops ride along on the
+                # replacement so a slow client still sees every crops batch.
+                if (kind == "frame" and payload is not None and dropped is not None
+                        and dropped.get("ocr_crops") is not None
+                        and payload.get("ocr_crops") is None):
+                    payload["ocr_crops"] = dropped["ocr_crops"]
+
+    def _enqueue_frame_payload(self, payload) -> None:
+        self._enqueue_ws("frame", payload)
+
+    async def _ws_sender_loop(self, queue: asyncio.Queue) -> None:
+        while True:
+            payload = await queue.get()
+            if payload is None:  # stop sentinel
+                return
+            await self._send_ws(payload)
+
+    async def _stop_ws_senders(self, drain: bool = True) -> None:
+        """Stop every sender task. With drain=True pending payloads are sent
+        first (call before the `complete` message so ordering holds); with
+        drain=False the tasks are cancelled immediately."""
+        tasks = getattr(self, "_ws_sender_tasks", None)
+        if not tasks:
+            return
+        queues = self._ws_queues
+        self._ws_sender_tasks = {}
+        pending = {k: t for k, t in tasks.items() if t is not None and not t.done()}
+        for kind, task in pending.items():
+            if drain:
+                await queues[kind].put(None)  # blocks until backlog is consumed
+            else:
+                task.cancel()
+        for task in pending.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        diag_drops = getattr(self, "_ws_drop_counts", {}).get("diag", 0)
+        if diag_drops:
+            print(f"  [ws] shed {diag_drops} diagnostic record(s) under "
+                  f"backpressure (JSONL on disk is complete)")
+
+    async def _stop_frame_sender(self, drain: bool = True) -> None:
+        await self._stop_ws_senders(drain=drain)
+
+    async def _warn_degraded(self, component: str, message: str) -> None:
+        """Surface a quality-degrading failure (SAM2 fallback, gallery disabled,
+        evidence loss) to the client. One websocket message per component;
+        repeats only bump the count so a per-frame failure can't spam."""
+        warnings = getattr(self, "degradation_warnings", None)
+        if warnings is None:
+            warnings = self.degradation_warnings = []
+        existing = next((w for w in warnings if w["component"] == component), None)
+        if existing is not None:
+            existing["count"] += 1
+            return
+        warnings.append({"component": component, "message": message, "count": 1})
+        print(f"  [DEGRADED] {component}: {message}")
+        await self._send_ws({
+            "type": "degradation_warning",
+            "component": component,
+            "message": message,
+        })
+
+    async def _send_ws(self, payload: dict) -> bool:
+        """Serialize websocket writes and isolate transport failures from inference."""
+        websocket = self.websocket
+        if websocket is None:
+            return False
+        try:
+            async with self._websocket_send_lock:
+                if self.websocket is not websocket:
+                    return False
+                await websocket.send_json(payload)
+            return True
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            if self.websocket is websocket:
+                self.websocket = None
+            return False
+        except Exception as e:
+            if self.websocket is websocket:
+                self.websocket = None
+            print(f"  WebSocket send failed: {type(e).__name__}: {e}")
+            return False
+
     async def _diagnostic_ws_send(self, record: dict) -> None:
         """Push one diagnostic record over the existing websocket. Best-effort:
-        the JSONL file is the canonical record. Disconnect-class exceptions are
-        DEBUG-logged; anything unexpected is WARN-logged via print()."""
-        if not self.websocket:
-            return
+        the JSONL file is the canonical record, so records ride the bounded
+        diag queue and shed oldest if a slow client falls behind."""
         msg_type = ("diagnostic_snapshot"
                    if record.get("type") == "snapshot"
                    else "diagnostic_event")
-        try:
-            await self.websocket.send_json({"type": msg_type, "record": record})
-        except WebSocketDisconnect:
-            # Expected when the client tab closes mid-stream — quiet.
-            pass
-        except (RuntimeError, ConnectionError):
-            # "WebSocket is not connected" / broken pipe — also expected on teardown.
-            pass
-        except Exception as e:
-            print(f"  diagnostic_ws_send: unexpected error: {type(e).__name__}: {e}")
+        self._enqueue_ws("diag", {"type": msg_type, "record": record})
 
     def audit_overturn_confirmations(self) -> None:
         """Let a wrong locked identity self-correct. For each confirmed robot,
@@ -1573,6 +2579,12 @@ class InferenceJob:
                 del r.team_ocr_votes[team]
             if r.appearance_votes and team in r.appearance_votes:
                 del r.appearance_votes[team]
+            ident = self.identity_registry.identities.get(r.robot_id)
+            if ident is not None and ident.team_number == team:
+                ident.team_number = None
+                ident.is_confirmed = False
+                ident.confidence = min(ident.confidence, 0.4)
+                ident.needs_immediate_read = True
 
     def ocr_score(self, overhead_frame: np.ndarray, alliance: str) -> Optional[int]:
         """OCR a single alliance score from the overhead crop of the scoreboard.
@@ -1606,11 +2618,49 @@ class InferenceJob:
                 return score
         
         return None
+
+    def read_match_clock(self, overhead_frame: np.ndarray) -> Optional[int]:
+        """Read the configured match-clock ROI from an overhead-crop frame."""
+        if overhead_frame is None or overhead_frame.size == 0:
+            return None
+        region = self.ocr_regions.get("match_clock")
+        if region is None:
+            return None
+        x, y, w, h = region
+        fh, fw = overhead_frame.shape[:2]
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+            return None
+        roi = overhead_frame[y:y + h, x:x + w]
+        roi = cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, thresholded = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(
+            thresholded, config=MATCH_CLOCK_OCR_CONFIG
+        ).strip()
+        return parse_match_clock_text(text)
+
+    def _scan_match_clock(self) -> List[Tuple[int, Optional[int]]]:
+        """Sparse-decode the source video and OCR the clock every half second."""
+        sample_step = max(1, int(round(self.video_fps * MATCH_CLOCK_SAMPLE_SECONDS)))
+        samples = []
+        scan_cap = cv2.VideoCapture(str(self.video_path))
+        try:
+            for frame_idx in range(0, self.total_frames, sample_step):
+                scan_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ok, frame = scan_cap.read()
+                if not ok:
+                    continue
+                overhead = frame[:self.overhead_height, :]
+                samples.append((frame_idx, self.read_match_clock(overhead)))
+        finally:
+            scan_cap.release()
+        return samples
     
     def update_hub_positions(self, detections: sv.Detections) -> None:
         """Update hub positions and bounding boxes from hub_opening detections.
         If event_hub_positions are set, use them for alliance assignment (static).
         Otherwise fall back to midpoint-based initial assignment."""
+        # Hub detections intentionally come from the existing 3-class model.
         hub_mask = detections.class_id == 2
         if not np.any(hub_mask):
             return
@@ -1665,14 +2715,6 @@ class InferenceJob:
         midpoint = self.video_width / 2
         return "red" if x < midpoint else "blue"
 
-    def detect_bumper_color(self, frame: np.ndarray, box: np.ndarray) -> str:
-        """Detect current-match alliance from the bumper band only.
-
-        Robot paint, LEDs, and mechanisms can be the opposite color from the
-        bumpers, so this delegates to the bumper-focused lower-band classifier.
-        Returns 'blue', 'red', or 'unknown'."""
-        return classify_bumper_color(frame, box).alliance
-
     def _team_hud_label(self, robot, fallback: str) -> tuple[str, bool]:
         """Return a display label and whether the team is confirmed.
 
@@ -1683,7 +2725,12 @@ class InferenceJob:
         if robot is None:
             return f"{fallback} no #", False
         if robot.team_number and robot.team_number_confirmed:
-            return f"{robot.team_number} (100%) S{robot.scores}", True
+            # A confirmed team is the current best identity, never a permanent
+            # lock — a sustained contradicting read will still override it. Drop
+            # the old "(100%)" so the HUD never implies certainty; the absence of
+            # a trailing "?" already distinguishes confirmed from a leading guess.
+            # (cv2 Hershey fonts are ASCII-only, so no unicode marker here.)
+            return f"{robot.team_number} S{robot.scores}", True
 
         best_team = robot.team_number
         best_vote = 0.0
@@ -1812,7 +2859,7 @@ class InferenceJob:
         track_outs = track_outs or []
         for det, _crop_b64 in paired:
             t = self._nearest_track_for_detection(det, track_outs)
-            robot = self.robot_tracks.get(t.slot_id) if t is not None else None
+            robot = self._get_or_create_slot_track(t.slot_id) if t is not None else None
             fallback = f"{det.color} bumper" if det.color != "unknown" else "bumper?"
             label, _confirmed = self._team_hud_label(robot, fallback)
             alliance = robot.alliance if robot is not None else det.color
@@ -1916,6 +2963,7 @@ class InferenceJob:
         Unmatched detections start new trajectories.
         Trajectories that haven't been seen for BALL_MAX_MISSING frames are marked dead.
         """
+        # Fuel detections intentionally come from the existing 3-class model.
         ball_mask = detections.class_id == 0
         if not np.any(ball_mask):
             # No balls detected — increment missing counter on all active trajectories
@@ -2306,25 +3354,410 @@ class InferenceJob:
         """Human label for a slot: B1..B3 / R1..R3."""
         return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
 
-    def _get_or_create_slot_track(self, slot_id: int) -> "RobotTrack":
-        """Lazily create the RobotTrack for a field-tracker slot (6 max).
+    def _identity_for_slot(self, slot_id: int) -> Optional[RobotIdentity]:
+        """Find the active identity currently bound to a slot."""
+        if not hasattr(self, "identity_registry") or self.identity_registry is None:
+            self.identity_registry = IdentityRegistry()
+            self.robot_identities = self.identity_registry.identities
+            self._last_bindings = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot == slot_id:
+                return ident
+        return None
 
-        FieldTracker owns position/alliance/box each frame; RobotTrack retains the
-        team votes, scores, and diagnostic fields keyed by slot_id."""
-        track = self.robot_tracks.get(slot_id)
+    def _get_or_create_identity_track(self, identity_id: int, alliance: str) -> "RobotTrack":
+        """Lazily create or retrieve the RobotTrack for a durable identity."""
+        track = self.robot_tracks.get(identity_id)
         if track is None:
             track = RobotTrack(
-                robot_id=slot_id,
-                alliance=self._slot_alliance(slot_id),
+                robot_id=identity_id,
+                alliance=alliance,
                 team_number=None,
                 last_position=(0.0, 0.0),
                 positions_history=deque(maxlen=30),
                 consecutive_tracker=ConsecutiveValueTracker(n_consecutive=3),
             )
-            self.robot_tracks[slot_id] = track
-        elif track.consecutive_tracker is None:
-            track.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            self.robot_tracks[identity_id] = track
+        elif not hasattr(track, "consecutive_tracker") or track.consecutive_tracker is None:
+            try:
+                track.consecutive_tracker = ConsecutiveValueTracker(n_consecutive=3)
+            except AttributeError:
+                pass
         return track
+
+    def _get_slot_track_if_exists(self, slot_id: int) -> Optional[RobotTrack]:
+        """Retrieve the RobotTrack for a slot if it already exists, without creating it lazily."""
+        ident = self._identity_for_slot(slot_id)
+        if ident is not None:
+            return self.robot_tracks.get(ident.identity_id)
+        return self.robot_tracks.get(slot_id)
+
+    def _get_or_create_slot_track(self, slot_id: int) -> "RobotTrack":
+        """Redirect slot lookup to the active identity's track.
+        If no identity is currently bound to this slot, fall back to creating one."""
+        ident = self._identity_for_slot(slot_id)
+        if ident is not None:
+            return self._get_or_create_identity_track(ident.identity_id, ident.alliance)
+        
+        alliance = self._slot_alliance(slot_id)
+        ident = self.identity_registry.identities.get(slot_id)
+        if ident is None:
+            ident = RobotIdentity(
+                identity_id=slot_id,
+                alliance=alliance,
+                active_slot=slot_id,
+                confidence=0.5
+            )
+            self.identity_registry.identities[slot_id] = ident
+            if slot_id >= self.identity_registry._next_id:
+                self.identity_registry._next_id = slot_id + 1
+        return self._get_or_create_identity_track(ident.identity_id, alliance)
+
+    def _canonical_identity_slots(self) -> dict[int, int]:
+        """Map at most three current identities per alliance onto the six slots.
+
+        Active bindings win. Inactive identities occupy the remaining alliance
+        slots so occlusion never creates an extra UI row.
+        """
+        assignments = {}
+        identities = list(self.identity_registry.identities.values())
+        for alliance, slots in (("blue", range(3)), ("red", range(3, 6))):
+            slot_set = set(slots)
+            alliance_ids = [i for i in identities if i.alliance == alliance]
+            used_ids = set()
+            for ident in alliance_ids:
+                if ident.active_slot in slot_set and ident.active_slot not in assignments:
+                    assignments[ident.active_slot] = ident.identity_id
+                    used_ids.add(ident.identity_id)
+            remaining = [i for i in alliance_ids if i.identity_id not in used_ids]
+            remaining.sort(
+                key=lambda i: (
+                    not bool(getattr(i, "is_confirmed", False)),
+                    -int(getattr(i, "last_seen_frame", 0)),
+                    i.identity_id,
+                )
+            )
+            free_slots = [slot for slot in slots if slot not in assignments]
+            for slot, ident in zip(free_slots, remaining):
+                assignments[slot] = ident.identity_id
+        return assignments
+
+    def _canonical_robot_rows(self) -> list[dict]:
+        """Serialize exactly the fixed 3v3 roster slots for live/final results."""
+        assignments = self._canonical_identity_slots()
+        rows = []
+        for slot_id in range(6):
+            identity_id = assignments.get(slot_id)
+            robot = self.robot_tracks.get(identity_id) if identity_id is not None else None
+            best_vote_team = None
+            best_vote = 0.0
+            if robot is not None and robot.team_ocr_votes:
+                best_vote_team, best_vote = max(
+                    robot.team_ocr_votes.items(), key=lambda kv: kv[1]
+                )
+            rows.append({
+                "id": identity_id,
+                "slot": self._slot_label(slot_id),
+                "slot_id": slot_id,
+                "alliance": self._slot_alliance(slot_id),
+                "team_number": (
+                    self._get_display_team_number(robot) if robot is not None else None
+                ),
+                "confirmed": bool(robot and robot.team_number_confirmed),
+                "team_candidate": best_vote_team,
+                "team_candidate_votes": best_vote,
+                "scores": robot.scores if robot is not None else 0,
+                "position": robot.last_position if robot is not None else None,
+            })
+        return rows
+
+    async def _bind_detection_identity(self, slot_id: int, identity_id: int):
+        ident = self.identity_registry.identities.get(identity_id)
+        if ident is not None:
+            ident.active_slot = slot_id
+            ident.last_seen_frame = self._current_frame
+            if not getattr(self, "_mock_db", False):
+                try:
+                    await database.insert_match_robot_binding({
+                        "job_id": self.job_id,
+                        "identity_id": identity_id,
+                        "slot": slot_id,
+                        "start_frame": self._current_frame,
+                    })
+                except Exception as e:
+                    print(f"Error inserting binding: {e}")
+
+    async def _detach_expired_slots(self):
+        if self.field_tracker is None:
+            return
+        import aiosqlite
+        for event in self.field_tracker.binding_events:
+            if event["event"] == "slot_expired":
+                slot_id = event["slot_id"]
+                for ident in self.identity_registry.identities.values():
+                    if ident.active_slot == slot_id:
+                        ident.active_slot = None
+                        if not getattr(self, "_mock_db", False):
+                            try:
+                                async with aiosqlite.connect(database.DB_PATH) as db:
+                                    await db.execute(
+                                        "UPDATE match_robot_binding SET end_frame = ? WHERE job_id = ? AND identity_id = ? AND slot = ? AND end_frame IS NULL",
+                                        (self._current_frame, self.job_id, ident.identity_id, slot_id)
+                                    )
+                                    await db.commit()
+                            except Exception as e:
+                                print(f"Error updating end_frame: {e}")
+
+    def _visible_identities(self) -> list[RobotIdentity]:
+        """All active identities that are currently visible (not coasting)."""
+        if self.field_tracker is None:
+            return []
+        visible_slots = {t.slot_id for t in self.field_tracker._emit() if t.status == "visible"}
+        return [ident for ident in self.identity_registry.identities.values()
+                if ident.active_slot in visible_slots]
+
+    async def _sync_identity_registry_frame(self, fused: list, ev_list: list, track_outs: list, main_person_boxes=None, log_frame_num=None):
+        self.identity_diagnostics.set_context(
+            source_frame=self._current_frame,
+            processed_frame=self._current_frame,
+            match_sec=self._current_frame / (self.video_fps or 10.0),
+        )
+        # 1. Detach expired slots
+        await self._detach_expired_slots()
+
+        # 2. Gather observations
+        observations = []
+        slot_to_fused = {}
+        slot_to_ev = {}
+
+        # From assignment_evidence:
+        for slot_id, evidence in self.field_tracker.assignment_evidence.items():
+            det_idx = evidence["detection_idx"]
+            if det_idx < len(fused):
+                slot_to_fused[slot_id] = fused[det_idx]
+                if det_idx < len(ev_list):
+                    slot_to_ev[slot_id] = ev_list[det_idx]
+
+        # From binding events:
+        for event in self.field_tracker.binding_events:
+            if event["event"] in ("slot_rebound", "slot_seeded"):
+                slot_id = event["slot_id"]
+                track_id = event["track_id"]
+                fused_obs = next((o for o in fused if o.track_id == track_id), None)
+                if fused_obs is not None:
+                    slot_to_fused[slot_id] = fused_obs
+                    for idx, o in enumerate(fused):
+                        if o.track_id == track_id:
+                            if idx < len(ev_list):
+                                slot_to_ev[slot_id] = ev_list[idx]
+                            break
+
+        # Construct IdentityObservation
+        for t in track_outs:
+            slot_id = t.slot_id
+            fused_obs = slot_to_fused.get(slot_id)
+            ev = slot_to_ev.get(slot_id)
+            
+            pos = fused_obs.detection.pos if fused_obs is not None else t.pos
+            alliance = t.alliance
+            emb = fused_obs.detection.embedding if fused_obs is not None else None
+            
+            margin = ev.margin if ev is not None else 1.0
+            ev_type = ev.type if ev is not None else "initial"
+            
+            obs = IdentityObservation(
+                slot_id=slot_id,
+                pos=pos,
+                alliance=alliance,
+                embedding=emb,
+                relink_margin=margin,
+                continuity_evidence=ev_type
+            )
+            observations.append(obs)
+
+        # 3. Call registry update
+        def alliance_side(pos):
+            if self.field_model is not None:
+                return self.field_model.alliance_side(pos)
+            return "blue" if pos[0] < self.field_length / 2.0 else "red"
+
+        # Record each disappearance once. Registry update clears active slots, so
+        # compare against the prior frame's bindings rather than repeatedly
+        # recording an identity throughout a long occlusion.
+        active_slot_ids = {obs.slot_id for obs in observations}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot is not None and ident.active_slot not in active_slot_ids:
+                event = self.co_occlusion_tracker.record_occlusion(
+                    self._current_frame, ident.identity_id, ident.alliance
+                )
+                self.identity_diagnostics.increment("identity_occlusions")
+                if len(event.identity_ids) == 2:
+                    self.identity_diagnostics.record(
+                        DiagnosticEvents.OCCLUSION_GROUP_OPENED,
+                        event_id=event.event_id,
+                        alliance=event.alliance,
+                        identity_ids=sorted(event.identity_ids),
+                    )
+
+        self.identity_registry.update_frame(
+            frame_idx=self._current_frame,
+            observations=observations,
+            alliance_side_fn=alliance_side
+        )
+
+        # 3.5 Update live confidence signals
+        from web.field.identity_confidence import ConfidenceSignals, ConfidenceState, calculate_confidence_update
+        from web.embedder import cosine_similarity
+        
+        team_counts = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.team_number:
+                team_counts[ident.team_number] = team_counts.get(ident.team_number, 0) + 1
+
+        for ident in self.identity_registry.identities.values():
+            is_observed = (ident.active_slot is not None)
+            
+            # Find the observation relink_margin
+            relink_margin = 1.0
+            continuity_evidence = "initial"
+            obs_emb = None
+            if is_observed:
+                # Find matching observation
+                obs = next((o for o in observations if o.slot_id == ident.active_slot), None)
+                if obs is not None:
+                    relink_margin = obs.relink_margin
+                    continuity_evidence = obs.continuity_evidence
+                    obs_emb = obs.embedding
+
+            # Check same-alliance co-occlusion re-emergence
+            if is_observed:
+                event = self.co_occlusion_tracker.handle_reemergence(
+                    self._current_frame,
+                    ident.identity_id,
+                    ident.active_slot,
+                    relink_margin
+                )
+                if event is not None:
+                    self.identity_diagnostics.record(
+                        DiagnosticEvents.OCCLUSION_GROUP_REEMERGED,
+                        event_id=event.event_id,
+                        identity_id=ident.identity_id,
+                        slot_id=ident.active_slot,
+                        margin=relink_margin,
+                    )
+
+            ambiguous_ids = self.co_occlusion_tracker.ambiguous_identity_ids()
+            ident.is_ambiguous = ident.identity_id in ambiguous_ids
+            if ident.is_ambiguous:
+                ident.needs_immediate_read = True
+
+            # Check for appearance divergence
+            appearance_divergent = False
+            if is_observed and obs_emb is not None and ident.appearance_embedding is not None:
+                sim = cosine_similarity(obs_emb, ident.appearance_embedding)
+                if sim < 0.7:
+                    appearance_divergent = True
+
+            roster_uniqueness_ok = True
+            if ident.team_number:
+                roster_uniqueness_ok = (team_counts.get(ident.team_number, 0) <= 1)
+
+            signals = ConfidenceSignals(
+                is_observed=is_observed,
+                relink_margin=relink_margin,
+                has_vlm_read=ident.has_vlm_read,
+                vlm_agrees=ident.vlm_agrees,
+                vlm_contradicts=ident.vlm_contradicts,
+                is_confirmed=ident.is_confirmed,
+                roster_uniqueness_ok=roster_uniqueness_ok
+            )
+
+            state = ConfidenceState(
+                confidence=ident.confidence,
+                is_confirmed=ident.is_confirmed
+            )
+
+            update = calculate_confidence_update(state, signals, self.confidence_config)
+
+            # Log confidence changes crossing thresholds (from or to confirmed/high confidence)
+            old_conf = ident.confidence
+            new_conf = update.new_confidence
+            ident.confidence = new_conf
+
+            if (old_conf < 0.8 and new_conf >= 0.8) or (old_conf >= 0.4 and new_conf < 0.4):
+                print(f"  Identity {ident.identity_id} confidence threshold crossed: {old_conf:.2f} -> {new_conf:.2f} (reasons: {', '.join(update.reasons)})")
+
+            # Reset transient VLM flags
+            ident.has_vlm_read = False
+            ident.vlm_agrees = False
+            ident.vlm_contradicts = False
+
+            # Queue immediate reads on low confidence / bad signals
+            if is_observed:
+                prev_slot = self._last_bindings.get(ident.identity_id)
+                # re-attachment
+                if prev_slot is None:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
+                # low margins
+                if relink_margin < 0.1:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
+                # appearance divergence
+                if appearance_divergent:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: appearance divergent")
+                # roster conflict
+                if not roster_uniqueness_ok:
+                    ident.needs_immediate_read = True
+                    print(f"  Immediate read queued for identity {ident.identity_id}: roster conflict")
+
+        # 4. Bind new slots to identities
+        current_bindings = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot is not None:
+                current_bindings[ident.identity_id] = ident.active_slot
+
+        for ident_id, slot_id in current_bindings.items():
+            prev_slot = self._last_bindings.get(ident_id)
+            if prev_slot != slot_id:
+                await self._bind_detection_identity(slot_id, ident_id)
+
+        self._last_bindings = current_bindings
+
+        if log_frame_num is not None:
+            try:
+                for ident in self.identity_registry.identities.values():
+                    slot = ident.active_slot
+                    if slot is None:
+                        continue
+                    fobs = slot_to_fused.get(slot)
+                    det = fobs.detection if fobs is not None else None
+                    box = det.box if det is not None else None
+                    overlap = bool(box is not None and main_person_boxes and any(
+                        box_ios(tuple(box), tuple(pb)) >= PERSON_OVERLAP_IOS
+                        for pb in main_person_boxes))
+                    self._identity_log.append({
+                        "frame_num": log_frame_num,
+                        "identity_id": ident.identity_id,
+                        "slot_id": slot,
+                        "alliance": ident.alliance,
+                        "pos": list(ident.last_seen_pos) if ident.last_seen_pos is not None else None,
+                        "person_overlap": overlap,
+                        "confirmed": bool(ident.is_confirmed or ident.team_number is not None),
+                        # Per-frame appearance (DINOv2) of the slot's object, for the
+                        # appearance-based slot-swap stitcher. In-memory only; the rerun
+                        # script strips it before JSON and dumps embeddings to .npz.
+                        "embedding": det.embedding if (det is not None and det.embedding is not None) else None,
+                    })
+            except Exception:
+                pass
+
+    def _get_display_team_number(self, robot) -> Optional[str]:
+        ident = self.identity_registry.identities.get(robot.robot_id)
+        if ident and ident.is_ambiguous:
+            return "AMBIGUOUS"
+        return robot.team_number
 
     def _is_robot_on_alliance_side(self, robot_x: float, alliance: str) -> bool:
         """Check if a robot is on its alliance's side of the field.
@@ -2380,7 +3813,6 @@ class InferenceJob:
         
         if trajectory_shooter is not None and trajectory_shooter in self.robot_tracks:
             robot = self.robot_tracks[trajectory_shooter]
-            robot.scores += 1
             
             # Calculate distance to hub for confidence
             hub = next((h for h in self.hubs if h.alliance == alliance), None)
@@ -2389,6 +3821,21 @@ class InferenceJob:
                 origin = robot.last_position
                 dist = np.sqrt((origin[0] - hub.x)**2 + (origin[1] - hub.y)**2)
             
+            # Defer score attribution if identity is ambiguous
+            ident = self.identity_registry.identities.get(robot.robot_id)
+            if ident and ident.is_ambiguous:
+                slot_id = ident.active_slot if ident else None
+                self.deferred_attributions.append({
+                    "alliance": alliance,
+                    "frame_num": frame_num,
+                    "timestamp": timestamp,
+                    "slot_id": slot_id,
+                    "distance_to_hub": dist
+                })
+                print(f"  DEFERRED trajectory attribution [{alliance}]: slot {slot_id} is ambiguous")
+                return
+
+            robot.scores += 1
             confidence = "high"  # Trajectory-based attribution is high confidence
             event = ScoringEvent(
                 frame_num=frame_num, timestamp=timestamp, alliance=alliance,
@@ -2408,11 +3855,24 @@ class InferenceJob:
         
         hub = next((h for h in self.hubs if h.alliance == alliance), None)
         if not hub:
-            alliance_robots[0].scores += 1
+            best_robot = alliance_robots[0]
+            ident = self.identity_registry.identities.get(best_robot.robot_id)
+            if ident and ident.is_ambiguous:
+                slot_id = ident.active_slot if ident else None
+                self.deferred_attributions.append({
+                    "alliance": alliance,
+                    "frame_num": frame_num,
+                    "timestamp": timestamp,
+                    "slot_id": slot_id,
+                    "distance_to_hub": 999
+                })
+                print(f"  DEFERRED proximity fallback (no hub) [{alliance}]: slot {slot_id} is ambiguous")
+                return
+            best_robot.scores += 1
             self.scoring_events.append(ScoringEvent(
                 frame_num=frame_num, timestamp=timestamp, alliance=alliance,
-                robot_id=alliance_robots[0].robot_id,
-                team_number=alliance_robots[0].team_number,
+                robot_id=best_robot.robot_id,
+                team_number=best_robot.team_number,
                 confidence="low", distance_to_hub=999
             ))
             self._mirror_event_to_replay()
@@ -2430,8 +3890,22 @@ class InferenceJob:
                                              (r.last_position[1] - hub.y)**2))
         dist_to_hub = np.sqrt((best_robot.last_position[0] - hub.x)**2 + 
                               (best_robot.last_position[1] - hub.y)**2)
-        best_robot.scores += 1
         
+        # Defer score attribution if identity is ambiguous
+        ident = self.identity_registry.identities.get(best_robot.robot_id)
+        if ident and ident.is_ambiguous:
+            slot_id = ident.active_slot if ident else None
+            self.deferred_attributions.append({
+                "alliance": alliance,
+                "frame_num": frame_num,
+                "timestamp": timestamp,
+                "slot_id": slot_id,
+                "distance_to_hub": dist_to_hub
+            })
+            print(f"  DEFERRED proximity fallback [{alliance}]: slot {slot_id} is ambiguous")
+            return
+
+        best_robot.scores += 1
         confidence = "low"  # Proximity-only is low confidence
         event = ScoringEvent(
             frame_num=frame_num, timestamp=timestamp, alliance=alliance,
@@ -2526,12 +4000,20 @@ class InferenceJob:
                           "camera before running inference.")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
-        cal = field_store.load(self.event_key, self.camera)
-        if cal is None:
+        versions = field_store.load_versions(self.event_key, self.camera)
+        if not versions:
             self.error = (f"No calibration found for event '{self.event_key}' "
                           f"camera '{self.camera}'. Calibrate the camera first.")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
+        chosen = select_epoch(versions, self.match_key)
+        cal = chosen["calibration"]
+        self._calib_version_id = chosen["version_id"]
+        if self.match_key is None:
+            print(f"  [calib] no match_key — using latest version {chosen['version_id']}")
+        else:
+            print(f"  [calib] match {self.match_key}: epoch {chosen['version_id']} "
+                  f"(start_match={chosen['start_match']})")
         if cal.camera_center is None:
             # Homography (or any pose-free) calibration has no camera center, so
             # occlusion ray-casting can't run. Require a pose-bearing solve.
@@ -2545,12 +4027,20 @@ class InferenceJob:
             self.field_model = FieldModel.load(cal.field_season)
             self.field_dims = (self.field_model.length_m, self.field_model.width_m)
             self.hub_prisms = hub_prisms(self.field_model)
+            self.hub_no_robot_zones = prism_bounding_zones(self.hub_prisms)
             static_zones = load_zones(self.event_key)
+            static_zones = static_zones + self.hub_no_robot_zones
             if static_zones:
                 print(f"  Static-structure zones (field m): {static_zones}")
             self.field_tracker = FieldTracker(self.field_model.length_m, zones=static_zones)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
-            self.views = load_views(self.event_key)  # main first; corners if calibrated
+            selection = {}
+            for _name in load_layout().keys():
+                _vs = field_store.load_versions(self.event_key, _name)
+                _pick = select_epoch(_vs, self.match_key)
+                if _pick is not None:
+                    selection[_name] = _pick["version_id"]
+            self.views = load_views(self.event_key, selection=selection)  # main first; corners if calibrated
             print(f"  Cameras active: {[v.name for v in self.views]}")
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
@@ -2579,9 +4069,124 @@ class InferenceJob:
         except Exception:
             pass
 
+    def _apply_track_verdicts(self) -> None:
+        """Slice 2: after the whole match is processed, classify each track from the
+        accumulated evidence and retroactively drop human/static-track rows from the
+        recorded replay frames (refs / parked structures stop appearing as robots).
+        Pruning only; does not re-bind slots (that is slice 3)."""
+        from web.field.track_evidence import track_verdicts, prune_replay_frames
+        rec = getattr(self, "_replay", None)
+        if rec is None or not getattr(self, "_match_evidence", None):
+            return
+        verdicts = track_verdicts(self._match_evidence)
+        rec.frames = prune_replay_frames(rec.frames, self._binding_log, verdicts)
+        try:
+            self.identity_diagnostics.gauge(
+                "track_verdicts",
+                {str(k): list(verdicts.values()).count(k)
+                 for k in ("robot", "human", "static")})
+        except Exception:
+            pass
+
+    def _reresolve_replay_frames(self) -> None:
+        """Slice 3b: rebuild replay frames keyed by stable slot_id (identity_id churns
+        — hundreds per match). Per-slot verdict excludes ref/static slots; retroactive
+        team per slot. Slot-churn correction is the stitcher's job. Guarded fallback."""
+        from web.field.track_evidence import slot_evidence, classify_track, reresolve_frames_by_slot
+        rec = getattr(self, "_replay", None)
+        if rec is None or not getattr(self, "_identity_log", None):
+            return self._apply_track_verdicts()
+        sev = slot_evidence(self._identity_log)
+        slot_verdicts = {sid: classify_track(te) for sid, te in sev.items()}
+        assignments = self._canonical_identity_slots()        # {slot_id: identity_id}
+        slot_meta = {}
+        for slot_id, iid in assignments.items():
+            robot = self.robot_tracks.get(iid)
+            slot_meta[slot_id] = {
+                "team_number": self._get_display_team_number(robot) if robot is not None else None,
+                "confirmed": bool(robot and robot.team_number_confirmed),
+                "alliance": self._slot_alliance(slot_id),
+            }
+        frame_nums = [f["frame_num"] for f in rec.frames]
+        orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
+        rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts, frame_nums)
+        rebuilt_rows = sum(len(f["robots"]) for f in rebuilt)
+        if rebuilt_rows >= max(1, orig_rows) * RERESOLVE_MIN_KEEP_FRAC:
+            orig = {f["frame_num"]: f for f in rec.frames}
+            rec.frames = [{**orig.get(f["frame_num"], {}), **f} for f in rebuilt]
+        else:
+            print(f"[backward-confirm] re-resolution kept {rebuilt_rows}/{orig_rows} rows "
+                  f"(< {RERESOLVE_MIN_KEEP_FRAC:.0%}); falling back to slice-2 prune")
+            self._apply_track_verdicts()
+        try:
+            self.identity_diagnostics.gauge("reresolve_slot_verdicts",
+                {k: list(slot_verdicts.values()).count(k) for k in ("robot", "human", "static")})
+        except Exception:
+            pass
+
+    def _verify_calibration_alignment(self) -> bool:
+        """Validate self.calib against auto-detected AprilTags in sampled in-match
+        frames (main view). Returns True to proceed. On drift, sets self.error +
+        self.status='error' + self.needs_calibration and returns False. No tags -> warn
+        + proceed. detect_tags must stay on one sequential path."""
+        if not CALIB_CHECK_ENABLED or self.calib is None:
+            return True
+        main_view = next((v for v in self.views if v.name == "main"), None)
+        if main_view is None or not self.processing_ranges:
+            return True
+        lo, hi = self.processing_ranges[0]
+        n = max(1, CALIB_CHECK_SAMPLE_FRAMES)
+        frame_idxs = [int(lo + (hi - lo) * i / (n - 1)) for i in range(n)] if n > 1 else [lo]
+        best_err, best_n = float("inf"), 0
+        cap = cv2.VideoCapture(str(self.video_path))
+        try:
+            for fidx in frame_idxs:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                crop = main_view.extract(frame)
+                detected = detect_tags(crop)
+                err_m, ntags = tag_alignment_error(self.calib, detected, self.field_model)
+                if ntags >= CALIB_CHECK_MIN_TAGS and err_m < best_err:
+                    best_err, best_n = err_m, ntags
+        finally:
+            cap.release()
+        if best_n < CALIB_CHECK_MIN_TAGS:
+            print(f"  [calib] WARNING: could not validate calibration — <{CALIB_CHECK_MIN_TAGS} "
+                  f"AprilTags detected across {n} sampled frames; proceeding unvalidated.")
+            return True
+        # best_err is finite here: the guard above returns when best_n < MIN_TAGS,
+        # which is the only case best_err stays inf (no frame ever updated it).
+        if best_err > CALIB_DRIFT_MAX_M:
+            self.status = "error"
+            _calib_url = (f"/calibrate?match={self.match_key}&camera={self.camera}"
+                          if self.match_key else "/calibrate")
+            self.error = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
+                          f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). "
+                          f"The camera likely moved/zoomed — recalibrate at {_calib_url} "
+                          f"(saved as a new version applying from this match onward).")
+            self.needs_calibration = {"event": self.event_key, "camera": self.camera,
+                                      "match_key": self.match_key, "error_m": round(best_err, 3),
+                                      "epoch": self._calib_version_id}
+            if self.match_key:
+                # Persist the failure so the calibrate page can flag this match
+                # in its selector until a new epoch covers it (or a check passes).
+                field_store.record_drift(self.event_key, self.camera, self.match_key,
+                                         best_err, self._calib_version_id)
+            print(f"  FIELD TRACKING ABORTED: {self.error}")
+            return False
+        if self.match_key:
+            field_store.clear_drift(self.event_key, self.camera, self.match_key)
+        print(f"  [calib] OK: {best_n} tags align to {best_err:.3f} m (epoch {self._calib_version_id})")
+        return True
+
     async def process_video(self) -> None:
         """Main video processing pipeline"""
         cap = None
+        # A/B provenance: knobs differing from code defaults (env or per-job).
+        _nd = self.config.non_defaults()
+        print(f"  [config] {_nd if _nd else 'all defaults'}")
         # Gate on calibration / loaded event (decision 7). No fallback to the old
         # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
         if not self._init_field_tracking():
@@ -2589,25 +4194,47 @@ class InferenceJob:
             self._open_log_file()
             print(f"ABORTING JOB: {self.error}")
             self._close_log_file()
-            if self.websocket:
-                try:
-                    await self.websocket.send_json({"type": "error", "error": self.error})
-                except Exception:
-                    pass
+            await self._send_ws({"type": "error", "error": self.error})
             return
         try:
             self.status = "processing"
             self._open_log_file()
             # Load the per-event appearance gallery AFTER the log file is open so the
             # load line lands in the match log (not just the server console).
-            if GALLERY_ENABLED and self.event_key:
+            if self.config.gallery_enabled and self.event_key:
                 try:
-                    rows = await database.get_gallery_exemplars(self.event_key)
+                    roster_teams = list(dict.fromkeys(
+                        str(team)
+                        for team in (
+                            self.match_teams
+                            + self.match_blue_teams
+                            + self.match_red_teams
+                        )
+                        if team is not None and str(team)
+                    ))
+                    rows = (
+                        await database.get_previous_gallery_exemplars(
+                            self.event_key,
+                            self.match_key,
+                            teams=roster_teams or None,
+                        )
+                        if self.match_key else []
+                    )
                     self.gallery = AppearanceGallery.from_rows(
                         rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
-                    print(f"  Appearance gallery loaded: {len(rows)} exemplars for {self.event_key}")
+                    scope = (
+                        f"match teams {roster_teams}"
+                        if roster_teams else "all event teams (no match roster)"
+                    )
+                    print(
+                        f"  Appearance gallery loaded: {len(rows)} exemplars "
+                        f"for {self.event_key} before {self.match_key or 'unknown match'}, {scope}"
+                    )
                 except Exception as e:
-                    print(f"  Appearance gallery load failed ({e}); appearance recovery disabled")
+                    await self._warn_degraded(
+                        "gallery",
+                        f"Appearance gallery load failed ({e}); appearance recovery disabled",
+                    )
                     self.gallery = None
             # Per-phase processing timers (seconds). `total` is filled at the end.
             self.timings = {}
@@ -2629,6 +4256,46 @@ class InferenceJob:
             print(f"Video: {self.video_width}x{self.video_height}, overhead: {self.video_width}x{self.overhead_height}")
             print(f"  OCR regions (overhead coords): {self.ocr_regions}")
             print(f"  Using {'custom' if custom_ocr_regions else 'default'} OCR regions")
+
+            scan_t0 = time.perf_counter()
+            # The clock scan is a ~minute-long synchronous decode+OCR loop. Run it
+            # OFF the event loop (asyncio.to_thread) — running it inline blocks the
+            # loop long enough that uvicorn can't service the WebSocket keepalive,
+            # so the browser drops the connection ("connection error" in the UI)
+            # even though the job keeps running. Tell the client what's happening
+            # first, since no progress streams during the scan.
+            await self._send_ws({
+                "type": "status", "status": "processing",
+                "message": "Scanning match clock…", "progress": 0.0,
+            })
+            clock_samples = await asyncio.to_thread(self._scan_match_clock)
+            (
+                self.processing_ranges,
+                self.match_periods,
+                self.timer_gate_fallback,
+                self.timer_gate_fallback_reason,
+            ) = compute_active_windows(
+                clock_samples, self.video_fps, self.total_frames
+            )
+            self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
+            if self.timer_gate_fallback:
+                fallback_start = min(TITLE_SCREEN_FRAMES, max(0, self.total_frames - 1))
+                self.processing_ranges = [
+                    (fallback_start, max(0, self.total_frames - 1))
+                ]
+                print(
+                    "  [timer] WARNING: using the legacy post-title-screen range: "
+                    f"{self.timer_gate_fallback_reason}"
+                )
+            else:
+                period_text = ", ".join(
+                    f"{p['label']}={p['start_frame']}-{p['end_frame']}"
+                    for p in self.match_periods
+                )
+                print(
+                    f"  [timer] periods: {period_text}; "
+                    f"processing ranges={self.processing_ranges}"
+                )
             
             # Extract team numbers from early frame (using overhead crop)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 30)
@@ -2636,24 +4303,51 @@ class InferenceJob:
             if ret:
                 early_overhead = early_frame[:self.overhead_height, :]
                 self.extract_team_numbers(early_overhead)
-            # Skip the first 180 frames (title screen / intro graphics)
-            TITLE_SCREEN_FRAMES = 180
-            EARLY_OCR_FRAME = 200
 
+            # Run off the event loop (like the clock scan above): the seek+decode+
+            # detect_tags work is synchronous and would otherwise block uvicorn's
+            # WebSocket keepalive while it runs.
+            if not await asyncio.to_thread(self._verify_calibration_alignment):
+                # _verify_calibration_alignment set self.status="error", self.error,
+                # self.needs_calibration. Notify the client and stop before the SAM2 pass
+                # (mirrors the _init_field_tracking abort at the top of process_video).
+                if self.websocket:
+                    try:
+                        await self.websocket.send_json({"type": "error", "error": self.error,
+                                                        "needs_calibration": self.needs_calibration})
+                    except Exception:
+                        pass
+                return
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
+            self.sam2_obj_color = {}
             self._replay = ReplayRecorder()
             self.robot_embedder = None
             
-            if self.total_frames <= EARLY_OCR_FRAME:
-                print(f"  [SAM2] Video is too short ({self.total_frames} frames) for early prompt frame {EARLY_OCR_FRAME}. Disabling SAM2.")
+            active_frame_count = sum(
+                end - start + 1 for start, end in self.processing_ranges
+            )
+            auto_period = next(
+                (p for p in self.match_periods if p["label"] == "auto"), None
+            )
+            prompt_source_frame = (
+                auto_period["start_frame"]
+                if auto_period is not None and not self.timer_gate_fallback
+                else EARLY_OCR_FRAME
+            )
+
+            if active_frame_count <= 1 or prompt_source_frame >= self.total_frames:
+                print(
+                    f"  [SAM2] Active video is too short ({active_frame_count} frames) "
+                    f"for prompt frame {prompt_source_frame}. Disabling SAM2."
+                )
             else:
                 try:
-                    from web.field.sam2_tracker import Sam2FieldTracker
                     import torch
                     
                     device = "cuda" if torch.cuda.is_available() else "cpu"
+                    backend_label = "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
                     offload_vid = True
                     offload_st = True
                     # Target FPS is a fixed speed knob (SAM2_TRACK_FPS), independent of
@@ -2663,7 +4357,7 @@ class InferenceJob:
                     target_tracking_fps = (
                         self.target_tracking_fps
                         if self.target_tracking_fps is not None
-                        else SAM2_TRACK_FPS
+                        else self.config.sam2_track_fps
                     )
                     if device == "cuda":
                         try:
@@ -2688,8 +4382,8 @@ class InferenceJob:
 
                     # VRAM-fit override: keep all tensors on the GPU and raise
                     # frame_skip so the tracked segment fits within the budget.
-                    if self.sam2_max_gpu_frames > 0 and self.total_frames:
-                        source_frames = max(1, self.total_frames - TITLE_SCREEN_FRAMES)
+                    if self.sam2_max_gpu_frames > 0 and active_frame_count:
+                        source_frames = max(1, active_frame_count)
                         self.frame_skip = max(
                             self.frame_skip,
                             math.ceil(source_frames / self.sam2_max_gpu_frames),
@@ -2703,47 +4397,94 @@ class InferenceJob:
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
                     _t_load = time.perf_counter()
-                    sam2_tracker = Sam2FieldTracker(
-                        config=SAM2_CONFIG,
-                        checkpoint=SAM2_CHECKPOINT,
-                        device=device,
-                        offload_video_to_cpu=offload_vid,
-                        offload_state_to_cpu=offload_st,
-                        vos_optimized=(SAM2_VOS_OPTIMIZED and device == "cuda"),
-                    )
+                    if self.tracking_backend == "sam3":
+                        from web.field.sam3_tracker import Sam3FieldTracker
+
+                        sam2_tracker = Sam3FieldTracker(
+                            checkpoint=SAM3_CHECKPOINT,
+                            device=device,
+                            offload_video_to_cpu=offload_vid,
+                            offload_state_to_cpu=offload_st,
+                            compile_model=(SAM3_COMPILE and device == "cuda"),
+                            max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
+                            use_fa3=SAM3_USE_FA3,
+                        )
+                        model_detail = (
+                            f"Object Multiplex, compile={SAM3_COMPILE}, "
+                            f"flash-attn-3={SAM3_USE_FA3}"
+                        )
+                    else:
+                        from web.field.sam2_tracker import Sam2FieldTracker
+
+                        # Per-job encoder size (UI override); falls back to the env default.
+                        job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
+                        sam2_tracker = Sam2FieldTracker(
+                            config=job_config,
+                            checkpoint=job_checkpoint,
+                            device=device,
+                            offload_video_to_cpu=offload_vid,
+                            offload_state_to_cpu=offload_st,
+                            vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
+                        )
+                        model_detail = (
+                            f"{self.model_size} model, "
+                            f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
+                        )
                     self.robot_embedder = RobotEmbedder()
                     self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
                     self.use_sam2 = True
-                    print(f"  [SAM2] Loaded Sam2FieldTracker ({SAM2_MODEL_SIZE} model, "
-                          f"vos_optimized={SAM2_VOS_OPTIMIZED and device == 'cuda'}) "
+                    print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
                           f"and RobotEmbedder on {device}")
                 except Exception as e:
-                    print(f"  [SAM2] Failed to initialize SAM2/embedder: {e}. Falling back to Kalman tracking.")
+                    backend_label = (
+                        "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
+                    )
+                    await self._warn_degraded(
+                        "sam2",
+                        f"[{backend_label}] Failed to initialize tracker/embedder: "
+                        f"{e}. Falling back to Kalman tracking.",
+                    )
                     self.use_sam2 = False
                     self.robot_embedder = None
 
             if self.use_sam2:
                 print(f"  [SAM2] Running pre-computation pass over {len(self.views)} views...")
-                all_frames = list(range(TITLE_SCREEN_FRAMES, self.total_frames, self.frame_skip))
-                # Find the index of the frame in all_frames closest to EARLY_OCR_FRAME
-                prompt_local_idx = min(range(len(all_frames)), key=lambda i: abs(all_frames[i] - EARLY_OCR_FRAME))
+                all_frames = [
+                    frame
+                    for start, end in self.processing_ranges
+                    for frame in range(start, end + 1, self.frame_skip)
+                ]
+                self.sam2_source_to_local = {
+                    source_frame: local_idx
+                    for local_idx, source_frame in enumerate(all_frames)
+                }
+                prompt_target_frame = prompt_source_frame + int(
+                    round(self.config.sam2_prompt_offset_seconds * max(self.video_fps, 0.0))
+                )
+                prompt_local_idx = min(
+                    range(len(all_frames)),
+                    key=lambda i: abs(all_frames[i] - prompt_target_frame),
+                )
                 prompt_frame = all_frames[prompt_local_idx]
-                SAM2_SCALE = 0.5
+                print(
+                    f"  [SAM2] Seeding at source frame {prompt_frame} "
+                    f"(~{self.config.sam2_prompt_offset_seconds:.1f}s after active start), "
+                    "then propagating backward."
+                )
+                SAM2_SCALE = self.sam2_export_scale
+                print(f"  [SAM2] Frame-export scale: {SAM2_SCALE}")
                 
                 N = len(self.views)
                 loop = asyncio.get_running_loop()
 
                 async def safe_send_status(msg: str, pct: float):
-                    if self.websocket:
-                        try:
-                            await self.websocket.send_json({
-                                "type": "status",
-                                "status": "processing",
-                                "message": msg,
-                                "progress": round(pct, 1)
-                            })
-                        except Exception:
-                            pass
+                    # Latest-wins queue: progress updates never wait on the client.
+                    self._enqueue_ws("status", {
+                        "type": "status",
+                        "status": "processing",
+                        "message": msg,
+                        "progress": round(pct, 1)
+                    })
 
                 # ----- Phase 1: ONE sequential decode pass exports every view's frames.
                 # Previously each view re-opened the video and random-seeked to every kept
@@ -2755,19 +4496,23 @@ class InferenceJob:
                 # but decoding is linear instead of seek-thrashing and happens only once.
                 view_dirs = {v.name: tempfile.TemporaryDirectory() for v in self.views}
                 view_prompt_boxes: dict[str, list] = {v.name: [] for v in self.views}
+                view_prompt_colors: dict[str, list] = {v.name: [] for v in self.views}
                 EXPORT_PCT = 25.0  # share of the progress bar spent exporting frames
                 export_t0 = time.perf_counter()
                 exported = 0
                 cap_pre = cv2.VideoCapture(str(self.video_path))
                 try:
-                    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
-                    fpos = TITLE_SCREEN_FRAMES
+                    first_export_frame = all_frames[0]
+                    export_frame_set = set(all_frames)
+                    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, first_export_frame)
+                    fpos = first_export_frame
                     local_idx = 0
-                    while fpos < self.total_frames:
+                    last_export_frame = all_frames[-1]
+                    while fpos <= last_export_frame:
                         ok, fr = cap_pre.read()
                         if not ok:
                             break
-                        if (fpos - TITLE_SCREEN_FRAMES) % self.frame_skip == 0:
+                        if fpos in export_frame_set:
                             is_prompt = (fpos == prompt_frame)
                             for view in self.views:
                                 try:
@@ -2776,25 +4521,76 @@ class InferenceJob:
                                     # tracking (robots can't be there) — a false-positive
                                     # filter.  NOTE: this does NOT save SAM2 VRAM/compute:
                                     # SAM2 hard-resizes every frame to a fixed image_size
-                                    # square, so fewer input rows == same tensor.  It does
-                                    # make robots larger in that square (better mask res).
+                                    # square, so fewer input rows
                                     top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                    if top_crop_frac > 0:
-                                        top_crop_px = int(crop.shape[0] * top_crop_frac)
+                                    top_crop_px = int(crop.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
+                                    if top_crop_px > 0:
                                         crop = crop[top_crop_px:, :]
                                     new_w = int(crop.shape[1] * SAM2_SCALE)
                                     new_h = int(crop.shape[0] * SAM2_SCALE)
                                     small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
                                     fname = os.path.join(view_dirs[view.name].name, f"{local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-                                    # Detect YOLO prompt boxes on the prompt frame.
+ 
+                                    # Seed SAM2 from expanded bumper detections so masks
+                                    # cover whole robots while color stays class-derived.
                                     if is_prompt:
-                                        res = self.model(crop, conf=0.4, verbose=False)[0]
-                                        for i in range(len(res.boxes)):
-                                            if int(res.boxes.cls[i]) == 1:
-                                                box = res.boxes.xyxy[i].cpu().numpy() * SAM2_SCALE
-                                                view_prompt_boxes[view.name].append(tuple(box))
+                                        merged = self._sam2_robot_candidates(crop)
+                                        full_boxes = [
+                                            (
+                                                box[0],
+                                                box[1] + top_crop_px,
+                                                box[2],
+                                                box[3] + top_crop_px,
+                                            )
+                                            for box, _color in merged
+                                        ]
+                                        keep_merged = filter_field_robot_boxes(
+                                            full_boxes,
+                                            view.calibration,
+                                            self.field_dims,
+                                            frame_shape=(
+                                                crop.shape[0] + top_crop_px,
+                                                crop.shape[1],
+                                                crop.shape[2],
+                                            ),
+                                            blocked_zones=self.hub_no_robot_zones,
+                                        )
+                                        merged = [merged[idx] for idx in keep_merged]
+                                        
+                                        bumper_halves = []
+                                        unknown_halves = []
+                                        unknown_boxes = []
+                                        for box, color in merged:
+                                            x1, y1, x2, y2 = box
+                                            full_box = (x1, y1 + top_crop_px, x2, y2 + top_crop_px)
+                                            uv = ((full_box[0] + full_box[2]) / 2.0, full_box[3])
+                                            xy = view.calibration.image_to_field(uv)
+                                            half = None
+                                            if xy is not None and self.field_model is not None:
+                                                half = self.field_model.alliance_side(xy)
+                                            
+                                            if color != "unknown":
+                                                if half is not None:
+                                                    bumper_halves.append(half)
+                                            else:
+                                                unknown_halves.append(half)
+                                                unknown_boxes.append(box)
+                                        
+                                        keep_indices = select_gap_fills(bumper_halves, unknown_halves, max_per_half=3)
+                                        
+                                        for box, color in merged:
+                                            if color != "unknown":
+                                                view_prompt_boxes[view.name].append(
+                                                    tuple(v * SAM2_SCALE for v in box)
+                                                )
+                                                view_prompt_colors[view.name].append(color)
+                                        
+                                        for idx in keep_indices:
+                                            view_prompt_boxes[view.name].append(
+                                                tuple(v * SAM2_SCALE for v in unknown_boxes[idx])
+                                            )
+                                            view_prompt_colors[view.name].append("unknown")
                                 except Exception as e:
                                     print(f"  [SAM2] Error exporting frame {local_idx} for view {view.name}: {e}")
                             local_idx += 1
@@ -2816,18 +4612,24 @@ class InferenceJob:
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
                     prompt_boxes_scaled = view_prompt_boxes[view.name]
+                    self.sam2_obj_color[view.name] = {
+                        i + 1: color
+                        for i, color in enumerate(view_prompt_colors[view.name])
+                    }
                     base_pct = EXPORT_PCT + (view_idx / N) * (100.0 - EXPORT_PCT)
                     span_pct = (100.0 - EXPORT_PCT) / N
                     print(f"  [SAM2] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
                     if not prompt_boxes_scaled:
-                        print(f"  [SAM2] View {view.name}: nothing to track, skipping SAM2 for this view.")
-                        await safe_send_status(
-                            f"[SAM2] View '{view.name}': skipped (no robots detected).",
-                            base_pct + span_pct,
+                        print(
+                            f"  [SAM2] View {view.name}: no prompt-frame robots; "
+                            "scanning later frames for detector bootstrap."
                         )
-                        tmp_dir_obj.cleanup()
-                        continue
+                        await safe_send_status(
+                            f"[SAM2] View '{view.name}': waiting for first robot...",
+                            base_pct,
+                        )
 
+                    _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
                     try:
                         def make_progress_cb(b_pct, sp_pct, v_name):
                             def progress_cb(current, total):
@@ -2838,28 +4640,122 @@ class InferenceJob:
                                 )
                             return progress_cb
 
-                        # Periodic re-prompting: re-run YOLO at chunk boundaries so
-                        # robots that start occluded (e.g. behind the hub) get picked
-                        # up once they emerge.  detect_fn runs on the exact JPEG SAM2
-                        # tracks, so returned boxes are already in SAM2 (0.5x) coords.
-                        def make_detect_fn():
+                        # Periodic re-prompting: re-run the detector cascade at chunk
+                        # boundaries so robots that start occluded (e.g. behind the
+                        # hub) get picked up once they emerge.  Detection runs on the
+                        # FULL-RESOLUTION source frame (decoded on demand — one seek
+                        # per ~2s of footage), not the 0.5x JPEG export SAM2 tracks:
+                        # the re-acquisition path exists for the hard cases, so it
+                        # must not have the worst recall of the three detect paths.
+                        # Returned boxes are scaled into SAM2 (0.5x, top-cropped)
+                        # coords to match the masks.
+                        def make_detect_fn(detect_caps):
+                            state = {"cap": None, "pos": None}
+                            detect_caps.append(state)
+
                             def detect_fn(local_idx, frame_path):
-                                if not frame_path:
-                                    return []
-                                img = cv2.imread(frame_path)
-                                if img is None:
-                                    return []
-                                res = self.model(img, conf=0.4, verbose=False)[0]
-                                boxes = []
-                                for i in range(len(res.boxes)):
-                                    if int(res.boxes.cls[i]) == 1:
-                                        boxes.append(tuple(res.boxes.xyxy[i].cpu().numpy()))
-                                return boxes
+                                if local_idx is None or local_idx >= len(all_frames):
+                                    return None
+                                source_frame = all_frames[local_idx]
+                                if state["cap"] is None:
+                                    state["cap"] = cv2.VideoCapture(str(self.video_path))
+                                cap_l = state["cap"]
+                                if state["pos"] != source_frame:
+                                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                                ok, fr = cap_l.read()
+                                state["pos"] = source_frame + 1
+                                if not ok or fr is None:
+                                    return None
+                                crop = view.extract(fr)
+                                top_crop_frac = (
+                                    getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0
+                                ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                top_crop_px = (
+                                    int(crop.shape[0] * top_crop_frac)
+                                    if top_crop_frac > 0 else 0
+                                )
+                                if top_crop_px:
+                                    crop = crop[top_crop_px:, :]
+                                merged = self._sam2_robot_candidates(crop)
+                                # Field-filter in full-view coords (restore the
+                                # top-crop offset). No blocked_zones: detect_fn
+                                # output also corroborates existing masks (a
+                                # zone-parked robot must stay detector-present);
+                                # seeding inside zones is blocked by seed_gate_fn.
+                                full_boxes = [
+                                    (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
+                                    for b, _c in merged
+                                ]
+                                keep = filter_field_robot_boxes(
+                                    full_boxes,
+                                    view.calibration,
+                                    self.field_dims,
+                                    frame_shape=(
+                                        crop.shape[0] + top_crop_px,
+                                        crop.shape[1],
+                                        3,
+                                    ),
+                                )
+                                return [
+                                    (
+                                        tuple(v * SAM2_SCALE for v in merged[idx][0]),
+                                        merged[idx][1],
+                                    )
+                                    for idx in keep
+                                ]
                             return detect_fn
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
                         eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
-                        reprompt_every = max(1, int(round(REPROMPT_SECONDS * eff_fps)))
+                        reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
+
+                        # Build a projector mapping a SAM2 mask box (tracker/0.5x
+                        # top-cropped pixel coords) to field meters, for the
+                        # mask-hijack cull's stationarity test. Exported frames are
+                        # ALREADY top-cropped, so we recover the CROPPED full-res
+                        # height and reconstruct the consumer's offset
+                        # (original_h * tc) via cropped_full_h * tc / (1 - tc).
+                        _sam2_scale = self.sam2_export_scale
+                        _top_crop = (
+                            (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
+                            if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                        )
+                        _exported = sorted(
+                            f for f in os.listdir(tmp_dir_obj.name)
+                            if f.endswith(".jpg") or f.endswith(".jpeg")
+                        )
+                        _cropped_full_h = None
+                        if _exported:
+                            _img0 = cv2.imread(os.path.join(tmp_dir_obj.name, _exported[0]))
+                            if _img0 is not None:
+                                _cropped_full_h = int(round(_img0.shape[0] / _sam2_scale))
+                        _y_off = (
+                            int(_cropped_full_h * _top_crop / max(1.0 - _top_crop, 1e-6))
+                            if (_cropped_full_h is not None and _top_crop > 0) else 0
+                        )
+
+                        def _make_project_fn(cal, y_off, scale):
+                            def _project(box):
+                                x1, y1, x2, y2 = box
+                                fx1, fx2 = x1 / scale, x2 / scale
+                                fy2 = y2 / scale + y_off
+                                return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
+                            return _project
+
+                        _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
+
+                        # Seed gate: a detection projecting into a static zone
+                        # cannot found a NEW SAM2 object (a robot is never born
+                        # inside a field element) but still corroborates masks.
+                        def _make_seed_gate_fn(project, zones):
+                            def _gate(box):
+                                xy = project(box)
+                                return xy is None or not point_in_zones(xy, zones)
+                            return _gate
+
+                        _seed_gate_fn = _make_seed_gate_fn(
+                            _project_fn, self.hub_no_robot_zones
+                        )
 
                         t0 = time.perf_counter()
                         view_tracks = await asyncio.to_thread(
@@ -2868,9 +4764,24 @@ class InferenceJob:
                             prompt_idx=prompt_local_idx,
                             prompt_boxes=prompt_boxes_scaled,
                             reprompt_every=reprompt_every,
-                            detect_fn=make_detect_fn(),
+                            detect_fn=make_detect_fn(_detect_caps),
+                            object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
-                            progress_cb=make_progress_cb(base_pct, span_pct, view.name)
+                            max_active_objects=MAX_TRACKED_ROBOTS,
+                            # Capped-roster eviction (sam2_tracker) re-seeds robots
+                            # under fresh ids, so lifetime id churn is higher than the
+                            # old 3x budget; qm24 hit 20 ids by the final frame.
+                            max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
+                            propagate_backward=True,
+                            progress_cb=make_progress_cb(base_pct, span_pct, view.name),
+                            diagnostics=self.identity_diagnostics,
+                            project_fn=_project_fn,
+                            seed_gate_fn=_seed_gate_fn,
+                            # None defers to the tracker's env-knob defaults.
+                            **({"cull_enabled": self.cull_hijack_enabled}
+                               if self.cull_hijack_enabled is not None else {}),
+                            **({"reanchor_enabled": self.reanchor_enabled}
+                               if self.reanchor_enabled is not None else {}),
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -2886,32 +4797,88 @@ class InferenceJob:
                     except Exception as e:
                         print(f"  [SAM2] Error during propagation for view {view.name}: {e}")
                     finally:
+                        for _state in _detect_caps:
+                            if _state.get("cap") is not None:
+                                _state["cap"].release()
                         tmp_dir_obj.cleanup()
 
                 if not self.sam2_raw:
-                    print("  [SAM2] No views produced tracklets — falling back to Kalman tracking.")
+                    await self._warn_degraded(
+                        "sam2",
+                        "No views produced tracklets — falling back to Kalman tracking.",
+                    )
                     self.use_sam2 = False
                 else:
                     self.fused_registry = FusedTrackRegistry()
             # -------------------------------------
 
-            # Early vision OCR pass on frame 200 to identify robots before main loop.
+            # Early vision OCR pass at the autonomous start when timer gating succeeds.
             # Seeds the field tracker's slots from this frame so VLM reads bind to
             # slot ids (the same identity the main loop uses).
-            cap.set(cv2.CAP_PROP_POS_FRAMES, EARLY_OCR_FRAME)
+            early_ocr_source_frame = prompt_source_frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, early_ocr_source_frame)
             ret, early_ocr_frame = cap.read()
             if ret and self.match_teams:
-                print(f"  Early vision OCR on frame {EARLY_OCR_FRAME}...")
+                print(f"  Early vision OCR on frame {early_ocr_source_frame}...")
                 early_overhead = early_ocr_frame[:self.overhead_height, :]
-                results = self.model(early_overhead, conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                detections = sv.Detections.from_ultralytics(results)
-                robot_mask = detections.class_id == 1
-                early_boxes = [detections.xyxy[i] for i in range(len(detections))
-                               if robot_mask[i]]
+                if self.bumper_model is not None:
+                    results = self.bumper_model(
+                        early_overhead, conf=DET_CONF_THRESHOLD, verbose=False
+                    )[0]
+                    robots, _balls, _hubs = self.det_schema.split(
+                        sv.Detections.from_ultralytics(results)
+                    )
+                    robots = [
+                        robot for robot in robots
+                        if plausible_bumper_box(robot[0])
+                    ]
+                else:
+                    results = self.model(
+                        early_overhead, conf=DET_CONF_THRESHOLD, verbose=False
+                    )[0]
+                    detections = sv.Detections.from_ultralytics(results)
+                    robots = [
+                        (
+                            tuple(detections.xyxy[i]),
+                            None,
+                            (
+                                float(detections.confidence[i])
+                                if detections.confidence is not None
+                                else 1.0
+                            ),
+                        )
+                        for i in range(len(detections))
+                        if detections.class_id[i] == 1
+                    ]
+                early_person_results = self.person_model(
+                    early_overhead,
+                    classes=[0],
+                    conf=DET_CONF_THRESHOLD,
+                    verbose=False,
+                )[0]
+                early_person_dets = sv.Detections.from_ultralytics(
+                    early_person_results
+                )
+                early_person_boxes = [
+                    tuple(early_person_dets.xyxy[i])
+                    for i in range(len(early_person_dets))
+                ]
+                robots = reject_person_candidates(
+                    robots,
+                    early_person_boxes,
+                    PERSON_ROBOT_REJECT_COVERAGE,
+                )
+                early_boxes = [np.asarray(box) for box, _color, _conf in robots]
+                early_colors = [color for _box, color, _conf in robots]
                 main_view = next((v for v in self.views if v.name == "main"), None)
                 if main_view:
                     filtered_early_boxes = []
-                    for box in early_boxes:
+                    filtered_early_colors = []
+                    for box, color in zip(early_boxes, early_colors):
+                        if not self._below_robot_tracking_top(
+                            main_view, box, early_overhead.shape[0]
+                        ):
+                            continue
                         cx = (box[0] + box[2]) / 2.0
                         cy = (box[1] + box[3]) / 2.0
                         is_masked = False
@@ -2921,13 +4888,30 @@ class InferenceJob:
                                 break
                         if not is_masked:
                             filtered_early_boxes.append(box)
+                            filtered_early_colors.append(color)
                     early_boxes = filtered_early_boxes
+                    early_colors = filtered_early_colors
+                early_rejected = []
                 early_field_dets = to_field_detections(
-                    early_boxes, self.calib, early_overhead, self.field_dims,
-                    color_fn=self.detect_bumper_color,
+                    early_boxes,
+                    self.calib,
+                    self.field_dims,
+                    colors=early_colors,
+                    frame_shape=early_overhead.shape,
+                    rejected_out=early_rejected,
                 )
+                if early_rejected:
+                    self.hard_neg_logger.maybe_log(
+                        early_overhead, [d.box for d in early_field_dets],
+                        early_rejected, view_name="main",
+                        frame_num=early_ocr_source_frame,
+                    )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
+                from web.field.fusion import FusedObservation
+                early_fused = [FusedObservation(detection=d, evidence=[]) for d in early_field_dets]
+                await self._sync_identity_registry_frame(
+                    early_fused, [], early_outs, log_frame_num=early_ocr_source_frame)
                 early_robots = []
                 for t in early_outs:
                     if t.state != "visible" or t.box is None:
@@ -2940,31 +4924,65 @@ class InferenceJob:
                     robot.last_position = (float(cx), float(cy))
                     early_robots.append((t.slot_id, t.box))
                 if early_robots:
-                    self.vision_identify_robots(early_overhead, early_robots)
+                    self.vision_identify_robots(
+                        early_overhead,
+                        early_robots,
+                        boxes_are_bumpers=self.bumper_model is not None,
+                    )
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, TITLE_SCREEN_FRAMES)
+            first_processing_frame = self.processing_ranges[0][0]
+            last_processing_frame = self.processing_ranges[-1][1]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_processing_frame)
 
-            frame_num = TITLE_SCREEN_FRAMES
+            frame_num = first_processing_frame
             processed_frame_num = 0
+            analysis_frame_set = {
+                frame
+                for start, end in self.processing_ranges
+                for frame in range(start, end + 1, self.frame_skip)
+            }
+            auto_core = next(
+                (
+                    (p["start_frame"], p["end_frame"])
+                    for p in self.match_periods
+                    if p["label"] == "auto"
+                ),
+                None,
+            )
+            previous_processed_source_frame = None
             self._inference_start_time = time.time()
-            robots_data = []
-            events_data = []
 
             _loop_t0 = time.perf_counter()
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                if frame_num > last_processing_frame:
+                    break
                 
-                # Skip frames
-                if (frame_num - TITLE_SCREEN_FRAMES) % self.frame_skip != 0:
+                if frame_num not in analysis_frame_set:
                     frame_num += 1
                     continue
+
+                self._evidence_frame = frame_num
+
+                if (
+                    previous_processed_source_frame is not None
+                    and frame_num - previous_processed_source_frame > self.frame_skip * 2
+                ):
+                    self.ball_trajectories.clear()
+                    self.recent_ball_detections.clear()
+                    self._ball_score_cooldown.clear()
+                    print(
+                        f"  [timer] resumed processing at frame {frame_num}; "
+                        "reset transient ball state across skipped gap"
+                    )
                 
                 # Crop overhead portion
                 overhead_frame = frame[:self.overhead_height, :]
                 
-                # Run YOLO
+                # Existing 3-class YOLO intentionally feeds fuel/hub detection
+                # and their HUD annotations; robots come from the bumper model.
                 results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
                 detections = sv.Detections.from_ultralytics(results)
                 
@@ -2974,10 +4992,11 @@ class InferenceJob:
                 # ---- Multi-camera field-space tracking ----
                 per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
+                person_evidence_boxes_by_cam = {}
                 
                 if self.use_sam2:
-                    local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
-                    SAM2_SCALE = 0.5
+                    local_idx = self.sam2_source_to_local.get(frame_num)
+                    SAM2_SCALE = self.sam2_export_scale
                     for view in self.views:
                         paired = []
                         view_raw = self.sam2_raw.get(view.name, {})
@@ -2996,6 +5015,18 @@ class InferenceJob:
                             new_h = int(view_frame.shape[0] * SAM2_SCALE)
                             small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+                        person_results = self.person_model(
+                            view_frame,
+                            classes=[0],
+                            conf=DET_CONF_THRESHOLD,
+                            verbose=False,
+                        )[0]
+                        pdets = sv.Detections.from_ultralytics(person_results)
+                        person_boxes_all = [
+                            tuple(pdets.xyxy[i]) for i in range(len(pdets))
+                        ]
+
+                        embed_candidates = []
                         for obj_id, info in view_raw.get(local_idx, {}).items():
                             x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
                             fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
@@ -3009,16 +5040,37 @@ class InferenceJob:
                                     break
                             if is_masked:
                                 continue
-                            uv = ((fx1 + fx2) / 2.0, fy2)  # bottom-center, full-res crop
+                            full_box = (fx1, fy1, fx2, fy2)
+                            if not reject_person_candidates(
+                                [(full_box, None)],
+                                person_boxes_all,
+                                PERSON_ROBOT_REJECT_COVERAGE,
+                            ):
+                                continue
+                            # No blocked_zones here: these are tracked masks
+                            # (post-seeding evidence); zones gate seeding only.
+                            if not filter_field_robot_boxes(
+                                [full_box],
+                                cal,
+                                self.field_dims,
+                                frame_shape=view_frame.shape,
+                            ):
+                                continue
+                            uv = ((fx1 + fx2) / 2.0, fy2)
                             xy = cal.image_to_field(uv)
-                            if xy is None or not _on_field(xy, self.field_dims):
+                            corner_weight = corner_detection_weight(
+                                view.name, xy, self.field_dims
+                            )
+                            if corner_weight <= 0.0:
                                 continue
                             
-                            # Detect bumper color on the full resolution view crop frame
-                            color = self.detect_bumper_color(view_frame, np.array([fx1, fy1, fx2, fy2]))
-                            
-                            det_embed = None
-                            robot_crop_b64 = None
+                            color = (
+                                self.sam2_obj_color.get(view.name, {}).get(obj_id)
+                                or "unknown"
+                            )
+
+                            box_s = None
+                            sub_mask = None
                             if small_frame is not None:
                                 # small_frame is the full-crop at 0.5x; index it with the
                                 # offset-corrected box scaled back to 0.5x (== raw box when
@@ -3028,22 +5080,36 @@ class InferenceJob:
                                 # SAM2 mask is in raw 0.5x top-cropped coords (same space
                                 # as info["box"]); slice the box region out as a box-local
                                 # mask so the signature covers the robot, not the field.
-                                sub_mask = None
                                 mask2d = info.get("mask")
                                 if mask2d is not None:
                                     sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
                                     if sub_mask.size == 0:
                                         sub_mask = None
-                                det_embed = self.robot_embedder.embed(
-                                    small_frame, box_s, mask=sub_mask)
+                            embed_candidates.append(
+                                (obj_id, full_box, xy, corner_weight, color,
+                                 box_s, sub_mask))
+
+                        # One DINOv2 forward pass for every robot in this view
+                        # (embed() is embed_batch([box])[0], so semantics match).
+                        det_embeds = [None] * len(embed_candidates)
+                        if small_frame is not None and embed_candidates:
+                            det_embeds = self.robot_embedder.embed_batch(
+                                small_frame,
+                                [c[5] for c in embed_candidates],
+                                masks=[c[6] for c in embed_candidates])
+
+                        for (obj_id, full_box, xy, corner_weight, color, box_s,
+                             sub_mask), det_embed in zip(embed_candidates, det_embeds):
+                            robot_crop_b64 = None
+                            if small_frame is not None:
                                 robot_crop_b64 = self._masked_robot_crop_b64(
                                     small_frame, box_s, sub_mask)
 
                             det = FieldDetection(
                                 pos=xy,
                                 color=color,
-                                box=(fx1, fy1, fx2, fy2),
-                                score=1.0,
+                                box=full_box,
+                                score=corner_weight,
                                 track_id=obj_id,
                                 embedding=det_embed,
                                 robot_crop_b64=robot_crop_b64,
@@ -3052,32 +5118,70 @@ class InferenceJob:
                             cb = self._bumper_crop_b64(view_frame, det.box, enforce_floor=False)
                             crop_b64 = cb[0] if cb is not None else None
                             paired.append((det, crop_b64))
-                            
-                        # Feed the person detector for occlusion reasoning in SAM2 mode
-                        person_results = self.person_model(view_frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                        pdets = sv.Detections.from_ultralytics(person_results)
-                        person_boxes_all = [tuple(pdets.xyxy[i]) for i in range(len(pdets))]
+
+
                         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
                         
                         per_camera[view.name] = paired
                         person_boxes_by_cam[view.name] = person_boxes
+                        person_evidence_boxes_by_cam[view.name] = person_boxes_all
                 else:
                     for view in self.views:
                         pre = detections if view.name == "main" else None
-                        paired, pboxes = self._detect_view(view, frame, precomputed_dets=pre)
+                        paired, pboxes, raw_pboxes = self._detect_view(
+                            view,
+                            frame,
+                            precomputed_dets=pre,
+                            frame_num=frame_num,
+                        )
                         per_camera[view.name] = paired
                         person_boxes_by_cam[view.name] = pboxes
+                        person_evidence_boxes_by_cam[view.name] = raw_pboxes
 
                 weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
                            for v in self.views}
-                fused = fuse_detections(per_camera, weights=weights)   # list[FusedObservation]
+                camera_centers = {
+                    v.name: v.calibration.camera_center
+                    for v in self.views
+                    if v.calibration.camera_center is not None
+                }
+
+                def _hub_blocks_camera(camera_name, field_pos):
+                    center = camera_centers.get(camera_name)
+                    return center is not None and any(
+                        occluded_by_hub(center, prism, field_pos)
+                        for prism in self.hub_prisms
+                    )
+
+                fused = fuse_detections(
+                    per_camera,
+                    weights=weights,
+                    is_hub_occluded=_hub_blocks_camera,
+                )   # list[FusedObservation]
                 
+                ev_list = []
                 if self.use_sam2:
-                    self.fused_registry.assign(fused)
+                    ev_list = self.fused_registry.assign(fused)
 
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                try:
+                    self._record_frame_evidence(
+                        fused,
+                        frame_num,
+                        person_evidence_boxes_by_cam.get("main", []),
+                    )
+                except Exception as e:
+                    await self._warn_degraded(
+                        "frame_evidence",
+                        f"Frame evidence recording failed ({e}); backward "
+                        f"re-resolution will be incomplete for this run.",
+                    )
+                await self._sync_identity_registry_frame(
+                    fused, ev_list, track_outs,
+                    main_person_boxes=person_evidence_boxes_by_cam.get("main", []),
+                    log_frame_num=frame_num)
 
                 # 5. Resolve occlusion from every posed camera and merge: a track
                 #    is occluded only if occluded in ALL posed cameras.
@@ -3141,69 +5245,86 @@ class InferenceJob:
                         robot.positions_history.append((processed_frame_num, float(cx), float(cy)))
                         robot.last_seen_frame = frame_num
                         tracked_robot_boxes.append((t.slot_id, t.box))
+                        if auto_core and auto_core[0] <= frame_num <= auto_core[1]:
+                            self.autonomous_paths[self._slot_label(t.slot_id)].append({
+                                "frame_num": frame_num,
+                                "timestamp": round(
+                                    frame_num / (self.video_fps or 1.0), 4
+                                ),
+                                "field_pos": [
+                                    round(float(t.pos[0]), 4),
+                                    round(float(t.pos[1]), 4),
+                                ],
+                            })
                     # Coasting tracks keep their stale last_position untouched.
-
-                # Map detection index -> slot_id for the annotation pass (a track's
-                # box is the same ndarray its field detection was built from).
-                detection_to_tracked = {}  # det_index -> slot_id
-                
-                if self.use_sam2:
-                    slot_to_main_box = {}
-                    for obs in fused:
-                        if obs.track_id is not None:
-                            for cam, det_id in obs.members:
-                                if cam == "main":
-                                    main_det = next((d for (d, _) in per_camera.get("main", []) if d.track_id == det_id), None)
-                                    if main_det is not None and main_det.box is not None:
-                                        slot_to_main_box[obs.track_id] = main_det.box
-                                    break
-                    
-                    for di in range(len(detections)):
-                        if detections.class_id[di] != 1:
-                            continue
-                        db = detections.xyxy[di]
-                        best_slot = None
-                        best_iou = 0.3
-                        for registry_track_id, sbox in slot_to_main_box.items():
-                            iou = _box_iou(db, sbox)
-                            if iou > best_iou:
-                                best_iou = iou
-                                resolved_slot = self.field_tracker._id_to_slot.get(registry_track_id)
-                                if resolved_slot is not None:
-                                    best_slot = resolved_slot
-                        if best_slot is not None:
-                            detection_to_tracked[di] = best_slot
-                else:
-                    for slot_id, tbox in tracked_robot_boxes:
-                        for di in range(len(detections)):
-                            if detections.class_id[di] != 1:
-                                continue
-                            db = detections.xyxy[di]
-                            if (abs(db[0] - tbox[0]) < 1 and abs(db[1] - tbox[1]) < 1 and
-                                    abs(db[2] - tbox[2]) < 1 and abs(db[3] - tbox[3]) < 1):
-                                detection_to_tracked[di] = slot_id
-                                break
 
                 # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                 # free, so there's no per-match call cap (the old 20-call budget was a
-                # paid-API leftover). It ramps up while identities are missing and then
-                # backs off to audit reads after all robots are confirmed.
-                current_time = time.time()
+                # paid-API leftover). We schedule VLM reads per-identity based on match seconds.
+                current_match_time = processed_frame_num / (self.video_fps or 10.0)
                 unconfirmed_count = sum(
-                    1 for r in self.robot_tracks.values() if not r.team_number_confirmed
+                    1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
                 )
-                vision_interval = self._vlm_interval_seconds(unconfirmed_count)
-                elapsed_since_vlm = current_time - self._claude_vision_last_time
-                should_read = bool(fused) and elapsed_since_vlm >= vision_interval
+                
+                due_priorities = {}
+                for ident in self.identity_registry.identities.values():
+                    if ident.active_slot is None:
+                        continue
+                    # Occlusion gate: a bumper hidden in EVERY camera cannot
+                    # be read — at best a wasted call, at worst a garbage-crop
+                    # contradiction against a correct lock. The
+                    # needs_immediate_read flag is NOT cleared, so the read
+                    # fires on the first visible frame.
+                    if VLM_OCCLUSION_GATE and occlusion_blocks_read(
+                            (self._occ or {}).get(ident.active_slot)):
+                        self.identity_diagnostics.increment(
+                            "vlm_scheduled.occluded_skip")
+                        continue
+                    # Novelty inputs: a failed read of an unmoved robot is
+                    # the same unreadable view again (decide_vlm_read gates
+                    # it, bounded by novelty_skip_max_sec).
+                    last_failed = (ident.last_vlm_time > ident.last_success_time)
+                    moved = True
+                    slot_track = self._get_slot_track_if_exists(ident.active_slot)
+                    cur_pos = getattr(slot_track, "field_position", None)
+                    if ident.last_vlm_pos is not None and cur_pos is not None:
+                        moved = (
+                            (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
+                            + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
+                        ) ** 0.5 >= self.confidence_config.novelty_min_move_m
+                    decision = decide_vlm_read(
+                        is_confirmed=ident.is_confirmed,
+                        confidence=ident.confidence,
+                        last_vlm_time=ident.last_vlm_time,
+                        last_success_time=ident.last_success_time,
+                        backoff_until=ident.backoff_until,
+                        needs_immediate_read=ident.needs_immediate_read,
+                        current_match_time=current_match_time,
+                        unconfirmed_count=unconfirmed_count,
+                        config=self.confidence_config,
+                        last_read_failed=last_failed,
+                        moved_since_read=moved,
+                    )
+                    if decision.due:
+                        due_priorities[ident.identity_id] = decision.priority
+                        self.identity_diagnostics.increment(
+                            f"vlm_scheduled.{decision.reason}"
+                        )
+                        self.identity_diagnostics.record(
+                            DiagnosticEvents.VLM_SCHEDULED,
+                            identity_id=ident.identity_id,
+                            reason_type=decision.reason,
+                            priority=decision.priority,
+                            is_audit=decision.is_audit,
+                        )
+
                 self.vlm_status.update({
-                    "last_interval_sec": vision_interval,
                     "unconfirmed": unconfirmed_count,
+                    "due_count": len(due_priorities),
                 })
-                if should_read:
+                if bool(fused) and len(due_priorities) > 0:
                     self._claude_vision_calls += 1
-                    self._claude_vision_last_time = current_time
-                    is_reread_due = self._is_reread_pass(unconfirmed_count)
-                    self.read_fused_bumper_numbers(fused, is_reread_due)
+                    await self.read_fused_bumper_numbers(fused, due_priorities)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -3262,48 +5383,7 @@ class InferenceJob:
                         color = (0, 255, 255)  # Yellow
                         label = "ball"
                     elif class_id == 1:  # robot
-                        # Use the detection→tracked mapping built above
-                        if i in detection_to_tracked:
-                            slot_id = detection_to_tracked[i]
-                            robot = self.robot_tracks[slot_id]
-                            alliance = robot.alliance
-                            label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
-                            t = track_by_slot.get(slot_id)
-                            
-                            # Find main view mask for this slot
-                            mask = None
-                            if self.use_sam2:
-                                local_idx = (frame_num - TITLE_SCREEN_FRAMES) // self.frame_skip
-                                registry_track_id = next((k for k, v in self.field_tracker._id_to_slot.items() if v == slot_id), None)
-                                if registry_track_id is not None:
-                                    obs = next((o for o in fused if o.track_id == registry_track_id), None)
-                                    if obs is not None:
-                                        for cam, det_id in obs.members:
-                                            if cam == "main" and "main" in self.sam2_raw:
-                                                view_raw = self.sam2_raw["main"]
-                                                if local_idx in view_raw and det_id in view_raw[local_idx]:
-                                                    mask2d = view_raw[local_idx][det_id].get("mask")
-                                                    if mask2d is not None:
-                                                        crop_h, crop_w = overhead_frame.shape[:2]
-                                                        mask = cv2.resize(mask2d.astype(np.uint8), (crop_w, crop_h), interpolation=cv2.INTER_NEAREST).astype(bool)
-                                                break
-
-                            self._draw_bumper_hud(
-                                annotated_frame, box, alliance, label, slot_id=slot_id,
-                                cal=self.calib,
-                                field_pos=t.pos if t else robot.field_position,
-                                vel=t.vel if t else None,
-                                mask=mask,
-                            )
-                            continue
-                        else:
-                            # Untracked robot detection — use bumper color for display only
-                            alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])
-                            color = (255, 0, 0) if alliance == "blue" else (0, 0, 255) if alliance == "red" else (200, 200, 200)
-                            confirmed = False
-                            label = "robot"
-                            self._draw_bumper_hud(annotated_frame, box, alliance, label)
-                            continue
+                        continue
                     else:  # hub_opening
                         color = (0, 255, 0)  # Green
                         label = "hub"
@@ -3313,19 +5393,94 @@ class InferenceJob:
                     if class_id == 0 and not HUD_DRAW_BALL_BOXES:
                         continue
 
-                    if class_id == 1 and i in detection_to_tracked and confirmed:
-                        # Confirmed robot: thick solid box
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
-                    elif class_id == 1 and i in detection_to_tracked:
-                        # Tentative/unidentified robot: thin box with corner ticks
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 1)
-                    else:
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
                     # Label with background for readability
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                     cv2.rectangle(annotated_frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 0), -1)
                     cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Robots are drawn from visible tracker slots. Their boxes and
+                # alliance colors originate from the bumper-model path.
+                for slot_id, box in tracked_robot_boxes:
+                    robot = self._get_slot_track_if_exists(slot_id)
+                    if robot is None:
+                        continue
+                    label, _confirmed = self._team_hud_label(
+                        robot, self._slot_label(slot_id)
+                    )
+                    track = track_by_slot.get(slot_id)
+                    mask = None
+                    if self.use_sam2:
+                        local_idx = self.sam2_source_to_local.get(frame_num)
+                        registry_track_id = next(
+                            (
+                                track_id
+                                for track_id, mapped_slot in
+                                self.field_tracker._id_to_slot.items()
+                                if mapped_slot == slot_id
+                            ),
+                            None,
+                        )
+                        if registry_track_id is not None:
+                            obs = next(
+                                (
+                                    item for item in fused
+                                    if item.track_id == registry_track_id
+                                ),
+                                None,
+                            )
+                            if obs is not None:
+                                for camera, det_id in obs.members:
+                                    if camera != "main" or "main" not in self.sam2_raw:
+                                        continue
+                                    entry = self.sam2_raw["main"].get(
+                                        local_idx, {}
+                                    ).get(det_id)
+                                    if entry is not None:
+                                        mask2d = entry.get("mask")
+                                        if mask2d is not None:
+                                            main_view = next(
+                                                (
+                                                    view
+                                                    for view in self.views
+                                                    if view.name == "main"
+                                                ),
+                                                None,
+                                            )
+                                            top_offset_px = 0
+                                            if main_view is not None:
+                                                top_crop_frac = (
+                                                    getattr(
+                                                        main_view.calibration,
+                                                        "robot_track_top_crop",
+                                                        0.0,
+                                                    )
+                                                    or 0.0
+                                                ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                                top_offset_px = int(
+                                                    overhead_frame.shape[0]
+                                                    * top_crop_frac
+                                                )
+                                            mask = _restore_sam2_mask_to_view(
+                                                mask2d,
+                                                overhead_frame.shape,
+                                                top_offset_px,
+                                            )
+                                    break
+                    self._draw_bumper_hud(
+                        annotated_frame,
+                        box,
+                        robot.alliance,
+                        label,
+                        slot_id=slot_id,
+                        cal=self.calib,
+                        field_pos=(
+                            track.pos if track else robot.field_position
+                        ),
+                        vel=track.vel if track else None,
+                        mask=mask,
+                    )
                 
                 # Draw hubs
                 for hub in self.hubs:
@@ -3339,8 +5494,10 @@ class InferenceJob:
                 for region_key, (rx, ry, rw, rh) in self.ocr_regions.items():
                     if "blue" in region_key:
                         rect_color = (255, 0, 0)  # Blue in BGR
-                    else:
+                    elif "red" in region_key:
                         rect_color = (0, 0, 255)  # Red in BGR
+                    else:
+                        rect_color = (0, 255, 255)  # Yellow in BGR
                     cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
                     cv2.putText(annotated_frame, region_key,
                                (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
@@ -3366,10 +5523,8 @@ class InferenceJob:
                             {
                                 "slot": self._slot_label(t.slot_id),
                                 "alliance": t.alliance,
-                                "team_number": (self.robot_tracks[t.slot_id].team_number
-                                                if t.slot_id in self.robot_tracks else None),
-                                "confirmed": (self.robot_tracks[t.slot_id].team_number_confirmed
-                                              if t.slot_id in self.robot_tracks else False),
+                                "team_number": self._get_display_team_number(self._get_or_create_slot_track(t.slot_id)),
+                                "confirmed": self._get_or_create_slot_track(t.slot_id).team_number_confirmed,
                                 "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
                             }
                             for t in track_outs if t.state != "empty"
@@ -3378,75 +5533,36 @@ class InferenceJob:
                 except Exception as e:
                     print(f"[replay] frame record error: {e}")
 
-                # Encode frame
-                _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                
-                # Prepare robot data
-                robots_data = []
-                for robot in self.robot_tracks.values():
-                    best_vote_team = None
-                    best_vote = 0.0
-                    if robot.team_ocr_votes:
-                        best_vote_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
-                    robots_data.append({
-                        "id": robot.robot_id,
-                        "slot": self._slot_label(robot.robot_id),
-                        "alliance": robot.alliance,
-                        "team_number": robot.team_number,
-                        "confirmed": robot.team_number_confirmed,
-                        "team_candidate": best_vote_team,
-                        "team_candidate_votes": best_vote,
-                        "scores": robot.scores,
-                        "position": robot.last_position
-                    })
-                
-                # Prepare scoring events
-                events_data = []
-                for event in self.scoring_events[-10:]:  # Last 10 events
-                    robot = self.robot_tracks.get(event.robot_id)
-                    events_data.append({
-                        "frame": event.frame_num,
-                        "timestamp": event.timestamp,
-                        "alliance": event.alliance,
-                        "robot_id": event.robot_id,
-                        "slot": self._slot_label(event.robot_id),
-                        "team_number": event.team_number,
-                        "team_candidate": (robot.team_number if robot else None),
-                        "robot_label": (
-                            event.team_number
-                            or (robot.team_number if robot and robot.team_number else None)
-                            or self._slot_label(event.robot_id)
-                        ),
-                        "confidence": event.confidence
-                    })
-                
-                # Send frame data via WebSocket
-                if self.websocket:
+                # Stream frame data via the latest-only queue: build display
+                # rows and encode only when a send is due, and never wait on
+                # the client.
+                if self.websocket and self._frame_stream_due(time.perf_counter()):
+                    robots_data = self._canonical_robot_rows()
+                    events_data = self._recent_events_data()
+                    _, buffer = cv2.imencode(
+                        '.jpg', annotated_frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, self.config.frame_stream_jpeg_quality])
+                    frame_b64 = base64.b64encode(buffer).decode('utf-8')
                     # Only stream the VLM crops on frames where a fresh batch exists,
                     # to avoid resending the same images every frame.
                     ocr_crops_payload = self.last_ocr_crops if self._ocr_crops_dirty else None
                     self._ocr_crops_dirty = False
-                    try:
-                        await self.websocket.send_json(jsonify({
-                            "type": "frame",
-                            "frame_num": frame_num,
-                            "processed_frame_num": processed_frame_num,
-                            "total_frames": self.total_frames,
-                            "fps": self.video_fps,
-                            "frame_data": frame_b64,
-                            "scores": self.alliance_scores,
-                            "robots": robots_data,
-                            "scoring_events": events_data,
-                            "ocr_crops": ocr_crops_payload,
-                            "vlm_status": self.vlm_status,
-                        }))
-                        await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
-                    except Exception as e:
-                        print(f"WebSocket send error: {e}")
-                        break
+                    self._enqueue_frame_payload(jsonify({
+                        "type": "frame",
+                        "frame_num": frame_num,
+                        "processed_frame_num": processed_frame_num,
+                        "total_frames": self.total_frames,
+                        "fps": self.video_fps,
+                        "frame_data": frame_b64,
+                        "scores": self.alliance_scores,
+                        "robots": robots_data,
+                        "scoring_events": events_data,
+                        "ocr_crops": ocr_crops_payload,
+                        "vlm_status": self.vlm_status,
+                    }))
 
                 self._current_frame = frame_num
+                previous_processed_source_frame = frame_num
 
                 if self._stopped:
                     break
@@ -3458,16 +5574,11 @@ class InferenceJob:
                     while self._paused and not self._stopped:
                         now = loop.time()
                         if self.websocket and (now - last_status_sent >= 1.0):
-                            try:
-                                await self.websocket.send_json({
-                                    "type": "status",
-                                    "status": "paused",
-                                    "frame_num": self._pause_frame
-                                })
-                            except Exception as e:
-                                print(f"WebSocket pause status send error: {e}")
-                                self._stopped = True
-                                break
+                            self._enqueue_ws("status", {
+                                "type": "status",
+                                "status": "paused",
+                                "frame_num": self._pause_frame
+                            })
                             last_status_sent = now
                         await asyncio.sleep(0.1)
 
@@ -3481,16 +5592,22 @@ class InferenceJob:
             self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
             self.status = "completed"
 
-            if self.websocket:
-                await self.websocket.send_json(jsonify({
-                    "type": "complete",
-                    "total_frames": self.total_frames,
-                    "robots": robots_data,
-                    "scoring_events": events_data,
-                    "final_scores": self.alliance_scores,
-                    "processing_sec": self.timings.get("total"),
-                    "timings": self.timings,
-                }))
+            # Deliver any in-flight frame before the complete message.
+            await self._stop_ws_senders(drain=True)
+            await self._send_ws(jsonify({
+                "type": "complete",
+                "total_frames": self.total_frames,
+                "robots": self._canonical_robot_rows(),
+                "scoring_events": self._recent_events_data(),
+                "final_scores": self.alliance_scores,
+                "periods": self.match_periods,
+                "autonomous_paths": dict(self.autonomous_paths),
+                "processing_sec": self.timings.get("total"),
+                "timings": self.timings,
+                "degradation_warnings": getattr(self, "degradation_warnings", []),
+                # A/B provenance: every knob that differed from the code default.
+                "config": self.config.non_defaults(),
+            }))
         
         except Exception as e:
             self.status = "error"
@@ -3498,12 +5615,15 @@ class InferenceJob:
             import traceback
             print(f"ERROR in process_video: {e}")
             print(traceback.format_exc())
-            if self.websocket:
-                await self.websocket.send_json({
-                    "type": "error",
-                    "error": str(e)
-                })
+            await self._send_ws({
+                "type": "error",
+                "error": str(e)
+            })
         finally:
+            try:
+                await self._stop_ws_senders(drain=False)
+            except Exception:
+                pass
             try:
                 self.diagnostic.close()
             except Exception:
@@ -3533,15 +5653,39 @@ class InferenceJob:
                         "robots": [r for f in rec.frames[:1] for r in f["robots"]],
                         "processing_sec": timings.get("total"),
                         "timings": timings,
+                        "periods": self.match_periods,
+                        "processing_ranges": self.processing_ranges,
+                        "timer_gate_fallback": self.timer_gate_fallback,
+                        "timer_gate_fallback_reason": self.timer_gate_fallback_reason,
+                        "autonomous_paths": dict(self.autonomous_paths),
                     }
-                    artifacts = rec.finalize(status=status, summary=summary)
+                    self.identity_diagnostics.gauge(
+                        "identity_count", len(self.identity_registry.identities)
+                    )
+                    self.identity_diagnostics.gauge(
+                        "unresolved_occlusion_groups",
+                        len(self.co_occlusion_tracker.get_active_events()),
+                    )
+                    self.identity_diagnostics.gauge(
+                        "deferred_attributions", len(self.deferred_attributions)
+                    )
+                    if BACKWARD_CONFIRM_ENABLED:
+                        try:
+                            self._reresolve_replay_frames()
+                        except Exception as e:
+                            print(f"[backward-confirm] re-resolution skipped: {e}")
+                    artifacts = rec.finalize(
+                        status=status,
+                        summary=summary,
+                        diagnostics=getattr(self, "identity_diagnostics", None),
+                    )
                     import json as _json
                     from datetime import datetime as _dt
                     await database.insert_replay({
                         "id": self.job_id,
                         "created_at": _dt.now().isoformat(timespec="seconds"),
                         "label": Path(str(self.video_path)).stem,
-                        "event_key": self.event_key, "match_key": None, "comp_level": None,
+                        "event_key": self.event_key, "match_key": self.match_key, "comp_level": None,
                         "blue_score": self.alliance_scores.get("blue", 0),
                         "red_score": self.alliance_scores.get("red", 0),
                         "blue_teams": _json.dumps(blue_teams),
@@ -3556,32 +5700,38 @@ class InferenceJob:
                 print(f"[replay] finalize error: {e}")
             try:
                 if self._pending_gallery_rows:
-                    for row in self._pending_gallery_rows:
-                        await database.insert_gallery_exemplar(row)
+                    await database.insert_gallery_exemplars(self._pending_gallery_rows)
                     print(f"  Appearance gallery: persisted {len(self._pending_gallery_rows)} "
                           f"new exemplars for {self.event_key}")
                     self._pending_gallery_rows = []
             except Exception as e:
                 print(f"  Appearance gallery flush failed ({e})")
             try:
-                for slot_id, robot in self.robot_tracks.items():
-                    crops = self._slot_crops.get(slot_id, [])
-                    await database.upsert_match_robot_identity({
-                        "job_id": self.job_id, "slot": slot_id,
+                identity_rows = []
+                crop_rows = []
+                for slot_id, identity_id in self._canonical_identity_slots().items():
+                    robot = self.robot_tracks.get(identity_id)
+                    if robot is None:
+                        continue
+                    crops = self._slot_crops.get(identity_id, [])
+                    identity_rows.append({
+                        "job_id": self.job_id, "identity_id": identity_id, "slot": slot_id,
                         "slot_label": self._slot_label(slot_id),
                         "alliance": robot.alliance, "team_number": robot.team_number,
                         "confirmed": int(bool(robot.team_number_confirmed)),
-                        "source": self._slot_source.get(slot_id, "ocr"),
+                        "source": self._slot_source.get(identity_id, "ocr"),
                         "confidence": (crops[0]["quality"] if crops else None),
                     })
                     for c in crops:
-                        await database.insert_match_robot_crop({
-                            "job_id": self.job_id, "slot": slot_id,
+                        crop_rows.append({
+                            "job_id": self.job_id, "identity_id": identity_id,
                             "legibility": c["quality"],
                             "embedding": (None if c["embedding"] is None
                                           else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
                             "image": _thumbnail_bytes(c.get("robot_crop_b64") or c["crop_b64"]),
                         })
+                await database.upsert_match_robot_identities(identity_rows)
+                await database.insert_match_robot_crops(crop_rows)
             except Exception as e:
                 print(f"  Match-identity capture failed ({e})")
 
@@ -3607,10 +5757,22 @@ async def calibrate_page():
 @app.get("/api/status")
 async def status():
     """Return model and system status"""
+    latest_job = jobs[next(reversed(jobs))] if jobs else None
+    bumper_classes = (
+        dict(latest_job.bumper_model.names)
+        if latest_job is not None and latest_job.bumper_model is not None
+        else None
+    )
     return {
-        "model": "YOLO26s Hub-Zone",
-        "model_path": str(MODEL_PATH),
-        "model_classes": {0: "fuel_ball", 1: "robot", 2: "hub_opening"},
+        "model": "YOLO26s Hub-Zone + YOLOv8m Bumpers",
+        "model_path": {
+            "fuel_hub_model": str(MODEL_PATH),
+            "bumper_model": str(BUMPER_MODEL_PATH),
+        },
+        "model_classes": {
+            "fuel_hub_model": {0: "fuel_ball", 1: "robot", 2: "hub_opening"},
+            "bumper_model": bumper_classes,
+        },
         "status": "ready",
         "has_event": current_event is not None,
         "event_key": current_event['event_key'] if current_event else None,
@@ -3622,15 +5784,18 @@ async def status():
 async def set_ocr_regions(request: Request):
     """Set custom OCR regions for score reading. 
     Coordinates are in the overhead crop coordinate space (1920x723 for 1080p).
-    Body: {"red_center": [x, y, w, h], "blue_center": [x, y, w, h]}"""
+    Body keys: red_center, blue_center, and optional match_clock."""
     global custom_ocr_regions
     body = await request.json()
-    custom_ocr_regions = {}
-    for key in ["red_center", "blue_center"]:
+    # Build locally, assign once: a running job reads this global between
+    # awaits and must never observe a partially-built region dict.
+    regions_update = {}
+    for key in ["red_center", "blue_center", "match_clock"]:
         if key in body:
             coords = body[key]
-            custom_ocr_regions[key] = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
-    
+            regions_update[key] = (int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3]))
+    custom_ocr_regions = regions_update
+
     # Persist to database for this event
     if current_event:
         from database import save_ocr_regions
@@ -3641,7 +5806,7 @@ async def set_ocr_regions(request: Request):
 @app.get("/api/ocr-regions")
 async def get_ocr_regions():
     """Get current OCR regions."""
-    regions = custom_ocr_regions if custom_ocr_regions else OCR_REGIONS_1080P
+    regions = {**OCR_REGIONS_1080P, **(custom_ocr_regions or {})}
     return {"regions": {k: list(v) for k, v in regions.items()}, "custom": custom_ocr_regions is not None}
 
 
@@ -3807,12 +5972,21 @@ async def save_calibration_masks(request: Request):
     camera = body.get("camera", "main")
     masks = body.get("masks", [])
 
-    cal = field_store.load(event, camera)
-    if cal is None:
+    version_id = body.get("version_id")
+    versions = field_store.load_versions(event, camera)
+    if not versions:
+        # No calibration yet — create a default base version (mirrors today's
+        # "no calibration -> default" branch).
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
-
+        cal.masks = [tuple(m) for m in masks]
+        field_store.save_version(event, camera, cal, start_match=None)
+        return {"status": "ok", "masks": cal.masks}
+    target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
+    if target is None:
+        target = max(versions, key=lambda v: v.get("created_at") or "")
+    cal = target["calibration"]
     cal.masks = [tuple(m) for m in masks]
-    field_store.save(event, camera, cal)
+    field_store.update_version(event, camera, target["version_id"], cal)
     return {"status": "ok", "masks": cal.masks}
 
 
@@ -3829,12 +6003,19 @@ async def save_robot_track_top_crop(request: Request):
     camera = body.get("camera", "main")
     crop = max(0.0, min(0.5, float(body.get("robot_track_top_crop", 0.0))))
 
-    cal = field_store.load(event, camera)
-    if cal is None:
+    version_id = body.get("version_id")
+    versions = field_store.load_versions(event, camera)
+    if not versions:
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
-
+        cal.robot_track_top_crop = crop
+        field_store.save_version(event, camera, cal, start_match=None)
+        return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
+    target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
+    if target is None:
+        target = max(versions, key=lambda v: v.get("created_at") or "")
+    cal = target["calibration"]
     cal.robot_track_top_crop = crop
-    field_store.save(event, camera, cal)
+    field_store.update_version(event, camera, target["version_id"], cal)
     return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
 
 
@@ -3863,14 +6044,20 @@ async def calibration_manual(request: Request):
     corr = {f"pt{i}": (np.array([[p["u"], p["v"]]], float),
                        np.array([[p["x"], p["y"], p["z"]]], float))
             for i, p in enumerate(pts)}
-    existing = field_store.load(event, camera)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
+    existing = prev["calibration"] if prev else None
     image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
     season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
     try:
         cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size, field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    field_store.save(event, camera, cal)
+    if existing is not None:
+        cal.masks = existing.masks
+        cal.robot_track_top_crop = existing.robot_track_top_crop
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     return {"status": "ok", "rms_error": cal.rms_error}
 
 
@@ -3911,19 +6098,86 @@ async def calibration_auto(request: Request):
                                     field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    field_store.save(event, camera, cal)
+    start_match = body.get("start_match")
+    label = body.get("label")
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
+    if prev is not None:
+        cal.masks = prev["calibration"].masks
+        cal.robot_track_top_crop = prev["calibration"].robot_track_top_crop
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
 
 
-@app.post("/api/calibration/frame")
-async def calibration_frame(request: Request):
-    """Grab a frame from a LOCAL video, cropped to the requested camera's region
-    from the composite layout (masks applied). Body: {timestamp?: seconds
-    (default 75), video_path?, camera?}.
-    Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
-    Pixel coords are crop-local (origin at the camera crop's top-left)."""
-    body = await request.json()
+# Stream URLs resolved for calibration frame grabs, keyed by YouTube video id.
+# yt-dlp resolution takes seconds; URLs stay valid for hours, cache for 10 min.
+_calib_stream_cache: dict = {}
+
+
+def _match_stream_url(match_key: str):
+    """Resolve a direct video stream URL for one of the loaded event's matches.
+    Returns (stream_url, None) on success or (None, error_message)."""
+    if not current_event:
+        return None, "No event loaded — load the event first."
+    m = next((mm for mm in current_event.get('matches', [])
+              if mm.get('key') == match_key), None)
+    if m is None:
+        return None, f"Match '{match_key}' is not in the loaded event."
+    vk = m.get('video_key')
+    if not vk:
+        return None, f"Match '{match_key}' has no YouTube video on TBA."
+    cached = _calib_stream_cache.get(vk)
+    if cached and cached[1] > time.time():
+        return cached[0], None
+    ydl_opts = {
+        'format': 'bestvideo[height<=1080]/best[height<=1080]/bestvideo/best',
+        'format_sort': ['res:1080', 'vcodec:h264'],
+        'quiet': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vk}",
+                                    download=False)
+        stream_url = info.get('url')
+        if not stream_url:
+            for fmt in info.get('requested_formats', []):
+                if fmt.get('vcodec') != 'none':
+                    stream_url = fmt['url']
+                    break
+        if not stream_url:
+            return None, "Could not resolve a video stream URL for the match."
+        _calib_stream_cache[vk] = (stream_url, time.time() + 600)
+        return stream_url, None
+    except Exception as e:
+        return None, f"Stream resolve failed: {e}"
+
+
+def _read_composite_frame(body: dict):
+    """Read the full composite frame a calibration request refers to.
+    Source precedence: match_key (the loaded event's YouTube video for that
+    match, single-frame ffmpeg extract — needed when recalibrating a moved
+    camera against footage from that match) > video_path (local file restricted
+    to data/test_footage/) > CALIB_TEST_VIDEO.
+    Returns (frame_bgr, None) on success or (None, error_message)."""
+    import subprocess
     ts = float(body.get("timestamp", 75))
+    match_key = body.get("match_key")
+    if match_key:
+        stream_url, err = _match_stream_url(match_key)
+        if err:
+            return None, err
+        frame_path = UPLOAD_DIR / f"calib_frame_{uuid.uuid4().hex[:8]}.jpg"
+        try:
+            subprocess.run(['ffmpeg', '-ss', str(ts), '-i', stream_url,
+                            '-frames:v', '1', '-q:v', '2', str(frame_path), '-y'],
+                           capture_output=True, timeout=45)
+            frame = cv2.imread(str(frame_path)) if frame_path.exists() else None
+        except subprocess.TimeoutExpired:
+            return None, "Frame extraction from the match video timed out."
+        finally:
+            frame_path.unlink(missing_ok=True)
+        if frame is None:
+            return None, "ffmpeg could not extract a frame from the match video."
+        return frame, None
     # video_path is restricted to data/test_footage/ with a video extension to
     # prevent arbitrary local-file / URL reads via cv2.VideoCapture.
     raw = body.get("video_path")
@@ -3935,20 +6189,83 @@ async def calibration_frame(request: Request):
         try:
             candidate.relative_to(allowed_dir)
         except ValueError:
-            return JSONResponse(status_code=400,
-                                content={"error": "video_path outside allowed directory"})
+            return None, "video_path outside allowed directory"
         if candidate.suffix.lower() not in {".mp4", ".mov", ".mkv"}:
-            return JSONResponse(status_code=400, content={"error": "unsupported video extension"})
+            return None, "unsupported video extension"
         path = candidate
     if not path.exists():
-        return JSONResponse(status_code=400, content={"error": "video not found"})
+        return None, "video not found"
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
     ok, frame = cap.read()
     cap.release()
     if not ok or frame is None:
-        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+        return None, "could not read frame"
+    return frame, None
+
+
+@app.get("/api/calibration/versions")
+async def get_calibration_versions(event: str, camera: str = "main"):
+    """Calibration version metadata for (event, camera), oldest first."""
+    versions = field_store.load_versions(event, camera)
+    return {"versions": [
+        {"version_id": v["version_id"], "start_match": v["start_match"],
+         "label": v["label"], "created_at": v["created_at"],
+         "rms_error": getattr(v["calibration"], "rms_error", None),
+         "mode": getattr(v["calibration"], "mode", None)}
+        for v in versions]}
+
+
+@app.get("/api/calibration/drift")
+async def get_calibration_drift(event: str):
+    """Failed drift-check records for the event, keyed camera -> match_key.
+    Each entry gains ``recalibrated``: True once a DIFFERENT epoch now covers
+    that match (a new version was anchored at/before it), so the UI can stop
+    flagging it without waiting for the match to be reprocessed."""
+    raw = field_store.load_drift(event)
+    out = {}
+    for camera, entries in raw.items():
+        versions = field_store.load_versions(event, camera)
+        cam_out = {}
+        for mk, rec in entries.items():
+            cover = select_epoch(versions, mk)
+            cam_out[mk] = {**rec, "recalibrated":
+                           bool(cover and cover["version_id"] != rec.get("epoch"))}
+        out[camera] = cam_out
+    return {"drift": out}
+
+
+@app.get("/api/calibration/epoch")
+async def get_calibration_epoch(event: str, camera: str = "main",
+                                match: str | None = None):
+    """The calibration version whose epoch covers ``match`` (latest version when
+    match is omitted), including the stored solve inputs (``source``) so the
+    calibrate page can restore correspondences and re-preview the solve."""
+    versions = field_store.load_versions(event, camera)
+    v = select_epoch(versions, match or None)
+    if v is None:
+        return {"version": None}
+    return {"version": {
+        "version_id": v["version_id"], "start_match": v["start_match"],
+        "label": v["label"], "created_at": v["created_at"],
+        "rms_error": getattr(v["calibration"], "rms_error", None),
+        "mode": getattr(v["calibration"], "mode", None),
+        "source": v.get("source")}}
+
+
+@app.post("/api/calibration/frame")
+async def calibration_frame(request: Request):
+    """Grab a frame cropped to the requested camera's region from the composite
+    layout (masks applied). Body: {timestamp?: seconds (default 75), match_key?,
+    video_path?, camera?} — match_key reads the loaded event's video for that
+    match (see _read_composite_frame for source precedence).
+    Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
+    Pixel coords are crop-local (origin at the camera crop's top-left)."""
+    body = await request.json()
+    frame, err = await asyncio.to_thread(_read_composite_frame, body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     camera = body.get("camera", "main")
     layout = load_layout()
     cl = layout.get(camera)
@@ -3971,23 +6288,18 @@ async def calibration_frame(request: Request):
 
 @app.post("/api/calibration/refine-tag")
 async def calibration_refine_tag(request: Request):
-    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, u, v, id}.
-    Reads the configured CALIB_TEST_VIDEO at the timestamp, crops to the camera's
-    composite region, runs tag detection in an upscaled ROI around (u,v), and
-    returns {corners: [[u,v]x4]} in crop-pixel coords, or {corners: null}."""
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key?, u, v, id}.
+    Reads the same source frame the page grabbed (match video / video_path /
+    CALIB_TEST_VIDEO), crops to the camera's composite region, runs tag detection
+    in an upscaled ROI around (u,v), and returns {corners: [[u,v]x4]} in
+    crop-pixel coords, or {corners: null}."""
     from web.field.apriltag_detect import detect_tags_in_roi
     body = await request.json()
     camera = body.get("camera", "main")
     tid = int(body["id"])
-    ts = float(body.get("timestamp", 75))
-    path = CALIB_TEST_VIDEO
-    cap = cv2.VideoCapture(str(path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    ok, frame = cap.read()
-    cap.release()
-    if not ok or frame is None:
-        return JSONResponse(status_code=400, content={"error": "could not read frame"})
+    frame, err = await asyncio.to_thread(_read_composite_frame, body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     cl = load_layout().get(camera)
     if cl is None:
         return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
@@ -3998,7 +6310,7 @@ async def calibration_refine_tag(request: Request):
 
 
 def _draw_field_overlay(frame, cal, fm):
-    """Draw the reprojected field perimeter + 2 m grid using cal.field_to_image.
+    """Draw the reprojected field, hubs, and bumps using cal.field_to_image.
     Field lines are SAMPLED into polylines (a straight field line projects to a curved
     image line under lens distortion, so a 2-point segment can't trace it).
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
@@ -4014,8 +6326,9 @@ def _draw_field_overlay(frame, cal, fm):
         # polyline conversion can't overflow (and we don't draw garbage segments).
         return (np.isfinite(u) and np.isfinite(v)
                 and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
-    def seg(p0, p1, color, thick, n=24):
-        (x0, y0), (x1, y1) = p0, p1
+    def seg3(p0, p1, color, thick, n=24):
+        x0, y0, z0 = p0
+        x1, y1, z1 = p1
         run = []
         def flush():
             if len(run) >= 2:
@@ -4023,12 +6336,16 @@ def _draw_field_overlay(frame, cal, fm):
             run.clear()
         for t in range(n + 1):
             u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
-                                       y0 + (y1 - y0) * t / n, 0.0))
+                                       y0 + (y1 - y0) * t / n,
+                                       z0 + (z1 - z0) * t / n))
             if _ok(u, v):
                 run.append((int(u), int(v)))
             else:
                 flush()   # break the polyline across the blown-up region
         flush()
+    def seg(p0, p1, color, thick, n=24):
+        seg3((p0[0], p0[1], 0.0), (p1[0], p1[1], 0.0),
+             color, thick, n)
     for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
         seg(a, b, (0, 255, 0), 2)
     x = 0.0
@@ -4037,6 +6354,15 @@ def _draw_field_overlay(frame, cal, fm):
     y = 0.0
     while y <= W + 1e-6:
         seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
+    prisms = hub_prisms(fm)
+    for a, b in hub_wireframe_edges(prisms):
+        seg3(a, b, (255, 220, 0), 2, n=12)
+    for a, b in bump_wireframe_edges(prisms, W):
+        seg3(a, b, (0, 140, 255), 2, n=8)
+    for a, b in tower_wireframe_edges(fm):
+        seg3(a, b, (255, 0, 255), 2, n=8)
+    for a, b in trench_wireframe_edges(fm):
+        seg3(a, b, (180, 80, 255), 2, n=8)
     return fp
 
 
@@ -4059,23 +6385,21 @@ async def calibration_solve_homography(request: Request):
                                                  "2026-rebuilt-welded")
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    existing = field_store.load(event, camera)
-    if existing and hasattr(existing, "masks"):
+    start_match = body.get("start_match")
+    label = body.get("label")
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
+    existing = prev["calibration"] if prev else None
+    if existing is not None:
         cal.masks = existing.masks
-    if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save(event, camera, cal)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
 
-    # Build overlay on the same frame/timestamp.
+    # Build overlay on the same frame/timestamp (and same source video).
     fm = FieldModel.load("2026-rebuilt-welded")
-    ts = float(body.get("timestamp", 75))
-    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    okf, frame = cap.read(); cap.release()
+    frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     overlay_b64 = None
     cl = load_layout().get(camera)
-    if okf and frame is not None and cl is not None:
+    if frame is not None and cl is not None:
         cx, cy, cw, ch = cl.crop
         main = frame[cy:cy + ch, cx:cx + cw].copy()
         for (mx, my, mw_, mh_) in cl.masks:
@@ -4128,28 +6452,34 @@ async def calibration_solve_tags(request: Request):
                                                 field_season=season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    existing = field_store.load(event, camera)
-    if existing and hasattr(existing, "masks"):
+    start_match = body.get("start_match")
+    label = body.get("label")
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
+    existing = prev["calibration"] if prev else None
+    if existing is not None:
         cal.masks = existing.masks
-    if existing and hasattr(existing, "robot_track_top_crop"):
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save(event, camera, cal)
+    # dry_run solves + renders the overlay without persisting — used by the
+    # calibrate page to re-preview a saved epoch's stored correspondences.
+    if not body.get("dry_run"):
+        field_store.save_version(
+            event, camera, cal, start_match=start_match, label=label,
+            source={"auto_tags": auto, "manual_tags": manual,
+                    "holdout_ids": sorted(holdout_ids),
+                    "timestamp": float(body.get("timestamp", 75)),
+                    "match_key": body.get("match_key")})
     holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
     overlay_b64 = None
-    ts = float(body.get("timestamp", 75))
-    cap = cv2.VideoCapture(str(CALIB_TEST_VIDEO))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    okf, frame = cap.read(); cap.release()
+    frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     cl = load_layout().get(camera)
     # Overlay is a best-effort visualization. A poorly-conditioned calibration can
     # make projection blow up; never let drawing failures sink the solve result
     # (the caller still needs rms_error + holdout_error_m to judge the calibration).
     try:
-        if okf and frame is not None and cl is not None:
+        if frame is not None and cl is not None:
             cx, cy, cw, ch = cl.crop
             main = frame[cy:cy + ch, cx:cx + cw].copy()
             for (mx, my, mw_, mh_) in cl.masks:
@@ -4221,11 +6551,6 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     # Claude Vision fallback (disabled for now)
     # return _claude_vision_read_bumpers(robot_crops_b64, match_teams, blue_teams, red_teams)
-
-
-def _detect_bumper_color_static(frame: np.ndarray, box) -> str:
-    """Static version of bumper color detection for use outside InferenceJob."""
-    return classify_bumper_color(frame, box).alliance
 
 
 def _claude_vision_read_bumpers(robot_crops_b64: list, match_teams: list,
@@ -4369,6 +6694,12 @@ def _get_qwen_vl():
             )
         except TypeError:
             _qwen_vl_processor = AutoProcessor.from_pretrained(VLM_MODEL_NAME)
+        # Batched generation on a decoder-only model requires LEFT padding —
+        # right-padded rows would generate from pad tokens.
+        try:
+            _qwen_vl_processor.tokenizer.padding_side = "left"
+        except AttributeError:
+            pass
         print(f"VLM loaded: {VLM_MODEL_NAME} ({torch.cuda.memory_allocated() / 1e9:.1f} GB VRAM)")
     return _qwen_vl_model, _qwen_vl_processor
 
@@ -4588,8 +6919,14 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                            expected_alliances: Optional[list] = None) -> list:
     """Use the local VLM (VLM_MODEL_NAME, default Qwen3-VL) to read bumper numbers from robot crops.
 
-    Processes each crop individually (Qwen VL handles multi-image differently from Claude).
-    Returns list of {"team_number": str|None, "alliance": str, "confidence": float}.
+    All due crops go through ONE padded generate call (VLM_BATCH_READS) —
+    prompts differ only in the alliance hint, so they batch cleanly; a batch
+    failure falls back to per-crop calls. With VLM_LOGPROB_CONFIDENCE, the
+    model's per-digit token probability is folded into the roster-match
+    confidence (blend_read_confidence) so a wavering read loses vote weight.
+
+    Returns list of {"team_number": str|None, "alliance": str,
+    "confidence": float, "raw_read": str|None, "digit_prob": float|None}.
     """
     import torch
     try:
@@ -4600,14 +6937,17 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
         return [{"team_number": None, "alliance": "unknown", "confidence": 0}] * len(robot_crops_b64)
 
     teams_str = ", ".join(match_teams)
-    blue_str = ", ".join(blue_teams)
-    red_str = ", ".join(red_teams)
     expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
 
-    results = []
+    def _error_entry(e):
+        return {"team_number": None, "alliance": "unknown", "confidence": 0,
+                "raw_read": None, "error": str(e)}
+
+    # ---- Phase 1: one (messages, context) item per decodable crop ----
+    results: list = [None] * len(robot_crops_b64)
+    items = []  # (idx, messages, expected_alliance, candidate_str, img_size)
     for idx, crop_b64 in enumerate(robot_crops_b64):
         try:
-            # Decode base64 to PIL Image
             img_bytes = base64.b64decode(crop_b64)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
@@ -4648,88 +6988,134 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 '{"team": "<the digits, or null if you cannot read them>", '
                 '"color": "red" or "blue"}.'
             )
-
             messages = [
                 {"role": "user", "content": [
                     {"type": "image", "image": img},
                     {"type": "text", "text": prompt},
                 ]}
             ]
-
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs, max_new_tokens=64)
-
-            # Trim input tokens from output
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0].strip()
-
-            print(f"    Qwen input image: {img.size}, raw output: {output_text}")
-
-            # Parse JSON from response
-            team = None
-            color = "unknown"
-            try:
-                # Handle markdown code blocks
-                clean = output_text
-                if "```" in clean:
-                    clean = clean.split("```")[1]
-                    if clean.startswith("json"):
-                        clean = clean[4:]
-                    clean = clean.strip()
-                # Find JSON object
-                start = clean.find("{")
-                end = clean.rfind("}") + 1
-                if start >= 0 and end > start:
-                    parsed = json.loads(clean[start:end])
-                    team = parsed.get("team")
-                    color = parsed.get("color", "unknown")
-                    if team is not None:
-                        team = str(team)
-            except (json.JSONDecodeError, Exception):
-                pass
-
-            print(f"    Qwen parsed: team={team}, color={color}, expected={expected_alliance}, candidates={candidate_str}")
-
-            read = "".join(ch for ch in team if ch.isdigit()) if team else ""
-            model_color = color if color in ("blue", "red") else "unknown"
-            matched, alliance, confidence = _match_bumper_read_to_roster(
-                read, model_color, expected_alliance,
-                match_teams, blue_teams, red_teams,
-            )
-            if read and not matched:
-                print(f"    Qwen read '{read}' — no roster match for alliance hint {expected_alliance}/{model_color}")
-
-            results.append({
-                "team_number": matched,
-                "alliance": alliance,
-                "confidence": confidence,
-                "raw_read": read,
-            })
-
+            items.append((idx, messages, expected_alliance, candidate_str, img.size))
         except Exception as e:
             print(f"  Qwen VL error on crop: {e}")
-            results.append({
-                "team_number": None,
-                "alliance": "unknown",
-                "confidence": 0,
-                "raw_read": None,
-                "error": str(e),
-            })
+            results[idx] = _error_entry(e)
 
+    # ---- Phase 2: one batched generate (per-crop fallback on failure) ----
+    def _generate(batch):
+        """batch: list of phase-1 items -> list of (output_text, digit_prob)."""
+        msgs = [m for (_i, m, _a, _c, _s) in batch]
+        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                 for m in msgs]
+        image_inputs, video_inputs = process_vision_info(msgs)
+        inputs = processor(
+            text=texts,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(model.device)
+        with torch.no_grad():
+            gen = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                return_dict_in_generate=True,
+                output_scores=VLM_LOGPROB_CONFIDENCE,
+            )
+        # Left padding makes the prompt length uniform across rows.
+        in_len = inputs.input_ids.shape[1]
+        trimmed = gen.sequences[:, in_len:]
+        outs = processor.batch_decode(
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        digit_probs = [None] * len(batch)
+        if VLM_LOGPROB_CONFIDENCE and gen.scores:
+            tok = processor.tokenizer
+            stop_ids = {tid for tid in (tok.eos_token_id, tok.pad_token_id)
+                        if tid is not None}
+            for b in range(len(batch)):
+                probs, tok_texts = [], []
+                for t, step_logits in enumerate(gen.scores):
+                    if t >= trimmed.shape[1]:
+                        break
+                    tid = int(trimmed[b, t])
+                    if tid in stop_ids:
+                        break
+                    probs.append(
+                        torch.softmax(step_logits[b].float(), dim=-1)[tid].item())
+                    tok_texts.append(tok.decode([tid]))
+                digit_probs[b] = digit_token_conf(probs, tok_texts)
+        return [(o.strip(), dp) for o, dp in zip(outs, digit_probs)]
+
+    decoded: list = [None] * len(items)
+    if items:
+        batched = VLM_BATCH_READS and len(items) > 1
+        if batched:
+            try:
+                decoded = _generate(items)
+            except Exception as e:
+                print(f"  Qwen VL batched generate failed ({e!r}); falling back to per-crop")
+        if any(d is None for d in decoded):
+            for k, item in enumerate(items):
+                if decoded[k] is not None:
+                    continue
+                try:
+                    decoded[k] = _generate([item])[0]
+                except Exception as e:
+                    print(f"  Qwen VL error on crop: {e}")
+                    results[item[0]] = _error_entry(e)
+
+    # ---- Phase 3: parse + roster-match each output ----
+    for item, out in zip(items, decoded):
+        idx, _messages, expected_alliance, candidate_str, img_size = item
+        if out is None:
+            if results[idx] is None:
+                results[idx] = _error_entry("no VLM output")
+            continue
+        output_text, digit_prob = out
+        print(f"    Qwen input image: {img_size}, raw output: {output_text}")
+
+        team = None
+        color = "unknown"
+        try:
+            clean = output_text
+            if "```" in clean:
+                clean = clean.split("```")[1]
+                if clean.startswith("json"):
+                    clean = clean[4:]
+                clean = clean.strip()
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
+            if start >= 0 and end > start:
+                parsed = json.loads(clean[start:end])
+                team = parsed.get("team")
+                color = parsed.get("color", "unknown")
+                if team is not None:
+                    team = str(team)
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        print(f"    Qwen parsed: team={team}, color={color}, "
+              f"expected={expected_alliance}, candidates={candidate_str}, "
+              f"digit_prob={None if digit_prob is None else round(digit_prob, 3)}")
+
+        read = "".join(ch for ch in team if ch.isdigit()) if team else ""
+        model_color = color if color in ("blue", "red") else "unknown"
+        matched, alliance, confidence = _match_bumper_read_to_roster(
+            read, model_color, expected_alliance,
+            match_teams, blue_teams, red_teams,
+        )
+        confidence = blend_read_confidence(confidence, digit_prob)
+        if read and not matched:
+            print(f"    Qwen read '{read}' — no roster match for alliance hint {expected_alliance}/{model_color}")
+
+        results[idx] = {
+            "team_number": matched,
+            "alliance": alliance,
+            "confidence": confidence,
+            "raw_read": read,
+            "digit_prob": digit_prob,
+        }
+
+    results = [r if r is not None else _error_entry("skipped") for r in results]
     identified = sum(1 for r in results if r["team_number"])
     print(f"  Qwen VL: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")
@@ -4837,23 +7223,45 @@ def _ocr_bumper_number(frame: np.ndarray, box, match_teams: list) -> dict:
     return {"ocr_raw": raw, "matched_team": best_match, "confidence": best_match_confidence}
 
 
-def _detect_robots_in_frame(frame: np.ndarray, model, match_teams: list,
-                            blue_teams: list, red_teams: list) -> list:
+def _detect_robots_in_frame(
+    frame: np.ndarray,
+    model,
+    match_teams: list,
+    blue_teams: list,
+    red_teams: list,
+    bumper_model=None,
+) -> list:
     """Detect robots in a single frame. Returns list of robot dicts."""
-    results = model(frame, verbose=False)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    robot_mask = detections.class_id == 1
-    robot_dets = detections[robot_mask]
+    if bumper_model is not None:
+        results = bumper_model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        schema = DetectionSchema.from_names(bumper_model.names)
+        robot_dets, _balls, _hubs = schema.split(
+            sv.Detections.from_ultralytics(results)
+        )
+    else:
+        results = model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(results)
+        robot_dets = [
+            (
+                tuple(detections.xyxy[i]),
+                None,
+                (
+                    float(detections.confidence[i])
+                    if detections.confidence is not None
+                    else 1.0
+                ),
+            )
+            for i in range(len(detections))
+            if detections.class_id[i] == 1
+        ]
 
     robots = []
-    for i in range(len(robot_dets)):
-        box = robot_dets.xyxy[i]
-        conf = float(robot_dets.confidence[i])
+    for box, class_color, conf in robot_dets:
         x1, y1, x2, y2 = map(int, box)
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
 
-        alliance = _detect_bumper_color_static(frame, box)
+        alliance = class_color or "unknown"
 
         if alliance == "blue":
             candidate_teams = blue_teams
@@ -4948,6 +7356,9 @@ async def detect_robots(request: Request):
         return JSONResponse(status_code=400, content={"error": "No frames provided"})
 
     model = YOLO(str(MODEL_PATH))
+    bumper_model = (
+        YOLO(str(BUMPER_MODEL_PATH)) if BUMPER_MODEL_PATH.exists() else None
+    )
     all_robots = []
     frame_dims = None
 
@@ -4960,7 +7371,14 @@ async def detect_robots(request: Request):
         if frame_dims is None:
             frame_dims = (frame.shape[1], frame.shape[0])
 
-        robots = _detect_robots_in_frame(frame, model, match_teams, blue_teams, red_teams)
+        robots = _detect_robots_in_frame(
+            frame,
+            model,
+            match_teams,
+            blue_teams,
+            red_teams,
+            bumper_model=bumper_model,
+        )
         for r in robots:
             r["frame_index"] = frame_idx
             r.pop("frame_source", None)
@@ -5078,6 +7496,7 @@ async def load_event(request: Request):
             "match_count": len(event_data['matches']),
             "matches": event_data['matches'],
             "teams": event_data['teams'],
+            "timezone": event_data.get('timezone'),
             "has_ocr_regions": saved_regions is not None,
             "has_hub_positions": saved_hubs is not None,
         }
@@ -5098,6 +7517,7 @@ async def get_current_event():
         "event_name": current_event['event_name'],
         "matches": current_event['matches'],
         "teams": current_event['teams'],
+        "timezone": current_event.get('timezone'),
         "has_ocr_regions": custom_ocr_regions is not None,
         "has_hub_positions": event_hub_positions is not None,
     }
@@ -5227,16 +7647,98 @@ async def get_diagnostic(key: str):
     return StreamingResponse(iter_file(), media_type="application/x-ndjson")
 
 
+@app.get("/api/sam2_models")
+async def sam2_models():
+    """List selectable SAM2 encoder sizes and whether each checkpoint is downloaded.
+
+    The UI uses `available` to disable sizes whose .pt file is missing, since picking
+    one would silently degrade to Kalman tracking.
+    """
+    return {
+        "default": SAM2_MODEL_SIZE,
+        "default_backend": TRACKING_BACKEND,
+        "backends": [
+            {
+                "id": "sam2",
+                "label": "SAM 2.1",
+                "detail": "Fast Hiera models; current production default",
+            },
+            {
+                "id": "sam3",
+                "label": "SAM 3.1",
+                "detail": "Object Multiplex; CUDA/H100-oriented, gated checkpoint",
+            },
+        ],
+        "models": [
+            {
+                "size": size,
+                "label": label,
+                "detail": detail,
+                "available": _sam2_checkpoint_present(size),
+            }
+            for size, label, detail in _SAM2_SIZE_INFO
+        ],
+    }
+
+
 @app.post("/api/infer")
 async def infer(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
     team_reader: str = Form("local"),
     sam2_max_gpu_frames: Optional[int] = Form(None),
+    tracking_backend: Optional[str] = Form(None),
+    model_size: Optional[str] = Form(None),
+    match_key: Optional[str] = Form(None),
+    sam2_export_scale: Optional[float] = Form(None),
+    cull_hijack_enabled: Optional[bool] = Form(None),
+    reanchor_enabled: Optional[bool] = Form(None),
+    config_json: Optional[str] = Form(None),
 ):
-    """Start inference job"""
+    """Start inference job.
+
+    Per-job knobs arrive either as the legacy named form fields above or as
+    `config_json`, a JSON object of {knob_name: value} validated against the
+    JobConfig registry — a bad knob fails the submit with 400 instead of
+    failing minutes into inference. config_json wins over named fields.
+    """
     job_id = str(uuid.uuid4())
-    
+
+    # Resolve and validate the job config BEFORE touching the video source.
+    overrides: dict = {}
+    if team_reader and team_reader != "local":
+        overrides["team_reader"] = team_reader
+    if sam2_max_gpu_frames is not None:
+        overrides["sam2_max_gpu_frames"] = sam2_max_gpu_frames
+    if tracking_backend:
+        overrides["tracking_backend"] = tracking_backend.lower()
+    if model_size:
+        overrides["sam2_model_size"] = model_size.lower()
+    if sam2_export_scale is not None:
+        overrides["sam2_export_scale"] = sam2_export_scale
+    if cull_hijack_enabled is not None:
+        overrides["cull_hijack_enabled"] = cull_hijack_enabled
+    if reanchor_enabled is not None:
+        overrides["reanchor_enabled"] = reanchor_enabled
+    if config_json:
+        try:
+            extra = json.loads(config_json)
+        except ValueError:
+            return JSONResponse(status_code=400,
+                                content={"error": "config_json is not valid JSON"})
+        if not isinstance(extra, dict):
+            return JSONResponse(status_code=400,
+                                content={"error": "config_json must be a JSON object"})
+        overrides.update(extra)
+    try:
+        job_config = JobConfig(overrides)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    if not _sam2_checkpoint_present(job_config.sam2_model_size):
+        print(f"  [SAM2] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
+              f"{_SAM2_MODELS[job_config.sam2_model_size][1]}; "
+              f"SAM2 will fall back to Kalman tracking.")
+
     try:
         # Handle video source
         if video_file:
@@ -5270,12 +7772,10 @@ async def infer(
         else:
             return JSONResponse(status_code=400, content={"error": "No video file or YouTube URL provided"})
         
-        # Create job
-        team_reader = team_reader if team_reader in ("local", "deepseek") else "local"
-        job = InferenceJob(job_id, video_path, team_reader=team_reader)
-        # Per-run VRAM frame budget (UI override); falls back to env default when omitted.
-        if sam2_max_gpu_frames is not None:
-            job.sam2_max_gpu_frames = max(0, int(sam2_max_gpu_frames))
+        # Create job; every per-job knob flows through the validated config.
+        job = InferenceJob(
+            job_id, video_path, match_key=match_key, config=job_config)
+        _prune_finished_jobs()  # finished jobs stop pinning models in memory
         jobs[job_id] = job
         
         return {"job_id": job_id}
@@ -5440,13 +7940,47 @@ async def get_replay_identities(job_id: str):
     """Robot-slot identities for a job, each with its captured bumper crops as
     data-URLs. Raw embeddings are NEVER exposed to the client."""
     ids = await database.get_match_identities(job_id)
+    canonical = []
+    for alliance, slots in (("blue", range(3)), ("red", range(3, 6))):
+        candidates = [r for r in ids if r.get("alliance") == alliance]
+        by_slot = {}
+        used_identity_ids = set()
+        for row in candidates:
+            slot = row.get("slot")
+            if slot in slots and slot not in by_slot:
+                by_slot[slot] = row
+                used_identity_ids.add(row.get("identity_id"))
+        remaining = [
+            row for row in candidates
+            if row.get("identity_id") not in used_identity_ids
+        ]
+        remaining.sort(
+            key=lambda row: (
+                not bool(row.get("confirmed")),
+                -(float(row.get("confidence") or 0.0)),
+                int(row.get("identity_id") or 0),
+            )
+        )
+        for slot, row in zip((s for s in slots if s not in by_slot), remaining):
+            row = dict(row)
+            row["slot"] = slot
+            row["slot_label"] = InferenceJob._slot_label(slot)
+            by_slot[slot] = row
+        canonical.extend(by_slot[slot] for slot in slots if slot in by_slot)
+    ids = canonical
     out = []
     for r in ids:
-        crops = await database.get_match_crops(job_id, r["slot"])
+        identity_id = r.get("identity_id")
+        if identity_id is None:
+            identity_id = r["slot"]
+        crops = await database.get_match_crops(job_id, identity_id)
         out.append({
-            "slot": r["slot"], "slot_label": r["slot_label"], "alliance": r["alliance"],
+            "slot": r["slot"] if r["slot"] is not None else -1,
+            "slot_label": r["slot_label"] if r["slot_label"] is not None else "occluded",
+            "alliance": r["alliance"],
             "team_number": r["team_number"], "confirmed": bool(r["confirmed"]),
             "source": r["source"], "confidence": r["confidence"],
+            "identity_id": identity_id,
             "crops": [
                 "data:image/jpeg;base64," + base64.b64encode(c["image"]).decode()
                 for c in crops if c["image"] is not None
@@ -5461,16 +7995,31 @@ async def correct_replay_identity(job_id: str, request: Request):
     replay's displayed team list, and mints VERIFIED gallery exemplars from the
     slot's crops (only when the replay has an event_key)."""
     body = await request.json()
-    slot = int(body["slot"])
+    identity_id = body.get("identity_id")
+    slot = body.get("slot")
+    if slot is not None:
+        slot = int(slot)
     team = str(body["team_number"]).strip()
-    ids = {r["slot"]: r for r in await database.get_match_identities(job_id)}
-    rec = ids.get(slot)
+    
+    ids = await database.get_match_identities(job_id)
+    rec = None
+    if identity_id is not None:
+        rec = next((r for r in ids if r.get("identity_id") == int(identity_id)), None)
+    elif slot is not None:
+        rec = next((r for r in ids if r.get("slot") == slot), None)
+        
     if rec is None:
-        return JSONResponse(status_code=404, content={"error": "slot not found"})
+        return JSONResponse(status_code=404, content={"error": "identity not found"})
+        
+    resolved_identity_id = rec.get("identity_id")
+    if resolved_identity_id is None:
+        resolved_identity_id = rec["slot"]
+    resolved_slot = rec.get("slot")
+        
     alliance = rec["alliance"]
     # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence)
     await database.upsert_match_robot_identity(
-        {**rec, "job_id": job_id, "slot": slot, "team_number": team})
+        {**rec, "job_id": job_id, "identity_id": resolved_identity_id, "team_number": team})
     # 2. update the replay's team lists for display + mint exemplars
     replay = await database.get_replay(job_id)
     minted = 0
@@ -5486,19 +8035,22 @@ async def correct_replay_identity(job_id: str, request: Request):
         if team not in [str(t) for t in teams]:
             teams.append(team)
         await database.update_replay_teams(job_id, key, json.dumps(teams))
-        # 3. mint verified exemplars from this slot's crops (needs event_key + color)
+        # 3. mint verified exemplars from this identity's crops (needs event_key + color)
         event_key = replay.get("event_key")
         color = alliance if alliance in ("red", "blue") else None
         if event_key and color:
-            for c in await database.get_match_crops(job_id, slot):
+            for c in await database.get_match_crops(job_id, resolved_identity_id):
                 if c["embedding"] is None:
                     continue
                 await database.insert_gallery_exemplar({
-                    "event_key": event_key, "team": team, "alliance_color": color,
+                    "event_key": event_key,
+                    "source_match_key": replay.get("match_key"),
+                    "team": team, "alliance_color": color,
                     "embedding": c["embedding"], "legibility": c["legibility"],
                     "image": c["image"], "verified": 1, "job_id": job_id})
                 minted += 1
-    return {"status": "ok", "slot": slot, "team_number": team,
+    return {"status": "ok", "slot": resolved_slot if resolved_slot is not None else -1,
+            "identity_id": resolved_identity_id, "team_number": team,
             "verified_exemplars": minted}
 
 
@@ -5560,6 +8112,15 @@ async def remove_gallery(gid: int):
     return {"status": "deleted", "id": gid}
 
 
+@app.delete("/api/gallery")
+async def clear_gallery(event_key: str):
+    """Delete ALL gallery exemplars for an event (troubleshooting reset). The
+    gallery regenerates from match processing, so this is a cache clear, not
+    permanent data loss."""
+    removed = await database.clear_gallery_exemplars(event_key)
+    return {"status": "cleared", "event_key": event_key, "removed": removed}
+
+
 @app.delete("/api/replays/{replay_id}")
 async def delete_replay_endpoint(replay_id: str):
     row = await database.get_replay(replay_id)
@@ -5603,15 +8164,12 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
         pass
 
     try:
-        await job.process_video()
+        await _run_job_serialized(job)
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for job {job_id}")
     except Exception as e:
         print(f"Error in websocket_infer: {e}")
-        try:
-            await websocket.send_json({"type": "error", "error": str(e)})
-        except:
-            pass
+        await job._send_ws({"type": "error", "error": str(e)})
     finally:
         try:
             job.diagnostic.set_ws_send(None)

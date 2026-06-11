@@ -1,9 +1,9 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import cv2
 
-from web.app import InferenceJob
+from web.app import InferenceJob, _restore_sam2_mask_to_view
 from web.field.tracker import FieldDetection
 
 
@@ -67,6 +67,33 @@ def test_inference_job_defaults_vram_budget_from_env_constant():
     assert job.sam2_max_gpu_frames == app_mod.SAM2_MAX_GPU_FRAMES
 
 
+def test_restore_sam2_mask_reinserts_top_crop_without_vertical_shift():
+    mask = np.zeros((4, 6), dtype=bool)
+    mask[1:3, 2:5] = True
+
+    restored = _restore_sam2_mask_to_view(
+        mask,
+        (10, 12, 3),
+        top_offset_px=2,
+    )
+
+    assert restored.shape == (10, 12)
+    assert not restored[:2].any()
+    ys, xs = np.where(restored)
+    assert ys.min() == 4
+    assert ys.max() == 7
+    assert xs.min() == 4
+    assert xs.max() == 9
+
+
+def test_restore_sam2_mask_without_crop_fills_full_view():
+    mask = np.ones((2, 3), dtype=bool)
+
+    restored = _restore_sam2_mask_to_view(mask, (4, 6, 3))
+
+    assert restored.all()
+
+
 class TestSAM2Streaming(unittest.TestCase):
     @patch("web.app.YOLO")
     def test_sam2_fallback_on_import_error(self, mock_yolo):
@@ -98,6 +125,7 @@ class TestSAM2Streaming(unittest.TestCase):
         job._open_log_file = MagicMock()
         job._close_log_file = MagicMock()
         job.extract_team_numbers = MagicMock()
+        job._scan_match_clock = MagicMock(return_value=[])
         
         # Simulate Sam2FieldTracker raising an ImportError (e.g. no torch/sam2 installed)
         with patch("web.field.sam2_tracker.Sam2FieldTracker", side_effect=ImportError("no torch")):
@@ -128,6 +156,7 @@ class TestSAM2Streaming(unittest.TestCase):
         # Mock YOLO model constructor
         mock_model_instance = MagicMock()
         mock_model_instance.return_value = [mock_yolo_result]
+        mock_model_instance.names = {0: "blue_bumper", 1: "red_bumper"}
         mock_yolo.return_value = mock_model_instance
         
         job = InferenceJob("test_job", "/mock/path/video.mp4")
@@ -170,10 +199,14 @@ class TestSAM2Streaming(unittest.TestCase):
         # Mock radar
         job.radar = MagicMock()
         job.radar.render.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+        job._compose_hud_frame = MagicMock(
+            return_value=np.zeros((100, 100, 3), dtype=np.uint8)
+        )
         
         job._open_log_file = MagicMock()
         job._close_log_file = MagicMock()
         job.extract_team_numbers = MagicMock()
+        job._scan_match_clock = MagicMock(return_value=[])
         
         mock_person_result = MagicMock()
         mock_person_result.boxes = MockBoxes(
@@ -191,16 +224,19 @@ class TestSAM2Streaming(unittest.TestCase):
         job.person_model = mock_person_model_instance
         
         # Mock SAM2 tracker returning a track dictionary
-        # local_idx = (200 - 180) // 2 = 10
+        # Legacy fallback starts at frame 180, so frame 200 maps to local index 10.
         mock_sam2_tracker = MagicMock()
         mock_sam2_tracker.track.return_value = {
             10: {0: {"box": (5.0, 5.0, 25.0, 25.0), "mask": np.ones((150, 150), dtype=bool)}}
         }
         mock_sam2_tracker_cls.return_value = mock_sam2_tracker
         
-        # Mock embedder returning mock embedding
+        # Mock embedder returning one embedding per box (batched API)
         mock_embedder = MagicMock()
         mock_embedder.embed.return_value = np.zeros(384, dtype=np.float32)
+        mock_embedder.embed_batch.side_effect = (
+            lambda frame, boxes, masks=None:
+                [np.zeros(384, dtype=np.float32)] * len(boxes))
         mock_embedder_cls.return_value = mock_embedder
         
         # Setup VideoCapture to run for a few frames
@@ -231,7 +267,27 @@ class TestSAM2Streaming(unittest.TestCase):
             return True, np.zeros((1080, 1920, 3), dtype=np.uint8)
         mock_cap.read.side_effect = mock_read
         
-        with patch("cv2.VideoCapture", return_value=mock_cap):
+        with patch("cv2.VideoCapture", return_value=mock_cap), \
+             patch("web.app.ReplayRecorder") as replay_cls, \
+             patch(
+                 "web.app.database.upsert_match_robot_identity",
+                 new=AsyncMock(),
+             ), \
+             patch(
+                 "web.app.database.insert_match_robot_crop",
+                 new=AsyncMock(),
+             ), \
+             patch(
+                 "web.app.database.insert_match_robot_binding",
+                 new=AsyncMock(),
+             ), \
+             patch(
+                 "web.app.asyncio.to_thread",
+                 new=AsyncMock(
+                     side_effect=lambda func, **kwargs: func(**kwargs)
+                 ),
+             ):
+            replay_cls.return_value.is_open = False
             import asyncio
             asyncio.run(job.process_video())
             
@@ -253,6 +309,8 @@ class TestSAM2Streaming(unittest.TestCase):
             assert callable(track_kwargs.get("detect_fn"))
             assert isinstance(track_kwargs.get("reprompt_every"), int)
             assert track_kwargs["reprompt_every"] >= 1
+            assert isinstance(track_kwargs.get("object_metadata"), dict)
             assert track_kwargs.get("max_objects") == 6
             # Verify DINOv2 embedding was extracted during the loop
-            mock_embedder.embed.assert_called()
+            # (one batched forward pass per view instead of per-object embed()).
+            mock_embedder.embed_batch.assert_called()

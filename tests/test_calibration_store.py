@@ -65,3 +65,48 @@ def test_robot_track_top_crop_defaults_zero_for_legacy_json():
     d.pop("robot_track_top_crop", None)  # simulate an old calibration file
     c2 = CameraCalibration.from_json(d)
     assert c2.robot_track_top_crop == 0.0
+
+
+def test_save_version_creates_new_file_never_overwrites(tmp_path):
+    store.UPLOAD_DIR = tmp_path
+    v1 = store.save_version("evt", "main", _cal(), start_match="2026evt_qm1", label="day1")
+    v2 = store.save_version("evt", "main", _cal(), start_match="2026evt_qm50")
+    assert v1 != v2
+    files = sorted(tmp_path.glob("calibration_evt_main__*.json"))
+    assert len(files) == 2
+
+
+def test_load_versions_returns_all_with_metadata(tmp_path):
+    store.UPLOAD_DIR = tmp_path
+    store.save_version("evt", "main", _cal(), start_match="2026evt_qm1", label="day1")
+    store.save_version("evt", "main", _cal(), start_match="2026evt_qm50")
+    vs = store.load_versions("evt", "main")
+    assert len(vs) == 2
+    assert {v["start_match"] for v in vs} == {"2026evt_qm1", "2026evt_qm50"}
+    assert all(v["calibration"] is not None and "version_id" in v for v in vs)
+    assert any(v["label"] == "day1" for v in vs)
+
+
+def test_load_versions_includes_legacy_single_file_as_none_start(tmp_path):
+    store.UPLOAD_DIR = tmp_path
+    store.save("evt", "main", _cal())          # legacy one-file save
+    vs = store.load_versions("evt", "main")
+    assert len(vs) == 1
+    assert vs[0]["start_match"] is None
+
+
+def test_update_version_in_place_keeps_metadata(tmp_path):
+    store.UPLOAD_DIR = tmp_path
+    vid = store.save_version("evt", "main", _cal(), start_match="2026evt_qm1", label="day1")
+    cal2 = _cal(); cal2.robot_track_top_crop = 0.42
+    store.update_version("evt", "main", vid, cal2)
+    vs = store.load_versions("evt", "main")
+    assert len(vs) == 1
+    v = vs[0]
+    assert v["version_id"] == vid and v["start_match"] == "2026evt_qm1" and v["label"] == "day1"
+    assert v["calibration"].robot_track_top_crop == 0.42
+
+
+def test_load_versions_empty_when_none(tmp_path):
+    store.UPLOAD_DIR = tmp_path
+    assert store.load_versions("evt", "main") == []

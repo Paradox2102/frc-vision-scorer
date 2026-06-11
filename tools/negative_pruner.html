@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hard-Negative Pruner</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #17191c; color: #eee; font-family: system-ui, sans-serif; }
+  header {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
+    gap: 12px; padding: 10px 16px; background: #25282d; border-bottom: 1px solid #444;
+  }
+  h1 { margin: 0; font-size: 17px; }
+  a, button, select { color: #fff; }
+  a { margin-left: auto; }
+  select, button {
+    border: 1px solid #555; border-radius: 5px; background: #343941;
+    padding: 7px 10px; font-size: 13px;
+  }
+  #status { color: #bbb; font-size: 13px; }
+  #sections { padding: 12px; }
+  .section { margin-bottom: 24px; }
+  .section h2 {
+    margin: 0 0 9px; color: #7fd69a; font-size: 16px; text-transform: capitalize;
+  }
+  .section-count { color: #999; font-size: 12px; font-weight: 400; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+  }
+  .card {
+    padding: 0; overflow: hidden; border: 2px solid transparent; border-radius: 7px;
+    background: #292d33; cursor: pointer; text-align: left;
+  }
+  .card:hover { border-color: #e05252; }
+  .card img {
+    display: block; width: 100%; height: 145px; object-fit: contain; background: #0c0d0f;
+  }
+  .meta { padding: 7px 9px 9px; }
+  .label { color: #7fd69a; font-weight: 700; }
+  .event, .frame { color: #aaa; font-size: 12px; overflow-wrap: anywhere; }
+  .empty { padding: 30px; color: #aaa; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hard-Negative Pruner</h1>
+  <select id="batch">
+    <option value="equipment">tablet/radio batch</option>
+    <option value="all">all tagged crops</option>
+    <option value="legacy">hub/outpost batch</option>
+  </select>
+  <select id="labelFilter">
+    <option value="all">all labels</option>
+  </select>
+  <button id="reload">Reload</button>
+  <span id="status"></span>
+  <a href="/">Box annotator</a>
+</header>
+<main id="sections"></main>
+<script>
+const sections = document.getElementById('sections');
+const batch = document.getElementById('batch');
+const labelFilter = document.getElementById('labelFilter');
+const status = document.getElementById('status');
+let loadedImages = [];
+
+async function loadImages() {
+  status.textContent = 'Loading...';
+  const r = await fetch('/api/prune/images?batch=' + encodeURIComponent(batch.value));
+  const data = await r.json();
+  loadedImages = data.images;
+  const previousLabel = labelFilter.value;
+  const labels = [...new Set(loadedImages.map(item => item.label))].sort();
+  labelFilter.replaceChildren(new Option('all labels', 'all'));
+  for (const label of labels) labelFilter.appendChild(new Option(label, label));
+  labelFilter.value = labels.includes(previousLabel) ? previousLabel : 'all';
+  renderImages();
+}
+
+function renderImages() {
+  sections.replaceChildren();
+  const visible = loadedImages.filter(
+    item => labelFilter.value === 'all' || item.label === labelFilter.value
+  );
+  const grouped = new Map();
+  for (const item of visible) {
+    if (!grouped.has(item.label)) grouped.set(item.label, []);
+    grouped.get(item.label).push(item);
+  }
+  for (const [groupLabel, items] of [...grouped.entries()].sort()) {
+    const section = document.createElement('section');
+    section.className = 'section';
+    const heading = document.createElement('h2');
+    heading.textContent = groupLabel + ' ';
+    const count = document.createElement('span');
+    count.className = 'section-count';
+    count.textContent = `(${items.length})`;
+    heading.appendChild(count);
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    for (const item of items) grid.appendChild(makeCard(item));
+    section.append(heading, grid);
+    sections.appendChild(section);
+  }
+  if (!visible.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No crops remain for this selection.';
+    sections.appendChild(empty);
+  }
+  updateCount();
+}
+
+function makeCard(item) {
+    const card = document.createElement('button');
+    card.className = 'card';
+    card.title = 'Click to permanently remove this crop';
+
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = '/api/prune/image?path=' + encodeURIComponent(item.path);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = item.label;
+    const event = document.createElement('div');
+    event.className = 'event';
+    event.textContent = item.event + (item.box !== item.label ? ' / ' + item.box : '');
+    const frame = document.createElement('div');
+    frame.className = 'frame';
+    frame.textContent = 'frame ' + item.frame;
+    meta.append(label, event, frame);
+    card.append(img, meta);
+
+    card.addEventListener('click', async () => {
+      card.disabled = true;
+      const response = await fetch(
+        '/api/prune/image?path=' + encodeURIComponent(item.path),
+        {method: 'DELETE'}
+      );
+      if (!response.ok) {
+        card.disabled = false;
+        alert('Delete failed: ' + (await response.text()));
+        return;
+      }
+      loadedImages = loadedImages.filter(image => image.path !== item.path);
+      renderImages();
+    });
+    return card;
+}
+
+function updateCount() {
+  const count = sections.querySelectorAll('.card').length;
+  status.textContent = `${count} crop${count === 1 ? '' : 's'} remaining`;
+}
+
+batch.addEventListener('change', loadImages);
+labelFilter.addEventListener('change', renderImages);
+document.getElementById('reload').addEventListener('click', loadImages);
+loadImages();
+</script>
+</body>
+</html>

@@ -12,6 +12,12 @@ dependencies = [
     "sam2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
 ]
 
+[project.optional-dependencies]
+sam3 = [
+    "numpy>=1.26,<2",
+    "sam3 @ git+https://github.com/facebookresearch/sam3.git@8e451d5eb43c817b64ae7577fb7b9ae223db88a9",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

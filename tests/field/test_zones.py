@@ -20,6 +20,18 @@ def test_no_zones_is_never_blocked():
     assert Z.point_in_zones((2.0, 2.0), None) is False
 
 
+def test_prism_bounding_zones_adds_margin():
+    from types import SimpleNamespace
+    import numpy as np
+
+    prism = SimpleNamespace(
+        footprint=np.array([[1.0, 2.0], [3.0, 2.0], [3.0, 4.0]])
+    )
+    assert Z.prism_bounding_zones([prism], margin=0.25) == [
+        (0.75, 1.75, 3.25, 4.25)
+    ]
+
+
 def test_corners_may_be_given_in_any_order():
     # The UI hands back drag corners that may be (x2<x1) or (y2<y1).
     assert Z.point_in_zones((2.0, 2.0), [(3.0, 3.0, 1.0, 1.0)]) is True

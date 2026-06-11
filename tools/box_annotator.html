@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hard-Negative Box Annotator</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #1e1e1e; color: #eee; }
+  header { padding: 10px 16px; background: #2b2b2b; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; }
+  button, select { background: #3a6ea5; color: #fff; border: 0; padding: 7px 11px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #4a82c0; }
+  button#submit { background: #2e8b57; font-weight: 600; }
+  button#submit:hover { background: #39a868; }
+  select { background: #333; }
+  #wrap { display: flex; gap: 12px; padding: 12px; }
+  #canvasBox { flex: 1; overflow: auto; border: 1px solid #444; max-height: 86vh; }
+  #side { width: 320px; flex-shrink: 0; }
+  canvas { cursor: crosshair; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { border: 1px solid #444; padding: 3px 5px; text-align: left; }
+  input.lbl { width: 84px; background: #333; color: #eee; border: 1px solid #555; }
+  .hint { font-size: 12px; color: #aaa; }
+  .del { background: #a44; padding: 2px 7px; }
+  #status { font-size: 13px; color: #6c6; }
+  .quick { background:#555; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hard-Negative Box Annotator</h1>
+  <select id="batchSel" title="annotation batch">
+    <option value="equipment">tablet/radio batch</option>
+    <option value="all">all frames</option>
+    <option value="legacy">hub/outpost batch</option>
+  </select>
+  <select id="frameSel" title="frame to annotate"></select>
+  <span>label:</span>
+  <button class="quick" data-lbl="hub">hub</button>
+  <button class="quick" data-lbl="outpost">outpost</button>
+  <button class="quick" data-lbl="tablet">tablet</button>
+  <button class="quick" data-lbl="radio">radio</button>
+  <input class="lbl" id="curLabel" value="hub" title="label for the next box">
+  <button id="submit">Submit &amp; save</button>
+  <span id="status"></span>
+</header>
+<div id="wrap">
+  <div id="canvasBox"><canvas id="cv"></canvas></div>
+  <div id="side">
+    <p class="hint" id="dims"></p>
+    <table id="tbl"><thead><tr><th>label</th><th>x1,y1,x2,y2</th><th></th></tr></thead><tbody></tbody></table>
+    <p class="hint">Drag one box around each complete false-positive assembly. For a
+      tablet or fieldside radio, include its full pole/stand in the same box. Box
+      repeated views separately. Do not box an assembly while a robot overlaps it.
+      Coords are original pixels. Submit saves to the server; reopening a frame
+      reloads your boxes.</p>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const sel = document.getElementById('frameSel'), batchSel = document.getElementById('batchSel');
+const status = document.getElementById('status');
+let img = null, scale = 1, boxes = [], drag = null, frameName = null, allFrames = [];
+
+async function init() {
+  allFrames = await (await fetch('/api/frames')).json();
+  selectBatch();
+}
+
+function selectBatch() {
+  const frames = allFrames.filter(name => {
+    if (batchSel.value === 'equipment') return name.startsWith('frame_equipment_');
+    if (batchSel.value === 'legacy') return !name.startsWith('frame_equipment_');
+    return true;
+  });
+  sel.innerHTML = frames.map(f => `<option>${f}</option>`).join('');
+  if (frames.length) loadFrame(frames[0]);
+  else {
+    frameName = null;
+    boxes = [];
+    status.textContent = 'No frames in this batch.';
+    sync();
+  }
+}
+batchSel.addEventListener('change', selectBatch);
+sel.addEventListener('change', () => loadFrame(sel.value));
+
+async function loadFrame(name) {
+  frameName = name;
+  boxes = await (await fetch('/api/boxes/' + encodeURIComponent(name))).json().catch(() => []);
+  status.textContent = boxes.length ? `loaded ${boxes.length} saved boxes` : '';
+  const im = new Image();
+  im.onload = () => {
+    img = im;
+    const maxW = Math.min(window.innerWidth - 360, 1600);
+    scale = Math.min(1, maxW / im.width);
+    cv.width = Math.round(im.width * scale);
+    cv.height = Math.round(im.height * scale);
+    document.getElementById('dims').textContent = `${name} — ${im.width}×${im.height}px (scale ${scale.toFixed(3)})`;
+    sync(); redraw();
+  };
+  im.src = '/api/frame/' + encodeURIComponent(name);
+}
+
+function toOrig(x, y) { return [Math.round(x / scale), Math.round(y / scale)]; }
+cv.addEventListener('mousedown', e => { const r = cv.getBoundingClientRect(); drag = { x0: e.clientX - r.left, y0: e.clientY - r.top, x1: 0, y1: 0 }; });
+cv.addEventListener('mousemove', e => { if (!drag) return; const r = cv.getBoundingClientRect(); drag.x1 = e.clientX - r.left; drag.y1 = e.clientY - r.top; redraw(); });
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  const [ox1, oy1] = toOrig(Math.min(drag.x0, drag.x1), Math.min(drag.y0, drag.y1));
+  const [ox2, oy2] = toOrig(Math.max(drag.x0, drag.x1), Math.max(drag.y0, drag.y1));
+  if (ox2 - ox1 > 4 && oy2 - oy1 > 4) { boxes.push({ label: document.getElementById('curLabel').value || 'neg', x1: ox1, y1: oy1, x2: ox2, y2: oy2 }); sync(); }
+  drag = null; redraw();
+});
+
+function redraw() {
+  if (!img) return;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  ctx.lineWidth = 2; ctx.font = '13px sans-serif';
+  boxes.forEach((b, i) => { ctx.strokeStyle = '#ff3b3b'; ctx.fillStyle = '#ff3b3b'; ctx.strokeRect(b.x1 * scale, b.y1 * scale, (b.x2 - b.x1) * scale, (b.y2 - b.y1) * scale); ctx.fillText(`${i}:${b.label}`, b.x1 * scale + 3, b.y1 * scale + 14); });
+  if (drag) { ctx.strokeStyle = '#3bf'; ctx.strokeRect(drag.x0, drag.y0, drag.x1 - drag.x0, drag.y1 - drag.y0); }
+}
+
+function sync() {
+  const tb = document.querySelector('#tbl tbody'); tb.innerHTML = '';
+  boxes.forEach((b, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><input class="lbl" value="${b.label}" data-i="${i}"></td><td>${b.x1},${b.y1},${b.x2},${b.y2}</td><td><button class="del" data-i="${i}">x</button></td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll('input.lbl').forEach(inp => inp.addEventListener('change', e => { boxes[+e.target.dataset.i].label = e.target.value; }));
+  tb.querySelectorAll('button.del').forEach(btn => btn.addEventListener('click', e => { boxes.splice(+e.target.dataset.i, 1); sync(); redraw(); }));
+}
+
+document.querySelectorAll('button.quick').forEach(b => b.addEventListener('click', () => { document.getElementById('curLabel').value = b.dataset.lbl; }));
+
+document.getElementById('submit').addEventListener('click', async () => {
+  const r = await fetch('/api/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ frame: frameName, boxes }) });
+  const j = await r.json();
+  if (!j.saved) { status.textContent = 'error: ' + JSON.stringify(j); return; }
+  // auto-advance to the next frame in the dropdown
+  const i = sel.selectedIndex;
+  if (i < sel.options.length - 1) {
+    sel.selectedIndex = i + 1;
+    loadFrame(sel.value);
+    status.textContent = `✓ saved ${j.n} — now ${sel.value} (${i + 2}/${sel.options.length})`;
+  } else {
+    status.textContent = `✓ saved ${j.n} — all ${sel.options.length} frames done`;
+  }
+});
+
+init();
+</script>
+</body>
+</html>

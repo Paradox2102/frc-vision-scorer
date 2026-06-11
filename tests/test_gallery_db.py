@@ -44,6 +44,26 @@ def test_get_gallery_exemplars_empty_for_unknown_event(db):
     assert asyncio.run(db.get_gallery_exemplars("nope")) == []
 
 
+def test_get_gallery_exemplars_filters_to_match_teams(db):
+    for team in ("573", "9785", "581", "1732", "4698", "3297", "254"):
+        asyncio.run(db.insert_gallery_exemplar({
+            "event_key": "2026hop", "team": team, "alliance_color": "blue",
+            "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        }))
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026other", "team": "573", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+    }))
+
+    roster = ["573", 9785, "581", "1732", "4698", "3297", "573"]
+    rows = asyncio.run(db.get_gallery_exemplars("2026hop", teams=roster))
+
+    assert {row["team"] for row in rows} == {
+        "573", "9785", "581", "1732", "4698", "3297",
+    }
+    assert len(rows) == 6
+
+
 def test_gallery_exemplar_records_source_job_id(db):
     # The source match (job_id) is persisted so the UI can offer that match's
     # roster as the relabel dropdown.
@@ -63,3 +83,33 @@ def test_gallery_exemplar_job_id_optional(db):
     }))
     rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
     assert rows[0]["job_id"] is None
+
+
+def test_previous_gallery_exemplars_excludes_current_future_and_unknown(db):
+    event_id = asyncio.run(db.upsert_event(
+        "2026wamon", "WAMon", 2026, "Somewhere", "2026-03-01", "2026-03-03"
+    ))
+    for number in (1, 2, 3):
+        asyncio.run(db.upsert_match(
+            event_id, f"2026wamon_qm{number}", "qm", number
+        ))
+
+    for source_match_key, team in (
+        ("2026wamon_qm1", "111"),
+        ("2026wamon_qm2", "222"),
+        ("2026wamon_qm3", "333"),
+        (None, "999"),
+    ):
+        asyncio.run(db.insert_gallery_exemplar({
+            "event_key": "2026wamon",
+            "source_match_key": source_match_key,
+            "team": team,
+            "alliance_color": "blue",
+            "embedding": _emb_bytes(1, 0, 0),
+            "legibility": 0.9,
+        }))
+
+    rows = asyncio.run(db.get_previous_gallery_exemplars(
+        "2026wamon", "2026wamon_qm2"
+    ))
+    assert [row["team"] for row in rows] == ["111"]

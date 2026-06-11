@@ -1,28 +1,59 @@
-# SP-B: Integrate the Bumper/Fuel Detection Model — Implementation Plan
+# SP-B: Integrate the Bumper Model (AUGMENT) — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Drive detection from a bumper model (`red_bumper`/`blue_bumper`/`fuel`), taking alliance color from the detection class and resolving it through the existing multi-camera fusion vote; expand bumper boxes into robot boxes for SAM2 seeding (so masks + appearance gallery stay whole-robot); rely on static hubs; and **delete the HSV color path entirely**.
+## Context: this is now an AUGMENT integration, not a replace
 
-**Architecture:** A `DetectionSchema` auto-detected from `model.names` says which class ids are robots (and their fixed color), fuel, and hub. Every class-id filter in the codebase routes through `schema.split()` — this is **correctness-critical** because class 0 changes meaning (`fuel_ball` → `red_bumper`). Per-detection class color flows into `FieldDetection.color` and is reconciled by `web/field/fusion.py`'s existing color vote (no fusion change). SAM2 seeds from upward-expanded boxes and carries seed/re-prompt class color per object id. The HSV classifier and its three call sites are removed.
+SP-A produced a **2-class bumper detector** (`runs/train/frc_bumpers/weights/best.pt`,
+`names = {0: blue_bumper, 1: red_bumper}`, mAP50 0.977, **0 red↔blue swaps**). It detects
+**robots + alliance color only** — no fuel, no hub. So we run **two models**:
 
-**Tech Stack:** Python, `ultralytics`/`supervision`, existing `web/field/` modules. Tests: `.venv/bin/python -m pytest` (base conda python lacks pytest — project memory).
+- **Existing model** (`runs/train/hub_zone_yolo26s`, `self.model`) — keeps providing
+  **fuel** (class 0) and **hub** (class 2), exactly as today. Its robot class (1) is
+  ignored.
+- **New bumper model** (`self.bumper_model`) — provides **robot detections + alliance
+  color** (red_bumper→red, blue_bumper→blue), replacing the existing model's robot class
+  **and** the HSV color path.
 
-**Contract consumed (from SP-A):** `runs/train/frc_bumpers/weights/best.pt`, `names == {0: red_bumper, 1: blue_bumper, 2: fuel}`. **Tasks 1–2 are pure helpers buildable now, before weights exist.**
+**Goal:** robots + color come from the bumper model (resolved through the existing fusion
+vote); fuel/hub stay on the existing model; the HSV color path is deleted; bumper boxes
+are expanded upward into robot boxes for SAM2 seeding so masks + appearance gallery stay
+whole-robot.
 
-**Spec:** `docs/superpowers/specs/2026-06-06-bumper-color-detection-model-design.md` (revised: full HSV removal, fusion-vote color, all class-id sites through schema).
+**Net change from today:** only the **robot-detection + color** paths switch to the new
+model. **Ball/hub paths are unchanged** (they keep reading the existing model's
+detections — so the `class_id==0` ball filter and `class_id==2` hub filter stay as-is).
+This is *smaller* than the earlier "route every class-id site through one schema" plan,
+but adds a second model pass and a dual-source HUD/detection split.
+
+**Tech Stack:** Python, `ultralytics`/`supervision`, `web/field/`. Tests:
+`.venv/bin/python -m pytest` (base conda python lacks pytest — project memory).
+
+**Spec:** `docs/superpowers/specs/2026-06-06-bumper-color-detection-model-design.md`
+(note: the spec describes the single-3-class replace; this plan supersedes it with the
+augment reality from SP-A's as-built outcome).
 
 ---
 
+## Performance note
+
+Running two YOLOv8m models on the overhead frame ≈ +6 ms/frame (the bumper model's
+inference). Detection is not the pipeline bottleneck (SAM2 is), so this is acceptable.
+If it ever matters, the bumper model can run only on the overhead crop (where robots are),
+which is already the case.
+
 ## File Structure
 
-- Create: `web/field/detect_schema.py` — `DetectionSchema` (+`split`), `expand_bumper_to_robot`. Pure, no app import.
+- Create: `web/field/detect_schema.py` — `DetectionSchema` (describes the **bumper**
+  model: red/blue → robot+color), `expand_bumper_to_robot`. Pure, no app import.
 - Create: `tests/test_detect_schema.py`.
-- Modify: `web/field/detect_bridge.py` — `to_field_detections` takes required `colors`, drops `color_fn`/`frame`.
-- Modify: `tests/test_detect_bridge.py` — update to the new signature.
-- Modify: `web/field/bumper.py` — delete color logic (`classify_bumper_color`, `_color_masks`, `_largest_rectangular_band_ratio`, `BumperColor`); keep geometry (`bumper_band_box`, `bumper_crop`, `_clamp_box`).
-- Modify: `web/app.py` — schema at load; route all class-id sites through schema; SAM2 seed/re-prompt expansion + color map; delete HSV methods; status/hub/HUD; `FRC_DETECT_MODEL` env + default flip.
-- Modify: `web/static/index.html` — none required (no UI change in SP-B).
+- Modify: `web/field/detect_bridge.py` — `to_field_detections` takes required `colors`,
+  drops `color_fn`/`frame`.
+- Modify: `tests/test_detect_bridge.py`.
+- Modify: `web/field/bumper.py` — delete color logic; keep geometry.
+- Modify: `web/app.py` — load `self.bumper_model` + schema; robot+color from it in
+  `_detect_view`, the early pass, SAM2 seed/re-prompt, the slot-map, the HUD robot branch,
+  and `_detect_robots_in_frame`; delete HSV; status endpoint. Ball/hub sites untouched.
 
 ---
 
@@ -30,7 +61,10 @@
 
 **Files:** Create `web/field/detect_schema.py`; Test `tests/test_detect_schema.py`
 
-- [ ] **Step 1: Write the failing tests**
+Same helper as before — the bumper model's `names` yield robots-with-color and (for this
+2-class model) **no** fuel/hub. `split()` returns `(robots[(box,color,conf)], [], [])`.
+
+- [ ] **Step 1: Failing tests**
 
 ```python
 # tests/test_detect_schema.py
@@ -38,144 +72,42 @@ import numpy as np
 from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot
 
 
-def test_schema_legacy_model():
-    s = DetectionSchema.from_names({0: "fuel_ball", 1: "robot", 2: "hub_opening"})
-    assert s.robot_class_color == {1: None}
-    assert s.fuel_class == 0 and s.hub_class == 2 and s.has_hub is True
-
-
-def test_schema_bumper_model():
-    s = DetectionSchema.from_names({0: "red_bumper", 1: "blue_bumper", 2: "fuel"})
-    assert s.robot_class_color == {0: "red", 1: "blue"}
-    assert s.fuel_class == 2 and s.hub_class is None and s.has_hub is False
+def test_schema_bumper_model_two_class():
+    s = DetectionSchema.from_names({0: "blue_bumper", 1: "red_bumper"})
+    assert s.robot_class_color == {0: "blue", 1: "red"}
+    assert s.fuel_class is None and s.hub_class is None
 
 
 class _FakeDets:
-    def __init__(self, boxes, class_ids, confs):
-        self.xyxy = np.array(boxes, dtype=float)
-        self.class_id = np.array(class_ids, dtype=int)
-        self.confidence = np.array(confs, dtype=float)
-    def __len__(self):
-        return len(self.class_id)
+    def __init__(self, boxes, ids, confs):
+        self.xyxy = np.array(boxes, float); self.class_id = np.array(ids, int)
+        self.confidence = np.array(confs, float)
+    def __len__(self): return len(self.class_id)
 
 
-def test_split_buckets_bumper_dets_with_color_and_fuel_is_class_2():
-    # CORRECTNESS-CRITICAL: under the bumper schema class 0 is a RED ROBOT, and fuel is
-    # class 2 — the opposite of the legacy schema. split() must bucket by schema, not id.
-    s = DetectionSchema.from_names({0: "red_bumper", 1: "blue_bumper", 2: "fuel"})
-    dets = _FakeDets([(0,0,10,10),(5,5,15,15),(1,1,2,2)], [0,1,2], [0.9,0.8,0.7])
+def test_split_bumper_only():
+    s = DetectionSchema.from_names({0: "blue_bumper", 1: "red_bumper"})
+    dets = _FakeDets([(0,0,10,10),(5,5,15,15)], [1,0], [0.9,0.8])
     robots, balls, hubs = s.split(dets)
     assert robots == [((0,0,10,10),"red",0.9), ((5,5,15,15),"blue",0.8)]
-    assert balls == [(1,1,2,2)]
-    assert hubs == []
-
-
-def test_split_legacy_schema_still_works():
-    s = DetectionSchema.from_names({0: "fuel_ball", 1: "robot", 2: "hub_opening"})
-    dets = _FakeDets([(0,0,9,9),(1,1,2,2),(3,3,4,4)], [1,0,2], [0.9,0.5,0.5])
-    robots, balls, hubs = s.split(dets)
-    assert robots == [((0,0,9,9), None, 0.9)]
-    assert balls == [(1,1,2,2)] and hubs == [(3,3,4,4)]
+    assert balls == [] and hubs == []
 
 
 def test_expand_grows_upward_only():
-    out = expand_bumper_to_robot((100,400,160,420), (480,640,3), factor=3.0)
-    assert out == (100, 360.0, 160, 420)   # width + bottom unchanged, top raised 3x height
+    assert expand_bumper_to_robot((100,400,160,420),(480,640,3),factor=3.0) == (100,360.0,160,420)
 
 
 def test_expand_clamps_to_frame_top():
-    out = expand_bumper_to_robot((0,30,50,60), (480,640,3), factor=5.0)
-    assert out[1] == 0.0
+    assert expand_bumper_to_robot((0,30,50,60),(480,640,3),factor=5.0)[1] == 0.0
 ```
 
-- [ ] **Step 2: Run — verify fail**
-
-Run: `.venv/bin/python -m pytest tests/test_detect_schema.py -v`
-Expected: FAIL (`ModuleNotFoundError: web.field.detect_schema`).
-
-- [ ] **Step 3: Implement**
-
-```python
-# web/field/detect_schema.py
-"""Auto-detect a detector's class scheme from model.names so the pipeline is driven by
-class meaning, not hardcoded ids. Pure — no app import."""
-from __future__ import annotations
-import re
-from dataclasses import dataclass
-
-
-def _norm(name: str) -> str:
-    s = re.sub(r"[\s\-]+", "_", name.strip().lower())
-    return re.sub(r"_+", "_", s).strip("_")
-
-
-@dataclass
-class DetectionSchema:
-    robot_class_color: dict[int, str | None]   # class_id -> "red"/"blue"/None(generic)
-    fuel_class: int | None
-    hub_class: int | None
-    names: dict[int, str]
-
-    @classmethod
-    def from_names(cls, names: dict[int, str]) -> "DetectionSchema":
-        names = {int(k): v for k, v in names.items()}
-        robot_color: dict[int, str | None] = {}
-        fuel = hub = None
-        for cid, raw in names.items():
-            n = _norm(raw)
-            if n == "red_bumper":
-                robot_color[cid] = "red"
-            elif n == "blue_bumper":
-                robot_color[cid] = "blue"
-            elif n == "robot":
-                robot_color[cid] = None
-            elif n in ("fuel", "fuel_ball"):
-                fuel = cid
-            elif n in ("hub_opening", "hub"):
-                hub = cid
-        return cls(robot_color, fuel, hub, names)
-
-    @property
-    def has_hub(self) -> bool:
-        return self.hub_class is not None
-
-    def split(self, dets):
-        """Bucket sv.Detections into (robots, balls, hubs). robots: (box, color|None, conf)."""
-        robots, balls, hubs = [], [], []
-        confs = getattr(dets, "confidence", None)
-        for i in range(len(dets)):
-            cid = int(dets.class_id[i])
-            box = tuple(float(v) for v in dets.xyxy[i])
-            conf = float(confs[i]) if confs is not None else 1.0
-            if cid in self.robot_class_color:
-                robots.append((box, self.robot_class_color[cid], conf))
-            elif cid == self.fuel_class:
-                balls.append(box)
-            elif cid == self.hub_class:
-                hubs.append(box)
-        return robots, balls, hubs
-
-
-def expand_bumper_to_robot(box, frame_shape, factor: float = 3.0):
-    """Grow a bumper box UPWARD into an estimated whole-robot box for SAM2 seeding.
-    Width and bottom edge (ground contact) unchanged; top raised and clamped to frame."""
-    x1, y1, x2, y2 = box
-    new_y1 = max(0.0, y2 - (y2 - y1) * factor)
-    return (x1, new_y1, x2, y2)
-```
-
-- [ ] **Step 4: Run — verify pass**
-
-Run: `.venv/bin/python -m pytest tests/test_detect_schema.py -v` → PASS (6 tests).
-
-- [ ] **Step 5: Reconcile `_norm` with SP-A names** — confirm the trained model's `names` normalize to `red_bumper`/`blue_bumper`/`fuel`; if SP-A used different strings, extend `from_names` + add a test.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add web/field/detect_schema.py tests/test_detect_schema.py
-git commit -m "feat(detect): DetectionSchema (class->color/fuel/hub) + bumper->robot box expansion"
-```
+- [ ] **Step 2: Run → fail** (`ModuleNotFoundError`).
+- [ ] **Step 3: Implement** `web/field/detect_schema.py` (identical to the helper specced
+  earlier — `from_names` maps `red_bumper`→"red"/`blue_bumper`→"blue"/`robot`→None,
+  `fuel`/`fuel_ball`→fuel, `hub_opening`/`hub`→hub; `split()`; `expand_bumper_to_robot`
+  grows the top by `factor`, clamps to 0, leaves width + bottom). Pure, name-driven.
+- [ ] **Step 4: Run → pass** (4 tests).
+- [ ] **Step 5: Commit** — `feat(detect): DetectionSchema + bumper->robot box expansion`.
 
 ---
 
@@ -183,464 +115,272 @@ git commit -m "feat(detect): DetectionSchema (class->color/fuel/hub) + bumper->r
 
 **Files:** Modify `web/field/detect_bridge.py:19-28`; Test `tests/test_detect_bridge.py`
 
-The HSV `color_fn` is being deleted, so `to_field_detections` no longer needs `color_fn` or `frame`; color is supplied per box.
+Drop `color_fn`/`frame`; require a `colors` list parallel to `robot_boxes` (the HSV path
+is being deleted, so there is no fallback colorizer).
 
-- [ ] **Step 1: Rewrite the tests to the new signature**
-
-Replace the body of `tests/test_detect_bridge.py` (keep imports + `truth_pinhole_camera`):
-
-```python
-import numpy as np
-from web.field.field_model import FieldModel
-from web.field.detect_bridge import to_field_detections, field_adjacent_persons
-from tests._field_synth import truth_pinhole_camera
-
-
-def test_box_maps_to_field_point_with_class_color():
-    fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()
-    gx, gy = 8.0, 4.0
-    u, v = cam.field_to_image((gx, gy, 0.0))
-    box = (u - 30, v - 120, u + 30, v)
-    dets = to_field_detections([box], cam, (fm.length_m, fm.width_m), colors=["blue"])
-    assert len(dets) == 1
-    assert np.hypot(dets[0].pos[0] - gx, dets[0].pos[1] - gy) < 0.10
-    assert dets[0].color == "blue"
-
-
-def test_per_box_colors_are_independent():
-    fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()
-    boxes, colors = [], []
-    for (gx, gy), c in [((6.0, 3.0), "red"), ((9.0, 5.0), "blue")]:
-        u, v = cam.field_to_image((gx, gy, 0.0))
-        boxes.append((u - 30, v - 120, u + 30, v)); colors.append(c)
-    dets = to_field_detections(boxes, cam, (fm.length_m, fm.width_m), colors=colors)
-    assert [d.color for d in dets] == ["red", "blue"]
-
-
-def test_off_field_box_dropped():
-    fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()
-    u, v = cam.field_to_image((30.0, 4.0, 0.0))
-    box = (u - 30, v - 120, u + 30, v)
-    assert to_field_detections([box], cam, (fm.length_m, fm.width_m), colors=["red"]) == []
-
-
-def test_field_adjacent_person_filter():
-    fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()
-    u, v = cam.field_to_image((8.0, -0.3, 0.0)); near = (u-25, v-150, u+25, v)
-    uc, vc = cam.field_to_image((40.0, 4.0, 0.0)); crowd = (uc-25, vc-150, uc+25, vc)
-    keep = field_adjacent_persons([near, crowd], cam, (fm.length_m, fm.width_m), margin=2.0)
-    assert near in keep and crowd not in keep
-```
-
-- [ ] **Step 2: Run — verify fail**
-
-Run: `.venv/bin/python -m pytest tests/test_detect_bridge.py -v`
-Expected: FAIL (`to_field_detections()` still has the old `color_fn`/`frame` signature → `TypeError`/unexpected kwarg).
-
-- [ ] **Step 3: Implement the new signature**
-
-Replace `to_field_detections` in `web/field/detect_bridge.py`:
-
-```python
-def to_field_detections(robot_boxes, calibration, field_dims, colors, margin=1.0):
-    """robot_boxes[i] is colored by colors[i] (the detection's class color: 'red'/'blue'
-    /'unknown'/None). No HSV — color is a property of the detection."""
-    out = []
-    for idx, box in enumerate(robot_boxes):
-        uv = _bottom_center(box)
-        xy = calibration.image_to_field(uv)
-        if xy is None or not _on_field(xy, field_dims, margin):
-            continue
-        color = colors[idx] if (colors is not None and idx < len(colors) and colors[idx]) else "unknown"
-        out.append(FieldDetection(pos=xy, color=color, box=tuple(box), score=1.0))
-    return out
-```
-
-(Drop the now-unused `frame` and `color_fn` params. `field_adjacent_persons` is unchanged.)
-
-- [ ] **Step 4: Run — verify pass**
-
-Run: `.venv/bin/python -m pytest tests/test_detect_bridge.py -v` → PASS (4 tests).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add web/field/detect_bridge.py tests/test_detect_bridge.py
-git commit -m "feat(detect): to_field_detections takes per-box class colors (drop HSV color_fn)"
-```
+- [ ] **Step 1–4:** rewrite the tests to call
+  `to_field_detections(boxes, cam, field_dims, colors=[...])` (per-box color used; missing
+  → `"unknown"`); run → fail; implement the new signature
+  `to_field_detections(robot_boxes, calibration, field_dims, colors, margin=1.0)`
+  (`color = colors[idx] if colors[idx] else "unknown"`); run → pass. (Full code as specced
+  earlier in the pre-rewrite plan; `field_adjacent_persons` unchanged.)
+- [ ] **Step 5: Commit** — `feat(detect): to_field_detections takes per-box class colors`.
 
 ---
 
-## Task 3: Load schema + env knobs at model init
+## Task 3: Load the bumper model + schema
 
-**Files:** Modify `web/app.py` (`:118`, `:481`)
+**Files:** Modify `web/app.py` (`:118` area, `:481` area)
 
-- [ ] **Step 1: Env-selectable model + factor**
-
-Replace `MODEL_PATH = ...` (`app.py:118`):
+- [ ] **Step 1: Env + path constants** near `MODEL_PATH` (`:118`):
 
 ```python
-_DEFAULT_MODEL = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
-# Flip _DEFAULT_MODEL to the bumper model in Task 8 after acceptance. FRC_DETECT_MODEL
-# overrides at runtime.
-MODEL_PATH = Path(os.environ.get("FRC_DETECT_MODEL", str(_DEFAULT_MODEL)))
+# Existing 3-class model stays for fuel + hub.
+MODEL_PATH = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
+# New bumper model supplies robots + alliance color (augment). Unset/missing -> fall
+# back to the existing model's robot class + no class-color (legacy behavior).
+BUMPER_MODEL_PATH = Path(os.environ.get(
+    "FRC_BUMPER_MODEL", str(PROJECT_ROOT / "runs/train/frc_bumpers/weights/best.pt")))
 ROBOT_BOX_FROM_BUMPER_FACTOR = float(os.environ.get("ROBOT_BOX_FROM_BUMPER_FACTOR", "3.0"))
 ```
 
-- [ ] **Step 2: Build schema after load**
-
-After `self.model = YOLO(str(MODEL_PATH))` (`app.py:481`):
+- [ ] **Step 2: Load + schema** after `self.model = YOLO(str(MODEL_PATH))` (`:481`):
 
 ```python
-from web.field.detect_schema import DetectionSchema
-self.det_schema = DetectionSchema.from_names(self.model.names)
-print(f"[detect] model={MODEL_PATH.name} classes={self.model.names} "
-      f"robots={self.det_schema.robot_class_color} hub={self.det_schema.has_hub}")
+from web.field.detect_schema import DetectionSchema, expand_bumper_to_robot
+self.bumper_model = None
+self.det_schema = None
+if BUMPER_MODEL_PATH.exists():
+    self.bumper_model = YOLO(str(BUMPER_MODEL_PATH))
+    self.det_schema = DetectionSchema.from_names(self.bumper_model.names)
+    print(f"[detect] bumper model={BUMPER_MODEL_PATH.name} "
+          f"classes={self.bumper_model.names} robots={self.det_schema.robot_class_color}")
+else:
+    print(f"[detect] bumper model not found at {BUMPER_MODEL_PATH}; "
+          f"falling back to existing model's robot class + HSV color")
 ```
 
-Add `from web.field.detect_schema import expand_bumper_to_robot` to the module imports (~`app.py:60`).
+Add `expand_bumper_to_robot` import at module level too (used in Task 5). When
+`self.bumper_model is None`, every robot+color site below keeps today's behavior (guarded
+by `if self.bumper_model is not None`). This keeps the app runnable without the weights.
 
-- [ ] **Step 3: Smoke check**
-
-Run: `.venv/bin/python -c "from web.field.detect_schema import DetectionSchema; from ultralytics import YOLO; m=YOLO('runs/train/hub_zone_yolo26s/weights/best.pt'); print(DetectionSchema.from_names(m.names))"`
-Expected: schema with `robot_class_color={1: None}`, `hub_class=2`.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add web/app.py
-git commit -m "feat(detect): env-selectable detector + DetectionSchema at load"
-```
+- [ ] **Step 3: Smoke** — load both models in a one-liner; confirm
+  `bumper.names == {0:'blue_bumper',1:'red_bumper'}`.
+- [ ] **Step 4: Commit** — `feat(detect): load bumper model + schema (augment)`.
 
 ---
 
-## Task 4: Route ALL class-id sites through the schema (correctness-critical)
+## Task 4: Robots + color from the bumper model (detection paths)
 
-**Files:** Modify `web/app.py` at `:796-810`, `:1942`, `:1637`, `:2933-2952`, `:4865-4890`
+**Files:** Modify `web/app.py` `:781-820` (`_detect_view`), `:2926-2955` (early pass),
+`:4865-4900` (`_detect_robots_in_frame`)
 
-Every hardcoded `class_id == N` must become a schema call, because the new model's ids mean different things. Do each, then run a syntax check.
+For each, robots+color come from the **bumper model**; **ball/hub logic is NOT touched**.
 
-- [ ] **Step 1: `_detect_view` (`:796-810`)** — replace the `class_id==1` loop + `to_field_detections` call:
+- [ ] **Step 1: `_detect_view` (`:781-820`)** — run the bumper model on the view frame
+  for robots; drop the existing model's robot loop. (Ball/hub aren't produced here.)
 
 ```python
-        robots, _balls, _hubs = self.det_schema.split(dets)
+        if self.bumper_model is not None:
+            bres = self.bumper_model(frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+            bdets = sv.Detections.from_ultralytics(bres)
+            robots, _b, _h = self.det_schema.split(bdets)
+        else:
+            # legacy fallback: robots from the existing model + HSV color (color=None)
+            robots = [(tuple(dets.xyxy[i]), None, float(dets.confidence[i]))
+                      for i in range(len(dets)) if dets.class_id[i] == 1]
         robot_boxes, robot_colors = [], []
-        for (box, color, _conf) in robots:
+        for (box, color, _c) in robots:
             cx, cy = (box[0]+box[2])/2.0, (box[1]+box[3])/2.0
-            if any(mx <= cx <= mx+mw and my <= cy <= my+mh for (mx,my,mw,mh) in view.masks):
+            if any(mx<=cx<=mx+mw and my<=cy<=my+mh for (mx,my,mw,mh) in view.masks):
                 continue
             robot_boxes.append(np.array(box)); robot_colors.append(color)
         field_dets = to_field_detections(robot_boxes, cal, self.field_dims, colors=robot_colors)
 ```
 
-- [ ] **Step 2: Ball detector (`:1942`) — CORRECTNESS-CRITICAL**
+(When falling back, `robot_colors` is all `None` → `to_field_detections` stores
+`"unknown"`; fusion's territory heuristic resolves it as today. With the bumper model,
+real colors flow.)
 
-`update_ball_trajectories` does `ball_mask = detections.class_id == 0`. Under the bumper schema class 0 is a **red robot**. Replace with the schema's fuel class:
+- [ ] **Step 2: Early-OCR pre-pass (`:2933`)** — same swap: build `early_boxes` +
+  `early_colors` from `self.bumper_model` via `schema.split` (fallback to existing model's
+  class-1 when `bumper_model is None`); pass `colors=` to `to_field_detections`. Keep the
+  mask filter; filter colors in lockstep.
 
-```python
-        if self.det_schema.fuel_class is None:
-            return   # detector has no fuel class
-        ball_mask = detections.class_id == self.det_schema.fuel_class
-```
+- [ ] **Step 3: `_detect_robots_in_frame` (`:4865`)** — this standalone helper takes a
+  `model` param and is called by `/api/detect-robots` (`:4957`), which currently
+  instantiates its own `YOLO(MODEL_PATH)` (`:4975`). This endpoint is part of the
+  calibration flow and may run with **no active job**, so do NOT reach into `jobs` for a
+  `bumper_model`. Instead, in the endpoint, load the bumper model directly (mirroring the
+  existing `YOLO(MODEL_PATH)` line): `bumper_model = YOLO(str(BUMPER_MODEL_PATH)) if
+  BUMPER_MODEL_PATH.exists() else None`, and pass it to `_detect_robots_in_frame`. Inside
+  the helper, when a bumper model is given, build `DetectionSchema.from_names(bumper_model.names)`,
+  run it for robots + class color, and use `_ocr_bumper_number` on each; fall back to the
+  existing model's class-1 + `"unknown"` color when no bumper model. Preserve the result-dict
+  keys (`box`, `center`, `confidence`, `alliance`, `ocr_raw`, `matched_team`, `ocr_confidence`).
 
-(Read the surrounding lines; keep the rest of the trajectory logic.)
+- [ ] **Step 4: Ball + hub — confirm UNCHANGED.** `update_ball_trajectories` (`:1942`,
+  `class_id==0`) and `update_hub_positions` (`:1637`, `class_id==2`) keep reading the
+  **existing** model's `detections`. Do **not** modify them. (Hub is also static per
+  event; leaving the existing detector running is harmless.) Add a one-line comment at each
+  noting they intentionally consume the existing 3-class model, not the bumper model.
+  Also leave a comment at the run-once `self.model(overhead_frame)` pass (`:2993`) that it
+  now feeds **only** ball/hub (+ HUD ball/hub drawing) — robots moved to `self.bumper_model`
+  — so a future reader doesn't delete it thinking robots still come from it.
 
-> Also note `detect_ball_in_hub_scores` (`:2186`) has the same `class_id == 0` but is
-> **dead code (no callers — verified)**. Leave it, but add a one-line comment there so
-> the Step 7 completeness grep doesn't flag it as an uncovered live site, OR delete the
-> dead method. Do not wire it up.
-
-- [ ] **Step 3: Hub detector (`:1637`)**
-
-`hub_mask = detections.class_id == 2` → drive from schema; a hubless schema yields none:
-
-```python
-        if self.det_schema.hub_class is None:
-            return
-        hub_mask = detections.class_id == self.det_schema.hub_class
-```
-
-- [ ] **Step 4: Early-OCR pre-pass (`:2933-2952`)**
-
-`early_boxes = [... if detections.class_id[i]==1]` + `to_field_detections(..., color_fn=...)` → use `schema.split` and pass colors:
-
-```python
-                robots, _b, _h = self.det_schema.split(detections)
-                early_boxes, early_colors = [], []
-                for (box, color, _c) in robots:
-                    early_boxes.append(np.array(box)); early_colors.append(color)
-                # (apply the existing main_view.masks filter to early_boxes/early_colors in lockstep)
-                ...
-                early_field_dets = to_field_detections(
-                    early_boxes, self.calib, self.field_dims, colors=early_colors)
-```
-
-Read `:2926-2955` and keep the mask-filter behavior, filtering `early_colors` in lockstep with `early_boxes`.
-
-- [ ] **Step 5: Detection→tracked-slot map (`:3187` and `:3204`)**
-
-Both branches (SAM2 at `:3187`, non-SAM2 at `:3204`) filter with `detections.class_id[di]
-!= 1` to consider only robots. Under the bumper schema, red robots are class 0, so `!= 1`
-would drop every red robot from the slot map (their HUD labels/boxes break). Replace both
-occurrences:
-
-```python
-                        if int(detections.class_id[di]) not in self.det_schema.robot_class_color:
-                            continue
-```
-
-(`replace_all` is unsafe — the two lines have different indentation; edit each in place.)
-
-- [ ] **Step 6: `/api/detect-robots` path (`_detect_robots_in_frame`, `:4865`)**
-
-It receives `model` and does `class_id==1` + `_detect_bumper_color_static`. Build a schema from the passed model and use class color:
-
-```python
-def _detect_robots_in_frame(frame, model, match_teams, blue_teams, red_teams) -> list:
-    from web.field.detect_schema import DetectionSchema
-    results = model(frame, verbose=False)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    schema = DetectionSchema.from_names(model.names)
-    robots_split, _b, _h = schema.split(detections)
-    robots = []
-    for (box, color, conf) in robots_split:
-        x1, y1, x2, y2 = map(int, box)
-        alliance = color or "unknown"
-        candidate_teams = {"blue": blue_teams, "red": red_teams}.get(alliance, match_teams)
-        ocr_result = _ocr_bumper_number(frame, box, candidate_teams)
-        ...  # keep the rest of the per-robot dict construction
-```
-
-Read `:4865-4900` and preserve the result-dict shape (`box`, `center`, `confidence`,
-`alliance`, `ocr_raw`, `matched_team`, `ocr_confidence`); just replace the class filter +
-color source.
-
-- [ ] **Step 7: Completeness grep + syntax check + commit**
-
-The HUD draw branch (`:3282-3344`) is rewired in Task 6 (it's coupled to the
-`detect_bumper_color` deletion). After Tasks 4 **and** 6, verify no live `class_id`
-literal remains:
-
-Run: `grep -nE "class_id(\[[^]]*\])? *[!=]= *[012]\b" web/app.py`
-(This matches only **bare-integer** comparisons, so schema-driven lines like
-`int(class_id) == self.det_schema.fuel_class` don't false-positive.)
-Expected after both tasks: only the dead-code `:2186` line remains. The
-grep-verified full inventory is: `798, 1637, 1942, 2186(dead), 2933, 3187, 3204,
-3286/3289/3338/3341/3344, 4870`.
-
-Run: `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`
-
-```bash
-git add web/app.py
-git commit -m "feat(detect): route all class-id sites through DetectionSchema (fuel=class2 fix)"
-```
+- [ ] **Step 5: Syntax check + commit** —
+  `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`;
+  `feat(detect): robots+color from bumper model in detection paths (augment)`.
 
 ---
 
-## Task 5: SAM2 seed/re-prompt expansion + class color → fusion vote
+## Task 5: SAM2 seed/re-prompt from the bumper model + box expansion
 
-**Files:** Modify `web/app.py` `:2816-2822` (prompt), `:2870-2883` (detect_fn), `:2905` (store), `:3024-3069` (post-SAM2)
+**Files:** Modify `web/app.py` `:2816-2822`, `:2870-2883`, `:2905`, `:3024-3069`
 
-SAM2 obj ids are `1..N` in prompt order, so seed colors map directly. Color flows into each post-SAM2 `FieldDetection.color`; fusion votes across views (no fusion change).
+SAM2 robot prompts come from the **bumper model**, expanded upward into robot boxes; obj
+ids `1..N` carry seed color; post-SAM2 color from that map (no HSV).
 
-- [ ] **Step 1: Prompt frame — expand boxes + record seed colors**
-
-Add a `view_prompt_colors` dict beside `view_prompt_boxes` (same init site). Replace `:2818-2822`:
+- [ ] **Step 1: Prompt frame (`:2818-2822`)** — add `view_prompt_colors` beside
+  `view_prompt_boxes`; detect with `self.bumper_model`:
 
 ```python
-                                    if is_prompt:
-                                        res = self.model(crop, conf=0.4, verbose=False)[0]
-                                        pdets = sv.Detections.from_ultralytics(res)
-                                        robots, _b, _h = self.det_schema.split(pdets)
+                                    if is_prompt and self.bumper_model is not None:
+                                        res = self.bumper_model(crop, conf=0.4, verbose=False)[0]
+                                        robots, _b, _h = self.det_schema.split(
+                                            sv.Detections.from_ultralytics(res))
                                         for (box, color, _c) in robots:
-                                            rbox = (expand_bumper_to_robot(box, crop.shape,
+                                            rbox = expand_bumper_to_robot(box, crop.shape,
                                                         ROBOT_BOX_FROM_BUMPER_FACTOR)
-                                                    if color is not None else box)
                                             view_prompt_boxes[view.name].append(
-                                                tuple(v * SAM2_SCALE for v in rbox))
+                                                tuple(v*SAM2_SCALE for v in rbox))
                                             view_prompt_colors[view.name].append(color)
+                                    elif is_prompt:  # legacy fallback: existing model, class 1
+                                        res = self.model(crop, conf=0.4, verbose=False)[0]
+                                        for i in range(len(res.boxes)):
+                                            if int(res.boxes.cls[i]) == 1:
+                                                box = res.boxes.xyxy[i].cpu().numpy()*SAM2_SCALE
+                                                view_prompt_boxes[view.name].append(tuple(box))
+                                                view_prompt_colors[view.name].append(None)
 ```
 
-- [ ] **Step 2: Re-prompt `detect_fn` — expand boxes**
-
-Replace `:2877-2882`:
-
-```python
-                                res = self.model(img, conf=0.4, verbose=False)[0]
-                                rdets = sv.Detections.from_ultralytics(res)
-                                robots, _b, _h = self.det_schema.split(rdets)
-                                return [
-                                    (expand_bumper_to_robot(box, img.shape, ROBOT_BOX_FROM_BUMPER_FACTOR)
-                                     if color is not None else box)
-                                    for (box, color, _c) in robots
-                                ]
-```
-
-- [ ] **Step 3: Store the obj-id → seed-color map**
-
-Where `self.sam2_raw[view.name] = view_tracks` (`:2905`):
-
-```python
-                        self.sam2_obj_color = getattr(self, "sam2_obj_color", {})
-                        self.sam2_obj_color[view.name] = {
-                            i + 1: c for i, c in enumerate(view_prompt_colors[view.name])
-                        }
-```
-
-- [ ] **Step 4: Post-SAM2 coloring (`:3043`) — class color, no HSV**
-
-Replace `color = self.detect_bumper_color(view_frame, np.array([fx1,fy1,fx2,fy2]))` with:
-
-```python
-                            color = self.sam2_obj_color.get(view.name, {}).get(obj_id) or "unknown"
-```
-
-Re-prompted obj ids not in the seed map get `"unknown"`; fusion's territory fallback + other views resolve them. Read `:3024-3069` to confirm `obj_id`/`view`/`view_frame` names.
-
-- [ ] **Step 5: Confirm fusion votes the color**
-
-Read `web/field/fusion.py` (`_merge`, ~`:54`). Confirm per-detection `color` feeds the existing weighted color vote (no code change expected). If fusion ignores `"unknown"`, that's correct. Note findings in the commit message; do **not** add a fusion code change unless a test shows it's needed.
-
-- [ ] **Step 6: Syntax check + commit**
-
-Run: `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`
-
-```bash
-git add web/app.py
-git commit -m "feat(detect): SAM2 seeds from expanded boxes; class color per track -> fusion vote"
-```
+- [ ] **Step 2: Re-prompt `detect_fn` (`:2877-2882`)** — use the bumper model + expand
+  (fallback to existing model class-1 unexpanded when `bumper_model is None`).
+- [ ] **Step 3: Store obj-id→color map (`:2905`)** —
+  `self.sam2_obj_color[view.name] = {i+1: c for i,c in enumerate(view_prompt_colors[view.name])}`.
+- [ ] **Step 4: Post-SAM2 color (`:3043`)** — replace the `detect_bumper_color(...)` call
+  with `color = self.sam2_obj_color.get(view.name, {}).get(obj_id) or "unknown"`. Fusion
+  votes across views.
+- [ ] **Step 5: Confirm fusion votes color** (read `web/field/fusion.py` `_merge` ~`:54`;
+  no change expected — it already weights color votes and ignores `"unknown"`).
+- [ ] **Step 6: Syntax + commit** — `feat(detect): SAM2 robot prompts from bumper model (expanded) + seed color`.
 
 ---
 
-## Task 6: Delete the HSV color path
+## Task 6: HUD draw branch — robots from tracked slots, balls/hubs from existing
 
-**Files:** Modify `web/field/bumper.py`, `web/app.py` (`:60`, `:1691`, `:3326`, `:4251`, `:4881`)
+**Files:** Modify `web/app.py` `:3150-3210` (slot map) and `:3280-3353` (HUD loop)
 
-- [ ] **Step 1: Delete color logic in `bumper.py`**
+**Corrected design (a review caught that the original framing was wrong):** in the
+overhead HUD today, tracked robots are drawn **only inside the `class_id==1` branch**
+(`:3291-3322`, plus box styling at `:3341/:3344`). There is **no** separate per-slot draw
+loop — so simply `continue`-ing past class 1 would make robots vanish. We must **add** an
+explicit per-slot draw loop. Fortunately the data is already there:
+`tracked_robot_boxes` (`:3151`, list of `(slot_id, box)` for visible tracks) and
+`track_by_slot` (`:3277`) hold every visible tracked robot, and `t.box` is the
+bumper-derived field-detection box once Task 4 lands. `detection_to_tracked` (`:3173`)
+exists **only** to feed this HUD branch (grep confirms uses at `:3291/:3341/:3344` only).
 
-Remove `classify_bumper_color`, `_color_masks`, `_largest_rectangular_band_ratio`, and the `BumperColor` dataclass. **Keep** `_clamp_box`, `bumper_band_box`, `bumper_crop` (used by HUD + VLM crop). Remove now-unused imports.
+- [ ] **Step 1: Delete the now-orphaned `detection_to_tracked` build (`:3173-3209`).** It
+  maps the *existing* model's class-1 detections to slots — the wrong source under augment,
+  and only the robot HUD branch consumed it. Remove the whole block (both the SAM2 and
+  non-SAM2 branches).
 
-- [ ] **Step 2: Fix the `bumper.py` import in app.py (`:60`)**
+- [ ] **Step 2: In the existing-`detections` HUD loop (`:3282`), stop drawing robots.**
+  Keep `class_id == 0` (ball) and the `else` (hub) branches exactly as today. Replace the
+  entire `elif class_id == 1:` branch (`:3289-3331`, both the tracked and the
+  `detect_bumper_color` untracked sub-branches) with `elif class_id == 1: continue`. Also
+  drop the class-1 box-styling lines (`:3341`, `:3344`) — robots are styled by the new loop.
 
-`from web.field.bumper import bumper_band_box, bumper_crop, classify_bumper_color`
-→ `from web.field.bumper import bumper_band_box, bumper_crop`
+- [ ] **Step 3: Add a per-slot robot draw loop** (after the `detections` loop, where
+  `track_by_slot` is in scope). For each visible tracked robot, draw via the existing
+  `_draw_bumper_hud`, recovering the main-view SAM2 mask the same way the old branch did
+  (`:3300-3314`):
 
-- [ ] **Step 3: Delete `detect_bumper_color` method (`:1691`)** and `_detect_bumper_color_static` (`:4251`). Verify no remaining callers:
-
-Run: `grep -n "detect_bumper_color\|classify_bumper_color\|_detect_bumper_color_static" web/app.py`
-Expected after edits: **no matches** (all call sites rewired in Tasks 4/5 and Step 4 below).
-
-- [ ] **Step 4: Rewire the WHOLE HUD draw branch (`:3282-3344`), not just the color call**
-
-This branch hardcodes class meaning throughout, so under the bumper schema class 0 (red
-robot) would render as a yellow "ball" and fuel (class 2) would fall into the `else: hub`
-branch. Route every comparison through the schema. Read `:3282-3344` and apply:
-
-- `:3286` `if class_id == 0:  # fuel_ball` → `if int(class_id) == self.det_schema.fuel_class:`
-- `:3289` `elif class_id == 1:  # robot` → `elif int(class_id) in self.det_schema.robot_class_color:`
-- `:3326` untracked color: `alliance = self.detect_bumper_color(overhead_frame, detections.xyxy[i])`
-  → `alliance = self.det_schema.robot_class_color.get(int(class_id)) or "unknown"`
-- `:3332` `else:  # hub_opening` — unchanged (catch-all), but it now only fires for the
-  hub class (or genuinely unknown classes), which is correct.
-- `:3338` `if class_id == 0 and not HUD_DRAW_BALL_BOXES:` → `if int(class_id) == self.det_schema.fuel_class and not HUD_DRAW_BALL_BOXES:`
-- `:3341` / `:3344` `class_id == 1 and i in detection_to_tracked ...` →
-  `int(class_id) in self.det_schema.robot_class_color and i in detection_to_tracked ...`
-
-(Guard against `fuel_class is None`: `int(class_id) == self.det_schema.fuel_class` is
-safely `False` when `fuel_class` is `None`, so no extra None-check is needed.)
-
-- [ ] **Step 5: Run unit suites + syntax check**
-
-Run: `.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"`
-Run: `.venv/bin/python -m pytest tests/test_detect_schema.py tests/test_detect_bridge.py -q`
-Expected: PASS, and the grep in Step 3 returns nothing.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add web/field/bumper.py web/app.py
-git commit -m "refactor(detect): delete HSV color path; color is now the detection class"
+```python
+                # Draw tracked robots from their slots (robots come from the bumper
+                # model now, not the existing-model class-1 detections).
+                for slot_id, tbox in tracked_robot_boxes:
+                    robot = self.robot_tracks.get(slot_id)
+                    if robot is None:
+                        continue
+                    label, confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
+                    t = track_by_slot.get(slot_id)
+                    mask = None
+                    if self.use_sam2:
+                        # (recover the main-view mask exactly as the old class-1 branch did
+                        # at :3300-3314 — registry_track_id -> obs -> sam2_raw[local_idx][det_id])
+                        ...
+                    self._draw_bumper_hud(
+                        annotated_frame, tbox, robot.alliance, label, slot_id=slot_id,
+                        cal=self.calib,
+                        field_pos=t.pos if t else robot.field_position,
+                        vel=t.vel if t else None, mask=mask)
 ```
+
+  Copy the mask-recovery block verbatim from the old branch (`:3300-3314`); it already
+  keys off `slot_id`. (Untracked bumper detections were previously drawn via
+  `detect_bumper_color`; that path is deleted. Drawing untracked robots is optional and low
+  value — skip it, or draw from `bumper_dets` with class color if desired.)
+
+- [ ] **Step 4: Syntax + commit** — `feat(detect): draw tracked robots per-slot; balls/hubs from existing model`.
 
 ---
 
-## Task 7: Status classes, hub warning, default flip
+## Task 7: Delete the HSV color path + status endpoint
 
-**Files:** Modify `web/app.py` (`:3638`, `:1633`, `:118`)
+**Files:** Modify `web/field/bumper.py`, `web/app.py` (`:60`, `:1691`, `:4251`, `:3638`)
 
-- [ ] **Step 1: `/api/status` model_classes from schema (`:3638`)**
-
-`/api/status` is process-global (no job param); `jobs` is a module dict (`:346`). Replace the hardcoded dict:
-
-```python
-        "model_classes": (
-            lambda _j: {int(k): v for k, v in _j.det_schema.names.items()}
-            if (_j is not None and getattr(_j, "det_schema", None) is not None)
-            else {0: "fuel_ball", 1: "robot", 2: "hub_opening"}
-        )(next(reversed(jobs.values()), None) if jobs else None),
-```
-
-- [ ] **Step 2: Hubless-schema warning in `update_hub_positions` (`:1633`)**
-
-```python
-        if not self.det_schema.has_hub and not event_hub_positions:
-            if not getattr(self, "_warned_no_hub", False):
-                print("[detect] WARNING: detector has no hub class and no static "
-                      "event_hub_positions set — set hubs in /calibrate or scoring degrades.")
-                self._warned_no_hub = True
-```
-
-- [ ] **Step 3: Flip default model (only after SP-A acceptance GO)**
-
-In Task 3 Step 1, change `_DEFAULT_MODEL` to `runs/train/frc_bumpers/weights/best.pt`. Do this only once SP-A's `EVAL.md` says GO and Task 8 passes; otherwise leave legacy default and note it.
-
-- [ ] **Step 4: Syntax check + commit**
-
-```bash
-.venv/bin/python -c "import ast; ast.parse(open('web/app.py').read()); print('ok')"
-git add web/app.py
-git commit -m "feat(detect): schema-driven status classes + hubless warning (+default flip if GO)"
-```
+- [ ] **Step 1:** Delete `classify_bumper_color`, `_color_masks`,
+  `_largest_rectangular_band_ratio`, `BumperColor` from `web/field/bumper.py`. **Keep**
+  `bumper_band_box`, `bumper_crop`, `_clamp_box` (HUD band + VLM crop).
+- [ ] **Step 2:** Fix the import (`:60`) → `from web.field.bumper import bumper_band_box, bumper_crop`.
+- [ ] **Step 3:** Delete `detect_bumper_color` (`:1691`) and `_detect_bumper_color_static`
+  (`:4251`). Verify: `grep -n "detect_bumper_color\|classify_bumper_color" web/app.py`
+  returns nothing (all callers rewired in Tasks 4–6).
+- [ ] **Step 4: `/api/status` (`:3638`)** — report both models. Replace the hardcoded
+  `model_classes` with the existing model's classes plus the bumper model's, e.g.
+  `{"fuel_hub_model": {0:"fuel_ball",1:"robot",2:"hub_opening"}, "bumper_model": (job.bumper_model.names if a job with a bumper model exists else None)}` — derive from a
+  job via `next(reversed(jobs.values()), None)`; fall back to the legacy dict.
+- [ ] **Step 5: Run unit suites + syntax check + commit** —
+  `pytest tests/test_detect_schema.py tests/test_detect_bridge.py -q`;
+  `refactor(detect): delete HSV color path; color is the bumper class`.
 
 ---
 
 ## Task 8: Integration verification on real footage
 
-**Files:** none (verification). Needs SP-A weights + static hubs for the test event.
+**Files:** none (verification). Uses `runs/train/frc_bumpers/weights/best.pt` (present).
 
-- [ ] **Step 1: Unit suites green**
-
-Run: `.venv/bin/python -m pytest tests/test_detect_schema.py tests/test_detect_bridge.py -v` → PASS.
-
-- [ ] **Step 2: Run a match with the bumper model**
-
-`FRC_DETECT_MODEL=runs/train/frc_bumpers/weights/best.pt` on one `web/uploads/*.mp4` (event has static hubs via `/calibrate`). Confirm the startup log shows `classes={0:'red_bumper',...} hub=False`.
-
-- [ ] **Step 3: Verify acceptance points**
-
-1. Tracks seed (count comparable to legacy).
-2. **SAM2 masks cover whole robots** (gallery crops look whole-robot) — proves box expansion.
-3. **Fuel still detected and NOT confused with red bumpers** — proves the class-2 fix (Task 4 Step 2).
-4. Alliance colors correct and **stable across views** (fusion vote).
-5. Scoring runs with static hubs (no crash from missing hub class).
-
-- [ ] **Step 4: Field-position drift check** — spot-compare a few robots' field positions vs the legacy model on the same clip; confirm no meaningful drift from the bumper-box bottom.
-
-- [ ] **Step 5: Record results; flip default if GO** (Task 7 Step 3), else document what failed.
-
-```bash
-git add web/app.py
-git commit -m "feat(detect): default to bumper model after acceptance (or: keep legacy, see notes)"
-```
+- [ ] **Step 1:** Unit suites green.
+- [ ] **Step 2:** Run one match (`web/uploads/*.mp4`). Confirm startup logs the bumper
+  model loaded; both models run.
+- [ ] **Step 3: Acceptance points:**
+  1. Robots detected + tracked from the bumper model (count comparable to legacy).
+  2. **Alliance colors correct and stable** (bumper class via fusion) — fewer errors than
+     the old HSV path.
+  3. **SAM2 masks cover whole robots** (gallery crops whole-robot) — proves box expansion.
+  4. **Fuel still detected** (existing model, unchanged) and ball trajectories work.
+  5. Scoring runs (hub from existing model / static).
+- [ ] **Step 4: Field-position drift check** vs legacy on the same clip.
+- [ ] **Step 5:** Record results; if good, this is the new default (bumper model auto-loads
+  from the default path). Commit any notes.
 
 ---
 
 ## Done when
 
-- `detect_schema` + `detect_bridge` unit suites green.
-- `grep -n "classify_bumper_color\|detect_bumper_color" web/` returns nothing in the live path (HSV deleted).
-- A real match analyzed with the bumper model seeds tracks, makes whole-robot masks, keeps fuel distinct from red bumpers, assigns stable correct colors via fusion, and scores with static hubs.
+- `detect_schema` + `detect_bridge` unit suites green; `grep` shows no HSV color path left.
+- A real match: robots+color from the bumper model (stable, correct), whole-robot SAM2
+  masks, fuel still detected by the existing model, scoring intact.
+- App still runs with `FRC_BUMPER_MODEL` unset (falls back to legacy robot+HSV path).

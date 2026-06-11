@@ -102,7 +102,7 @@ class ReplayRecorder:
     def add_event(self, event: dict) -> None:
         self.events.append(dict(event))
 
-    def finalize(self, status: str, summary: dict) -> dict:
+    def finalize(self, status: str, summary: dict, diagnostics: Optional[Any] = None) -> dict:
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
@@ -127,10 +127,16 @@ class ReplayRecorder:
         full_summary.update({
             "fps": self.fps, "frame_count": frame_count, "duration_sec": duration,
         })
+        if diagnostics is not None:
+            diag_path = self._out_dir / "diagnostics.jsonl"
+            diagnostics.flush_jsonl(str(diag_path))
+            full_summary["diagnostics_path"] = str(diag_path)
+            full_summary["diagnostics_summary"] = diagnostics.summary()
+
         meta = {"summary": full_summary, "frames": self.frames, "events": self.events}
         (self._out_dir / "meta.json").write_text(json.dumps(meta))
 
-        return {
+        res = {
             "video_path": str(self._out_dir / "hud.mp4"),
             "meta_path": str(self._out_dir / "meta.json"),
             "thumb_path": str(self._out_dir / "thumb.jpg"),
@@ -138,6 +144,9 @@ class ReplayRecorder:
             "width": self.width, "height": self.height,
             "codec": self.codec, "status": status,
         }
+        if diagnostics is not None:
+            res["diagnostics_path"] = str(self._out_dir / "diagnostics.jsonl")
+        return res
 
     def _stamp_event_times(self) -> None:
         """Map each event's source frame_num to the recorded-frame index, then t=i/fps.

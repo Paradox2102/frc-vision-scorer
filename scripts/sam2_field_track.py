@@ -28,7 +28,7 @@ from web.field.field_model import FieldModel
 from web.field.tracker import FieldDetection, FieldTracker
 from web.field.sam2_tracker import Sam2FieldTracker
 from web.field.spike_metrics import continuity_stats
-from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO, _detect_bumper_color_static
+from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO
 
 VIDEO = ROOT / "data/test_footage/qual1_first_champs_2026.mp4"
 DEFAULT_LABELS = ROOT / "data/test_footage/qual1_first_champs_2026.spike_labels.json"

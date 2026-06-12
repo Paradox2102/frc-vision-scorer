@@ -94,6 +94,35 @@ REANCHOR_MAX_BOUNDARY_GAP = int(os.environ.get("SAM2_REANCHOR_MAX_BOUNDARY_GAP",
 REANCHOR_MAX_JUMP_M = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_M", "2.0"))
 REANCHOR_MAX_JUMP_PX = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_PX", "100"))
 
+# Dark-mask re-anchor: a fresh detection claimed by an object whose mask has
+# not been emitted for >= SAM2_DARK_REANCHOR_FRAMES is a robot the tracker has
+# effectively lost — the stale mask blocks seeding ("already_tracked") while
+# producing no output. Re-prompt that SAME object id at the detection box
+# instead of dropping the detection. Unlike the sliver re-anchor above this
+# acts only on detections the matcher itself attributed to the object, so the
+# identity-transfer risk that kept REANCHOR_ENABLED off does not apply.
+DARK_REANCHOR_ENABLED = os.environ.get(
+    "SAM2_DARK_REANCHOR_ENABLED", "1") not in ("0", "false", "False")
+DARK_REANCHOR_FRAMES = int(os.environ.get("SAM2_DARK_REANCHOR_FRAMES", "2"))
+# Consecutive re-anchor attempts allowed while an object stays dark. Every
+# prompt accumulates per-object session state in the predictor; re-prompting
+# a never-reviving object at every boundary grew SAM3 video sessions until
+# they OOM'd a full 24GB card. After the cap, the detection seeds a NEW id
+# (identity machinery re-binds it) and the zombie ages into retirement.
+DARK_REANCHOR_MAX_ATTEMPTS = int(
+    os.environ.get("SAM2_DARK_REANCHOR_MAX_ATTEMPTS", "3"))
+
+# Capped-roster eviction, dark tier: an object whose mask has been absent for
+# >= this many frames (yet not retired) may be evicted for a fresh unmatched
+# detection even without the full stationary-absence evidence bar.
+EVICT_DARK_FRAMES = int(os.environ.get("SAM2_EVICT_DARK_FRAMES", "8"))
+# Capped-roster eviction, least-corroborated tier: minimum windowed detector
+# absences before ANY object (moving included) may be evicted for a fresh
+# detection. The roster should hold the objects most likely to be robots; an
+# object the bumper detector repeatedly fails to back (referee, field clutter)
+# loses its slot to a detector-backed newcomer.
+EVICT_MIN_ABSENCES = int(os.environ.get("SAM2_EVICT_MIN_ABSENCES", "2"))
+
 # Color backfill: an object whose metadata color is unknown (seeded from a
 # colorless whole-robot gap-fill) inherits the color of the bumper detections
 # that corroborate its mask on this many CONSECUTIVE colored boundaries.
@@ -188,7 +217,8 @@ def match_new_detections(
     existing_colors: dict[int, Any] | None = None,
     new_colors: list[Any] | None = None,
     min_mask_area_frac: float = SEED_MIN_MASK_AREA_FRAC,
-) -> list[int]:
+    with_claims: bool = False,
+) -> list[int] | tuple[list[int], dict[int, int]]:
     """Return indices of new_boxes that are genuinely new robots (not already tracked).
 
     For each box in new_boxes the box is rasterised to a boolean mask of shape
@@ -206,18 +236,24 @@ def match_new_detections(
         min_mask_area_frac: an existing mask smaller than this fraction of a
             box's area cannot claim that box (a degenerate sliver scores IoS
             1.0 inside any box and would otherwise block its own replacement).
+        with_claims: when True, also return a mapping of matched box index ->
+            claiming object id, so the caller can act on WHO blocked a
+            detection (e.g. re-anchor a dark object instead of dropping it).
 
     Returns:
-        List of integer indices into new_boxes for unmatched (new) robots.
+        List of integer indices into new_boxes for unmatched (new) robots;
+        with ``with_claims`` a ``(unmatched, claims)`` tuple.
     """
     w, h = wh
     mask_areas = {oid: int(m.sum()) for oid, m in existing_masks.items()}
     unmatched: list[int] = []
+    claims: dict[int, int] = {}
     for idx, (x1, y1, x2, y2) in enumerate(new_boxes):
         box_mask = np.zeros((h, w), bool)
         box_mask[y1:y2, x1:x2] = True
         box_area = int(box_mask.sum())
         best_ios = 0.0
+        best_oid = None
         for oid, existing in existing_masks.items():
             if existing_colors and new_colors and idx < len(new_colors):
                 e_col = existing_colors.get(oid)
@@ -229,8 +265,13 @@ def match_new_detections(
             score = _ios(existing, box_mask)
             if score > best_ios:
                 best_ios = score
+                best_oid = oid
         if best_ios < ios_thresh:
             unmatched.append(idx)
+        elif best_oid is not None:
+            claims[idx] = best_oid
+    if with_claims:
+        return unmatched, claims
     return unmatched
 
 
@@ -319,29 +360,75 @@ def absent_enough(history, k: int) -> bool:
 
 
 def pick_evictable(active_objects, corroboration_history, field_pos_window,
-                   k: int, stationary_m: float) -> int | None:
+                   k: int, stationary_m: float,
+                   last_visible_frame=None, current_idx=None,
+                   dark_frames: int | None = None,
+                   min_absences: int = EVICT_MIN_ABSENCES) -> int | None:
     """Return the active object best justified for eviction, or None.
 
-    An object is evictable only when its bounded corroboration history shows
-    >= ``k`` detector absences AND its recent field positions are stationary —
-    the same evidence bar as the spontaneous hijack cull, applied on demand
-    when a fresh unmatched detection needs a roster slot. A moving object is
-    never evictable (it could be a real robot in a detector blind spot), and
-    neither is one without history yet. Among evictable objects the one with
-    the most absences wins; ties go to the smaller (older) object id.
+    The roster should hold the objects MOST LIKELY to be robots; a fresh
+    unmatched detection (detector-backed by construction) outranks a roster
+    member with weak evidence. Candidates are ranked in three tiers, strongest
+    eviction evidence first:
+
+    1. Stationary + >= ``k`` windowed detector absences — the spontaneous
+       hijack-cull bar (static field clutter). Most absences wins.
+    2. Dark — the object's mask has not been emitted for >= ``dark_frames``
+       (tracked in name only, not yet retired). Longest darkness wins.
+    3. Least corroborated — >= ``min_absences`` windowed absences regardless
+       of motion (a moving hijack such as a referee is exactly the object the
+       bumper detector keeps failing to back). Most absences wins.
+
+    Universal guard: an object the detector corroborated at the most recent
+    boundary is never evictable, and neither is one without history yet (a
+    just-seeded object has had no chance to prove itself). Ties go to the
+    smaller (older) object id.
     """
-    best = None
-    best_absent = -1
-    for oid in active_objects:
+    def _evidence(oid):
         hist = corroboration_history.get(oid)
+        if not hist or hist[-1]:
+            return None  # no history yet, or detector just backed it
+        return hist
+
+    # Tier 1: stationary + absent_enough(k).
+    best, best_absent = None, -1
+    for oid in active_objects:
+        hist = _evidence(oid)
         if not hist or not absent_enough(hist, k):
             continue
         if not is_stationary(field_pos_window.get(oid, []), stationary_m):
             continue
         absent = sum(1 for c in hist if not c)
         if absent > best_absent:
-            best = oid
-            best_absent = absent
+            best, best_absent = oid, absent
+    if best is not None:
+        return best
+
+    # Tier 2: dark mask (no emission for >= dark_frames).
+    if (last_visible_frame is not None and current_idx is not None
+            and dark_frames is not None):
+        best, best_dark = None, -1
+        for oid in active_objects:
+            if _evidence(oid) is None:
+                continue
+            lv = last_visible_frame.get(oid)
+            if lv is None:
+                continue
+            gap = current_idx - lv
+            if gap >= dark_frames and gap > best_dark:
+                best, best_dark = oid, gap
+        if best is not None:
+            return best
+
+    # Tier 3: least corroborated, motion irrelevant.
+    best, best_absent = None, -1
+    for oid in active_objects:
+        hist = _evidence(oid)
+        if not hist:
+            continue
+        absent = sum(1 for c in hist if not c)
+        if absent >= min_absences and absent > best_absent:
+            best, best_absent = oid, absent
     return best
 
 
@@ -398,6 +485,11 @@ class Sam2FieldTracker:
     for future occlusion-recovery reprompting but are **not yet implemented**.
     Single-prompt offline propagation is the only supported mode.
     """
+
+    #: Tags for log lines and diagnostics event names; the SAM3 subclass
+    #: overrides both so runs label themselves with the backend in use.
+    LOG_TAG = "SAM2"
+    DIAG_PREFIX = "sam2"
 
     def __init__(
         self,
@@ -486,6 +578,11 @@ class Sam2FieldTracker:
         cull_corrob_ios: float = CULL_CORROB_IOS,
         cull_stationary_m: float = CULL_STATIONARY_M,
         evict_when_capped: bool = EVICT_WHEN_CAPPED,
+        evict_dark_frames: int = EVICT_DARK_FRAMES,
+        evict_min_absences: int = EVICT_MIN_ABSENCES,
+        dark_reanchor_enabled: bool = DARK_REANCHOR_ENABLED,
+        dark_reanchor_frames: int = DARK_REANCHOR_FRAMES,
+        dark_reanchor_max_attempts: int = DARK_REANCHOR_MAX_ATTEMPTS,
         reanchor_enabled: bool = REANCHOR_ENABLED,
         reanchor_ios: float = REANCHOR_IOS,
         reanchor_max_boundary_gap: int = REANCHOR_MAX_BOUNDARY_GAP,
@@ -606,6 +703,10 @@ class Sam2FieldTracker:
         retired_set: set[int] = set()
         culled_set: set[int] = set()
         corroboration_history: dict[int, deque] = {}
+        # Dark re-anchor budget: consecutive attempts per object and the
+        # boundary frame of the last attempt (for success detection).
+        dark_reanchor_attempts: dict[int, int] = {}
+        dark_reanchor_last: dict[int, int] = {}
         field_pos_window: dict[int, list] = {}
         # oid -> (pending color, consecutive colored-corroboration count)
         color_backfill_votes: dict[int, tuple] = {}
@@ -636,7 +737,7 @@ class Sam2FieldTracker:
                 0, _box_area(box), tuple(int(v) for v in box))
             if diagnostics:
                 diagnostics.record(
-                    "sam2.object_created",
+                    f"{self.DIAG_PREFIX}.object_created",
                     details={"object_id": next_obj_id, "frame_idx": prompt_idx, "box": list(box)}
                 )
             next_obj_id += 1
@@ -707,7 +808,7 @@ class Sam2FieldTracker:
                         object_metadata[next_obj_id] = metadata
                     if diagnostics:
                         diagnostics.record(
-                            "sam2.object_created",
+                            f"{self.DIAG_PREFIX}.object_created",
                             details={
                                 "object_id": next_obj_id,
                                 "frame_idx": candidate_idx,
@@ -773,7 +874,7 @@ class Sam2FieldTracker:
                         if diagnostics:
                             if last_visible_frame.get(oid_int) == f_idx_int - 1:
                                 diagnostics.record(
-                                    "sam2.mask_gap",
+                                    f"{self.DIAG_PREFIX}.mask_gap",
                                     details={"object_id": oid_int, "frame_idx": f_idx_int}
                                 )
                         continue  # object not visible this frame
@@ -783,7 +884,7 @@ class Sam2FieldTracker:
                         # Skip storing it; the slot coasts and retires like a gap.
                         if diagnostics:
                             diagnostics.record(
-                                "sam2.mask_rejected",
+                                f"{self.DIAG_PREFIX}.mask_rejected",
                                 reason="mask_implausible",
                                 details={"object_id": oid_int, "frame_idx": f_idx_int,
                                          "box": [int(v) for v in box]},
@@ -829,7 +930,7 @@ class Sam2FieldTracker:
                         pass
             if diagnostics and last_idx is not None:
                 diagnostics.record(
-                    "sam2.chunk_complete",
+                    f"{self.DIAG_PREFIX}.chunk_complete",
                     details={"start_frame": start_frame_idx, "end_frame": last_idx}
                 )
             return last_idx
@@ -908,7 +1009,7 @@ class Sam2FieldTracker:
                                 retired_set.add(oid)
                                 if diagnostics:
                                     diagnostics.record(
-                                        "sam2.object_retired",
+                                        f"{self.DIAG_PREFIX}.object_retired",
                                         details={"object_id": oid, "frame_idx": last_idx},
                                     )
 
@@ -948,12 +1049,12 @@ class Sam2FieldTracker:
                             detected = None
                             if not detect_fn_error_logged:
                                 detect_fn_error_logged = True
-                                print(f"  [SAM2] detect_fn failed at frame {last_idx} "
+                                print(f"  [{self.LOG_TAG}] detect_fn failed at frame {last_idx} "
                                       f"(further errors suppressed): {exc!r}")
                             if diagnostics:
-                                diagnostics.increment("sam2_detector_errors")
+                                diagnostics.increment(f"{self.DIAG_PREFIX}_detector_errors")
                                 diagnostics.record(
-                                    "sam2.detector_error",
+                                    f"{self.DIAG_PREFIX}.detector_error",
                                     details={"frame_idx": last_idx, "error": repr(exc)},
                                 )
                         if detected is None:
@@ -964,7 +1065,7 @@ class Sam2FieldTracker:
                             if diagnostics:
                                 for box in new_boxes:
                                     diagnostics.record(
-                                        "sam2.reprompt_candidate",
+                                        f"{self.DIAG_PREFIX}.reprompt_candidate",
                                         details={"frame_idx": last_idx, "box": list(box)},
                                     )
 
@@ -1009,7 +1110,7 @@ class Sam2FieldTracker:
                                         existing_colors[oid] = c
                                         if diagnostics:
                                             diagnostics.record(
-                                                "sam2.color_backfilled",
+                                                f"{self.DIAG_PREFIX}.color_backfilled",
                                                 details={"object_id": oid,
                                                          "color": c,
                                                          "frame_idx": last_idx},
@@ -1032,9 +1133,9 @@ class Sam2FieldTracker:
                                     # Uncapped counter so the cull count survives
                                     # event-list truncation (max_events) over a full
                                     # match — the at-a-glance on/off comparison signal.
-                                    diagnostics.increment("sam2_objects_culled")
+                                    diagnostics.increment(f"{self.DIAG_PREFIX}_objects_culled")
                                     diagnostics.record(
-                                        "sam2.object_culled",
+                                        f"{self.DIAG_PREFIX}.object_culled",
                                         reason="detector_absent_stationary",
                                         details={
                                             "object_id": oid,
@@ -1061,20 +1162,92 @@ class Sam2FieldTracker:
                         int_boxes = [
                             (int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in new_boxes
                         ]
-                        new_indices = match_new_detections(
+                        new_indices, matched_claims = match_new_detections(
                             existing, int_boxes, (w, h),
                             ios_thresh=new_obj_ios_thresh,
                             existing_colors=existing_colors,
                             new_colors=new_metadata,
+                            with_claims=True,
                         )
-                        if diagnostics:
-                            for idx, box_val in enumerate(new_boxes):
-                                if idx not in new_indices:
+                        # Dark-mask re-anchor: a matched detection whose
+                        # claimant has emitted no mask for dark_reanchor_frames
+                        # is the lost robot itself — re-prompt the SAME obj id
+                        # at the fresh box instead of dropping the detection as
+                        # redundant (a stale mask must not both block seeding
+                        # AND produce no output). Attempts are capped: each
+                        # prompt accumulates predictor session state, so a
+                        # never-reviving object gets dark_reanchor_max_attempts
+                        # tries and then its detection seeds a NEW id.
+                        dark_reanchored: set[int] = set()
+                        for idx, box_val in enumerate(new_boxes):
+                            if idx in new_indices:
+                                continue
+                            oid = matched_claims.get(idx)
+                            lv = (last_visible_frame.get(oid)
+                                  if oid is not None else None)
+                            if oid is not None and lv is not None:
+                                # A mask emitted since the last re-anchor means
+                                # the attempt worked — reset the budget.
+                                if lv > dark_reanchor_last.get(oid, -1):
+                                    dark_reanchor_attempts[oid] = 0
+                            if (dark_reanchor_enabled and lv is not None
+                                    and (last_idx - lv) >= dark_reanchor_frames
+                                    and dark_reanchor_attempts.get(oid, 0)
+                                        >= dark_reanchor_max_attempts):
+                                # Budget exhausted: promote the detection to
+                                # the new-object seeding path below.
+                                new_indices.append(idx)
+                                if diagnostics:
                                     diagnostics.record(
-                                        "sam2.reprompt_rejected",
-                                        reason="already_tracked",
-                                        details={"frame_idx": last_idx, "box": list(box_val)},
+                                        f"{self.DIAG_PREFIX}.reprompt_rejected",
+                                        reason="dark_reanchor_exhausted",
+                                        details={"frame_idx": last_idx,
+                                                 "object_id": oid,
+                                                 "box": list(box_val)},
                                     )
+                                continue
+                            if (dark_reanchor_enabled and lv is not None
+                                    and (last_idx - lv) >= dark_reanchor_frames
+                                    and oid not in dark_reanchored):
+                                predictor.add_new_points_or_box(
+                                    state, frame_idx=last_idx, obj_id=oid,
+                                    box=np.asarray(box_val, dtype=np.float32),
+                                )
+                                dark_reanchored.add(oid)
+                                dark_reanchor_attempts[oid] = (
+                                    dark_reanchor_attempts.get(oid, 0) + 1)
+                                dark_reanchor_last[oid] = last_idx
+                                # Fresh prompt re-conditions the object: stale
+                                # absence evidence no longer applies, and the
+                                # restored extent must be visible to the rest
+                                # of this boundary (a second detection over the
+                                # same robot cannot also re-anchor it).
+                                corroboration_history.pop(oid, None)
+                                bx1, by1, bx2, by2 = int_boxes[idx]
+                                refreshed = np.zeros((h, w), bool)
+                                refreshed[by1:by2, bx1:bx2] = True
+                                existing[oid] = refreshed
+                                boundary_mask_record[oid] = (
+                                    boundary_no, float(refreshed.sum()),
+                                    tuple(int_boxes[idx]))
+                                if diagnostics:
+                                    diagnostics.increment(f"{self.DIAG_PREFIX}_objects_reanchored")
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.object_reanchored",
+                                        reason="dark_mask",
+                                        details={
+                                            "object_id": oid,
+                                            "frame_idx": last_idx,
+                                            "box": list(box_val),
+                                            "dark_frames": last_idx - lv,
+                                        },
+                                    )
+                            elif diagnostics:
+                                diagnostics.record(
+                                    f"{self.DIAG_PREFIX}.reprompt_rejected",
+                                    reason="already_tracked",
+                                    details={"frame_idx": last_idx, "box": list(box_val)},
+                                )
                         for j in new_indices:
                             if reanchor_enabled and existing:
                                 # A detection is only in new_indices because no
@@ -1155,9 +1328,9 @@ class Sam2FieldTracker:
                                         boundary_no, float(reanchor_box_area),
                                         tuple(int_boxes[j]))
                                     if diagnostics:
-                                        diagnostics.increment("sam2_objects_reanchored")
+                                        diagnostics.increment(f"{self.DIAG_PREFIX}_objects_reanchored")
                                         diagnostics.record(
-                                            "sam2.object_reanchored",
+                                            f"{self.DIAG_PREFIX}.object_reanchored",
                                             details={
                                                 "object_id": best_oid,
                                                 "frame_idx": last_idx,
@@ -1171,7 +1344,7 @@ class Sam2FieldTracker:
                                 # box above; it just can't found a new object.
                                 if diagnostics:
                                     diagnostics.record(
-                                        "sam2.reprompt_rejected",
+                                        f"{self.DIAG_PREFIX}.reprompt_rejected",
                                         reason="static_structure",
                                         details={"frame_idx": last_idx,
                                                  "box": list(new_boxes[j])},
@@ -1187,14 +1360,20 @@ class Sam2FieldTracker:
                             lifetime_capped = (next_obj_id - 1) >= max_lifetime_objects
                             if roster_capped and not lifetime_capped and evict_when_capped:
                                 # An unmatched detection is concrete evidence a
-                                # roster slot is wrongly held. Evict the least-
-                                # corroborated stationary object (same evidence
-                                # bar as the cull) rather than going blind.
+                                # roster slot is wrongly held. The roster keeps
+                                # the objects most likely to be robots: evict
+                                # the weakest-evidence member (stationary-
+                                # absent, then dark, then least-corroborated)
+                                # rather than going blind.
                                 victim = pick_evictable(
                                     active_objects, corroboration_history,
                                     field_pos_window,
                                     cull_uncorroborated_reprompts,
                                     cull_stationary_m,
+                                    last_visible_frame=last_visible_frame,
+                                    current_idx=last_idx,
+                                    dark_frames=evict_dark_frames,
+                                    min_absences=evict_min_absences,
                                 )
                                 if victim is not None:
                                     culled_set.add(victim)
@@ -1202,9 +1381,9 @@ class Sam2FieldTracker:
                                     existing_colors.pop(victim, None)
                                     roster_capped = False
                                     if diagnostics:
-                                        diagnostics.increment("sam2_objects_culled")
+                                        diagnostics.increment(f"{self.DIAG_PREFIX}_objects_culled")
                                         diagnostics.record(
-                                            "sam2.object_culled",
+                                            f"{self.DIAG_PREFIX}.object_culled",
                                             reason="evicted_for_new_detection",
                                             details={
                                                 "object_id": victim,
@@ -1216,7 +1395,7 @@ class Sam2FieldTracker:
                                 reason = "roster_cap" if roster_capped else "lifetime_cap"
                                 if diagnostics:
                                     diagnostics.record(
-                                        "sam2.reprompt_rejected",
+                                        f"{self.DIAG_PREFIX}.reprompt_rejected",
                                         reason=reason,
                                         details={"frame_idx": last_idx, "box": list(new_boxes[j])},
                                     )
@@ -1246,7 +1425,7 @@ class Sam2FieldTracker:
                                 tuple(int_boxes[j]))
                             if diagnostics:
                                 diagnostics.record(
-                                    "sam2.object_created",
+                                    f"{self.DIAG_PREFIX}.object_created",
                                     details={"object_id": next_obj_id, "frame_idx": last_idx,
                                              "box": list(new_boxes[j])},
                                 )

@@ -319,3 +319,143 @@ class TestSAM2Streaming(unittest.TestCase):
             # Verify DINOv2 embedding was extracted during the loop
             # (one batched forward pass per view instead of per-object embed()).
             mock_embedder.embed_batch.assert_called()
+
+
+def test_debug_tasks_endpoint_reports_running_task_stacks():
+    """/api/debug/tasks dumps every live asyncio task with a coroutine stack —
+    the diagnostic hook for event-loop hangs (job stalls with all threads idle)."""
+    import asyncio
+    import web.app as app_mod
+
+    async def scenario():
+        async def parked():
+            await asyncio.sleep(30)
+
+        t = asyncio.create_task(parked(), name="parked-task")
+        await asyncio.sleep(0)  # let it start and suspend
+        payload = await app_mod.debug_tasks()
+        t.cancel()
+        return payload
+
+    payload = asyncio.run(scenario())
+    names = {t["name"] for t in payload["tasks"]}
+    assert "parked-task" in names
+    parked_stacks = [t["stack"] for t in payload["tasks"] if t["name"] == "parked-task"]
+    assert any("parked" in frame for frame in parked_stacks[0])
+
+
+def test_ws_first_attach_claims_and_runs_job():
+    """The first websocket connection to a job starts its run (and marks the
+    job claimed so later connections won't run it again)."""
+    from unittest.mock import patch
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("ws-first", "/mock/video.mp4")
+    app_mod.jobs["ws-first"] = job
+    ran = []
+
+    async def fake_run(j):
+        ran.append(j.job_id)
+
+    try:
+        with patch.object(app_mod, "_run_job_serialized", fake_run):
+            client = TestClient(app_mod.app)
+            with client.websocket_connect("/ws/infer/ws-first"):
+                pass
+        assert ran == ["ws-first"]
+        assert job._run_claimed is True
+    finally:
+        app_mod.jobs.pop("ws-first", None)
+
+
+def test_ws_reattach_does_not_rerun_running_job():
+    """Reconnecting to a job that is already running must attach for
+    streaming only — never queue a second process_video run."""
+    from unittest.mock import patch
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("ws-re", "/mock/video.mp4")
+    job._run_claimed = True
+    job.status = "processing"
+    app_mod.jobs["ws-re"] = job
+    ran = []
+
+    async def fake_run(j):
+        ran.append(j.job_id)
+
+    try:
+        with patch.object(app_mod, "_run_job_serialized", fake_run):
+            client = TestClient(app_mod.app)
+            with client.websocket_connect("/ws/infer/ws-re") as ws:
+                msg = ws.receive_json()
+                assert msg["type"] == "status"
+                assert msg["status"] == "processing"
+                assert "attach" in msg["message"].lower()
+        assert ran == []
+    finally:
+        app_mod.jobs.pop("ws-re", None)
+
+
+def test_ws_attach_to_finished_job_reports_terminal_status():
+    """Connecting to an already-finished job reports its terminal status
+    instead of re-running it."""
+    from unittest.mock import patch
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("ws-done", "/mock/video.mp4")
+    job._run_claimed = True
+    job.status = "completed"
+    app_mod.jobs["ws-done"] = job
+    ran = []
+
+    async def fake_run(j):
+        ran.append(j.job_id)
+
+    try:
+        with patch.object(app_mod, "_run_job_serialized", fake_run):
+            client = TestClient(app_mod.app)
+            with client.websocket_connect("/ws/infer/ws-done") as ws:
+                msg = ws.receive_json()
+                assert msg["type"] == "status"
+                assert msg["status"] == "completed"
+        assert ran == []
+    finally:
+        app_mod.jobs.pop("ws-done", None)
+
+
+def test_active_job_endpoint_reports_running_job():
+    """GET /api/job/active lets a reloaded page rediscover and rejoin a
+    running match (the page loses the job id on reload)."""
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("active-1", "/mock/video.mp4")
+    job._run_claimed = True
+    job.status = "processing"
+    app_mod.jobs["active-1"] = job
+    try:
+        client = TestClient(app_mod.app)
+        body = client.get("/api/job/active").json()
+        assert body["job_id"] == "active-1"
+        assert body["status"] == "processing"
+        assert isinstance(body.get("started_at"), (int, float))
+    finally:
+        app_mod.jobs.pop("active-1", None)
+
+
+def test_active_job_endpoint_none_when_idle():
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("done-1", "/mock/video.mp4")
+    job.status = "completed"
+    app_mod.jobs["done-1"] = job
+    try:
+        client = TestClient(app_mod.app)
+        body = client.get("/api/job/active").json()
+        assert body["job_id"] is None
+    finally:
+        app_mod.jobs.pop("done-1", None)

@@ -35,6 +35,21 @@ mask is empty at the boundary (occluded) is not re-seeded and will not be
 re-found by SAM3 itself. The pipeline's existing detector re-prompts and
 identity machinery (VLM votes + gallery) already handle exactly that case
 for SAM2 re-seeds.
+
+Windowed propagation (action history)
+-------------------------------------
+
+Unlike SAM2, a SAM3 session interprets each ``propagate_in_video`` request
+through its action history (``parse_action_history_for_propagation``): with
+no new prompts since the previous propagate it returns cached outputs only
+(``propagation_fetch``), and after new prompts it tracks ONLY the newly
+prompted obj_ids (``propagation_partial``). The pipeline propagates in
+``reprompt_every`` windows, so without intervention every object emits masks
+for exactly one window and then goes dark. The adapter therefore re-sends
+each live object's latest observed box (fresh within SAM3_RESEED_MAX_AGE)
+before every windowed propagate, keeping the full roster on the partial
+path; per-object tracker states persist within the session, so this is a
+re-anchor, not a cold re-seed.
 """
 from __future__ import annotations
 
@@ -197,6 +212,7 @@ class Sam3PredictorAdapter:
                 "rel_coordinates": True,
             }
         )
+        chunk["prompted"].add(int(obj_id))
 
     def _open_chunk_for(self, state: dict, global_idx: int, *, reverse: bool) -> None:
         self._close_chunk(state)
@@ -228,6 +244,9 @@ class Sam3PredictorAdapter:
             "lo": lo,
             "hi": hi,
             "dir": tmp_dir,
+            # obj_ids prompted since the last propagate request in this
+            # session; consumed (cleared) by each _stream_chunk call.
+            "prompted": set(),
         }
 
         # Seed: pending prompts that fall in this window, then carried
@@ -259,6 +278,19 @@ class Sam3PredictorAdapter:
         finally:
             shutil.rmtree(chunk["dir"], ignore_errors=True)
             state["chunk"] = None
+            # VRAM forensics for the recurring whole-card OOM: if allocated
+            # memory climbs across chunk closes, session state is not being
+            # released (close_session leak / lingering references); if it is
+            # flat, the growth is intra-chunk (prompt accumulation).
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    alloc = torch.cuda.memory_allocated() / 2**30
+                    reserved = torch.cuda.memory_reserved() / 2**30
+                    print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']}) "
+                          f"VRAM allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+            except Exception:
+                pass
 
     def _stream_chunk(self, state: dict, start_global: int, lo: int, hi: int,
                       *, reverse: bool):
@@ -267,6 +299,24 @@ class Sam3PredictorAdapter:
         import torch
 
         chunk = state["chunk"]
+
+        # SAM3 sessions route each propagate request through their action
+        # history: objects WITHOUT an add/refine since the previous propagate
+        # are not tracked at all (fetch/partial-only semantics, see
+        # parse_action_history_for_propagation). Refresh every live object's
+        # latest observed box before each window so the whole roster rides
+        # ``propagation_partial``; stale objects stay with the detector
+        # re-prompt recovery path, same rule as the chunk-boundary re-seed.
+        for obj_id, (seen_idx, box) in sorted(state["last_box"].items()):
+            if obj_id in chunk["prompted"]:
+                continue
+            if not (chunk["lo"] <= seen_idx < chunk["hi"]):
+                continue
+            if abs(start_global - seen_idx) > SAM3_RESEED_MAX_AGE:
+                continue
+            self._send_prompt(state, seen_idx, obj_id, box)
+        chunk["prompted"] = set()
+
         local_start = start_global - chunk["lo"]
         # frames of this chunk that fall inside the caller's range
         chunk_lo = max(lo, chunk["lo"])
@@ -322,6 +372,9 @@ class Sam3PredictorAdapter:
 class Sam3FieldTracker(Sam2FieldTracker):
     """Run the field tracker with Meta's SAM3 video model (instance prompts,
     chunked sessions)."""
+
+    LOG_TAG = "SAM3"
+    DIAG_PREFIX = "sam3"
 
     def __init__(
         self,

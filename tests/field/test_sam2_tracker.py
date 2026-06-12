@@ -726,9 +726,11 @@ def test_eviction_frees_slot_for_uncorroborated_stationary_object():
     assert 2 not in result[stub.NUM_FRAMES - 1]
 
 
-def test_no_eviction_of_moving_uncorroborated_object():
-    """A moving object is never evicted even if uncorroborated (it could be a
-    real robot in a detector blind spot); the new detection is cap-rejected."""
+def test_moving_uncorroborated_object_evicted_after_min_absences():
+    """The roster holds the objects most likely to be robots: a MOVING object
+    the detector repeatedly fails to back (a referee hijack) loses its slot to
+    a fresh detector-backed newcomer — but never on its first absence, and a
+    higher min_absences bar restores the old keep-moving-objects behavior."""
     from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
     stub = CullStubPredictor(moving={2})
     tracker = Sam2FieldTracker(predictor=stub)
@@ -744,11 +746,36 @@ def test_no_eviction_of_moving_uncorroborated_object():
         object_metadata={1: "blue", 2: "red"},
         max_active_objects=2, cull_enabled=False,
         cull_uncorroborated_reprompts=3, cull_evidence_window=5,
-        cull_stationary_m=0.5,
+        cull_stationary_m=0.5, evict_min_absences=2,
         project_fn=lambda box: bottom_center(box), diagnostics=diag,
     )
-    assert _culled_ids(diag) == set()
-    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert 2 in _culled_ids(diag)
+    evictions = [e["details"]["frame_idx"] for e in diag._events
+                 if e.get("event") == "sam2.object_culled"
+                 and e.get("reason") == "evicted_for_new_detection"
+                 and e["details"]["object_id"] == 2]
+    first_boundary = min(e["details"]["frame_idx"] for e in diag._events
+                         if e.get("event") == "sam2.reprompt_candidate")
+    assert all(f > first_boundary for f in evictions), \
+        "one absence is not enough evidence to evict"
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+
+    # With the bar raised out of reach, the moving object keeps its slot.
+    stub2 = CullStubPredictor(moving={2})
+    tracker2 = Sam2FieldTracker(predictor=stub2)
+    diag2 = _ident_diag()
+    tracker2.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub2._rect_for(1, 0), stub2._rect_for(2, 0)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, cull_enabled=False,
+        cull_uncorroborated_reprompts=99, cull_evidence_window=5,
+        cull_stationary_m=0.5, evict_min_absences=99, evict_dark_frames=999,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag2,
+    )
+    assert _culled_ids(diag2) == set()
+    assert all(oid != 3 for (_f, oid) in stub2.add_calls)
 
 
 def test_eviction_disabled_via_flag():
@@ -1649,3 +1676,217 @@ def test_reanchor_in_place_collapse_still_rescued():
         diagnostics=diag,
     )
     assert 1 in _reanchored_ids(diag)
+
+
+# ---------------------------------------------------------------------------
+# Evidence-ranked roster: dark-mask re-anchor + tiered eviction
+# ---------------------------------------------------------------------------
+
+def test_match_new_detections_with_claims_returns_claimant():
+    """with_claims=True also maps each matched box index to the object that
+    claimed it, so the caller can act on WHO blocked a detection."""
+    existing = {4: _rect_mask(0, 0, 5, 10)}
+    new_boxes = [(1, 1, 4, 9), (6, 1, 9, 9)]
+    unmatched, claims = match_new_detections(
+        existing, new_boxes, (10, 10), ios_thresh=0.5, with_claims=True
+    )
+    assert unmatched == [1]
+    assert claims == {0: 4}
+
+
+def test_dark_mask_reanchor_reprompts_same_object():
+    """A detection overlapping a dark object's stale mask re-prompts that
+    object in place instead of being dropped as already_tracked."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    # obj 1 always visible; obj 2 visible only frames 0-1, dark afterwards.
+    schedule = {
+        0: [1, 2], 1: [1, 2],
+        2: [1], 3: [1], 4: [1], 5: [1], 6: [1],
+    }
+    stub = AbsentStubPredictor(schedule, num_frames=7)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        # The detector still sees both robots at their fixed spots.
+        return [(6, 2, 10, 6), (12, 2, 16, 6)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        retirement_frames=10,
+        dark_reanchor_frames=2,
+    )
+
+    # obj 2 went dark at frame 2; once the gap reaches dark_reanchor_frames
+    # a boundary re-prompts the SAME obj id at the detector box.
+    later_calls = stub.add_calls[2:]
+    assert any(oid == 2 for (_f, oid) in later_calls)
+    # No new object id was invented for the still-dark robot.
+    assert all(oid <= 2 for (_f, oid) in stub.add_calls)
+
+
+def test_visible_object_detection_not_dark_reanchored():
+    """A detection over a currently-visible object stays a plain dedup: no
+    extra re-prompt is issued for it."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    schedule = {f: [1, 2] for f in range(7)}  # both always visible
+    stub = AbsentStubPredictor(schedule, num_frames=7)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        return [(6, 2, 10, 6), (12, 2, 16, 6)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        dark_reanchor_frames=2,
+    )
+
+    assert stub.add_calls == [(0, 1), (0, 2)]
+
+
+def test_pick_evictable_evicts_dark_uncorroborated_object():
+    """Tier 2: an object whose mask has been absent for >= dark_frames and
+    whose stale mask drew no detector support is evictable even when the
+    stationary-absence bar (tier 1) is not met."""
+    from collections import deque
+    from web.field.sam2_tracker import pick_evictable
+
+    hist = {7: deque([True, False], maxlen=6)}     # only 1 absence -> tier 1 (k=3) can't fire
+    window = {7: [(1.0, 1.0), (4.0, 5.0)]}          # moving -> old rule can't fire either
+    victim = pick_evictable(
+        [7], hist, window, 3, 0.5,
+        last_visible_frame={7: 10}, current_idx=14, dark_frames=2,
+    )
+    assert victim == 7
+
+
+def test_pick_evictable_evicts_moving_never_corroborated():
+    """Tier 3: a moving object the detector repeatedly fails to back (e.g. a
+    referee hijack) is evictable despite its motion."""
+    from collections import deque
+    from web.field.sam2_tracker import pick_evictable
+
+    hist = {3: deque([False, False, True, False], maxlen=6)}
+    window = {3: [(1.0, 1.0), (6.0, 4.0)]}          # moving
+    victim = pick_evictable(
+        [3], hist, window, 99, 0.5,                  # tier 1 unreachable (k=99)
+        last_visible_frame={3: 14}, current_idx=14, dark_frames=2,  # visible now -> tier 2 can't fire
+    )
+    assert victim == 3
+
+
+def test_pick_evictable_never_evicts_just_corroborated():
+    """An object the detector backed at the latest boundary is never evicted,
+    whatever its history."""
+    from collections import deque
+    from web.field.sam2_tracker import pick_evictable
+
+    hist = {5: deque([False, False, False, True], maxlen=6)}
+    window = {5: [(1.0, 1.0), (1.0, 1.1)]}          # stationary
+    victim = pick_evictable(
+        [5], hist, window, 3, 0.5,
+        last_visible_frame={5: 2}, current_idx=14, dark_frames=2,  # long dark
+    )
+    assert victim is None
+
+
+def test_pick_evictable_prefers_stationary_absent_over_dark():
+    """Tier order: the classic stationary+absent victim wins over a merely
+    dark one."""
+    from collections import deque
+    from web.field.sam2_tracker import pick_evictable
+
+    hist = {
+        1: deque([False, False, False], maxlen=6),   # stationary + absent (tier 1)
+        2: deque([True, False], maxlen=6),           # dark (tier 2)
+    }
+    window = {
+        1: [(1.0, 1.0), (1.0, 1.05)],
+        2: [(3.0, 3.0), (5.0, 6.0)],
+    }
+    victim = pick_evictable(
+        [1, 2], hist, window, 3, 0.5,
+        last_visible_frame={1: 14, 2: 9}, current_idx=14, dark_frames=2,
+    )
+    assert victim == 1
+
+
+def test_capped_roster_evicts_dark_zombie_for_new_detection():
+    """A capped roster holding a dark, detector-orphaned object gives up that
+    slot to a fresh detection of a real robot."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    # obj 2 goes dark at frame 2 and the detector NEVER sees anything there.
+    schedule = {
+        0: [1, 2], 1: [1, 2],
+        2: [1], 3: [1], 4: [1], 5: [1], 6: [1],
+    }
+    stub = AbsentStubPredictor(schedule, num_frames=7)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        # obj 1 corroborated; a NEW robot at a fresh spot (x=30..34).
+        return [(6, 2, 10, 6), (30, 2, 34, 6)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=2,                  # capped at construction
+        retirement_frames=10,                  # obj 2 stays in-roster
+        cull_uncorroborated_reprompts=99,      # tier 1 unreachable
+        evict_when_capped=True,
+        evict_dark_frames=2,
+        dark_reanchor_frames=2,
+    )
+
+    # The dark zombie was evicted and the new robot seeded under a new id.
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+
+
+def test_dark_reanchor_attempts_capped_then_new_seed():
+    """A dark object that never revives gets a bounded number of re-anchor
+    attempts; afterwards the detection seeds a NEW object id instead of
+    re-prompting forever (every prompt accumulates session state — unbounded
+    re-prompting OOM'd full-card SAM3 runs)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    # obj 2 visible only at frames 0-1, dark for the rest of a long video.
+    schedule = {0: [1, 2], 1: [1, 2]}
+    for f in range(2, 12):
+        schedule[f] = [1]
+    stub = AbsentStubPredictor(schedule, num_frames=12)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        return [(6, 2, 10, 6), (12, 2, 16, 6)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(6, 2, 10, 6), (12, 2, 16, 6)],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        max_active_objects=6,
+        retirement_frames=50,            # keep the zombie in-roster
+        dark_reanchor_frames=2,
+        dark_reanchor_max_attempts=2,
+    )
+
+    reanchor_calls = [(f, oid) for (f, oid) in stub.add_calls[2:] if oid == 2]
+    assert len(reanchor_calls) == 2, f"expected 2 capped attempts, got {reanchor_calls}"
+    # After the cap, the still-detected robot seeds a fresh object id.
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)

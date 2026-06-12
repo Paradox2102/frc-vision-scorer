@@ -8224,7 +8224,7 @@ async def infer(
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     if not _sam2_checkpoint_present(job_config.sam2_model_size):
-        print(f"  [{self.tracker_tag}] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
+        print(f"  [sam2] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
               f"{_SAM2_MODELS[job_config.sam2_model_size][1]}; "
               f"SAM2 will fall back to Kalman tracking.")
 

@@ -113,3 +113,66 @@ def test_previous_gallery_exemplars_excludes_current_future_and_unknown(db):
         "2026wamon", "2026wamon_qm2"
     ))
     assert [row["team"] for row in rows] == ["111"]
+
+
+def test_previous_gallery_exemplars_verified_only(db):
+    # Unverified deposits are candidates awaiting review, not identity
+    # evidence: verified_only must exclude them from the match-time gallery.
+    event_id = asyncio.run(db.upsert_event(
+        "2026wamon", "WAMon", 2026, "Somewhere", "2026-03-01", "2026-03-03"
+    ))
+    for number in (1, 2):
+        asyncio.run(db.upsert_match(
+            event_id, f"2026wamon_qm{number}", "qm", number
+        ))
+
+    for team, verified in (("111", 1), ("222", 0), ("333", 1)):
+        asyncio.run(db.insert_gallery_exemplar({
+            "event_key": "2026wamon",
+            "source_match_key": "2026wamon_qm1",
+            "team": team,
+            "alliance_color": "blue",
+            "embedding": _emb_bytes(1, 0, 0),
+            "legibility": 0.9,
+            "verified": verified,
+        }))
+
+    rows = asyncio.run(db.get_previous_gallery_exemplars(
+        "2026wamon", "2026wamon_qm2", verified_only=True
+    ))
+    assert sorted(row["team"] for row in rows) == ["111", "333"]
+    assert all(row["verified"] for row in rows)
+
+    # Default (verified_only=False) still returns every prior deposit, which
+    # is what the review UI and opt-out path rely on.
+    all_rows = asyncio.run(db.get_previous_gallery_exemplars(
+        "2026wamon", "2026wamon_qm2"
+    ))
+    assert sorted(row["team"] for row in all_rows) == ["111", "222", "333"]
+
+
+def test_previous_gallery_exemplars_verified_only_composes_with_team_filter(db):
+    event_id = asyncio.run(db.upsert_event(
+        "2026wamon", "WAMon", 2026, "Somewhere", "2026-03-01", "2026-03-03"
+    ))
+    for number in (1, 2):
+        asyncio.run(db.upsert_match(
+            event_id, f"2026wamon_qm{number}", "qm", number
+        ))
+    for team, verified in (("111", 1), ("111", 0), ("999", 1)):
+        asyncio.run(db.insert_gallery_exemplar({
+            "event_key": "2026wamon",
+            "source_match_key": "2026wamon_qm1",
+            "team": team,
+            "alliance_color": "blue",
+            "embedding": _emb_bytes(1, 0, 0),
+            "legibility": 0.9,
+            "verified": verified,
+        }))
+
+    rows = asyncio.run(db.get_previous_gallery_exemplars(
+        "2026wamon", "2026wamon_qm2", teams=["111"], verified_only=True
+    ))
+    assert len(rows) == 1
+    assert rows[0]["team"] == "111"
+    assert rows[0]["verified"]

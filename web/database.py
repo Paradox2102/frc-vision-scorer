@@ -697,11 +697,17 @@ async def get_previous_gallery_exemplars(
     event_key: str,
     current_match_key: str,
     teams: Optional[List[str]] = None,
+    verified_only: bool = False,
 ) -> List[Dict]:
     """Return exemplars sourced only from matches before ``current_match_key``.
 
     Rows without match provenance are intentionally excluded: they cannot be
     proven to come from an earlier match.
+
+    ``verified_only`` restricts to human-verified rows: unverified deposits
+    are candidates awaiting review in the gallery UI, not identity evidence
+    (one mislabeled deposit otherwise votes for the wrong team in every later
+    match, and DINOv2 embeddings can't separate same-alliance robots).
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -758,6 +764,8 @@ async def get_previous_gallery_exemplars(
         if team_filter:
             where += f" AND team IN ({','.join('?' for _ in team_filter)})"
             params.extend(team_filter)
+        if verified_only:
+            where += " AND verified = 1"
 
         cursor = await db.execute(
             "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "

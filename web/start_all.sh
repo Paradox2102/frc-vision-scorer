@@ -1,36 +1,36 @@
 #!/bin/bash
-# Start the full stack: vLLM team reader + main app, wired together.
+# Start the app with the vLLM reader configured but NOT running.
 #
-#   web/start_all.sh   — brings up both servers
-#   web/stop_all.sh    — stops both
+#   web/start_all.sh   — starts the app (vLLM comes up on demand)
+#   web/stop_all.sh    — stops the app and any running vLLM
 #
-# Order matters: the vLLM server preallocates its GPU pool (~11 GB at util
-# 0.45), and the app must see TEAM_READER=vllm so it never loads its own
-# in-process copy of Qwen (two copies of the 4B fp16 weights do not fit).
+# The vLLM server is fully job-managed (vllm_phase_exclusive knob, default
+# on): a job stops any running instance before its tracking precompute
+# (vLLM's ~11GB pool + SAM3's ~11GB peak OOMs the 24GB card), starts it for
+# the analysis phase's bumper reads (~90s model load), and stops it again
+# when the job finishes. Idle time between matches therefore costs zero
+# VRAM. Co-residency chunk trimming (350/250/150) is gone — every size
+# OOM'd the main view; SAM3's peak is model + per-object state, not frame
+# residency.
+#
+# TEAM_READER=vllm only sets the DEFAULT reader; the UI radio per-job
+# override wins either way, and the app never preloads in-process Qwen when
+# the configured reader is vllm.
 
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
-"$PROJECT_ROOT/web/start_vllm.sh"
-
-echo "Waiting for vLLM to come up (model load ~90s)..."
-for i in $(seq 1 36); do
-    if curl -s http://localhost:"${VLM_SERVER_PORT:-8006}"/v1/models 2>/dev/null | grep -q .; then
-        echo "vLLM ready."
-        break
-    fi
-    if ! kill -0 "$(cat /tmp/frc-vllm.pid 2>/dev/null)" 2>/dev/null; then
-        echo "vLLM process died — check /tmp/frc-vllm.log. Starting app with local reader."
-        break
-    fi
-    sleep 5
-done
-
-# Route bumper reads to the vLLM server, and trim SAM3 chunk windows so its
-# video residency coexists with vLLM's pool (400-frame default assumes the
-# whole card; 350 leaves margin — identity was flat across 150-800 in the
-# chunk-size sweep).
 export TEAM_READER=vllm
-export SAM3_CHUNK_FRAMES="${SAM3_CHUNK_FRAMES:-350}"
+
+# 2026-06-11 whole-card OOM containment: full-card SAM3 runs OOM'd at ~21GB
+# even with the dark-reanchor attempt cap, while the previous day's runs
+# (same matches, no dark-reanchor / no aggressive eviction / no
+# expandable_segments) were clean. Until the instrumented chunk-VRAM logs
+# attribute the growth, run yesterday's known-good behavior profile. The
+# features stay in the tree and re-enable per job via config_json for
+# A/B-ing the leak.
+export SAM2_DARK_REANCHOR_ENABLED="${SAM2_DARK_REANCHOR_ENABLED:-0}"
+export SAM2_EVICT_DARK_FRAMES="${SAM2_EVICT_DARK_FRAMES:-99999}"
+export SAM2_EVICT_MIN_ABSENCES="${SAM2_EVICT_MIN_ABSENCES:-99}"
 
 "$PROJECT_ROOT/web/start.sh"

@@ -10,7 +10,30 @@ source weight.
 SAM2 can occasionally propagate two object masks onto the same robot. Same-camera
 detections are therefore also merged when their image boxes overlap strongly.
 Requiring both field proximity and image overlap avoids collapsing merely-adjacent
-robots."""
+robots.
+
+Cross-camera positions disagree anisotropically: a low oblique camera keeps
+accurate bearing but its ground projection slides AWAY from the camera whenever
+the visible mask bottom sits above true ground contact (occlusion, crop clipping,
+range). Measured on 2026hop qm24, same-robot main/corner pairs were 1.1-3.8 m
+apart with only 0.1-0.3 m of cross-ray error — far outside any safe isotropic
+radius. When ``camera_centers`` is provided, a second pass therefore merges
+clusters whose detections agree in bearing (cross-ray gate) with a
+range-proportional along-ray allowance. Two robots on the same ray cannot both
+be visible to that camera, and clusters sharing any camera never merge, so the
+along-ray slack cannot chain two real robots together.
+
+Corner cameras sit near carpet level, so their range estimates are treated as
+nearly meaningless: the along-ray allowance is deliberately generous (60% of
+range, capped at 6 m). The cross-ray tolerance (default 1.0 m) also covers
+more than pixel noise: a close robot clipped by the crop edge or showing only
+its near face shifts the projected bottom-center laterally by up to half a
+robot, on top of the main camera's own ~0.3 m error (all measured on 2026hop
+qm24 with a verified-good calibration). Cross-pairing two real robots through
+that slack is instead blocked by the per-frame color veto: detections with
+known, contradicting bumper colors never merge. Corner cameras are
+identity/bearing evidence first and geometry second — a merged cluster's
+position always comes from main when main saw the robot."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -42,12 +65,98 @@ def _box_ios(box_a, box_b) -> float:
     return (iw * ih) / smaller
 
 
+def _ray_gate_score(pos_ref, center_ref, pos_other, cross_m, along_frac,
+                    along_max_m, near_slack_m):
+    """Goodness (lower = better) of ``pos_other`` explaining the same robot as
+    ``pos_ref`` seen from the camera at ``center_ref``, or None if rejected.
+
+    Decomposes the residual into bearing (cross-ray) and range (along-ray)
+    components. Projection error only pushes ``pos_ref`` away from its camera,
+    so ``pos_other`` farther out than ``pos_ref`` (beyond ``near_slack_m``
+    noise) is rejected outright."""
+    c = np.array(center_ref, float)[:2]
+    p = np.array(pos_ref, float)
+    o = np.array(pos_other, float)
+    ray = p - c
+    rng = float(np.linalg.norm(ray))
+    if rng < 1e-6:
+        return None
+    u = ray / rng
+    rel = o - c
+    along_err = rng - float(rel @ u)          # > 0: other is nearer the camera
+    cross = abs(float(rel[0] * u[1] - rel[1] * u[0]))
+    along_tol = min(along_max_m, along_frac * rng)
+    if cross > cross_m or along_err > along_tol or along_err < -near_slack_m:
+        return None
+    return (cross / cross_m) ** 2 + (along_err / along_tol) ** 2
+
+
+def _ray_gate_merge_clusters(clusters, camera_centers, cross_m, along_frac,
+                             along_max_m, near_slack_m):
+    """Merge clusters whose members agree in bearing from either camera.
+
+    Greedy best-score-first with a hard invariant: merged clusters never share
+    a camera (one camera sees one robot once), which also guarantees two
+    main-camera robots can never collapse through a corner detection."""
+    cams = [set(m[0] for m in cl) for cl in clusters]
+    candidates = []
+    for i in range(len(clusters)):
+        for j in range(i + 1, len(clusters)):
+            if cams[i] & cams[j]:
+                continue
+            best = None
+            for cam_a, det_a, _ca, _wa in clusters[i]:
+                for cam_b, det_b, _cb, _wb in clusters[j]:
+                    # Color veto: the wide geometric slack must never marry
+                    # two robots the bumper evidence already distinguishes.
+                    col_a, col_b = det_a.color, det_b.color
+                    if (col_a and col_b and "unknown" not in (col_a, col_b)
+                            and col_a != col_b):
+                        continue
+                    for (ref_cam, ref_det, other_det) in (
+                            (cam_a, det_a, det_b), (cam_b, det_b, det_a)):
+                        center = camera_centers.get(ref_cam)
+                        if center is None:
+                            continue
+                        s = _ray_gate_score(
+                            ref_det.pos, center, other_det.pos,
+                            cross_m, along_frac, along_max_m, near_slack_m)
+                        if s is not None and (best is None or s < best):
+                            best = s
+            if best is not None:
+                candidates.append((best, i, j))
+    candidates.sort()
+    parent = list(range(len(clusters)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for _score, i, j in candidates:
+        ri, rj = find(i), find(j)
+        if ri == rj or (cams[ri] & cams[rj]):
+            continue
+        parent[rj] = ri
+        cams[ri] = cams[ri] | cams[rj]
+    merged = {}
+    for idx, cl in enumerate(clusters):
+        merged.setdefault(find(idx), []).extend(cl)
+    return list(merged.values())
+
+
 def fuse_detections(
     per_camera: dict,
     weights: dict,
     radius_m: float = 0.6,
     same_camera_ios: float = 0.7,
     is_hub_occluded: Optional[Callable[[str, tuple], bool]] = None,
+    camera_centers: Optional[dict] = None,
+    ray_cross_m: float = 1.0,
+    ray_along_frac: float = 0.6,
+    ray_along_max_m: float = 6.0,
+    ray_near_slack_m: float = 0.75,
 ) -> list:
     # flatten to (camera, det, crop, weight). The effective weight is the
     # camera's vote weight scaled by the detection's own score (1.0 unless a
@@ -60,7 +169,7 @@ def fuse_detections(
             items.append((cam, det, crop, w * float(det.score or 1.0)))
 
     used = [False] * len(items)
-    out = []
+    clusters = []
     for i in range(len(items)):
         if used[i]:
             continue
@@ -81,8 +190,12 @@ def fuse_detections(
                 continue
             cluster.append((cam_j, det_j, crop_j, w_j))
             used[j] = True
-        out.append(_merge(cluster, is_hub_occluded=is_hub_occluded))
-    return out
+        clusters.append(cluster)
+    if camera_centers:
+        clusters = _ray_gate_merge_clusters(
+            clusters, camera_centers, ray_cross_m, ray_along_frac,
+            ray_along_max_m, ray_near_slack_m)
+    return [_merge(c, is_hub_occluded=is_hub_occluded) for c in clusters]
 
 
 def _merge(cluster, is_hub_occluded=None) -> FusedObservation:

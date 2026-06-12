@@ -75,13 +75,20 @@ class FusedTrackRegistry:
                     # Clean up collapsed embeddings and merge their appearance state
                     for loser in losers:
                         if loser in self._id_to_embedding:
-                            w_emb = self._id_to_embedding[fused_id]
-                            l_emb = self._id_to_embedding[loser]
-                            blended = 0.5 * w_emb + 0.5 * l_emb
-                            norm = np.linalg.norm(blended)
-                            self._id_to_embedding[fused_id] = blended / norm if norm > 0 else blended
-                            self._id_to_embedding.pop(loser, None)
+                            # Winner may have been created from an observation
+                            # without an embedding; adopt the loser's instead
+                            # of blending with nothing.
+                            w_emb = self._id_to_embedding.get(fused_id)
+                            l_emb = self._id_to_embedding.pop(loser)
+                            if w_emb is None:
+                                self._id_to_embedding[fused_id] = l_emb
+                            else:
+                                blended = 0.5 * w_emb + 0.5 * l_emb
+                                norm = np.linalg.norm(blended)
+                                self._id_to_embedding[fused_id] = blended / norm if norm > 0 else blended
                         if loser in self._id_to_anchor:
+                            if fused_id not in self._id_to_anchor:
+                                self._id_to_anchor[fused_id] = self._id_to_anchor[loser]
                             self._id_to_anchor.pop(loser, None)
                         if loser in self._recent_exemplars:
                             self._recent_exemplars.setdefault(fused_id, []).extend(self._recent_exemplars[loser])

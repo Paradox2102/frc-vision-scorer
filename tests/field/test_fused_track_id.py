@@ -1,3 +1,5 @@
+import numpy as np
+
 from web.field.fused_track_id import FusedTrackRegistry
 from web.field.fusion import FusedObservation
 from web.field.tracker import FieldDetection
@@ -54,6 +56,31 @@ def test_new_member_set_gets_fresh_id():
     fresh = _obs([("corner_right", 9)])       # never seen
     reg.assign([_obs([("main", 1)]), fresh])
     assert fresh.track_id == 1
+
+
+def _emb(seed):
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=384)
+    return v / np.linalg.norm(v)
+
+
+def test_merge_into_embeddingless_winner_adopts_loser_embedding():
+    # Regression: a track created from an observation WITHOUT an embedding
+    # (winner, lower id) later merges with a track that HAS one (loser).
+    # The collapse blended winner+loser embeddings assuming the winner had
+    # one -> KeyError on the winner id. The winner must adopt the loser's
+    # appearance state instead of crashing.
+    reg = FusedTrackRegistry()
+    no_emb = _obs([("main", 1)])            # frame 1 -> id 0, no embedding
+    reg.assign([no_emb])
+    with_emb = _obs([("corner_left", 1)])   # frame 2 -> id 1, has embedding
+    with_emb.detection.embedding = _emb(1)
+    reg.assign([with_emb])
+
+    merged = _obs([("main", 1), ("corner_left", 1)])
+    reg.assign([merged])
+    assert merged.track_id == 0
+    assert reg.get_embedding(0) is not None
 
 
 def test_bridging_two_prior_ids_collapses_to_one():

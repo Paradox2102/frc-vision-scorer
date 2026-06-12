@@ -201,3 +201,116 @@ def test_default_score_keeps_existing_weighting():
     }
     fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
     assert fused[0].evidence == [("main", b"m", 1.0), ("corner_left", b"c", 2.5)]
+
+
+# --- ray-aware cross-camera gating -----------------------------------------
+# A low oblique camera projecting a mask bottom to the carpet has anisotropic
+# error: bearing stays accurate while range error grows with distance (the
+# visible bottom sits above true ground contact, pushing the estimate AWAY
+# from the camera). Geometry below is measured from 2026hop qm24: corner_right
+# at (15.82, -0.23), corner_left at (0.64, -0.30).
+
+CENTERS = {"corner_left": (0.64, -0.30), "corner_right": (15.82, -0.23)}
+W2 = {"main": 1.0, "corner_left": 2.5, "corner_right": 2.5}
+
+
+def test_ray_gate_merges_along_ray_range_error():
+    # Measured split pair: corner_right saw the robot at (14.72, 6.91); main
+    # (trusted) at (15.30, 4.49) — 2.48 m apart but only 0.20 m off the ray.
+    per_cam = {
+        "main": [(_det(15.30, 4.49, "blue", (100, 100, 200, 200)), b"m")],
+        "corner_right": [(_det(14.72, 6.91, "blue", None), b"c")],
+    }
+    without = fuse_detections(per_cam, weights=W2)
+    assert len(without) == 2  # default behavior unchanged
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 1
+    assert fused[0].detection.pos == (15.30, 4.49)  # main still owns geometry
+    assert set(fused[0].members) == {("main", None), ("corner_right", None)}
+
+
+def test_ray_gate_merges_close_range_clipped_corner_pair():
+    # Measured corner_left pair (calibration verified good): a robot 3.3 m
+    # from the low corner camera with its box clipped at the crop edge showed
+    # 0.97 m cross-track — half-robot near-face/clip offset plus main's own
+    # ~0.3 m, all bounded in meters. Same color, so the wide gate may merge.
+    per_cam = {
+        "main": [(_det(2.13, 1.72, "red", (10, 10, 20, 20)), b"m")],
+        "corner_left": [(_det(1.43, 2.95, "red", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 1
+
+
+def test_ray_gate_vetoes_contradicting_colors():
+    # Same geometry as the merge above, but the bumper evidence disagrees:
+    # known, contradicting colors must never marry through geometric slack.
+    per_cam = {
+        "main": [(_det(2.13, 1.72, "blue", (10, 10, 20, 20)), b"m")],
+        "corner_left": [(_det(1.43, 2.95, "red", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 2
+
+
+def test_ray_gate_rejects_large_cross_track():
+    # ~1.5 m of bearing disagreement exceeds every bounded error source.
+    per_cam = {
+        "main": [(_det(2.60, 1.50, "red", (10, 10, 20, 20)), b"m")],
+        "corner_left": [(_det(1.43, 2.95, "red", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 2
+
+
+def test_ray_gate_never_chains_two_main_robots():
+    # Two real robots along the same corner ray (the nearer occludes the
+    # farther in that camera). The corner det may merge with only ONE main
+    # det, and the two main dets must never collapse into one observation.
+    per_cam = {
+        "main": [
+            (FieldDetection(pos=(15.30, 4.49), color="blue", box=(0, 0, 10, 10), track_id=1), b"m1"),
+            (FieldDetection(pos=(15.05, 5.55), color="blue", box=(40, 0, 50, 10), track_id=2), b"m2"),
+        ],
+        "corner_right": [(_det(14.72, 6.91, "blue", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 2
+    main_ids = [m for f in fused for m in f.members if m[0] == "main"]
+    assert len(main_ids) == 2  # both main robots survive as members somewhere
+
+
+def test_ray_gate_along_tolerance_scales_with_range():
+    # At short range the along-ray slack shrinks: a 2.5 m range error on a
+    # ~3 m-range detection is implausible even for a carpet-level camera.
+    per_cam = {
+        # 2.5 m nearer corner_right than its (14.5, 2.4) estimate, on the ray
+        "main": [(_det(15.62, 0.16, "red", (10, 10, 20, 20)), b"m")],
+        "corner_right": [(_det(14.5, 2.4, "red", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 2
+
+
+def test_ray_gate_rejects_other_det_beyond_corner_estimate():
+    # Projection error pushes the corner estimate AWAY from its camera, so a
+    # main det even farther out along the ray cannot be the same robot.
+    per_cam = {
+        "main": [(_det(13.91, 9.95, "blue", (10, 10, 20, 20)), b"m")],
+        "corner_right": [(_det(14.72, 6.91, "blue", None), b"c")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 2
+
+
+def test_ray_gate_pairs_corner_only_views():
+    # Main misses the robot (e.g. hub occlusion); the two corner views still
+    # unify through either camera's ray.
+    per_cam = {
+        "corner_right": [(_det(14.0, 6.0, "red", None), b"cr")],
+        # 2.0 m nearer corner_right along its ray toward (14.0, 6.0)
+        "corner_left": [(_det(14.56, 4.08, "red", None), b"cl")],
+    }
+    fused = fuse_detections(per_cam, weights=W2, camera_centers=CENTERS)
+    assert len(fused) == 1
+    assert {m[0] for m in fused[0].members} == {"corner_left", "corner_right"}

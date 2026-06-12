@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260603h">
+    <link rel="stylesheet" href="/static/style.css?v=20260611e">
 </head>
 <body>
     <div class="container">
@@ -94,21 +94,11 @@
                                 <label for="youtubeUrl">YouTube URL:</label>
                                 <input type="text" id="youtubeUrl" placeholder="https://youtube.com/watch?v=...">
                             </div>
-                            <div class="reader-toggle">
-                                <span class="reader-toggle-label">Team Number Reader</span>
-                                <label>
-                                    <input type="radio" name="teamReader" value="local" checked>
-                                    <span>Local GPU</span>
-                                </label>
-                                <label>
-                                    <input type="radio" name="teamReader" value="vllm" id="vllmReaderRadio">
-                                    <span>vLLM Server <span id="vllmReaderHint" class="reader-hint"></span></span>
-                                </label>
-                                <label>
-                                    <input type="radio" name="teamReader" value="deepseek">
-                                    <span>DeepSeek V4</span>
-                                </label>
-                            </div>
+                            <!-- Team-number reader is no longer user-selected: jobs use
+                                 the server default (vllm), the phase-exclusive lifecycle
+                                 starts/stops the vLLM server around the phases that need
+                                 it, and reads fall back to the in-process model
+                                 automatically if it fails to come up. -->
                             <div class="input-group">
                                 <label for="trackingBackend">Segmentation tracker:</label>
                                 <select id="trackingBackend">
@@ -124,9 +114,10 @@
                                 <label for="sam3ChunkFrames">SAM 3 chunk window (frames):</label>
                                 <input type="number" id="sam3ChunkFrames" min="16" max="2000" step="50" placeholder="400 (default)">
                                 <small style="color:#889;display:block;margin-top:4px;">
-                                    Frames per GPU-resident tracking window (~14&nbsp;MiB each).
-                                    A VRAM-fit knob, not a speed knob — identity was flat from
-                                    150–800 in testing. Drop to ~350 when the vLLM reader shares the GPU.
+                                    Frames per GPU-resident tracking window. A VRAM-fit knob,
+                                    not a speed knob — identity was flat from 150–800 in testing.
+                                    Tracking has the whole GPU (the vLLM reader is stopped during
+                                    this phase), so the 400 default is fine; leave empty.
                                 </small>
                             </div>
                             <div class="input-group" id="sam2ModelGroup">
@@ -162,6 +153,15 @@
                 </div>
             </div>
 
+            <!-- Degradation warnings: results-threatening problems, kept visible -->
+            <div class="degradation-banner" id="degradationBanner" style="display:none;">
+                <strong id="degradationTitle">⚠ Results may be incomplete</strong>
+                <ul id="degradationList"></ul>
+            </div>
+
+            <!-- Rolling status history: progress detail that would otherwise be overwritten -->
+            <div class="status-log" id="statusLog" style="display:none;"></div>
+
             <div class="inference-controls" id="inferenceControls" style="display:none;">
                 <button id="startInferenceBtn" class="inference-btn start-btn" style="display:none;">Start Inference</button>
                 <button id="pauseInferenceBtn" class="inference-btn pause-btn" style="display:none;">Pause</button>
@@ -178,6 +178,8 @@
                             <span class="hud-item"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
                             <span class="hud-item"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
                             <span class="hud-item"><span class="hud-label">Reader</span> <span id="hudReader">local idle</span></span>
+                            <span class="hud-item"><span class="hud-label">Started</span> <span id="hudStartTime">—</span></span>
+                            <span class="hud-item"><span class="hud-label">Elapsed</span> <span id="hudElapsed">0:00</span></span>
                         </div>
                         <div class="hud-scores">
                             <div class="score-chip blue">
@@ -191,6 +193,12 @@
                         </div>
                     </div>
                     <div class="video-container">
+                        <!-- Tracking phase: per-view seed frames + propagation progress.
+                             Hidden once the analysis loop starts streaming overlay frames. -->
+                        <div id="trackingPanel" class="tracking-panel" style="display:none;">
+                            <div class="tracking-panel-title">Tracking phase — per-camera propagation</div>
+                            <div id="trackingCards" class="tracking-cards"></div>
+                        </div>
                         <canvas id="videoCanvas"></canvas>
                     </div>
                 </div>
@@ -453,6 +461,6 @@
 
     </div>
 
-    <script src="/static/app.js?v=20260607a"></script>
+    <script src="/static/app.js?v=20260611f"></script>
 </body>
 </html>

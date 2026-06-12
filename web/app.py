@@ -86,8 +86,10 @@ from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
+from web.field.view_stride import build_view_frame_plan, scale_frame_knob
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
+from web.hud_util import select_coasting_ghosts, draw_dashed_box
 from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import load_zones, point_in_zones, prism_bounding_zones, save_zones
 from web.replay_recorder import ReplayRecorder
@@ -588,6 +590,7 @@ HUD_DRAW_ROBOT_BOX      = _hud_flag("HUD_DRAW_ROBOT_BOX", "0")       # full boun
 HUD_DRAW_GROUND_PLANE   = _hud_flag("HUD_DRAW_GROUND_PLANE", "0")    # bumper ground-contact polygon
 HUD_DRAW_VELOCITY_ARROW = _hud_flag("HUD_DRAW_VELOCITY_ARROW", "0")  # motion-direction arrow
 HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball detection boxes (hundreds = noise)
+HUD_DRAW_COASTING_GHOST = _hud_flag("HUD_DRAW_COASTING_GHOST", "1")  # dashed last-known box for coasting tracks
 
 # Bumper-number reading VLM. Loaded via AutoModelForImageTextToText, so any
 # transformers-supported image-text-to-text model works.  Override via VLM_MODEL_NAME
@@ -848,8 +851,15 @@ class InferenceJob:
         self.needs_calibration = None
         self._log_file = None
         self._log_path: Optional[Path] = None
+        # Wall-clock creation time, surfaced by /api/job/active so a
+        # reloaded page can show truthful start/elapsed clocks on rejoin.
+        self.started_at = time.time()
         self.websocket: Optional[WebSocket] = None
         self._websocket_send_lock = asyncio.Lock()
+        # First ws connection claims the run; later connections only attach
+        # for streaming and wait on _done_event (no second process_video).
+        self._run_claimed = False
+        self._done_event = asyncio.Event()
         self._paused = False
         self._stopped = False
         self._pause_frame = 0
@@ -924,6 +934,10 @@ class InferenceJob:
         self.timer_gate_fallback = True
         self.timer_gate_fallback_reason: Optional[str] = None
         self.sam2_source_to_local: Dict[int, int] = {}
+        # Per-view source-frame -> tracker-local-index maps. Corner views may
+        # be decimated (corner_track_stride), so each view has its own index
+        # space; main's map equals sam2_source_to_local.
+        self.sam2_view_source_to_local: Dict[str, Dict[int, int]] = {}
         self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
         # Per-job A/B knobs, all resolved through self.config (override > env >
         # default). The attributes survive because downstream plumbing and the
@@ -937,6 +951,9 @@ class InferenceJob:
         self.reanchor_enabled: Optional[bool] = self.config.reanchor_enabled
         # SAM3 remains opt-in until it has been benchmarked on the event hardware.
         self.tracking_backend = self.config.tracking_backend
+        # Display tag for log lines / status messages / degradation
+        # components, so SAM3 runs no longer label themselves "[SAM2]".
+        self.tracker_tag = "SAM3" if self.tracking_backend == "sam3" else "SAM2"
 
         # Detection state
         self.hubs: List[DetectedHub] = []
@@ -4223,6 +4240,7 @@ class InferenceJob:
                             self.event_key,
                             self.match_key,
                             teams=roster_teams or None,
+                            verified_only=self.config.gallery_verified_only,
                         )
                         if self.match_key else []
                     )
@@ -4232,8 +4250,12 @@ class InferenceJob:
                         f"match teams {roster_teams}"
                         if roster_teams else "all event teams (no match roster)"
                     )
+                    trust = (
+                        "verified-only" if self.config.gallery_verified_only
+                        else "all deposits"
+                    )
                     print(
-                        f"  Appearance gallery loaded: {len(rows)} exemplars "
+                        f"  Appearance gallery loaded: {len(rows)} exemplars ({trust}) "
                         f"for {self.event_key} before {self.match_key or 'unknown match'}, {scope}"
                     )
                 except Exception as e:
@@ -4345,7 +4367,7 @@ class InferenceJob:
 
             if active_frame_count <= 1 or prompt_source_frame >= self.total_frames:
                 print(
-                    f"  [SAM2] Active video is too short ({active_frame_count} frames) "
+                    f"  [{self.tracker_tag}] Active video is too short ({active_frame_count} frames) "
                     f"for prompt frame {prompt_source_frame}. Disabling SAM2."
                 )
             else:
@@ -4354,6 +4376,29 @@ class InferenceJob:
                     
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     backend_label = "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
+
+                    # Phase exclusivity: a resident vLLM server (~11GB pool)
+                    # plus SAM3 propagation (~11GB peak) OOMs the 24GB card —
+                    # and vLLM is idle through this whole phase. Take it down
+                    # BEFORE the free-VRAM probe below so the offload
+                    # heuristic sees the real budget; the server comes back
+                    # right before the analysis loop's bumper reads.
+                    if self.config.vllm_phase_exclusive and device == "cuda":
+                        from web import vllm_lifecycle
+                        await self._send_ws({
+                            "type": "status", "status": "processing",
+                            "message": "Pausing vLLM reader to free VRAM for tracking…",
+                            "progress": 8.0,
+                        })
+                        if not await vllm_lifecycle.ensure_stopped():
+                            await self._warn_degraded(
+                                "vllm",
+                                "Could not stop the vLLM server before tracking; "
+                                "propagation may run out of GPU memory.",
+                            )
+                        else:
+                            await asyncio.sleep(5)  # let CUDA reclaim the pool
+
                     offload_vid = True
                     offload_st = True
                     # Target FPS is a fixed speed knob (SAM2_TRACK_FPS), independent of
@@ -4370,21 +4415,21 @@ class InferenceJob:
                             free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(0)
                             free_vram_gb = free_mem_bytes / (1024 ** 3)
                             total_vram_gb = total_mem_bytes / (1024 ** 3)
-                            print(f"  [SAM2] GPU VRAM: {free_vram_gb:.2f} GB free of {total_vram_gb:.2f} GB total")
+                            print(f"  [{self.tracker_tag}] GPU VRAM: {free_vram_gb:.2f} GB free of {total_vram_gb:.2f} GB total")
                             if free_vram_gb >= 16.0:
                                 offload_st = False
-                                print("  [SAM2] Free VRAM >= 16GB: keeping tracker state on GPU.")
+                                print(f"  [{self.tracker_tag}] Free VRAM >= 16GB: keeping tracker state on GPU.")
                             else:
-                                print("  [SAM2] Free VRAM < 16GB: offloading tracker state to CPU.")
+                                print(f"  [{self.tracker_tag}] Free VRAM < 16GB: offloading tracker state to CPU.")
                         except Exception as e:
-                            print(f"  [SAM2] Error querying GPU VRAM info: {e}. Using conservative defaults.")
+                            print(f"  [{self.tracker_tag}] Error querying GPU VRAM info: {e}. Using conservative defaults.")
                     
                     # Update dynamic frame_skip calculation based on adaptive target tracking FPS
                     if self.video_fps and self.video_fps > 0:
                         self.frame_skip = max(1, int(round(self.video_fps / target_tracking_fps)))
                     else:
                         self.frame_skip = FRAME_SKIP
-                    print(f"  [SAM2] Recalculating dynamic frame_skip = {self.frame_skip} for target FPS = {target_tracking_fps}")
+                    print(f"  [{self.tracker_tag}] Recalculating dynamic frame_skip = {self.frame_skip} for target FPS = {target_tracking_fps}")
 
                     # VRAM-fit override: keep all tensors on the GPU and raise
                     # frame_skip so the tracked segment fits within the budget.
@@ -4398,7 +4443,7 @@ class InferenceJob:
                         offload_vid = False
                         offload_st = False
                         est_gib = seg_frames * SAM2_FRAME_GPU_MIB / 1024.0
-                        print(f"  [SAM2] VRAM-fit: budget={self.sam2_max_gpu_frames} frames -> "
+                        print(f"  [{self.tracker_tag}] VRAM-fit: budget={self.sam2_max_gpu_frames} frames -> "
                               f"frame_skip={self.frame_skip}, ~{seg_frames} tracked frames "
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
@@ -4448,7 +4493,7 @@ class InferenceJob:
                         "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
                     )
                     await self._warn_degraded(
-                        "sam2",
+                        self.tracker_tag.lower(),
                         f"[{backend_label}] Failed to initialize tracker/embedder: "
                         f"{e}. Falling back to Kalman tracking.",
                     )
@@ -4456,7 +4501,7 @@ class InferenceJob:
                     self.robot_embedder = None
 
             if self.use_sam2:
-                print(f"  [SAM2] Running pre-computation pass over {len(self.views)} views...")
+                print(f"  [{self.tracker_tag}] Running pre-computation pass over {len(self.views)} views...")
                 all_frames = [
                     frame
                     for start, end in self.processing_ranges
@@ -4475,13 +4520,51 @@ class InferenceJob:
                 )
                 prompt_frame = all_frames[prompt_local_idx]
                 print(
-                    f"  [SAM2] Seeding at source frame {prompt_frame} "
+                    f"  [{self.tracker_tag}] Seeding at source frame {prompt_frame} "
                     f"(~{self.config.sam2_prompt_offset_seconds:.1f}s after active start), "
                     "then propagating backward."
                 )
                 SAM2_SCALE = self.sam2_export_scale
-                print(f"  [SAM2] Frame-export scale: {SAM2_SCALE}")
-                
+                print(f"  [{self.tracker_tag}] Frame-export scale: {SAM2_SCALE}")
+
+                # Corner-cam decimation: corner views are tracked at
+                # track_fps/stride (less signal there, and propagation cost
+                # scales with frames/view). Each view gets its own
+                # local-index space, phase-aligned so the prompt frame is
+                # always kept; main always runs at full rate.
+                corner_stride = max(1, int(self.config.corner_track_stride))
+                # Dense head: full-rate corners through the lock-formation
+                # window (kept-frame units from the active start), strided
+                # afterwards. The corner-stride A/B showed whole-timeline
+                # decimation starves team confirmation.
+                corner_dense_frames = 0
+                if corner_stride > 1 and self.video_fps and self.frame_skip:
+                    corner_dense_frames = int(round(
+                        self.config.corner_dense_seconds
+                        * self.video_fps / self.frame_skip))
+                view_plans = {
+                    v.name: build_view_frame_plan(
+                        all_frames,
+                        prompt_local_idx,
+                        1 if v.name == "main" else corner_stride,
+                        dense_frames=0 if v.name == "main" else corner_dense_frames,
+                    )
+                    for v in self.views
+                }
+                self.sam2_view_source_to_local = {
+                    name: plan.source_to_local
+                    for name, plan in view_plans.items()
+                }
+                if corner_stride > 1:
+                    for v in self.views:
+                        if v.name != "main":
+                            print(
+                                f"  [{self.tracker_tag}] View {v.name}: corner stride "
+                                f"{corner_stride} (dense head {corner_dense_frames}) -> "
+                                f"{len(view_plans[v.name].source_frames)}"
+                                f"/{len(all_frames)} frames"
+                            )
+
                 N = len(self.views)
                 loop = asyncio.get_running_loop()
 
@@ -4523,6 +4606,11 @@ class InferenceJob:
                         if fpos in export_frame_set:
                             is_prompt = (fpos == prompt_frame)
                             for view in self.views:
+                                # Decimated views skip frames outside their
+                                # plan (prompt frame is always in-plan).
+                                view_local_idx = view_plans[view.name].source_to_local.get(fpos)
+                                if view_local_idx is None:
+                                    continue
                                 try:
                                     crop = view.extract(fr)
                                     # Exclude the airspace at the top of the view from robot
@@ -4537,7 +4625,7 @@ class InferenceJob:
                                     new_w = int(crop.shape[1] * SAM2_SCALE)
                                     new_h = int(crop.shape[0] * SAM2_SCALE)
                                     small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                                    fname = os.path.join(view_dirs[view.name].name, f"{local_idx:05d}.jpg")
+                                    fname = os.path.join(view_dirs[view.name].name, f"{view_local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
  
                                     # Seed SAM2 from expanded bumper detections so masks
@@ -4600,25 +4688,31 @@ class InferenceJob:
                                             )
                                             view_prompt_colors[view.name].append("unknown")
                                 except Exception as e:
-                                    print(f"  [SAM2] Error exporting frame {local_idx} for view {view.name}: {e}")
+                                    print(f"  [{self.tracker_tag}] Error exporting frame {local_idx} for view {view.name}: {e}")
                             local_idx += 1
                             exported += 1
                             if exported % 20 == 0:
                                 pct = (exported / max(1, len(all_frames))) * EXPORT_PCT
-                                msg = f"[SAM2] Exporting frames ({exported}/{len(all_frames)}) across {N} view(s)..."
+                                msg = f"[{self.tracker_tag}] Exporting frames ({exported}/{len(all_frames)}) across {N} view(s)..."
                                 await safe_send_status(msg, pct)
                         fpos += 1
                 except Exception as e:
-                    print(f"  [SAM2] Error during single-pass frame export: {e}")
+                    print(f"  [{self.tracker_tag}] Error during single-pass frame export: {e}")
                 finally:
                     cap_pre.release()
                 self.timings["frame_export"] = self.timings.get("frame_export", 0.0) + (time.perf_counter() - export_t0)
-                print(f"  [SAM2] Exported {exported} frames/view across {N} view(s) in "
+                print(f"  [{self.tracker_tag}] Exported {exported} frames/view across {N} view(s) in "
                       f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
 
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
+                    view_plan = view_plans[view.name]
+                    # Effective average stride over the (possibly mixed-rate)
+                    # timeline: 1.0 for main, the full stride for a pure
+                    # decimated view, in between with a dense head. Used to
+                    # rescale wall-clock-denominated tracker knobs.
+                    view_stride = len(all_frames) / max(1, len(view_plan.source_frames))
                     prompt_boxes_scaled = view_prompt_boxes[view.name]
                     self.sam2_obj_color[view.name] = {
                         i + 1: color
@@ -4626,26 +4720,64 @@ class InferenceJob:
                     }
                     base_pct = EXPORT_PCT + (view_idx / N) * (100.0 - EXPORT_PCT)
                     span_pct = (100.0 - EXPORT_PCT) / N
-                    print(f"  [SAM2] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
+                    print(f"  [{self.tracker_tag}] View {view.name}: prompt frame detected {len(prompt_boxes_scaled)} robots")
+
+                    # Tracking-phase visualization: send this view's seed frame
+                    # (annotated with the prompt boxes) so the UI has something
+                    # to show in the video area while propagation grinds.
+                    try:
+                        seed_path = os.path.join(
+                            tmp_dir_obj.name, f"{view_plan.prompt_idx:05d}.jpg")
+                        seed_img = cv2.imread(seed_path)
+                        if seed_img is not None:
+                            from web.hud_util import encode_seed_thumbnail
+                            await self._send_ws({
+                                "type": "tracking_view_seed",
+                                "view": view.name,
+                                "robots": len(prompt_boxes_scaled),
+                                "image": encode_seed_thumbnail(
+                                    seed_img, prompt_boxes_scaled),
+                            })
+                    except Exception as e:
+                        print(f"  [{self.tracker_tag}] seed thumbnail for {view.name} failed: {e}")
                     if not prompt_boxes_scaled:
                         print(
-                            f"  [SAM2] View {view.name}: no prompt-frame robots; "
+                            f"  [{self.tracker_tag}] View {view.name}: no prompt-frame robots; "
                             "scanning later frames for detector bootstrap."
                         )
                         await safe_send_status(
-                            f"[SAM2] View '{view.name}': waiting for first robot...",
+                            f"[{self.tracker_tag}] View '{view.name}': waiting for first robot...",
                             base_pct,
                         )
 
                     _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
                     try:
                         def make_progress_cb(b_pct, sp_pct, v_name):
+                            throttle = {"last": 0.0}
+
                             def progress_cb(current, total):
                                 pct = b_pct + (current / max(1, total)) * sp_pct
-                                msg = f"[SAM2] View '{v_name}': tracking frame {current}/{total}..."
+                                msg = f"[{self.tracker_tag}] View '{v_name}': tracking frame {current}/{total}..."
                                 loop.call_soon_threadsafe(
                                     lambda: asyncio.create_task(safe_send_status(msg, pct))
                                 )
+                                # Structured per-view progress for the tracking
+                                # panel, throttled so a fast view can't flood
+                                # the socket.
+                                now_s = time.monotonic()
+                                if now_s - throttle["last"] >= 0.5 or current >= total:
+                                    throttle["last"] = now_s
+                                    payload = {
+                                        "type": "tracking_progress",
+                                        "view": v_name,
+                                        "current": current,
+                                        "total": total,
+                                        "pct": round(pct, 1),
+                                    }
+                                    loop.call_soon_threadsafe(
+                                        lambda p=payload: asyncio.create_task(
+                                            self._send_ws(p))
+                                    )
                             return progress_cb
 
                         # Periodic re-prompting: re-run the detector cascade at chunk
@@ -4662,9 +4794,11 @@ class InferenceJob:
                             detect_caps.append(state)
 
                             def detect_fn(local_idx, frame_path):
-                                if local_idx is None or local_idx >= len(all_frames):
+                                # local_idx is in THIS view's (possibly
+                                # decimated) index space.
+                                if local_idx is None or local_idx >= len(view_plan.source_frames):
                                     return None
-                                source_frame = all_frames[local_idx]
+                                source_frame = view_plan.source_frames[local_idx]
                                 if state["cap"] is None:
                                     state["cap"] = cv2.VideoCapture(str(self.video_path))
                                 cap_l = state["cap"]
@@ -4714,7 +4848,10 @@ class InferenceJob:
                             return detect_fn
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
+                        # Decimated views see 1/stride the frames, so divide to
+                        # keep the same wall-clock cadence.
                         eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
+                        eff_fps /= view_stride
                         reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
 
                         # Build a projector mapping a SAM2 mask box (tracker/0.5x
@@ -4769,7 +4906,7 @@ class InferenceJob:
                         view_tracks = await asyncio.to_thread(
                             sam2_tracker.track,
                             frames_dir=tmp_dir_obj.name,
-                            prompt_idx=prompt_local_idx,
+                            prompt_idx=view_plan.prompt_idx,
                             prompt_boxes=prompt_boxes_scaled,
                             reprompt_every=reprompt_every,
                             detect_fn=make_detect_fn(_detect_caps),
@@ -4790,20 +4927,37 @@ class InferenceJob:
                                if self.cull_hijack_enabled is not None else {}),
                             **({"reanchor_enabled": self.reanchor_enabled}
                                if self.reanchor_enabled is not None else {}),
+                            dark_reanchor_enabled=self.config.dark_reanchor_enabled,
+                            # Frame-denominated wall-clock threshold: rescale
+                            # for decimated views ("dark for ~1s" must not
+                            # become ~2s on a stride-2 corner). Absence counts
+                            # are per re-prompt cycle, already rescaled above.
+                            evict_dark_frames=scale_frame_knob(
+                                self.config.evict_dark_frames, view_stride),
+                            evict_min_absences=self.config.evict_min_absences,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
                         n = len(view_tracks)
-                        print(f"  [SAM2] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
+                        print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
                               f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
                         self.sam2_raw[view.name] = view_tracks
 
                         await safe_send_status(
-                            f"[SAM2] View '{view.name}': tracking complete.",
+                            f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
                             base_pct + span_pct,
                         )
                     except Exception as e:
-                        print(f"  [SAM2] Error during propagation for view {view.name}: {e}")
+                        print(f"  [{self.tracker_tag}] Error during propagation for view {view.name}: {e}")
+                        # A dead view means a mostly-empty overlay for that
+                        # camera; without this warning the job still reports
+                        # "completed" and the gap reads as a tracker bug
+                        # (it has been a VRAM OOM all three times so far).
+                        await self._warn_degraded(
+                            self.tracker_tag.lower(),
+                            f"View '{view.name}' produced no tracks "
+                            f"({type(e).__name__}): {e}",
+                        )
                     finally:
                         for _state in _detect_caps:
                             if _state.get("cap") is not None:
@@ -4812,13 +4966,64 @@ class InferenceJob:
 
                 if not self.sam2_raw:
                     await self._warn_degraded(
-                        "sam2",
+                        self.tracker_tag.lower(),
                         "No views produced tracklets — falling back to Kalman tracking.",
                     )
                     self.use_sam2 = False
                 else:
                     self.fused_registry = FusedTrackRegistry()
+
+                # Every tracklet the analysis loop will ever read is already
+                # in self.sam2_raw (CPU); the SAM predictor weights and any
+                # session state are dead VRAM from here on. Drop the last
+                # reference so the cache release below can actually hand the
+                # memory to the vLLM server (empty_cache cannot free live
+                # tensors).
+                del sam2_tracker
             # -------------------------------------
+
+            # Tracking precompute is done; the analysis loop (and the early
+            # OCR pass just below) issue bumper reads, so bring the vLLM
+            # server back now. On failure the read path falls back to the
+            # in-process Qwen reader — degraded speed, not a dead job.
+            if (self.config.vllm_phase_exclusive
+                    and getattr(self, "team_reader", "local") == "vllm"):
+                from web import vllm_lifecycle
+                # Tracking leaves the CUDA caching allocator holding a large
+                # RESERVED pool (observed 14.5GiB cached over ~4GiB live);
+                # torch never returns it to the OS on its own, so vLLM's
+                # ~10.6GB preallocation can't fit until we release the cache.
+                try:
+                    import gc
+                    import torch
+                    # Break any reference cycles inside the dropped tracker
+                    # so its CUDA tensors are truly unreferenced before the
+                    # cache is returned to the OS.
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        free_gb = torch.cuda.mem_get_info(0)[0] / 2**30
+                        print(f"  [{self.tracker_tag}] released CUDA cache "
+                              f"before vLLM start ({free_gb:.1f} GB free)")
+                except Exception as e:
+                    print(f"  [vllm] cache release failed: {e}")
+                await self._send_ws({
+                    "type": "status", "status": "processing",
+                    "message": "Starting vLLM reader for the analysis phase (~90s model load)…",
+                    "progress": 55.0,
+                })
+                if not await vllm_lifecycle.ensure_started():
+                    # The server never came up. Switch this job to the
+                    # in-process reader for the rest of the run so every read
+                    # batch skips the doomed vLLM round-trip (and its
+                    # connection-refused fallback) entirely.
+                    self.team_reader = "local"
+                    await self._warn_degraded(
+                        "vllm",
+                        "vLLM reader did not come up after tracking; bumper "
+                        "reads fall back to the slower in-process model.",
+                    )
 
             # Early vision OCR pass at the autonomous start when timer gating succeeds.
             # Seeds the field tracker's slots from this frame so VLM reads bind to
@@ -5003,11 +5208,15 @@ class InferenceJob:
                 person_evidence_boxes_by_cam = {}
                 
                 if self.use_sam2:
-                    local_idx = self.sam2_source_to_local.get(frame_num)
                     SAM2_SCALE = self.sam2_export_scale
                     for view in self.views:
                         paired = []
                         view_raw = self.sam2_raw.get(view.name, {})
+                        # Per-view index space: a decimated corner view has no
+                        # entry for dropped frames -> clean gap (same as
+                        # occlusion), never a stale-box reuse.
+                        local_idx = self.sam2_view_source_to_local.get(
+                            view.name, {}).get(frame_num)
                         
                         view_frame = view.extract(frame)
                         cal = view.calibration
@@ -5165,7 +5374,23 @@ class InferenceJob:
                     per_camera,
                     weights=weights,
                     is_hub_occluded=_hub_blocks_camera,
+                    camera_centers=(
+                        {name: (float(c[0]), float(c[1]))
+                         for name, c in camera_centers.items()}
+                        if self.config.fuse_ray_gate else None),
+                    ray_cross_m=self.config.fuse_ray_cross_m,
                 )   # list[FusedObservation]
+
+                # Cross-view merge rate is the health signal for multi-camera
+                # identity: silent fusion failure looks like per-view identity
+                # disagreement downstream (split fused tracks, slot churn).
+                if frame_num - getattr(self, "_last_fusion_log", -(10 ** 9)) >= 600:
+                    self._last_fusion_log = frame_num
+                    _multi = sum(
+                        1 for o in fused if len({m[0] for m in o.members}) > 1)
+                    print(f"  [fusion] frame {frame_num}: {len(fused)} fused obs, "
+                          f"{_multi} cross-view, "
+                          f"{sum(len(d) for d in per_camera.values())} raw dets")
                 
                 ev_list = []
                 if self.use_sam2:
@@ -5489,7 +5714,29 @@ class InferenceJob:
                         vel=track.vel if track else None,
                         mask=mask,
                     )
-                
+
+                # Coasting tracks: position alive, mask gone. Without a ghost
+                # they are indistinguishable from never-seen robots in the
+                # camera view (they only show on the field map).
+                if HUD_DRAW_COASTING_GHOST:
+                    drawn_slots = {sid for sid, _ in tracked_robot_boxes}
+                    for slot_id, gbox in select_coasting_ghosts(track_outs):
+                        if slot_id in drawn_slots:
+                            continue
+                        robot = self._get_slot_track_if_exists(slot_id)
+                        if robot is None:
+                            continue
+                        label, _ = self._team_hud_label(
+                            robot, self._slot_label(slot_id))
+                        gcolor = ((153, 60, 0) if robot.alliance == "blue"
+                                  else (0, 30, 153))
+                        draw_dashed_box(annotated_frame, gbox, gcolor, thickness=2)
+                        gx1, gy1 = int(gbox[0]), int(gbox[1])
+                        cv2.putText(annotated_frame, f"{label} coast",
+                                    (gx1, max(12, gy1 - 5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, gcolor, 1,
+                                    cv2.LINE_AA)
+
                 # Draw hubs
                 for hub in self.hubs:
                     color = (255, 0, 0) if hub.alliance == "blue" else (0, 0, 255)
@@ -5629,6 +5876,15 @@ class InferenceJob:
                 "error": str(e)
             })
         finally:
+            # Leave the GPU clean for whatever runs next: the vLLM server is
+            # only needed during this job's analysis phase, and the next
+            # job's tracking would have to stop it anyway.
+            if getattr(self.config, "vllm_phase_exclusive", False):
+                try:
+                    from web import vllm_lifecycle
+                    await vllm_lifecycle.ensure_stopped()
+                except Exception as e:
+                    print(f"  [vllm] post-job stop failed: {e}")
             try:
                 await self._stop_ws_senders(drain=False)
             except Exception:
@@ -5761,6 +6017,48 @@ async def index():
 @app.get("/calibrate")
 async def calibrate_page():
     return FileResponse(STATIC_DIR / "calibrate.html")
+
+
+@app.get("/api/job/active")
+async def active_job():
+    """The currently running/queued job, if any.
+
+    A page reload loses the job id, so the UI calls this on load to rejoin a
+    running match (the websocket reattach path streams without re-running).
+    """
+    for job_id in reversed(jobs):
+        job = jobs[job_id]
+        if job.status not in ("completed", "error"):
+            return {
+                "job_id": job_id,
+                "status": job.status,
+                "started_at": getattr(job, "started_at", None),
+                "match_key": getattr(job, "match_key", None),
+            }
+    return {"job_id": None}
+
+
+@app.get("/api/debug/tasks")
+async def debug_tasks():
+    """Stack of every live asyncio task.
+
+    Diagnostic hook for event-loop hangs: a job that stalls with the log
+    frozen, all OS threads idle and the loop still serving requests is a
+    coroutine awaiting something that never resolves — py-spy can't see
+    which one, this can. Hit it from a browser/curl while the hang is live.
+    """
+    out = []
+    for task in asyncio.all_tasks():
+        frames = [
+            f"{f.f_code.co_filename}:{f.f_lineno} {f.f_code.co_name}"
+            for f in task.get_stack(limit=30)
+        ]
+        out.append({
+            "name": task.get_name(),
+            "done": task.done(),
+            "stack": frames,
+        })
+    return {"tasks": out}
 
 
 @app.get("/api/status")
@@ -7152,6 +7450,21 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
     teams_str = ", ".join(match_teams)
     expected_alliances = expected_alliances or ["unknown"] * len(robot_crops_b64)
 
+    # Pre-flight reachability probe. The per-crop reads below catch their own
+    # exceptions and return error entries, so a dead server would otherwise
+    # yield a full batch of "connection refused" reads and the caller's
+    # fallback (try/except around this function) would never fire. Raising here
+    # on an unreachable server lets _vision_read_bumpers degrade to the
+    # in-process Qwen reader — slower, but a live match instead of a dead one.
+    try:
+        probe = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+        with urllib.request.urlopen(probe, timeout=3):
+            pass
+    except Exception as e:
+        raise RuntimeError(
+            f"vLLM server unreachable at {VLM_SERVER_URL}: {e}"
+        ) from e
+
     def _error_entry(e):
         return {"team_number": None, "alliance": "unknown", "confidence": 0,
                 "raw_read": None, "error": str(e)}
@@ -7822,10 +8135,17 @@ async def sam2_models():
         except Exception:
             return False
 
+    # Phase-exclusive lifecycle starts the server on demand during a job's
+    # analysis phase, so "selectable" means installed, not currently serving.
+    vllm_up = await asyncio.to_thread(_vllm_server_up)
+    vllm_installed = (Path(__file__).parent.parent / ".venv-vllm" / "bin" / "vllm").exists()
+    vllm_state = "online" if vllm_up else ("on-demand" if vllm_installed else "unavailable")
+
     return {
         "default": SAM2_MODEL_SIZE,
         "default_backend": TRACKING_BACKEND,
-        "vllm_available": await asyncio.to_thread(_vllm_server_up),
+        "vllm_available": vllm_up or vllm_installed,
+        "vllm_state": vllm_state,
         "backends": [
             {
                 "id": "sam3",
@@ -7904,7 +8224,7 @@ async def infer(
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     if not _sam2_checkpoint_present(job_config.sam2_model_size):
-        print(f"  [SAM2] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
+        print(f"  [{self.tracker_tag}] WARNING: '{job_config.sam2_model_size}' checkpoint not found at "
               f"{_SAM2_MODELS[job_config.sam2_model_size][1]}; "
               f"SAM2 will fall back to Kalman tracking.")
 
@@ -8313,6 +8633,7 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
         return
     
     job = jobs[job_id]
+    reattach = job._run_claimed
     job.websocket = websocket
     job.diagnostic.set_ws_send(job._diagnostic_ws_send)
 
@@ -8333,22 +8654,66 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
         pass
 
     try:
-        await _run_job_serialized(job)
+        if reattach:
+            # The job's run is owned by the connection that claimed it; this
+            # one only attaches for streaming (job._send_ws already targets
+            # the newest socket). Running _run_job_serialized again here used
+            # to queue a SECOND process_video over the same job.
+            if job.status in ("completed", "error"):
+                await job._send_ws({
+                    "type": "status", "status": job.status,
+                    "error": job.error,
+                    "message": "Job already finished — results are in Replays.",
+                })
+            else:
+                await job._send_ws({
+                    "type": "status", "status": job.status or "processing",
+                    "message": "Re-attached to running job; streaming resumed.",
+                })
+                done_task = asyncio.create_task(job._done_event.wait())
+                recv_task = asyncio.create_task(_drain_client(websocket))
+                try:
+                    finished, _pending = await asyncio.wait(
+                        {done_task, recv_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in finished:
+                        t.exception()  # retrieve WebSocketDisconnect etc.
+                finally:
+                    done_task.cancel()
+                    recv_task.cancel()
+        else:
+            job._run_claimed = True
+            try:
+                await _run_job_serialized(job)
+            finally:
+                job._done_event.set()
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for job {job_id}")
     except Exception as e:
         print(f"Error in websocket_infer: {e}")
         await job._send_ws({"type": "error", "error": str(e)})
     finally:
-        try:
-            job.diagnostic.set_ws_send(None)
-        except Exception:
-            pass
-        job.websocket = None
+        # Only tear down job-side streaming if this socket is still the
+        # job's current one — a stale handler exiting after a reattach must
+        # not sever the new connection.
+        if job.websocket is websocket:
+            try:
+                job.diagnostic.set_ws_send(None)
+            except Exception:
+                pass
+            job.websocket = None
         try:
             await websocket.close()
         except:
             pass
+
+
+async def _drain_client(websocket: WebSocket) -> None:
+    """Consume messages from a reattached (read-only) viewer until it
+    disconnects; raises WebSocketDisconnect to end the attachment."""
+    while True:
+        await websocket.receive_text()
 
 
 # Mount static files

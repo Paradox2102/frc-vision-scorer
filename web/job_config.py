@@ -53,12 +53,57 @@ KNOBS = [
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
     # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.
     Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 400, min=16, max=2000),
+    # Corner-cam decimation: track corner views at track_fps/stride. SAM
+    # propagation cost scales with frames/view (export resolution is NOT a
+    # lever — the model resizes everything to a fixed square). Stride 2 cut
+    # corner propagation ~39% on the qm24 smoke, BUT cost confirmed locks
+    # (5/6 at stride 1 vs 3/6 and 1/6 across two stride-2 runs) — corner
+    # reads carry 2.5x vote weight and halved crop opportunities starve
+    # confirmation. Default OFF; opt in per job when speed outweighs
+    # identity. Wall-clock-denominated tracker knobs (reprompt_seconds,
+    # evict_dark_frames) are rescaled per view automatically.
+    Knob("corner_track_stride", "CORNER_TRACK_STRIDE", int, 1, min=1, max=8),
+    # Dense head for corner decimation: corners run full-rate for the first
+    # N seconds of tracked footage (the lock-formation window), then pay the
+    # stride. Only meaningful when corner_track_stride > 1. Smoke A/B
+    # (qm24 45s, June 12 2026): stride 2 + 20s head got 2/6 locks vs 3/6
+    # same-day baseline — softer than pure stride 2 (1/6) but still never
+    # matched baseline, so decimation stays opt-in.
+    Knob("corner_dense_seconds", "CORNER_DENSE_SECONDS", float, 25.0, min=0.0),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
+    # Evidence-ranked roster: re-prompt a dark object claimed by a fresh
+    # detection in place, and let weak-evidence roster members (dark or
+    # repeatedly detector-orphaned) lose their slot to detector-backed
+    # newcomers. The roster holds the 6 objects most likely to be robots.
+    Knob("dark_reanchor_enabled", "SAM2_DARK_REANCHOR_ENABLED", bool, True),
+    Knob("evict_dark_frames", "SAM2_EVICT_DARK_FRAMES", int, 8, min=1),
+    Knob("evict_min_absences", "SAM2_EVICT_MIN_ABSENCES", int, 2, min=1),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),
+    # Phase-exclusive vLLM: stop the server during tracking (its ~11GB pool
+    # plus SAM3's ~11GB peak OOMs the 24GB card; it is idle in that phase
+    # anyway), start it for the analysis loop's reads, stop it after the job.
+    Knob("vllm_phase_exclusive", "VLLM_PHASE_EXCLUSIVE", bool, True),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True),
+    # Trust model: deposits are saved as unverified CANDIDATES; only
+    # human-verified exemplars (gallery UI checkbox, or minted from identity
+    # corrections) vote at match time. Unverified deposits were poisoning
+    # identity — one bad row votes wrong in every later match, and DINOv2
+    # can't tell same-alliance robots apart to catch it.
+    Knob("gallery_verified_only", "GALLERY_VERIFIED_ONLY", bool, True),
+    # --- cross-camera fusion ---
+    # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,
+    # so their range estimate is nearly meaningless (measured 1.1-3.8 m off on
+    # 2026hop qm24 vs the 0.6 m isotropic radius) while bearing stays useful —
+    # same-robot views were splitting into separate fused identities. The gate
+    # merges on loose bearing agreement (fuse_ray_cross_m) with generous
+    # range-proportional along-ray slack; contradicting per-frame bumper
+    # colors veto a merge. Corners are identity evidence first, geometry
+    # second. See web/field/fusion.py.
+    Knob("fuse_ray_gate", "FUSE_RAY_GATE", bool, True),
+    Knob("fuse_ray_cross_m", "FUSE_RAY_CROSS_M", float, 1.0, min=0.1, max=2.0),
     # --- live-view streaming ---
     Knob("frame_stream_interval_sec", "FRAME_STREAM_INTERVAL_SEC", float, 0.1,
          min=0.0, max=5.0),

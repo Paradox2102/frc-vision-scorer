@@ -20,6 +20,20 @@ class VisionScorer {
         this.statusBar = document.getElementById('statusBar');
         this.statusText = document.getElementById('statusText');
         this.progressBar = document.getElementById('progressBar');
+        this.degradationBanner = document.getElementById('degradationBanner');
+        this.degradationTitle = document.getElementById('degradationTitle');
+        this.degradationList = document.getElementById('degradationList');
+        this.statusLog = document.getElementById('statusLog');
+        this.degradationWarnings = [];
+        this.lastWsMessageAt = 0;
+        this.stallTimer = null;
+        this.trackingPanel = document.getElementById('trackingPanel');
+        this.trackingCards = document.getElementById('trackingCards');
+        this.hudStartTime = document.getElementById('hudStartTime');
+        this.hudElapsed = document.getElementById('hudElapsed');
+        this.runStartedAt = null;
+        this.elapsedTimer = null;
+        this.viewCards = {};
         this.inferenceControls = document.getElementById('inferenceControls');
         this.startInferenceBtn = document.getElementById('startInferenceBtn');
         this.pauseInferenceBtn = document.getElementById('pauseInferenceBtn');
@@ -59,6 +73,7 @@ class VisionScorer {
         // Upload form
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
         this.populateSam2Models();
+        this.rejoinActiveJob();
         this.startInferenceBtn.addEventListener('click', () => this.startInference());
         this.pauseInferenceBtn.addEventListener('click', () => this.pauseInference());
         this.resumeInferenceBtn.addEventListener('click', () => this.resumeInference());
@@ -826,20 +841,8 @@ class VisionScorer {
                 const firstAvailable = Array.from(select.options).find((o) => !o.disabled);
                 if (firstAvailable) firstAvailable.selected = true;
             }
-            // Reader availability: the vLLM option only makes sense when the
-            // server is actually up (web/start_all.sh starts both).
-            const vllmRadio = document.getElementById('vllmReaderRadio');
-            const vllmHint = document.getElementById('vllmReaderHint');
-            if (vllmRadio) {
-                vllmRadio.disabled = !data.vllm_available;
-                if (vllmHint) {
-                    vllmHint.textContent = data.vllm_available ? '● online' : '○ offline';
-                    vllmHint.classList.toggle('reader-hint-up', !!data.vllm_available);
-                }
-                if (data.vllm_available && !document.querySelector('input[name="teamReader"]:checked:not(:disabled)')) {
-                    vllmRadio.checked = true;
-                }
-            }
+            // Team-number reader is server-chosen (vllm default with
+            // in-process fallback); no UI selection remains.
             // Show only the controls that apply to the selected backend.
             const sam3Group = document.getElementById('sam3ChunkGroup');
             const sam2Groups = [
@@ -878,8 +881,8 @@ class VisionScorer {
         } else if (youtubeUrl) {
             formData.append('youtube_url', youtubeUrl);
         }
-        const teamReader = document.querySelector('input[name="teamReader"]:checked')?.value || 'local';
-        formData.append('team_reader', teamReader);
+        // team_reader intentionally not sent: the server default (vllm via
+        // start_all.sh) applies, with automatic in-process fallback.
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
             formData.append('sam2_max_gpu_frames', vramBudget);
@@ -928,6 +931,34 @@ class VisionScorer {
         }
     }
 
+    async rejoinActiveJob() {
+        // A page reload loses the job id; if a match is still running
+        // server-side, rejoin it (the ws reattach path streams without
+        // re-running the job).
+        try {
+            const resp = await fetch('/api/job/active');
+            const data = await resp.json();
+            if (!data.job_id) return;
+            this.jobId = data.job_id;
+            this.jobFinished = false;
+            this.videoSection.style.display = 'grid';
+            this.setInferenceControlState('running');
+            this.resetRunIndicators();
+            // Truthful clocks: the run started before this page existed.
+            if (data.started_at) {
+                this.runStartedAt = data.started_at * 1000;
+                if (this.hudStartTime) {
+                    this.hudStartTime.textContent = new Date(this.runStartedAt)
+                        .toLocaleTimeString([], { hour12: false });
+                }
+            }
+            this.appendStatusLog(`Rejoined running job ${data.job_id.slice(0, 8)}…`);
+            this.connectWebSocket();
+        } catch (e) {
+            // No active job or server unreachable — normal page load.
+        }
+    }
+
     _showInferenceView() {
         this.matchSetupSection.style.display = 'none';
         this.videoSection.style.display = 'grid';
@@ -956,6 +987,8 @@ class VisionScorer {
 
     startInference() {
         if (!this.jobId) return;
+        this.jobFinished = false;
+        this.resetRunIndicators();
         this.setInferenceControlState('running');
         this.connectWebSocket();
     }
@@ -1038,15 +1071,26 @@ class VisionScorer {
         };
 
         this.ws.onmessage = (event) => {
+            this.lastWsMessageAt = Date.now();
             const data = JSON.parse(event.data);
             this.handleWebSocketMessage(data);
         };
 
         this.ws.onerror = (error) => {
-            this.setStatus('Connection error', 0);
+            // onclose always follows; reconnection is handled there.
         };
 
-        this.ws.onclose = () => {};
+        // The server supports re-attaching to a running job (streaming only,
+        // no re-run), so a dropped connection is recoverable: keep retrying
+        // until the job reports a terminal state.
+        this.ws.onclose = () => {
+            if (this.jobFinished || !this.jobId) return;
+            const currentProgress = parseFloat(this.progressBar.style.width) || 0;
+            this.setStatus('Connection lost — reconnecting…', currentProgress);
+            setTimeout(() => {
+                if (!this.jobFinished && this.jobId) this.connectWebSocket();
+            }, 3000);
+        };
     }
 
     handleWebSocketMessage(data) {
@@ -1063,20 +1107,157 @@ class VisionScorer {
             case 'error':
                 this.handleError(data);
                 break;
+            case 'degradation_warning':
+                this.addDegradationWarning(`${data.component}: ${data.message}`);
+                break;
+            case 'tracking_view_seed':
+                this.updateTrackingCard(data.view, (card) => {
+                    if (data.image) card.img.src = 'data:image/jpeg;base64,' + data.image;
+                    card.meta.textContent = `${data.robots} robot${data.robots === 1 ? '' : 's'} seeded`;
+                });
+                break;
+            case 'tracking_progress':
+                this.updateTrackingCard(data.view, (card) => {
+                    const pct = data.total ? (data.current / data.total) * 100 : 0;
+                    card.bar.style.width = `${pct.toFixed(1)}%`;
+                    card.frames.textContent = `${data.current} / ${data.total} frames`;
+                });
+                break;
         }
     }
 
+    updateTrackingCard(viewName, apply) {
+        if (!this.trackingCards) return;
+        if (this.trackingPanel && !this.jobFinished &&
+                this.trackingPanel.style.display === 'none' && !this.overlayStreaming) {
+            this.trackingPanel.style.display = 'block';
+        }
+        let card = this.viewCards[viewName];
+        if (!card) {
+            const root = document.createElement('div');
+            root.className = 'tracking-card';
+            const title = document.createElement('div');
+            title.className = 'tracking-card-title';
+            title.textContent = viewName;
+            const img = document.createElement('img');
+            img.className = 'tracking-card-img';
+            img.alt = `${viewName} seed frame`;
+            const meta = document.createElement('div');
+            meta.className = 'tracking-card-meta';
+            meta.textContent = 'waiting…';
+            const barWrap = document.createElement('div');
+            barWrap.className = 'tracking-card-barwrap';
+            const bar = document.createElement('div');
+            bar.className = 'tracking-card-bar';
+            barWrap.appendChild(bar);
+            const frames = document.createElement('div');
+            frames.className = 'tracking-card-frames';
+            frames.textContent = '0 / 0 frames';
+            root.append(title, img, meta, barWrap, frames);
+            this.trackingCards.appendChild(root);
+            card = this.viewCards[viewName] = { root, img, meta, bar, frames };
+        }
+        apply(card);
+    }
+
+    addDegradationWarning(text) {
+        this.degradationWarnings.push(text);
+        if (this.degradationList) {
+            const li = document.createElement('li');
+            li.textContent = text;
+            this.degradationList.appendChild(li);
+        }
+        if (this.degradationTitle) {
+            this.degradationTitle.textContent =
+                `⚠ ${this.degradationWarnings.length} warning${this.degradationWarnings.length > 1 ? 's' : ''} — results may be incomplete`;
+        }
+        if (this.degradationBanner) this.degradationBanner.style.display = 'block';
+        this.appendStatusLog(`⚠ ${text}`);
+    }
+
+    resetRunIndicators() {
+        this.degradationWarnings = [];
+        if (this.degradationList) this.degradationList.replaceChildren();
+        if (this.degradationBanner) this.degradationBanner.style.display = 'none';
+        if (this.statusLog) {
+            this.statusLog.replaceChildren();
+            this.statusLog.style.display = 'block';
+        }
+        // Run clocks + tracking panel.
+        this.runStartedAt = Date.now();
+        this.overlayStreaming = false;
+        if (this.hudStartTime) {
+            this.hudStartTime.textContent =
+                new Date(this.runStartedAt).toLocaleTimeString([], { hour12: false });
+        }
+        if (this.elapsedTimer) clearInterval(this.elapsedTimer);
+        this.elapsedTimer = setInterval(() => {
+            if (!this.hudElapsed || this.runStartedAt === null) return;
+            const s = Math.floor((Date.now() - this.runStartedAt) / 1000);
+            const mm = Math.floor(s / 60);
+            const ss = String(s % 60).padStart(2, '0');
+            this.hudElapsed.textContent = mm >= 60
+                ? `${Math.floor(mm / 60)}:${String(mm % 60).padStart(2, '0')}:${ss}`
+                : `${mm}:${ss}`;
+            if (this.jobFinished) clearInterval(this.elapsedTimer);
+        }, 1000);
+        this.viewCards = {};
+        if (this.trackingCards) this.trackingCards.replaceChildren();
+        if (this.trackingPanel) this.trackingPanel.style.display = 'none';
+        this.lastWsMessageAt = Date.now();
+        if (this.stallTimer) clearInterval(this.stallTimer);
+        // Stall watchdog: tracking can be quiet for a while, but minutes of
+        // total silence means the job is hung — say so instead of letting a
+        // frozen frame impersonate progress.
+        this.stallTimer = setInterval(() => {
+            if (this.jobFinished) { clearInterval(this.stallTimer); return; }
+            const quiet = Math.round((Date.now() - this.lastWsMessageAt) / 1000);
+            if (quiet >= 120) {
+                const currentProgress = parseFloat(this.progressBar.style.width) || 0;
+                this.setStatus(`No updates for ${quiet}s — job may be stalled. ` +
+                               `Results so far are preserved; check /api/debug/tasks if it persists.`,
+                               currentProgress);
+            }
+        }, 15000);
+    }
+
+    appendStatusLog(text) {
+        if (!this.statusLog) return;
+        const last = this.statusLog.lastElementChild;
+        if (last && last.dataset.msg === text) return;  // collapse repeats
+        const row = document.createElement('div');
+        row.dataset.msg = text;
+        const ts = new Date().toLocaleTimeString([], { hour12: false });
+        row.textContent = `${ts}  ${text}`;
+        this.statusLog.appendChild(row);
+        while (this.statusLog.childElementCount > 50) {
+            this.statusLog.removeChild(this.statusLog.firstElementChild);
+        }
+        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+    }
+
     handleStatus(data) {
+        if (data.status === 'completed' || data.status === 'error') {
+            // Terminal state reported on re-attach: stop the reconnect loop.
+            this.jobFinished = true;
+        }
         if (data.status === 'paused') {
             const currentProgress = parseFloat(this.progressBar.style.width) || 0;
             this.setStatus(`Paused at frame ${data.frame_num}`, currentProgress);
         } else if (data.message) {
             const currentProgress = data.progress !== undefined ? data.progress : (parseFloat(this.progressBar.style.width) || 0);
             this.setStatus(data.message, currentProgress);
+            this.appendStatusLog(data.message);
         }
     }
 
     updateFrame(data) {
+        // First overlay frame = analysis phase has begun: swap the tracking
+        // panel out for the live annotated video feed.
+        if (!this.overlayStreaming) {
+            this.overlayStreaming = true;
+            if (this.trackingPanel) this.trackingPanel.style.display = 'none';
+        }
         const progress = (data.frame_num / data.total_frames) * 100;
         this.setStatus(`Processing frame ${data.frame_num} of ${data.total_frames}`, progress);
 
@@ -1354,7 +1535,23 @@ class VisionScorer {
     }
 
     handleComplete(data) {
-        this.setStatus('Processing complete!', 100);
+        this.jobFinished = true;
+        if (this.stallTimer) clearInterval(this.stallTimer);
+        // The completion payload carries the authoritative warning list
+        // (covers warnings sent while this client was disconnected).
+        (data.degradation_warnings || []).forEach((w) => {
+            const text = typeof w === 'string' ? w : `${w.component}: ${w.message}`;
+            if (!this.degradationWarnings.includes(text)) this.addDegradationWarning(text);
+        });
+        if (this.degradationWarnings.length > 0) {
+            this.setStatus(
+                `Complete with ${this.degradationWarnings.length} warning(s) — review before trusting results`,
+                100);
+            this.appendStatusLog('Job finished WITH warnings.');
+        } else {
+            this.setStatus('Processing complete!', 100);
+            this.appendStatusLog('Job finished cleanly.');
+        }
         this.inferenceResults = data;
         this.setInferenceControlState('hidden');
 
@@ -1368,8 +1565,11 @@ class VisionScorer {
     }
 
     handleError(data) {
+        this.jobFinished = true;
+        if (this.stallTimer) clearInterval(this.stallTimer);
         this.setInferenceControlState('hidden');
         this.setStatus(`Error: ${data.error}`, 0);
+        this.appendStatusLog(`✖ Job failed: ${data.error}`);
     }
 
     setStatus(text, progress) {

@@ -1402,3 +1402,96 @@ select.g-team, input.g-team { min-width: 72px; }
 .team-confirmed { color: #22c55e; font-weight: 600; }
 .team-tentative { color: var(--text-primary, #e8eaf0); }
 .team-candidate { color: #f59e0b; font-style: italic; opacity: 0.85; }
+
+/* Degradation banner: results-threatening warnings stay visible for the run */
+.degradation-banner {
+    margin: 8px 0;
+    padding: 10px 14px;
+    background: #3a2a08;
+    border: 1px solid #b8860b;
+    border-left: 4px solid #ffb020;
+    border-radius: 6px;
+    color: #ffd591;
+}
+.degradation-banner ul {
+    margin: 6px 0 0 18px;
+    padding: 0;
+    font-size: 0.85rem;
+}
+.degradation-banner li { margin: 2px 0; }
+
+/* Rolling status history under the progress bar */
+.status-log {
+    margin: 6px 0;
+    padding: 8px 12px;
+    max-height: 130px;
+    overflow-y: auto;
+    background: #101418;
+    border: 1px solid #2a3038;
+    border-radius: 6px;
+    font-family: ui-monospace, monospace;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: #9ab;
+    white-space: pre-wrap;
+}
+
+/* Tracking-phase panel: per-view seed frames + propagation progress */
+.tracking-panel {
+    padding: 12px;
+    background: #0d1117;
+    border-radius: 6px;
+}
+.tracking-panel-title {
+    font-size: 0.85rem;
+    color: #8b98a8;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 10px;
+}
+.tracking-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+}
+.tracking-card {
+    background: #161b22;
+    border: 1px solid #2a3038;
+    border-radius: 6px;
+    padding: 8px;
+}
+.tracking-card-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: #c5d0dc;
+    margin-bottom: 6px;
+}
+.tracking-card-img {
+    width: 100%;
+    border-radius: 4px;
+    background: #000;
+    min-height: 60px;
+}
+.tracking-card-meta {
+    font-size: 0.75rem;
+    color: #8b98a8;
+    margin: 5px 0 4px;
+}
+.tracking-card-barwrap {
+    height: 8px;
+    background: #21262e;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.tracking-card-bar {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, #2f81f7, #56d364);
+    transition: width 0.4s ease;
+}
+.tracking-card-frames {
+    font-size: 0.72rem;
+    color: #6e7b8a;
+    margin-top: 4px;
+    font-family: ui-monospace, monospace;
+}

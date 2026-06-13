@@ -1,9 +1,11 @@
 """Typed registry of per-job inference knobs.
 
 One place defining every job-scoped A/B knob: its override key, env var,
-type, default, and valid range. JobConfig resolves override > env > default
-at job creation and validates everything up front, so a bad knob fails the
-submit with a clear message instead of failing minutes into inference.
+type, default, and valid range. JobConfig resolves
+override > runtime setting > env > default at job creation and validates
+everything up front, so a bad knob fails the submit with a clear message
+instead of failing minutes into inference. Runtime settings come from the
+settings UI (/api/settings) and live only until restart.
 
 Adding a knob is one Knob line here plus reading `job.config.<name>` at the
 consumption site. Module-level constants consumed at import time by helper
@@ -104,6 +106,15 @@ KNOBS = [
     # second. See web/field/fusion.py.
     Knob("fuse_ray_gate", "FUSE_RAY_GATE", bool, True),
     Knob("fuse_ray_cross_m", "FUSE_RAY_CROSS_M", float, 1.0, min=0.1, max=2.0),
+    # --- field tracker position stability (field-map-v2 spec) ---
+    # Corner-only measurements (no main-view box) get inflated KF noise —
+    # low cameras have poor range; 1.0 restores full-trust updates.
+    Knob("corner_only_r_scale", "CORNER_ONLY_R_SCALE", float, 8.0,
+         min=1.0, max=100.0),
+    # Per-missed-frame velocity decay while coasting: occluded robots ease
+    # to a stop instead of sailing away; 1.0 restores constant-velocity.
+    Knob("coast_vel_decay", "COAST_VEL_DECAY", float, 0.85,
+         min=0.0, max=1.0),
     # --- live-view streaming ---
     Knob("frame_stream_interval_sec", "FRAME_STREAM_INTERVAL_SEC", float, 0.1,
          min=0.0, max=5.0),
@@ -112,6 +123,73 @@ KNOBS = [
 ]
 
 _BY_NAME = {k.name: k for k in KNOBS}
+
+# Runtime overrides set from the settings UI. They sit between per-job
+# overrides and the environment: job override > runtime > env > default.
+# Deliberately in-memory: a server restart returns to the launch profile
+# (match nights run a known-good env profile; a persisted stale override
+# silently shadowing it would be a footgun). Values stored here are already
+# coerced and validated.
+_runtime_overrides: dict = {}
+
+
+def set_runtime_override(name: str, value: Any) -> Any:
+    """Validate and set a runtime override; ``None`` clears it.
+
+    Returns the coerced value (or None when cleared). Raises ValueError on an
+    unknown knob or invalid value.
+    """
+    knob = _BY_NAME.get(name)
+    if knob is None:
+        raise ValueError(
+            f"unknown config knob: {name}; valid knobs: {sorted(_BY_NAME)}")
+    if value is None:
+        _runtime_overrides.pop(name, None)
+        return None
+    coerced = _coerce(knob, value)
+    _validate(knob, coerced)
+    _runtime_overrides[name] = coerced
+    return coerced
+
+
+def reset_runtime_overrides() -> None:
+    _runtime_overrides.clear()
+
+
+def _resolve_launch(knob: Knob) -> tuple[Any, str]:
+    """Resolve a knob ignoring runtime overrides: (value, 'env'|'default')."""
+    env_val = os.environ.get(knob.env)
+    if env_val not in (None, ""):
+        return env_val, "env"
+    return knob.default, "default"
+
+
+def describe_knobs() -> list[dict]:
+    """Full per-knob metadata + current resolution, for the settings UI."""
+    out = []
+    for knob in KNOBS:
+        launch_raw, launch_source = _resolve_launch(knob)
+        try:
+            launch_value = _coerce(knob, launch_raw)
+        except ValueError:
+            launch_value = knob.default
+        if knob.name in _runtime_overrides:
+            effective, source = _runtime_overrides[knob.name], "runtime"
+        else:
+            effective, source = launch_value, launch_source
+        out.append({
+            "name": knob.name,
+            "env": knob.env,
+            "type": knob.type.__name__,
+            "default": knob.default,
+            "choices": list(knob.choices) if knob.choices else None,
+            "min": knob.min,
+            "max": knob.max,
+            "launch_value": launch_value,   # what a restart returns to
+            "effective": effective,
+            "source": source,               # runtime | env | default
+        })
+    return out
 
 
 def _coerce(knob: Knob, value: Any) -> Any:
@@ -154,6 +232,8 @@ class JobConfig:
         for knob in KNOBS:
             if knob.name in overrides:
                 raw = overrides[knob.name]
+            elif knob.name in _runtime_overrides:
+                raw = _runtime_overrides[knob.name]
             else:
                 env_val = os.environ.get(knob.env)
                 raw = env_val if env_val not in (None, "") else knob.default

@@ -31,10 +31,10 @@ def _make_replay_files(tmp_path, rid="job-1", frames=5, fps=8.0):
     return d
 
 
-def _insert(database, d, rid="job-1"):
+def _insert(database, d, rid="job-1", match_key=None):
     asyncio.run(database.insert_replay({
         "id": rid, "created_at": "2026-06-03T00:00:00", "label": "Qual 10",
-        "event_key": None, "match_key": None, "comp_level": None,
+        "event_key": None, "match_key": match_key, "comp_level": None,
         "blue_score": 70, "red_score": 67, "blue_teams": "[581]", "red_teams": "[1732]",
         "video_path": str(d / "hud.mp4"), "meta_path": str(d / "meta.json"),
         "thumb_path": str(d / "thumb.jpg"), "source_video_path": "x.mp4",
@@ -52,11 +52,14 @@ def test_list_get_thumb_delete(client):
     assert r.status_code == 200
     assert any(x["id"] == "job-1" and x["label"] == "Qual 10" for x in r.json())
     item = [x for x in r.json() if x["id"] == "job-1"][0]
-    assert item["blue_teams"] == [581] and item["red_teams"] == [1732]
+    # No TBA match linked -> no rosters (detected teams are NOT shown)
+    assert item["blue_teams"] == [] and item["red_teams"] == []
+    assert item["event_name"] is None
     assert item["thumb_url"] == "/api/replays/job-1/thumb"
 
     r = c.get("/api/replays/job-1")
     assert r.status_code == 200 and r.json()["summary"]["frame_count"] == 5
+    assert r.json()["replay_info"]["id"] == "job-1"
 
     r = c.get("/api/replays/job-1/thumb")
     assert r.status_code == 200 and r.headers["content-type"].startswith("image/")
@@ -65,6 +68,32 @@ def test_list_get_thumb_delete(client):
     assert r.status_code == 200
     assert c.get("/api/replays/job-1").status_code == 404
     assert not d.exists()
+
+
+def test_list_uses_tba_rosters_when_match_linked(client):
+    c, tmp_path = client
+    d = _make_replay_files(tmp_path, rid="job-3")
+
+    async def seed_tba():
+        event_id = await database.upsert_event("2026hop", "Hopper Division", 2026)
+        match_id = await database.upsert_match(event_id, "2026hop_qm30", "qm", 30)
+        for pos, team in enumerate(["2056", "11493", "3297"], start=1):
+            await database.upsert_match_robot(match_id, "blue", pos, team)
+        for pos, team in enumerate(["6200", "2102", "3539"], start=1):
+            await database.upsert_match_robot(match_id, "red", pos, team)
+    asyncio.run(seed_tba())
+    _insert(database, d, rid="job-3", match_key="2026hop_qm30")
+
+    item = [x for x in c.get("/api/replays").json() if x["id"] == "job-3"][0]
+    assert item["blue_teams"] == ["2056", "11493", "3297"]
+    assert item["red_teams"] == ["6200", "2102", "3539"]
+    assert item["event_name"] == "Hopper Division"
+    assert item["comp_level"] == "qm" and item["match_number"] == 30
+
+    info = c.get("/api/replays/job-3").json()["replay_info"]
+    assert info["id"] == "job-3"
+    assert info["event_name"] == "Hopper Division"
+    assert info["comp_level"] == "qm" and info["match_number"] == 30
 
 
 def test_get_missing_returns_404(client):

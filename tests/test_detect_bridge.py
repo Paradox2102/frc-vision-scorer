@@ -235,6 +235,37 @@ def test_filter_field_robot_boxes_rejects_off_field_and_oversized():
     ) == [0]
 
 
+def test_filter_field_robot_boxes_ray_zones_block_occluded_structure():
+    """qm28 corner_left regression: a low corner camera sees the outpost with
+    its base occluded, so the box's ground contact lands ~2m short of the
+    drawn zone — the point test misses, but the contact's viewing ray enters
+    the zone right behind it. ``ray_blocked_zones`` must drop that box while
+    leaving a clear-carpet contact (ray pointing away from zones) alone."""
+    from web.field.detect_bridge import filter_field_robot_boxes
+    from web.field.zones import inflate_zones
+
+    fm = FieldModel.load("2026-rebuilt-welded")
+    # Mimic corner_left: 0.7m-high camera at the blue corner wall, looking
+    # across toward the blue outpost.
+    cam = truth_pinhole_camera(eye=(0.64, -0.3, 0.7), target=(1.3, 6.5, 0.0))
+    zone_rects = inflate_zones([(0.03, 5.51, 1.34, 7.42)], 0.4)
+
+    u_s, v_s = cam.field_to_image((1.25, 3.63, 0.0))    # occluded-base contact
+    u_r, v_r = cam.field_to_image((4.0, 3.0, 0.0))      # real robot, clear ray
+    boxes = [
+        (u_s - 40, v_s - 120, u_s + 40, v_s),
+        (u_r - 40, v_r - 120, u_r + 40, v_r),
+    ]
+    dims = (fm.length_m, fm.width_m)
+
+    # Without ray zones both stay (the point test misses the structure).
+    assert filter_field_robot_boxes(boxes, cam, dims) == [0, 1]
+    # With ray zones only the structure contact is dropped.
+    assert filter_field_robot_boxes(
+        boxes, cam, dims, ray_blocked_zones=zone_rects
+    ) == [1]
+
+
 def test_corner_views_contribute_up_to_midline_margin():
     """The old hard 4.8 m cutoff left center field covered by only the main
     camera. Corner evidence is now admitted with a decaying weight out to the

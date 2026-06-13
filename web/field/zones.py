@@ -44,6 +44,51 @@ def prism_bounding_zones(prisms, margin=0.2) -> list:
     return zones
 
 
+def inflate_zones(zones, margin: float) -> list:
+    """Grow each zone rect outward by ``margin`` meters, normalizing corner
+    order. Used at seed-gating sites: corner cams project a structure's ground
+    contact with enough range error (2026hop qm28: 17cm) to land just outside
+    a tightly drawn rect."""
+    if not zones:
+        return []
+    out = []
+    for x1, y1, x2, y2 in zones:
+        out.append((
+            min(x1, x2) - margin,
+            min(y1, y2) - margin,
+            max(x1, x2) + margin,
+            max(y1, y2) + margin,
+        ))
+    return out
+
+
+def ray_enters_zones(camera_xy, contact_xy, zones,
+                     max_beyond_m: float = 3.0, step_m: float = 0.25) -> bool:
+    """True if the ground ray from ``camera_xy`` through ``contact_xy``,
+    continued past the contact, enters any zone within ``max_beyond_m``.
+
+    Low cameras see a structure's base occluded (balls, wall lip), so the
+    detected bottom edge projects to a contact point SHORT of the structure —
+    always between camera and structure, never beyond. A contact whose ray
+    pierces a static zone just behind it is that occluded-base signature
+    (2026hop qm28: blue outpost contact landed 1.9m short of its zone)."""
+    if not zones:
+        return False
+    cx, cy = float(camera_xy[0]), float(camera_xy[1])
+    px, py = float(contact_xy[0]), float(contact_xy[1])
+    dx, dy = px - cx, py - cy
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-6:
+        return False
+    dx, dy = dx / norm, dy / norm
+    t = step_m
+    while t <= max_beyond_m:
+        if point_in_zones((px + t * dx, py + t * dy), zones):
+            return True
+        t += step_m
+    return False
+
+
 def _path(event_key: str) -> Path:
     safe = "".join(c for c in event_key if c.isalnum() or c in "_-")
     return UPLOAD_DIR / f"zones_{safe}.json"

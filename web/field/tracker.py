@@ -35,6 +35,9 @@ class TrackOut:
     vel: tuple
     box: Optional[tuple]
     state: str   # "visible" | "coasting" | "empty"
+    # Position currently sourced from corner cameras only (no main-view box).
+    # Corner ground projections have poor range; the map flags these dots.
+    corner_only: bool = False
 
 
 class _KF:
@@ -51,12 +54,15 @@ class _KF:
         G = np.array([[0.5*dt*dt, 0], [0, 0.5*dt*dt], [dt, 0], [0, dt]])
         self.P = F @ self.P @ F.T + G @ (self.q * np.eye(2)) @ G.T
 
-    def update(self, z):
+    def update(self, z, r_scale: float = 1.0):
         H = np.zeros((2, 4)); H[0, 0] = H[1, 1] = 1.0
-        S = H @ self.P @ H.T + self.r * np.eye(2)
+        S = H @ self.P @ H.T + (self.r * r_scale) * np.eye(2)
         Kg = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + Kg @ (np.asarray(z, float) - H @ self.x)
         self.P = (np.eye(4) - Kg @ H) @ self.P
+
+    def decay_velocity(self, factor: float):
+        self.x[2:4] *= factor
 
     @property
     def pos(self): return (float(self.x[0]), float(self.x[1]))
@@ -75,16 +81,26 @@ class _Track:
     hits: int = 0
     coasting: bool = False
     active: bool = False
+    corner_only: bool = False
 
 
 class FieldTracker:
     def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
-                 max_coast_occluded=90, color_penalty=3.0, zones=None):
+                 max_coast_occluded=90, color_penalty=3.0, zones=None,
+                 corner_only_r_scale=8.0, coast_vel_decay=0.85,
+                 max_speed_m_s=5.5):
         self.gate = gate_m
         self.field_length = field_length
         self.max_open = max_coast_open
         self.max_occ = max_coast_occluded
         self.color_penalty = color_penalty
+        # Position-stability knobs (see field-map-v2 spec): corner-only
+        # measurements get inflated noise (poor range from low cameras),
+        # coasting velocity decays toward rest, and measurements implying
+        # impossible robot speed are downweighted instead of followed.
+        self.corner_only_r_scale = float(corner_only_r_scale)
+        self.coast_vel_decay = float(coast_vel_decay)
+        self.max_speed = float(max_speed_m_s)
         # Static-structure zones (field meters). A new slot is never seeded from
         # a detection inside a zone; existing tracks update normally.
         self.zones = list(zones) if zones else []
@@ -129,6 +145,7 @@ class FieldTracker:
                 self._slots(alliance),
                 pairs,
                 alliance,
+                dt,
             )
 
         # Coast/expire logic: runs after _assign has updated missed counts
@@ -139,6 +156,8 @@ class FieldTracker:
             budget = self.max_occ if occ else self.max_open
             if t.missed > 0:
                 t.coasting = True
+                if t.kf is not None:
+                    t.kf.decay_velocity(self.coast_vel_decay)
             if t.missed > budget:
                 # Expire the track
                 t.active = False
@@ -157,7 +176,7 @@ class FieldTracker:
 
         return self._emit()
 
-    def _assign(self, slots, dets_with_idx, alliance):
+    def _assign(self, slots, dets_with_idx, alliance, dt):
         """Match active tracks to dets, update matched, coast unmatched, seed free slots."""
         active_slots = [t for t in slots if t.active]
         free_slots = [t for t in slots if not t.active]
@@ -177,7 +196,7 @@ class FieldTracker:
                 slot_id = self._id_to_slot[tid]
                 slot = next((t for t in slots if t.slot_id == slot_id), None)
                 if slot is not None and slot.active:
-                    slot.kf.update(d.pos)
+                    self._measured_update(slot, d, dt)
                     slot.box = d.box
                     slot.missed = 0
                     slot.hits += 1
@@ -204,6 +223,7 @@ class FieldTracker:
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
+                slot.corner_only = d.box is None
                 slot.missed = 0
                 slot.hits = 1
                 slot.coasting = False
@@ -262,7 +282,7 @@ class FieldTracker:
                 if np.isfinite(cost[r, c]):
                     # Update matched slot
                     t = active_slots[r]
-                    t.kf.update(dets[c].pos)
+                    self._measured_update(t, dets[c], dt)
                     t.box = dets[c].box
                     t.missed = 0
                     t.hits += 1
@@ -303,6 +323,7 @@ class FieldTracker:
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
+                slot.corner_only = d.box is None
                 slot.missed = 0
                 slot.hits = 1
                 slot.coasting = False
@@ -325,11 +346,30 @@ class FieldTracker:
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
+                slot.corner_only = d.box is None
                 slot.missed = 0
                 slot.hits = 1
                 slot.coasting = False
                 slot.active = True
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
+
+    def _measured_update(self, t, d, dt):
+        """KF update with measurement noise scaled by source quality.
+
+        Corner-only detections (no main-view box) carry poor range from the
+        low cameras; measurements implying impossible robot speed are noise
+        or identity errors. Both lean the state on the motion model instead
+        of being followed."""
+        scale = 1.0
+        if d.box is None:
+            scale *= self.corner_only_r_scale
+        if dt and dt > 0:
+            speed = float(np.linalg.norm(
+                np.asarray(d.pos, float) - np.asarray(t.kf.pos, float))) / dt
+            if speed > self.max_speed:
+                scale *= (speed / self.max_speed) ** 2
+        t.kf.update(d.pos, r_scale=scale)
+        t.corner_only = d.box is None
 
     def _best_assignment(self, cost):
         """Brute-force minimum-cost assignment for ≤3×3 cost matrices.
@@ -359,5 +399,6 @@ class FieldTracker:
                 out.append(TrackOut(
                     t.slot_id, t.alliance, t.kf.pos, t.kf.vel,
                     t.box, "coasting" if t.coasting else "visible",
+                    corner_only=t.corner_only,
                 ))
         return out

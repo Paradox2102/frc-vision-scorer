@@ -42,6 +42,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
 from web.job_config import JobConfig
+from web import job_config as job_config_registry
 from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
@@ -83,7 +84,7 @@ from web.field.detect_schema import (
 )
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
-from web.field.radar import Radar
+from web.field.radar import Radar, RadarTrack
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.view_stride import build_view_frame_plan, scale_frame_knob
@@ -91,7 +92,14 @@ from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
 from web.hud_util import select_coasting_ghosts, draw_dashed_box
 from web.field.bumper import bumper_band_box, bumper_crop
-from web.field.zones import load_zones, point_in_zones, prism_bounding_zones, save_zones
+from web.field.zones import (
+    inflate_zones,
+    load_zones,
+    point_in_zones,
+    prism_bounding_zones,
+    ray_enters_zones,
+    save_zones,
+)
 from web.replay_recorder import ReplayRecorder
 from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
@@ -503,6 +511,20 @@ ROBOT_TRACK_TOP_CROP_ENABLED = os.environ.get(
     "ROBOT_TRACK_TOP_CROP_ENABLED", "1"
 ) not in ("0", "false", "False")
 
+# User-drawn static-structure zones are inflated by this margin (meters) at every
+# seed-gating site. Corner cams project a structure's ground contact with enough
+# range error to land just outside a tightly drawn rect (2026hop qm28: the red
+# outpost projected 17cm outside its zone and held a phantom slot for ~60s).
+ZONE_SEED_MARGIN_M = float(os.environ.get("ZONE_SEED_MARGIN_M", "0.4") or "0.4")
+
+# Cameras at or below this height get the ray-beyond-contact zone test at SAM2/3
+# seed sites: a low camera sees a structure's base occluded (balls, wall lip), so
+# the contact projects SHORT of the structure — qm28 corner_left put the blue
+# outpost 1.9m inside the field, beyond any sane point margin. High cameras have
+# reliable contacts and robots legitimately park flush to hubs, so they keep the
+# plain point test. 0 disables ray gating entirely.
+ZONE_RAY_GATE_CAM_Z_M = float(os.environ.get("ZONE_RAY_GATE_CAM_Z_M", "1.5") or "1.5")
+
 # SAM2 model size — the single biggest speed lever.  Robots are large, high-contrast
 # blobs, so the "small" Hiera encoder tracks them well at ~3-5x the throughput of the
 # "large" model (which ran ~650-730 ms/frame, i.e. ~hours per match).  Override via
@@ -907,8 +929,11 @@ class InferenceJob:
         self.field_model = None
         self.hub_prisms = []
         self.hub_no_robot_zones = []
+        self.static_seed_zones = []
+        self.user_seed_zones = []
         self.field_tracker: Optional[FieldTracker] = None
         self.radar: Optional[Radar] = None
+        self._radar_trails: dict = {}   # slot_id -> deque of recent filtered positions
         self.field_tracking = False
         # Per-frame occlusion state. `_view_flags` feeds the NEXT frame's tracker
         # (view_occluded -> longer coast); `_occ` is this frame's full result and
@@ -1303,6 +1328,17 @@ class InferenceJob:
         return reject_person_candidates(
             merged, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
+
+    def _ray_zone_list(self, view):
+        """Inflated user zones for the ray-beyond-contact seed gate, or None
+        when it doesn't apply: high cameras (reliable ground contacts), pose-
+        free calibrations (no camera center), or ZONE_RAY_GATE_CAM_Z_M=0."""
+        if ZONE_RAY_GATE_CAM_Z_M <= 0 or not self.user_seed_zones:
+            return None
+        cc = getattr(view.calibration, "camera_center", None)
+        if cc is None or float(cc[2]) > ZONE_RAY_GATE_CAM_Z_M:
+            return None
+        return self.user_seed_zones
 
     @staticmethod
     def _below_robot_tracking_top(view, box, frame_height: int) -> bool:
@@ -4051,12 +4087,26 @@ class InferenceJob:
             self.field_dims = (self.field_model.length_m, self.field_model.width_m)
             self.hub_prisms = hub_prisms(self.field_model)
             self.hub_no_robot_zones = prism_bounding_zones(self.hub_prisms)
-            static_zones = load_zones(self.event_key)
-            static_zones = static_zones + self.hub_no_robot_zones
+            # One combined no-seed list for every gate: FieldTracker slot
+            # seeding AND the SAM2/SAM3 prompt + re-prompt seed gates. User
+            # zones are inflated to absorb corner-cam projection error; they
+            # are also kept separately for the low-camera ray gate (hub zones
+            # stay point-test only — robots park flush to hubs).
+            self.user_seed_zones = inflate_zones(
+                load_zones(self.event_key), ZONE_SEED_MARGIN_M
+            )
+            static_zones = self.user_seed_zones + self.hub_no_robot_zones
+            self.static_seed_zones = static_zones
             if static_zones:
-                print(f"  Static-structure zones (field m): {static_zones}")
-            self.field_tracker = FieldTracker(self.field_model.length_m, zones=static_zones)
-            self.radar = Radar(self.field_model.length_m, self.field_model.width_m)
+                print(f"  Static-structure zones (field m, user zones "
+                      f"inflated {ZONE_SEED_MARGIN_M}m): {static_zones}")
+            self.field_tracker = FieldTracker(
+                self.field_model.length_m, zones=static_zones,
+                corner_only_r_scale=self.config.corner_only_r_scale,
+                coast_vel_decay=self.config.coast_vel_decay)
+            self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
+                               field_model=self.field_model)
+            self._radar_trails = {}
             selection = {}
             for _name in load_layout().keys():
                 _vs = field_store.load_versions(self.event_key, _name)
@@ -4650,7 +4700,8 @@ class InferenceJob:
                                                 crop.shape[1],
                                                 crop.shape[2],
                                             ),
-                                            blocked_zones=self.hub_no_robot_zones,
+                                            blocked_zones=self.static_seed_zones,
+                                            ray_blocked_zones=self._ray_zone_list(view),
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
                                         
@@ -4892,14 +4943,29 @@ class InferenceJob:
                         # Seed gate: a detection projecting into a static zone
                         # cannot found a NEW SAM2 object (a robot is never born
                         # inside a field element) but still corroborates masks.
-                        def _make_seed_gate_fn(project, zones):
+                        # Low cameras also test the viewing ray beyond the
+                        # contact — an occluded structure base projects short
+                        # of its zone (qm28 outpost phantom).
+                        def _make_seed_gate_fn(project, zones, ray_zones, cam_xy):
                             def _gate(box):
                                 xy = project(box)
-                                return xy is None or not point_in_zones(xy, zones)
+                                if xy is None:
+                                    return True
+                                if point_in_zones(xy, zones):
+                                    return False
+                                if ray_zones and cam_xy is not None:
+                                    return not ray_enters_zones(cam_xy, xy, ray_zones)
+                                return True
                             return _gate
 
+                        _cam_center = view.calibration.camera_center
                         _seed_gate_fn = _make_seed_gate_fn(
-                            _project_fn, self.hub_no_robot_zones
+                            _project_fn,
+                            self.static_seed_zones,
+                            self._ray_zone_list(view),
+                            None if _cam_center is None else (
+                                float(_cam_center[0]), float(_cam_center[1])
+                            ),
                         )
 
                         t0 = time.perf_counter()
@@ -5758,8 +5824,27 @@ class InferenceJob:
                                (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
 
                 # Radar + corner camera HUD panels live in a right rail, not over the video.
-                radar_img = self.radar.render(
-                    [(t.pos, t.alliance) for t in track_outs if t.state != "empty"])
+                radar_tracks = []
+                radar_seen_slots = set()
+                for t in track_outs:
+                    if t.state == "empty":
+                        continue
+                    radar_seen_slots.add(t.slot_id)
+                    trail = self._radar_trails.setdefault(
+                        t.slot_id, deque(maxlen=16))
+                    trail.append(t.pos)
+                    slot_track = self._get_slot_track_if_exists(t.slot_id)
+                    team = slot_track.team_number if slot_track is not None else None
+                    radar_tracks.append(RadarTrack(
+                        pos=t.pos, alliance=t.alliance,
+                        team=team or self._slot_label(t.slot_id),
+                        slot_id=t.slot_id, state=t.state,
+                        corner_only=t.corner_only, trail=tuple(trail)))
+                # A slot that vanished re-seeds its trail from scratch.
+                for sid in list(self._radar_trails):
+                    if sid not in radar_seen_slots:
+                        del self._radar_trails[sid]
+                radar_img = self.radar.render(radar_tracks)
                 camera_panels = [
                     self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
                     for v in self.views if v.name != "main"
@@ -6036,6 +6121,43 @@ async def active_job():
                 "match_key": getattr(job, "match_key", None),
             }
     return {"job_id": None}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Every registered knob with metadata and current resolution.
+
+    `effective`/`source` reflect what the NEXT submitted job will use
+    (per-job config_json still wins); `launch_value` is what a server
+    restart returns to. Runtime overrides are in-memory by design.
+    """
+    return {"knobs": job_config_registry.describe_knobs()}
+
+
+@app.post("/api/settings")
+async def set_setting(body: dict):
+    """Set (or clear, with value=null) one runtime knob override.
+
+    Applies to jobs submitted after the change; the currently running job
+    keeps the config it was created with.
+    """
+    name = body.get("name")
+    if not name:
+        return JSONResponse(status_code=400, content={"error": "missing 'name'"})
+    try:
+        job_config_registry.set_runtime_override(name, body.get("value"))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    knob = next(k for k in job_config_registry.describe_knobs()
+                if k["name"] == name)
+    return {"ok": True, "knob": knob}
+
+
+@app.post("/api/settings/reset")
+async def reset_settings():
+    """Clear every runtime override, returning to the launch profile."""
+    job_config_registry.reset_runtime_overrides()
+    return {"ok": True}
 
 
 @app.get("/api/debug/tasks")
@@ -8322,8 +8444,15 @@ async def list_replays_endpoint():
         out.append({
             "id": r["id"], "label": r["label"], "created_at": r["created_at"],
             "blue_score": r["blue_score"], "red_score": r["red_score"],
-            "blue_teams": json.loads(r["blue_teams"] or "[]"),
-            "red_teams": json.loads(r["red_teams"] or "[]"),
+            # Official TBA rosters (empty when the match wasn't imported);
+            # the card view shows these, not the detected-team lists.
+            "blue_teams": r["tba_blue_teams"],
+            "red_teams": r["tba_red_teams"],
+            "event_name": r["event_name"],
+            "comp_level": r["tba_comp_level"],
+            "match_number": r["match_number"],
+            "set_number": r["set_number"],
+            "match_key": r["match_key"],
             "duration_sec": r["duration_sec"], "status": r["status"],
             "processing_sec": r["processing_sec"],
             "thumb_url": f"/api/replays/{r['id']}/thumb",
@@ -8421,7 +8550,21 @@ async def get_replay_endpoint(replay_id: str):
     meta_path = Path(row["meta_path"])
     if not meta_path.exists():
         return JSONResponse(status_code=404, content={"error": "metadata missing"})
-    return JSONResponse(content=json.loads(meta_path.read_text()))
+    meta = json.loads(meta_path.read_text())
+    # TBA match identity for the player header (the job GUID stays available
+    # as `id` for troubleshooting).
+    info = {"id": row["id"], "label": row["label"], "match_key": row["match_key"]}
+    if row["match_key"]:
+        match = await database.get_match_by_key(row["match_key"])
+        if match:
+            info.update({
+                "event_name": match["event_name"],
+                "comp_level": match["comp_level"],
+                "match_number": match["match_number"],
+                "set_number": match["set_number"],
+            })
+    meta["replay_info"] = info
+    return JSONResponse(content=meta)
 
 
 @app.get("/api/replays/{job_id}/identities")

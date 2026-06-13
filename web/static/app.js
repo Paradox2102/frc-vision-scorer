@@ -105,17 +105,26 @@ class VisionScorer {
         }
         if (this.replayVideo) {
             this.replayVideo.addEventListener('timeupdate', () => this.onReplayTimeUpdate());
-            this.replayVideo.addEventListener('loadedmetadata', () => this.drawReplayFieldMap([]));
         }
 
         // Gallery
         const galleryLoadBtn = document.getElementById('galleryLoadBtn');
         if (galleryLoadBtn) galleryLoadBtn.addEventListener('click', () => this.loadGallery());
 
+        // Settings
+        const settingsResetBtn = document.getElementById('settingsResetBtn');
+        if (settingsResetBtn) settingsResetBtn.addEventListener('click', () => this.resetAllSettings());
+
         // Modal
         document.getElementById('modalClose').addEventListener('click', () => this.closeModal());
         document.getElementById('modalCancelBtn').addEventListener('click', () => this.closeModal());
         document.getElementById('modalSaveBtn').addEventListener('click', () => this.saveModalChanges());
+
+        // Deep-link: #replays/#history/#gallery/#settings opens that view
+        const hashView = window.location.hash.replace('#', '');
+        if (['replays', 'history', 'gallery', 'settings'].includes(hashView)) {
+            this.switchView(hashView);
+        }
 
         // Check if we have an active event
         this.checkExistingEvent();
@@ -131,6 +140,7 @@ class VisionScorer {
         document.getElementById('historyView').style.display = view === 'history' ? 'block' : 'none';
         document.getElementById('replaysView').style.display = view === 'replays' ? 'block' : 'none';
         document.getElementById('galleryView').style.display = view === 'gallery' ? 'block' : 'none';
+        document.getElementById('settingsView').style.display = view === 'settings' ? 'block' : 'none';
 
         if (view === 'history') {
             this.loadHistory();
@@ -141,6 +151,132 @@ class VisionScorer {
             this.loadReplays();
         } else if (view === 'gallery') {
             this.loadGallery();
+        } else if (view === 'settings') {
+            this.loadSettings();
+        }
+    }
+
+    // --- Settings (runtime knob overrides) ---
+
+    async loadSettings() {
+        const list = document.getElementById('settingsList');
+        list.innerHTML = '<p class="empty-state">Loading…</p>';
+        try {
+            const resp = await fetch('/api/settings');
+            if (!resp.ok) { list.innerHTML = '<p class="empty-state">Failed to load settings</p>'; return; }
+            const { knobs } = await resp.json();
+            list.innerHTML = '';
+            knobs.forEach(k => list.appendChild(this.settingRow(k)));
+        } catch (e) {
+            list.innerHTML = '<p class="empty-state">Failed to load settings</p>';
+        }
+    }
+
+    settingControl(k) {
+        if (k.type === 'bool') {
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !!k.effective;
+            cb.addEventListener('change', () => this.saveSetting(k.name, cb.checked));
+            return cb;
+        }
+        if (k.choices) {
+            const sel = document.createElement('select');
+            k.choices.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c; opt.textContent = c;
+                if (c === k.effective) opt.selected = true;
+                sel.appendChild(opt);
+            });
+            sel.addEventListener('change', () => this.saveSetting(k.name, sel.value));
+            return sel;
+        }
+        const inp = document.createElement('input');
+        if (k.type === 'int' || k.type === 'float') {
+            inp.type = 'number';
+            if (k.min != null) inp.min = k.min;
+            if (k.max != null) inp.max = k.max;
+            if (k.type === 'float') inp.step = 'any';
+        } else {
+            inp.type = 'text';
+        }
+        inp.value = k.effective;
+        // Commit on change (Enter/blur), not per keystroke.
+        inp.addEventListener('change', () => this.saveSetting(k.name, inp.value));
+        return inp;
+    }
+
+    settingRow(k) {
+        const row = document.createElement('div');
+        row.className = 'setting-row';
+        row.dataset.name = k.name;
+
+        const label = document.createElement('div');
+        label.className = 'setting-label';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'setting-name';
+        nameEl.textContent = k.name;
+        const envEl = document.createElement('span');
+        envEl.className = 'setting-env';
+        envEl.textContent = k.env;
+        label.appendChild(nameEl);
+        label.appendChild(envEl);
+
+        const control = document.createElement('div');
+        control.className = 'setting-control';
+        control.appendChild(this.settingControl(k));
+
+        const meta = document.createElement('div');
+        meta.className = 'setting-meta';
+        const badge = document.createElement('span');
+        badge.className = `setting-source setting-source-${k.source}`;
+        badge.textContent = k.source === 'runtime'
+            ? `overridden (launch: ${k.launch_value})` : k.source;
+        meta.appendChild(badge);
+        if (k.source === 'runtime') {
+            const reset = document.createElement('button');
+            reset.className = 'setting-reset';
+            reset.textContent = 'reset';
+            reset.title = `Back to launch value (${k.launch_value})`;
+            reset.addEventListener('click', () => this.saveSetting(k.name, null));
+            meta.appendChild(reset);
+        }
+        const err = document.createElement('span');
+        err.className = 'setting-error';
+        meta.appendChild(err);
+
+        row.appendChild(label);
+        row.appendChild(control);
+        row.appendChild(meta);
+        return row;
+    }
+
+    async saveSetting(name, value) {
+        const row = document.querySelector(`.setting-row[data-name="${name}"]`);
+        const errEl = row ? row.querySelector('.setting-error') : null;
+        if (errEl) errEl.textContent = '';
+        try {
+            const resp = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, value }),
+            });
+            const body = await resp.json();
+            if (!resp.ok) {
+                if (errEl) errEl.textContent = body.error || `HTTP ${resp.status}`;
+                return;
+            }
+            if (row) row.replaceWith(this.settingRow(body.knob));
+        } catch (e) {
+            if (errEl) errEl.textContent = 'request failed';
+        }
+    }
+
+    async resetAllSettings() {
+        try {
+            await fetch('/api/settings/reset', { method: 'POST' });
+        } finally {
+            this.loadSettings();
         }
     }
 
@@ -2006,11 +2142,24 @@ class VisionScorer {
         }
     }
 
+    // "qm 30" -> "Qualification 30", "sf 2" -> "Playoff 2", "f 1" -> "Final 1".
+    // Falls back to the raw match_key, then the stored label (job GUID).
+    formatMatchTitle(r) {
+        const names = { qm: 'Qualification', qf: 'Quarterfinal', sf: 'Playoff', f: 'Final' };
+        if (r.comp_level && r.match_number != null) {
+            const level = names[r.comp_level] || r.comp_level.toUpperCase();
+            const num = r.comp_level === 'sf' ? (r.set_number ?? r.match_number) : r.match_number;
+            const match = `${level} ${num}`;
+            return r.event_name ? `${r.event_name} · ${match}` : match;
+        }
+        return r.match_key || r.label || `Replay ${r.id}`;
+    }
+
     renderReplayCard(r) {
         const id = this.escapeHtml(r.id);
-        const label = this.escapeHtml(r.label || `Replay ${r.id}`);
-        const blueTeams = (r.blue_teams || []).join(', ') || '—';
-        const redTeams = (r.red_teams || []).join(', ') || '—';
+        const label = this.escapeHtml(this.formatMatchTitle(r));
+        const blueTeams = (r.blue_teams || []).filter(Boolean).join(', ') || '—';
+        const redTeams = (r.red_teams || []).filter(Boolean).join(', ') || '—';
         const blueScore = r.blue_score != null ? r.blue_score : '—';
         const redScore = r.red_score != null ? r.red_score : '—';
         const date = r.created_at ? new Date(r.created_at).toLocaleString() : '';
@@ -2101,7 +2250,13 @@ class VisionScorer {
             this.replayMeta = meta;
 
             const summary = meta.summary || {};
-            labelEl.textContent = summary.match_label || `Replay ${id}`;
+            const info = meta.replay_info || {};
+            labelEl.textContent = info.event_name
+                ? this.formatMatchTitle(info)
+                : (summary.match_label || `Replay ${id}`);
+            // Job GUID kept visible (small) for troubleshooting
+            const idEl = document.getElementById('replayPlayerId');
+            if (idEl) idEl.textContent = id;
 
             // Processing-time breakdown for this match
             const ptCard = document.getElementById('replayTimingCard');
@@ -2264,9 +2419,6 @@ class VisionScorer {
 
         // Highlight current scoring event (largest event.t <= currentTime)
         this.highlightReplayEvent();
-
-        // Client-side field map
-        this.drawReplayFieldMap(frame.robots || []);
     }
 
     highlightReplayEvent() {
@@ -2290,80 +2442,6 @@ class VisionScorer {
         });
         const activeEl = container.querySelector(`.timeline-event[data-event-idx="${activeIdx}"]`);
         if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
-    }
-
-    drawReplayFieldMap(robots) {
-        const canvas = document.getElementById('replayFieldMap');
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        const W = canvas.width;
-        const H = canvas.height;
-
-        // 2026 REBUILT field dimensions (metres).
-        // Source: data/field/2026-rebuilt-welded.json -> field.length / field.width,
-        // loaded by web/field/field_model.py (FieldModel.length_m / width_m).
-        const FIELD_LENGTH_M = 16.541;
-        const FIELD_WIDTH_M = 8.069;
-
-        // Fit the field rectangle inside the canvas with a small margin, preserving aspect.
-        const margin = 12;
-        const availW = W - margin * 2;
-        const availH = H - margin * 2;
-        const scale = Math.min(availW / FIELD_LENGTH_M, availH / FIELD_WIDTH_M);
-        const fieldW = FIELD_LENGTH_M * scale;
-        const fieldH = FIELD_WIDTH_M * scale;
-        const ox = (W - fieldW) / 2;
-        const oy = (H - fieldH) / 2;
-
-        ctx.clearRect(0, 0, W, H);
-
-        // Blue (left) / red (right) halves
-        ctx.fillStyle = 'rgba(59, 130, 246, 0.12)';
-        ctx.fillRect(ox, oy, fieldW / 2, fieldH);
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.12)';
-        ctx.fillRect(ox + fieldW / 2, oy, fieldW / 2, fieldH);
-
-        // Field border
-        ctx.strokeStyle = '#2a3550';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(ox, oy, fieldW, fieldH);
-
-        // Center line
-        ctx.beginPath();
-        ctx.moveTo(ox + fieldW / 2, oy);
-        ctx.lineTo(ox + fieldW / 2, oy + fieldH);
-        ctx.stroke();
-
-        // Plot robots
-        for (const r of robots) {
-            const pos = r.field_pos;
-            if (!Array.isArray(pos) || pos.length < 2) continue;
-            const [x, y] = pos;
-            if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-            const px = ox + (x / FIELD_LENGTH_M) * fieldW;
-            const py = oy + (y / FIELD_WIDTH_M) * fieldH;
-            ctx.beginPath();
-            ctx.arc(px, py, 7, 0, Math.PI * 2);
-            ctx.fillStyle = r.alliance === 'red' ? '#ef4444' : '#3b82f6';
-            ctx.fill();
-            ctx.lineWidth = 1.5;
-            ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-            ctx.stroke();
-            // Confirmed team renders solid; a leading-but-unconfirmed VLM read
-            // (team_candidate) renders dimmed with a "?" so reads are visible
-            // immediately instead of waiting for the lock.
-            if (r.team_number) {
-                ctx.fillStyle = '#e8eaf0';
-                ctx.font = 'bold 10px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText(String(r.team_number), px, py - 10);
-            } else if (r.team_candidate) {
-                ctx.fillStyle = 'rgba(232,234,240,0.6)';
-                ctx.font = '10px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText(String(r.team_candidate) + '?', px, py - 10);
-            }
-        }
     }
 
     // --- Match Detail Modal ---

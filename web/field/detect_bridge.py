@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from web.field.tracker import FieldDetection
-from web.field.zones import point_in_zones
+from web.field.zones import point_in_zones, ray_enters_zones
 
 # Field-boundary slack (m) when deciding a detection's footprint is "on the field".
 # Tightened from the original 1.0 m, which let field-edge clutter (scoreboard side
@@ -230,18 +230,29 @@ def filter_field_robot_boxes(
     frame_shape=None,
     margin=DET_FIELD_MARGIN_M,
     blocked_zones=None,
+    ray_blocked_zones=None,
 ):
     """Return indices of boxes whose ground contact is a plausible field robot.
 
     This is the geometry-only counterpart to ``to_field_detections`` for paths
     such as SAM2 prompting that must retain their original box/color metadata.
+
+    ``ray_blocked_zones``: zones additionally tested along the viewing ray
+    BEYOND the contact point (see ``zones.ray_enters_zones``). Pass only for
+    low cameras, whose occluded-base contacts land short of the structure.
     """
+    cam_xy = None
+    if ray_blocked_zones and calibration.camera_center is not None:
+        cam_xy = (float(calibration.camera_center[0]),
+                  float(calibration.camera_center[1]))
     kept = []
     for idx, box in enumerate(robot_boxes):
         xy = calibration.image_to_field(_bottom_center(box))
         if xy is None or not _on_field(xy, field_dims, margin):
             continue
         if point_in_zones(xy, blocked_zones):
+            continue
+        if cam_xy is not None and ray_enters_zones(cam_xy, xy, ray_blocked_zones):
             continue
         if _too_large(
             box,

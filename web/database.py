@@ -370,10 +370,13 @@ async def get_match(match_id: int) -> Optional[Dict]:
 
 
 async def get_match_by_key(tba_match_key: str) -> Optional[Dict]:
-    """Get a match by its TBA key."""
+    """Get a match by its TBA key (includes event_name from the events table)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM matches WHERE tba_match_key = ?", (tba_match_key,))
+        cursor = await db.execute(
+            "SELECT m.*, e.event_name FROM matches m "
+            "JOIN events e ON e.id = m.event_id "
+            "WHERE m.tba_match_key = ?", (tba_match_key,))
         match = await cursor.fetchone()
         if not match:
             return None
@@ -598,12 +601,42 @@ async def insert_replay(row: Dict[str, Any]) -> None:
 
 
 async def list_replays() -> List[Dict]:
-    """All replays, newest first."""
+    """All replays, newest first, enriched with TBA match info when the
+    replay's match_key matches an imported match: event_name, comp_level
+    (as tba_comp_level), match_number, set_number, and the official
+    alliance rosters (tba_blue_teams / tba_red_teams)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM replays ORDER BY created_at DESC, id DESC")
-        return [dict(r) for r in await cursor.fetchall()]
+        cursor = await db.execute("""
+            SELECT r.*, e.event_name,
+                   m.comp_level AS tba_comp_level,
+                   m.match_number, m.set_number,
+                   m.id AS _match_id
+            FROM replays r
+            LEFT JOIN matches m ON m.tba_match_key = r.match_key
+            LEFT JOIN events e ON e.id = m.event_id
+            ORDER BY r.created_at DESC, r.id DESC
+        """)
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        match_ids = [r["_match_id"] for r in rows if r["_match_id"] is not None]
+        rosters: Dict[int, Dict[str, List[str]]] = {}
+        if match_ids:
+            placeholders = ",".join("?" for _ in set(match_ids))
+            cursor = await db.execute(
+                f"SELECT match_id, alliance, team_number FROM match_robots "
+                f"WHERE match_id IN ({placeholders}) ORDER BY alliance, position",
+                list(set(match_ids)))
+            for row in await cursor.fetchall():
+                roster = rosters.setdefault(
+                    row["match_id"], {"blue": [], "red": []})
+                roster[row["alliance"]].append(row["team_number"])
+
+        for r in rows:
+            roster = rosters.get(r.pop("_match_id"), {})
+            r["tba_blue_teams"] = roster.get("blue", [])
+            r["tba_red_teams"] = roster.get("red", [])
+        return rows
 
 
 async def get_replay(replay_id: str) -> Optional[Dict]:

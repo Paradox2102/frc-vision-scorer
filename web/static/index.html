@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260611e">
+    <link rel="stylesheet" href="/static/style.css?v=20260612d">
 </head>
 <body>
     <div class="container">
@@ -15,6 +15,7 @@
                 <button class="nav-btn" data-view="replays">Replays</button>
                 <button class="nav-btn" data-view="history">Match History</button>
                 <button class="nav-btn" data-view="gallery">Gallery</button>
+                <button class="nav-btn" data-view="settings">Settings</button>
                 <a href="/static/calibrate.html" class="nav-btn" style="text-decoration: none;" target="_blank">Calibration</a>
             </nav>
         </header>
@@ -367,6 +368,7 @@
                     <div class="replay-player-bar">
                         <button class="btn-small" id="replayBackBtn">&larr; Back to Library</button>
                         <span class="replay-player-label" id="replayPlayerLabel"></span>
+                        <span class="replay-player-id" id="replayPlayerId" title="Job ID"></span>
                         <span class="replay-export-group">
                             <a class="btn-small" id="replayDownloadVideo" download>&#11015; Video</a>
                             <a class="btn-small" id="replayDownloadData" download>&#11015; Data (JSON)</a>
@@ -392,9 +394,6 @@
                             </div>
                             <div class="video-container">
                                 <video id="replayVideo" controls playsinline preload="metadata" style="width:100%;display:block;height:auto;"></video>
-                            </div>
-                            <div class="replay-fieldmap-wrap">
-                                <canvas id="replayFieldMap" width="640" height="320"></canvas>
                             </div>
                             <div class="replay-timing-card" id="replayTimingCard" style="display:none;">
                                 <div class="timeline-header">PROCESSING TIME</div>
@@ -459,8 +458,22 @@
           <div id="galleryGrid" class="gallery-list"></div>
         </div>
 
+        <div id="settingsView" style="display:none">
+          <div class="card">
+            <h2>Settings</h2>
+            <p class="settings-note">
+              Launch profile (env vars) provides the defaults; changes here
+              apply to jobs submitted afterwards and last until the server
+              restarts. The running job keeps the config it started with.
+              Per-job <code>config_json</code> still wins over everything.
+            </p>
+            <button id="settingsResetBtn" class="settings-reset-all">Reset all to launch profile</button>
+          </div>
+          <div id="settingsList" class="settings-list"></div>
+        </div>
+
     </div>
 
-    <script src="/static/app.js?v=20260611f"></script>
+    <script src="/static/app.js?v=20260612b"></script>
 </body>
 </html>

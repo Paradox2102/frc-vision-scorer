@@ -1,5 +1,5 @@
 import numpy as np
-from web.field.radar import Radar
+from web.field.radar import Radar, RadarTrack
 
 def test_render_returns_image_of_configured_size():
     r = Radar(field_length=16.541, field_width=8.069, px_per_m=40)
@@ -21,7 +21,8 @@ def test_point_maps_to_expected_pixel():
 
 def test_side_tint_blue_left_red_right():
     r = Radar(field_length=16.541, field_width=8.069, px_per_m=40)
-    img = r.render([((2.0, 4.0), "blue"), ((14.0, 4.0), "red")])
+    img = r.render([RadarTrack(pos=(2.0, 4.0), alliance="blue"),
+                    RadarTrack(pos=(14.0, 4.0), alliance="red")])
     bu, bv = r.field_to_pixel((2.0, 4.0))
     ru, rv = r.field_to_pixel((14.0, 4.0))
     blue_px = img[int(bv), int(bu)]   # BGR; _TINT blue = (255, 120, 0)

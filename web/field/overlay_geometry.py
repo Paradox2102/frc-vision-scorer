@@ -42,6 +42,61 @@ def _box_edges(x0, x1, y0, y1, z0, z1):
     return edges
 
 
+def structure_footprints(field_model, prisms) -> dict:
+    """Ground-plane outlines of the fixed field structures, in field meters.
+
+    Single source of truth shared by the calibrate overlay (wireframes above)
+    and the 2D field map: hub cabinet bases, bumps, towers, trenches. Returns
+    {"hubs": [poly], "bumps": [...], "towers": [...], "trenches": [...]}
+    where each poly is a list of (x, y) vertices in drawing order."""
+    out = {"hubs": [], "bumps": [], "towers": [], "trenches": []}
+
+    for prism in prisms:
+        poly = np.asarray(prism.footprint, float)
+        cx = float(poly[:, 0].mean())
+        cy = float(poly[:, 1].mean())
+        bh = HUB_BASE_WIDTH_M / 2.0
+        out["hubs"].append(
+            [(cx - bh, cy - bh), (cx + bh, cy - bh),
+             (cx + bh, cy + bh), (cx - bh, cy + bh)])
+
+        x0 = cx - BUMP_DEPTH_M / 2.0
+        x1 = cx + BUMP_DEPTH_M / 2.0
+        near_y1 = float(poly[:, 1].min())
+        far_y0 = float(poly[:, 1].max())
+        for y0, y1 in (
+                (max(0.0, near_y1 - BUMP_WIDTH_M), near_y1),
+                (far_y0, min(float(field_model.width_m), far_y0 + BUMP_WIDTH_M))):
+            out["bumps"].append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+    for tag_ids, inward_sign in (((31, 32), 1.0), ((15, 16), -1.0)):
+        pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
+        panel_x = float(pts[:, 0].mean())
+        frame_x = panel_x + inward_sign * TOWER_DEPTH_M
+        cy = float(field_model.width_m) / 2.0
+        y0, y1 = cy - TOWER_WIDTH_M / 2.0, cy + TOWER_WIDTH_M / 2.0
+        xa, xb = sorted((panel_x, frame_x))
+        out["towers"].append([(xa, y0), (xb, y0), (xb, y1), (xa, y1)])
+
+    for tag_ids in ((17, 28), (22, 23), (6, 7), (1, 12)):
+        pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
+        center_x = float(pts[:, 0].mean())
+        tagged_y = float(pts[:, 1].mean())
+        cy = float(field_model.width_m) / 2.0
+        if tagged_y < cy:
+            arm_w = TRENCH_FIXED_ARM_WIDTH_M
+            y0 = cy - TRENCH_FIXED_OUTER_CAD_M
+            y1 = cy - TRENCH_FIXED_INNER_CAD_M
+        else:
+            arm_w = TRENCH_HINGED_ARM_WIDTH_M
+            y0 = cy + TRENCH_HINGED_INNER_CAD_M
+            y1 = cy + TRENCH_HINGED_OUTER_CAD_M
+        x0, x1 = center_x - arm_w / 2.0, center_x + arm_w / 2.0
+        out["trenches"].append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+    return out
+
+
 def hub_wireframe_edges(prisms):
     """Dimensioned hub cabinet, opening, and tapered upper frame."""
     edges = []

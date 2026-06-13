@@ -1,12 +1,36 @@
 /* FRC Vision Scorer */
 
 :root {
-    --bg-primary: #0a0e1a;
-    --bg-secondary: #131825;
+    /* shadcn-style token names resolving to the app's original blue-grey
+       palette: modern component styling (fields, switches, focus rings)
+       with the old color identity. */
+    --background: #0a0e1a;
+    --foreground: #e8eaf0;
+    --card: #131825;
+    --card-foreground: #e8eaf0;
+    --popover: #131825;
+    --primary: #3b82f6;
+    --primary-foreground: #ffffff;
+    --secondary: #1a2035;
+    --secondary-foreground: #e8eaf0;
+    --muted: #1a2035;
+    --muted-foreground: #a0a8c0;
+    --accent: #1f2740;
+    --accent-foreground: #e8eaf0;
+    --destructive: #dc2626;
+    --destructive-foreground: #ffffff;
+    --border: #2a3550;
+    --input: #2f3b5c;
+    --ring: #3b82f6;
+    --radius: 0.5rem;
+
+    /* Legacy names used throughout this stylesheet. */
+    --bg-primary: var(--background);
+    --bg-secondary: var(--card);
     --bg-tertiary: #1a2035;
-    --text-primary: #e8eaf0;
-    --text-secondary: #a0a8c0;
-    --border-color: #2a3550;
+    --text-primary: var(--foreground);
+    --text-secondary: var(--muted-foreground);
+    --border-color: var(--border);
     --blue-alliance: #3b82f6;
     --blue-bg: rgba(59, 130, 246, 0.08);
     --blue-border: rgba(59, 130, 246, 0.4);
@@ -21,11 +45,23 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--bg-primary);
-    color: var(--text-primary);
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--background);
+    color: var(--foreground);
     line-height: 1.5;
     min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* shadcn focus ring on every interactive element */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+    outline: none;
+    border-color: var(--ring);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.3);
 }
 
 .container {
@@ -51,6 +87,7 @@ header {
 header h1 {
     font-size: 1.2rem;
     font-weight: 700;
+    letter-spacing: -0.025em;
     background: linear-gradient(135deg, var(--blue-alliance), var(--red-alliance));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -59,22 +96,31 @@ header h1 {
 
 nav {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.25rem;
+    background: var(--muted);
+    padding: 0.25rem;
+    border-radius: calc(var(--radius) + 2px);
 }
 
+/* shadcn tabs-style nav: ghost items, active gets a raised pill */
 .nav-btn {
-    padding: 0.4rem 1rem;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    color: var(--text-secondary);
+    padding: 0.35rem 0.9rem;
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--muted-foreground);
     font-size: 0.85rem;
+    font-weight: 500;
     cursor: pointer;
-    transition: all 0.2s;
+    transition: color 0.15s, background-color 0.15s, box-shadow 0.15s;
 }
 
-.nav-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
-.nav-btn.active { background: var(--blue-alliance); color: white; border-color: var(--blue-alliance); }
+.nav-btn:hover { color: var(--foreground); }
+.nav-btn.active {
+    background: var(--blue-alliance);
+    color: #fff;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+}
 
 /* ========== Event Setup ========== */
 .event-section {
@@ -83,10 +129,11 @@ nav {
 }
 
 .event-setup {
-    background: var(--bg-secondary);
-    border: 2px solid var(--border-color);
-    border-radius: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 4px);
     padding: 2rem;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
 }
 
 .event-setup h2 {
@@ -149,10 +196,11 @@ nav {
 }
 
 .match-setup {
-    background: var(--bg-secondary);
-    border: 2px solid var(--border-color);
-    border-radius: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 4px);
     padding: 1.5rem;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
 }
 
 .match-select-group {
@@ -169,12 +217,13 @@ nav {
 
 .match-select-group select {
     width: 100%;
-    padding: 0.6rem;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    color: var(--text-primary);
+    padding: 0.5rem 0.75rem;
+    background: transparent;
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
     font-size: 0.9rem;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
 }
 
 .match-select-group select option { background: var(--bg-tertiary); }
@@ -251,22 +300,29 @@ nav {
 }
 
 .input-group input[type="file"],
-.input-group input[type="text"] {
+.input-group input[type="text"],
+.input-group input[type="number"],
+.input-group select {
     width: 100%;
-    padding: 0.6rem;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    color: var(--text-primary);
-    font-size: 0.95rem;
+    padding: 0.5rem 0.75rem;
+    background: transparent;
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
+    font-size: 0.9rem;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+    transition: border-color 0.15s, box-shadow 0.15s;
 }
 
+.input-group input::placeholder { color: var(--muted-foreground); }
+
 .input-group input[type="file"]::file-selector-button {
-    padding: 0.4rem 0.8rem;
-    background: var(--blue-alliance);
+    padding: 0.35rem 0.8rem;
+    background: var(--secondary);
     border: none;
-    border-radius: 4px;
-    color: white;
+    border-radius: calc(var(--radius) - 4px);
+    color: var(--secondary-foreground);
+    font-weight: 500;
     cursor: pointer;
     margin-right: 0.75rem;
 }
@@ -306,48 +362,53 @@ nav {
     font-size: 0.8rem;
 }
 
-/* ========== Buttons ========== */
+/* ========== Buttons (shadcn variants) ========== */
 .btn-primary {
     width: 100%;
-    padding: 0.8rem;
+    padding: 0.65rem 1rem;
     background: linear-gradient(135deg, var(--blue-alliance), var(--red-alliance));
-    border: none;
-    border-radius: 6px;
-    color: white;
-    font-size: 1rem;
+    border: 1px solid transparent;
+    border-radius: calc(var(--radius) - 2px);
+    color: #fff;
+    font-size: 0.95rem;
     font-weight: 600;
     cursor: pointer;
-    transition: transform 0.2s;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+    transition: opacity 0.15s;
 }
 
-.btn-primary:hover { transform: translateY(-1px); }
-.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn-primary:hover { opacity: 0.92; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-secondary {
-    padding: 0.8rem 1.5rem;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    color: var(--text-primary);
-    font-size: 0.95rem;
+    padding: 0.55rem 1.25rem;
+    background: var(--secondary);
+    border: 1px solid transparent;
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--secondary-foreground);
+    font-size: 0.9rem;
+    font-weight: 500;
     cursor: pointer;
-    transition: all 0.2s;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+    transition: background-color 0.15s;
 }
 
-.btn-secondary:hover { background: var(--bg-secondary); }
+.btn-secondary:hover { background: hsl(240 3.7% 19%); }
 
 .btn-small {
     padding: 0.3rem 0.8rem;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 4px;
-    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
     font-size: 0.8rem;
+    font-weight: 500;
     cursor: pointer;
-    transition: all 0.2s;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+    transition: background-color 0.15s, border-color 0.15s;
 }
 
-.btn-small:hover { background: var(--bg-secondary); color: var(--text-primary); border-color: var(--blue-alliance); }
+.btn-small:hover { background: var(--accent); }
 #recalibrateBtn { border-color: var(--yellow); color: var(--yellow); }
 #recalibrateBtn:hover { background: rgba(245, 158, 11, 0.15); border-color: var(--yellow); color: var(--yellow); }
 
@@ -390,19 +451,19 @@ nav {
 }
 
 .inference-btn {
-    border: none;
-    border-radius: 6px;
+    border: 1px solid transparent;
+    border-radius: calc(var(--radius) - 2px);
     color: #ffffff;
-    padding: 0.55rem 1rem;
+    padding: 0.5rem 1rem;
     font-size: 0.9rem;
-    font-weight: 700;
+    font-weight: 500;
     cursor: pointer;
-    transition: transform 0.15s ease, filter 0.2s ease;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+    transition: filter 0.15s ease;
 }
 
 .inference-btn:hover {
-    transform: translateY(-1px);
-    filter: brightness(1.06);
+    filter: brightness(1.1);
 }
 
 .start-btn { background: #2ecc71; }
@@ -578,7 +639,7 @@ nav {
     width: 96px;
     height: 58px;
     object-fit: contain;
-    background: #05070c;
+    background: var(--background);
     border-radius: 4px;
     border: 1px solid rgba(255, 255, 255, 0.08);
 }
@@ -912,39 +973,43 @@ nav {
     font-size: 0.9rem;
 }
 
+/* shadcn table: bordered card shell, muted header, hairline rows */
 .history-table {
     width: 100%;
     border-collapse: collapse;
-    background: var(--bg-secondary);
-    border-radius: 8px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 2px);
     overflow: hidden;
 }
 
 .history-table th {
-    background: var(--bg-tertiary);
-    padding: 0.6rem 0.8rem;
+    background: transparent;
+    padding: 0.65rem 0.8rem;
     text-align: left;
-    font-weight: 600;
+    font-weight: 500;
     font-size: 0.8rem;
-    color: var(--text-secondary);
-    border-bottom: 1px solid var(--border-color);
+    color: var(--muted-foreground);
+    border-bottom: 1px solid var(--border);
 }
 
 .history-table td {
-    padding: 0.5rem 0.8rem;
-    border-bottom: 1px solid rgba(42, 53, 80, 0.3);
+    padding: 0.55rem 0.8rem;
+    border-bottom: 1px solid var(--border);
     font-size: 0.9rem;
 }
 
-.history-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+.history-table tbody tr:last-child td { border-bottom: none; }
+.history-table tbody tr:hover { background: hsl(240 3.7% 15.9% / 0.4); }
 
 .team-cell.blue { color: var(--blue-alliance); }
 .team-cell.red { color: var(--red-alliance); }
 
 .status-badge {
-    padding: 0.2rem 0.6rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
+    padding: 0.15rem 0.65rem;
+    border-radius: 9999px;
+    border: 1px solid transparent;
+    font-size: 0.72rem;
     font-weight: 600;
 }
 
@@ -956,7 +1021,7 @@ nav {
 .modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: rgb(0 0 0 / 0.8);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -964,9 +1029,10 @@ nav {
 }
 
 .modal-content {
-    background: var(--bg-secondary);
-    border: 2px solid var(--border-color);
-    border-radius: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 4px);
+    box-shadow: 0 10px 30px rgb(0 0 0 / 0.5);
     width: 90%;
     max-width: 700px;
     max-height: 85vh;
@@ -1229,6 +1295,7 @@ nav {
     padding: 0.4rem 0.2rem 0.6rem;
 }
 .replay-player-label { font-weight: 600; font-size: 1rem; }
+.replay-player-id { font-size: 0.7rem; color: var(--text-secondary); font-family: monospace; opacity: 0.7; }
 .replay-export-group { margin-left: auto; display: flex; gap: 0.5rem; }
 a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; align-items: center; }
 
@@ -1239,15 +1306,6 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
    scroll internally instead of growing the layout. */
 .replay-player .main-layout { align-items: start; }
 .replay-player .alliance-column { max-height: calc(100vh - 180px); }
-
-.replay-fieldmap-wrap {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    padding: 0.4rem;
-    flex-shrink: 0;
-}
-#replayFieldMap { width: 100%; height: auto; display: block; background: var(--bg-primary); border-radius: 4px; }
 
 .timeline-event.clickable { cursor: pointer; }
 .timeline-event.clickable:hover { background: rgba(255, 255, 255, 0.04); }
@@ -1426,25 +1484,25 @@ select.g-team, input.g-team { min-width: 72px; }
     padding: 8px 12px;
     max-height: 130px;
     overflow-y: auto;
-    background: #101418;
-    border: 1px solid #2a3038;
+    background: var(--card);
+    border: 1px solid var(--border);
     border-radius: 6px;
     font-family: ui-monospace, monospace;
     font-size: 0.75rem;
     line-height: 1.5;
-    color: #9ab;
+    color: var(--muted-foreground);
     white-space: pre-wrap;
 }
 
 /* Tracking-phase panel: per-view seed frames + propagation progress */
 .tracking-panel {
     padding: 12px;
-    background: #0d1117;
+    background: var(--background);
     border-radius: 6px;
 }
 .tracking-panel-title {
     font-size: 0.85rem;
-    color: #8b98a8;
+    color: var(--muted-foreground);
     text-transform: uppercase;
     letter-spacing: 0.06em;
     margin-bottom: 10px;
@@ -1455,15 +1513,15 @@ select.g-team, input.g-team { min-width: 72px; }
     gap: 12px;
 }
 .tracking-card {
-    background: #161b22;
-    border: 1px solid #2a3038;
+    background: var(--card);
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 8px;
 }
 .tracking-card-title {
     font-weight: 600;
     font-size: 0.85rem;
-    color: #c5d0dc;
+    color: var(--foreground);
     margin-bottom: 6px;
 }
 .tracking-card-img {
@@ -1474,12 +1532,12 @@ select.g-team, input.g-team { min-width: 72px; }
 }
 .tracking-card-meta {
     font-size: 0.75rem;
-    color: #8b98a8;
+    color: var(--muted-foreground);
     margin: 5px 0 4px;
 }
 .tracking-card-barwrap {
     height: 8px;
-    background: #21262e;
+    background: var(--muted);
     border-radius: 4px;
     overflow: hidden;
 }
@@ -1491,7 +1549,176 @@ select.g-team, input.g-team { min-width: 72px; }
 }
 .tracking-card-frames {
     font-size: 0.72rem;
-    color: #6e7b8a;
+    color: var(--muted-foreground);
     margin-top: 4px;
     font-family: ui-monospace, monospace;
 }
+
+/* ===== Settings page ===== */
+.settings-note {
+    color: var(--muted-foreground);
+    font-size: 0.85rem;
+    margin: 6px 0 10px;
+}
+.settings-note code {
+    font-family: ui-monospace, monospace;
+    color: var(--foreground);
+}
+.settings-reset-all {
+    font-size: 0.8rem;
+}
+.settings-list {
+    margin-top: 12px;
+}
+.setting-row {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) 220px minmax(180px, 1fr);
+    gap: 12px;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.setting-row:hover {
+    background: var(--card);
+}
+.setting-label {
+    display: flex;
+    flex-direction: column;
+}
+.setting-name {
+    font-family: ui-monospace, monospace;
+    font-size: 0.88rem;
+}
+.setting-env {
+    font-size: 0.72rem;
+    color: var(--muted-foreground);
+    font-family: ui-monospace, monospace;
+}
+.setting-control input[type="number"],
+.setting-control input[type="text"],
+.setting-control select {
+    width: 100%;
+    box-sizing: border-box;
+}
+.setting-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.75rem;
+}
+.setting-source {
+    color: var(--muted-foreground);
+}
+.setting-source-runtime {
+    color: #d29922;
+}
+.setting-source-env {
+    color: #2f81f7;
+}
+.setting-reset {
+    font-size: 0.72rem;
+    padding: 1px 8px;
+}
+.setting-error {
+    color: #f85149;
+}
+
+/* ===== shadcn primitives added with the restyle ===== */
+
+/* Card: used by Gallery / Settings page headers */
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 4px);
+    padding: 1.25rem 1.5rem;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+    margin-bottom: 0.75rem;
+}
+.card h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    margin-bottom: 0.5rem;
+}
+
+/* Settings list reads as one bordered card */
+.settings-list {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 4px);
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-row:hover { background: hsl(240 3.7% 15.9% / 0.35); }
+
+/* shadcn Switch: restyle the settings checkboxes */
+.setting-control input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 2.25rem;
+    height: 1.25rem;
+    border-radius: 9999px;
+    background: var(--input);
+    position: relative;
+    cursor: pointer;
+    transition: background-color 0.15s;
+    vertical-align: middle;
+}
+.setting-control input[type="checkbox"]::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: calc(1.25rem - 4px);
+    height: calc(1.25rem - 4px);
+    border-radius: 9999px;
+    background: var(--background);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.4);
+    transition: transform 0.15s;
+}
+.setting-control input[type="checkbox"]:checked {
+    background: var(--primary);
+}
+.setting-control input[type="checkbox"]:checked::after {
+    transform: translateX(1rem);
+}
+
+/* Source badges as shadcn outline badges */
+.setting-source {
+    padding: 0.1rem 0.6rem;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    font-weight: 500;
+}
+.setting-source-runtime { border-color: #d2992255; }
+.setting-source-env { border-color: #2f81f755; }
+
+/* Settings controls: same field skin as the rest of the app */
+.setting-control input[type="number"],
+.setting-control input[type="text"],
+.setting-control select {
+    padding: 0.4rem 0.7rem;
+    background: var(--background);
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
+    font-size: 0.85rem;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+}
+.setting-control select option { background: var(--bg-tertiary); }
+
+/* Outline buttons on the settings page */
+.settings-reset-all,
+.setting-reset {
+    background: transparent;
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
+    font-weight: 500;
+    cursor: pointer;
+    padding: 0.35rem 0.9rem;
+    transition: background-color 0.15s;
+}
+.settings-reset-all:hover,
+.setting-reset:hover { background: var(--accent); }

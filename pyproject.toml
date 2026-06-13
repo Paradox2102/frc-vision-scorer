@@ -1,8 +1,9 @@
 [project]
 name = "frc-vision-scorer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Automated FRC vision scouting from broadcast match video: field-coordinate robot tracking + VLM bumper-number identity"
 readme = "README.md"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
 requires-python = ">=3.12"
 dependencies = [
     "pupil-apriltags>=1.0.4",

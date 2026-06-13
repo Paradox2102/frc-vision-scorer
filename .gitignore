@@ -13,7 +13,7 @@ data/results/
 models/*.pt
 models/*.onnx
 
-# Training runs (large - plots, caches)
+# Training runs (large - plots, caches); keep only shipped model weights
 runs/*
 !runs/train/
 runs/train/*
@@ -22,6 +22,16 @@ runs/train/hub_zone_yolo26s/*
 !runs/train/hub_zone_yolo26s/weights/
 runs/train/hub_zone_yolo26s/weights/*
 !runs/train/hub_zone_yolo26s/weights/best.pt
+!runs/train/frc_bumpers/
+runs/train/frc_bumpers/*
+!runs/train/frc_bumpers/weights/
+runs/train/frc_bumpers/weights/*
+!runs/train/frc_bumpers/weights/best.pt
+!runs/train/frc_bumpers_equipment_hardneg/
+runs/train/frc_bumpers_equipment_hardneg/*
+!runs/train/frc_bumpers_equipment_hardneg/weights/
+runs/train/frc_bumpers_equipment_hardneg/weights/*
+!runs/train/frc_bumpers_equipment_hardneg/weights/best.pt
 *.cache
 
 # Raw frames (can regenerate from videos)
@@ -95,6 +105,8 @@ data/videos/
 yolo11m.pt
 *.pt
 !runs/train/hub_zone_yolo26s/weights/best.pt
+!runs/train/frc_bumpers/weights/best.pt
+!runs/train/frc_bumpers_equipment_hardneg/weights/best.pt
 
 # SAM2 checkpoints (downloaded, ~900MB)
 checkpoints/
@@ -102,10 +114,17 @@ checkpoints/
 # Test footage (large video, not committed)
 data/test_footage/
 
-# Local tooling / session state (not shared)
+# Local AI-assistant tooling / session state (not shared)
 .antigravitycli/
 .claude/
+.agents/
+.codex/
+docs/superpowers/
 log.md
+
+# Local caches / extra virtualenvs
+.pytest_cache/
+.venv-vllm/
 
 # Match replay artifacts (recorded HUD videos + metadata, large/user data)
 web/replays/
@@ -123,3 +142,6 @@ tools/frame_*.png
 !data/hard_negatives/boxes/
 data/hard_negatives/boxes/*/
 !data/hard_negatives/boxes/*.json
+
+# Blog drafts (not part of the public repo)
+blog-post-*.md

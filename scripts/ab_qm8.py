@@ -1,0 +1,142 @@
+"""Automated A/B harness for the red-robot identity-collapse fix on 2026cur qm8.
+
+For each config: POST the qm8 video + config_json to /api/infer, drive the job
+to completion over its websocket, then score the resulting replay against Manta
+(aggregate mean-NN + per-red-robot coverage). Configs toggle the spatial-gate
+knobs. Runs sequentially (GPU is serial). Results stream to a JSON file.
+
+    .venv/bin/python scripts/ab_qm8.py
+"""
+from __future__ import annotations
+import asyncio, json, subprocess, sys, time
+from pathlib import Path
+
+import numpy as np
+import websockets
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+from scripts.compare_manta import (  # noqa: E402
+    load_our_auto_paths, load_manta_auto_paths, assign_alliance, summarize_our_path,
+)
+
+HOST = "localhost:8004"
+VIDEO = REPO / "web/uploads/ff4be1d9-b8e5-49ff-ac78-4a6a0e77a697.mp4"  # cached qm8
+MATCH = 8
+RESULTS = Path("/tmp/frc-ab-qm8.json")
+
+CONFIGS = [
+    ("baseline", {}),
+    ("relink-gate", {"relink_max_dist_m": 3.0}),
+    ("tracker-side", {"merge_main_guard": True, "sticky_max_dist_m": 2.5}),
+    ("both", {"relink_max_dist_m": 3.0, "merge_main_guard": True,
+              "sticky_max_dist_m": 2.5}),
+]
+
+
+def load_event() -> None:
+    """Load 2026cur so the server has a calibrated event (jobs read event_key
+    from the global current_event); without it inference aborts immediately."""
+    out = subprocess.run(
+        ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
+         "-d", '{"event_key":"2026cur"}', f"http://{HOST}/api/event/load"],
+        capture_output=True, text=True, timeout=180).stdout
+    if '"event_key"' not in out:
+        raise RuntimeError(f"event load failed: {out[:200]}")
+
+
+def post_job(cfg: dict) -> str:
+    """Create a job via /api/infer (curl multipart); return job_id."""
+    config_json = json.dumps({"auto_period_only": True, **cfg})
+    out = subprocess.run(
+        ["curl", "-s", "-F", f"video_file=@{VIDEO}",
+         "-F", "match_key=2026cur_qm8", "-F", f"config_json={config_json}",
+         f"http://{HOST}/api/infer"],
+        capture_output=True, text=True, timeout=300).stdout
+    return json.loads(out)["job_id"]
+
+
+async def drive(job_id: str) -> str:
+    """Connect the job websocket and drain until it completes; return status.
+
+    The server signals success with a ``type:"complete"`` message and then
+    closes the socket, so a close AFTER seeing 'complete' is a success, not a
+    failure. Errors arrive as a status/error message before the close."""
+    uri = f"ws://{HOST}/ws/infer/{job_id}"
+    saw_complete = False
+    async with websockets.connect(uri, max_size=None, ping_interval=20,
+                                  ping_timeout=1200) as ws:
+        while True:
+            try:
+                msg = json.loads(await ws.recv())
+            except websockets.ConnectionClosed:
+                return "completed" if saw_complete else "closed"
+            except (TypeError, ValueError):
+                continue
+            t = msg.get("type")
+            if t == "complete":
+                saw_complete = True                      # drain until the server closes
+            if t == "status" and msg.get("status") in ("completed", "error"):
+                return msg.get("status")
+            if t == "error":
+                return "error"
+
+
+def score() -> dict:
+    """Score the newest 2026cur_qm8 replay vs Manta: aggregate mean-NN and
+    per-alliance red coverage/tracked-count."""
+    ours = load_our_auto_paths("2026cur")
+    tbf = {False: load_manta_auto_paths("2026cur", False),
+           True: load_manta_auto_paths("2026cur", True)}
+    pairs = []
+    for alliance in ("blue", "red"):
+        pairs += [dict(p, alliance=alliance)
+                  for p in assign_alliance(ours, tbf, MATCH, alliance, "off")]
+    if not pairs:
+        return {"error": "no pairs"}
+    red = [p for p in pairs if p["alliance"] == "red"]
+    blue = [p for p in pairs if p["alliance"] == "blue"]
+    return {
+        "agg_meanNN": round(float(np.mean([p["mean_nn_m"] for p in pairs])), 3),
+        "blue_meanNN": round(float(np.mean([p["mean_nn_m"] for p in blue])), 3) if blue else None,
+        "red_meanNN": round(float(np.mean([p["mean_nn_m"] for p in red])), 3) if red else None,
+        "n_blue": len(blue), "n_red": len(red),
+        "red_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in red},
+        "blue_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in blue},
+    }
+
+
+def main():
+    load_event()
+    print("event 2026cur loaded", flush=True)
+    results = []
+    for name, cfg in CONFIGS:
+        t0 = time.time()
+        print(f"\n=== [{name}] config={cfg} ===", flush=True)
+        try:
+            jid = post_job(cfg)
+            print(f"  job_id={jid}; driving...", flush=True)
+            status = asyncio.run(drive(jid))
+            print(f"  status={status} in {time.time()-t0:.0f}s", flush=True)
+            time.sleep(3)  # let the replay finish writing
+            metrics = score() if status == "completed" else {"error": status}
+        except Exception as e:
+            metrics = {"error": repr(e)}
+        row = {"config": name, "cfg": cfg, "metrics": metrics}
+        results.append(row)
+        RESULTS.write_text(json.dumps(results, indent=2))  # stream partial
+        print(f"  metrics={metrics}", flush=True)
+    # summary table
+    print("\n\n===== A/B SUMMARY (2026cur qm8) =====", flush=True)
+    print(f"{'config':>13} {'aggMeanNN':>10} {'redMeanNN':>10} {'nRed':>5} {'redCov%':>28}", flush=True)
+    for r in results:
+        m = r["metrics"]
+        if "error" in m:
+            print(f"{r['config']:>13}  ERROR: {m['error']}", flush=True); continue
+        print(f"{r['config']:>13} {m['agg_meanNN']:>10} {str(m['red_meanNN']):>10} "
+              f"{m['n_red']:>5} {str(m['red_cov']):>28}", flush=True)
+    print(f"\nresults -> {RESULTS}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

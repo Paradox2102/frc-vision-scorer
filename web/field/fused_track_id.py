@@ -28,12 +28,20 @@ class FusedAssignmentEvidence:
 
 
 class FusedTrackRegistry:
-    def __init__(self, app_floor: float = 0.55, ema_alpha: float = 0.3) -> None:
+    def __init__(self, app_floor: float = 0.55, ema_alpha: float = 0.3,
+                 relink_max_dist_m: float = 0.0) -> None:
         # member key (camera, per_camera_id) -> fused id
         self._key_to_id: dict[tuple, int] = {}
         self._next_id = 0
         self.app_floor = app_floor
         self.ema_alpha = ema_alpha
+        # Appearance-relink spatial gate (meters); 0 = off. Blocks relinking an
+        # observation onto an inactive id whose last position is farther than
+        # this — DINOv2 can't distinguish same-alliance robots, so without it one
+        # red robot relinks onto another's id and distinct robots collapse.
+        self.relink_max_dist_m = float(relink_max_dist_m)
+        # last-known field position per fused id, for the spatial gate.
+        self._id_to_pos: dict[int, tuple] = {}
         # running embedding per fused track
         self._id_to_embedding: dict[int, np.ndarray] = {}
         # initial embedding when track was created (anchor)
@@ -161,6 +169,16 @@ class FusedTrackRegistry:
                         sim_candidates.append(cosine_similarity(obs.detection.embedding, ex))
                     
                     sim = max(sim_candidates)
+                    # Spatial gate: a robot can't teleport across the field, so
+                    # block relinking to an inactive id whose last position is
+                    # implausibly far — stops same-appearance distinct robots
+                    # (same-alliance) from collapsing onto one id.
+                    if self.relink_max_dist_m > 0 and inactive_id in self._id_to_pos:
+                        px, py = self._id_to_pos[inactive_id]
+                        d = float(np.hypot(obs.detection.pos[0] - px,
+                                           obs.detection.pos[1] - py))
+                        if d > self.relink_max_dist_m:
+                            sim = -1.0
                     all_sims[r, c] = sim
                     cost_matrix[r, c] = 1.0 - sim
             
@@ -239,10 +257,14 @@ class FusedTrackRegistry:
             obs.detection.relink_evidence = ev
             evidence_list.append(ev)
 
-        # Register every member key of this cluster to the chosen id.
+        # Register every member key of this cluster to the chosen id, and record
+        # each id's latest field position for the appearance-relink spatial gate.
         for obs in observations:
             keys = [tuple(m) for m in obs.members]
             for k in keys:
                 self._key_to_id[k] = obs.track_id
-                
+            if obs.track_id is not None and obs.detection.pos is not None:
+                self._id_to_pos[obs.track_id] = (float(obs.detection.pos[0]),
+                                                 float(obs.detection.pos[1]))
+
         return evidence_list

@@ -4175,7 +4175,8 @@ class InferenceJob:
             self.field_tracker = FieldTracker(
                 self.field_model.length_m, zones=static_zones,
                 corner_only_r_scale=self.config.corner_only_r_scale,
-                coast_vel_decay=self.config.coast_vel_decay)
+                coast_vel_decay=self.config.coast_vel_decay,
+                sticky_max_dist_m=self.config.sticky_max_dist_m)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -5205,7 +5206,8 @@ class InferenceJob:
                     )
                     self.use_sam2 = False
                 else:
-                    self.fused_registry = FusedTrackRegistry()
+                    self.fused_registry = FusedTrackRegistry(
+                        relink_max_dist_m=self.config.relink_max_dist_m)
 
                 # Every tracklet the analysis loop will ever read is already
                 # in self.sam2_raw (CPU); the SAM predictor weights and any
@@ -5635,7 +5637,8 @@ class InferenceJob:
                     # slot (the B1<->B3 churn). Corner identity/bearing evidence is
                     # unioned in, and a lone corner obs (main occluded) still
                     # carries the track — so hand-off between cameras is preserved.
-                    fused, ev_list = merge_same_id_observations(fused, ev_list)
+                    fused, ev_list = merge_same_id_observations(
+                        fused, ev_list, main_guard=self.config.merge_main_guard)
 
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)

@@ -88,8 +88,14 @@ class FieldTracker:
     def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
                  max_coast_occluded=90, color_penalty=3.0, zones=None,
                  corner_only_r_scale=8.0, coast_vel_decay=0.85,
-                 max_speed_m_s=5.5):
+                 max_speed_m_s=5.5, sticky_max_dist_m=0.0):
         self.gate = gate_m
+        # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
+        # known track_id normally re-binds to that id's slot unconditionally; when
+        # this is > 0, a re-bind farther than this from the slot is rejected
+        # (the registry mis-assigned one id to two robots) and the detection is
+        # routed to distance matching so it can claim its own slot.
+        self.sticky_max_dist_m = float(sticky_max_dist_m)
         self.field_length = field_length
         self.max_open = max_coast_open
         self.max_occ = max_coast_occluded
@@ -196,6 +202,16 @@ class FieldTracker:
                 slot_id = self._id_to_slot[tid]
                 slot = next((t for t in slots if t.slot_id == slot_id), None)
                 if slot is not None and slot.active:
+                    if (self.sticky_max_dist_m > 0 and slot.kf is not None
+                            and float(np.linalg.norm(
+                                np.array(slot.kf.pos) - np.array(d.pos)))
+                            > self.sticky_max_dist_m):
+                        # Same track_id but implausibly far from its slot: the
+                        # registry mis-assigned one id to two robots. Don't
+                        # collapse them — route to distance matching so this
+                        # detection can claim its own slot.
+                        remaining_pairs.append((orig_idx, d))
+                        continue
                     self._measured_update(slot, d, dt)
                     slot.box = d.box
                     slot.missed = 0

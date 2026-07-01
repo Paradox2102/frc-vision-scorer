@@ -165,6 +165,35 @@ def test_fresh_trackid_far_from_coasting_still_seeds_new():
     assert tr._id_to_slot[300] != slot_S
 
 
+def test_sticky_rebind_blocked_when_far_with_gate():
+    # The registry can mis-assign one track_id to two distinct robots. With the
+    # sticky gate, a detection carrying a known id but implausibly far from that
+    # id's slot must NOT collapse into it — it should claim its own slot.
+    tr = FieldTracker(field_length=16.0, sticky_max_dist_m=2.0)
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+    outs2 = tr.update([_blue(10.0, 6.0, track_id=100)], {}, 0.1)  # 8.9 m away
+    assert tr.last_det_to_slot[0] != slot_S       # not collapsed into slot_S
+
+
+def test_sticky_rebind_far_allowed_when_gate_off():
+    # Default (sticky_max_dist_m=0): unchanged — sticky rebind regardless of dist.
+    tr = FieldTracker(field_length=16.0)
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+    tr.update([_blue(10.0, 6.0, track_id=100)], {}, 0.1)
+    assert tr.last_det_to_slot[0] == slot_S
+
+
+def test_sticky_rebind_near_allowed_with_gate():
+    # Genuine re-acquisition nearby still sticky-rebinds even with the gate on.
+    tr = FieldTracker(field_length=16.0, sticky_max_dist_m=2.0)
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+    tr.update([_blue(2.5, 2.0, track_id=100)], {}, 0.1)
+    assert tr.last_det_to_slot[0] == slot_S
+
+
 def test_expiration_clears_bindings_and_emits_events():
     tr = FieldTracker(field_length=16.0, max_coast_open=2)
 

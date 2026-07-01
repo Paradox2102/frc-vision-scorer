@@ -198,7 +198,7 @@ def fuse_detections(
     return [_merge(c, is_hub_occluded=is_hub_occluded) for c in clusters]
 
 
-def merge_same_id_observations(observations, evidence=None):
+def merge_same_id_observations(observations, evidence=None, main_guard=False):
     """Collapse observations that share a fused ``track_id`` into one per id.
 
     A fused track_id is one physical robot by definition (the registry unifies a
@@ -241,13 +241,21 @@ def merge_same_id_observations(observations, evidence=None):
         # Retain a main-backed member's geometry/evidence when one exists.
         ref_local = next((k for k, i in enumerate(idxs)
                           if observations[i].detection.box is not None), 0)
-        if len(idxs) == 1:
-            merged_obs.append(observations[idxs[0]])
+        n_main = sum(1 for i in idxs if observations[i].detection.box is not None)
+        if len(idxs) == 1 or (main_guard and n_main >= 2):
+            # Either nothing to merge, or the same-id group has >=2 independent
+            # main-camera detections at different positions — those are DISTINCT
+            # robots the registry mis-identified, not a corner duplicate. Pass
+            # them through unmerged so the tracker can give each its own slot.
+            for i in idxs:
+                merged_obs.append(observations[i])
+                if merged_ev is not None:
+                    merged_ev.append(evidence[i])
         else:
             merged_obs.append(_merge_fused_group(
                 [observations[i] for i in idxs], ref_local))
-        if merged_ev is not None:
-            merged_ev.append(evidence[idxs[ref_local]])
+            if merged_ev is not None:
+                merged_ev.append(evidence[idxs[ref_local]])
     return merged_obs, merged_ev
 
 

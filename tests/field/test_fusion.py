@@ -29,6 +29,24 @@ def test_merge_collapses_same_track_id_prefers_main_geometry():
     assert len(m1.evidence) == 2
 
 
+def test_merge_main_guard_keeps_two_main_backed_distinct_robots():
+    # Two DISTINCT main-camera detections sharing a mis-assigned id (the red
+    # collapse). With main_guard they stay separate so the tracker slots both;
+    # without it they wrongly collapse.
+    a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")
+    b = _obs((9.4, 4.3), (0, 0, 10, 10), 1, "main")
+    assert len(merge_same_id_observations([a, b], main_guard=True)[0]) == 2
+    assert len(merge_same_id_observations([a, b], main_guard=False)[0]) == 1
+
+
+def test_merge_main_guard_still_collapses_corner_duplicate():
+    # A genuine corner duplicate (1 main + 1 corner-only) still collapses under
+    # the guard — that is one robot, not two.
+    a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")
+    b = _obs((7.1, 4.26), None, 1, "corner_left")
+    assert len(merge_same_id_observations([a, b], main_guard=True)[0]) == 1
+
+
 def test_merge_passthrough_when_ids_distinct():
     a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")
     c = _obs((2.4, 5.1), (0, 0, 5, 5), 3, "main")

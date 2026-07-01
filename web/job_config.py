@@ -108,6 +108,18 @@ KNOBS = [
     # second. See web/field/fusion.py.
     Knob("fuse_ray_gate", "FUSE_RAY_GATE", bool, True),
     Knob("fuse_ray_cross_m", "FUSE_RAY_CROSS_M", float, 1.0, min=0.1, max=2.0),
+    # Appearance-relink spatial gate: DINOv2 can't tell same-alliance robots
+    # apart, so the fused-track registry was relinking one red robot onto
+    # another red robot's inactive id (distinct robots collapse to one track).
+    # When > 0, an unmatched observation may only relink to an inactive fused id
+    # whose last-known position is within this many meters — a robot can't
+    # teleport across the field. 0 = off (no spatial gate). See fused_track_id.py.
+    Knob("relink_max_dist_m", "RELINK_MAX_DIST_M", float, 0.0, min=0.0, max=20.0),
+    # Fusion same-id merge guard: don't collapse a same-track_id group that has
+    # >=2 independent main-camera detections (distinct robots the registry
+    # mis-identified) — only collapse genuine corner-camera duplicates. Lets the
+    # tracker's sticky gate give each robot its own slot. See fusion.py.
+    Knob("merge_main_guard", "MERGE_MAIN_GUARD", bool, False),
     # --- field tracker position stability (field-map-v2 spec) ---
     # Corner-only measurements (no main-view box) get inflated KF noise —
     # low cameras have poor range; 1.0 restores full-trust updates.
@@ -117,6 +129,13 @@ KNOBS = [
     # to a stop instead of sailing away; 1.0 restores constant-velocity.
     Knob("coast_vel_decay", "COAST_VEL_DECAY", float, 0.85,
          min=0.0, max=1.0),
+    # Sticky-rebind distance gate: a detection carrying a known SAM3 track_id
+    # re-binds to that id's slot even when the registry mis-assigned the same id
+    # to a different robot far away (distinct robots collapse into one slot).
+    # When > 0, a sticky re-bind is only honored if the detection is within this
+    # many meters of the slot's predicted position; otherwise it falls through to
+    # distance matching and can claim its own slot. 0 = off. See tracker.py.
+    Knob("sticky_max_dist_m", "STICKY_MAX_DIST_M", float, 0.0, min=0.0, max=20.0),
     # --- match-period gating ---
     # Process ONLY the autonomous window (clock-locked) instead of the whole
     # match. Used to A/B against Manta human-scouted auto paths, which only

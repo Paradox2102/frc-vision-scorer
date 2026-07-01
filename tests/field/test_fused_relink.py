@@ -35,6 +35,45 @@ def test_relink_lost_track_by_embedding():
     assert f3.track_id == 0
 
 
+def test_relink_blocked_by_spatial_gate():
+    # DINOv2 can't tell same-alliance robots apart, so a DISTINCT robot with a
+    # near-identical embedding must not relink onto another's inactive id when
+    # it's implausibly far away (a robot can't teleport across the field).
+    reg = FusedTrackRegistry(app_floor=0.55, ema_alpha=0.3, relink_max_dist_m=3.0)
+    emb_a = _e(1, 0, 0)
+    f1 = _obs([("main", 1)], embedding=emb_a, pos=(2.0, 2.0))
+    reg.assign([f1])
+    assert f1.track_id == 0
+    # Frame 3: same appearance, far away (11.3 m) -> gate blocks relink -> new id.
+    f3 = _obs([("corner_left", 2)], embedding=emb_a, pos=(12.0, 12.0))
+    reg.assign([f3])
+    assert f3.track_id == 1
+
+
+def test_relink_allowed_within_spatial_gate():
+    # The genuine re-acquisition case: same robot reappears NEARBY with a fresh
+    # SAM id -> within the gate -> relink to its own id.
+    reg = FusedTrackRegistry(app_floor=0.55, ema_alpha=0.3, relink_max_dist_m=3.0)
+    emb_a = _e(1, 0, 0)
+    f1 = _obs([("main", 1)], embedding=emb_a, pos=(2.0, 2.0))
+    reg.assign([f1])
+    f3 = _obs([("corner_left", 2)], embedding=emb_a, pos=(2.5, 2.0))
+    reg.assign([f3])
+    assert f3.track_id == 0
+
+
+def test_relink_gate_off_by_default_preserves_behavior():
+    # Default (relink_max_dist_m=0) must relink by appearance regardless of
+    # distance — unchanged from before the gate existed.
+    reg = FusedTrackRegistry(app_floor=0.55, ema_alpha=0.3)
+    emb_a = _e(1, 0, 0)
+    f1 = _obs([("main", 1)], embedding=emb_a, pos=(2.0, 2.0))
+    reg.assign([f1])
+    f3 = _obs([("corner_left", 2)], embedding=emb_a, pos=(12.0, 12.0))
+    reg.assign([f3])
+    assert f3.track_id == 0
+
+
 def test_no_relink_when_similarity_below_floor():
     reg = FusedTrackRegistry(app_floor=0.55, ema_alpha=0.3)
     emb_a = _e(1, 0, 0)

@@ -98,7 +98,7 @@ from web.field.manta import overlay_paths_for_job
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.view_stride import build_view_frame_plan, scale_frame_knob
-from web.field.fusion import fuse_detections
+from web.field.fusion import fuse_detections, merge_same_id_observations
 from web.field.fused_track_id import FusedTrackRegistry
 from web.hud_util import select_coasting_ghosts, draw_dashed_box
 from web.field.bumper import bumper_band_box, bumper_crop
@@ -5629,6 +5629,13 @@ class InferenceJob:
                 ev_list = []
                 if self.use_sam2:
                     ev_list = self.fused_registry.assign(fused)
+                    # A fused track_id is one physical robot; collapse any same-id
+                    # split (e.g. a duplicate corner-camera mask whose projection
+                    # slid away) into one observation so it can't seed a phantom
+                    # slot (the B1<->B3 churn). Corner identity/bearing evidence is
+                    # unioned in, and a lone corner obs (main occluded) still
+                    # carries the track — so hand-off between cameras is preserved.
+                    fused, ev_list = merge_same_id_observations(fused, ev_list)
 
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)

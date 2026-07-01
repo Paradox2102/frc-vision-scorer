@@ -1,9 +1,60 @@
-from web.field.fusion import fuse_detections, FusedObservation
+from web.field.fusion import (
+    fuse_detections, FusedObservation, merge_same_id_observations)
 from web.field.tracker import FieldDetection
 
 
 def _det(x, y, color="blue", box=(0, 0, 10, 10)):
     return FieldDetection(pos=(x, y), color=color, box=box)
+
+
+def _obs(pos, box, tid, cam):
+    det = FieldDetection(pos=pos, color="blue", box=box, track_id=tid)
+    return FusedObservation(detection=det, evidence=[(cam, b"crop", 1.0)],
+                            members=[(cam, tid)], track_id=tid)
+
+
+def test_merge_collapses_same_track_id_prefers_main_geometry():
+    # The qm8 bug: one robot, two fused observations sharing track_id=1 — a
+    # main-backed one and a corner-only duplicate whose position has slid away.
+    a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")       # real robot (main box)
+    b = _obs((7.1, 4.26), None, 1, "corner_left")         # corner-only duplicate
+    c = _obs((2.4, 5.1), (0, 0, 5, 5), 3, "main")         # a different robot
+    merged, _ = merge_same_id_observations([a, b, c])
+    assert len(merged) == 2                                # duplicate collapsed
+    m1 = next(o for o in merged if o.track_id == 1)
+    assert m1.detection.pos == (6.0, 3.4)                  # main geometry kept
+    assert m1.detection.box == (0, 0, 10, 10)
+    # corner identity/bearing still contributes (members + evidence unioned)
+    assert set(m1.members) == {("main", 1), ("corner_left", 1)}
+    assert len(m1.evidence) == 2
+
+
+def test_merge_passthrough_when_ids_distinct():
+    a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")
+    c = _obs((2.4, 5.1), (0, 0, 5, 5), 3, "main")
+    merged, _ = merge_same_id_observations([a, c])
+    assert len(merged) == 2
+
+
+def test_merge_single_corner_only_obs_survives_for_handoff():
+    # Main occluded, only the corner sees the robot -> one corner-only obs must
+    # pass through so the tracker keeps the slot (the handoff case).
+    b = _obs((7.0, 4.0), None, 1, "corner_left")
+    merged, _ = merge_same_id_observations([b])
+    assert len(merged) == 1 and merged[0].detection.box is None
+    assert merged[0].track_id == 1
+
+
+def test_merge_keeps_evidence_list_aligned():
+    a = _obs((6.0, 3.4), (0, 0, 10, 10), 1, "main")
+    b = _obs((7.1, 4.26), None, 1, "corner_left")
+    c = _obs((2.4, 5.1), (0, 0, 5, 5), 3, "main")
+    ev = ["evA", "evB", "evC"]
+    merged, merged_ev = merge_same_id_observations([a, b, c], ev)
+    assert len(merged_ev) == len(merged) == 2
+    # the id-1 group keeps its main member's evidence ("evA")
+    i1 = next(i for i, o in enumerate(merged) if o.track_id == 1)
+    assert merged_ev[i1] == "evA"
 
 
 def test_single_camera_passthrough():

@@ -198,6 +198,95 @@ def fuse_detections(
     return [_merge(c, is_hub_occluded=is_hub_occluded) for c in clusters]
 
 
+def merge_same_id_observations(observations, evidence=None):
+    """Collapse observations that share a fused ``track_id`` into one per id.
+
+    A fused track_id is one physical robot by definition (the registry unifies a
+    robot's per-camera detections across frames), so two observations with the
+    same id in a single frame are a split — e.g. a corner camera producing a
+    second, duplicate mask whose ground projection has slid away from the real
+    position. Left alone they reach the tracker as two detections and seed a
+    phantom slot (the qm8 B1<->B3 churn).
+
+    Merging preserves the multi-camera cooperation the design intends: the merged
+    observation takes its geometry from a main-camera member when one exists (main
+    is authoritative; corner range is unreliable) but unions every member and all
+    evidence, so a corner camera's bumper read still contributes to the robot's
+    identity, and a lone corner observation (main occluded) still carries the
+    track. ``evidence`` (the per-observation assignment evidence, index-aligned to
+    ``observations``) is collapsed in step, taking the retained member's entry.
+    Returns ``(merged_observations, merged_evidence)``; ``merged_evidence`` is None
+    when ``evidence`` is None. Observation order is preserved by first appearance."""
+    groups: dict = {}
+    order: list = []   # ("id", track_id) or ("obs", index) preserving first-seen order
+    for i, o in enumerate(observations):
+        tid = o.track_id
+        if tid is None:                      # never assigned an id — pass through
+            order.append(("obs", i))
+            continue
+        if tid not in groups:
+            groups[tid] = []
+            order.append(("id", tid))
+        groups[tid].append(i)
+
+    merged_obs = []
+    merged_ev = [] if evidence is not None else None
+    for kind, val in order:
+        if kind == "obs":
+            merged_obs.append(observations[val])
+            if merged_ev is not None:
+                merged_ev.append(evidence[val])
+            continue
+        idxs = groups[val]
+        # Retain a main-backed member's geometry/evidence when one exists.
+        ref_local = next((k for k, i in enumerate(idxs)
+                          if observations[i].detection.box is not None), 0)
+        if len(idxs) == 1:
+            merged_obs.append(observations[idxs[0]])
+        else:
+            merged_obs.append(_merge_fused_group(
+                [observations[i] for i in idxs], ref_local))
+        if merged_ev is not None:
+            merged_ev.append(evidence[idxs[ref_local]])
+    return merged_obs, merged_ev
+
+
+def _merge_fused_group(group, ref_local: int) -> FusedObservation:
+    """Merge same-id FusedObservations: geometry/box/color from the ref member
+    (a main-backed one when present), members + evidence unioned, embeddings
+    averaged. Preserves the ref's track_id and relink annotations."""
+    ref = group[ref_local]
+    members, seen = [], set()
+    for o in group:
+        for m in o.members:
+            key = tuple(m)
+            if key not in seen:
+                seen.add(key)
+                members.append(m)
+    evidence = [e for o in group for e in o.evidence]
+    embs = [o.detection.embedding for o in group if o.detection.embedding is not None]
+    if embs:
+        avg = np.mean(embs, axis=0)
+        norm = np.linalg.norm(avg)
+        emb = avg / norm if norm > 0 else avg
+    else:
+        emb = None
+    rd = ref.detection
+    det = FieldDetection(pos=rd.pos, color=rd.color, box=rd.box,
+                         score=rd.score, track_id=rd.track_id, embedding=emb,
+                         robot_crop_b64=rd.robot_crop_b64)
+    # Carry the registry's per-detection relink annotations forward if present.
+    for attr in ("relink_margin", "relink_evidence"):
+        if hasattr(rd, attr):
+            setattr(det, attr, getattr(rd, attr))
+    merged = FusedObservation(detection=det, evidence=evidence,
+                              members=members, track_id=ref.track_id)
+    for attr in ("relink_margin", "relink_evidence"):
+        if hasattr(ref, attr):
+            setattr(merged, attr, getattr(ref, attr))
+    return merged
+
+
 def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     position_members = cluster
     if is_hub_occluded is not None:

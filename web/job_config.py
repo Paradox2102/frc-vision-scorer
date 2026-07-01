@@ -119,7 +119,9 @@ KNOBS = [
     # >=2 independent main-camera detections (distinct robots the registry
     # mis-identified) — only collapse genuine corner-camera duplicates. Lets the
     # tracker's sticky gate give each robot its own slot. See fusion.py.
-    Knob("merge_main_guard", "MERGE_MAIN_GUARD", bool, False),
+    # DEFAULT ON: A/B on 2026cur qm8 (red coverage 58->86%) and qm2 (aggregate
+    # mean-NN 1.52->0.82) both improved with this + sticky_max_dist_m.
+    Knob("merge_main_guard", "MERGE_MAIN_GUARD", bool, True),
     # --- field tracker position stability (field-map-v2 spec) ---
     # Corner-only measurements (no main-view box) get inflated KF noise —
     # low cameras have poor range; 1.0 restores full-trust updates.
@@ -135,7 +137,8 @@ KNOBS = [
     # When > 0, a sticky re-bind is only honored if the detection is within this
     # many meters of the slot's predicted position; otherwise it falls through to
     # distance matching and can claim its own slot. 0 = off. See tracker.py.
-    Knob("sticky_max_dist_m", "STICKY_MAX_DIST_M", float, 0.0, min=0.0, max=20.0),
+    # DEFAULT 2.5 m: A/B-validated on qm8 + qm2 with merge_main_guard (above).
+    Knob("sticky_max_dist_m", "STICKY_MAX_DIST_M", float, 2.5, min=0.0, max=20.0),
     # --- match-period gating ---
     # Process ONLY the autonomous window (clock-locked) instead of the whole
     # match. Used to A/B against Manta human-scouted auto paths, which only

@@ -38,6 +38,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.manta_client import GridCalibration, MantaClient, parse_auto_field  # noqa: E402
 from web.field.manta import match_number_from_key  # noqa: E402  (single source of truth)
+from web.field.path_quality import coverage, gap_segments, tracked_length_m  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 DB_PATH = REPO / "frc_scorer.db"
@@ -76,6 +77,24 @@ def _polyline_length(p: np.ndarray) -> float:
     if len(p) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+
+
+def summarize_our_path(samples, max_gap_s: float = 1.0, window_s=None) -> dict:
+    """Gap-aware quality summary for one slot's raw auto samples.
+
+    ``samples`` is the stored list of ``{"timestamp", "field_pos"}`` dicts. A
+    dropout (occlusion / lost track) shows up as a large timestamp gap, so we
+    report both the naive polyline length (which bridges gaps with fabricated
+    straight lines) and the honest tracked length, plus coverage — turning a
+    "the lengths disagree" mystery into "we only tracked 40 % of the window".
+    """
+    pts = np.array([s["field_pos"] for s in samples], float).reshape(-1, 2)
+    ts = np.array([s["timestamp"] for s in samples], float)
+    return {
+        "naive_len_m": round(_polyline_length(pts), 3),
+        "tracked_len_m": round(tracked_length_m(pts, ts, max_gap_s), 3),
+        **coverage(ts, max_gap_s=max_gap_s, window_s=window_s),
+    }
 
 
 def _directed_mean_nn(a: np.ndarray, b: np.ndarray) -> float:
@@ -156,6 +175,7 @@ def load_our_auto_paths(event_key: str) -> dict[tuple[str, int, int], dict]:
                 "match_key": r["match_key"],
                 "slot": slot,
                 "path_m": pts,
+                "samples": samples,  # raw {timestamp, field_pos} for gap/coverage
             }
     return out
 
@@ -243,11 +263,12 @@ def assign_alliance(
                 metrics = compare_paths(
                     ours[(match_number, alliance, op)]["path_m"],
                     truth[(match_number, alliance, tp)]["path_m"])
+                cov = summarize_our_path(ours[(match_number, alliance, op)]["samples"])
                 pairs.append({
                     "our_slot": ours[(match_number, alliance, op)]["slot"],
                     "manta_pos": tp,
                     "manta_team": truth[(match_number, alliance, tp)]["team_number"],
-                    "flip_y": fy, **metrics.as_row(),
+                    "flip_y": fy, **metrics.as_row(), **cov,
                 })
             best = (total, fy, pairs)
     return best[2] if best else []
@@ -316,6 +337,7 @@ def main() -> None:
             "slot": ours[key]["slot"], "match_key": ours[key]["match_key"],
             "manta_team": truth["team_number"], "flip_y": flip_y,
             "matched": True, **metrics.as_row(),
+            **summarize_our_path(ours[key]["samples"]),
         })
 
     matched = [r for r in results if r.get("matched")]
@@ -323,14 +345,15 @@ def main() -> None:
           f"(of {len(ours)} ours, flip_y={args.flip_y})\n")
     if matched:
         hdr = f"{'match':>6} {'slot':>4} {'team':>6} {'flipY':>5} " \
-              f"{'meanNN':>7} {'hausd':>7} {'start':>6} {'end':>6} {'lenO/lenT':>11}"
+              f"{'meanNN':>7} {'hausd':>7} {'cov%':>5} {'maxGap':>6} {'trkO/lenT':>11}"
         print(hdr)
         print("-" * len(hdr))
         for r in sorted(matched, key=lambda x: (x["match_number"], x["slot"])):
+            drop = " DROPOUT" if (r["coverage_frac"] < 0.6 or r["max_gap_s"] > 2.0) else ""
             print(f"{r['match_number']:>6} {r['slot']:>4} {str(r['manta_team']):>6} "
                   f"{str(r['flip_y']):>5} {r['mean_nn_m']:>7.3f} {r['hausdorff_m']:>7.3f} "
-                  f"{r['start_err_m']:>6.2f} {r['end_err_m']:>6.2f} "
-                  f"{r['len_ours_m']:>5.1f}/{r['len_truth_m']:<5.1f}")
+                  f"{100*r['coverage_frac']:>5.0f} {r['max_gap_s']:>6.1f} "
+                  f"{r['tracked_len_m']:>5.1f}/{r['len_truth_m']:<5.1f}{drop}")
         mean_nn = np.mean([r["mean_nn_m"] for r in matched])
         print(f"\n  aggregate mean nearest-neighbor error: {mean_nn:.3f} m "
               f"over {len(matched)} robots")
@@ -346,7 +369,8 @@ def main() -> None:
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.write_text(json.dumps(
             [{k: (v.tolist() if isinstance(v, np.ndarray) else v)
-              for k, v in r.items() if k != "path_m"} for r in results], indent=2))
+              for k, v in r.items() if k not in ("path_m", "samples")}
+             for r in results], indent=2))
         print(f"\n  wrote metrics -> {args.json}")
 
     if args.overlay and matched:
@@ -360,7 +384,8 @@ def _run_assignment(args, ours, truth_by_flip):
     print(f"\n{args.event_key}: optimal per-alliance assignment "
           f"(flip_y={args.flip_y}) — reveals our-slot -> Manta-position mapping\n")
     hdr = (f"{'match':>6} {'alliance':>8} {'ourSlot':>7} -> {'manta#':>6} "
-           f"{'team':>6} {'flipY':>5} {'meanNN':>7} {'hausd':>7} {'lenO/lenT':>11}")
+           f"{'team':>6} {'flipY':>5} {'meanNN':>7} {'hausd':>7} "
+           f"{'cov%':>5} {'maxGap':>6} {'trkO/lenT':>11}")
     print(hdr)
     print("-" * len(hdr))
     for match_number in matches:
@@ -368,20 +393,26 @@ def _run_assignment(args, ours, truth_by_flip):
             pairs = assign_alliance(
                 ours, truth_by_flip, match_number, alliance, args.flip_y)
             for p in pairs:
-                label_ok = "" if p["our_slot"][1:] == str(p["manta_pos"]) else "  <-- LABEL MISMATCH"
+                flags = "" if p["our_slot"][1:] == str(p["manta_pos"]) else "  MISLABEL"
+                if p["coverage_frac"] < 0.6 or p["max_gap_s"] > 2.0:
+                    flags += "  DROPOUT"
                 print(f"{match_number:>6} {alliance:>8} {p['our_slot']:>7} -> "
                       f"{p['manta_pos']:>6} {str(p['manta_team']):>6} "
                       f"{str(p['flip_y']):>5} {p['mean_nn_m']:>7.3f} "
-                      f"{p['hausdorff_m']:>7.3f} {p['len_ours_m']:>5.1f}/"
-                      f"{p['len_truth_m']:<5.1f}{label_ok}")
+                      f"{p['hausdorff_m']:>7.3f} {100*p['coverage_frac']:>5.0f} "
+                      f"{p['max_gap_s']:>6.1f} {p['tracked_len_m']:>5.1f}/"
+                      f"{p['len_truth_m']:<5.1f}{flags}")
             all_pairs.extend(pairs)
     if all_pairs:
         mean_nn = np.mean([p["mean_nn_m"] for p in all_pairs])
         mism = sum(1 for p in all_pairs if p["our_slot"][1:] != str(p["manta_pos"]))
+        drop = sum(1 for p in all_pairs if p["coverage_frac"] < 0.6 or p["max_gap_s"] > 2.0)
         print(f"\n  best-case aggregate mean nearest-neighbor: {mean_nn:.3f} m "
               f"over {len(all_pairs)} robots")
         print(f"  position-label mismatches: {mism}/{len(all_pairs)} "
               "(our slot numbering vs Manta driver-station position)")
+        print(f"  dropout-flagged robots: {drop}/{len(all_pairs)} "
+              "(coverage <60% or a >2 s tracking gap — trkO = gap-aware length)")
 
 
 def _write_overlays(out_dir, matched, ours, truth_by_flip):
@@ -396,12 +427,25 @@ def _write_overlays(out_dir, matched, ours, truth_by_flip):
     for r in matched:
         key = (r["match_number"], r["alliance"], r["position"])
         o = ours[key]["path_m"]
+        ts = [s["timestamp"] for s in ours[key]["samples"]]
         t = truth_by_flip[r["flip_y"]][key]["path_m"]
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(o[:, 0], o[:, 1], "-o", ms=3, label="ours (vision)", color="#2a7")
+        # Draw ours as separate segments broken at tracking dropouts, and show
+        # the dropout as a thin dotted connector so it reads as "lost track"
+        # rather than fabricated straight-line motion.
+        segs = gap_segments(ts, max_gap_s=1.0)
+        for si, (a, b) in enumerate(segs):
+            ax.plot(o[a:b, 0], o[a:b, 1], "-o", ms=3, color="#2a7",
+                    label="ours (vision)" if si == 0 else None)
+            if si > 0:  # dotted bridge across the gap from the previous segment
+                pa, pb = segs[si - 1][1] - 1, a
+                ax.plot([o[pa, 0], o[pb, 0]], [o[pa, 1], o[pb, 1]],
+                        ":", color="#999", lw=1,
+                        label="dropout (no tracking)" if si == 1 else None)
         ax.plot(t[:, 0], t[:, 1], "-s", ms=3, label="Manta (human)", color="#c44")
         ax.set_title(f"{r['match_key']} {r['slot']} team {r['manta_team']} "
-                     f"meanNN={r['mean_nn_m']:.2f}m flipY={r['flip_y']}")
+                     f"meanNN={r['mean_nn_m']:.2f}m cov={100*r['coverage_frac']:.0f}% "
+                     f"flipY={r['flip_y']}")
         ax.set_xlabel("field x (m)"); ax.set_ylabel("field y (m)")
         ax.set_xlim(0, 16.541); ax.set_ylim(0, 8.069); ax.set_aspect("equal")
         ax.legend(loc="best", fontsize=8); ax.grid(alpha=0.3)

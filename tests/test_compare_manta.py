@@ -4,6 +4,7 @@ from scripts.compare_manta import (
     compare_paths,
     match_number_from_key,
     slot_to_alliance_pos,
+    summarize_our_path,
 )
 
 
@@ -50,3 +51,20 @@ def test_compare_paths_handles_different_sampling():
     assert m.mean_nn_m < 0.5  # off-line error is zero; only along-line gaps remain
     assert m.hausdorff_m < 1.5
     assert m.len_ours_m == 10.0 and m.len_truth_m == 10.0
+
+
+def test_summarize_our_path_flags_dropout():
+    # Two short tracked runs bridged by a 9 m straight line across a 4.9 s
+    # dropout: the naive length counts the bridge, the honest length does not,
+    # and coverage exposes the gap that a raw length comparison would hide.
+    samples = [
+        {"timestamp": 0.0, "field_pos": [0.0, 0.0]},
+        {"timestamp": 0.1, "field_pos": [1.0, 0.0]},
+        {"timestamp": 5.0, "field_pos": [10.0, 0.0]},
+        {"timestamp": 5.1, "field_pos": [11.0, 0.0]},
+    ]
+    s = summarize_our_path(samples, max_gap_s=1.0)
+    assert s["naive_len_m"] == 11.0
+    assert s["tracked_len_m"] == 2.0
+    assert s["n_gaps"] == 1
+    assert abs(s["max_gap_s"] - 4.9) < 1e-6

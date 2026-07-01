@@ -700,6 +700,13 @@ BACKWARD_CONFIRM_ENABLED = os.environ.get("BACKWARD_CONFIRM_ENABLED", "1") == "1
 # Re-resolution must retain at least this fraction of the live replay rows, else it
 # falls back to the slice-2 prune (guards against identity-churn gutting the replay).
 RERESOLVE_MIN_KEEP_FRAC = float(os.environ.get("RERESOLVE_MIN_KEEP_FRAC", "0.5"))
+# Per-segment resolution: split a slot's track at gap-jumps and drop phantom /
+# wrong-robot segments inside an otherwise-robot slot (do-no-harm). Nested under
+# backward-confirm; off -> exactly the prior per-slot behavior.
+SEGMENT_RESOLVE_ENABLED = os.environ.get("SEGMENT_RESOLVE_ENABLED", "1") == "1"
+# Debug: when set, dump a per-frame fused-observation + slot-assignment trace to
+# /tmp/frc-tracker-trace.json to diagnose multi-camera slot churn. Off by default.
+TRACKER_TRACE = os.environ.get("TRACKER_TRACE", "") == "1"
 
 # Whole-robot gap-fill parameters
 ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
@@ -4246,6 +4253,13 @@ class InferenceJob:
             return self._apply_track_verdicts()
         sev = slot_evidence(self._identity_log)
         slot_verdicts = {sid: classify_track(te) for sid, te in sev.items()}
+        dropped = {}
+        fps = getattr(self, "video_fps", None)
+        if SEGMENT_RESOLVE_ENABLED and fps:
+            # Without a real fps we can't turn frame gaps into seconds, so skip
+            # per-segment resolution rather than split on bad time data.
+            from web.field.track_segments import slot_dropped_ranges
+            dropped = slot_dropped_ranges(self._identity_log, fps)
         assignments = self._canonical_identity_slots()        # {slot_id: identity_id}
         slot_meta = {}
         for slot_id, iid in assignments.items():
@@ -4258,6 +4272,17 @@ class InferenceJob:
         frame_nums = [f["frame_num"] for f in rec.frames]
         orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
         rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts, frame_nums)
+        if dropped:
+            # Drop phantom / wrong-robot segments (per-segment resolution) from the
+            # per-slot rebuild. Rows are keyed by slot label; map back to slot_id.
+            from web.field.track_evidence import slot_label_to_id
+            for fr in rebuilt:
+                fn = fr["frame_num"]
+                fr["robots"] = [
+                    r for r in fr["robots"]
+                    if not any(lo <= fn <= hi
+                               for (lo, hi) in dropped.get(slot_label_to_id(r["slot"]), []))
+                ]
         rebuilt_rows = sum(len(f["robots"]) for f in rebuilt)
         if rebuilt_rows >= max(1, orig_rows) * RERESOLVE_MIN_KEEP_FRAC:
             orig = {f["frame_num"]: f for f in rec.frames}
@@ -4271,6 +4296,12 @@ class InferenceJob:
                 {k: list(slot_verdicts.values()).count(k) for k in ("robot", "human", "static")})
         except Exception:
             pass
+        if dropped:
+            # Apply the same per-segment drops to the auto-path data the Manta
+            # comparison consumes, so phantom/alien segments stop corrupting it.
+            from web.field.track_segments import filter_paths_by_dropped
+            self.autonomous_paths = filter_paths_by_dropped(
+                dict(self.autonomous_paths), dropped)
 
     def _verify_calibration_alignment(self) -> bool:
         """Validate self.calib against auto-detected AprilTags in sampled in-match
@@ -5602,6 +5633,27 @@ class InferenceJob:
                 field_dets = [obs.detection for obs in fused]
                 dt = self.frame_skip / (self.video_fps or 30.0)
                 track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                if TRACKER_TRACE:
+                    ft = self.field_tracker
+                    self._tracker_trace = getattr(self, "_tracker_trace", [])
+                    self._tracker_trace.append({
+                        "frame": frame_num,
+                        "fused": [{
+                            "pos": [round(float(o.detection.pos[0]), 2),
+                                    round(float(o.detection.pos[1]), 2)],
+                            "cams": sorted({m[0] for m in o.members}),
+                            "has_main_box": o.detection.box is not None,
+                            "color": o.detection.color,
+                            "tid": o.track_id,
+                        } for o in fused],
+                        "tracks": [{
+                            "slot": t.slot_id, "label": self._slot_label(t.slot_id),
+                            "pos": [round(float(t.pos[0]), 2), round(float(t.pos[1]), 2)],
+                            "state": t.state, "corner_only": t.corner_only,
+                        } for t in track_outs],
+                        "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
+                        "events": [dict(e) for e in ft.binding_events],
+                    })
                 try:
                     self._record_frame_evidence(
                         fused,
@@ -6163,8 +6215,19 @@ class InferenceJob:
                     if BACKWARD_CONFIRM_ENABLED:
                         try:
                             self._reresolve_replay_frames()
+                            # Re-resolution may have dropped phantom/alien path
+                            # segments; refresh the snapshot built before it ran.
+                            summary["autonomous_paths"] = dict(self.autonomous_paths)
                         except Exception as e:
                             print(f"[backward-confirm] re-resolution skipped: {e}")
+                    if TRACKER_TRACE and getattr(self, "_tracker_trace", None):
+                        try:
+                            Path("/tmp/frc-tracker-trace.json").write_text(
+                                json.dumps(self._tracker_trace))
+                            print(f"[tracker-trace] wrote {len(self._tracker_trace)} "
+                                  "frames -> /tmp/frc-tracker-trace.json")
+                        except Exception as e:
+                            print(f"[tracker-trace] write failed: {e}")
                     artifacts = rec.finalize(
                         status=status,
                         summary=summary,

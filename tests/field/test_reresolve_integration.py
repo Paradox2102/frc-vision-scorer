@@ -32,6 +32,41 @@ def test_reresolve_rebuilds_frames_excluding_human():
     assert job._replay.frames[0]["scores"] == {}   # original keys preserved
 
 
+def test_reresolve_drops_phantom_prefix_from_frames_and_auto_paths():
+    """Per-segment resolution: a slot that is a 9 s static phantom then a real
+    moving robot (stitched by a gap-jump) keeps only the moving segment — the
+    phantom prefix is dropped from both replay frames and autonomous_paths."""
+    job = _job()
+    job.video_fps = 60.0
+    # slot 0 (B1): frames 0..9 parked static at x=15 (phantom), then a >1 s gap
+    # and a big jump, then frames 120..131 moving (real robot).
+    for f in range(10):
+        job._identity_log.append({"frame_num": f, "identity_id": 1, "slot_id": 0,
+                                  "alliance": "blue", "pos": [15.0, 2.4],
+                                  "person_overlap": False, "confirmed": False})
+    for i in range(12):
+        job._identity_log.append({"frame_num": 120 + i, "identity_id": 1, "slot_id": 0,
+                                  "alliance": "blue", "pos": [9.0 + 0.3 * i, 5.0],
+                                  "person_overlap": False, "confirmed": False})
+    frames = list(range(10)) + [120 + i for i in range(12)]
+    job._replay.frames = [{"frame_num": f, "scores": {}, "robots": []} for f in frames]
+    job.autonomous_paths = {"B1": [{"frame_num": f, "timestamp": f / 60.0,
+                                    "field_pos": [15.0, 2.4]} for f in range(10)]
+                            + [{"frame_num": 120 + i, "timestamp": (120 + i) / 60.0,
+                                "field_pos": [9.0 + 0.3 * i, 5.0]} for i in range(12)]}
+    job.robot_tracks = {1: SimpleNamespace(team_number=None, team_number_confirmed=False)}
+    job._canonical_identity_slots = lambda: {0: 1}
+    job._get_display_team_number = lambda r: None
+    job._slot_alliance = lambda sid: "blue"
+    job._reresolve_replay_frames()
+
+    by_frame = {f["frame_num"]: f for f in job._replay.frames}
+    assert all(len(by_frame[f]["robots"]) == 0 for f in range(10))       # phantom gone
+    assert all(len(by_frame[120 + i]["robots"]) == 1 for i in range(12))  # robot kept
+    path_frames = [s["frame_num"] for s in job.autonomous_paths["B1"]]
+    assert min(path_frames) == 120 and len(path_frames) == 12            # prefix pruned
+
+
 def test_reresolve_falls_back_on_catastrophic_drop():
     """Identity-churn can make the rebuild retain almost no rows; the guard must
     fall back to the slice-2 prune rather than ship a gutted replay."""

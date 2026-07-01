@@ -115,6 +115,56 @@ def test_trackid_reacquires_same_slot_after_coast():
     )
 
 
+def test_fresh_trackid_rebinds_to_coasting_slot_not_duplicate():
+    """The qm8 B1<->B3 churn: one robot fragmented across two slots. A robot that
+    coasts (occluded) and reappears with a NEW SAM3 track_id (mask re-seeded) must
+    re-bind to its still-coasting slot, not spawn a duplicate in a free slot."""
+    tr = FieldTracker(field_length=16.0, max_coast_open=8)
+
+    # Frame 1: seed track_id=100 at (2, 2) -> slot S
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+
+    # Frame 2: absent -> slot S coasts (not expired; budget is 8)
+    tr.update([], {}, 0.1)
+
+    # Frame 3: SAME robot reappears near S but with a FRESH track_id=200
+    outs3 = tr.update([_blue(2.3, 2.0, track_id=200)], {}, 0.1)
+    assert len(outs3) == 1
+    assert tr.last_det_to_slot[0] == slot_S, (
+        f"fresh track_id spawned slot {tr.last_det_to_slot[0]} instead of "
+        f"re-binding to coasting slot {slot_S}")
+    assert tr._id_to_slot[200] == slot_S   # new id now owns the original slot
+
+
+def test_fresh_trackid_on_visible_robot_stays_in_slot_no_occlusion():
+    """The qm8 B1<->B3 flip observed with NO obstruction between frames: a
+    continuously-visible robot whose SAM3 track_id churns mid-track must keep its
+    slot, not flip into a new one. (The old code seeded fresh ids before distance
+    matching, so a re-ided-but-visible robot spawned a duplicate slot.)"""
+    tr = FieldTracker(field_length=16.0)
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+    # Next frame: SAME robot, still visible (no miss), but SAM3 gave a fresh id.
+    outs2 = tr.update([_blue(2.1, 2.0, track_id=200)], {}, 0.1)
+    assert len(outs2) == 1                    # not duplicated into a 2nd slot
+    assert tr.last_det_to_slot[0] == slot_S   # stayed in its slot
+    assert tr._id_to_slot[200] == slot_S      # new id now owns the slot
+
+
+def test_fresh_trackid_far_from_coasting_still_seeds_new():
+    """Do-no-harm: a genuinely new robot (fresh track_id) far from any coasting
+    slot must still seed its own slot, not get vacuumed into a distant coaster."""
+    tr = FieldTracker(field_length=16.0, max_coast_open=8)
+    outs1 = tr.update([_blue(2.0, 2.0, track_id=100)], {}, 0.1)
+    slot_S = outs1[0].slot_id
+    tr.update([], {}, 0.1)  # slot S coasts near (2, 2)
+    # A new blue robot appears far away (7, 6) with a fresh id -> its own slot.
+    outs3 = tr.update([_blue(7.0, 6.0, track_id=300)], {}, 0.1)
+    assert tr.last_det_to_slot[0] != slot_S
+    assert tr._id_to_slot[300] != slot_S
+
+
 def test_expiration_clears_bindings_and_emits_events():
     tr = FieldTracker(field_length=16.0, max_coast_open=2)
 

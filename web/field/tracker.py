@@ -217,33 +217,15 @@ class FieldTracker:
                 # (remove stale mapping so it can be re-seeded below)
                 del self._id_to_slot[tid]
 
-            # New track_id — seed into a free slot if available, respecting
-            # the static-zone gate exactly like the existing seed path.
-            if free_slots and not point_in_zones(d.pos, self.zones):
-                slot = free_slots.pop(0)
-                slot.kf = _KF(d.pos)
-                slot.box = d.box
-                slot.corner_only = d.box is None
-                slot.missed = 0
-                slot.hits = 1
-                slot.coasting = False
-                slot.active = True
-                self._id_to_slot[tid] = slot.slot_id
-                self.last_det_to_slot[orig_idx] = slot.slot_id
-                self.binding_events.append({
-                    "event": "slot_seeded",
-                    "slot_id": slot.slot_id,
-                    "track_id": tid,
-                    "alliance": slot.alliance,
-                })
-            elif point_in_zones(d.pos, self.zones):
-                # Inside a seeding-blocked zone — don't seed, don't add to
-                # remaining (same behavior as anonymous dets in zone).
-                pass
-            else:
-                # No free slots available — treat as an anonymous detection
-                # so distance matching can at least try to match it.
-                remaining_pairs.append((orig_idx, d))
+            # New/unknown track_id: do NOT seed a fresh slot in this sticky pass.
+            # Route it into the distance-matching pass below, which binds a
+            # detection to the nearest active slot — whether that slot is still
+            # VISIBLE (SAM3 re-ided a continuously-tracked robot mid-track: the qm8
+            # B1<->B3 flip, which happened with no occlusion) or COASTING (a robot
+            # reappearing after occlusion with a new mask id). Only a detection that
+            # matches no active slot within gate seeds a new slot there. Seeding
+            # before matching is exactly what spawned the duplicate slot.
+            remaining_pairs.append((orig_idx, d))
 
         # Replace dets_with_idx with the non-sticky remainder for the
         # existing distance-matching / seeding path below.
@@ -329,6 +311,14 @@ class FieldTracker:
                 slot.coasting = False
                 slot.active = True
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
+                if d.track_id is not None:
+                    self._id_to_slot[d.track_id] = slot.slot_id
+                    self.binding_events.append({
+                        "event": "slot_seeded",
+                        "slot_id": slot.slot_id,
+                        "track_id": d.track_id,
+                        "alliance": slot.alliance,
+                    })
 
         elif active_slots and not dets:
             # No detections: all active slots missed
@@ -352,6 +342,14 @@ class FieldTracker:
                 slot.coasting = False
                 slot.active = True
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
+                if d.track_id is not None:
+                    self._id_to_slot[d.track_id] = slot.slot_id
+                    self.binding_events.append({
+                        "event": "slot_seeded",
+                        "slot_id": slot.slot_id,
+                        "track_id": d.track_id,
+                        "alliance": slot.alliance,
+                    })
 
     def _measured_update(self, t, d, dt):
         """KF update with measurement noise scaled by source quality.

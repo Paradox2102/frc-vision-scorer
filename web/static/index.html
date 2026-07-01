@@ -140,6 +140,24 @@
                                     ~12&nbsp;MiB VRAM per frame, e.g. 1200 ≈ 14&nbsp;GiB. Trades temporal resolution for speed.
                                 </small>
                             </div>
+                            <div class="input-group">
+                                <label><input type="checkbox" id="autoPeriodOnly"> Auto period only</label>
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    Process only the autonomous window (located via the match
+                                    clock) instead of the full match. Use this to compare against
+                                    Manta human-scouted auto paths. Needs a clean clock lock on the
+                                    auto countdown.
+                                </small>
+                            </div>
+                            <div class="input-group">
+                                <label><input type="checkbox" id="fieldWireframeOverlay"> Field wireframe overlay</label>
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    Draw the reprojected field (perimeter, grid, hubs, bumps,
+                                    towers, trenches) over the main view — baked into the live
+                                    stream and the recorded replay. Use it to check the calibration
+                                    and results line up with the real field.
+                                </small>
+                            </div>
                             <button type="submit" class="btn-primary">Analyze Video</button>
                         </form>
                     </div>

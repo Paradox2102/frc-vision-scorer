@@ -1,4 +1,4 @@
-path: /home/nick/frc-vision-scorer/data/bumper_hardneg_equipment
+path: /home/nick/AI/frc-vision-scorer/data/bumper_hardneg_equipment
 train: train/images
 val: valid/images
 test: test/images

@@ -123,6 +123,46 @@ def clear_drift(event_key, camera, match_key) -> None:
         _drift_path(event_key).write_text(json.dumps(d, indent=2))
 
 
+def _pending_autofix_path(event_key: str, camera: str) -> Path:
+    safe = "".join(c for c in f"{event_key}_{camera}" if c.isalnum() or c in "_-")
+    return UPLOAD_DIR / f"calibration_autofix_{safe}.json"
+
+
+def save_pending_autofix(event_key, camera, match_key, cal, summary, base_epoch=None) -> None:
+    """Stage an auto-solved pose fix AWAITING HUMAN APPROVAL. Kept separate from the
+    live versions so ``select_epoch`` never adopts it until approved — approval
+    promotes it to a real version, rejection clears it (falling back to manual)."""
+    p = _pending_autofix_path(event_key, camera)
+    d = json.loads(p.read_text()) if p.exists() else {}
+    d[match_key] = {"calibration": cal.to_json(), "summary": summary,
+                    "base_epoch": base_epoch, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d, indent=2))
+
+
+def load_pending_autofix(event_key, camera, match_key) -> dict | None:
+    """Staged fix for a match, or None. Returns {calibration: CameraCalibration,
+    summary, base_epoch, created_at}."""
+    p = _pending_autofix_path(event_key, camera)
+    if not p.exists():
+        return None
+    rec = json.loads(p.read_text()).get(match_key)
+    if not rec:
+        return None
+    return {"calibration": CameraCalibration.from_json(rec["calibration"]),
+            "summary": rec.get("summary"), "base_epoch": rec.get("base_epoch"),
+            "created_at": rec.get("created_at")}
+
+
+def clear_pending_autofix(event_key, camera, match_key) -> None:
+    p = _pending_autofix_path(event_key, camera)
+    if not p.exists():
+        return
+    d = json.loads(p.read_text())
+    if d.pop(match_key, None) is not None:
+        p.write_text(json.dumps(d, indent=2))
+
+
 def update_version(event_key, camera, version_id, cal) -> None:
     """Overwrite an existing version's calibration in place (property edits), keeping
     its start_match/label/created_at. 'legacy' updates the legacy single file."""

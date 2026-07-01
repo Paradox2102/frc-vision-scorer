@@ -28,6 +28,9 @@
                  background:#0a0a14; }
   #frameCanvas { cursor:crosshair; display:block; max-width:760px; }
   #mapCanvas   { cursor:pointer;   display:block; }
+  #loupe { position:absolute; top:0; left:0; border-radius:50%;
+           border:2px solid #80ffb4; box-shadow:0 0 0 2px #0a0a14, 0 3px 10px rgba(0,0,0,.6);
+           pointer-events:none; display:none; z-index:5; background:#0a0a14; }
   .points-section { margin-bottom:14px; }
   .points-section h2 { font-size:1em; color:#a0c4ff; margin-bottom:8px; }
   table { border-collapse:collapse; width:100%; max-width:760px; background:#16213e; }
@@ -83,14 +86,46 @@
   video</b>, and the solved calibration is saved as a new version applying from that match
   onward (earlier matches keep their old calibration). Matches without a ▶ have no
   TBA-linked video, so frames fall back to the default test video. ❌ marks matches
-  where the drift check failed for this camera — recalibrate from there.
+  where the drift check failed for this camera — recalibrate from there. 🔧 marks
+  matches with an <b>auto-fix awaiting your approval</b> (panel appears below).
 </p>
+
+<!-- Auto-fix approval: shown only when the selected match has a staged pose re-solve.
+     The pose was re-derived from AprilTags against the SAME (unchanged) lens; the
+     operator eyeballs the reprojected wireframe over the frame, then approves (adopts
+     it as a new epoch) or rejects (falls back to manual calibration below). -->
+<div id="autofixPanel" style="display:none; border:2px solid #80ffb4; border-radius:8px;
+     background:#12241a; padding:14px 16px; margin-bottom:16px;">
+  <h2 style="margin:0 0 6px; color:#80ffb4; font-size:1.05em;">🔧 Auto-fix available — camera pose re-solved</h2>
+  <p class="hint" style="margin:0 0 8px;">
+    The drift check re-solved the camera <b>pose</b> from AprilTags against the unchanged
+    lens (same distortion). Review the reprojected wireframe + tags below: green boxes are
+    detected tags, cyan boxes are the field model reprojected under the fix — a good fix
+    sits the cyan on the green and the wireframe on the field. <b>Approve</b> saves it as a
+    new calibration version from this match onward; <b>Reject</b> keeps this match flagged so
+    you can calibrate it manually below.
+  </p>
+  <div id="autofixSummary" style="font-family:monospace; font-size:.85em; color:#bfe;
+       margin-bottom:10px;">—</div>
+  <div class="controls" style="margin-bottom:10px;">
+    <button onclick="previewAutofix()">Preview correction</button>
+    <button class="primary" onclick="approveAutofix()">Approve &amp; save version</button>
+    <button onclick="rejectAutofix()">Reject (calibrate manually)</button>
+    <span id="autofixStatus" class="hint"></span>
+  </div>
+  <img id="autofixImg" src="" alt="" style="display:none; max-width:760px; border:1px solid #234; border-radius:4px;">
+</div>
 
 <div class="canvases">
   <div class="canvas-col">
     <h2>Broadcast frame</h2>
-    <div class="canvas-wrap"><canvas id="frameCanvas"></canvas></div>
+    <div class="canvas-wrap"><canvas id="frameCanvas"></canvas><canvas id="loupe" width="160" height="160"></canvas></div>
     <div class="hint" id="frameHint">Click a tag here, then its marker on the map →</div>
+    <label class="hint" style="display:inline-flex; align-items:center; gap:5px; margin-top:2px;">
+      <input type="checkbox" id="magnifierToggle" checked> Magnifier — hover the frame to zoom;
+      <span id="loupeZoomLabel">4×</span>
+      <input type="range" id="loupeZoom" min="2" max="8" step="1" value="4" style="width:90px; vertical-align:middle;">
+    </label>
   </div>
   <div class="canvas-col">
     <h2>Top-down tag map (oriented to camera: blue left, red right)</h2>
@@ -232,8 +267,12 @@ function matchLabel(m){
   const cam = document.getElementById('camera').value;
   const rec = (driftMap[cam] || {})[m.key];
   const bad = rec && !rec.recalibrated;
-  const icon = bad ? '❌ ' : (m.video_key ? '▶ ' : '');
-  const suffix = bad ? `  — drift ${rec.error_m} m` : '';
+  // A staged auto-fix takes the 🔧 marker (approve/reject below); an un-fixed
+  // drift keeps ❌; otherwise the play/blank video marker.
+  const icon = (bad && rec.autofix_pending) ? '🔧 '
+             : bad ? '❌ '
+             : (m.video_key ? '▶ ' : '');
+  const suffix = bad ? `  — drift ${rec.error_m} m${rec.autofix_pending ? ' · auto-fix ready' : ''}` : '';
   return icon + lvl + `  (${m.key})` + suffix;
 }
 
@@ -462,6 +501,7 @@ async function grabFrame(opts){
 // a dry-run solve so the overlay preview appears. Otherwise just grab fresh.
 async function refreshForSelection(){
   loadVersions();
+  refreshAutofix();
   const event = document.getElementById('event').value.trim();
   const camera = document.getElementById('camera').value.trim();
   let epoch = null;
@@ -801,6 +841,74 @@ function clearZones(){ zones = []; drawMap(); renderZoneList();
   });
 })();
 
+// ---- Magnifier loupe: zoom the full-res frame under the cursor for precise tag picking ----
+(function(){
+  const fc = document.getElementById('frameCanvas');
+  const loupe = document.getElementById('loupe');
+  const lctx = loupe.getContext('2d');
+  const SIZE = loupe.width;   // loupe is square; internal px == CSS px
+  const OFFSET = 18;          // gap between cursor and loupe
+
+  const zoomEl = document.getElementById('loupeZoom');
+  const toggleEl = document.getElementById('magnifierToggle');
+  zoomEl.addEventListener('input', () => {
+    document.getElementById('loupeZoomLabel').textContent = zoomEl.value + '×';
+  });
+
+  function hide(){ loupe.style.display = 'none'; }
+
+  function draw(e){
+    if (!baseImg || !toggleEl.checked){ hide(); return; }
+    const r = fc.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;   // cursor in canvas-display px
+    if (cx < 0 || cy < 0 || cx > r.width || cy > r.height){ hide(); return; }
+
+    // Source window in FULL-resolution image px, centered on the cursor. Sampling
+    // baseImg (not the downscaled canvas) means the loupe shows real detail, not an
+    // upscaled blur. ZOOM is magnification relative to what's already on screen.
+    const ZOOM = parseFloat(zoomEl.value) || 4;
+    const imgX = cx / fScale, imgY = cy / fScale;
+    const srcSize = SIZE / (ZOOM * fScale);                  // image px shown across the loupe
+    const sx = imgX - srcSize/2, sy = imgY - srcSize/2;
+
+    lctx.clearRect(0, 0, SIZE, SIZE);
+    lctx.fillStyle = '#0a0a14'; lctx.fillRect(0, 0, SIZE, SIZE);
+    lctx.imageSmoothingEnabled = true;
+    // Clamp the source rect to image bounds so edge picks don't throw or smear,
+    // mapping the clamped region to the matching sub-rect of the loupe.
+    const k = SIZE / srcSize;                                // loupe px per image px
+    const sxC = Math.max(0, sx), syC = Math.max(0, sy);
+    const sxE = Math.min(frameW, sx + srcSize), syE = Math.min(frameH, sy + srcSize);
+    if (sxE > sxC && syE > syC){
+      lctx.drawImage(baseImg, sxC, syC, sxE - sxC, syE - syC,
+                     (sxC - sx) * k, (syC - sy) * k, (sxE - sxC) * k, (syE - syC) * k);
+    }
+
+    // Crosshair on the exact target pixel (loupe center), with a gap so the pixel shows.
+    const c = SIZE / 2;
+    lctx.strokeStyle = 'rgba(255,208,96,0.95)'; lctx.lineWidth = 1;
+    lctx.beginPath();
+    lctx.moveTo(c, 0); lctx.lineTo(c, c - 6); lctx.moveTo(c, c + 6); lctx.lineTo(c, SIZE);
+    lctx.moveTo(0, c); lctx.lineTo(c - 6, c); lctx.moveTo(c + 6, c); lctx.lineTo(SIZE, c);
+    lctx.stroke();
+    lctx.beginPath(); lctx.arc(c, c, 2, 0, 2 * Math.PI);
+    lctx.strokeStyle = '#fff'; lctx.stroke();
+
+    // Position near the cursor, flipping sides so it stays inside the frame.
+    let lx = cx + OFFSET, ly = cy + OFFSET;
+    if (lx + SIZE > r.width)  lx = cx - OFFSET - SIZE;
+    if (ly + SIZE > r.height) ly = cy - OFFSET - SIZE;
+    lx = Math.max(0, Math.min(lx, r.width - SIZE));
+    ly = Math.max(0, Math.min(ly, r.height - SIZE));
+    loupe.style.left = lx + 'px'; loupe.style.top = ly + 'px';
+    loupe.style.display = 'block';
+  }
+
+  fc.addEventListener('mousemove', draw);
+  fc.addEventListener('mouseleave', hide);
+  toggleEl.addEventListener('change', () => { if (!toggleEl.checked) hide(); });
+})();
+
 function renderMaskList(){
   const ul = document.getElementById('maskList'); ul.replaceChildren();
   frameMasks.forEach((m,i) => {
@@ -896,6 +1004,94 @@ async function loadVersions(){
       ul.appendChild(li);
     });
   } catch(e){ /* leave the list empty */ }
+}
+
+// ---- Auto-fix approval ----------------------------------------------------
+// A staged pose re-solve (server-side, on drift) is shown for the selected match.
+// Approve promotes it to a new epoch; reject drops it and leaves the manual flow.
+function autofixCtx(){
+  return {event: document.getElementById('event').value.trim(),
+          camera: document.getElementById('camera').value.trim(),
+          match: selectedMatch()};
+}
+
+function _fmtAutofixSummary(s){
+  if (!s) return 'Pose re-solved from AprilTags against the fixed lens.';
+  const bits = [];
+  if (s.best_err_m != null) bits.push(`tag alignment ${s.best_err_m} m`);
+  if (s.n_tags != null) bits.push(`${s.n_tags} tags`);
+  if (s.center_shift_m != null) bits.push(`camera moved ${s.center_shift_m} m`);
+  if (s.rotation_delta_deg != null) bits.push(`rotated ${s.rotation_delta_deg}°`);
+  if (s.rms_error_px != null) bits.push(`RMS ${s.rms_error_px} px`);
+  return bits.join('  ·  ') || (s.reason || '');
+}
+
+async function refreshAutofix(){
+  const {event, camera, match} = autofixCtx();
+  const panel = document.getElementById('autofixPanel');
+  const img = document.getElementById('autofixImg');
+  img.style.display = 'none'; img.src = '';
+  document.getElementById('autofixStatus').textContent = '';
+  if (!event || !camera || !match){ panel.style.display = 'none'; return; }
+  try {
+    const r = await fetch(`/api/calibration/autofix?event=${encodeURIComponent(event)}`
+      + `&camera=${encodeURIComponent(camera)}&match=${encodeURIComponent(match)}`);
+    const af = (await r.json()).autofix;
+    if (!af){ panel.style.display = 'none'; return; }
+    document.getElementById('autofixSummary').textContent =
+      _fmtAutofixSummary(af.summary) + (af.base_epoch ? `   (was epoch ${af.base_epoch})` : '');
+    panel.style.display = 'block';
+  } catch(e){ panel.style.display = 'none'; }
+}
+
+async function previewAutofix(){
+  const {event, camera, match} = autofixCtx();
+  const st = document.getElementById('autofixStatus');
+  st.textContent = 'Rendering preview…';
+  try {
+    const r = await fetch('/api/calibration/autofix/preview', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({event, camera, match_key: match,
+                            timestamp: parseFloat(document.getElementById('timestamp').value) || 75})});
+    const j = await r.json();
+    if (!r.ok || j.error){ st.textContent = 'Preview failed: ' + (j.error || r.status); return; }
+    const img = document.getElementById('autofixImg');
+    img.src = 'data:image/jpeg;base64,' + j.overlay; img.style.display = 'block';
+    st.textContent = 'Green = detected tags · cyan = model reprojected under the fix.';
+  } catch(e){ st.textContent = 'Preview error: ' + e.message; }
+}
+
+async function approveAutofix(){
+  const {event, camera, match} = autofixCtx();
+  const st = document.getElementById('autofixStatus');
+  st.textContent = 'Saving new calibration version…';
+  try {
+    const r = await fetch('/api/calibration/autofix/approve', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({event, camera, match_key: match})});
+    const j = await r.json();
+    if (!r.ok || j.error){ st.textContent = 'Approve failed: ' + (j.error || r.status); return; }
+    setStatus(`Auto-fix approved — saved version ${j.version_id} applying from ${j.start_match} →`, 'rms-info');
+    document.getElementById('autofixPanel').style.display = 'none';
+    await loadDrift(); populateMatchSelector();
+    await refreshForSelection();   // reloads the now-fixed epoch + overlay
+  } catch(e){ st.textContent = 'Approve error: ' + e.message; }
+}
+
+async function rejectAutofix(){
+  const {event, camera, match} = autofixCtx();
+  const st = document.getElementById('autofixStatus');
+  try {
+    const r = await fetch('/api/calibration/autofix/reject', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({event, camera, match_key: match})});
+    const j = await r.json();
+    if (!r.ok || j.error){ st.textContent = 'Reject failed: ' + (j.error || r.status); return; }
+    document.getElementById('autofixPanel').style.display = 'none';
+    await loadDrift(); populateMatchSelector();
+    setStatus('Auto-fix rejected — grab a frame and calibrate this match manually below.', 'rms-warn');
+    await refreshForSelection();
+  } catch(e){ st.textContent = 'Reject error: ' + e.message; }
 }
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');

@@ -8,7 +8,7 @@ decision points: aligned -> proceed, drifted -> abort, too-few-tags -> proceed
 (unvalidated), disabled -> proceed unconditionally.
 """
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +20,7 @@ from tests._field_synth import truth_pinhole_camera, project_tag_corners
 
 class _FakeView:
     name = "main"
+    crop = (0, 0, 16, 16)      # (x, y, w, h), as CameraView.crop
 
     def extract(self, frame):
         return frame
@@ -58,6 +59,10 @@ def _make_job(cam, fm, **over):
         _calib_version_id="20260608-1200",
         status=None, error=None, needs_calibration=None,
     )
+    # Bind the collaborators _verify_calibration_alignment calls via self so the
+    # real methods run end-to-end (the file only stubs video I/O, not logic).
+    for name in ("_attempt_autofix", "_drift_abort_state"):
+        setattr(job, name, MethodType(getattr(app.InferenceJob, name), job))
     job.__dict__.update(over)
     return job
 
@@ -85,14 +90,43 @@ def test_drifted_calibration_aborts(monkeypatch, cam_and_tags):
     # test_shifted_tags_large_error).
     drifted = {tid: img + 60.0 for tid, img in aligned.items()}
     _patch_video(monkeypatch, drifted)
+    # Autofix OFF: assert the classic manual-recalibration abort payload.
+    monkeypatch.setattr(app, "CALIB_AUTOFIX_ENABLED", False)
     job = _make_job(cam, fm)
     assert app.InferenceJob._verify_calibration_alignment(job) is False
     assert job.status == "error"
     assert "drift" in job.error.lower()
+    assert "recalibrate" in job.error.lower()
     assert job.needs_calibration is not None
+    assert not job.needs_calibration.get("autofix_pending")
     assert job.needs_calibration["match_key"] == "2026hop_qm84"
     assert job.needs_calibration["camera"] == "main"
     assert job.needs_calibration["error_m"] > 1.0   # not merely past the 0.5 m gate
+
+
+def test_drifted_calibration_stages_autofix(monkeypatch, cam_and_tags, tmp_path):
+    """With autofix ON, a drift abort attempts a pose re-solve and, when it passes,
+    STAGES it for approval — flipping the abort payload to autofix_pending and
+    persisting a pending fix (never auto-adopting it)."""
+    from web.field import store as field_store
+    from web.field.pose_autofix import PoseFixResult
+    fm, cam, aligned = cam_and_tags
+    drifted = {tid: img + 60.0 for tid, img in aligned.items()}
+    _patch_video(monkeypatch, drifted)
+    monkeypatch.setattr(app, "CALIB_AUTOFIX_ENABLED", True)
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    result = PoseFixResult(passed=True, reason="held", calibration=truth_pinhole_camera(),
+                           best_err_m=0.1, n_tags=6, center_shift_m=0.02,
+                           rotation_delta_deg=1.0)
+    monkeypatch.setattr(app, "resolve_pose_from_video", lambda *a, **k: result)
+
+    job = _make_job(cam, fm)
+    assert app.InferenceJob._verify_calibration_alignment(job) is False
+    assert job.status == "error"
+    assert job.needs_calibration["autofix_pending"] is True
+    assert "approve" in job.error.lower() or "review" in job.error.lower()
+    staged = field_store.load_pending_autofix("2026hop", "main", "2026hop_qm84")
+    assert staged is not None and staged["summary"]["best_err_m"] == 0.1
 
 
 def test_too_few_tags_proceeds_unvalidated(monkeypatch, cam_and_tags):

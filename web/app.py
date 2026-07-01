@@ -3,6 +3,13 @@ FRC Vision Scorer - YOLO26s Hub-Zone Model
 Clean rebuild focused on per-robot scoring attribution
 """
 
+# Set the CUDA caching-allocator config BEFORE torch initializes CUDA (the var is
+# read at the first CUDA allocation). expandable_segments lets freed blocks
+# coalesce, cutting fragmentation-driven OOMs on the 24GB card. setdefault so an
+# explicit shell/.env value still wins.
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import asyncio
 import base64
 import cv2
@@ -49,7 +56,9 @@ from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
-from web.field.calibration import CameraCalibration, Calibrator, CalibrationError, holdout_field_error, tag_alignment_error
+from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
+                                   holdout_field_error, tag_alignment_error, MIN_POSE_TAGS)
+from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
 from web.field.apriltag_detect import detect_tags
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
@@ -85,6 +94,7 @@ from web.field.detect_schema import (
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
+from web.field.manta import overlay_paths_for_job
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
 from web.field.view_stride import build_view_frame_plan, scale_frame_knob
@@ -424,14 +434,48 @@ def _merge_frame_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(start, end) for start, end in merged]
 
 
+def _pad_clock_period(
+    label: str,
+    period: dict,
+    fps: float,
+    total_frames: int,
+    lead_frames: int,
+    tail_frames: int,
+) -> dict:
+    """Label a raw clock period and add its padded processing window.
+
+    Extends the end by any residual clock seconds (the countdown is sampled
+    sparsely, so the true end is `end_frame` + `end_seconds`), then pads
+    `lead_frames` before the countdown start and `tail_frames` after.
+    """
+    item = dict(period, label=label)
+    if item["end_seconds"] > 0:
+        item["end_frame"] = min(
+            total_frames - 1,
+            item["end_frame"] + int(round(item["end_seconds"] * fps)),
+        )
+        item["end_seconds"] = 0
+    item["processing_start_frame"] = max(0, period["start_frame"] - lead_frames)
+    item["processing_end_frame"] = min(
+        total_frames - 1, item["end_frame"] + tail_frames
+    )
+    return item
+
+
 def compute_active_windows(
     samples: List[Tuple[int, Optional[int]]],
     fps: float,
     total_frames: int,
     lead_seconds: float = MATCH_CLOCK_LEAD_SECONDS,
     tail_seconds: float = MATCH_CLOCK_TAIL_SECONDS,
+    auto_only: bool = False,
 ) -> Tuple[List[Tuple[int, int]], List[dict], bool, Optional[str]]:
-    """Return merged processing ranges, labeled core periods, and fallback state."""
+    """Return merged processing ranges, labeled core periods, and fallback state.
+
+    When ``auto_only`` is set, restrict processing to the autonomous window and
+    skip the teleop search entirely — auto-only ground-truth runs (vs. Manta)
+    don't need teleop, and a clip that ends in auto still locks cleanly.
+    """
     full_range = [(0, max(0, total_frames - 1))]
     if not samples or fps <= 0 or total_frames <= 0:
         return full_range, [], True, "missing clock samples or video metadata"
@@ -439,26 +483,27 @@ def compute_active_windows(
     auto = _find_clock_period(samples, 20)
     if auto is None:
         return full_range, [], True, "autonomous countdown was not found"
+
+    lead_frames = int(round(lead_seconds * fps))
+    tail_frames = int(round(tail_seconds * fps))
+
+    if auto_only:
+        item = _pad_clock_period("auto", auto, fps, total_frames, lead_frames, tail_frames)
+        return (
+            [(item["processing_start_frame"], item["processing_end_frame"])],
+            [item],
+            False,
+            None,
+        )
+
     teleop = _find_clock_period(samples, 140, after_frame=auto["end_frame"])
     if teleop is None:
         return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
 
-    lead_frames = int(round(lead_seconds * fps))
-    tail_frames = int(round(tail_seconds * fps))
     periods = []
     padded = []
     for label, period in (("auto", auto), ("teleop", teleop)):
-        item = dict(period, label=label)
-        if item["end_seconds"] > 0:
-            item["end_frame"] = min(
-                total_frames - 1,
-                item["end_frame"] + int(round(item["end_seconds"] * fps)),
-            )
-            item["end_seconds"] = 0
-        item["processing_start_frame"] = max(0, period["start_frame"] - lead_frames)
-        item["processing_end_frame"] = min(
-            total_frames - 1, item["end_frame"] + tail_frames
-        )
+        item = _pad_clock_period(label, period, fps, total_frames, lead_frames, tail_frames)
         periods.append(item)
         padded.append((item["processing_start_frame"], item["processing_end_frame"]))
     return _merge_frame_ranges(padded), periods, False, None
@@ -636,6 +681,11 @@ CALIB_CHECK_ENABLED = os.environ.get("CALIB_CHECK_ENABLED", "1") not in ("0", "f
 CALIB_DRIFT_MAX_M = float(os.environ.get("CALIB_DRIFT_MAX_M", "0.5"))
 CALIB_CHECK_MIN_TAGS = int(os.environ.get("CALIB_CHECK_MIN_TAGS", "2"))
 CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5"))
+# On drift, attempt an automatic pose re-solve (lens fixed, only pose re-solved from
+# AprilTags) and stage it for HUMAN APPROVAL rather than aborting outright. The
+# operator approves (promotes to a new epoch) or rejects (falls back to today's
+# manual recalibration). Set to 0 to keep the old abort-straight-to-manual behavior.
+CALIB_AUTOFIX_ENABLED = os.environ.get("CALIB_AUTOFIX_ENABLED", "1") not in ("0", "false", "False")
 
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
@@ -2940,6 +2990,21 @@ class InferenceJob:
                     (230, 230, 230), 1, cv2.LINE_AA)
         return out
 
+    def _maybe_draw_field_wireframe(self, frame) -> None:
+        """When the field_wireframe_overlay knob is on, draw the reprojected field
+        (perimeter, grid, hubs, bumps, towers, trenches) onto the main-view frame.
+        ``frame`` is crop-local (origin at the main crop's top-left), matching what
+        cal.field_to_image projects to. Best-effort: a poorly-conditioned calibration
+        can make projection blow up, so a draw failure must never sink inference."""
+        if not getattr(self.config, "field_wireframe_overlay", False):
+            return
+        if self.calib is None or self.field_model is None:
+            return
+        try:
+            _draw_field_overlay(frame, self.calib, self.field_model)
+        except Exception as e:
+            print(f"  [wireframe] overlay draw skipped: {e}")
+
     def _compose_hud_frame(self, annotated_frame, radar_img, camera_panels) -> np.ndarray:
         """Stack a larger field/corner-camera dashboard below the main view."""
         ah, aw = annotated_frame.shape[:2]
@@ -4107,6 +4172,16 @@ class InferenceJob:
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
+            # Auto-only comparison runs overlay Manta's human-scouted auto paths on
+            # the Field Map (cache-only; no network). Off unless auto_period_only AND
+            # cached Manta data exist for this match.
+            manta_ref = overlay_paths_for_job(self.config.auto_period_only, self.match_key)
+            if manta_ref:
+                self.radar.set_reference_paths(manta_ref)
+                print(f"  [manta] overlaying {len(manta_ref)} scouted auto paths "
+                      f"for {self.match_key}")
+            elif self.config.auto_period_only and self.match_key:
+                print(f"  [manta] auto-only run but no cached Manta paths for {self.match_key}")
             selection = {}
             for _name in load_layout().keys():
                 _vs = field_store.load_versions(self.event_key, _name)
@@ -4233,15 +4308,14 @@ class InferenceJob:
         # which is the only case best_err stays inf (no frame ever updated it).
         if best_err > CALIB_DRIFT_MAX_M:
             self.status = "error"
-            _calib_url = (f"/calibrate?match={self.match_key}&camera={self.camera}"
-                          if self.match_key else "/calibrate")
-            self.error = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
-                          f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). "
-                          f"The camera likely moved/zoomed — recalibrate at {_calib_url} "
-                          f"(saved as a new version applying from this match onward).")
-            self.needs_calibration = {"event": self.event_key, "camera": self.camera,
-                                      "match_key": self.match_key, "error_m": round(best_err, 3),
-                                      "epoch": self._calib_version_id}
+            # Before giving up, try to auto-recover the pose against the fixed lens
+            # and STAGE it for approval (never auto-adopted). A staged fix flips the
+            # abort message from "recalibrate manually" to "review/approve".
+            autofix = None
+            if (CALIB_AUTOFIX_ENABLED and self.match_key
+                    and getattr(self.calib, "mode", None) in ("camera", "pinhole")):
+                autofix = self._attempt_autofix(main_view, best_err)
+            self.error, self.needs_calibration = self._drift_abort_state(best_err, autofix)
             if self.match_key:
                 # Persist the failure so the calibrate page can flag this match
                 # in its selector until a new epoch covers it (or a check passes).
@@ -4253,6 +4327,52 @@ class InferenceJob:
             field_store.clear_drift(self.event_key, self.camera, self.match_key)
         print(f"  [calib] OK: {best_n} tags align to {best_err:.3f} m (epoch {self._calib_version_id})")
         return True
+
+    def _attempt_autofix(self, main_view, best_err: float):
+        """Re-solve the camera pose against the fixed lens from AprilTags across the
+        match and, if it clears the guardrails, STAGE it for human approval. Returns
+        the PoseFixResult (passed or not), or None if the solve raised. Never adopts
+        the fix — approval happens via /api/calibration/autofix/approve."""
+        cfg = PoseFixConfig(min_tags=max(MIN_POSE_TAGS, CALIB_CHECK_MIN_TAGS),
+                            drift_max_m=CALIB_DRIFT_MAX_M)
+        try:
+            result = resolve_pose_from_video(
+                str(self.video_path), main_view.crop, self.calib, self.field_model, cfg)
+        except Exception as e:
+            print(f"  [autofix] pose re-solve errored, falling back to manual: {e}")
+            return None
+        if result.passed:
+            field_store.save_pending_autofix(
+                self.event_key, self.camera, self.match_key,
+                result.calibration, result.summary(), base_epoch=self._calib_version_id)
+            print(f"  [autofix] staged a pose re-solve for approval: {result.reason}")
+        else:
+            print(f"  [autofix] no safe auto-fix ({result.reason}); manual recalibration needed")
+        return result
+
+    def _drift_abort_state(self, best_err: float, autofix):
+        """PURE: build the (error message, needs_calibration dict) for a drift abort.
+        ``autofix`` is the PoseFixResult from _attempt_autofix (or None). A passing
+        fix routes the operator to review/approve; otherwise to manual recalibration."""
+        calib_url = (f"/calibrate?match={self.match_key}&camera={self.camera}"
+                     if self.match_key else "/calibrate")
+        needs = {"event": self.event_key, "camera": self.camera,
+                 "match_key": self.match_key, "error_m": round(best_err, 3),
+                 "epoch": self._calib_version_id}
+        head = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
+                f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). ")
+        if autofix is not None and autofix.passed:
+            needs["autofix_pending"] = True
+            needs["autofix_summary"] = autofix.summary()
+            error = (head + "An automatic pose re-solve is available for review — "
+                     f"approve or reject it at {calib_url}.")
+        else:
+            if autofix is not None:
+                needs["autofix_attempted"] = True
+                needs["autofix_reason"] = autofix.reason
+            error = (head + f"The camera likely moved/zoomed — recalibrate at {calib_url} "
+                     f"(saved as a new version applying from this match onward).")
+        return error, needs
 
     async def process_video(self) -> None:
         """Main video processing pipeline"""
@@ -4353,7 +4473,8 @@ class InferenceJob:
                 self.timer_gate_fallback,
                 self.timer_gate_fallback_reason,
             ) = compute_active_windows(
-                clock_samples, self.video_fps, self.total_frames
+                clock_samples, self.video_fps, self.total_frames,
+                auto_only=self.config.auto_period_only,
             )
             self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
             if self.timer_gate_fallback:
@@ -4361,9 +4482,25 @@ class InferenceJob:
                 self.processing_ranges = [
                     (fallback_start, max(0, self.total_frames - 1))
                 ]
+                if self.config.auto_period_only:
+                    # Auto-only was requested but we never locked the auto
+                    # countdown, so we can't isolate it. Surface this loudly —
+                    # the run will cover the whole match and a silent full-match
+                    # pass would quietly invalidate any Manta auto comparison.
+                    await self._warn_degraded(
+                        "auto_period_only",
+                        "auto-period-only requested but the autonomous clock was "
+                        f"not found ({self.timer_gate_fallback_reason}); processing "
+                        "the full match instead.",
+                    )
                 print(
                     "  [timer] WARNING: using the legacy post-title-screen range: "
                     f"{self.timer_gate_fallback_reason}"
+                )
+            elif self.config.auto_period_only:
+                print(
+                    "  [timer] AUTO-PERIOD-ONLY: restricting processing to the "
+                    f"autonomous window {self.processing_ranges}"
                 )
             else:
                 period_text = ", ".join(
@@ -5669,6 +5806,10 @@ class InferenceJob:
                 
                 # Draw annotations
                 annotated_frame = overhead_frame.copy()
+                # Optional verification pass: lay the reprojected field wireframe down
+                # first so robot/ball/hub HUD draws on top of it (and it's baked into
+                # both the live stream and the recorded replay).
+                self._maybe_draw_field_wireframe(annotated_frame)
                 track_by_slot = {t.slot_id: t for t in track_outs}
                 
                 # Draw detections
@@ -6462,10 +6603,11 @@ async def calibration_manual(request: Request):
     Body: {event, camera?, points: [{u, v, x, y, z}, ...]}."""
     body = await request.json()
     event = body["event"]; camera = body.get("camera", "main")
-    K, D = field_store.load_intrinsics(event, camera)
-    if K is None:
+    base = field_store.load(event, camera)   # most-recent cal: intrinsics + lens mode
+    if base is None or base.K is None:
         return JSONResponse(status_code=400, content={
             "error": "No saved intrinsics — run auto calibration first."})
+    K, D, intr_mode = base.K, np.asarray(base.D).reshape(-1), base.mode
     pts = body.get("points", [])
     if len(pts) < 2:
         return JSONResponse(status_code=400, content={
@@ -6480,7 +6622,8 @@ async def calibration_manual(request: Request):
     image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
     season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
     try:
-        cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size, field_season=season)
+        cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size,
+                                    field_season=season, mode=intr_mode)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     if existing is not None:
@@ -6498,11 +6641,12 @@ async def calibration_auto(request: Request):
     body = await request.json()
     event = body["event"]; camera = body.get("camera", "main")
     season = body.get("season", "2026-rebuilt-welded")
-    K, D = field_store.load_intrinsics(event, camera)
-    if K is None:
+    base = field_store.load(event, camera)   # most-recent cal: intrinsics + lens mode
+    if base is None or base.K is None:
         return JSONResponse(status_code=400, content={
             "error": "No intrinsics — import or run multi-viewpoint "
                      "intrinsics calibration first."})
+    K, D, intr_mode = base.K, np.asarray(base.D).reshape(-1), base.mode
     fm = FieldModel.load(season)
     frames = body.get("frames", [])
     if not frames:
@@ -6524,7 +6668,7 @@ async def calibration_auto(request: Request):
     try:
         cal = Calibrator.solve_pose(corr, K=K, D=D,
                                     image_size=image_size or (1920, 1080),
-                                    field_season=season)
+                                    field_season=season, mode=intr_mode)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
@@ -6659,10 +6803,138 @@ async def get_calibration_drift(event: str):
         cam_out = {}
         for mk, rec in entries.items():
             cover = select_epoch(versions, mk)
+            # A staged auto-fix awaiting approval lets the UI offer approve/reject
+            # for this match instead of only manual recalibration.
+            pending = field_store.load_pending_autofix(event, camera, mk)
             cam_out[mk] = {**rec, "recalibrated":
-                           bool(cover and cover["version_id"] != rec.get("epoch"))}
+                           bool(cover and cover["version_id"] != rec.get("epoch")),
+                           "autofix_pending": pending is not None}
         out[camera] = cam_out
     return {"drift": out}
+
+
+@app.get("/api/calibration/autofix")
+async def get_calibration_autofix(event: str, camera: str = "main",
+                                  match: str | None = None):
+    """The staged automatic pose re-solve awaiting approval for ``match`` (or None).
+
+    Returned when the in-match drift check recovered a plausible pose by re-solving
+    against the fixed lens (see web.field.pose_autofix). The operator reviews it via
+    the preview overlay and then approves (promotes to a new epoch) or rejects
+    (falls back to manual recalibration)."""
+    if not match:
+        return {"autofix": None}
+    pending = field_store.load_pending_autofix(event, camera, match)
+    if pending is None:
+        return {"autofix": None}
+    return {"autofix": {"summary": pending.get("summary"),
+                        "base_epoch": pending.get("base_epoch"),
+                        "created_at": pending.get("created_at")}}
+
+
+@app.post("/api/calibration/autofix/preview")
+async def calibration_autofix_preview(request: Request):
+    """Render the staged auto-fix over an example frame for human review.
+
+    Body: {event, camera?, match_key, timestamp?}. Draws the reprojected field
+    wireframe under the re-solved pose plus every auto-detected AprilTag (its
+    detected corners in green, the model tag reprojected under the fix in cyan) so
+    a good fix shows green boxes sitting on cyan boxes. Returns {overlay: b64,
+    width, height, summary}."""
+    body = await request.json()
+    event = body["event"]; camera = body.get("camera", "main")
+    match_key = body.get("match_key")
+    pending = field_store.load_pending_autofix(event, camera, match_key)
+    if pending is None:
+        return JSONResponse(status_code=400, content={
+            "error": "no pending auto-fix for this match"})
+    cal = pending["calibration"]
+    # Read the example frame from the drifted match's footage by default. An explicit
+    # video_path (local file / manual override) wins so the preview isn't blocked when
+    # the match's remote video is unavailable.
+    frame_body = dict(body)
+    if frame_body.get("video_path"):
+        frame_body.pop("match_key", None)
+    else:
+        frame_body["match_key"] = match_key
+    frame, err = await asyncio.to_thread(_read_composite_frame, frame_body)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    cl = load_layout().get(camera)
+    if cl is None:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    cx, cy, cw, ch = cl.crop
+    main = frame[cy:cy + ch, cx:cx + cw].copy()
+    for (mx, my, mw_, mh_) in (cal.masks or cl.masks):
+        main[my:my + mh_, mx:mx + mw_] = 0
+    fm = FieldModel.load(cal.field_season or "2026-rebuilt-welded")
+    try:
+        _draw_field_overlay(main, cal, fm)
+        for tid, corners in detect_tags(main).items():
+            if tid not in fm.tags:
+                continue
+            pts = np.asarray(corners, float).reshape(-1, 2)
+            cv2.polylines(main, [pts.astype(np.int32)], True, (0, 255, 0), 2)
+            # model tag reprojected under the re-solved pose (should hug the green)
+            proj = np.array([cal.field_to_image(tuple(p))
+                             for p in fm.tag_corners_3d(tid)], float)
+            if np.all(np.isfinite(proj)):
+                cv2.polylines(main, [proj.astype(np.int32)], True, (255, 255, 0), 1)
+    except Exception as e:
+        print(f"  [autofix] preview overlay draw failed: {e}")
+    okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not okj:
+        return JSONResponse(status_code=500, content={"error": "jpeg encode failed"})
+    return {"overlay": base64.b64encode(buf.tobytes()).decode(),
+            "width": int(main.shape[1]), "height": int(main.shape[0]),
+            "summary": pending.get("summary")}
+
+
+@app.post("/api/calibration/autofix/approve")
+async def calibration_autofix_approve(request: Request):
+    """Adopt the staged auto-fix: promote it to a NEW calibration version anchored
+    at the drifted match (so it applies from that match onward, earlier matches
+    keep their old epoch), carry the base epoch's masks/crop settings, then clear
+    the drift record and the pending fix. Body: {event, camera?, match_key, label?}."""
+    body = await request.json()
+    event = body["event"]; camera = body.get("camera", "main")
+    match_key = body.get("match_key")
+    pending = field_store.load_pending_autofix(event, camera, match_key)
+    if pending is None:
+        return JSONResponse(status_code=400, content={
+            "error": "no pending auto-fix for this match"})
+    cal = pending["calibration"]
+    # Carry the covering epoch's manual settings (masks, robot-track crop) so the
+    # auto-fix only changes the pose, not the operator's per-camera tuning.
+    prev = select_epoch(field_store.load_versions(event, camera), match_key)
+    existing = prev["calibration"] if prev else None
+    if existing is not None:
+        cal.masks = existing.masks
+        cal.robot_track_top_crop = existing.robot_track_top_crop
+    version_id = field_store.save_version(
+        event, camera, cal, start_match=match_key,
+        label=body.get("label") or "auto-fix (pose re-solve)",
+        source={"autofix": True, "base_epoch": pending.get("base_epoch"),
+                "summary": pending.get("summary")})
+    if match_key:
+        field_store.clear_drift(event, camera, match_key)
+        field_store.clear_pending_autofix(event, camera, match_key)
+    return {"status": "ok", "version_id": version_id, "start_match": match_key,
+            "rms_error": getattr(cal, "rms_error", None)}
+
+
+@app.post("/api/calibration/autofix/reject")
+async def calibration_autofix_reject(request: Request):
+    """Discard the staged auto-fix without adopting it. The drift record is LEFT in
+    place so the match stays flagged (❌) for manual recalibration. Returns a
+    ``redirect`` to the calibrate page pre-scoped to this match/camera.
+    Body: {event, camera?, match_key}."""
+    body = await request.json()
+    event = body["event"]; camera = body.get("camera", "main")
+    match_key = body.get("match_key")
+    field_store.clear_pending_autofix(event, camera, match_key)
+    q = f"?match={match_key}&camera={camera}" if match_key else f"?camera={camera}"
+    return {"status": "ok", "redirect": f"/calibrate{q}"}
 
 
 @app.get("/api/calibration/epoch")
@@ -8292,6 +8564,37 @@ async def sam2_models():
     }
 
 
+async def _load_db_roster(match_key: Optional[str]) -> Optional[tuple[list, list, list]]:
+    """Server-authoritative roster from the DB: ``(match_teams, blue, red)``.
+
+    The browser pushes the roster over the websocket within a 0.5 s window
+    (see ``websocket_infer``); on a timeout — or when the page had no roster
+    loaded for the selected match — the job historically ran with NO roster,
+    which disables the alliance gate in ``_match_bumper_read_to_roster`` and
+    lets a misread of one alliance's team number land on the other alliance's
+    robot. The same roster is already in ``match_robots``, so load it here and
+    use it as the default; a non-empty client roster still overrides.
+    """
+    if not match_key:
+        return None
+    try:
+        match = await database.get_match_by_key(match_key)
+    except Exception as e:
+        print(f"  [roster] DB lookup failed for {match_key}: {e}")
+        return None
+    if not match:
+        return None
+    blue, red = [], []
+    for r in match.get("robots", []):
+        team = r.get("team_number")
+        if team is None:
+            continue
+        (blue if r.get("alliance") == "blue" else red).append(str(team))
+    if not blue and not red:
+        return None
+    return [*blue, *red], blue, red
+
+
 @app.post("/api/infer")
 async def infer(
     video_file: Optional[UploadFile] = File(None),
@@ -8386,6 +8689,14 @@ async def infer(
         # Create job; every per-job knob flows through the validated config.
         job = InferenceJob(
             job_id, video_path, match_key=match_key, config=job_config)
+        # Seed the roster server-side from the DB so the alliance gate works
+        # even if the browser never pushes one over the websocket. A non-empty
+        # client roster still overrides this in websocket_infer.
+        db_roster = await _load_db_roster(match_key)
+        if db_roster is not None:
+            job.match_teams, job.match_blue_teams, job.match_red_teams = db_roster
+            print(f"  [roster] seeded from DB for {match_key}: "
+                  f"blue={job.match_blue_teams} red={job.match_red_teams}")
         _prune_finished_jobs()  # finished jobs stop pinning models in memory
         jobs[job_id] = job
         
@@ -8434,6 +8745,41 @@ async def stop_job(job_id: str):
     job._stopped = True
     job._paused = False
     return {"status": "stopping", "job_id": job_id, "frame_num": job._current_frame}
+
+
+@app.post("/api/job/{job_id}/retry")
+async def retry_job(job_id: str):
+    """Continue an aborted analysis WITHOUT re-uploading the video.
+
+    A calibration-drift abort stops the job before any tracking. After the operator
+    fixes the calibration (approves the staged auto-fix or recalibrates manually),
+    this re-runs the SAME video, match, and per-job config under a fresh job id. The
+    new run re-scans calibration against the now-current epoch and, if it passes,
+    processes normally. The client opens a websocket to the returned job_id to start
+    it (a fresh job is not yet run-claimed, so the socket drives process_video).
+    """
+    old = jobs.get(job_id)
+    if old is None:
+        return JSONResponse(status_code=404, content={
+            "error": "Job not found (it may have been pruned) — re-submit the match."})
+    video_path = Path(str(old.video_path))
+    if not video_path.exists():
+        return JSONResponse(status_code=400, content={
+            "error": "The original video is no longer on the server — re-submit the match."})
+    new_id = str(uuid.uuid4())
+    job = InferenceJob(new_id, video_path,
+                       match_key=getattr(old, "match_key", None),
+                       config=getattr(old, "config", None))
+    # Re-seed the roster from the DB exactly as /api/infer does; the client still
+    # overrides with any roster it pushes over the new websocket.
+    db_roster = await _load_db_roster(getattr(old, "match_key", None))
+    if db_roster is not None:
+        job.match_teams, job.match_blue_teams, job.match_red_teams = db_roster
+    _prune_finished_jobs()
+    jobs[new_id] = job
+    print(f"  [retry] continuing {job_id} as {new_id} "
+          f"(video + config reused; calibration will be re-scanned)")
+    return {"job_id": new_id, "previous_job_id": job_id}
 
 
 @app.get("/api/replays")
@@ -8785,14 +9131,20 @@ async def websocket_infer(websocket: WebSocket, job_id: str):
         msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
         data = json.loads(msg)
         if data.get("type") == "robot_identifications":
-            # Store match teams for continuous bumper OCR during inference
-            job.match_teams = data.get("match_teams", [])
-            job.match_blue_teams = data.get("blue_teams", [])
-            job.match_red_teams = data.get("red_teams", [])
-            print(
-                "Received match roster for VLM: "
-                f"blue={job.match_blue_teams} red={job.match_red_teams}"
-            )
+            # Store match teams for continuous bumper OCR during inference.
+            # Only override the DB-seeded roster (set at job creation) when the
+            # client actually supplies one — an empty client message must not
+            # wipe a good server-side roster.
+            client_blue = data.get("blue_teams") or []
+            client_red = data.get("red_teams") or []
+            if client_blue or client_red:
+                job.match_teams = data.get("match_teams", []) or [*client_blue, *client_red]
+                job.match_blue_teams = client_blue
+                job.match_red_teams = client_red
+                print(
+                    "Received match roster for VLM: "
+                    f"blue={job.match_blue_teams} red={job.match_red_teams}"
+                )
     except (asyncio.TimeoutError, Exception):
         pass
 

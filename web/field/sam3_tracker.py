@@ -62,9 +62,10 @@ import numpy as np
 
 from web.field.sam2_tracker import Sam2FieldTracker
 
-# Frames per SAM3 session window. ~14 MB GPU/frame: 400 frames ≈ 5.6 GB video
+# Frames per SAM3 session window. ~14 MB GPU/frame: 200 frames ≈ 2.8 GB video
 # residency, leaving headroom for the model and a co-resident vLLM reader.
-SAM3_CHUNK_FRAMES = int(os.environ.get("SAM3_CHUNK_FRAMES", "400"))
+# Lowered from 400 after a 24GB-card whole-card OOM with co-resident state.
+SAM3_CHUNK_FRAMES = int(os.environ.get("SAM3_CHUNK_FRAMES", "200"))
 # Only re-seed an object across a boundary if its mask was non-empty within
 # this many recent frames (stale boxes hijack background clutter).
 SAM3_RESEED_MAX_AGE = int(os.environ.get("SAM3_RESEED_MAX_AGE", "24"))

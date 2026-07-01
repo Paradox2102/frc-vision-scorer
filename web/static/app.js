@@ -1031,9 +1031,21 @@ class VisionScorer {
         if (modelSize) {
             formData.append('model_size', modelSize);
         }
+        // Accumulate per-job knobs into one config_json object (validated
+        // server-side against the JobConfig registry).
+        const config = {};
         const chunkFrames = parseInt(document.getElementById('sam3ChunkFrames')?.value, 10);
         if (trackingBackend === 'sam3' && Number.isFinite(chunkFrames) && chunkFrames > 0) {
-            formData.append('config_json', JSON.stringify({ sam3_chunk_frames: chunkFrames }));
+            config.sam3_chunk_frames = chunkFrames;
+        }
+        if (document.getElementById('autoPeriodOnly')?.checked) {
+            config.auto_period_only = true;
+        }
+        if (document.getElementById('fieldWireframeOverlay')?.checked) {
+            config.field_wireframe_overlay = true;
+        }
+        if (Object.keys(config).length > 0) {
+            formData.append('config_json', JSON.stringify(config));
         }
         if (this.selectedMatch?.key) {
             formData.append('match_key', this.selectedMatch.key);
@@ -1706,6 +1718,79 @@ class VisionScorer {
         this.setInferenceControlState('hidden');
         this.setStatus(`Error: ${data.error}`, 0);
         this.appendStatusLog(`✖ Job failed: ${data.error}`);
+        // A calibration-drift abort carries needs_calibration; surface a clickable
+        // jump to the calibrate page (approval panel / manual flow) plus a button to
+        // continue the analysis once the calibration is fixed — no re-upload.
+        if (data.needs_calibration) {
+            this.appendCalibrationLink(data.needs_calibration);
+            this.appendContinueAnalysisButton(this.jobId);
+        }
+    }
+
+    appendContinueAnalysisButton(previousJobId) {
+        if (!this.statusLog || !previousJobId) return;
+        this.statusLog.querySelectorAll('.continue-analysis-row').forEach((n) => n.remove());
+        const row = document.createElement('div');
+        row.className = 'continue-analysis-row';
+        row.style.marginTop = '4px';
+        const btn = document.createElement('button');
+        btn.className = 'btn-small';
+        btn.style.color = '#80ffb4';
+        btn.textContent = '▶ Continue analysis — re-check calibration & resume';
+        btn.title = 'Re-runs this match with the fixed calibration, reusing the '
+                  + 'already-uploaded video (no need to start over).';
+        btn.addEventListener('click', () => { btn.disabled = true; this.retryAnalysis(previousJobId); });
+        row.appendChild(btn);
+        this.statusLog.appendChild(row);
+        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+    }
+
+    async retryAnalysis(previousJobId) {
+        if (!previousJobId) return;
+        this.appendStatusLog('Re-checking calibration and continuing analysis…');
+        try {
+            const resp = await fetch(`/api/job/${previousJobId}/retry`, { method: 'POST' });
+            const data = await resp.json();
+            if (!resp.ok || data.error) {
+                this.setStatus(`Error: ${data.error || 'Could not continue analysis'}`, 0);
+                return;
+            }
+            // Fresh job id; drive it exactly like a new run (the websocket start path
+            // runs process_video, which re-scans calibration before tracking).
+            this.jobId = data.job_id;
+            this.jobFinished = false;
+            this.resetRunIndicators();
+            this.setInferenceControlState('running');
+            this.connectWebSocket();
+        } catch (e) {
+            this.setStatus(`Error: ${e.message}`, 0);
+        }
+    }
+
+    appendCalibrationLink(nc) {
+        if (!this.statusLog) return;
+        // Only one calibration link per failure — drop any prior one.
+        this.statusLog.querySelectorAll('.calib-link-row').forEach((n) => n.remove());
+        const params = new URLSearchParams();
+        if (nc.match_key) params.set('match', nc.match_key);
+        if (nc.camera) params.set('camera', nc.camera);
+        const qs = params.toString();
+        const row = document.createElement('div');
+        row.className = 'calib-link-row';
+        const ts = new Date().toLocaleTimeString([], { hour12: false });
+        row.appendChild(document.createTextNode(`${ts}  `));
+        const a = document.createElement('a');
+        a.href = '/calibrate' + (qs ? `?${qs}` : '');
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.style.color = '#80ffb4';
+        a.style.fontWeight = 'bold';
+        a.textContent = nc.autofix_pending
+            ? `🔧 Review the auto-fix for ${nc.camera || 'main'} — approve or reject →`
+            : `📐 Recalibrate ${nc.camera || 'main'} on the calibration page →`;
+        row.appendChild(a);
+        this.statusLog.appendChild(row);
+        this.statusLog.scrollTop = this.statusLog.scrollHeight;
     }
 
     setStatus(text, progress) {

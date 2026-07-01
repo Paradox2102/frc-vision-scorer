@@ -224,6 +224,250 @@ def test_solve_tags_stores_source_and_dry_run_skips_save(tmp_path, monkeypatch):
     assert len(field_store.load_versions("evt_src", "main")) == 1
 
 
+def _stage_autofix(field_store, event, camera, match_key, base_epoch=None,
+                   summary=None):
+    """Stage a pending auto-fix the way the pipeline would, for endpoint tests."""
+    import numpy as np
+    from web.field.calibration import CameraCalibration
+    cal = CameraCalibration(
+        K=np.eye(3), D=np.zeros(5),
+        rvec=np.zeros((3, 1)), tvec=np.ones((3, 1)),
+        image_size=(1920, 1080), crop_region=None, mode="pinhole",
+        field_season="2026-rebuilt-welded", rms_error=1.5)
+    summary = summary or {"passed": True, "best_err_m": 0.12, "n_tags": 5,
+                          "center_shift_m": 0.03, "rotation_delta_deg": 1.4}
+    field_store.save_pending_autofix(event, camera, match_key, cal, summary,
+                                     base_epoch=base_epoch)
+    return cal
+
+
+def test_get_autofix_none_when_unstaged(tmp_path, monkeypatch):
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    r = _client().get("/api/calibration/autofix", params={
+        "event": "evt_af", "camera": "main", "match": "evt_af_qm1"})
+    assert r.status_code == 200
+    assert r.json()["autofix"] is None
+
+
+def test_get_autofix_returns_staged_summary(tmp_path, monkeypatch):
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    _stage_autofix(field_store, "evt_af", "main", "evt_af_qm5", base_epoch="base1")
+    r = _client().get("/api/calibration/autofix", params={
+        "event": "evt_af", "camera": "main", "match": "evt_af_qm5"})
+    assert r.status_code == 200
+    af = r.json()["autofix"]
+    assert af["base_epoch"] == "base1"
+    assert af["summary"]["best_err_m"] == 0.12
+    assert af["created_at"]
+
+
+def test_approve_autofix_promotes_to_version_and_clears(tmp_path, monkeypatch):
+    """Approval anchors a NEW calibration version at the drifted match, carries the
+    base epoch's masks, and clears both the drift record and the pending fix."""
+    import numpy as np
+    from web.field import store as field_store
+    from web.field.calibration import CameraCalibration
+    from web.field.match_order import select_epoch
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+
+    base = CameraCalibration(
+        K=np.eye(3), D=np.zeros(5), rvec=np.zeros((3, 1)), tvec=np.ones((3, 1)),
+        image_size=(1920, 1080), crop_region=None, mode="pinhole",
+        field_season="2026-rebuilt-welded")
+    base.masks = [(10, 20, 30, 40)]
+    base.robot_track_top_crop = 0.15
+    base_id = field_store.save_version("evt_ap", "main", base, start_match=None)
+    field_store.record_drift("evt_ap", "main", "evt_ap_qm7", 3.1, base_id)
+    _stage_autofix(field_store, "evt_ap", "main", "evt_ap_qm7", base_epoch=base_id)
+
+    r = _client().post("/api/calibration/autofix/approve", json={
+        "event": "evt_ap", "camera": "main", "match_key": "evt_ap_qm7"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["status"] == "ok" and j["version_id"]
+
+    # A new epoch now covers qm7 (anchored there) and carries the base masks.
+    versions = field_store.load_versions("evt_ap", "main")
+    cover = select_epoch(versions, "evt_ap_qm7")
+    assert cover["start_match"] == "evt_ap_qm7"
+    assert cover["version_id"] != base_id
+    assert cover["calibration"].masks == [(10, 20, 30, 40)]
+    assert cover["calibration"].robot_track_top_crop == 0.15
+
+    # Drift record and pending fix are both gone.
+    assert "evt_ap_qm7" not in field_store.load_drift("evt_ap").get("main", {})
+    assert field_store.load_pending_autofix("evt_ap", "main", "evt_ap_qm7") is None
+
+
+def test_approve_autofix_without_pending_is_400(tmp_path, monkeypatch):
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    r = _client().post("/api/calibration/autofix/approve", json={
+        "event": "evt_none", "camera": "main", "match_key": "evt_none_qm1"})
+    assert r.status_code == 400
+    assert "pending" in r.json().get("error", "").lower()
+
+
+def test_reject_autofix_clears_pending_but_keeps_drift(tmp_path, monkeypatch):
+    """Rejecting drops the staged fix (so nothing auto-adopts) but leaves the drift
+    record so the match stays flagged for manual recalibration."""
+    import numpy as np
+    from web.field import store as field_store
+    from web.field.calibration import CameraCalibration
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+
+    base = CameraCalibration(
+        K=np.eye(3), D=np.zeros(5), rvec=np.zeros((3, 1)), tvec=np.ones((3, 1)),
+        image_size=(1920, 1080), mode="pinhole", field_season="2026-rebuilt-welded")
+    base_id = field_store.save_version("evt_rj", "main", base, start_match=None)
+    field_store.record_drift("evt_rj", "main", "evt_rj_qm9", 3.1, base_id)
+    _stage_autofix(field_store, "evt_rj", "main", "evt_rj_qm9", base_epoch=base_id)
+
+    r = _client().post("/api/calibration/autofix/reject", json={
+        "event": "evt_rj", "camera": "main", "match_key": "evt_rj_qm9"})
+    assert r.status_code == 200
+    assert "/calibrate" in r.json().get("redirect", "")
+    assert field_store.load_pending_autofix("evt_rj", "main", "evt_rj_qm9") is None
+    # drift record survives -> match still flagged for manual fix
+    assert "evt_rj_qm9" in field_store.load_drift("evt_rj").get("main", {})
+    # no new version was created
+    assert len(field_store.load_versions("evt_rj", "main")) == 1
+
+
+def test_preview_autofix_without_pending_is_400(tmp_path, monkeypatch):
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    r = _client().post("/api/calibration/autofix/preview", json={
+        "event": "evt_pv", "camera": "main", "match_key": "evt_pv_qm1"})
+    assert r.status_code == 400
+    assert "pending" in r.json().get("error", "").lower()
+
+
+def test_preview_autofix_renders_overlay(tmp_path, monkeypatch):
+    """End-to-end preview: stage a fix, read a local frame, draw the wireframe +
+    tags, return a JPEG plus the summary."""
+    import os
+    if not os.path.exists("data/test_footage/qual1_first_champs_2026.mp4"):
+        import pytest; pytest.skip("test video not present")
+    from web.field import store as field_store
+    from tests._field_synth import truth_pinhole_camera
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    cal = truth_pinhole_camera()
+    field_store.save_pending_autofix(
+        "evt_pv", "main", "evt_pv_qm2", cal,
+        {"passed": True, "best_err_m": 0.1, "n_tags": 5}, base_epoch="b0")
+    r = _client().post("/api/calibration/autofix/preview", json={
+        "event": "evt_pv", "camera": "main", "match_key": "evt_pv_qm2",
+        "video_path": "data/test_footage/qual1_first_champs_2026.mp4",
+        "timestamp": 75})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert len(j["overlay"]) > 1000            # base64 jpeg present
+    assert j["summary"]["best_err_m"] == 0.1
+
+
+def test_drift_endpoint_flags_pending_autofix(tmp_path, monkeypatch):
+    """The drift listing marks a match as having a pending auto-fix so the calibrate
+    page can offer the approve/reject panel instead of only manual recalibration."""
+    import numpy as np
+    from web.field import store as field_store
+    from web.field.calibration import CameraCalibration
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+
+    base = CameraCalibration(
+        K=np.eye(3), D=np.zeros(5), rvec=np.zeros((3, 1)), tvec=np.ones((3, 1)),
+        image_size=(1920, 1080), mode="pinhole", field_season="2026-rebuilt-welded")
+    base_id = field_store.save_version("evt_df", "main", base, start_match=None)
+    field_store.record_drift("evt_df", "main", "evt_df_qm3", 2.2, base_id)
+    field_store.record_drift("evt_df", "main", "evt_df_qm4", 2.2, base_id)
+    _stage_autofix(field_store, "evt_df", "main", "evt_df_qm3", base_epoch=base_id)
+
+    r = _client().get("/api/calibration/drift", params={"event": "evt_df"})
+    cam = r.json()["drift"]["main"]
+    assert cam["evt_df_qm3"]["autofix_pending"] is True
+    assert cam["evt_df_qm4"]["autofix_pending"] is False
+
+
+def _base_pinhole_cal():
+    import numpy as np
+    from web.field.calibration import CameraCalibration
+    return CameraCalibration(
+        K=np.eye(3), D=np.zeros(5), rvec=np.zeros((3, 1)), tvec=np.ones((3, 1)),
+        image_size=(1920, 1080), mode="pinhole",
+        field_season="2026-rebuilt-welded", rms_error=1.2)
+
+
+def _pose_fix_result(passed):
+    from web.field.pose_autofix import PoseFixResult
+    return PoseFixResult(
+        passed=passed, reason="held" if passed else "camera moved too far",
+        calibration=_base_pinhole_cal(), best_err_m=0.12 if passed else 0.9,
+        n_tags=5, center_shift_m=0.02, rotation_delta_deg=1.1)
+
+
+def _autofix_job():
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        video_path="x.mp4", calib=_base_pinhole_cal(), field_model=object(),
+        event_key="evt_t", camera="main", match_key="evt_t_qm2",
+        _calib_version_id="base9")
+
+
+def test_attempt_autofix_stages_passing_result(tmp_path, monkeypatch):
+    """A passing re-solve is persisted as a pending fix keyed by match, tagged with
+    the base epoch and the JSON-safe summary."""
+    import web.app as app_mod
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    result = _pose_fix_result(passed=True)
+    monkeypatch.setattr(app_mod, "resolve_pose_from_video", lambda *a, **k: result)
+
+    from types import SimpleNamespace
+    job = _autofix_job()
+    out = app_mod.InferenceJob._attempt_autofix(job, SimpleNamespace(crop=(0, 0, 1920, 1080)), 3.0)
+
+    assert out is result and out.passed
+    staged = field_store.load_pending_autofix("evt_t", "main", "evt_t_qm2")
+    assert staged is not None
+    assert staged["base_epoch"] == "base9"
+    assert staged["summary"]["best_err_m"] == 0.12
+
+
+def test_attempt_autofix_does_not_stage_failing_result(tmp_path, monkeypatch):
+    import web.app as app_mod
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    result = _pose_fix_result(passed=False)
+    monkeypatch.setattr(app_mod, "resolve_pose_from_video", lambda *a, **k: result)
+
+    from types import SimpleNamespace
+    out = app_mod.InferenceJob._attempt_autofix(_autofix_job(), SimpleNamespace(crop=(0, 0, 1920, 1080)), 3.0)
+    assert out is result and not out.passed
+    assert field_store.load_pending_autofix("evt_t", "main", "evt_t_qm2") is None
+
+
+def test_drift_abort_state_pending_points_to_review():
+    """With a staged fix, the abort payload flags autofix_pending + summary and the
+    message directs the operator to review/approve rather than recalibrate."""
+    import web.app as app_mod
+    job = _autofix_job()
+    err, nc = app_mod.InferenceJob._drift_abort_state(job, 3.0, _pose_fix_result(True))
+    assert nc["autofix_pending"] is True
+    assert nc["autofix_summary"]["best_err_m"] == 0.12
+    assert nc["error_m"] == 3.0 and nc["match_key"] == "evt_t_qm2"
+    assert "approve" in err.lower() or "review" in err.lower()
+
+
+def test_drift_abort_state_without_fix_is_manual():
+    import web.app as app_mod
+    job = _autofix_job()
+    err, nc = app_mod.InferenceJob._drift_abort_state(job, 3.0, None)
+    assert not nc.get("autofix_pending")
+    assert "recalibrate" in err.lower()
+
+
 def test_drift_records_lifecycle(tmp_path, monkeypatch):
     """Drift failures persist per (camera, match); the endpoint marks them
     recalibrated once a different epoch covers the match; passing clears them."""

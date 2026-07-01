@@ -44,3 +44,15 @@ def test_select_epoch_none_match_key_returns_latest_created():
         {"version_id": "b", "start_match": "2026hop_qm50", "created_at": "2026-06-08"},
     ]
     assert select_epoch(versions, None)["version_id"] == "b"
+
+def test_select_epoch_breaks_start_match_ties_by_newest():
+    # Recalibrating with the default start_match=None creates a second None-start
+    # version; the NEWER one must win. Otherwise recalibration is silently ignored
+    # and an older/broken stub (e.g. a K=None pinhole) gets selected and crashes.
+    versions = [
+        {"version_id": "20260630-104110", "start_match": None, "created_at": "2026-06-30T10:41:10"},
+        {"version_id": "20260630-104112", "start_match": None, "created_at": "2026-06-30T10:41:12"},
+    ]
+    assert select_epoch(versions, "2026cur_qm1")["version_id"] == "20260630-104112"
+    # order-independent: newest wins even if listed first
+    assert select_epoch(list(reversed(versions)), "2026cur_qm1")["version_id"] == "20260630-104112"

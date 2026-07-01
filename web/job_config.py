@@ -54,7 +54,9 @@ KNOBS = [
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
     # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.
-    Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 400, min=16, max=2000),
+    # Default lowered 400->200 for 24GB cards: 400 peaked the whole card and OOM'd
+    # when other state was co-resident (see web/field/sam3_tracker.py header).
+    Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 200, min=16, max=2000),
     # Corner-cam decimation: track corner views at track_fps/stride. SAM
     # propagation cost scales with frames/view (export resolution is NOT a
     # lever — the model resizes everything to a fixed square). Stride 2 cut
@@ -115,11 +117,23 @@ KNOBS = [
     # to a stop instead of sailing away; 1.0 restores constant-velocity.
     Knob("coast_vel_decay", "COAST_VEL_DECAY", float, 0.85,
          min=0.0, max=1.0),
+    # --- match-period gating ---
+    # Process ONLY the autonomous window (clock-locked) instead of the whole
+    # match. Used to A/B against Manta human-scouted auto paths, which only
+    # cover auto. Needs a clean clock lock on the auto countdown; if the scan
+    # can't find auto, the job logs a warning and runs the legacy full range.
+    Knob("auto_period_only", "AUTO_PERIOD_ONLY", bool, False),
     # --- live-view streaming ---
     Knob("frame_stream_interval_sec", "FRAME_STREAM_INTERVAL_SEC", float, 0.1,
          min=0.0, max=5.0),
     Knob("frame_stream_jpeg_quality", "FRAME_STREAM_JPEG_QUALITY", int, 70,
          min=1, max=100),
+    # --- verification overlays ---
+    # Draw the reprojected field wireframe (perimeter, grid, hubs, bumps, towers,
+    # trenches) onto the main view. Baked into both the live stream and the recorded
+    # replay so the operator can confirm the calibration/results line up with the
+    # real field. Off by default (it's a visual-check pass, not a scoring change).
+    Knob("field_wireframe_overlay", "FIELD_WIREFRAME_OVERLAY", bool, False),
 ]
 
 _BY_NAME = {k.name: k for k in KNOBS}

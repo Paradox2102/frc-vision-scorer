@@ -57,6 +57,53 @@ def test_compute_active_windows_tolerates_one_dropout_and_merges_padding():
     assert ranges == [(95, 1760)]
 
 
+def test_compute_active_windows_auto_only_restricts_to_auto_window():
+    fps = 10
+    auto = _countdown(100, 20, fps)
+    teleop = _countdown(500, 140, fps)
+    ranges, periods, fell_back, reason = compute_active_windows(
+        auto + [(350, None), (400, None)] + teleop,
+        fps=fps,
+        total_frames=2200,
+        auto_only=True,
+    )
+
+    assert not fell_back
+    assert reason is None
+    # Only the auto period survives; teleop is never even searched for.
+    assert [p["label"] for p in periods] == ["auto"]
+    assert ranges == [(95, 330)]
+
+
+def test_compute_active_windows_auto_only_locks_clip_ending_in_auto():
+    # A clip that cuts off during/just after auto has no teleop countdown.
+    # Full-match mode would fall back to the whole range, but auto-only still
+    # locks the auto window.
+    fps = 10
+    auto = _countdown(100, 20, fps)
+    ranges, periods, fell_back, reason = compute_active_windows(
+        auto, fps=fps, total_frames=400, auto_only=True
+    )
+
+    assert not fell_back
+    assert reason is None
+    assert [p["label"] for p in periods] == ["auto"]
+    assert ranges == [(95, 330)]
+
+
+def test_compute_active_windows_auto_only_falls_back_without_auto():
+    ranges, periods, fell_back, reason = compute_active_windows(
+        [(0, None), (15, None)],
+        fps=30,
+        total_frames=900,
+        auto_only=True,
+    )
+    assert fell_back
+    assert periods == []
+    assert ranges == [(0, 899)]
+    assert "autonomous" in reason
+
+
 def test_compute_active_windows_falls_back_without_complete_match():
     ranges, periods, fell_back, reason = compute_active_windows(
         [(0, None), (15, None), (30, 20)],

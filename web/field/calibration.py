@@ -215,25 +215,50 @@ class Calibrator:
 
     @staticmethod
     def solve_pose(correspondences: dict, K, D, image_size: tuple,
-                   field_season: str) -> "CameraCalibration":
+                   field_season: str, mode: str = "camera") -> "CameraCalibration":
         """Solve camera POSE against KNOWN intrinsics K, D (the per-event auto step).
-        correspondences: {tag_id: (corners_2d (4,2), corners_3d (4,3))}."""
+        correspondences: {tag_id: (corners_2d (N,2), corners_3d (N,3))}.
+
+        ``mode`` selects the lens model of the supplied intrinsics and MUST match the
+        model they were solved under: "camera" (fisheye, 4-coeff D) or "pinhole"
+        (5-coeff radial/tangential D). Undistorting with the wrong model silently
+        yields a wrong pose — the two undistort routines are not interchangeable. The
+        returned calibration carries the same mode so downstream projection matches."""
         if len(correspondences) < MIN_POSE_TAGS:
             raise CalibrationError(
                 f"need >= {MIN_POSE_TAGS} tags for pose, got {len(correspondences)}")
+        if mode not in ("camera", "pinhole"):
+            raise CalibrationError(f"solve_pose needs a projective mode, got '{mode}'")
         K = np.asarray(K, float)
         D = np.asarray(D, float).reshape(-1)
         obj = np.vstack([c3d for (_, c3d) in correspondences.values()]).astype(np.float64)
         img = np.vstack([c2d for (c2d, _) in correspondences.values()]).astype(np.float64)
-        # Undistort to a pinhole frame (intrinsics K), then PnP.
-        undist = cv2.fisheye.undistortPoints(img.reshape(-1, 1, 2), K, D, P=K)
-        ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
-                                      flags=cv2.SOLVEPNP_ITERATIVE)
+        # Recover pose against the correct lens model. The two models take different
+        # PnP paths — mixing them is the classic wrong-pose bug:
+        #   pinhole: DLT-init on undistorted points, then LM-refine against the true
+        #     5-coeff Brown model. Passing distortion straight to solvePnP's ITERATIVE
+        #     init is fragile for oblique views — its DLT seed ignores distortion and
+        #     can diverge by hundreds of px — while undistort-only init leaves residual
+        #     at moderate k1. Init-then-refine is both robust and sub-pixel accurate.
+        #   fisheye: solvePnP can't ingest the 4-coeff equidistant D, so undistort to a
+        #     pinhole frame (P=K) first, then PnP with no further distortion.
+        img_pnp = img.reshape(-1, 1, 2)
+        if mode == "pinhole":
+            Dp = D.reshape(-1, 1)
+            undist = cv2.undistortPoints(img_pnp, K, Dp, P=K)
+            ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
+                                          flags=cv2.SOLVEPNP_ITERATIVE)
+            if ok:
+                rvec, tvec = cv2.solvePnPRefineLM(obj, img_pnp, K, Dp, rvec, tvec)
+        else:
+            undist = cv2.fisheye.undistortPoints(img_pnp, K, D, P=K)
+            ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
+                                          flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok:
             raise CalibrationError("solvePnP failed")
         cal = CameraCalibration(K=K, D=D, rvec=rvec, tvec=tvec,
                                 image_size=image_size, crop_region=None,
-                                field_season=field_season)
+                                field_season=field_season, mode=mode)
         cal.rms_error = _reprojection_rms(cal, correspondences)
         return cal
 

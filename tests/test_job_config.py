@@ -91,6 +91,14 @@ def test_non_defaults_for_ab_provenance(monkeypatch):
     assert JobConfig().non_defaults() == {"reprompt_seconds": 1.0}
 
 
+def test_field_wireframe_overlay_default_and_override(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    assert JobConfig().field_wireframe_overlay is False
+    # Form checkboxes arrive as strings; "1" must coerce to True.
+    assert JobConfig({"field_wireframe_overlay": "1"}).field_wireframe_overlay is True
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

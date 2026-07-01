@@ -126,6 +126,9 @@ log.md
 .pytest_cache/
 .venv-vllm/
 
+# Cached Manta scouting API responses (3128 data; fetched, not source)
+data/manta_cache/
+
 # Match replay artifacts (recorded HUD videos + metadata, large/user data)
 web/replays/
 

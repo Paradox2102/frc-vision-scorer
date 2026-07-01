@@ -47,4 +47,8 @@ def select_epoch(versions, match_key):
 
     covering = [v for v in versions if start_key(v) <= target]
     pool = covering if covering else versions   # else: earliest extends backward
-    return max(pool, key=start_key)
+    # Tie-break equal start keys (e.g. several start_match=None versions) toward
+    # the most recently created — so recalibrating actually takes effect and a
+    # stale/broken earlier stub is never preferred over a newer good version.
+    return max(pool, key=lambda v: (start_key(v), v.get("created_at") or "",
+                                    v.get("version_id") or ""))

@@ -5660,6 +5660,14 @@ class InferenceJob:
                         } for t in track_outs],
                         "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
                         "events": [dict(e) for e in ft.binding_events],
+                        # Raw per-camera detections BEFORE fusion — shows whether a
+                        # robot vanished from detection itself (SAM3 gave up / occluded /
+                        # left frame) vs was detected but lost in fusion/tracking.
+                        "raw": {cam: [{
+                            "pos": [round(float(d.pos[0]), 2), round(float(d.pos[1]), 2)],
+                            "color": d.color, "has_box": d.box is not None,
+                            "tid": d.track_id, "score": round(float(d.score or 1.0), 2),
+                        } for (d, _crop) in dets] for cam, dets in per_camera.items()},
                     })
                 try:
                     self._record_frame_evidence(

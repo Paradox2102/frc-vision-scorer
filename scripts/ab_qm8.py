@@ -21,17 +21,23 @@ from scripts.compare_manta import (  # noqa: E402
 )
 
 HOST = "localhost:8004"
+# Defaults target qm8; override via CLI for other matches.
+MATCH_KEY = "2026cur_qm8"
 VIDEO = REPO / "web/uploads/ff4be1d9-b8e5-49ff-ac78-4a6a0e77a697.mp4"  # cached qm8
 MATCH = 8
 RESULTS = Path("/tmp/frc-ab-qm8.json")
 
-CONFIGS = [
-    ("baseline", {}),
-    ("relink-gate", {"relink_max_dist_m": 3.0}),
-    ("tracker-side", {"merge_main_guard": True, "sticky_max_dist_m": 2.5}),
-    ("both", {"relink_max_dist_m": 3.0, "merge_main_guard": True,
-              "sticky_max_dist_m": 2.5}),
-]
+TRACKER_SIDE = {"merge_main_guard": True, "sticky_max_dist_m": 2.5}
+PROFILES = {
+    "full": [
+        ("baseline", {}),
+        ("relink-gate", {"relink_max_dist_m": 3.0}),
+        ("tracker-side", TRACKER_SIDE),
+        ("both", {"relink_max_dist_m": 3.0, **TRACKER_SIDE}),
+    ],
+    "validate": [("baseline", {}), ("tracker-side", TRACKER_SIDE)],
+}
+CONFIGS = PROFILES["full"]
 
 
 def load_event() -> None:
@@ -50,7 +56,7 @@ def post_job(cfg: dict) -> str:
     config_json = json.dumps({"auto_period_only": True, **cfg})
     out = subprocess.run(
         ["curl", "-s", "-F", f"video_file=@{VIDEO}",
-         "-F", "match_key=2026cur_qm8", "-F", f"config_json={config_json}",
+         "-F", f"match_key={MATCH_KEY}", "-F", f"config_json={config_json}",
          f"http://{HOST}/api/infer"],
         capture_output=True, text=True, timeout=300).stdout
     return json.loads(out)["job_id"]
@@ -139,4 +145,14 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--match-key", default=MATCH_KEY)
+    ap.add_argument("--match", type=int, default=MATCH)
+    ap.add_argument("--video", default=str(VIDEO))
+    ap.add_argument("--results", default=str(RESULTS))
+    ap.add_argument("--profile", choices=list(PROFILES), default="full")
+    a = ap.parse_args()
+    MATCH_KEY, MATCH, VIDEO, RESULTS = a.match_key, a.match, Path(a.video), Path(a.results)
+    CONFIGS = PROFILES[a.profile]
     main()

@@ -84,18 +84,19 @@ from web.field.detect_bridge import (
 )
 from web.field.detect_schema import (
     DetectionSchema,
-    admit_low_conf_movers,
     bumper_admissible,
     expand_bumper_to_robot,
     blob_window_open,
     box_ios,
+    dedupe_against,
     dedupe_seed_robots,
     diff_box_energy,
-    merge_colorless_candidates,
     merge_robot_detections,
     motion_blob_boxes,
     motion_diff,
+    partition_low_conf_movers,
     plausible_bumper_box,
+    reject_ball_pile_candidates,
     reject_person_candidates,
     select_gap_fills,
 )
@@ -720,6 +721,14 @@ TRACKER_TRACE = os.environ.get("TRACKER_TRACE", "") == "1"
 ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
 ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
 ROBOT_FILL_IOS = float(os.environ.get("ROBOT_FILL_IOS", "0.5"))
+# Motion-tier subordination: a motion hint is deduped against YOLO-tier
+# boxes inflated by MOTION_TIER_INFLATE per side, at this (deliberately low)
+# IoS — adjacency to a YOLO robot counts as redundancy for a hint.
+MOTION_TIER_DEDUP_IOS = float(os.environ.get("MOTION_TIER_DEDUP_IOS", "0.1"))
+MOTION_TIER_INFLATE = float(os.environ.get("MOTION_TIER_INFLATE", "0.25"))
+# Colorless candidates >= this fraction covered by ball detections are ball
+# piles, not robots (the whole-robot class fires on dense piles).
+BALL_PILE_COVERAGE = float(os.environ.get("BALL_PILE_COVERAGE", "0.5"))
 ROBOT_FILL_MAX_BOX_FRAC = float(os.environ.get("ROBOT_FILL_MAX_BOX_FRAC", "0.5"))
 # Relaxed cap used when det_frac_backstop="uncalibrated": a robot close to a
 # low corner camera legitimately spans most of the short panel's height, and
@@ -1391,9 +1400,14 @@ class InferenceJob:
         cannot back a candidate. ``blobs_allowed`` gates the diff-blob
         candidate source (early-match window; the caller knows the clock).
 
-        Returns [(box_xyxy, color)] in the input frame's pixel coords. Field
-        filtering and any coordinate scaling are the caller's concern (they
-        differ between the prompt-seeding and re-prompt paths).
+        Returns [(box_xyxy, color, strong)] in the input frame's pixel
+        coords, in strict priority order: strong YOLO evidence first
+        (bumpers at/above conf + whole-robot fills), then the motion tier
+        (low-conf movers, diff blobs) deduped against it. ``strong=False``
+        entries are fallback hints — callers must never let them displace a
+        strong candidate from a seat. Field filtering and any coordinate
+        scaling are the caller's concern (they differ between the
+        prompt-seeding and re-prompt paths).
         """
         whole_boxes, ball_boxes = self._detect_whole_robots(frame, with_balls=True)
         person_res = self.person_model(
@@ -1422,39 +1436,65 @@ class InferenceJob:
                     motion_boxes = motion_blob_boxes(
                         prev_gray, cur_gray, exclude_boxes=exclude)
 
-        if motion_boxes:
-            # Frame-diff blobs join as colorless candidates (deduped against
-            # YOLO's whole robots); the gap-fill path colors them later.
-            whole_boxes = merge_colorless_candidates(
-                whole_boxes, motion_boxes, ROBOT_FILL_IOS)
-        bumper_robots = []
+        strong_bumpers = []
+        motion_bumpers = []
         if self.bumper_model is not None:
             # Motion-gated low-conf admission: with a motion probe available,
-            # detect down to det_conf_floor and let admit_low_conf_movers
-            # keep the sub-conf band only where pixels actually moved.
+            # detect down to det_conf_floor; the sub-conf band survives only
+            # where pixels actually moved — and only as the SUBORDINATE tier.
             gated = motion_probe is not None
             run_conf = min(conf, self.config.det_conf_floor) if gated else conf
             res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
                 sv.Detections.from_ultralytics(res)
             )
-            if gated:
-                robots = admit_low_conf_movers(robots, conf, motion_probe)
-            for box, color, _confidence in robots:
-                if not bumper_admissible(box, whole_boxes):
-                    continue
-                robot_box = expand_bumper_to_robot(
-                    box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR
-                )
-                bumper_robots.append((robot_box, color))
+            strong_dets, motion_dets = partition_low_conf_movers(
+                robots, conf, motion_probe if gated else None)
+
+            def _expand(dets):
+                out = []
+                for box, color, _confidence in dets:
+                    if not bumper_admissible(box, whole_boxes):
+                        continue
+                    out.append((expand_bumper_to_robot(
+                        box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR), color))
+                return out
+
+            strong_bumpers = _expand(strong_dets)
+            motion_bumpers = _expand(motion_dets)
         # Cross-class double-reads of one blurred bumper (per-class NMS)
         # must not seed duplicate objects.
-        bumper_robots = dedupe_seed_robots(bumper_robots, ROBOT_FILL_IOS)
+        strong_bumpers = dedupe_seed_robots(strong_bumpers, ROBOT_FILL_IOS)
+        # YOLO tier: strong bumpers + whole-robot fills.
         merged = merge_robot_detections(
-            bumper_robots, whole_boxes, ROBOT_FILL_IOS,
+            strong_bumpers, whole_boxes, ROBOT_FILL_IOS,
             union_extent=self.config.seed_union_extent)
+        tiered = [(box, color, True) for box, color in merged]
+        # Motion tier (STRICTLY subordinate): low-conf movers, then diff
+        # blobs — each deduped against everything the YOLO tier produced,
+        # with the YOLO boxes INFLATED first: a hint adjacent to a tracked
+        # robot is usually its own spillover (ejected balls, blur trail),
+        # not a new robot (qm11: a second box seeded beside 3181 and two
+        # slots fought over one robot). These are hints for when YOLO has
+        # nothing for a slot, never competitors for a seat YOLO can fill.
+        yolo_boxes = [box for box, _c in merged]
+        motion_tier = dedupe_seed_robots(
+            dedupe_against(motion_bumpers, yolo_boxes,
+                           MOTION_TIER_DEDUP_IOS, inflate=MOTION_TIER_INFLATE),
+            ROBOT_FILL_IOS)
+        if motion_boxes:
+            covered = yolo_boxes + [box for box, _c in motion_tier]
+            motion_tier += dedupe_against(
+                [(mb, "unknown") for mb in motion_boxes], covered,
+                MOTION_TIER_DEDUP_IOS, inflate=MOTION_TIER_INFLATE)
+        tiered += [(box, color, False) for box, color in motion_tier]
+        # Ball-pile veto: the whole-robot class fires on dense ball piles;
+        # a colorless candidate mostly covered by ball detections is not a
+        # robot (bumper-colored candidates are exempt — robots carry balls).
+        tiered = reject_ball_pile_candidates(
+            tiered, ball_boxes, BALL_PILE_COVERAGE)
         return reject_person_candidates(
-            merged, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
+            tiered, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
 
     def _ray_zone_list(self, view):
@@ -4970,7 +5010,7 @@ class InferenceJob:
                                                 box[2],
                                                 box[3] + top_crop_px,
                                             )
-                                            for box, _color in merged
+                                            for box, _color, _strong in merged
                                         ]
                                         keep_merged = filter_field_robot_boxes(
                                             full_boxes,
@@ -4986,11 +5026,17 @@ class InferenceJob:
                                             frac_backstop=self.config.det_frac_backstop,
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
-                                        
+
+                                        # YOLO priority: strong colored
+                                        # candidates seed directly; strong
+                                        # colorless fills, then motion-tier
+                                        # hints, share the per-half quota IN
+                                        # THAT ORDER — a motion hint only
+                                        # gets a seat YOLO left empty.
                                         bumper_halves = []
-                                        unknown_halves = []
-                                        unknown_boxes = []
-                                        for box, color in merged:
+                                        pool_halves = []
+                                        pool_entries = []
+                                        for box, color, strong in merged:
                                             x1, y1, x2, y2 = box
                                             full_box = (x1, y1 + top_crop_px, x2, y2 + top_crop_px)
                                             uv = ((full_box[0] + full_box[2]) / 2.0, full_box[3])
@@ -4998,28 +5044,29 @@ class InferenceJob:
                                             half = None
                                             if xy is not None and self.field_model is not None:
                                                 half = self.field_model.alliance_side(xy)
-                                            
-                                            if color != "unknown":
+
+                                            if strong and color != "unknown":
                                                 if half is not None:
                                                     bumper_halves.append(half)
                                             else:
-                                                unknown_halves.append(half)
-                                                unknown_boxes.append(box)
-                                        
-                                        keep_indices = select_gap_fills(bumper_halves, unknown_halves, max_per_half=3)
-                                        
-                                        for box, color in merged:
-                                            if color != "unknown":
+                                                pool_halves.append(half)
+                                                pool_entries.append((box, color))
+
+                                        keep_indices = select_gap_fills(bumper_halves, pool_halves, max_per_half=3)
+
+                                        for box, color, strong in merged:
+                                            if strong and color != "unknown":
                                                 view_prompt_boxes[view.name].append(
                                                     tuple(v * SAM2_SCALE for v in box)
                                                 )
                                                 view_prompt_colors[view.name].append(color)
-                                        
+
                                         for idx in keep_indices:
+                                            box, color = pool_entries[idx]
                                             view_prompt_boxes[view.name].append(
-                                                tuple(v * SAM2_SCALE for v in unknown_boxes[idx])
+                                                tuple(v * SAM2_SCALE for v in box)
                                             )
-                                            view_prompt_colors[view.name].append("unknown")
+                                            view_prompt_colors[view.name].append(color)
                                 except Exception as e:
                                     print(f"  [{self.tracker_tag}] Error exporting frame {local_idx} for view {view.name}: {e}")
                             local_idx += 1
@@ -5184,7 +5231,7 @@ class InferenceJob:
                                 # seeding inside zones is blocked by seed_gate_fn.
                                 full_boxes = [
                                     (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
-                                    for b, _c in merged
+                                    for b, _c, _strong in merged
                                 ]
                                 keep = filter_field_robot_boxes(
                                     full_boxes,
@@ -5197,12 +5244,41 @@ class InferenceJob:
                                     ),
                                     frac_backstop=self.config.det_frac_backstop,
                                 )
+                                # YOLO priority at boundaries too: motion
+                                # hints share the per-half quota (3 = slots
+                                # per alliance) AFTER every strong candidate
+                                # is counted — the seed-frame rule, applied
+                                # at every re-prompt. Tier order is also
+                                # preserved (strong first), so the tracker
+                                # hands roster seats to YOLO evidence first.
+                                strong_halves = []
+                                motion_entries = []   # (candidate_idx, half)
+                                for idx in keep:
+                                    box, _color, strong = merged[idx]
+                                    fb = full_boxes[idx]
+                                    uv = ((fb[0] + fb[2]) / 2.0, fb[3])
+                                    xy = view.calibration.image_to_field(uv)
+                                    half = None
+                                    if xy is not None and self.field_model is not None:
+                                        half = self.field_model.alliance_side(xy)
+                                    if strong:
+                                        if half is not None:
+                                            strong_halves.append(half)
+                                    else:
+                                        motion_entries.append((idx, half))
+                                kept_motion = set(
+                                    motion_entries[i][0]
+                                    for i in select_gap_fills(
+                                        strong_halves,
+                                        [h for _i, h in motion_entries],
+                                        max_per_half=3))
                                 return [
                                     (
                                         tuple(v * SAM2_SCALE for v in merged[idx][0]),
                                         merged[idx][1],
                                     )
                                     for idx in keep
+                                    if merged[idx][2] or idx in kept_motion
                                 ]
                             return detect_fn
 

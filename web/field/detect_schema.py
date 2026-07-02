@@ -129,20 +129,22 @@ def reject_person_candidates(candidates, person_boxes, coverage_thresh=0.6):
     ]
 
 
-def admit_low_conf_movers(robots, conf, motion_probe):
-    """Filter ``(box, color, confidence)`` detections at ``conf``, admitting
-    the sub-threshold band only when ``motion_probe(box)`` proves pixel motion.
+def partition_low_conf_movers(robots, conf, motion_probe):
+    """Split ``(box, color, confidence)`` detections into evidence tiers:
+    (strong, motion_admitted).
 
-    Motion blur is WHY a fast robot's bumper reads low confidence, and motion
-    is what proves the low read is a robot rather than static clutter — the
-    failure mode self-identifies. A ``None`` probe (gating disabled, or no
-    previous frame yet) reduces to the plain threshold; a raising probe
+    Strong = at/above ``conf``: plain YOLO evidence. Motion-admitted = the
+    sub-threshold band kept only because ``motion_probe(box)`` proved pixel
+    motion (motion blur is WHY a fast robot's bumper reads low confidence).
+    Motion is a SUBORDINATE tier: callers must never let it displace a
+    strong hit from a seat/slot. A ``None`` probe (gating disabled, or no
+    previous frame yet) admits nothing to the motion tier; a raising probe
     rejects only that detection.
     """
-    out = []
+    strong, motion = [], []
     for box, color, confidence in robots:
         if confidence >= conf:
-            out.append((box, color, confidence))
+            strong.append((box, color, confidence))
             continue
         if motion_probe is None:
             continue
@@ -151,7 +153,37 @@ def admit_low_conf_movers(robots, conf, motion_probe):
         except Exception:
             moving = False
         if moving:
-            out.append((box, color, confidence))
+            motion.append((box, color, confidence))
+    return strong, motion
+
+
+def admit_low_conf_movers(robots, conf, motion_probe):
+    """Flat union of :func:`partition_low_conf_movers` tiers (strong first)."""
+    strong, motion = partition_low_conf_movers(robots, conf, motion_probe)
+    return strong + motion
+
+
+def dedupe_against(candidates, kept_boxes, ios_thresh, inflate=0.0):
+    """Drop ``(box, ...)`` candidate tuples overlapping any kept box.
+
+    Used to keep the motion tier subordinate: a motion-backed candidate
+    overlapping anything the YOLO tiers already produced is redundant.
+    ``inflate`` grows each kept box by that fraction of its size per side
+    before the IoS test — a motion hint ADJACENT to a YOLO robot is usually
+    that robot's own spillover (ejected balls, blur trail), not a new robot.
+    """
+    kept = []
+    for kb in kept_boxes:
+        if inflate:
+            dx = (kb[2] - kb[0]) * inflate
+            dy = (kb[3] - kb[1]) * inflate
+            kb = (kb[0] - dx, kb[1] - dy, kb[2] + dx, kb[3] + dy)
+        kept.append(kb)
+    out = []
+    for cand in candidates:
+        if any(box_ios(cand[0], kb) > ios_thresh for kb in kept):
+            continue
+        out.append(cand)
     return out
 
 
@@ -224,6 +256,36 @@ def motion_blob_boxes(prev_gray, cur_gray, diff_thresh=25, min_side_px=48,
         if max(w, h) > max_aspect * min(w, h):
             continue
         out.append((x, y, x + w, y + h))
+    return out
+
+
+def reject_ball_pile_candidates(candidates, ball_boxes, coverage_thresh=0.5):
+    """Drop COLORLESS candidates whose box is mostly covered by ball boxes.
+
+    The whole-robot detector fires on dense ball piles. A candidate without
+    bumper evidence whose area is >= ``coverage_thresh`` covered by ball
+    detections is a pile, not a robot. Bumper-colored candidates are exempt
+    — robots legitimately carry and eject balls. Ball boxes rarely overlap,
+    so summed clipped areas approximate the union.
+    """
+    out = []
+    for cand in candidates:
+        box, color = cand[0], cand[1]
+        if color != "unknown":
+            out.append(cand)
+            continue
+        x1, y1, x2, y2 = box
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if area <= 0:
+            continue
+        covered = 0.0
+        for bx1, by1, bx2, by2 in ball_boxes:
+            ix = max(0.0, min(x2, bx2) - max(x1, bx1))
+            iy = max(0.0, min(y2, by2) - max(y1, by1))
+            covered += ix * iy
+        if covered / area >= coverage_thresh:
+            continue
+        out.append(cand)
     return out
 
 

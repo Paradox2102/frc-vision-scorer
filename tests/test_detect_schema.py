@@ -362,3 +362,65 @@ def test_motion_blob_boxes_excludes_person_regions():
     boxes = motion_blob_boxes(prev, cur, exclude_boxes=[(95, 95, 205, 225)])
     assert len(boxes) == 1
     assert boxes[0][0] >= 480, "only the robot blob survives"
+
+
+def test_partition_low_conf_movers_separates_tiers():
+    """Motion-admitted detections are a subordinate evidence tier: strong
+    YOLO hits must never compete with them for seats. partition keeps the
+    two groups separate; admit_low_conf_movers stays the flat union."""
+    from web.field.detect_schema import partition_low_conf_movers
+    robots = [((0, 0, 10, 10), "red", 0.9),
+              ((20, 0, 30, 10), "red", 0.26),
+              ((40, 0, 50, 10), "blue", 0.30)]
+    moving = {(20, 0, 30, 10), (40, 0, 50, 10)}
+    strong, motion = partition_low_conf_movers(
+        robots, conf=0.4, motion_probe=lambda b: tuple(b) in moving)
+    assert strong == [((0, 0, 10, 10), "red", 0.9)]
+    assert motion == [((20, 0, 30, 10), "red", 0.26),
+                      ((40, 0, 50, 10), "blue", 0.30)]
+
+
+def test_dedupe_against_drops_boxes_covered_by_kept():
+    from web.field.detect_schema import dedupe_against
+    kept = [(100, 100, 200, 200)]
+    cands = [((110, 110, 190, 190), "red"),   # covered -> dropped
+             ((400, 100, 480, 200), "blue")]  # clear -> kept
+    assert dedupe_against(cands, kept, ios_thresh=0.5) == [
+        ((400, 100, 480, 200), "blue")]
+
+
+def test_dedupe_against_inflate_drops_adjacent_motion_hint():
+    """A motion hint ADJACENT to a YOLO robot is usually that robot's own
+    spillover (balls it is ejecting, its blur trail) — qm11: a second box
+    seeded beside 3181 and two slots fought over one robot. Inflating the
+    kept boxes before the IoS test absorbs adjacency; a genuinely separate
+    candidate farther away still survives."""
+    from web.field.detect_schema import dedupe_against
+    kept = [(611, 153, 685, 285)]
+    adjacent = ((683, 213, 766, 286), "unknown")   # 2 px overlap
+    distant = ((830, 213, 900, 286), "unknown")
+    out = dedupe_against([adjacent, distant], kept, ios_thresh=0.5)
+    assert adjacent in out                          # plain IoS: survives
+    out = dedupe_against([adjacent, distant], kept, ios_thresh=0.1,
+                         inflate=0.25)
+    assert adjacent not in out
+    assert distant in out
+
+
+def test_reject_ball_pile_candidates_drops_ball_covered_fill():
+    """The whole-robot class fires on dense ball piles (qm11 fi-67: a strong
+    colorless fill seeded beside 3181 over the balls it ejected, and two
+    slots fought over one robot). A COLORLESS candidate mostly covered by
+    ball detections is a ball pile; a bumper-colored candidate keeps its
+    seat regardless (robots legitimately carry/eject balls)."""
+    from web.field.detect_schema import reject_ball_pile_candidates
+    balls = [(690, 220, 720, 250), (715, 240, 745, 270), (735, 215, 765, 245),
+             (695, 255, 725, 285)]
+    pile = ((683, 213, 766, 286), "unknown", True)
+    robot_fill = ((500, 150, 590, 280), "unknown", True)   # one stray ball
+    colored = ((683, 213, 766, 286), "red", True)          # bumper evidence
+    out = reject_ball_pile_candidates(
+        [pile, robot_fill, colored], balls, coverage_thresh=0.5)
+    assert pile not in out
+    assert robot_fill in out
+    assert colored in out

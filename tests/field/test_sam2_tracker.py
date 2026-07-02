@@ -2019,12 +2019,14 @@ def test_motion_fn_exception_treated_as_static():
 
 
 def test_pick_evictable_moving_candidate_relaxes_absence_bar():
-    """A motion-proven candidate may evict a stationary object with a single
-    windowed absence, even when min_absences/k put every normal tier out of
-    reach. Without the moving-candidate flag the same evidence evicts nobody."""
+    """A motion-proven candidate may evict a stationary object absent at
+    BOTH of the last two boundaries (YOLO priority: anything the detector
+    backed recently is immune), even when min_absences/k put every normal
+    tier out of reach. Without the moving-candidate flag the same evidence
+    evicts nobody."""
     from web.field.sam2_tracker import pick_evictable
     from collections import deque
-    hist = {1: deque([True, False]), 2: deque([True, True])}
+    hist = {1: deque([True, False, False]), 2: deque([True, True])}
     window = {1: [(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)],
               2: [(8.0, 8.0), (8.0, 8.0)]}
     kwargs = dict(k=99, stationary_m=0.5, last_visible_frame={1: 10, 2: 10},
@@ -2103,3 +2105,22 @@ def test_make_frame_diff_motion_fn_reads_exported_frames(tmp_path):
     # local_idx 0 has no predecessor; missing files are not an error.
     assert motion_fn(0, (55, 2, 90, 14)) is False
     assert motion_fn(9, (55, 2, 90, 14)) is False
+
+
+def test_pick_evictable_motion_never_evicts_recently_corroborated():
+    """YOLO priority: a roster member the detector backed at EITHER of the
+    last two boundaries is immune to motion-driven (tier 2.5) eviction — a
+    parked robot missing one boundary read must not lose its seat to a
+    motion-only candidate (ball cluster / misread)."""
+    from web.field.sam2_tracker import pick_evictable
+    from collections import deque
+    hist = {1: deque([False, True, False]),   # corroborated one boundary ago
+            2: deque([True, False, False])}   # absent last TWO boundaries
+    window = {1: [(5.0, 5.0)] * 3, 2: [(8.0, 8.0)] * 3}
+    kwargs = dict(k=99, stationary_m=0.5, last_visible_frame={1: 10, 2: 10},
+                  current_idx=10, dark_frames=999, min_absences=99)
+    assert pick_evictable([1, 2], hist, window,
+                          moving_candidate=True, **kwargs) == 2
+    # With only the recently-corroborated object present: nobody is evicted.
+    assert pick_evictable([1], hist, window,
+                          moving_candidate=True, **kwargs) is None

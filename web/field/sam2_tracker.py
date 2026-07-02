@@ -483,16 +483,19 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
         if best is not None:
             return best
 
-    # Tier 2.5: motion-proven candidate vs stationary absentee.
+    # Tier 2.5: motion-proven candidate vs stationary absentee. YOLO
+    # priority: an object the detector backed at EITHER of the last two
+    # boundaries is immune — a parked robot missing one boundary read must
+    # not lose its seat to motion-only evidence (ball cluster, misread).
     if moving_candidate:
         best, best_absent = None, -1
         for oid in active_objects:
             hist = _evidence(oid)
             if not hist:
                 continue
+            if len(hist) < 2 or hist[-2]:
+                continue  # corroborated too recently (or unproven)
             absent = sum(1 for c in hist if not c)
-            if absent < 1:
-                continue
             if not is_stationary(field_pos_window.get(oid, []), stationary_m):
                 continue
             if absent > best_absent:

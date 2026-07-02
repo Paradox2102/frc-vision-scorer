@@ -51,6 +51,29 @@ KNOBS = [
     Knob("sam2_prompt_offset_seconds", "SAM2_PROMPT_OFFSET_SECONDS", float, 3.0,
          min=0.0),
     Knob("reprompt_seconds", "REPROMPT_SECONDS", float, 2.0, min=0.1),
+    # Motion override: frame-diff pixel motion as positive robot evidence at
+    # re-prompt boundaries — a moving detection claimed by a stationary mask
+    # seeds anyway, and may evict a stationary once-absent object from a
+    # capped roster (qm11: sprinting robot starved by already_tracked/
+    # roster_cap against equipment-parked masks). DEFAULT OFF pending A/B.
+    Knob("motion_override", "SAM2_MOTION_OVERRIDE_ENABLED", bool, False),
+    # Min mean-abs-gray-diff (normalized /255) inside the candidate box, one
+    # track_fps step apart, to count as "moving". Static-scene JPEG noise is
+    # <0.01; a robot sweeping its own box scores >0.06.
+    Knob("motion_energy_thresh", "SAM2_MOTION_ENERGY_THRESH", float, 0.04,
+         min=0.0, max=1.0),
+    # Motion-gated low-confidence admission: run the bumper detector down to
+    # det_conf_floor at seed/re-prompt frames and admit the sub-threshold band
+    # only when the box shows pixel motion (qm11 6800: dark blurred bumper
+    # read 0.26-0.34 vs the 0.4 seed conf — blur lowers confidence, and the
+    # blur IS the motion evidence). DEFAULT OFF pending A/B.
+    Knob("motion_gated_conf", "MOTION_GATED_CONF_ENABLED", bool, False),
+    Knob("det_conf_floor", "DET_CONF_FLOOR", float, 0.2, min=0.01, max=1.0),
+    # Detector-independent seed candidates from frame-diff blobs, fed into
+    # the colorless gap-fill path (color backfilled later). Rescues a robot
+    # YOLO whiffs on entirely (heavy blur, dark bumpers). DEFAULT OFF
+    # pending A/B.
+    Knob("motion_seed_blobs", "MOTION_SEED_BLOBS_ENABLED", bool, False),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
     # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.

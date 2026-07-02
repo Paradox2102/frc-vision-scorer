@@ -1890,3 +1890,216 @@ def test_dark_reanchor_attempts_capped_then_new_seed():
     assert len(reanchor_calls) == 2, f"expected 2 capped attempts, got {reanchor_calls}"
     # After the cap, the still-detected robot seeds a fresh object id.
     assert any(oid == 3 for (_f, oid) in stub.add_calls)
+
+
+# ---------------------------------------------------------------------------
+# Motion-override: pixel-motion evidence unblocks the seed rejection gates
+# (qm11: a sprinting robot's detections died as already_tracked against a
+# mask parked on static field equipment, then as roster_cap).
+# ---------------------------------------------------------------------------
+
+
+def test_box_motion_energy_high_for_moving_object_low_for_static():
+    from web.field.sam2_tracker import box_motion_energy
+    prev = np.zeros((20, 200), np.uint8)
+    cur = np.zeros((20, 200), np.uint8)
+    # A bright robot-blob that moves 6 px between frames inside the box.
+    prev[4:12, 60:80] = 200
+    cur[4:12, 66:86] = 200
+    moving_box = (55, 2, 90, 14)
+    static_box = (120, 2, 155, 14)
+    assert box_motion_energy(prev, cur, moving_box) > 0.05
+    assert box_motion_energy(prev, cur, static_box) == 0.0
+    # Degenerate box never divides by zero.
+    assert box_motion_energy(prev, cur, (5, 5, 5, 5)) == 0.0
+
+
+def test_motion_override_seeds_new_object_over_static_claimant():
+    """A detection claimed by a STATIONARY mask ("already_tracked") seeds a
+    new object anyway when motion_fn proves the detection is moving — the
+    static claimant is equipment/hijack, the mover is a robot."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [stub._rect_for(1)]  # always claimed by obj 1's mask
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        motion_fn=lambda local_idx, box: True,
+        max_active_objects=6, cull_enabled=False,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert any(oid == 3 for (_f, oid) in stub.add_calls), \
+        "moving detection over a static claimant must seed a new object"
+    assert any(e.get("event") == "sam2.motion_override" for e in diag._events)
+
+
+def test_motion_override_spares_moving_claimant():
+    """A claimant mask that is itself moving is a robot following its own
+    detection — the override must NOT fire (no duplicate ids)."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor(moving={1})
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Track obj 1's drifting rect so the detection stays claimed by it.
+        boundary_frame = local_idx
+        return [stub._rect_for(1, boundary_frame)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1, 0), stub._rect_for(2, 0)],
+        reprompt_every=2, detect_fn=detect_fn,
+        motion_fn=lambda local_idx, box: True,
+        max_active_objects=6, cull_enabled=False,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert all(oid != 3 for (_f, oid) in stub.add_calls), \
+        "override must not duplicate a claimant that is itself moving"
+    assert not any(e.get("event") == "sam2.motion_override" for e in diag._events)
+
+
+def test_motion_override_ignored_when_candidate_static():
+    """motion_fn says the candidate shows no pixel motion: the claimed
+    detection stays already_tracked (a parked robot is not equipment)."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [stub._rect_for(1)]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        motion_fn=lambda local_idx, box: False,
+        max_active_objects=6, cull_enabled=False,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "already_tracked" for e in diag._events)
+
+
+def test_motion_fn_exception_treated_as_static():
+    """A crashing motion_fn must degrade to no-override, never kill tracking."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [stub._rect_for(1)]
+
+    def motion_fn(local_idx, box):
+        raise RuntimeError("boom")
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, motion_fn=motion_fn,
+        max_active_objects=6, cull_enabled=False,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "already_tracked" for e in diag._events)
+
+
+def test_pick_evictable_moving_candidate_relaxes_absence_bar():
+    """A motion-proven candidate may evict a stationary object with a single
+    windowed absence, even when min_absences/k put every normal tier out of
+    reach. Without the moving-candidate flag the same evidence evicts nobody."""
+    from web.field.sam2_tracker import pick_evictable
+    from collections import deque
+    hist = {1: deque([True, False]), 2: deque([True, True])}
+    window = {1: [(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)],
+              2: [(8.0, 8.0), (8.0, 8.0)]}
+    kwargs = dict(k=99, stationary_m=0.5, last_visible_frame={1: 10, 2: 10},
+                  current_idx=10, dark_frames=999, min_absences=99)
+    assert pick_evictable([1, 2], hist, window, **kwargs) is None
+    assert pick_evictable([1, 2], hist, window,
+                          moving_candidate=True, **kwargs) == 1
+
+
+def test_moving_candidate_evicts_stationary_absentee_when_capped():
+    """Roster capped, every normal eviction tier out of reach: an unmatched
+    detection that PROVES motion still claims a seat from a stationary object
+    the detector failed to back; without motion proof it stays roster_cap."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+
+    def make_detect(stub):
+        # Corroborate obj 1 every boundary; obj 2 never; one new mover at 15.
+        def detect_fn(local_idx, frame_path):
+            return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+        return detect_fn
+
+    strict = dict(
+        reprompt_every=2, max_active_objects=2, cull_enabled=False,
+        cull_uncorroborated_reprompts=99, cull_evidence_window=5,
+        cull_stationary_m=0.5, evict_min_absences=99, evict_dark_frames=999,
+        object_metadata={1: "blue", 2: "red"},
+    )
+
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        detect_fn=make_detect(stub),
+        motion_fn=lambda local_idx, box: True,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+        **strict,
+    )
+    assert 2 in _culled_ids(diag), \
+        "motion-proven candidate must evict the stationary absentee"
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+
+    stub2 = CullStubPredictor()
+    tracker2 = Sam2FieldTracker(predictor=stub2)
+    diag2 = _ident_diag()
+    tracker2.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub2._rect_for(1), stub2._rect_for(2)],
+        detect_fn=make_detect(stub2),
+        project_fn=lambda box: bottom_center(box), diagnostics=diag2,
+        **strict,
+    )
+    assert _culled_ids(diag2) == set()
+    assert all(oid != 3 for (_f, oid) in stub2.add_calls)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "roster_cap" for e in diag2._events)
+
+
+def test_make_frame_diff_motion_fn_reads_exported_frames(tmp_path):
+    """The factory builds a motion_fn over the exported-frames directory:
+    True where pixels moved between local_idx-1 and local_idx, False in
+    static regions, False (never raising) when a frame is missing."""
+    import cv2
+    from web.field.sam2_tracker import make_frame_diff_motion_fn
+    prev = np.zeros((20, 200, 3), np.uint8)
+    cur = np.zeros((20, 200, 3), np.uint8)
+    prev[4:12, 60:80] = 200
+    cur[4:12, 66:86] = 200
+    cv2.imwrite(str(tmp_path / "00004.jpg"), prev)
+    cv2.imwrite(str(tmp_path / "00005.jpg"), cur)
+
+    motion_fn = make_frame_diff_motion_fn(str(tmp_path), energy_thresh=0.05)
+    assert motion_fn(5, (55, 2, 90, 14)) is True
+    assert motion_fn(5, (120, 2, 155, 14)) is False
+    # local_idx 0 has no predecessor; missing files are not an error.
+    assert motion_fn(0, (55, 2, 90, 14)) is False
+    assert motion_fn(9, (55, 2, 90, 14)) is False

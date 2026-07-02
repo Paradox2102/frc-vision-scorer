@@ -242,6 +242,21 @@ def assign_alliance(
         return []
     modes = {"off": [False], "on": [True], "auto": [False, True]}[flip_mode]
 
+    # Whole-match window (earliest to latest sample across ALL this match's
+    # slots, both alliances). Coverage measured against a slot's own span
+    # hides a late start entirely — qm11 R1 began 5.1 s into auto (the
+    # untracked opening sweep) yet scored coverage_frac=1.0.
+    starts, ends = [], []
+    for (m, _a, _p), rec in ours.items():
+        if m != match_number:
+            continue
+        ts = [s["timestamp"] for s in rec["samples"]]
+        if ts:
+            starts.append(min(ts))
+            ends.append(max(ts))
+    window_start = min(starts) if starts else None
+    window_s = (max(ends) - window_start) if starts else None
+
     best = None  # (total_cost, flip_y, pairs)
     for fy in modes:
         truth = truth_by_flip[fy]
@@ -263,12 +278,16 @@ def assign_alliance(
                 metrics = compare_paths(
                     ours[(match_number, alliance, op)]["path_m"],
                     truth[(match_number, alliance, tp)]["path_m"])
-                cov = summarize_our_path(ours[(match_number, alliance, op)]["samples"])
+                samples = ours[(match_number, alliance, op)]["samples"]
+                cov = summarize_our_path(samples, window_s=window_s)
+                first_ts = min(s["timestamp"] for s in samples)
                 pairs.append({
                     "our_slot": ours[(match_number, alliance, op)]["slot"],
                     "manta_pos": tp,
                     "manta_team": truth[(match_number, alliance, tp)]["team_number"],
                     "flip_y": fy, **metrics.as_row(), **cov,
+                    "start_lag_s": round(first_ts - window_start, 4)
+                                   if window_start is not None else None,
                 })
             best = (total, fy, pairs)
     return best[2] if best else []

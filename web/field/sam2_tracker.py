@@ -195,6 +195,64 @@ def bottom_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((x1 + x2) / 2, float(y2))
 
 
+def box_motion_energy(prev_gray: np.ndarray, cur_gray: np.ndarray,
+                      box: tuple[float, float, float, float]) -> float:
+    """Mean absolute intensity change inside ``box`` between two grayscale
+    frames, normalized to [0, 1].
+
+    The cameras are fixed, so frame differencing is a direct motion probe: a
+    robot sweeping through its detection box scores high (motion blur only
+    amplifies the signal), static equipment scores ~0 (JPEG noise). Callers
+    threshold the result; a degenerate or fully-clipped box scores 0.0.
+    """
+    h, w = cur_gray.shape[:2]
+    x1 = max(0, int(box[0]))
+    y1 = max(0, int(box[1]))
+    x2 = min(w, int(box[2]))
+    y2 = min(h, int(box[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    a = prev_gray[y1:y2, x1:x2].astype(np.int16)
+    b = cur_gray[y1:y2, x1:x2].astype(np.int16)
+    return float(np.abs(b - a).mean()) / 255.0
+
+
+def make_frame_diff_motion_fn(frames_dir: str, energy_thresh: float,
+                              filename_fmt: str = "{:05d}.jpg"):
+    """Build a ``motion_fn(local_idx, box) -> bool`` over exported frames.
+
+    Compares the boundary frame against its immediate predecessor (adjacent
+    exported frames, so one track_fps step apart) with
+    :func:`box_motion_energy`. Frames are cached one pair at a time —
+    boundaries are processed in order and every candidate at a boundary
+    shares the same pair. Missing/unreadable frames yield False, never an
+    exception (motion is only ever positive evidence).
+    """
+    import cv2
+
+    cache: dict[int, np.ndarray | None] = {}
+
+    def _gray(idx: int):
+        if idx not in cache:
+            if len(cache) > 4:
+                cache.clear()
+            img = cv2.imread(
+                os.path.join(frames_dir, filename_fmt.format(idx)),
+                cv2.IMREAD_GRAYSCALE)
+            cache[idx] = img
+        return cache[idx]
+
+    def motion_fn(local_idx: int, box) -> bool:
+        if local_idx <= 0:
+            return False
+        prev, cur = _gray(local_idx - 1), _gray(local_idx)
+        if prev is None or cur is None or prev.shape != cur.shape:
+            return False
+        return box_motion_energy(prev, cur, box) >= energy_thresh
+
+    return motion_fn
+
+
 def _ios(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """Intersection over Smaller-area (IoS) between two boolean masks.
 
@@ -363,18 +421,23 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
                    k: int, stationary_m: float,
                    last_visible_frame=None, current_idx=None,
                    dark_frames: int | None = None,
-                   min_absences: int = EVICT_MIN_ABSENCES) -> int | None:
+                   min_absences: int = EVICT_MIN_ABSENCES,
+                   moving_candidate: bool = False) -> int | None:
     """Return the active object best justified for eviction, or None.
 
     The roster should hold the objects MOST LIKELY to be robots; a fresh
     unmatched detection (detector-backed by construction) outranks a roster
-    member with weak evidence. Candidates are ranked in three tiers, strongest
+    member with weak evidence. Candidates are ranked in tiers, strongest
     eviction evidence first:
 
     1. Stationary + >= ``k`` windowed detector absences — the spontaneous
        hijack-cull bar (static field clutter). Most absences wins.
     2. Dark — the object's mask has not been emitted for >= ``dark_frames``
        (tracked in name only, not yet retired). Longest darkness wins.
+    2.5. Motion-proven candidate (``moving_candidate=True``) — a stationary
+       object with ANY windowed absence yields to a detection that proved
+       pixel motion. Moving almost always means robot; a stationary object
+       the detector failed to back at least once is the weaker claim.
     3. Least corroborated — >= ``min_absences`` windowed absences regardless
        of motion (a moving hijack such as a referee is exactly the object the
        bumper detector keeps failing to back). Most absences wins.
@@ -417,6 +480,23 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
             gap = current_idx - lv
             if gap >= dark_frames and gap > best_dark:
                 best, best_dark = oid, gap
+        if best is not None:
+            return best
+
+    # Tier 2.5: motion-proven candidate vs stationary absentee.
+    if moving_candidate:
+        best, best_absent = None, -1
+        for oid in active_objects:
+            hist = _evidence(oid)
+            if not hist:
+                continue
+            absent = sum(1 for c in hist if not c)
+            if absent < 1:
+                continue
+            if not is_stationary(field_pos_window.get(oid, []), stationary_m):
+                continue
+            if absent > best_absent:
+                best, best_absent = oid, absent
         if best is not None:
             return best
 
@@ -590,6 +670,7 @@ class Sam2FieldTracker:
         reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
         seed_gate_fn=None,
         project_fn=None,
+        motion_fn=None,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
     ) -> dict[int, dict[int, dict]]:
@@ -657,6 +738,17 @@ class Sam2FieldTracker:
                 new id — preserving identity across propagation collapse.
             reanchor_ios: Min IoS (over smaller) of the sliver mask vs the
                 detection box required to re-anchor.
+            motion_fn: Optional ``(local_idx, box) -> bool``; True means the
+                detection box shows real pixel motion at this boundary (e.g.
+                frame-diff energy above threshold). Motion is positive
+                evidence of robot-ness and unblocks two rejection gates: a
+                moving detection claimed by a STATIONARY mask seeds a new
+                object anyway (the claimant is parked equipment, not the
+                mover), and a moving unmatched detection may evict a
+                stationary once-absent object from a capped roster
+                (``pick_evictable`` tier 2.5). False/None/raising never
+                penalizes a detection — absence of motion is not evidence of
+                absence of a robot.
             seed_gate_fn: Optional ``(box) -> bool``; a detection for which it
                 returns False is never seeded as a NEW object (rejection reason
                 ``static_structure``) but still corroborates existing masks.
@@ -748,6 +840,7 @@ class Sam2FieldTracker:
         reprompting = bool(reprompt_every) and detect_fn is not None
         detected = []
         detect_fn_error_logged = False  # first-error print guard (one line per track())
+        motion_fn_error_logged = False  # same guard for motion_fn
 
         def _normalize_detections(items):
             boxes = []
@@ -1069,6 +1162,27 @@ class Sam2FieldTracker:
                                         details={"frame_idx": last_idx, "box": list(box)},
                                     )
 
+                    # Lazy per-boundary motion probe: True means candidate j
+                    # shows real pixel motion at this boundary. A crashing
+                    # motion_fn degrades to False (no override) — motion is
+                    # only ever positive evidence.
+                    motion_cache: dict[int, bool] = {}
+
+                    def _candidate_moving(j: int) -> bool:
+                        nonlocal motion_fn_error_logged
+                        if motion_fn is None:
+                            return False
+                        if j not in motion_cache:
+                            try:
+                                motion_cache[j] = bool(motion_fn(last_idx, new_boxes[j]))
+                            except Exception as exc:
+                                motion_cache[j] = False
+                                if not motion_fn_error_logged:
+                                    motion_fn_error_logged = True
+                                    print(f"  [{self.LOG_TAG}] motion_fn failed at frame "
+                                          f"{last_idx} (further errors suppressed): {exc!r}")
+                        return motion_cache[j]
+
                     # ---- Corroboration bookkeeping (windowed detector-absence +
                     # stationarity), maintained whenever the detector ran. The
                     # spontaneous hijack cull stays gated behind cull_enabled;
@@ -1242,6 +1356,27 @@ class Sam2FieldTracker:
                                             "dark_frames": last_idx - lv,
                                         },
                                     )
+                            elif (oid is not None and _candidate_moving(idx)
+                                    and is_stationary(
+                                        field_pos_window.get(oid, []),
+                                        cull_stationary_m)):
+                                # Motion override: a MOVING detection claimed
+                                # by a mask that has sat still all window is a
+                                # robot passing static equipment/hijack, not a
+                                # redundant sighting — promote it to the
+                                # new-object seeding path. A claimant that is
+                                # itself moving is a robot following its own
+                                # detection and keeps suppressing it.
+                                new_indices.append(idx)
+                                if diagnostics:
+                                    diagnostics.increment(
+                                        f"{self.DIAG_PREFIX}_motion_overrides")
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.motion_override",
+                                        details={"frame_idx": last_idx,
+                                                 "box": list(box_val),
+                                                 "claimant": oid},
+                                    )
                             elif diagnostics:
                                 diagnostics.record(
                                     f"{self.DIAG_PREFIX}.reprompt_rejected",
@@ -1374,6 +1509,7 @@ class Sam2FieldTracker:
                                     current_idx=last_idx,
                                     dark_frames=evict_dark_frames,
                                     min_absences=evict_min_absences,
+                                    moving_candidate=_candidate_moving(j),
                                 )
                                 if victim is not None:
                                     culled_set.add(victim)

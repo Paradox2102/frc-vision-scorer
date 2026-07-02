@@ -210,3 +210,76 @@ def test_bumper_admissible_accepts_corroborated_sliver():
     sliver = (10, 10, 14, 30)            # w/h = 0.2
     whole = (0, 0, 60, 60)               # whole-robot box covering it
     assert bumper_admissible(sliver, [whole]) is True
+
+
+def test_admit_low_conf_movers_keeps_high_conf_without_probe():
+    from web.field.detect_schema import admit_low_conf_movers
+    robots = [((0, 0, 10, 10), "red", 0.9), ((20, 0, 30, 10), "blue", 0.25)]
+    out = admit_low_conf_movers(robots, conf=0.4, motion_probe=None)
+    assert out == [((0, 0, 10, 10), "red", 0.9)]
+
+
+def test_admit_low_conf_movers_admits_moving_sub_threshold_detection():
+    """A blurred fast robot reads low confidence BECAUSE it is moving; the
+    motion probe is what proves the sub-threshold band is a robot (qm11 6800:
+    red bumper at 0.26-0.34 vs the 0.4 seed conf, whole sweep untracked)."""
+    from web.field.detect_schema import admit_low_conf_movers
+    robots = [((0, 0, 10, 10), "red", 0.9),
+              ((20, 0, 30, 10), "red", 0.26),   # moving -> admit
+              ((40, 0, 50, 10), "blue", 0.30)]  # static -> reject
+    moving = {(20, 0, 30, 10)}
+    out = admit_low_conf_movers(robots, conf=0.4,
+                                motion_probe=lambda box: tuple(box) in moving)
+    assert ((20, 0, 30, 10), "red", 0.26) in out
+    assert all(b != (40, 0, 50, 10) for b, _c, _cf in out)
+    assert ((0, 0, 10, 10), "red", 0.9) in out
+
+
+def test_admit_low_conf_movers_probe_exception_rejects_only_that_box():
+    from web.field.detect_schema import admit_low_conf_movers
+    def probe(box):
+        raise RuntimeError("boom")
+    robots = [((0, 0, 10, 10), "red", 0.9), ((20, 0, 30, 10), "red", 0.26)]
+    out = admit_low_conf_movers(robots, conf=0.4, motion_probe=probe)
+    assert out == [((0, 0, 10, 10), "red", 0.9)]
+
+
+def test_motion_blob_boxes_finds_moving_robot_ignores_static():
+    from web.field.detect_schema import motion_blob_boxes
+    rng = np.random.default_rng(42)
+    texture = rng.integers(60, 255, size=(100, 140), dtype=np.uint8)
+    prev = np.zeros((400, 800), np.uint8)
+    cur = np.zeros((400, 800), np.uint8)
+    prev[100:200, 300:440] = texture   # textured robot-sized blob...
+    cur[100:200, 330:470] = texture    # ...moves 30 px intact
+    boxes = motion_blob_boxes(prev, cur)
+    assert len(boxes) == 1
+    x1, y1, x2, y2 = boxes[0]
+    # Blob spans the union of the two positions (plus dilation slack).
+    assert x1 <= 310 and x2 >= 460 and y1 <= 110 and y2 >= 190
+    assert motion_blob_boxes(prev, prev) == []
+
+
+def test_motion_blob_boxes_rejects_ball_sized_blobs():
+    from web.field.detect_schema import motion_blob_boxes
+    prev = np.zeros((400, 800), np.uint8)
+    cur = np.zeros((400, 800), np.uint8)
+    prev[100:128, 300:328] = 180   # ~28 px ball...
+    cur[100:128, 340:368] = 180    # ...flies right
+    assert motion_blob_boxes(prev, cur) == []
+
+
+def test_motion_blob_boxes_rejects_full_frame_change():
+    from web.field.detect_schema import motion_blob_boxes
+    prev = np.zeros((400, 800), np.uint8)
+    cur = np.full((400, 800), 120, np.uint8)  # global light change
+    assert motion_blob_boxes(prev, cur) == []
+
+
+def test_merge_colorless_candidates_dedups_blobs_against_whole_robots():
+    from web.field.detect_schema import merge_colorless_candidates
+    whole = [(100, 100, 220, 200)]
+    blobs = [(110, 105, 215, 195),   # same robot seen by both -> dropped
+             (500, 100, 620, 210)]   # blob-only mover -> kept
+    out = merge_colorless_candidates(whole, blobs, ios_thresh=0.5)
+    assert out == [(100, 100, 220, 200), (500, 100, 620, 210)]

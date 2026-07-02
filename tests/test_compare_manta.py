@@ -68,3 +68,36 @@ def test_summarize_our_path_flags_dropout():
     assert s["tracked_len_m"] == 2.0
     assert s["n_gaps"] == 1
     assert abs(s["max_gap_s"] - 4.9) < 1e-6
+
+
+def _samples(t0, t1, xy=(1.0, 1.0), step=0.2):
+    ts = np.arange(t0, t1 + 1e-9, step)
+    return [{"timestamp": round(float(t), 4), "field_pos": [xy[0] + 0.01 * i, xy[1]]}
+            for i, t in enumerate(ts)]
+
+
+def test_assign_alliance_reports_start_lag_and_window_coverage():
+    """A slot that starts 5 s into the match must NOT score 100% coverage:
+    coverage is measured against the whole-match window (earliest to latest
+    sample across all slots), and the late start is reported as start_lag_s.
+    qm11: R1 started 5.1 s late yet scored coverage_frac=1.0, hiding the
+    untracked opening sweep."""
+    from scripts.compare_manta import assign_alliance
+    path = np.array([[1.0, 1.0], [1.5, 1.0]], float)
+    ours = {
+        (11, "red", 1): {"replay_id": "x", "match_key": "t_qm11", "slot": "R1",
+                         "path_m": path, "samples": _samples(7.5, 27.5)},
+        (11, "red", 2): {"replay_id": "x", "match_key": "t_qm11", "slot": "R2",
+                         "path_m": path, "samples": _samples(12.5, 27.5)},
+    }
+    truth = {
+        (11, "red", 1): {"team_number": 111, "path_m": path},
+        (11, "red", 2): {"team_number": 222, "path_m": path + 5.0},
+    }
+    pairs = assign_alliance(ours, {False: truth, True: {}}, 11, "red", "off")
+    by_slot = {p["our_slot"]: p for p in pairs}
+    assert abs(by_slot["R1"]["start_lag_s"] - 0.0) < 1e-6
+    assert abs(by_slot["R2"]["start_lag_s"] - 5.0) < 1e-6
+    # R2 tracked 15 of the 20 s window -> 75%, not 100%.
+    assert abs(by_slot["R1"]["coverage_frac"] - 1.0) < 0.02
+    assert abs(by_slot["R2"]["coverage_frac"] - 0.75) < 0.02

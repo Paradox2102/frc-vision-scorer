@@ -60,6 +60,8 @@ PROFILES = {
     # alternation. The relink distance gate was A/B'd for qm8 but left
     # default-off; this isolates it against the (already default-on) tracker
     # side.
+    # One plain-defaults job (for validating default-on fixes on any match).
+    "single": [("baseline", {})],
     "relink": [
         ("baseline", {}),
         ("relink-gate", {"relink_max_dist_m": 3.0}),
@@ -73,6 +75,46 @@ PROFILES = {
         ("frac-fix", {"det_frac_backstop": "uncalibrated"}),
         ("frac-fix+guard", {"det_frac_backstop": "uncalibrated",
                             "occlusion_rebind_guard": True}),
+    ],
+    # qm11 fast-robot blackout: pixel-motion evidence unblocks the seed
+    # rejection gates (already_tracked vs a stationary claimant; roster_cap
+    # eviction tier 2.5). motion+cull adds the static-equipment cull on top.
+    "motion": [
+        ("baseline", {}),
+        ("motion", {"motion_override": True}),
+        ("motion+cull", {"motion_override": True, "cull_hijack_enabled": True}),
+    ],
+    # Resume variant: baseline already scored before a server restart.
+    "motion-only": [
+        ("motion", {"motion_override": True}),
+        ("motion+cull", {"motion_override": True, "cull_hijack_enabled": True}),
+    ],
+    # Motion-gated low-conf admission on top of the override (qm11 6800: dark
+    # blurred bumper reads 0.26-0.34, below the 0.4 seed conf; the low band is
+    # admitted only where pixels moved).
+    "motion-lowconf": [
+        ("baseline", {}),
+        ("override", {"motion_override": True}),
+        ("override+lowconf", {"motion_override": True, "motion_gated_conf": True}),
+        ("all", {"motion_override": True, "motion_gated_conf": True,
+                 "cull_hijack_enabled": True}),
+    ],
+    # New-configs-only variant (baseline and override already scored).
+    "lowconf-only": [
+        ("override+lowconf", {"motion_override": True, "motion_gated_conf": True}),
+        ("all", {"motion_override": True, "motion_gated_conf": True,
+                 "cull_hijack_enabled": True}),
+    ],
+    # qm11 sprint fix, full stack: seed at auto start (offset 0 — the 2s
+    # boundary reprompts are the "second seed", deduped against propagated
+    # masks), motion-gated low-conf admission, motion override, and
+    # detector-independent diff-blob candidates.
+    "sprint-fix": [
+        ("dual-seed", {"sam2_prompt_offset_seconds": 0.0,
+                       "motion_override": True, "motion_gated_conf": True}),
+        ("dual-seed+blobs", {"sam2_prompt_offset_seconds": 0.0,
+                             "motion_override": True, "motion_gated_conf": True,
+                             "motion_seed_blobs": True}),
     ],
 }
 CONFIGS = PROFILES["full"]
@@ -147,6 +189,13 @@ def score() -> dict:
         "n_blue": len(blue), "n_red": len(red),
         "red_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in red},
         "blue_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in blue},
+        # Seconds each slot's path starts after the match window opens — a
+        # late start is an untracked opening (qm11 6800's first sweep), which
+        # span-relative coverage alone cannot see.
+        "red_lag": {str(p["manta_team"]): round(p["start_lag_s"], 1) for p in red
+                    if p.get("start_lag_s") is not None},
+        "blue_lag": {str(p["manta_team"]): round(p["start_lag_s"], 1) for p in blue
+                     if p.get("start_lag_s") is not None},
     }
 
 

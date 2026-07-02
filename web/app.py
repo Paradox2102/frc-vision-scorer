@@ -84,14 +84,18 @@ from web.field.detect_bridge import (
 )
 from web.field.detect_schema import (
     DetectionSchema,
+    admit_low_conf_movers,
     bumper_admissible,
     expand_bumper_to_robot,
     box_ios,
+    merge_colorless_candidates,
     merge_robot_detections,
+    motion_blob_boxes,
     plausible_bumper_box,
     reject_person_candidates,
     select_gap_fills,
 )
+from web.field.sam2_tracker import box_motion_energy
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
@@ -1359,7 +1363,24 @@ class InferenceJob:
                     valid_boxes.append(box)
         return valid_boxes
 
-    def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4):
+    def _motion_seed_inputs(self, prev_gray, cur_gray):
+        """(motion_probe, motion_boxes) for _sam2_robot_candidates, per the
+        motion knobs. (None, None) without a usable frame pair."""
+        if (prev_gray is None or cur_gray is None
+                or prev_gray.shape != cur_gray.shape):
+            return None, None
+        probe = None
+        if self.config.motion_gated_conf:
+            def probe(box, _p=prev_gray, _c=cur_gray,
+                      _t=self.config.motion_energy_thresh):
+                return box_motion_energy(_p, _c, box) >= _t
+        boxes = None
+        if self.config.motion_seed_blobs:
+            boxes = motion_blob_boxes(prev_gray, cur_gray)
+        return probe, boxes
+
+    def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
+                               motion_probe=None, motion_boxes=None):
         """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
@@ -1370,12 +1391,24 @@ class InferenceJob:
         differ between the prompt-seeding and re-prompt paths).
         """
         whole_boxes = self._detect_whole_robots(frame)
+        if motion_boxes:
+            # Frame-diff blobs join as colorless candidates (deduped against
+            # YOLO's whole robots); the gap-fill path colors them later.
+            whole_boxes = merge_colorless_candidates(
+                whole_boxes, motion_boxes, ROBOT_FILL_IOS)
         bumper_robots = []
         if self.bumper_model is not None:
-            res = self.bumper_model(frame, conf=conf, verbose=False)[0]
+            # Motion-gated low-conf admission: with a motion probe available,
+            # detect down to det_conf_floor and let admit_low_conf_movers
+            # keep the sub-conf band only where pixels actually moved.
+            gated = motion_probe is not None and self.config.motion_gated_conf
+            run_conf = min(conf, self.config.det_conf_floor) if gated else conf
+            res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
                 sv.Detections.from_ultralytics(res)
             )
+            if gated:
+                robots = admit_low_conf_movers(robots, conf, motion_probe)
             for box, color, _confidence in robots:
                 if not bumper_admissible(box, whole_boxes):
                     continue
@@ -4834,6 +4867,9 @@ class InferenceJob:
                 view_dirs = {v.name: tempfile.TemporaryDirectory() for v in self.views}
                 view_prompt_boxes: dict[str, list] = {v.name: [] for v in self.views}
                 view_prompt_colors: dict[str, list] = {v.name: [] for v in self.views}
+                # Per-view grayscale of the previous kept frame, for the seed
+                # frame's motion probe (motion-gated low-conf admission).
+                view_prev_gray: dict[str, np.ndarray] = {}
                 EXPORT_PCT = 25.0  # share of the progress bar spent exporting frames
                 export_t0 = time.perf_counter()
                 exported = 0
@@ -4874,10 +4910,27 @@ class InferenceJob:
                                     fname = os.path.join(view_dirs[view.name].name, f"{view_local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
  
+                                    # Motion evidence for the seed frame: diff
+                                    # vs this view's previous kept frame (low-
+                                    # conf gate + detector-independent blobs).
+                                    seed_motion_probe = seed_motion_boxes = None
+                                    if (self.config.motion_gated_conf
+                                            or self.config.motion_seed_blobs):
+                                        if is_prompt:
+                                            seed_motion_probe, seed_motion_boxes = (
+                                                self._motion_seed_inputs(
+                                                    view_prev_gray.get(view.name),
+                                                    cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)))
+                                        elif fpos < prompt_frame:
+                                            view_prev_gray[view.name] = cv2.cvtColor(
+                                                crop, cv2.COLOR_BGR2GRAY)
+
                                     # Seed SAM2 from expanded bumper detections so masks
                                     # cover whole robots while color stays class-derived.
                                     if is_prompt:
-                                        merged = self._sam2_robot_candidates(crop)
+                                        merged = self._sam2_robot_candidates(
+                                            crop, motion_probe=seed_motion_probe,
+                                            motion_boxes=seed_motion_boxes)
                                         full_boxes = [
                                             (
                                                 box[0],
@@ -5066,7 +5119,28 @@ class InferenceJob:
                                 )
                                 if top_crop_px:
                                     crop = crop[top_crop_px:, :]
-                                merged = self._sam2_robot_candidates(crop)
+                                # Motion evidence: diff against the previous
+                                # kept frame in this view's plan (one extra
+                                # decode per boundary; the YOLO pass beside
+                                # it dwarfs the cost).
+                                motion_probe = motion_boxes = None
+                                if ((self.config.motion_gated_conf
+                                        or self.config.motion_seed_blobs)
+                                        and local_idx > 0):
+                                    prev_sf = view_plan.source_frames[local_idx - 1]
+                                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, prev_sf)
+                                    ok_p, fr_p = cap_l.read()
+                                    state["pos"] = prev_sf + 1
+                                    if ok_p and fr_p is not None:
+                                        pcrop = view.extract(fr_p)
+                                        if top_crop_px:
+                                            pcrop = pcrop[top_crop_px:, :]
+                                        motion_probe, motion_boxes = self._motion_seed_inputs(
+                                            cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
+                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+                                merged = self._sam2_robot_candidates(
+                                    crop, motion_probe=motion_probe,
+                                    motion_boxes=motion_boxes)
                                 # Field-filter in full-view coords (restore the
                                 # top-crop offset). No blocked_zones: detect_fn
                                 # output also corroborates existing masks (a
@@ -5166,6 +5240,18 @@ class InferenceJob:
                             ),
                         )
 
+                        # Motion override (A/B knob): frame-diff motion probe
+                        # over this view's exported frames; boxes at boundaries
+                        # are in the same scaled/cropped pixel space as the
+                        # jpgs, so no coordinate translation is needed.
+                        _motion_fn = None
+                        if self.config.motion_override:
+                            from web.field.sam2_tracker import make_frame_diff_motion_fn
+                            _motion_fn = make_frame_diff_motion_fn(
+                                tmp_dir_obj.name,
+                                self.config.motion_energy_thresh,
+                            )
+
                         t0 = time.perf_counter()
                         view_tracks = await asyncio.to_thread(
                             sam2_tracker.track,
@@ -5174,6 +5260,7 @@ class InferenceJob:
                             prompt_boxes=prompt_boxes_scaled,
                             reprompt_every=reprompt_every,
                             detect_fn=make_detect_fn(_detect_caps),
+                            motion_fn=_motion_fn,
                             object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
                             max_active_objects=MAX_TRACKED_ROBOTS,

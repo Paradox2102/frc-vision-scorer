@@ -127,6 +127,81 @@ def reject_person_candidates(candidates, person_boxes, coverage_thresh=0.6):
     ]
 
 
+def admit_low_conf_movers(robots, conf, motion_probe):
+    """Filter ``(box, color, confidence)`` detections at ``conf``, admitting
+    the sub-threshold band only when ``motion_probe(box)`` proves pixel motion.
+
+    Motion blur is WHY a fast robot's bumper reads low confidence, and motion
+    is what proves the low read is a robot rather than static clutter — the
+    failure mode self-identifies. A ``None`` probe (gating disabled, or no
+    previous frame yet) reduces to the plain threshold; a raising probe
+    rejects only that detection.
+    """
+    out = []
+    for box, color, confidence in robots:
+        if confidence >= conf:
+            out.append((box, color, confidence))
+            continue
+        if motion_probe is None:
+            continue
+        try:
+            moving = bool(motion_probe(box))
+        except Exception:
+            moving = False
+        if moving:
+            out.append((box, color, confidence))
+    return out
+
+
+def motion_blob_boxes(prev_gray, cur_gray, diff_thresh=25, min_side_px=48,
+                      max_area_frac=0.25, max_aspect=4.0, dilate_px=6):
+    """Detector-independent robot candidates from frame differencing.
+
+    Fixed cameras make the absdiff of consecutive tracked frames a direct
+    motion map; a fast robot YOLO whiffs on (motion blur, dark bumpers) is
+    still a fat bright blob here — the blur widens it. Returns (x1,y1,x2,y2)
+    component boxes filtered to robot-plausible sizes: ``min_side_px`` drops
+    balls (even dilation-merged pairs), ``max_area_frac`` drops global light
+    changes, ``max_aspect`` drops thin ball-trail streaks. Callers feed these
+    into the colorless gap-fill path; field/person/zone filters and the
+    tracker's own gates do the rest of the vetting.
+    """
+    import cv2
+
+    diff = cv2.absdiff(prev_gray, cur_gray)
+    _thr, mask = cv2.threshold(diff, diff_thresh, 255, cv2.THRESH_BINARY)
+    if dilate_px:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
+        mask = cv2.dilate(mask, k)
+    n, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
+    frame_area = float(cur_gray.shape[0] * cur_gray.shape[1])
+    out = []
+    for i in range(1, n):
+        x, y, w, h = (int(stats[i][j]) for j in range(4))
+        if min(w, h) < min_side_px:
+            continue
+        if w * h > max_area_frac * frame_area:
+            continue
+        if max(w, h) > max_aspect * min(w, h):
+            continue
+        out.append((x, y, x + w, y + h))
+    return out
+
+
+def merge_colorless_candidates(whole_boxes, motion_boxes, ios_thresh):
+    """Union whole-robot detections with motion blobs, motion deduped last.
+
+    A robot both YOLO and the diff see must contribute ONE colorless
+    candidate; a blob is added only when it overlaps nothing already kept
+    (max IoS <= ``ios_thresh``)."""
+    out = list(whole_boxes)
+    for mb in motion_boxes:
+        if all(box_ios(mb, wb) <= ios_thresh for wb in out):
+            out.append(tuple(mb))
+    return out
+
+
 def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh):
     """Combine bumper-derived robot boxes with whole-robot gap-fill boxes.
 

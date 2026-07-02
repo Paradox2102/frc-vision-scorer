@@ -92,6 +92,10 @@ class DiagnosticReasons:
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}
+# The SAM tracker code is shared between backends and emits events under its
+# DIAG_PREFIX ("sam2" or "sam3"). Mirror every sam2.* event for sam3 so SAM3
+# runs aren't schema-rejected (they were silently dropped: qm10 dropped_logs=201).
+ALL_EVENTS |= {f"sam3.{e.split('.', 1)[1]}" for e in ALL_EVENTS if e.startswith("sam2.")}
 ALL_REASONS = {getattr(DiagnosticReasons, k) for k in dir(DiagnosticReasons) if not k.startswith("_")}
 
 

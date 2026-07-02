@@ -5,6 +5,7 @@ Per frame, per alliance, assign that color's <=3 detections to its 3 slots by
 minimum-cost matching, brute-forced over small permutation sets. Update matched, coast
 unmatched. Occluded slots coast far longer and cannot be re-seeded. Alliance sticky."""
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass
 from itertools import permutations
 from typing import Optional
@@ -82,13 +83,18 @@ class _Track:
     coasting: bool = False
     active: bool = False
     corner_only: bool = False
+    # Went into coast while hub-occluded; stays set until re-acquired. Gates the
+    # occlusion re-acquisition guard (suspect-zone detections need motion proof).
+    occ_coasting: bool = False
 
 
 class FieldTracker:
     def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
                  max_coast_occluded=90, color_penalty=3.0, zones=None,
                  corner_only_r_scale=8.0, coast_vel_decay=0.85,
-                 max_speed_m_s=5.5, sticky_max_dist_m=0.0):
+                 max_speed_m_s=5.5, sticky_max_dist_m=0.0,
+                 suspect_zones=None, occlusion_rebind_guard=False,
+                 guard_motion_m=0.3, guard_motion_window=5):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -110,6 +116,18 @@ class FieldTracker:
         # Static-structure zones (field meters). A new slot is never seeded from
         # a detection inside a zone; existing tracks update normally.
         self.zones = list(zones) if zones else []
+        # Occlusion re-acquisition guard: while a slot coasts hub-occluded, a
+        # detection inside a suspect zone (bump/hub/trench footprint — places a
+        # false positive parks) may not claim that slot or seed a new one until
+        # its track_id displaces >= guard_motion_m within the last
+        # guard_motion_window update calls. Robots legitimately drive over these
+        # structures, so unlike `zones` this is motion-conditioned, not a hard block.
+        self.suspect_zones = list(suspect_zones) if suspect_zones else []
+        self.occlusion_rebind_guard = bool(occlusion_rebind_guard)
+        self.guard_motion_m = float(guard_motion_m)
+        self.guard_motion_window = int(guard_motion_window)
+        self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
+        self._frame_idx = 0
         self.tracks = []
         sid = 0
         for a in ALLIANCES:
@@ -124,9 +142,55 @@ class FieldTracker:
     def _slots(self, alliance):
         return [t for t in self.tracks if t.alliance == alliance]
 
+    def _record_det_history(self, detections):
+        """Track recent positions per stable track_id for the motion proof."""
+        for d in detections:
+            if d.track_id is None:
+                continue
+            h = self._det_history.get(d.track_id)
+            if h is None:
+                h = self._det_history[d.track_id] = deque(
+                    maxlen=self.guard_motion_window + 3)
+            h.append((self._frame_idx, (float(d.pos[0]), float(d.pos[1]))))
+        if len(self._det_history) > 256:
+            stale = self._frame_idx - 3 * self.guard_motion_window
+            for tid in [tid for tid, h in self._det_history.items()
+                        if h[-1][0] < stale]:
+                del self._det_history[tid]
+
+    def _det_moving(self, d):
+        """Has this detection's track_id displaced >= guard_motion_m within the
+        last guard_motion_window update calls? track_id-less detections can
+        never prove motion (conservative: guard treats them as stationary)."""
+        if d.track_id is None:
+            return False
+        h = self._det_history.get(d.track_id)
+        if not h:
+            return False
+        recent = [p for f, p in h if f > self._frame_idx - self.guard_motion_window]
+        if len(recent) < 2:
+            return False
+        span = 0.0
+        for i in range(len(recent)):
+            for j in range(i + 1, len(recent)):
+                dx = recent[i][0] - recent[j][0]
+                dy = recent[i][1] - recent[j][1]
+                span = max(span, (dx * dx + dy * dy) ** 0.5)
+        return span >= self.guard_motion_m
+
+    def _guard_blocks(self, slot, d):
+        """Suspect-zone detection may not claim an occlusion-coasting slot
+        until it proves motion."""
+        return (self.occlusion_rebind_guard and slot.occ_coasting
+                and point_in_zones(d.pos, self.suspect_zones)
+                and not self._det_moving(d))
+
     def update(self, detections, occlusion, dt):
         self.binding_events = []
         self.assignment_evidence = {}
+        self._frame_idx += 1
+        if self.occlusion_rebind_guard:
+            self._record_det_history(detections)
         # Predict step for all active tracks
         for t in self.tracks:
             if t.active:
@@ -162,6 +226,8 @@ class FieldTracker:
             budget = self.max_occ if occ else self.max_open
             if t.missed > 0:
                 t.coasting = True
+                if occ:
+                    t.occ_coasting = True
                 if t.kf is not None:
                     t.kf.decay_velocity(self.coast_vel_decay)
             if t.missed > budget:
@@ -170,6 +236,7 @@ class FieldTracker:
                 t.kf = None
                 t.box = None
                 t.coasting = False
+                t.occ_coasting = False
                 tids_to_del = [tid for tid, sid in self._id_to_slot.items() if sid == t.slot_id]
                 for tid in tids_to_del:
                     del self._id_to_slot[tid]
@@ -212,11 +279,24 @@ class FieldTracker:
                         # detection can claim its own slot.
                         remaining_pairs.append((orig_idx, d))
                         continue
+                    if self._guard_blocks(slot, d):
+                        # Known id gone motionless on a static structure while
+                        # its slot is hub-occluded: hold the binding. The det is
+                        # consumed (it must not seed elsewhere); the slot stays
+                        # coasting and re-binds when this id proves motion.
+                        self.binding_events.append({
+                            "event": "occlusion_rebind_held",
+                            "slot_id": slot.slot_id,
+                            "track_id": tid,
+                            "alliance": slot.alliance,
+                        })
+                        continue
                     self._measured_update(slot, d, dt)
                     slot.box = d.box
                     slot.missed = 0
                     slot.hits += 1
                     slot.coasting = False
+                    slot.occ_coasting = False
                     self.last_det_to_slot[orig_idx] = slot.slot_id
                     self.binding_events.append({
                         "event": "slot_rebound",
@@ -251,6 +331,7 @@ class FieldTracker:
         idxs = [i for (i, _) in dets_with_idx]
         dets = [d for (_, d) in dets_with_idx]
 
+        guard_blocked = set()  # det indices barred from seeding this call
         if active_slots and dets:
             # Build cost matrix: rows=active_slots, cols=dets
             n = len(active_slots)
@@ -265,6 +346,19 @@ class FieldTracker:
                     # wider gate), but cap the multiplier to prevent teleportation.
                     effective_gate = self.gate * min(4.0, 1.0 + 0.5 * t.missed)
                     if dist <= effective_gate:
+                        if self._guard_blocks(t, d):
+                            # In-gate suspect-zone detection vs an occlusion-
+                            # coasting slot: leave the pair unmatchable and bar
+                            # the det from seeding (a bump false positive must
+                            # not become a robot while the real one is hidden).
+                            guard_blocked.add(j)
+                            self.binding_events.append({
+                                "event": "occlusion_rebind_held",
+                                "slot_id": t.slot_id,
+                                "track_id": d.track_id,
+                                "alliance": t.alliance,
+                            })
+                            continue
                         c = dist
                         if d.color == "unknown":
                             c += self.color_penalty
@@ -285,6 +379,7 @@ class FieldTracker:
                     t.missed = 0
                     t.hits += 1
                     t.coasting = False
+                    t.occ_coasting = False
                     matched_slot_indices.add(r)
                     matched_det_indices.add(c)
                     self.last_det_to_slot[idxs[c]] = t.slot_id
@@ -316,7 +411,7 @@ class FieldTracker:
             for j, d in leftover_pairs:
                 if not free_slots:
                     break
-                if point_in_zones(d.pos, self.zones):
+                if j in guard_blocked or point_in_zones(d.pos, self.zones):
                     continue
                 slot = free_slots.pop(0)
                 slot.kf = _KF(d.pos)

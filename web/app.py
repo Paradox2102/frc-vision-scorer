@@ -71,6 +71,7 @@ from web.field.occlusion import (
 from web.field.overlay_geometry import (
     bump_wireframe_edges,
     hub_wireframe_edges,
+    structure_footprints,
     tower_wireframe_edges,
     trench_wireframe_edges,
 )
@@ -713,6 +714,11 @@ ROBOT_FILL_ENABLED = os.environ.get("ROBOT_FILL_ENABLED", "1") == "1"
 ROBOT_FILL_CONF = float(os.environ.get("ROBOT_FILL_CONF", str(DET_CONF_THRESHOLD)))
 ROBOT_FILL_IOS = float(os.environ.get("ROBOT_FILL_IOS", "0.5"))
 ROBOT_FILL_MAX_BOX_FRAC = float(os.environ.get("ROBOT_FILL_MAX_BOX_FRAC", "0.5"))
+# Relaxed cap used when det_frac_backstop="uncalibrated": a robot close to a
+# low corner camera legitimately spans most of the short panel's height, and
+# 0.5 made the whole-robot fill blind exactly where corners matter (qm10 4027).
+ROBOT_FILL_MAX_BOX_FRAC_CLOSE = float(
+    os.environ.get("ROBOT_FILL_MAX_BOX_FRAC_CLOSE", "0.9"))
 
 # Scoring parameters
 BALL_PROXIMITY_FRAMES = 30  # Look back this many frames for ball near robot
@@ -1341,12 +1347,15 @@ class InferenceJob:
             return []
         results = self.model(frame, conf=ROBOT_FILL_CONF, verbose=False)[0]
         dets = sv.Detections.from_ultralytics(results)
-        
+
+        max_frac = (ROBOT_FILL_MAX_BOX_FRAC_CLOSE
+                    if self.config.det_frac_backstop == "uncalibrated"
+                    else ROBOT_FILL_MAX_BOX_FRAC)
         valid_boxes = []
         for i in range(len(dets)):
             if int(dets.class_id[i]) == self.whole_robot_class_id:
                 box = tuple(float(v) for v in dets.xyxy[i])
-                if not box_exceeds_frac(box, frame.shape, ROBOT_FILL_MAX_BOX_FRAC):
+                if not box_exceeds_frac(box, frame.shape, max_frac):
                     valid_boxes.append(box)
         return valid_boxes
 
@@ -1473,6 +1482,7 @@ class InferenceJob:
             robot_boxes, cal, self.field_dims, colors=robot_colors,
             frame_shape=frame.shape,
             rejected_out=rejected,
+            frac_backstop=self.config.det_frac_backstop,
         )
         # Corner-camera range falloff: attenuate (via det.score, which scales
         # the fusion weight) instead of hard-dropping, so center-field robots
@@ -4172,11 +4182,28 @@ class InferenceJob:
             if static_zones:
                 print(f"  Static-structure zones (field m, user zones "
                       f"inflated {ZONE_SEED_MARGIN_M}m): {static_zones}")
+            # Suspect zones for the occlusion re-acquisition guard: bounding
+            # rects of every fixed structure footprint (bumps/hubs/trenches).
+            # Unlike static_zones these are motion-conditioned in the tracker,
+            # not hard no-seed blocks — robots legitimately cross bumps.
+            suspect_zones = []
+            if self.config.occlusion_rebind_guard:
+                footprints = structure_footprints(self.field_model, self.hub_prisms)
+                for polys in footprints.values():
+                    for poly in polys:
+                        xs = [p[0] for p in poly]
+                        ys = [p[1] for p in poly]
+                        suspect_zones.append(
+                            (min(xs), min(ys), max(xs), max(ys)))
+                print(f"  Occlusion rebind guard ON: {len(suspect_zones)} "
+                      "suspect structure footprints")
             self.field_tracker = FieldTracker(
                 self.field_model.length_m, zones=static_zones,
                 corner_only_r_scale=self.config.corner_only_r_scale,
                 coast_vel_decay=self.config.coast_vel_decay,
-                sticky_max_dist_m=self.config.sticky_max_dist_m)
+                sticky_max_dist_m=self.config.sticky_max_dist_m,
+                suspect_zones=suspect_zones,
+                occlusion_rebind_guard=self.config.occlusion_rebind_guard)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -4871,6 +4898,7 @@ class InferenceJob:
                                             ),
                                             blocked_zones=self.static_seed_zones,
                                             ray_blocked_zones=self._ray_zone_list(view),
+                                            frac_backstop=self.config.det_frac_backstop,
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
                                         
@@ -5057,6 +5085,7 @@ class InferenceJob:
                                         crop.shape[1],
                                         3,
                                     ),
+                                    frac_backstop=self.config.det_frac_backstop,
                                 )
                                 return [
                                     (
@@ -5348,6 +5377,7 @@ class InferenceJob:
                     colors=early_colors,
                     frame_shape=early_overhead.shape,
                     rejected_out=early_rejected,
+                    frac_backstop=self.config.det_frac_backstop,
                 )
                 if early_rejected:
                     self.hard_neg_logger.maybe_log(
@@ -5507,6 +5537,7 @@ class InferenceJob:
                                 cal,
                                 self.field_dims,
                                 frame_shape=view_frame.shape,
+                                frac_backstop=self.config.det_frac_backstop,
                             ):
                                 continue
                             uv = ((fx1 + fx2) / 2.0, fy2)

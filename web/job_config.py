@@ -139,6 +139,19 @@ KNOBS = [
     # distance matching and can claim its own slot. 0 = off. See tracker.py.
     # DEFAULT 2.5 m: A/B-validated on qm8 + qm2 with merge_main_guard (above).
     Knob("sticky_max_dist_m", "STICKY_MAX_DIST_M", float, 2.5, min=0.0, max=20.0),
+    # Occlusion re-acquisition guard: while a slot coasts hub-occluded, a
+    # detection sitting on a static-structure footprint (bump/hub/trench) may
+    # not re-bind that slot or seed a new one until its track_id proves motion
+    # over recent frames. Targets the bump/depot mask-hijack after a robot
+    # drives behind the hub (qm10 blue side). DEFAULT OFF pending A/B.
+    Knob("occlusion_rebind_guard", "OCCLUSION_REBIND_GUARD", bool, False),
+    # Scope of the too-large image-fraction backstop in detect_bridge.
+    # "always" (legacy): drop any box spanning >50% of the frame in either
+    # dimension. "uncalibrated": apply only when the pose-based width checks
+    # could not run — a close robot legitimately fills most of a short corner
+    # panel's height (qm10: 4027 invisible to corner_left at close range).
+    Knob("det_frac_backstop", "DET_FRAC_BACKSTOP", str, "always",
+         choices=("always", "uncalibrated")),
     # --- match-period gating ---
     # Process ONLY the autonomous window (clock-locked) instead of the whole
     # match. Used to A/B against Manta human-scouted auto paths, which only

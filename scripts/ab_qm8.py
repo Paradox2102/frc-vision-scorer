@@ -36,6 +36,36 @@ PROFILES = {
         ("both", {"relink_max_dist_m": 3.0, **TRACKER_SIDE}),
     ],
     "validate": [("baseline", {}), ("tracker-side", TRACKER_SIDE)],
+    # qm10 blue-side failure: SAM3 masks hijacked by static field equipment
+    # (B1 green machine at ~(1.4,2.7), B3 tan machine at ~(7.9,2.6)). Tests the
+    # opt-in hijack cull (default-off since the qm24 gate) and mask re-anchoring.
+    "static-cull": [
+        ("baseline", {}),
+        ("cull-hijack", {"cull_hijack_enabled": True}),
+        ("reanchor", {"reanchor_enabled": True}),
+        ("cull+reanchor", {"cull_hijack_enabled": True, "reanchor_enabled": True}),
+    ],
+    # Occlusion re-acquisition guard (slot-level; complements the mask-level
+    # cull above): suspect-zone detections need motion proof to claim a slot
+    # that went into coast while hub-occluded.
+    "occl-guard": [
+        ("baseline", {}),
+        ("occl-guard", {"occlusion_rebind_guard": True}),
+        ("guard+cull", {"occlusion_rebind_guard": True, "cull_hijack_enabled": True}),
+    ],
+    # Corner close-range fix: scope the too-large image-fraction backstop to
+    # uncalibrated views only, so corner cameras can detect/seed the near
+    # robots that fill most of their short panels (qm10: 4027 dead zone).
+    # Single-config probe for seed-decision forensics (sam3.* diagnostics).
+    "corner-probe": [
+        ("frac-fix", {"det_frac_backstop": "uncalibrated"}),
+    ],
+    "corner-close": [
+        ("baseline", {}),
+        ("frac-fix", {"det_frac_backstop": "uncalibrated"}),
+        ("frac-fix+guard", {"det_frac_backstop": "uncalibrated",
+                            "occlusion_rebind_guard": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

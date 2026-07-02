@@ -45,6 +45,13 @@ CORNER_MIDLINE_MARGIN_M = float(os.environ.get("CORNER_MIDLINE_MARGIN_M", "1.0")
 # 3.0 clears a genuine robot (and the ~2x far box guarded by the oblique-range
 # regression test) with margin, while catching the ~3.5x+ leaks.
 DET_MAX_WIDTH_PX_FACTOR = float(os.environ.get("DET_MAX_WIDTH_PX_FACTOR", "3.0"))
+# Scope of the image-fraction backstop. "always": apply to every box (legacy).
+# "uncalibrated": apply only when the pose-based forward-projected width check
+# could not run — its documented purpose. With a full pose the geometric checks
+# bound plausibility, and a robot close to a low corner camera legitimately
+# spans most of the short corner panel's height (qm10: 4027 passed every
+# pose-based check and was silently dropped at 84% panel height).
+DET_FRAC_BACKSTOP = os.environ.get("DET_FRAC_BACKSTOP", "always")
 
 
 def _bottom_center(box):
@@ -166,12 +173,16 @@ def box_exceeds_frac(box, frame_shape, max_box_frac):
 
 
 def _too_large(box, calibration, field_xy, frame_shape, max_field_width,
-               max_box_frac, max_range, width_px_factor=DET_MAX_WIDTH_PX_FACTOR):
+               max_box_frac, max_range, width_px_factor=DET_MAX_WIDTH_PX_FACTOR,
+               frac_backstop=None):
     """True if the box is implausibly large to be a robot. Three independent layers:
     a carpet-footprint cap (only applied at near range, where the ground projection
     is well-conditioned), a forward-projected expected-width cap (well-conditioned at
     ANY range — catches leaked/oversized boxes the footprint cap can't at distance),
-    and an image-fraction backstop (calibration-independent)."""
+    and an image-fraction backstop (calibration-independent; see DET_FRAC_BACKSTOP
+    for when it applies)."""
+    if frac_backstop is None:
+        frac_backstop = DET_FRAC_BACKSTOP
     dist = _camera_ground_dist(calibration, field_xy)
     if dist is not None and dist <= max_range:
         width_m = _field_footprint_width(box, calibration)
@@ -181,6 +192,11 @@ def _too_large(box, calibration, field_xy, frame_shape, max_field_width,
     if expected_px is not None and expected_px > 0:
         if (box[2] - box[0]) > expected_px * width_px_factor:
             return True
+        if frac_backstop == "uncalibrated":
+            # Pose-based width check ran: it owns plausibility; the frame-
+            # fraction backstop would wrongly kill tall close-range boxes in
+            # the short corner panels.
+            return False
     if box_exceeds_frac(box, frame_shape, max_box_frac):
         return True
     return False
@@ -192,7 +208,8 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
                         max_box_frac=DET_MAX_BOX_FRAC,
                         width_max_range=DET_FIELD_WIDTH_MAX_RANGE_M,
                         blocked_zones=None,
-                        rejected_out=None):
+                        rejected_out=None,
+                        frac_backstop=None):
     """Project image boxes to field-space detections, dropping off-field and
     implausibly-large boxes. If `rejected_out` is a list, each dropped box is
     appended as {"box", "reason", "field_xy"} for hard-negative mining.
@@ -213,7 +230,7 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
                                      "reason": "off_field", "field_xy": xy})
             continue
         if _too_large(box, calibration, xy, frame_shape, max_field_width,
-                      max_box_frac, width_max_range):
+                      max_box_frac, width_max_range, frac_backstop=frac_backstop):
             if rejected_out is not None:
                 rejected_out.append({"box": tuple(float(v) for v in box),
                                      "reason": "too_large", "field_xy": xy})
@@ -231,6 +248,7 @@ def filter_field_robot_boxes(
     margin=DET_FIELD_MARGIN_M,
     blocked_zones=None,
     ray_blocked_zones=None,
+    frac_backstop=None,
 ):
     """Return indices of boxes whose ground contact is a plausible field robot.
 
@@ -262,6 +280,7 @@ def filter_field_robot_boxes(
             DET_MAX_ROBOT_WIDTH_M,
             DET_MAX_BOX_FRAC,
             DET_FIELD_WIDTH_MAX_RANGE_M,
+            frac_backstop=frac_backstop,
         ):
             continue
         kept.append(idx)

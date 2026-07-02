@@ -173,6 +173,7 @@ def test_yolo_detections_filtering_by_exclusion_masks(monkeypatch):
     job.bumper_model = None
     job.det_schema = None
     job.hub_no_robot_zones = []
+    job.config = app_mod.JobConfig()
     
     # Run _detect_view
     paired, person_boxes, person_boxes_all = job._detect_view(

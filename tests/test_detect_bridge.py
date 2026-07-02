@@ -310,3 +310,100 @@ def test_corner_detection_weight_falloff_shape():
     assert corner_detection_weight("main", (8.0, 4.0), dims) == 1.0
     # Unprojectable position contributes nothing.
     assert corner_detection_weight("corner_left", None, dims) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Image-fraction backstop scoping (the corner close-range dead zone).
+# A robot near a low corner camera legitimately spans most of the short corner
+# panel's HEIGHT; the >50%-of-frame backstop was silently discarding every such
+# detection (qm10: 4027 passed all pose-based checks, died on box_exceeds_frac).
+# The backstop is documented as "for poor/absent calibration", so with
+# frac_backstop="uncalibrated" it must yield to the pose-based width checks
+# whenever those actually ran — and still apply when the calibration has no pose.
+# --------------------------------------------------------------------------- #
+
+def _corner_camera():
+    """Low corner camera like the real corner_left: 0.7 m high at the blue
+    corner, small 960x377 panel. Extrinsics built with OpenCV convention
+    (+y down, so image-bottom rays hit the carpet) — the shared look_at
+    fixture yields an inverted camera, harmless for the high main-cam tests
+    but fatal for a near-horizontal low camera."""
+    import cv2
+    from web.field.calibration import CameraCalibration
+    eye = np.array([0.65, -0.23, 0.69])
+    target = np.array([8.0, 4.0, 0.0])
+    z = target - eye; z /= np.linalg.norm(z)
+    x = np.cross(z, np.array([0.0, 0.0, 1.0])); x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    R = np.vstack([x, y, z])
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = (-R @ eye).reshape(3, 1)
+    K = np.array([[700.0, 0.0, 480.0], [0.0, 700.0, 188.5], [0.0, 0.0, 1.0]])
+    return CameraCalibration(mode="pinhole", K=K, D=np.zeros(5), rvec=rvec,
+                             tvec=tvec, image_size=(960, 377),
+                             crop_region=(0, 0, 960, 377),
+                             field_season="2026-rebuilt-welded")
+
+
+def _close_robot_box(cam, base=(2.0, 1.5), width_m=1.1, height_m=0.9):
+    """Image box of a robot at `base`, built from real projections."""
+    import math
+    cc = cam.camera_center
+    dx, dy = base[0] - cc[0], base[1] - cc[1]
+    n = math.hypot(dx, dy)
+    ux, uy = -dy / n, dx / n
+    h = width_m / 2.0
+    corners = [
+        cam.field_to_image((base[0] - ux * h, base[1] - uy * h, 0.0)),
+        cam.field_to_image((base[0] + ux * h, base[1] + uy * h, 0.0)),
+        cam.field_to_image((base[0] - ux * h, base[1] - uy * h, height_m)),
+        cam.field_to_image((base[0] + ux * h, base[1] + uy * h, height_m)),
+    ]
+    us = [c[0] for c in corners]; vs = [c[1] for c in corners]
+    return (min(us), min(vs), max(us), max(vs))
+
+
+def test_close_corner_robot_kept_when_backstop_scoped_to_uncalibrated():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = _corner_camera()
+    box = _close_robot_box(cam)
+    frame_shape = (377, 960, 3)
+    assert (box[3] - box[1]) / 377 > 0.5, "precondition: box is tall in-panel"
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"],
+        frame_shape=frame_shape, frac_backstop="uncalibrated",
+    )
+    assert len(dets) == 1, "tall close corner robot was dropped despite full pose"
+    assert abs(dets[0].pos[0] - 2.0) < 0.6 and abs(dets[0].pos[1] - 1.5) < 0.6
+
+
+def test_close_corner_robot_dropped_in_default_mode():
+    """Documents the current default: the backstop still fires (knob off)."""
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = _corner_camera()
+    box = _close_robot_box(cam)
+    dets = to_field_detections(
+        [box], cam, (fm.length_m, fm.width_m), colors=["blue"],
+        frame_shape=(377, 960, 3),
+    )
+    assert dets == []
+
+
+def test_uncalibrated_mode_still_applies_backstop_without_pose():
+    """A pose-less homography calibration cannot run the width checks, so the
+    image-fraction backstop must stay active even in 'uncalibrated' mode."""
+    import cv2
+    fm = FieldModel.load("2026-rebuilt-welded")
+    pin = _corner_camera()
+    src = np.array([[150, 250], [800, 250], [300, 360], [650, 340]], np.float64)
+    dst = np.array([pin.image_to_field(tuple(p)) for p in src], np.float64)
+    H = cv2.findHomography(src.reshape(-1, 1, 2), dst.reshape(-1, 1, 2))[0]
+    from web.field.calibration import CameraCalibration
+    homog = CameraCalibration(mode="homography", H=H, image_size=(960, 377),
+                              field_season="2026-rebuilt-welded")
+    box = (200, 100, 500, 350)   # 66% of panel height, plausible ground contact
+    dets = to_field_detections(
+        [box], homog, (fm.length_m, fm.width_m), colors=["blue"],
+        frame_shape=(377, 960, 3), frac_backstop="uncalibrated",
+    )
+    assert dets == []

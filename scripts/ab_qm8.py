@@ -56,6 +56,14 @@ PROFILES = {
     # Corner close-range fix: scope the too-large image-fraction backstop to
     # uncalibrated views only, so corner cameras can detect/seed the near
     # robots that fill most of their short panels (qm10: 4027 dead zone).
+    # qm11 red identity collapse: one fused tid bound to R1/R2/R3 in rapid
+    # alternation. The relink distance gate was A/B'd for qm8 but left
+    # default-off; this isolates it against the (already default-on) tracker
+    # side.
+    "relink": [
+        ("baseline", {}),
+        ("relink-gate", {"relink_max_dist_m": 3.0}),
+    ],
     # Single-config probe for seed-decision forensics (sam3.* diagnostics).
     "corner-probe": [
         ("frac-fix", {"det_frac_backstop": "uncalibrated"}),

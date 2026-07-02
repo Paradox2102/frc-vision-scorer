@@ -254,12 +254,25 @@ class FieldTracker:
         active_slots = [t for t in slots if t.active]
         free_slots = [t for t in slots if not t.active]
 
+        # A track_id carried by 2+ detections in this frame is AMBIGUOUS: the
+        # registry mis-assigned one id to distinct robots (merge_main_guard
+        # passes them through so each keeps its own slot). Sticky binding and
+        # mapping updates for such an id would flip-flop _id_to_slot between
+        # the robots' slots every frame (qm11 R1/R2/R3 churn); route these to
+        # distance matching, which preserves per-slot continuity, and learn
+        # nothing from them.
+        tid_counts: dict = {}
+        for _i, d in dets_with_idx:
+            if d.track_id is not None:
+                tid_counts[d.track_id] = tid_counts.get(d.track_id, 0) + 1
+        ambiguous_tids = {t for t, n in tid_counts.items() if n > 1}
+
         # ---- Sticky binding pass (track_id is not None) ----
         # Process before building the cost matrix so these detections are
         # removed from the pool and never cause an index off-by-one.
         remaining_pairs = []
         for orig_idx, d in dets_with_idx:
-            if d.track_id is None:
+            if d.track_id is None or d.track_id in ambiguous_tids:
                 remaining_pairs.append((orig_idx, d))
                 continue
 
@@ -383,7 +396,8 @@ class FieldTracker:
                     matched_slot_indices.add(r)
                     matched_det_indices.add(c)
                     self.last_det_to_slot[idxs[c]] = t.slot_id
-                    if dets[c].track_id is not None:
+                    if (dets[c].track_id is not None
+                            and dets[c].track_id not in ambiguous_tids):
                         self._id_to_slot[dets[c].track_id] = t.slot_id
                     
                     # Store assignment evidence with margin
@@ -422,7 +436,7 @@ class FieldTracker:
                 slot.coasting = False
                 slot.active = True
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
-                if d.track_id is not None:
+                if d.track_id is not None and d.track_id not in ambiguous_tids:
                     self._id_to_slot[d.track_id] = slot.slot_id
                     self.binding_events.append({
                         "event": "slot_seeded",
@@ -453,7 +467,7 @@ class FieldTracker:
                 slot.coasting = False
                 slot.active = True
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
-                if d.track_id is not None:
+                if d.track_id is not None and d.track_id not in ambiguous_tids:
                     self._id_to_slot[d.track_id] = slot.slot_id
                     self.binding_events.append({
                         "event": "slot_seeded",

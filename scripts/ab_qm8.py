@@ -123,6 +123,18 @@ PROFILES = {
                                "motion_override": True, "motion_gated_conf": True,
                                "motion_seed_blobs": True}),
     ],
+    # Seed-prompt quality: dedupe cross-class bumper double-reads and adopt
+    # whole-robot union extents (a 24px sliver prompt on a blurred robot
+    # dies in propagation; the union box is the prompt SAM can hold onto).
+    "seed-quality": [
+        ("union", {"sam2_prompt_offset_seconds": 0.0,
+                   "motion_override": True, "motion_gated_conf": True,
+                   "seed_union_extent": True}),
+        ("union+blobs6s", {"sam2_prompt_offset_seconds": 0.0,
+                           "motion_override": True, "motion_gated_conf": True,
+                           "motion_seed_blobs": True,
+                           "seed_union_extent": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

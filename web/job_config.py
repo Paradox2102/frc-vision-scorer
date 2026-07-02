@@ -78,6 +78,11 @@ KNOBS = [
     # (the auto-start sprint problem); match-long admission tripled roster
     # churn on qm11. 0 disables the scope (blobs whole match).
     Knob("motion_blob_window_s", "MOTION_BLOB_WINDOW_S", float, 6.0, min=0.0),
+    # Seed candidates adopt the union of the bumper-expanded box and the
+    # overlapping whole-robot detection (bumper color kept). A blurred
+    # bumper expands to a narrow sliver — a poor SAM prompt; the whole-robot
+    # detector knows the true extent. DEFAULT OFF pending A/B.
+    Knob("seed_union_extent", "SEED_UNION_EXTENT_ENABLED", bool, False),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
     # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.

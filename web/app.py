@@ -89,6 +89,7 @@ from web.field.detect_schema import (
     expand_bumper_to_robot,
     blob_window_open,
     box_ios,
+    dedupe_seed_robots,
     merge_colorless_candidates,
     merge_robot_detections,
     motion_blob_boxes,
@@ -1421,7 +1422,12 @@ class InferenceJob:
                     box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR
                 )
                 bumper_robots.append((robot_box, color))
-        merged = merge_robot_detections(bumper_robots, whole_boxes, ROBOT_FILL_IOS)
+        # Cross-class double-reads of one blurred bumper (per-class NMS)
+        # must not seed duplicate objects.
+        bumper_robots = dedupe_seed_robots(bumper_robots, ROBOT_FILL_IOS)
+        merged = merge_robot_detections(
+            bumper_robots, whole_boxes, ROBOT_FILL_IOS,
+            union_extent=self.config.seed_union_extent)
         person_res = self.person_model(
             frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
         )[0]

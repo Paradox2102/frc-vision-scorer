@@ -295,3 +295,34 @@ def test_blob_window_open_scopes_to_early_match():
     assert blob_window_open(6.1, 6.0) is False
     assert blob_window_open(None, 6.0) is False     # unknown time: closed
     assert blob_window_open(999.0, 0.0) is True     # 0 disables the scope
+
+
+def test_dedupe_seed_robots_drops_cross_class_double_read():
+    """YOLO NMS is per-class: a blurred bumper read as BOTH red and blue
+    survives as two near-identical boxes and seeds duplicate SAM objects
+    (qm11 seed frame: [486,135,510,189] + [489,134,513,188]). Keep the first
+    (highest-confidence) entry regardless of color."""
+    from web.field.detect_schema import dedupe_seed_robots
+    robots = [((486, 135, 510, 189), "red"),
+              ((489, 134, 513, 188), "blue"),    # same robot, other class
+              ((700, 200, 760, 260), "blue")]    # distinct robot
+    out = dedupe_seed_robots(robots, ios_thresh=0.5)
+    assert out == [((486, 135, 510, 189), "red"),
+                   ((700, 200, 760, 260), "blue")]
+
+
+def test_merge_union_extent_adopts_whole_robot_geometry():
+    """A blurred bumper expands to a narrow sliver — a poor SAM prompt —
+    while the whole-robot detector has the true extent. With union_extent,
+    the merged candidate takes the union geometry and keeps the bumper's
+    color; the consumed whole box no longer duplicates as an unknown fill."""
+    from web.field.detect_schema import merge_robot_detections
+    bumper = [((490, 130, 514, 190), "red")]          # 24 px sliver
+    whole = [(486, 140, 560, 193)]                    # true robot extent
+    merged = merge_robot_detections(bumper, whole, ios_thresh=0.5,
+                                    union_extent=True)
+    assert merged == [((486, 130, 560, 193), "red")]
+
+    # Default behavior unchanged: bumper box passes through, covered fill dropped.
+    legacy = merge_robot_detections(bumper, whole, ios_thresh=0.5)
+    assert legacy == [((490, 130, 514, 190), "red")]

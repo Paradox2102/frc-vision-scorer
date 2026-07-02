@@ -215,7 +215,25 @@ def merge_colorless_candidates(whole_boxes, motion_boxes, ios_thresh):
     return out
 
 
-def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh):
+def dedupe_seed_robots(bumper_robots, ios_thresh):
+    """Drop later bumper-derived robots overlapping an earlier kept one.
+
+    YOLO NMS is per-class, so one blurred bumper read as BOTH red and blue
+    survives as two near-identical boxes — which would seed duplicate SAM
+    objects. Detections arrive confidence-sorted; keeping the first entry
+    keeps the stronger read, whatever its color. Two real robots can never
+    overlap above a sane ios_thresh.
+    """
+    kept = []
+    for box, color in ((item[0], item[1]) for item in bumper_robots):
+        if any(box_ios(box, kb) > ios_thresh for kb, _kc in kept):
+            continue
+        kept.append((box, color))
+    return kept
+
+
+def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh,
+                           union_extent=False):
     """Combine bumper-derived robot boxes with whole-robot gap-fill boxes.
 
     bumper_robots: list of tuples starting with (box_xyxy, color).
@@ -223,10 +241,33 @@ def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh):
     Returns list[(box_xyxy, color)]: every bumper entry, followed by each
     whole-robot box NOT already covered by any bumper box (max IoS over all
     bumper boxes <= ios_thresh), tagged color="unknown".
+
+    With ``union_extent``, a bumper entry overlapping a whole-robot box
+    adopts the UNION geometry (bumper color kept, that whole box consumed):
+    a blurred bumper expands to a narrow sliver — a poor SAM prompt — while
+    the whole-robot detector knows the true extent.
     """
     bumper_boxes = [item[0] for item in bumper_robots]
-    merged = [(item[0], item[1]) for item in bumper_robots]
-    for fb in robot_boxes:
+    merged = []
+    consumed: set[int] = set()
+    for box, color in ((item[0], item[1]) for item in bumper_robots):
+        if union_extent:
+            best_j, best_ios = None, ios_thresh
+            for j, fb in enumerate(robot_boxes):
+                if j in consumed:
+                    continue
+                score = box_ios(fb, box)
+                if score > best_ios:
+                    best_j, best_ios = j, score
+            if best_j is not None:
+                fb = robot_boxes[best_j]
+                consumed.add(best_j)
+                box = (min(box[0], fb[0]), min(box[1], fb[1]),
+                       max(box[2], fb[2]), max(box[3], fb[3]))
+        merged.append((box, color))
+    for j, fb in enumerate(robot_boxes):
+        if j in consumed:
+            continue
         if not bumper_boxes or all(box_ios(fb, bb) <= ios_thresh for bb in bumper_boxes):
             merged.append((fb, "unknown"))
     return merged

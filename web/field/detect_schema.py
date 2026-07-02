@@ -189,6 +189,19 @@ def motion_blob_boxes(prev_gray, cur_gray, diff_thresh=25, min_side_px=48,
     return out
 
 
+def blob_window_open(elapsed_s, window_s):
+    """Is motion-blob seeding allowed ``elapsed_s`` into the active period?
+
+    Blob candidates exist to catch the auto-start sprint a detector whiffs
+    on; match-long admission tripled roster churn on qm11. ``window_s <= 0``
+    disables the scope (always open); an unknown elapsed time is closed —
+    blobs are a privilege of the well-understood opening seconds.
+    """
+    if window_s <= 0:
+        return True
+    return elapsed_s is not None and elapsed_s <= window_s
+
+
 def merge_colorless_candidates(whole_boxes, motion_boxes, ios_thresh):
     """Union whole-robot detections with motion blobs, motion deduped last.
 

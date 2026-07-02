@@ -283,3 +283,15 @@ def test_merge_colorless_candidates_dedups_blobs_against_whole_robots():
              (500, 100, 620, 210)]   # blob-only mover -> kept
     out = merge_colorless_candidates(whole, blobs, ios_thresh=0.5)
     assert out == [(100, 100, 220, 200), (500, 100, 620, 210)]
+
+
+def test_blob_window_open_scopes_to_early_match():
+    """Blob seeding is scoped to the opening seconds of the active period —
+    that's where the sprint-seeding problem lives; match-long blob admission
+    tripled roster churn on qm11 (62->176 candidates, 19->61 objects)."""
+    from web.field.detect_schema import blob_window_open
+    assert blob_window_open(0.0, 6.0) is True
+    assert blob_window_open(5.9, 6.0) is True
+    assert blob_window_open(6.1, 6.0) is False
+    assert blob_window_open(None, 6.0) is False     # unknown time: closed
+    assert blob_window_open(999.0, 0.0) is True     # 0 disables the scope

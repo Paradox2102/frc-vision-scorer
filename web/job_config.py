@@ -74,6 +74,10 @@ KNOBS = [
     # YOLO whiffs on entirely (heavy blur, dark bumpers). DEFAULT OFF
     # pending A/B.
     Knob("motion_seed_blobs", "MOTION_SEED_BLOBS_ENABLED", bool, False),
+    # Blob seeding is scoped to the first N seconds of the active period
+    # (the auto-start sprint problem); match-long admission tripled roster
+    # churn on qm11. 0 disables the scope (blobs whole match).
+    Knob("motion_blob_window_s", "MOTION_BLOB_WINDOW_S", float, 6.0, min=0.0),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
     # Bigger = fewer identity-risky chunk boundaries; cap is VRAM, not speed.

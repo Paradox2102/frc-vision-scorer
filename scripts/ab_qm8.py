@@ -116,6 +116,13 @@ PROFILES = {
                              "motion_override": True, "motion_gated_conf": True,
                              "motion_seed_blobs": True}),
     ],
+    # Blob taming: blobs scoped to the first motion_blob_window_s (6s) of the
+    # active period — keeps the sprint rescue, drops the match-long churn.
+    "blob-window": [
+        ("dual-seed+blobs6s", {"sam2_prompt_offset_seconds": 0.0,
+                               "motion_override": True, "motion_gated_conf": True,
+                               "motion_seed_blobs": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

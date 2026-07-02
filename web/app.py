@@ -87,6 +87,7 @@ from web.field.detect_schema import (
     admit_low_conf_movers,
     bumper_admissible,
     expand_bumper_to_robot,
+    blob_window_open,
     box_ios,
     merge_colorless_candidates,
     merge_robot_detections,
@@ -1363,9 +1364,11 @@ class InferenceJob:
                     valid_boxes.append(box)
         return valid_boxes
 
-    def _motion_seed_inputs(self, prev_gray, cur_gray):
+    def _motion_seed_inputs(self, prev_gray, cur_gray, active_elapsed_s=None):
         """(motion_probe, motion_boxes) for _sam2_robot_candidates, per the
-        motion knobs. (None, None) without a usable frame pair."""
+        motion knobs. (None, None) without a usable frame pair. Blob
+        candidates additionally require the early-match window to be open
+        (``active_elapsed_s`` seconds into the active period)."""
         if (prev_gray is None or cur_gray is None
                 or prev_gray.shape != cur_gray.shape):
             return None, None
@@ -1375,7 +1378,9 @@ class InferenceJob:
                       _t=self.config.motion_energy_thresh):
                 return box_motion_energy(_p, _c, box) >= _t
         boxes = None
-        if self.config.motion_seed_blobs:
+        if (self.config.motion_seed_blobs
+                and blob_window_open(active_elapsed_s,
+                                     self.config.motion_blob_window_s)):
             boxes = motion_blob_boxes(prev_gray, cur_gray)
         return probe, boxes
 
@@ -4920,7 +4925,11 @@ class InferenceJob:
                                             seed_motion_probe, seed_motion_boxes = (
                                                 self._motion_seed_inputs(
                                                     view_prev_gray.get(view.name),
-                                                    cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)))
+                                                    cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                                                    active_elapsed_s=max(
+                                                        0.0,
+                                                        (prompt_frame - prompt_source_frame)
+                                                        / max(self.video_fps, 1e-6))))
                                         elif fpos < prompt_frame:
                                             view_prev_gray[view.name] = cv2.cvtColor(
                                                 crop, cv2.COLOR_BGR2GRAY)
@@ -5137,7 +5146,11 @@ class InferenceJob:
                                             pcrop = pcrop[top_crop_px:, :]
                                         motion_probe, motion_boxes = self._motion_seed_inputs(
                                             cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
-                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                                            active_elapsed_s=max(
+                                                0.0,
+                                                (source_frame - prompt_source_frame)
+                                                / max(self.video_fps, 1e-6)))
                                 merged = self._sam2_robot_candidates(
                                     crop, motion_probe=motion_probe,
                                     motion_boxes=motion_boxes)

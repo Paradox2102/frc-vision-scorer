@@ -90,14 +90,15 @@ from web.field.detect_schema import (
     blob_window_open,
     box_ios,
     dedupe_seed_robots,
+    diff_box_energy,
     merge_colorless_candidates,
     merge_robot_detections,
     motion_blob_boxes,
+    motion_diff,
     plausible_bumper_box,
     reject_person_candidates,
     select_gap_fills,
 )
-from web.field.sam2_tracker import box_motion_energy
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
@@ -1347,56 +1348,80 @@ class InferenceJob:
             return None
         return base64.b64encode(buf).decode('utf-8')
 
-    def _detect_whole_robots(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
-        """Run YOLO model on the frame, select only the whole-robot class, and filter out boxes that exceed ROBOT_FILL_MAX_BOX_FRAC."""
+    def _detect_whole_robots(self, frame: np.ndarray, with_balls: bool = False):
+        """Run YOLO model on the frame, select only the whole-robot class, and
+        filter out boxes that exceed ROBOT_FILL_MAX_BOX_FRAC. With
+        ``with_balls``, also return the fuel-ball boxes from the same pass
+        (motion-attribution exclusions)."""
         if not ROBOT_FILL_ENABLED:
-            return []
+            return ([], []) if with_balls else []
         results = self.model(frame, conf=ROBOT_FILL_CONF, verbose=False)[0]
         dets = sv.Detections.from_ultralytics(results)
 
         max_frac = (ROBOT_FILL_MAX_BOX_FRAC_CLOSE
                     if self.config.det_frac_backstop == "uncalibrated"
                     else ROBOT_FILL_MAX_BOX_FRAC)
+        schema = getattr(self, "det_schema", None)
+        fuel_cls = (schema.fuel_class
+                    if schema is not None and schema.fuel_class is not None
+                    else 0)
         valid_boxes = []
+        ball_boxes = []
         for i in range(len(dets)):
-            if int(dets.class_id[i]) == self.whole_robot_class_id:
-                box = tuple(float(v) for v in dets.xyxy[i])
+            cid = int(dets.class_id[i])
+            box = tuple(float(v) for v in dets.xyxy[i])
+            if cid == self.whole_robot_class_id:
                 if not box_exceeds_frac(box, frame.shape, max_frac):
                     valid_boxes.append(box)
-        return valid_boxes
-
-    def _motion_seed_inputs(self, prev_gray, cur_gray, active_elapsed_s=None):
-        """(motion_probe, motion_boxes) for _sam2_robot_candidates, per the
-        motion knobs. (None, None) without a usable frame pair. Blob
-        candidates additionally require the early-match window to be open
-        (``active_elapsed_s`` seconds into the active period)."""
-        if (prev_gray is None or cur_gray is None
-                or prev_gray.shape != cur_gray.shape):
-            return None, None
-        probe = None
-        if self.config.motion_gated_conf:
-            def probe(box, _p=prev_gray, _c=cur_gray,
-                      _t=self.config.motion_energy_thresh):
-                return box_motion_energy(_p, _c, box) >= _t
-        boxes = None
-        if (self.config.motion_seed_blobs
-                and blob_window_open(active_elapsed_s,
-                                     self.config.motion_blob_window_s)):
-            boxes = motion_blob_boxes(prev_gray, cur_gray)
-        return probe, boxes
+            elif with_balls and cid == fuel_cls:
+                ball_boxes.append(box)
+        return (valid_boxes, ball_boxes) if with_balls else valid_boxes
 
     def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
-                               motion_probe=None, motion_boxes=None):
+                               motion_grays=None, blobs_allowed: bool = False):
         """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
         whole-robot gap fills, person candidates vetoed.
 
+        ``motion_grays``: optional (prev_gray, cur_gray) pair in this frame's
+        pixel space, enabling the motion knobs. Motion is attributed before
+        it is trusted: person and ball detections are zeroed from the diff,
+        so a ref walking past the bump (or balls rolling under a misread)
+        cannot back a candidate. ``blobs_allowed`` gates the diff-blob
+        candidate source (early-match window; the caller knows the clock).
+
         Returns [(box_xyxy, color)] in the input frame's pixel coords. Field
         filtering and any coordinate scaling are the caller's concern (they
         differ between the prompt-seeding and re-prompt paths).
         """
-        whole_boxes = self._detect_whole_robots(frame)
+        whole_boxes, ball_boxes = self._detect_whole_robots(frame, with_balls=True)
+        person_res = self.person_model(
+            frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
+        )[0]
+        person_dets = sv.Detections.from_ultralytics(person_res)
+        person_boxes = [
+            tuple(person_dets.xyxy[i]) for i in range(len(person_dets))
+        ]
+
+        motion_probe = None
+        motion_boxes = None
+        want_probe = self.config.motion_gated_conf
+        want_blobs = self.config.motion_seed_blobs and blobs_allowed
+        if motion_grays is not None and (want_probe or want_blobs):
+            prev_gray, cur_gray = motion_grays
+            if (prev_gray is not None and cur_gray is not None
+                    and prev_gray.shape == cur_gray.shape):
+                exclude = list(person_boxes) + list(ball_boxes)
+                diff = motion_diff(prev_gray, cur_gray, exclude)
+                if want_probe:
+                    def motion_probe(box, _d=diff,
+                                     _t=self.config.motion_energy_thresh):
+                        return diff_box_energy(_d, box) >= _t
+                if want_blobs:
+                    motion_boxes = motion_blob_boxes(
+                        prev_gray, cur_gray, exclude_boxes=exclude)
+
         if motion_boxes:
             # Frame-diff blobs join as colorless candidates (deduped against
             # YOLO's whole robots); the gap-fill path colors them later.
@@ -1407,7 +1432,7 @@ class InferenceJob:
             # Motion-gated low-conf admission: with a motion probe available,
             # detect down to det_conf_floor and let admit_low_conf_movers
             # keep the sub-conf band only where pixels actually moved.
-            gated = motion_probe is not None and self.config.motion_gated_conf
+            gated = motion_probe is not None
             run_conf = min(conf, self.config.det_conf_floor) if gated else conf
             res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
@@ -1428,13 +1453,6 @@ class InferenceJob:
         merged = merge_robot_detections(
             bumper_robots, whole_boxes, ROBOT_FILL_IOS,
             union_extent=self.config.seed_union_extent)
-        person_res = self.person_model(
-            frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
-        )[0]
-        person_dets = sv.Detections.from_ultralytics(person_res)
-        person_boxes = [
-            tuple(person_dets.xyxy[i]) for i in range(len(person_dets))
-        ]
         return reject_person_candidates(
             merged, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
@@ -4924,18 +4942,13 @@ class InferenceJob:
                                     # Motion evidence for the seed frame: diff
                                     # vs this view's previous kept frame (low-
                                     # conf gate + detector-independent blobs).
-                                    seed_motion_probe = seed_motion_boxes = None
+                                    seed_motion_grays = None
                                     if (self.config.motion_gated_conf
                                             or self.config.motion_seed_blobs):
                                         if is_prompt:
-                                            seed_motion_probe, seed_motion_boxes = (
-                                                self._motion_seed_inputs(
-                                                    view_prev_gray.get(view.name),
-                                                    cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
-                                                    active_elapsed_s=max(
-                                                        0.0,
-                                                        (prompt_frame - prompt_source_frame)
-                                                        / max(self.video_fps, 1e-6))))
+                                            seed_motion_grays = (
+                                                view_prev_gray.get(view.name),
+                                                cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
                                         elif fpos < prompt_frame:
                                             view_prev_gray[view.name] = cv2.cvtColor(
                                                 crop, cv2.COLOR_BGR2GRAY)
@@ -4944,8 +4957,12 @@ class InferenceJob:
                                     # cover whole robots while color stays class-derived.
                                     if is_prompt:
                                         merged = self._sam2_robot_candidates(
-                                            crop, motion_probe=seed_motion_probe,
-                                            motion_boxes=seed_motion_boxes)
+                                            crop, motion_grays=seed_motion_grays,
+                                            blobs_allowed=blob_window_open(
+                                                max(0.0,
+                                                    (prompt_frame - prompt_source_frame)
+                                                    / max(self.video_fps, 1e-6)),
+                                                self.config.motion_blob_window_s))
                                         full_boxes = [
                                             (
                                                 box[0],
@@ -5138,7 +5155,7 @@ class InferenceJob:
                                 # kept frame in this view's plan (one extra
                                 # decode per boundary; the YOLO pass beside
                                 # it dwarfs the cost).
-                                motion_probe = motion_boxes = None
+                                motion_grays = None
                                 if ((self.config.motion_gated_conf
                                         or self.config.motion_seed_blobs)
                                         and local_idx > 0):
@@ -5150,16 +5167,16 @@ class InferenceJob:
                                         pcrop = view.extract(fr_p)
                                         if top_crop_px:
                                             pcrop = pcrop[top_crop_px:, :]
-                                        motion_probe, motion_boxes = self._motion_seed_inputs(
+                                        motion_grays = (
                                             cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
-                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
-                                            active_elapsed_s=max(
-                                                0.0,
-                                                (source_frame - prompt_source_frame)
-                                                / max(self.video_fps, 1e-6)))
+                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
                                 merged = self._sam2_robot_candidates(
-                                    crop, motion_probe=motion_probe,
-                                    motion_boxes=motion_boxes)
+                                    crop, motion_grays=motion_grays,
+                                    blobs_allowed=blob_window_open(
+                                        max(0.0,
+                                            (source_frame - prompt_source_frame)
+                                            / max(self.video_fps, 1e-6)),
+                                        self.config.motion_blob_window_s))
                                 # Field-filter in full-view coords (restore the
                                 # top-crop offset). No blocked_zones: detect_fn
                                 # output also corroborates existing masks (a

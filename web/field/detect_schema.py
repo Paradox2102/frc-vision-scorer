@@ -1,6 +1,8 @@
 """Name-driven normalization for detector outputs."""
 from __future__ import annotations
 
+import numpy as np
+
 
 class DetectionSchema:
     def __init__(self, names, robot_class_color, fuel_class=None, hub_class=None):
@@ -153,8 +155,44 @@ def admit_low_conf_movers(robots, conf, motion_probe):
     return out
 
 
+def motion_diff(prev_gray, cur_gray, exclude_boxes=()):
+    """Absolute grayscale frame difference with non-robot motion zeroed.
+
+    Motion is robot evidence only when it is the ROBOT moving. Person and
+    ball detections are the two known innocent movers (a ref striding past
+    the bump lit up the raw diff and admitted static equipment as a robot);
+    their regions are zeroed so downstream energy/blob scoring attributes
+    only residual motion to the candidate.
+    """
+    diff = np.abs(
+        cur_gray.astype(np.int16) - prev_gray.astype(np.int16)
+    ).astype(np.uint8)
+    h, w = diff.shape[:2]
+    for box in exclude_boxes:
+        x1 = max(0, int(box[0]))
+        y1 = max(0, int(box[1]))
+        x2 = min(w, int(box[2]))
+        y2 = min(h, int(box[3]))
+        if x2 > x1 and y2 > y1:
+            diff[y1:y2, x1:x2] = 0
+    return diff
+
+
+def diff_box_energy(diff, box):
+    """Mean of a (possibly exclusion-masked) diff inside ``box``, /255."""
+    h, w = diff.shape[:2]
+    x1 = max(0, int(box[0]))
+    y1 = max(0, int(box[1]))
+    x2 = min(w, int(box[2]))
+    y2 = min(h, int(box[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return float(diff[y1:y2, x1:x2].mean()) / 255.0
+
+
 def motion_blob_boxes(prev_gray, cur_gray, diff_thresh=25, min_side_px=48,
-                      max_area_frac=0.25, max_aspect=4.0, dilate_px=6):
+                      max_area_frac=0.25, max_aspect=4.0, dilate_px=6,
+                      exclude_boxes=()):
     """Detector-independent robot candidates from frame differencing.
 
     Fixed cameras make the absdiff of consecutive tracked frames a direct
@@ -168,7 +206,7 @@ def motion_blob_boxes(prev_gray, cur_gray, diff_thresh=25, min_side_px=48,
     """
     import cv2
 
-    diff = cv2.absdiff(prev_gray, cur_gray)
+    diff = motion_diff(prev_gray, cur_gray, exclude_boxes)
     _thr, mask = cv2.threshold(diff, diff_thresh, 255, cv2.THRESH_BINARY)
     if dilate_px:
         k = cv2.getStructuringElement(

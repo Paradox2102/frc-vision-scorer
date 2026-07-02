@@ -326,3 +326,39 @@ def test_merge_union_extent_adopts_whole_robot_geometry():
     # Default behavior unchanged: bumper box passes through, covered fill dropped.
     legacy = merge_robot_detections(bumper, whole, ios_thresh=0.5)
     assert legacy == [((490, 130, 514, 190), "red")]
+
+
+def test_motion_diff_zeroes_person_and_ball_motion():
+    """Motion is only robot evidence when it's the ROBOT moving: a human
+    walking in front of the bump (or balls rolling) lights up the raw diff
+    and got static equipment admitted as a robot (qm11 union run). Person
+    and ball detection regions are zeroed before scoring."""
+    from web.field.detect_schema import motion_diff, diff_box_energy
+    rng = np.random.default_rng(7)
+    prev = np.zeros((200, 400), np.uint8)
+    cur = np.zeros((200, 400), np.uint8)
+    # A "human" strides across the bump region (50..110): bright texture
+    # appears there in cur only.
+    cur[40:120, 50:110] = rng.integers(80, 255, size=(80, 60), dtype=np.uint8)
+    # A robot moves elsewhere.
+    cur[40:120, 250:320] = rng.integers(80, 255, size=(80, 70), dtype=np.uint8)
+    person_boxes = [(45, 30, 115, 130)]
+    diff = motion_diff(prev, cur, exclude_boxes=person_boxes)
+    bump_box = (40, 30, 120, 130)
+    robot_box = (240, 30, 330, 130)
+    assert diff_box_energy(diff, bump_box) < 0.01, \
+        "person-attributed motion must not back the bump"
+    assert diff_box_energy(diff, robot_box) > 0.05
+    assert diff_box_energy(diff, (5, 5, 5, 5)) == 0.0
+
+
+def test_motion_blob_boxes_excludes_person_regions():
+    from web.field.detect_schema import motion_blob_boxes
+    rng = np.random.default_rng(9)
+    prev = np.zeros((400, 800), np.uint8)
+    cur = np.zeros((400, 800), np.uint8)
+    cur[100:220, 100:200] = rng.integers(80, 255, size=(120, 100), dtype=np.uint8)  # person
+    cur[100:220, 500:620] = rng.integers(80, 255, size=(120, 120), dtype=np.uint8)  # robot
+    boxes = motion_blob_boxes(prev, cur, exclude_boxes=[(95, 95, 205, 225)])
+    assert len(boxes) == 1
+    assert boxes[0][0] >= 480, "only the robot blob survives"

@@ -107,6 +107,28 @@ KNOBS = [
     # matched baseline, so decimation stays opt-in.
     Knob("corner_dense_seconds", "CORNER_DENSE_SECONDS", float, 25.0, min=0.0),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False),
+    # Scope the absence-based cull to the main view: mid-field equipment is
+    # fully visible to main-view YOLO (absence there is strong evidence),
+    # while corner views are where qm24's false culls killed real robots
+    # parked in detector blind spots. Only meaningful with cull_hijack_enabled.
+    Knob("cull_main_view_only", "CULL_MAIN_VIEW_ONLY", bool, True),
+    # Person-overlap veto: cull a stationary mask that spends consecutive
+    # boundaries mostly inside a person detection — a positive hijack signal,
+    # independent of the absence cull (qm11: R3 spent all of auto on a ref).
+    Knob("person_veto_enabled", "SAM2_PERSON_VETO_ENABLED", bool, False),
+    # Zone-blind corroboration: detections whose ground contact lies inside a
+    # static-structure zone (UNinflated rects) never count as mask
+    # corroboration, so a bumper-lookalike FP on equipment (2026cur OVERFLOW
+    # bin base reads "1477") can't vouch for its own hijacked mask and the
+    # absence cull can fire. Robots can't park inside an equipment footprint,
+    # so blinding corroboration there is safe. Pair with cull_hijack_enabled.
+    Knob("zone_blind_corroboration", "ZONE_BLIND_CORROB", bool, False),
+    # Zone-blind VOTING (identity layer): a VLM read taken while the track's
+    # field position is inside a raw static zone is printed equipment text
+    # (2026cur OVERFLOW crate reads "1477" at digit_prob 1.0), never a
+    # bumper — discard the vote. Default ON: it only acts inside explicit
+    # equipment footprints, where a robot cannot be.
+    Knob("zone_blind_votes", "VLM_ZONE_BLIND_VOTES", bool, True),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
     # Evidence-ranked roster: re-prompt a dark object claimed by a fresh
     # detection in place, and let weak-evidence roster members (dark or

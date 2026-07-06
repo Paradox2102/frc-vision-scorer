@@ -56,6 +56,14 @@ CULL_CORROB_IOS = float(os.environ.get("CULL_CORROB_IOS", "0.3"))
 # Max field-position span over the window to count as stationary.
 CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 
+# Person-overlap veto: a stationary mask that sits mostly inside a person
+# detection for consecutive boundaries is a hijacked track — a robot is never
+# a person, so this is the POSITIVE hijack signal the absence-based cull
+# lacks (qm24's false culls were absence-only; qm11's R3 spent all of auto
+# parked on a referee's orange vest). Enabled by passing person_fn to track().
+PERSON_VETO_COVERAGE = float(os.environ.get("SAM2_PERSON_VETO_COVERAGE", "0.5"))
+PERSON_VETO_BOUNDARIES = int(os.environ.get("SAM2_PERSON_VETO_BOUNDARIES", "2"))
+
 # Capped-roster eviction. When the active roster is full and a fresh detection
 # matches no tracked mask, the least-corroborated *stationary* active object may
 # be evicted to make room. Uses the same evidence bar as the hijack cull
@@ -401,6 +409,24 @@ def is_stationary(positions, max_span_m: float) -> bool:
     return span < max_span_m
 
 
+def cull_enabled_for_view(requested, view_name: str, main_only: bool):
+    """Scope the absence-based hijack cull to the main view.
+
+    Mid-field equipment (feeder rig, OVERFLOW bins) is fully visible to
+    main-view YOLO, so repeated detector absence there is strong evidence.
+    Corner views are where qm24's false culls happened — a robot parked in a
+    corner camera's detector blind spot is indistinguishable from junk by
+    absence+stationarity alone — so with ``main_only`` they never cull.
+
+    ``requested`` may be None (defer to the tracker's env-knob default); the
+    tri-state is preserved for the main view, but a scoped-out corner view is
+    forced to False (never "defer", which could re-enable via env).
+    """
+    if not main_only or view_name == "main":
+        return requested
+    return False
+
+
 def absent_enough(history, k: int) -> bool:
     """Return True if a bounded corroboration ``history`` shows >= ``k`` absences.
 
@@ -672,8 +698,12 @@ class Sam2FieldTracker:
         reanchor_max_jump_m: float = REANCHOR_MAX_JUMP_M,
         reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
         seed_gate_fn=None,
+        corrob_gate_fn=None,
         project_fn=None,
         motion_fn=None,
+        person_fn=None,
+        person_veto_coverage: float = PERSON_VETO_COVERAGE,
+        person_veto_boundaries: int = PERSON_VETO_BOUNDARIES,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
     ) -> dict[int, dict[int, dict]]:
@@ -803,6 +833,8 @@ class Sam2FieldTracker:
         dark_reanchor_attempts: dict[int, int] = {}
         dark_reanchor_last: dict[int, int] = {}
         field_pos_window: dict[int, list] = {}
+        # oid -> consecutive boundaries with >= person_veto_coverage overlap
+        person_overlap_counts: dict[int, int] = {}
         # oid -> (pending color, consecutive colored-corroboration count)
         color_backfill_votes: dict[int, tuple] = {}
         # Re-anchor v2 bookkeeping. boundary_no counts processed re-prompt
@@ -844,6 +876,8 @@ class Sam2FieldTracker:
         detected = []
         detect_fn_error_logged = False  # first-error print guard (one line per track())
         motion_fn_error_logged = False  # same guard for motion_fn
+        person_fn_error_logged = False  # same guard for person_fn
+        corrob_gate_error_logged = False  # same guard for corrob_gate_fn
 
         def _normalize_detections(items):
             boxes = []
@@ -1193,13 +1227,40 @@ class Sam2FieldTracker:
                     # demand. ----
                     if detector_available and existing:
                         h, w = next(iter(existing.values())).shape
+                        # Zone-blind corroboration: a detection whose box the
+                        # gate rejects (ground contact inside a static-structure
+                        # zone) is invisible to corroboration/color bookkeeping.
+                        # The OVERFLOW bin's bumper-lookalike false positive
+                        # otherwise vouches for its own hijacked mask forever,
+                        # so the absence cull can never fire. Seeding below
+                        # still sees the full detection list (the seed gate has
+                        # its own zone test). Fails OPEN per box: a broken
+                        # projector must not blind the whole roster.
+                        corrob_boxes, corrob_metadata = new_boxes, new_metadata
+                        if corrob_gate_fn is not None and new_boxes:
+                            kept_boxes, kept_meta = [], []
+                            for _j, _b in enumerate(new_boxes):
+                                try:
+                                    _ok = bool(corrob_gate_fn(_b))
+                                except Exception as exc:
+                                    _ok = True
+                                    if not corrob_gate_error_logged:
+                                        corrob_gate_error_logged = True
+                                        print(f"  [{self.LOG_TAG}] corrob_gate_fn failed at "
+                                              f"frame {last_idx} (further errors "
+                                              f"suppressed): {exc!r}")
+                                if _ok:
+                                    kept_boxes.append(_b)
+                                    kept_meta.append(
+                                        new_metadata[_j] if _j < len(new_metadata) else None)
+                            corrob_boxes, corrob_metadata = kept_boxes, kept_meta
                         for oid, mask in list(existing.items()):
                             corroborated = mask_corroborated(
-                                mask, new_boxes, (w, h),
+                                mask, corrob_boxes, (w, h),
                                 ios_thresh=cull_corrob_ios,
                                 mask_color=(existing_colors.get(oid)
                                             if existing_colors else None),
-                                new_colors=new_metadata,
+                                new_colors=corrob_metadata,
                             )
                             hist = corroboration_history.setdefault(
                                 oid, deque(maxlen=cull_evidence_window))
@@ -1213,9 +1274,9 @@ class Sam2FieldTracker:
                             if (object_metadata is not None
                                     and object_metadata.get(oid) not in ("red", "blue")):
                                 definite = corroborating_colors(
-                                    mask, new_boxes, (w, h),
+                                    mask, corrob_boxes, (w, h),
                                     ios_thresh=cull_corrob_ios,
-                                    new_colors=new_metadata,
+                                    new_colors=corrob_metadata,
                                 )
                                 if len(definite) == 1:
                                     c = next(iter(definite))
@@ -1267,6 +1328,66 @@ class Sam2FieldTracker:
                             for o in list(culled_set):
                                 existing.pop(o, None)
                                 existing_colors.pop(o, None)
+
+                    # ---- Person-overlap veto (positive hijack signal). A
+                    # stationary mask spending consecutive boundaries mostly
+                    # inside a person detection is a hijacked track — a robot
+                    # is never a person — so unlike the absence-based cull
+                    # above this fires independent of cull_enabled and needs
+                    # no detector-absence evidence. Moving masks are spared:
+                    # motion is the strongest robot-not-junk signal we have,
+                    # and a robot legitimately drives past wall-side refs. ----
+                    if person_fn is not None and existing:
+                        pv_frame_path = (
+                            frame_paths[last_idx] if last_idx < len(frame_paths) else None
+                        )
+                        try:
+                            person_boxes = list(person_fn(last_idx, pv_frame_path) or [])
+                        except Exception as exc:
+                            person_boxes = []
+                            if not person_fn_error_logged:
+                                person_fn_error_logged = True
+                                print(f"  [{self.LOG_TAG}] person_fn failed at frame "
+                                      f"{last_idx} (further errors suppressed): {exc!r}")
+                        from .detect_schema import box_coverage
+                        veto_culled: set[int] = set()
+                        for oid in list(existing):
+                            box = results[last_visible_frame[oid]][oid]["box"]
+                            covered = any(
+                                box_coverage(box, pb) >= person_veto_coverage
+                                for pb in person_boxes
+                            )
+                            if covered:
+                                person_overlap_counts[oid] = (
+                                    person_overlap_counts.get(oid, 0) + 1)
+                            else:
+                                person_overlap_counts.pop(oid, None)
+                            if (person_overlap_counts.get(oid, 0) >= person_veto_boundaries
+                                    and is_stationary(
+                                        field_pos_window.get(oid, []),
+                                        cull_stationary_m)):
+                                veto_culled.add(oid)
+                                if diagnostics:
+                                    diagnostics.increment(
+                                        f"{self.DIAG_PREFIX}_objects_culled")
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.object_culled",
+                                        reason="person_overlap",
+                                        details={
+                                            "object_id": oid,
+                                            "frame_idx": last_idx,
+                                            "consecutive_boundaries":
+                                                person_overlap_counts.get(oid, 0),
+                                        },
+                                    )
+                        if veto_culled:
+                            culled_set |= veto_culled
+                            active_objects = [
+                                o for o in active_objects if o not in veto_culled]
+                            for o in veto_culled:
+                                existing.pop(o, None)
+                                existing_colors.pop(o, None)
+                                person_overlap_counts.pop(o, None)
 
                     # ---- New-object seeding (caps re-checked per seed; a capped
                     # roster may evict an evidently-stale object to make room) ----

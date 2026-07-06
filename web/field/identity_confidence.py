@@ -202,3 +202,54 @@ def blend_read_confidence(base_conf: float, digit_prob) -> float:
         return base_conf
     return round(base_conf * (max(0.0, min(1.0, float(digit_prob))) ** 0.5), 3)
 
+
+
+def dedupe_batch_team_reads(reads):
+    """Allow at most ONE vote per team value within a single VLM batch.
+
+    ``reads`` is ``[(team, conf, source_weight), ...]`` in batch order; the
+    return is a parallel list of booleans (True = this read may cast its
+    vote). One physical robot photographed by two crops in the same batch
+    (or its number cross-read from an adjacent crop) otherwise votes the
+    same team into two different slots simultaneously — the qm11 duplicate
+    "2992?" label. The strongest read (conf x weight, first on ties) keeps
+    the vote; ``None`` teams are never blocked (they cast no vote anyway).
+    """
+    best_idx = {}
+    for i, (team, conf, weight) in enumerate(reads):
+        if team is None:
+            continue
+        score = float(conf) * float(weight)
+        if team not in best_idx or score > best_idx[team][1]:
+            best_idx[team] = (i, score)
+    winners = {i for i, _s in best_idx.values()}
+    return [team is None or i in winners for i, (team, _c, _w) in enumerate(reads)]
+
+
+def tentative_claim_winners(vote_maps):
+    """For each team, the single robot allowed to display it as a tentative
+    "TEAM?" claim: the one with the highest accumulated vote (ties break to
+    the first key in sorted order, for stable display).
+
+    ``vote_maps`` is ``{robot_id: {team: vote_total}}``. Accumulated votes
+    across batches can put the same team's top vote on two robots (qm11: two
+    slots both showed "2992?"); the HUD consults this map so only the
+    strongest claimant renders the label.
+    """
+    winners = {}
+    for rid in sorted(vote_maps):
+        for team, total in (vote_maps[rid] or {}).items():
+            cur = winners.get(team)
+            if cur is None or total > cur[1]:
+                winners[team] = (rid, total)
+    return {team: rid for team, (rid, _t) in winners.items()}
+
+
+def best_owned_team(votes, robot_id, winners):
+    """The robot's highest-voted team among those it actually OWNS per
+    ``tentative_claim_winners`` — ``(team, vote)`` or ``(None, 0.0)``."""
+    best = (None, 0.0)
+    for team, total in (votes or {}).items():
+        if winners.get(team) == robot_id and total > best[1]:
+            best = (team, total)
+    return best

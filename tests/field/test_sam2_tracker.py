@@ -2124,3 +2124,167 @@ def test_pick_evictable_motion_never_evicts_recently_corroborated():
     # With only the recently-corroborated object present: nobody is evicted.
     assert pick_evictable([1], hist, window,
                           moving_candidate=True, **kwargs) is None
+
+
+# ---------------------------------------------------------------------------
+# Person-overlap veto: a mask sitting mostly inside a person detection for
+# consecutive boundaries is a hijack (a robot is never a person) — the
+# positive signal the absence-based cull lacks (qm24: absence+stationarity
+# alone killed real blind-spot robots; qm11: R3 spent all of auto on a ref).
+# ---------------------------------------------------------------------------
+
+def _track_with_person_fn(stub, person_fn, **overrides):
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    kwargs = dict(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=lambda *_a: [(stub._rect_for(1), "blue")],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=False,
+        person_fn=person_fn,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    kwargs.update(overrides)
+    result = tracker.track(**kwargs)
+    return result, diag
+
+
+def test_person_veto_culls_object_locked_on_person():
+    """Object 2 (rect x[20,24) y[2,6)) fully inside a person box at every
+    boundary -> culled with reason person_overlap, even with cull_enabled=False.
+    Object 1 is untouched."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_person_fn(
+        stub, person_fn=lambda idx, path: [(18.0, 0.0, 26.0, 8.0)])
+    culled = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
+    assert any(e["details"]["object_id"] == 2 and e.get("reason") == "person_overlap"
+               for e in culled), f"expected person_overlap cull of obj 2, got {culled}"
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_person_veto_requires_consecutive_boundaries():
+    """A single-boundary overlap (person walks past) must NOT cull."""
+    stub = CullStubPredictor()
+    calls = {"n": 0}
+
+    def person_fn(idx, path):
+        calls["n"] += 1
+        return [(18.0, 0.0, 26.0, 8.0)] if calls["n"] == 1 else []
+
+    result, diag = _track_with_person_fn(stub, person_fn)
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_person_veto_ignores_partial_overlap():
+    """Coverage below the threshold (person box clips 1px of the 4px-wide
+    mask box -> 0.25) is not a hijack signal."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_person_fn(
+        stub, person_fn=lambda idx, path: [(23.0, 0.0, 40.0, 8.0)])
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_person_fn_error_is_nonfatal():
+    """A crashing person_fn degrades to no-veto; track() completes."""
+    stub = CullStubPredictor()
+
+    def person_fn(idx, path):
+        raise RuntimeError("person model exploded")
+
+    result, diag = _track_with_person_fn(stub, person_fn)
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_person_veto_spares_moving_object():
+    """A MOVING mask overlapped by a person (robot driving past a ref at the
+    wall) is not vetoed — the veto is for parked hijacks, and motion is the
+    strongest robot-not-equipment signal we have."""
+    stub = CullStubPredictor(moving={2})
+    result, diag = _track_with_person_fn(
+        stub, person_fn=lambda idx, path: [(0.0, 0.0, 200.0, 20.0)])
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_cull_enabled_for_view_scopes_to_main():
+    """Main-view scoping: mid-field equipment is fully visible to main-view
+    YOLO (absence there is strong evidence); corner-view objects are the
+    qm24 false-cull victims and stay exempt."""
+    from web.field.sam2_tracker import cull_enabled_for_view
+    assert cull_enabled_for_view(True, "main", main_only=True) is True
+    assert cull_enabled_for_view(True, "corner_left", main_only=True) is False
+    assert cull_enabled_for_view(True, "corner_left", main_only=False) is True
+    assert cull_enabled_for_view(False, "main", main_only=True) is False
+    assert cull_enabled_for_view(None, "main", main_only=True) is None
+    assert cull_enabled_for_view(None, "corner_left", main_only=True) is False
+
+
+# ---------------------------------------------------------------------------
+# Zone-blind corroboration: a detection whose box the corrob_gate_fn rejects
+# (contact point inside a static-structure zone) must not count as mask
+# corroboration — the OVERFLOW bin's bumper-lookalike false positive otherwise
+# corroborates its own hijacked mask forever, so the absence cull never fires.
+# Robots physically cannot park inside the bin footprint, so blinding
+# corroboration there is safe.
+# ---------------------------------------------------------------------------
+
+def test_zone_gated_detection_does_not_corroborate():
+    """Object 2 is stationary and 'detected' every boundary, but the gate
+    rejects those detections (equipment zone) -> absence accumulates -> the
+    cull fires exactly as if the detector had never seen it."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(2), "red")]
+
+    def corrob_gate_fn(box):
+        # reject anything near object 2's spot (the "bin footprint")
+        return not (18 <= (box[0] + box[2]) / 2 <= 26)
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_corrob_ios=0.3, cull_stationary_m=0.5,
+        corrob_gate_fn=corrob_gate_fn,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    assert 1 in result[stub.NUM_FRAMES - 1]        # obj 1 corroborated, kept
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_corrob_gate_error_fails_open():
+    """A crashing corrob_gate_fn must degrade to normal corroboration (no
+    cull) — never to mass blinding."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def corrob_gate_fn(box):
+        raise RuntimeError("projector exploded")
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [(stub._rect_for(2), "red")],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, corrob_gate_fn=corrob_gate_fn,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]

@@ -14,6 +14,7 @@ import asyncio
 import base64
 import cv2
 import datetime
+import hashlib
 import io
 import json
 import math
@@ -124,10 +125,13 @@ from web import database
 from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
 from web.field.identity_confidence import (
     ConfidenceConfig,
+    best_owned_team,
     blend_read_confidence,
     decide_vlm_read,
+    dedupe_batch_team_reads,
     digit_token_conf,
     occlusion_blocks_read,
+    tentative_claim_winners,
 )
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
@@ -207,7 +211,17 @@ def _restore_sam2_mask_to_view(
 
 # Configuration
 PROJECT_ROOT = Path(__file__).parent.parent
-MODEL_PATH = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
+# Prefer the 2026cur hard-negative distill (kills the OVERFLOW-bin robot-class
+# false positive that corroborated the qm10/qm11 equipment hijacks: bin FP
+# 44/47 -> 1/47 sampled auto frames, parked-robot recall preserved), with the
+# base model as fallback. Override per-process via FRC_HUB_MODEL.
+_HUB_MODEL_HARDNEG = PROJECT_ROOT / "runs/train/hub_zone_yolo26s_2026cur_v2/weights/best.pt"
+_HUB_MODEL_BASE = PROJECT_ROOT / "runs/train/hub_zone_yolo26s/weights/best.pt"
+MODEL_PATH = (
+    Path(os.environ["FRC_HUB_MODEL"]).expanduser() if os.environ.get("FRC_HUB_MODEL")
+    else _HUB_MODEL_HARDNEG if _HUB_MODEL_HARDNEG.exists()
+    else _HUB_MODEL_BASE
+)
 BUMPER_MODEL_HARDNEG_PATH = (
     PROJECT_ROOT / "runs/train/frc_bumpers_equipment_hardneg/weights/best.pt"
 )
@@ -1964,7 +1978,15 @@ class InferenceJob:
 
         ocr_crops = []
         status_results = []
-        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
+        # Within-batch team dedupe: one physical robot photographed by two
+        # crops (or its number cross-read from an adjacent crop) must not
+        # vote the same team into two slots at once (qm11: one batch put
+        # "2992" on B1 AND B3). The strongest read keeps the vote.
+        _vote_ok = dedupe_batch_team_reads([
+            (r.get("team_number"), float(r.get("confidence", 0.0)), c[1])
+            for c, r in zip(chosen, results)
+        ])
+        for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64), res) in enumerate(zip(chosen, results)):
             robot = self._get_or_create_slot_track(slot_id)
             ident = self.identity_registry.identities.get(identity_id)
             if not robot or not ident:
@@ -2036,6 +2058,33 @@ class InferenceJob:
                                          image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             if not team:
                 continue
+            if not _vote_ok[_read_idx]:
+                print(f"  VLM vote dropped [batch-dup]: "
+                      f"{self._slot_label(slot_id)} += {team} suppressed "
+                      f"(stronger read of the same team in this batch)")
+                continue
+            # Zone-blind voting: a read taken while the track sits inside a
+            # static-structure footprint is printed equipment text, not a
+            # bumper (qm11: R2 read the OVERFLOW crate's "1477" at prob 1.0
+            # from [11.3,2.1] — inside the bin zone — and it tied the one
+            # real "4256" read so nothing ever locked).
+            _pos = getattr(robot, "field_position", None)
+            try:
+                _pos = (float(_pos[0]), float(_pos[1]))
+            except (TypeError, ValueError, IndexError):
+                _pos = None
+            # Small margin over the raw footprints: the SAM box reaches the
+            # equipment (and the crop shows its printed text) slightly before
+            # the track's ground contact enters the tight rect.
+            _vote_zones = inflate_zones(
+                getattr(self, "user_seed_zones_raw", None) or [], 0.3)
+            if (getattr(getattr(self, "config", None), "zone_blind_votes", False)
+                    and _pos is not None
+                    and point_in_zones(_pos, _vote_zones)):
+                print(f"  VLM vote dropped [static-zone]: "
+                      f"{self._slot_label(slot_id)} += {team} at "
+                      f"({_pos[0]:.1f},{_pos[1]:.1f})")
+                continue
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
@@ -2072,7 +2121,9 @@ class InferenceJob:
                 self._deposit_to_gallery(robot, legibility=conf,
                                          image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             print(f"  VLM read [{cam}]: {self._slot_label(slot_id)} += {team} "
-                  f"(w={vote_weight:.1f}, total={vote_total:.1f})")
+                  f"(w={vote_weight:.1f}, total={vote_total:.1f}"
+                  + (f", at {_pos[0]:.2f},{_pos[1]:.2f}" if _pos is not None else ", at ?")
+                  + ")")
 
         # Co-occlusion resolution. Reads identify the robot occupying each slot;
         # translate those team labels back to durable identities before changing
@@ -2867,9 +2918,30 @@ class InferenceJob:
         ).strip()
         return parse_match_clock_text(text)
 
+    def _clock_scan_cache_path(self, sample_step: int) -> Path:
+        """Cache key = video CONTENT fingerprint, not filename: every job
+        re-uploads the same bytes under a fresh uuid name, so the name is
+        useless as a key while size+head-hash is stable and cheap."""
+        h = hashlib.md5()
+        with open(self.video_path, "rb") as f:
+            h.update(f.read(1 << 20))
+        h.update(f"{self.video_path.stat().st_size}:{sample_step}:{self.overhead_height}".encode())
+        return UPLOAD_DIR / f"clockscan_{h.hexdigest()}.json"
+
     def _scan_match_clock(self) -> List[Tuple[int, Optional[int]]]:
-        """Sparse-decode the source video and OCR the clock every half second."""
+        """Sparse-decode the source video and OCR the clock every half second.
+
+        Results are cached per video content: the scan is deterministic given
+        the same bytes and sampling params, and at ~60s per scan it dominated
+        repeat-analysis (A/B) turnaround."""
         sample_step = max(1, int(round(self.video_fps * MATCH_CLOCK_SAMPLE_SECONDS)))
+        cache_path = self._clock_scan_cache_path(sample_step)
+        try:
+            cached = json.loads(cache_path.read_text())
+            print(f"  Clock scan: cache hit ({cache_path.name})")
+            return [(int(i), None if v is None else int(v)) for i, v in cached]
+        except (OSError, ValueError):
+            pass
         samples = []
         scan_cap = cv2.VideoCapture(str(self.video_path))
         try:
@@ -2882,6 +2954,10 @@ class InferenceJob:
                 samples.append((frame_idx, self.read_match_clock(overhead)))
         finally:
             scan_cap.release()
+        try:
+            cache_path.write_text(json.dumps(samples))
+        except OSError:
+            pass
         return samples
     
     def update_hub_positions(self, detections: sv.Detections) -> None:
@@ -2963,7 +3039,21 @@ class InferenceJob:
         best_team = robot.team_number
         best_vote = 0.0
         if robot.team_ocr_votes:
-            best_team, best_vote = max(robot.team_ocr_votes.items(), key=lambda kv: kv[1])
+            # Cross-slot claim arbitration: a tentative "TEAM?" renders only
+            # on the robot with the highest accumulated vote for that team —
+            # votes gathered across batches otherwise put the same guess on
+            # two slots at once (qm11: B1 and B3 both showed "2992?").
+            winners = tentative_claim_winners({
+                rid: getattr(r, "team_ocr_votes", None) or {}
+                for rid, r in self.robot_tracks.items()
+            })
+            owned_team, owned_vote = best_owned_team(
+                robot.team_ocr_votes, robot.robot_id, winners)
+            if owned_team:
+                best_team, best_vote = owned_team, owned_vote
+            elif best_team and winners.get(best_team) not in (None, robot.robot_id):
+                # its assigned team_number is also claimed elsewhere — show no #
+                best_team = None
         if best_team:
             if best_vote:
                 conf = min(99, int(best_vote / OCR_TEAM_CONFIRM_VOTES * 100))
@@ -4276,8 +4366,12 @@ class InferenceJob:
             # zones are inflated to absorb corner-cam projection error; they
             # are also kept separately for the low-camera ray gate (hub zones
             # stay point-test only — robots park flush to hubs).
+            # Raw (uninflated) rects kept separately for the corroboration
+            # gate: blinding corroboration needs tight footprints so a robot
+            # parked BESIDE the equipment keeps its detector evidence.
+            self.user_seed_zones_raw = load_zones(self.event_key)
             self.user_seed_zones = inflate_zones(
-                load_zones(self.event_key), ZONE_SEED_MARGIN_M
+                self.user_seed_zones_raw, ZONE_SEED_MARGIN_M
             )
             static_zones = self.user_seed_zones + self.hub_no_robot_zones
             self.static_seed_zones = static_zones
@@ -5364,6 +5458,48 @@ class InferenceJob:
                                 self.config.motion_energy_thresh,
                             )
 
+                        # Person-overlap veto (A/B knob): person YOLO on the
+                        # exported tracking frame itself — boxes come back in
+                        # the same scaled/cropped pixel space as the masks, so
+                        # no coordinate translation and no extra video decode.
+                        _person_fn = None
+                        if self.config.person_veto_enabled:
+                            def _person_fn(local_idx, frame_path):
+                                if not frame_path:
+                                    return []
+                                img = cv2.imread(frame_path)
+                                if img is None:
+                                    return []
+                                res = self.person_model(
+                                    img, classes=[0], conf=DET_CONF_THRESHOLD,
+                                    verbose=False)[0]
+                                dets = sv.Detections.from_ultralytics(res)
+                                return [tuple(dets.xyxy[i]) for i in range(len(dets))]
+
+                        # Zone-blind corroboration (A/B knob): detections whose
+                        # ground contact lands inside a raw static zone are
+                        # invisible to the tracker's corroboration bookkeeping.
+                        _corrob_gate_fn = None
+                        if (self.config.zone_blind_corroboration
+                                and getattr(self, "user_seed_zones_raw", None)):
+                            def _make_corrob_gate(project, zones):
+                                def _gate(box):
+                                    xy = project(box)
+                                    if xy is None:
+                                        return True
+                                    return not point_in_zones(xy, zones)
+                                return _gate
+                            _corrob_gate_fn = _make_corrob_gate(
+                                _project_fn, self.user_seed_zones_raw)
+
+                        # Main-view cull scoping: corner views are the qm24
+                        # false-cull victims; None still defers to env knobs
+                        # on the main view.
+                        from web.field.sam2_tracker import cull_enabled_for_view
+                        _cull_enabled = cull_enabled_for_view(
+                            self.cull_hijack_enabled, view.name,
+                            self.config.cull_main_view_only)
+
                         t0 = time.perf_counter()
                         view_tracks = await asyncio.to_thread(
                             sam2_tracker.track,
@@ -5373,6 +5509,7 @@ class InferenceJob:
                             reprompt_every=reprompt_every,
                             detect_fn=make_detect_fn(_detect_caps),
                             motion_fn=_motion_fn,
+                            person_fn=_person_fn,
                             object_metadata=self.sam2_obj_color[view.name],
                             max_objects=MAX_TRACKED_ROBOTS,
                             max_active_objects=MAX_TRACKED_ROBOTS,
@@ -5385,9 +5522,10 @@ class InferenceJob:
                             diagnostics=self.identity_diagnostics,
                             project_fn=_project_fn,
                             seed_gate_fn=_seed_gate_fn,
+                            corrob_gate_fn=_corrob_gate_fn,
                             # None defers to the tracker's env-knob defaults.
-                            **({"cull_enabled": self.cull_hijack_enabled}
-                               if self.cull_hijack_enabled is not None else {}),
+                            **({"cull_enabled": _cull_enabled}
+                               if _cull_enabled is not None else {}),
                             **({"reanchor_enabled": self.reanchor_enabled}
                                if self.reanchor_enabled is not None else {}),
                             dark_reanchor_enabled=self.config.dark_reanchor_enabled,

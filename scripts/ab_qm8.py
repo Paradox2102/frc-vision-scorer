@@ -123,6 +123,59 @@ PROFILES = {
                                "motion_override": True, "motion_gated_conf": True,
                                "motion_seed_blobs": True}),
     ],
+    # Hijack pair fix (2026-07-06 deep dive): person-overlap veto (positive
+    # hijack signal — qm11 R3 spent all of auto on a ref) and the absence
+    # cull scoped to the main view (corner views were qm24's false-cull
+    # victims; mid-field equipment is main-visible so absence is strong).
+    "hijack-fix": [
+        ("person-veto", {"person_veto_enabled": True}),
+        ("cull-main", {"cull_hijack_enabled": True}),
+        ("veto+cull", {"person_veto_enabled": True,
+                       "cull_hijack_enabled": True}),
+    ],
+    # Post-detector-retrain validation (hub_zone_yolo26s_2026cur_v2 wired in
+    # via MODEL_PATH): baseline on the new model, then the full hijack stack.
+    "newmodel": [
+        ("baseline", {}),
+        ("veto+cull", {"person_veto_enabled": True,
+                       "cull_hijack_enabled": True}),
+    ],
+    # OVERFLOW-bin endgame: tight zones_2026cur.json (bin + rig pole) are now
+    # event config (both configs get the seed gate); the contrast is the
+    # corroboration blinding that lets the scoped cull finally fire on the
+    # bumper-FP-corroborated bin mask.
+    "binfix": [
+        ("zones-only", {}),
+        ("full-stack", {"zone_blind_corroboration": True,
+                        "cull_hijack_enabled": True,
+                        "person_veto_enabled": True}),
+    ],
+    # Endgame: the validated sprint recipe (qm11 memory: meanNN 1.105->0.738;
+    # it was NOT enabled in any of today's runs) as the true baseline, vs
+    # sprint + the full hijack stack (3 tight zones incl. the pole tote,
+    # zone-blind corroboration, main-scoped cull, person veto). Opus root
+    # cause: 3181's 26 already_tracked seed rejections are exactly what
+    # motion_override promotes; the stack frees the seats clutter holds.
+    # Single sprint+stack run (vote-fix validation etc.).
+    "endgame-stack": [
+        ("sprint+stack", {"sam2_prompt_offset_seconds": 0.0,
+                          "motion_override": True, "motion_gated_conf": True,
+                          "seed_union_extent": True,
+                          "zone_blind_corroboration": True,
+                          "cull_hijack_enabled": True,
+                          "person_veto_enabled": True}),
+    ],
+    "endgame": [
+        ("sprint", {"sam2_prompt_offset_seconds": 0.0,
+                    "motion_override": True, "motion_gated_conf": True,
+                    "seed_union_extent": True}),
+        ("sprint+stack", {"sam2_prompt_offset_seconds": 0.0,
+                          "motion_override": True, "motion_gated_conf": True,
+                          "seed_union_extent": True,
+                          "zone_blind_corroboration": True,
+                          "cull_hijack_enabled": True,
+                          "person_veto_enabled": True}),
+    ],
     # Seed-prompt quality: dedupe cross-class bumper double-reads and adopt
     # whole-robot union extents (a 24px sliver prompt on a blurred robot
     # dies in propagation; the union box is the prompt SAM can hold onto).

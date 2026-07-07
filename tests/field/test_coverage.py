@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from web.field.calibration import CameraCalibration
-from web.field.coverage import cell_coverage, coverage_grid
+from web.field.coverage import cell_coverage, coverage_grid, _in_frustum
+from web.field.detect_bridge import DET_MAX_BOX_FRAC, expected_robot_pixel_width
 from web.field.occlusion import Prism
 from tests._field_synth import look_at, TRUTH_K, TRUTH_D
 
@@ -67,15 +68,35 @@ def test_corner_view_falloff_applied():
 
 
 def test_close_range_pose_camera_blind_when_box_exceeds_frac():
-    # A pose-based (pinhole) camera looking straight down from very low height
-    # right above the cell: expected robot pixel width should blow past the
-    # frac backstop, forcing weight to 0 even though the point is in-frustum.
-    rvec, tvec = look_at((5.0, 2.5, 0.3), (5.0, 2.5, 0.0))
+    # A pose-based (fisheye) camera placed LOW and laterally OFFSET from the
+    # test cell (not overhead — that degenerates look_at's cross product against
+    # world_up, and zero ground-plane range short-circuits the width forward-
+    # projection entirely). At half a meter of ground-plane range, a 1.1 m robot
+    # projects far wider than the frac backstop allows.
+    cell_xy = (4.5, 2.5)
+    rvec, tvec = look_at((4.0, 2.5, 0.4), (cell_xy[0], cell_xy[1], 0.0))
     cal = CameraCalibration(K=TRUTH_K.copy(), D=TRUTH_D.copy(), rvec=rvec, tvec=tvec,
                             image_size=(1920, 1080), crop_region=None,
                             field_season="2026-rebuilt-welded", mode="camera")
+
+    # Precondition: the point is actually in-frustum (finite, in-bounds uv) —
+    # so a zero weight below can only come from the close-range factor, not
+    # frustum rejection.
+    uv = cal.field_to_image((cell_xy[0], cell_xy[1], 0.0))
+    assert all(np.isfinite(c) for c in uv)
+    u, v = uv
+    w_img, h_img = cal.image_size
+    assert 0.0 <= u <= w_img and 0.0 <= v <= h_img
+    assert _in_frustum(cal, *cell_xy)
+
+    # Precondition: the close-range branch genuinely fires (expected pixel
+    # width is real and exceeds the frac-backstop threshold).
+    expected_px = expected_robot_pixel_width(cell_xy, cal, 1.1)
+    assert expected_px is not None
+    assert expected_px > DET_MAX_BOX_FRAC * w_img
+
     views = [_FakeView("main", cal)]
-    w = cell_coverage(5.0, 2.5, views, _FakeModel(), prisms=[])
+    w = cell_coverage(cell_xy[0], cell_xy[1], views, _FakeModel(), prisms=[])
     assert w["main"] == 0.0
 
 

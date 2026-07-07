@@ -2593,6 +2593,7 @@ class InferenceJob:
                 "confidence": float(res.get("confidence", 0.0)),
                 "error": res.get("error"),
                 "legibility": round(score, 4),
+                "surface": res.get("surface", "unknown"),
             })
             self.diagnostic.record_vlm_read(
                 frame=self._current_frame, robot_id=robot.robot_id,
@@ -2603,6 +2604,7 @@ class InferenceJob:
                 alliance_read=res.get("alliance", "unknown"),
                 confidence=float(res.get("confidence", 0.0)),
                 vote_weight=1.0 if float(res.get("confidence", 0.0)) >= 0.85 else 0.5,
+                surface=res.get("surface", "unknown"),
             )
         self.last_ocr_crops = ocr_crops
         self._ocr_crops_dirty = True
@@ -2613,6 +2615,12 @@ class InferenceJob:
                 continue
             robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
+                continue
+            if surface_vote_multiplier(
+                    result.get("surface"),
+                    getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+                print(f"  VLM vote dropped [printed-surface]: "
+                      f"{self._slot_label(canonical_id)} += {team}")
                 continue
             conf = result.get("confidence", 0.0)
             weight = 1.0 if conf >= 0.85 else 0.5

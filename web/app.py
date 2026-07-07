@@ -6392,6 +6392,23 @@ class InferenceJob:
                                 ):
                                     continue
                                 uv = ((fx1 + fx2) / 2.0, fy2)
+                                if self.config.mask_footprint_pos:
+                                    # Use the mask's carpet-contact footprint as
+                                    # the ray origin instead of the box bottom-
+                                    # center: an extended intake/arm stretches
+                                    # the box and shifts its bottom-center off
+                                    # the robot's actual contact. The mask is in
+                                    # 0.5x top-cropped coords (same space as the
+                                    # box), so transform mask->full-res exactly
+                                    # as the box is transformed above.
+                                    from web.field.sam2_tracker import mask_bottom_center
+                                    fmask = info.get("mask")
+                                    if fmask is not None:
+                                        mp = mask_bottom_center(fmask)
+                                        if mp is not None:
+                                            mx, my = mp
+                                            uv = (mx / SAM2_SCALE,
+                                                  my / SAM2_SCALE + sam2_y_offset)
                                 xy = cal.image_to_field(uv)
                                 corner_weight = corner_detection_weight(
                                     view.name, xy, self.field_dims

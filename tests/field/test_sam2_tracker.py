@@ -5,6 +5,7 @@ import pytest
 from web.field.sam2_tracker import (
     mask_to_box,
     bottom_center,
+    mask_bottom_center,
     match_new_detections,
     size_prior_ratio,
     size_prior_violation,
@@ -22,6 +23,32 @@ def test_mask_to_box_empty_returns_none():
 
 def test_bottom_center():
     assert bottom_center((3, 2, 8, 5)) == (5.5, 5.0)
+
+
+def test_mask_bottom_center_empty_returns_none():
+    assert mask_bottom_center(np.zeros((4, 4), bool)) is None
+
+
+def test_mask_bottom_center_uses_bottom_band_not_box_center():
+    # Asymmetric mask: a wide extended intake up top (cols 0..10) plus a narrow
+    # carpet-contact footprint at the bottom (cols 8..10). The box bottom-center
+    # x would be pulled left by the wide top rows; the true footprint x is the
+    # mean column of only the bottom-band contact pixels.
+    m = np.zeros((10, 12), bool)
+    m[2:7, 0:11] = True   # wide extended arm/intake up top
+    m[7:9, 8:11] = True   # narrow base actually touching the carpet
+    box = mask_to_box(m)                 # (0, 2, 11, 9)
+    box_cx = (box[0] + box[2]) / 2.0     # 5.5 — pulled toward the wide top
+    ymax = 8                             # lowest nonzero row
+    fp = mask_bottom_center(m)           # default band of 3 rows: rows 6,7,8
+    assert fp is not None
+    fx, fy = fp
+    assert fy == float(ymax)             # y is the true lowest contact row
+    # Bottom 3 rows: row 6 spans cols 0..10, rows 7,8 span cols 8..10.
+    # Mean column of those pixels sits well right of the box center.
+    assert fx > box_cx
+    # Restricting to just the bottom 2 rows (the narrow base) -> centered on 9.
+    assert mask_bottom_center(m, rows=2) == (9.0, 8.0)
 
 
 def test_match_new_detections_flags_unmatched():

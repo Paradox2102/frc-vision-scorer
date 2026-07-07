@@ -189,6 +189,19 @@ def test_mask_leak_cleanup_default_and_override(monkeypatch):
     assert JobConfig({"mask_leak_cleanup": "0"}).mask_leak_cleanup is False
 
 
+def test_mask_footprint_pos_default_and_override(monkeypatch):
+    # Field position from the mask's carpet-contact band instead of the box
+    # bottom-center, so an extended intake/arm doesn't shift the ray origin.
+    # DEFAULT OFF (byte-identical default path).
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    assert JobConfig().mask_footprint_pos is False
+    monkeypatch.setenv("MASK_FOOTPRINT_POS", "1")
+    assert JobConfig().mask_footprint_pos is True
+    assert JobConfig({"mask_footprint_pos": "1"}).mask_footprint_pos is True
+    assert JobConfig({"mask_footprint_pos": "0"}).mask_footprint_pos is False
+
+
 def test_vote_ray_gate_knobs_default_off(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

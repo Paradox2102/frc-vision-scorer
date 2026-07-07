@@ -409,6 +409,30 @@ def bottom_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((x1 + x2) / 2, float(y2))
 
 
+def mask_bottom_center(
+    mask: np.ndarray, rows: int = 3,
+) -> tuple[float, float] | None:
+    """Return the (x, y) footprint of a mask's carpet-contact band.
+
+    The tracked box bottom-center is the tight-bbox midpoint, so an extended
+    intake/arm at a different column than the base shifts the ray origin off the
+    robot's actual carpet contact. This finds the lowest nonzero row ``ymax``,
+    takes the nonzero pixels within the bottom ``rows`` rows (a small band up
+    from ``ymax``), and returns ``(mean_x, ymax)`` — x is the mean column of
+    those bottom-band pixels, y is the true lowest contact row. The band clamps
+    at the mask top, so a mask shorter than ``rows`` uses all its rows.
+
+    Returns None for an empty mask.
+    """
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return None
+    ymax = int(ys.max())
+    band_lo = ymax - (rows - 1)  # inclusive lowest row of the band
+    in_band = ys >= band_lo
+    return (float(xs[in_band].mean()), float(ymax))
+
+
 def box_motion_energy(prev_gray: np.ndarray, cur_gray: np.ndarray,
                       box: tuple[float, float, float, float]) -> float:
     """Mean absolute intensity change inside ``box`` between two grayscale

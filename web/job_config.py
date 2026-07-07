@@ -194,6 +194,13 @@ KNOBS = [
     # Unconditional largest-component regressed qm10/qm12 by dropping those
     # halves. DEFAULT OFF pending re-validation.
     Knob("mask_leak_cleanup", "SAM2_MASK_LEAK_CLEANUP", bool, False),
+    # Derive a robot's field position from the centroid of its SAM mask's
+    # carpet-contact band instead of the tracked box bottom-center. An extended
+    # intake/arm stretches the box, shifting the box bottom-center off the
+    # robot's actual carpet contact; the mask footprint is a truer ray origin.
+    # Falls back to the box bottom-center when no mask is available.
+    # DEFAULT OFF (byte-identical default path) pending A/B.
+    Knob("mask_footprint_pos", "MASK_FOOTPRINT_POS", bool, False),
     # Size-prior hijack cull: a tracked mask whose pixel width, at its
     # projected field position, stays far wider (or narrower) than a robot
     # could appear for size_prior_boundaries consecutive boundaries has latched

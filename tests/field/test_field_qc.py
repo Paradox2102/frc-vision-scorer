@@ -92,6 +92,9 @@ class TestBoxesToFieldPoints:
             raise ValueError("outside homography")
         assert boxes_to_field_points([[0, 0, 2, 2]], 1.0, boom) == []
 
+    def test_none_projection_skips_point(self):
+        assert boxes_to_field_points([[0, 0, 2, 2]], 1.0, lambda uv: None) == []
+
 
 class TestReconcileCensus:
     def test_exact_match(self):

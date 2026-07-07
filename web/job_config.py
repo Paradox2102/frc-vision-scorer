@@ -236,6 +236,8 @@ KNOBS = [
     # (equipment hijacks) — are recorded to diagnostics ONLY. This is the
     # grading dataset for wiring seed/evict corrections later; census reads
     # run single-flight so they never starve identity bumper reads.
+    # NOTE for grading: unmatched_tracks includes legitimately occluded/
+    # coasting robots (stale field_position) — not every entry is a ghost.
     # DEFAULT OFF pending A/B.
     Knob("field_qc_enabled", "VLM_FIELD_QC", bool, False),
     Knob("field_qc_interval_sec", "VLM_FIELD_QC_INTERVAL_SEC", float, 5.0, min=1.0),

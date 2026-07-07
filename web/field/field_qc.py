@@ -126,6 +126,8 @@ def boxes_to_field_points(boxes, scale, image_to_field):
         v = box[3] / scale
         try:
             xy = image_to_field((u, v))
+            if xy is None:
+                continue
             pts.append((float(xy[0]), float(xy[1])))
         except Exception:
             continue

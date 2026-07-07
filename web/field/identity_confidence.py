@@ -297,3 +297,24 @@ def best_owned_team(votes, robot_id, winners):
         if winners.get(team) == robot_id and total > best[1]:
             best = (team, total)
     return best
+
+
+def normalize_surface(value) -> str:
+    """Normalize the reader's "surface" field to bumper|printed|unknown.
+
+    "printed" means the digits are printed on equipment (crate/bin/sign),
+    not a robot bumper band — the qm11 OVERFLOW-crate "1477" failure mode.
+    Anything unexpected is "unknown" so downstream gating fails open."""
+    if not isinstance(value, str):
+        return "unknown"
+    v = value.strip().lower()
+    return v if v in ("bumper", "printed") else "unknown"
+
+
+def surface_vote_multiplier(surface, gate_enabled: bool) -> float:
+    """0.0 (drop the vote) only when the gate is ON and the reader is
+    affirmatively saying the digits are printed on a structure. "unknown"
+    and "unclear" fail open — never lose a bumper vote to a missing field."""
+    if gate_enabled and normalize_surface(surface) == "printed":
+        return 0.0
+    return 1.0

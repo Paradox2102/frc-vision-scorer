@@ -130,7 +130,8 @@ class DiagnosticRecorder:
     def record_vlm_read(self, frame: int | None, robot_id: int | None,
                        crop_b64: str | None, legibility: float,
                        raw_read: str | None, matched_team: str | None,
-                       alliance_read: str, confidence: float, vote_weight: float) -> None:
+                       alliance_read: str, confidence: float, vote_weight: float,
+                       surface: str = "unknown") -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -140,6 +141,7 @@ class DiagnosticRecorder:
             "legibility": float(legibility), "raw_read": raw_read,
             "matched_team": matched_team, "alliance_read": alliance_read,
             "confidence": float(confidence), "vote_weight": float(vote_weight),
+            "surface": surface,
         })
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

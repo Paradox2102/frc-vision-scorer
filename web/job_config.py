@@ -207,6 +207,15 @@ KNOBS = [
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),
+    # Surface-aware vote gate: the bumper readers also report whether the
+    # digits sit on a robot bumper band ("bumper") or are PRINTED on
+    # equipment ("printed") — qm11's OVERFLOW crate base read "1477" at
+    # digit_prob 1.0, a perfect read of the wrong object. The surface value
+    # is always parsed and recorded in diagnostics; when this gate is ON a
+    # "printed" read's vote is dropped. Complements zone_blind_votes, which
+    # only acts inside explicitly mapped equipment zones (2026cur had none).
+    # DEFAULT OFF pending A/B (observe-only via diagnostics until then).
+    Knob("surface_gate", "VLM_SURFACE_GATE", bool, False),
     # Phase-exclusive vLLM: stop the server during tracking (its ~11GB pool
     # plus SAM3's ~11GB peak OOMs the 24GB card; it is idle in that phase
     # anyway), start it for the analysis loop's reads, stop it after the job.

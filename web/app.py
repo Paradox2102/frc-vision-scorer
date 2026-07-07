@@ -134,7 +134,9 @@ from web.field.identity_confidence import (
     decide_vlm_read,
     dedupe_batch_team_reads,
     digit_token_conf,
+    normalize_surface,
     occlusion_blocks_read,
+    surface_vote_multiplier,
     tentative_claim_winners,
     vote_ray_cross_m,
 )
@@ -1766,6 +1768,11 @@ class InferenceJob:
         team = res.get("team_number")
         if not team:
             return
+        if surface_vote_multiplier(
+                res.get("surface"),
+                getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+            print(f"  VLM vote dropped [printed-surface]: slot {slot_id} += {team}")
+            return
         conf = res.get("confidence", 0.0)
         weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
         if robot.team_ocr_votes is None:
@@ -2220,6 +2227,7 @@ class InferenceJob:
                 "team_number": team,
                 "confidence": conf,
                 "error": res.get("error"),
+                "surface": res.get("surface", "unknown"),
             })
             ocr_crops.append({
                 "robot_id": robot.robot_id,
@@ -2233,6 +2241,7 @@ class InferenceJob:
                 "error": res.get("error"),
                 "legibility": None,
                 "via": "ocr",
+                "surface": res.get("surface", "unknown"),
             })
             self.diagnostic.record_vlm_read(
                 frame=self._current_frame, robot_id=robot.robot_id,
@@ -2243,6 +2252,7 @@ class InferenceJob:
                 alliance_read=res.get("alliance", "unknown"),
                 confidence=conf,
                 vote_weight=vote_weight,
+                surface=res.get("surface", "unknown"),
             )
 
             # Update success/backoff based on whether read succeeded
@@ -2274,6 +2284,13 @@ class InferenceJob:
                 print(f"  VLM vote dropped [batch-dup]: "
                       f"{self._slot_label(slot_id)} += {team} suppressed "
                       f"(stronger read of the same team in this batch)")
+                continue
+            if surface_vote_multiplier(
+                    res.get("surface"),
+                    getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+                print(f"  VLM vote dropped [printed-surface]: "
+                      f"{self._slot_label(slot_id)} += {team} "
+                      f"(digits printed on structure, not a bumper)")
                 continue
             # Zone-blind voting: a read taken while the track sits inside a
             # static-structure footprint is printed equipment text, not a
@@ -8608,7 +8625,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     def _error_entry(e):
         return {"team_number": None, "alliance": "unknown", "confidence": 0,
-                "raw_read": None, "error": str(e)}
+                "raw_read": None, "error": str(e), "surface": "unknown"}
 
     # ---- Phase 1: one (messages, context) item per decodable crop ----
     results: list = [None] * len(robot_crops_b64)
@@ -8653,7 +8670,10 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 "color looks surprising.\n\n"
                 'Reply with ONLY compact JSON and nothing else: '
                 '{"team": "<the digits, or null if you cannot read them>", '
-                '"color": "red" or "blue"}.'
+                '"color": "red" or "blue", '
+                '"surface": "bumper" if the digits are on a robot\'s bumper band, '
+                'or "printed" if they are printed on a crate, bin, sign, or other '
+                'field structure}.'
             )
             messages = [
                 {"role": "user", "content": [
@@ -8742,6 +8762,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
 
         team = None
         color = "unknown"
+        surface = "unknown"
         try:
             clean = output_text
             if "```" in clean:
@@ -8755,6 +8776,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 parsed = json.loads(clean[start:end])
                 team = parsed.get("team")
                 color = parsed.get("color", "unknown")
+                surface = normalize_surface(parsed.get("surface"))
                 if team is not None:
                     team = str(team)
         except (json.JSONDecodeError, Exception):
@@ -8780,6 +8802,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
             "confidence": confidence,
             "raw_read": read,
             "digit_prob": digit_prob,
+            "surface": surface,
         }
 
     results = [r if r is not None else _error_entry("skipped") for r in results]
@@ -8819,7 +8842,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     def _error_entry(e):
         return {"team_number": None, "alliance": "unknown", "confidence": 0,
-                "raw_read": None, "error": str(e)}
+                "raw_read": None, "error": str(e), "surface": "unknown"}
 
     def _read_one(idx: int, crop_b64: str) -> dict:
         img_bytes = base64.b64decode(crop_b64)
@@ -8862,7 +8885,10 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             "color looks surprising.\n\n"
             'Reply with ONLY compact JSON and nothing else: '
             '{"team": "<the digits, or null if you cannot read them>", '
-            '"color": "red" or "blue"}.'
+            '"color": "red" or "blue", '
+            '"surface": "bumper" if the digits are on a robot\'s bumper band, '
+            'or "printed" if they are printed on a crate, bin, sign, or other '
+            'field structure}.'
         )
         payload = {
             "model": VLM_MODEL_NAME,
@@ -8894,6 +8920,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
 
         team = None
         color = "unknown"
+        surface = "unknown"
         try:
             clean = output_text
             if "```" in clean:
@@ -8907,6 +8934,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
                 parsed = json.loads(clean[start:end])
                 team = parsed.get("team")
                 color = parsed.get("color", "unknown")
+                surface = normalize_surface(parsed.get("surface"))
                 if team is not None:
                     team = str(team)
         except (json.JSONDecodeError, Exception):
@@ -8927,6 +8955,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             "confidence": confidence,
             "raw_read": read,
             "digit_prob": digit_prob,
+            "surface": surface,
         }
 
     results: list = [None] * len(robot_crops_b64)

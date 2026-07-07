@@ -120,6 +120,7 @@ from web.field.zones import (
     prism_bounding_zones,
     ray_enters_zones,
     save_zones,
+    start_zones,
 )
 from web.replay_recorder import ReplayRecorder
 from web import database
@@ -1456,7 +1457,8 @@ class InferenceJob:
         return (valid_boxes, ball_boxes) if with_balls else valid_boxes
 
     def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
-                               motion_grays=None, blobs_allowed: bool = False):
+                               motion_grays=None, blobs_allowed: bool = False,
+                               zone_probe=None):
         """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
@@ -1468,6 +1470,12 @@ class InferenceJob:
         so a ref walking past the bump (or balls rolling under a misread)
         cannot back a candidate. ``blobs_allowed`` gates the diff-blob
         candidate source (early-match window; the caller knows the clock).
+
+        ``zone_probe(box)->bool``: optional predicate in this frame's pixel
+        space; when it (or ``motion_probe``) admits a sub-conf box, that box
+        rides the SUBORDINATE (strong=False) motion tier. Used for the
+        starting-zone seed prior (boxes whose ground contact projects into a
+        legal opening starting band).
 
         Returns [(box_xyxy, color, strong)] in the input frame's pixel
         coords, in strict priority order: strong YOLO evidence first
@@ -1511,14 +1519,18 @@ class InferenceJob:
             # Motion-gated low-conf admission: with a motion probe available,
             # detect down to det_conf_floor; the sub-conf band survives only
             # where pixels actually moved — and only as the SUBORDINATE tier.
-            gated = motion_probe is not None
+            gated = motion_probe is not None or zone_probe is not None
             run_conf = min(conf, self.config.det_conf_floor) if gated else conf
             res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
                 sv.Detections.from_ultralytics(res)
             )
+
+            def _admit_probe(box, _m=motion_probe, _z=zone_probe):
+                return bool((_m is not None and _m(box))
+                            or (_z is not None and _z(box)))
             strong_dets, motion_dets = partition_low_conf_movers(
-                robots, conf, motion_probe if gated else None)
+                robots, conf, _admit_probe if gated else None)
 
             def _expand(dets):
                 out = []
@@ -1565,6 +1577,24 @@ class InferenceJob:
         return reject_person_candidates(
             tiered, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
+
+    def _make_start_zone_probe(self, view, top_crop_px, elapsed_s):
+        """zone_probe(box)->bool for _sam2_robot_candidates: True when the
+        box's ground contact projects inside a starting band, only while the
+        opening window is open. Boxes are in the view's top-cropped space."""
+        if (not self.config.start_zone_seed
+                or elapsed_s > self.config.start_zone_window_s
+                or view.calibration is None or self.field_model is None):
+            return None
+        zones = start_zones(
+            (self.field_model.length_m, self.field_model.width_m),
+            self.config.start_zone_depth_m)
+
+        def _probe(box):
+            uv = ((box[0] + box[2]) / 2.0, box[3] + top_crop_px)
+            xy = view.calibration.image_to_field(uv)
+            return xy is not None and point_in_zones(xy, zones)
+        return _probe
 
     def _ray_zone_list(self, view):
         """Inflated user zones for the ray-beyond-contact seed gate, or None
@@ -5300,7 +5330,9 @@ class InferenceJob:
                                                 max(0.0,
                                                     (prompt_frame - prompt_source_frame)
                                                     / max(self.video_fps, 1e-6)),
-                                                self.config.motion_blob_window_s))
+                                                self.config.motion_blob_window_s),
+                                            zone_probe=self._make_start_zone_probe(
+                                                view, top_crop_px, 0.0))
                                         full_boxes = [
                                             (
                                                 box[0],
@@ -5515,13 +5547,17 @@ class InferenceJob:
                                         motion_grays = (
                                             cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
                                             cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+                                elapsed = max(
+                                    0.0,
+                                    (source_frame - prompt_source_frame)
+                                    / max(self.video_fps, 1e-6))
                                 merged = self._sam2_robot_candidates(
                                     crop, motion_grays=motion_grays,
                                     blobs_allowed=blob_window_open(
-                                        max(0.0,
-                                            (source_frame - prompt_source_frame)
-                                            / max(self.video_fps, 1e-6)),
-                                        self.config.motion_blob_window_s))
+                                        elapsed,
+                                        self.config.motion_blob_window_s),
+                                    zone_probe=self._make_start_zone_probe(
+                                        view, top_crop_px, elapsed))
                                 # Field-filter in full-view coords (restore the
                                 # top-crop offset). No blocked_zones: detect_fn
                                 # output also corroborates existing masks (a

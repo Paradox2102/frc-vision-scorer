@@ -89,6 +89,16 @@ KNOBS = [
     # (the auto-start sprint problem); match-long admission tripled roster
     # churn on qm11. 0 disables the scope (blobs whole match).
     Knob("motion_blob_window_s", "MOTION_BLOB_WINDOW_S", float, 6.0, min=0.0),
+    # Autonomous starting-zone seed priors: during the opening window, admit
+    # sub-threshold bumper reads whose ground contact projects into a legal
+    # starting band (within start_zone_depth_m of an alliance wall, full field
+    # width) as SUBORDINATE (strong=False) candidates — robots sit stationary
+    # and rule-constrained at t=0, so grab them before they sprint (qm11 fast
+    # robot never seeded). Reuses det_conf_floor. DEFAULT OFF pending A/B.
+    Knob("start_zone_seed", "START_ZONE_SEED_ENABLED", bool, False),
+    Knob("start_zone_depth_m", "START_ZONE_DEPTH_M", float, 2.0,
+         min=0.5, max=8.0),
+    Knob("start_zone_window_s", "START_ZONE_WINDOW_S", float, 6.0, min=0.0),
     # Seed candidates adopt the union of the bumper-expanded box and the
     # overlapping whole-robot detection (bumper color kept). A blurred
     # bumper expands to a narrow sliver — a poor SAM prompt; the whole-robot

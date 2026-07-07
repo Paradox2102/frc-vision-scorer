@@ -246,6 +246,43 @@ def test_kin_gate_range_validation():
         JobConfig({"kin_max_speed_mps": 0.5})
 
 
+def test_start_zone_seed_knobs_default_off(monkeypatch):
+    # Autonomous starting-zone seed priors: admit sub-threshold bumper reads
+    # inside alliance-wall starting bands during the opening window. OFF by
+    # default pending A/B.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.start_zone_seed is False
+    assert cfg.start_zone_depth_m == 2.0
+    assert cfg.start_zone_window_s == 6.0
+
+
+def test_start_zone_seed_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("START_ZONE_SEED_ENABLED", "1")
+    monkeypatch.setenv("START_ZONE_DEPTH_M", "3.0")
+    monkeypatch.setenv("START_ZONE_WINDOW_S", "8.0")
+    cfg = JobConfig()
+    assert cfg.start_zone_seed is True
+    assert cfg.start_zone_depth_m == 3.0
+    assert cfg.start_zone_window_s == 8.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"start_zone_seed": "0", "start_zone_depth_m": "1.5",
+                      "start_zone_window_s": "4.0"})
+    assert cfg2.start_zone_seed is False
+    assert cfg2.start_zone_depth_m == 1.5
+    assert cfg2.start_zone_window_s == 4.0
+
+
+def test_start_zone_seed_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_depth_m": 0.1})   # min 0.5
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_depth_m": 9.0})   # max 8.0
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_window_s": -1.0})  # min 0.0
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

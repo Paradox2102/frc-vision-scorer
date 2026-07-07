@@ -131,3 +131,17 @@ def test_saved_file_is_plain_json(tmp_path, monkeypatch):
     Z.save_zones("2026hop", [(1.0, 1.0, 3.0, 3.0)])
     raw = json.loads((tmp_path / "zones_2026hop.json").read_text())
     assert raw == {"zones": [[1.0, 1.0, 3.0, 3.0]]}
+
+
+def test_start_zones_are_alliance_wall_bands():
+    zones = Z.start_zones((16.54, 8.07), depth_m=2.0)
+    assert len(zones) == 2
+    assert Z.point_in_zones((1.0, 4.0), zones)      # blue wall band
+    assert Z.point_in_zones((15.8, 4.0), zones)     # red wall band
+    assert not Z.point_in_zones((8.0, 4.0), zones)  # midfield
+
+
+def test_start_zones_full_field_width():
+    zones = Z.start_zones((16.54, 8.07), depth_m=2.0)
+    assert Z.point_in_zones((0.5, 0.1), zones)
+    assert Z.point_in_zones((0.5, 7.9), zones)

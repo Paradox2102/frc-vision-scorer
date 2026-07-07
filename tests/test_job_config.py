@@ -221,6 +221,31 @@ def test_vote_ray_gate_range_validation():
         JobConfig({"vote_stale_max_m": 0.0})
 
 
+def test_kin_gate_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.kin_gate is False
+    assert cfg.kin_max_speed_mps == 6.5
+
+
+def test_kin_gate_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("KIN_GATE_ENABLED", "1")
+    monkeypatch.setenv("KIN_MAX_SPEED_MPS", "7.0")
+    cfg = JobConfig()
+    assert cfg.kin_gate is True
+    assert cfg.kin_max_speed_mps == 7.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"kin_gate": "false", "kin_max_speed_mps": "5.0"})
+    assert cfg2.kin_gate is False
+    assert cfg2.kin_max_speed_mps == 5.0
+
+
+def test_kin_gate_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"kin_max_speed_mps": 0.5})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

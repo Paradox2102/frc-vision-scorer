@@ -4585,7 +4585,9 @@ class InferenceJob:
                 coast_vel_decay=self.config.coast_vel_decay,
                 sticky_max_dist_m=self.config.sticky_max_dist_m,
                 suspect_zones=suspect_zones,
-                occlusion_rebind_guard=self.config.occlusion_rebind_guard)
+                occlusion_rebind_guard=self.config.occlusion_rebind_guard,
+                kin_gate_enabled=self.config.kin_gate,
+                kin_max_speed_mps=self.config.kin_max_speed_mps)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}

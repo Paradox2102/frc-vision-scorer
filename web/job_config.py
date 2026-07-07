@@ -256,6 +256,14 @@ KNOBS = [
     # over recent frames. Targets the bump/depot mask-hijack after a robot
     # drives behind the hub (qm10 blue side). DEFAULT OFF pending A/B.
     Knob("occlusion_rebind_guard", "OCCLUSION_REBIND_GUARD", bool, False),
+    # Kinematic plausibility gate: hard-reject a tracker association that
+    # implies a robot speed beyond the physical cap (FRC robots sustain
+    # <= ~5.5-6 m/s) — a track "moving" several meters in one frame got
+    # stolen, not driven. Additional to (not a replacement for) the KF's
+    # existing r_scale downweighting of fast measurements. DEFAULT OFF
+    # pending A/B. See tracker.py FieldTracker._kin_violates.
+    Knob("kin_gate", "KIN_GATE_ENABLED", bool, False),
+    Knob("kin_max_speed_mps", "KIN_MAX_SPEED_MPS", float, 6.5, min=1.0),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

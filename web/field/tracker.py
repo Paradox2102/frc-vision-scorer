@@ -94,7 +94,8 @@ class FieldTracker:
                  corner_only_r_scale=8.0, coast_vel_decay=0.85,
                  max_speed_m_s=5.5, sticky_max_dist_m=0.0,
                  suspect_zones=None, occlusion_rebind_guard=False,
-                 guard_motion_m=0.3, guard_motion_window=5):
+                 guard_motion_m=0.3, guard_motion_window=5,
+                 kin_gate_enabled=False, kin_max_speed_mps=6.5):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -126,6 +127,14 @@ class FieldTracker:
         self.occlusion_rebind_guard = bool(occlusion_rebind_guard)
         self.guard_motion_m = float(guard_motion_m)
         self.guard_motion_window = int(guard_motion_window)
+        # Kinematic plausibility gate: hard-reject an association implying a
+        # robot speed beyond what's physically possible (FRC robots sustain
+        # <= ~5.5-6 m/s). The KF's _measured_update already downweights fast
+        # measurements via r_scale; this is an additional hard rejection so
+        # the detection is routed elsewhere (distance match / seed a free
+        # slot) instead of dragging the existing slot along. Default off.
+        self.kin_gate_enabled = bool(kin_gate_enabled)
+        self.kin_max_speed = float(kin_max_speed_mps)
         self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
         self._frame_idx = 0
         self.tracks = []
@@ -184,6 +193,16 @@ class FieldTracker:
         return (self.occlusion_rebind_guard and slot.occ_coasting
                 and point_in_zones(d.pos, self.suspect_zones)
                 and not self._det_moving(d))
+
+    def _kin_violates(self, t, d, dt):
+        """Implied speed of detection d claiming slot t, vs the physical cap.
+        Coasting slots were last measured (missed+1) intervals ago."""
+        if not self.kin_gate_enabled or t.kf is None or not dt or dt <= 0:
+            return False
+        gap_s = dt * (t.missed + 1)
+        dist = float(np.linalg.norm(
+            np.asarray(d.pos, float) - np.asarray(t.kf.pos, float)))
+        return (dist / gap_s) > self.kin_max_speed
 
     def update(self, detections, occlusion, dt):
         self.binding_events = []
@@ -292,6 +311,22 @@ class FieldTracker:
                         # detection can claim its own slot.
                         remaining_pairs.append((orig_idx, d))
                         continue
+                    if self._kin_violates(slot, d, dt):
+                        # Implied speed exceeds the physical cap: the
+                        # registry handed this id to a robot it isn't. Refuse
+                        # the rebind and let distance matching decide.
+                        gap_s = dt * (slot.missed + 1)
+                        dist = float(np.linalg.norm(
+                            np.array(slot.kf.pos) - np.array(d.pos)))
+                        self.binding_events.append({
+                            "event": "kinematic_reject",
+                            "slot_id": slot.slot_id,
+                            "track_id": tid,
+                            "alliance": slot.alliance,
+                            "speed_mps": round(dist / gap_s, 1),
+                        })
+                        remaining_pairs.append((orig_idx, d))
+                        continue
                     if self._guard_blocks(slot, d):
                         # Known id gone motionless on a static structure while
                         # its slot is hub-occluded: hold the binding. The det is
@@ -359,6 +394,20 @@ class FieldTracker:
                     # wider gate), but cap the multiplier to prevent teleportation.
                     effective_gate = self.gate * min(4.0, 1.0 + 0.5 * t.missed)
                     if dist <= effective_gate:
+                        if self._kin_violates(t, d, dt):
+                            # Implied speed exceeds the physical cap: leave
+                            # this pair at cost=inf so it can't win the
+                            # assignment (the detection may seed/claim
+                            # elsewhere — it might be a different robot).
+                            gap_s = dt * (t.missed + 1)
+                            self.binding_events.append({
+                                "event": "kinematic_reject",
+                                "slot_id": t.slot_id,
+                                "track_id": d.track_id,
+                                "alliance": t.alliance,
+                                "speed_mps": round(dist / gap_s, 1),
+                            })
+                            continue
                         if self._guard_blocks(t, d):
                             # In-gate suspect-zone detection vs an occlusion-
                             # coasting slot: leave the pair unmatchable and bar

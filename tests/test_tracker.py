@@ -120,3 +120,48 @@ def test_unknown_detection_seeds_one_slot_only():
     assert active[0].alliance == "blue", (
         f"Expected blue slot, got {active[0].alliance}"
     )
+
+
+def _mk_tracker(**kw):
+    return FieldTracker(field_length=16.54, zones=[], **kw)
+
+
+def test_kinematic_gate_rejects_teleport():
+    # gate_m widened so the 5 m jump reaches the kinematic check in the cost
+    # matrix instead of being excluded earlier by the plain distance gate
+    # (default gate_m=2.5 would reject it before _kin_violates ever runs).
+    tr = _mk_tracker(kin_gate_enabled=True, kin_max_speed_mps=6.5, gate_m=10.0)
+    d0 = FieldDetection(pos=(2.0, 2.0), color="blue", box=(0, 0, 5, 5))
+    tr.update([d0], {}, dt=0.125)
+    orig_slot_id = [t for t in tr.tracks if t.alliance == "blue" and t.active][0].slot_id
+    # 5 m in one 0.125s frame = 40 m/s: impossible — must not update the slot
+    d1 = FieldDetection(pos=(7.0, 2.0), color="blue", box=(0, 0, 5, 5))
+    out = tr.update([d1], {}, dt=0.125)
+    # The original slot must not have followed the jump (it may still seed a
+    # *free* slot at (7, 2) instead — that's intended, it might be a
+    # different robot; see brief note).
+    orig = [t for t in out if t.slot_id == orig_slot_id][0]
+    assert abs(orig.pos[0] - 7.0) > 2.0
+    assert any(e["event"] == "kinematic_reject" for e in tr.binding_events)
+
+
+def test_kinematic_gate_allows_post_coast_reacquire():
+    tr = _mk_tracker(kin_gate_enabled=True, kin_max_speed_mps=6.5)
+    d0 = FieldDetection(pos=(2.0, 2.0), color="blue", box=(0, 0, 5, 5))
+    tr.update([d0], {}, dt=0.125)
+    for _ in range(4):                      # coast 4 frames (missed accrues)
+        tr.update([], {}, dt=0.125)
+    # 2.5 m over 5 frame-intervals = 4 m/s: fine — must re-acquire
+    d1 = FieldDetection(pos=(4.5, 2.0), color="blue", box=(0, 0, 5, 5))
+    out = tr.update([d1], {}, dt=0.125)
+    vis = [t for t in out if t.state == "visible"]
+    assert len(vis) == 1 and abs(vis[0].pos[0] - 4.5) < 1.0
+
+
+def test_kinematic_gate_default_off_preserves_behavior():
+    tr = _mk_tracker()
+    d0 = FieldDetection(pos=(2.0, 2.0), color="blue", box=(0, 0, 5, 5))
+    tr.update([d0], {}, dt=0.125)
+    d1 = FieldDetection(pos=(7.0, 2.0), color="blue", box=(0, 0, 5, 5))
+    tr.update([d1], {}, dt=0.125)
+    assert not any(e["event"] == "kinematic_reject" for e in tr.binding_events)

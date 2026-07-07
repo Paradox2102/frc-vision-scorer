@@ -1598,8 +1598,43 @@ select.g-team, input.g-team { min-width: 72px; }
 .settings-reset-all {
     font-size: 0.8rem;
 }
+.settings-filter {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0 0 12px;
+    padding: 0.5rem 0.75rem;
+    background: var(--background);
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
+    font-size: 0.85rem;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+}
 .settings-list {
     margin-top: 12px;
+}
+.settings-section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 10px 12px 6px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+}
+.settings-section-header:first-child {
+    border-top: none;
+}
+.settings-section-name {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted-foreground);
+}
+.settings-section-count {
+    font-size: 0.72rem;
+    color: var(--muted-foreground);
+    font-family: ui-monospace, monospace;
 }
 .setting-row {
     display: grid;

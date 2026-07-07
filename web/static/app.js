@@ -119,6 +119,8 @@ class VisionScorer {
         // Settings
         const settingsResetBtn = document.getElementById('settingsResetBtn');
         if (settingsResetBtn) settingsResetBtn.addEventListener('click', () => this.resetAllSettings());
+        const settingsFilter = document.getElementById('settingsFilter');
+        if (settingsFilter) settingsFilter.addEventListener('input', () => this.filterSettings(settingsFilter.value));
 
         // Modal
         document.getElementById('modalClose').addEventListener('click', () => this.closeModal());
@@ -206,10 +208,53 @@ class VisionScorer {
             if (!resp.ok) { list.innerHTML = '<p class="empty-state">Failed to load settings</p>'; return; }
             const { knobs } = await resp.json();
             list.innerHTML = '';
-            knobs.forEach(k => list.appendChild(this.settingRow(k)));
+            // Group by section, preserving first-appearance order from the registry.
+            const sections = new Map();
+            knobs.forEach(k => {
+                const name = k.section || 'misc';
+                if (!sections.has(name)) sections.set(name, []);
+                sections.get(name).push(k);
+            });
+            sections.forEach((rows, section) => {
+                const header = document.createElement('div');
+                header.className = 'settings-section-header';
+                header.dataset.section = section;
+                header.innerHTML = `<span class="settings-section-name">${section}</span>` +
+                    `<span class="settings-section-count">${rows.length}</span>`;
+                list.appendChild(header);
+                rows.forEach(k => list.appendChild(this.settingRow(k)));
+            });
+            const filterInput = document.getElementById('settingsFilter');
+            if (filterInput) this.filterSettings(filterInput.value);
         } catch (e) {
             list.innerHTML = '<p class="empty-state">Failed to load settings</p>';
         }
+    }
+
+    filterSettings(query) {
+        const list = document.getElementById('settingsList');
+        if (!list) return;
+        const q = query.trim().toLowerCase();
+        let currentHeader = null;
+        let currentHeaderVisibleCount = 0;
+        const flushHeader = () => {
+            if (currentHeader) currentHeader.style.display = currentHeaderVisibleCount > 0 ? '' : 'none';
+        };
+        Array.from(list.children).forEach(el => {
+            if (el.classList.contains('settings-section-header')) {
+                flushHeader();
+                currentHeader = el;
+                currentHeaderVisibleCount = 0;
+                return;
+            }
+            if (!el.classList.contains('setting-row')) return;
+            const name = (el.dataset.name || '').toLowerCase();
+            const env = (el.querySelector('.setting-env')?.textContent || '').toLowerCase();
+            const visible = !q || name.includes(q) || env.includes(q);
+            el.style.display = visible ? '' : 'none';
+            if (visible) currentHeaderVisibleCount++;
+        });
+        flushHeader();
     }
 
     settingControl(k) {

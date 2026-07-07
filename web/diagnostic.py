@@ -155,6 +155,18 @@ class DiagnosticRecorder:
             "legibility": float(legibility), "reason": reason,
         })
 
+    def record_adjudication(self, frame: int | None, robot_id: int | None,
+                            verdict: str, streak: int) -> None:
+        """Observe-only VLM verdict on whether a static track is a robot."""
+        if frame is None or robot_id is None:
+            logger.warning("record_adjudication: missing required field; dropped")
+            return
+        self._emit({
+            "frame": int(frame), "t_ms": self._t_ms(), "type": "adjudication",
+            "robot_id": int(robot_id), "verdict": str(verdict),
+            "streak": int(streak),
+        })
+
     def record_assignment(self, frame: int | None, robot_id: int | None, team: str | None,
                          alliance: str, confirmed: bool,
                          votes_for_assigned: float, votes_total: float,

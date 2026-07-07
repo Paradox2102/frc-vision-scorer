@@ -143,6 +143,7 @@ from web.field.identity_confidence import (
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
 from web.field.track_evidence import MatchEvidence
+from web.field.field_qc import track_is_static, parse_object_class
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -1204,6 +1205,10 @@ class InferenceJob:
         # runs as an event-loop task (create_task) so frame processing never
         # blocks on the 0.6-1.5s generate; only one pass is in flight at a time.
         self._vlm_task = None
+        # Single-flight background handle + per-identity position history for
+        # the observe-only equipment-adjudication pass (equipment_adjudicate).
+        self._adjudicate_task = None
+        self._ident_pos_history: dict[int, deque] = {}
         self._claude_vision_max_calls = 20  # Max API calls per match during inference
         self._claude_vision_interval_sec = 5  # Call every 5 seconds until all identified
         self._claude_vision_last_time = 0.0  # Timestamp of last call
@@ -2022,6 +2027,59 @@ class InferenceJob:
             print(f"  VLM pass failed (drain): {e}")
         finally:
             self._vlm_task = None
+
+    def _maybe_schedule_adjudication(self, now: float) -> None:
+        """Observe-only equipment adjudication: ask the VLM whether long-static
+        tracks are actually robots. Single-flight like the bumper pass; verdicts
+        go to diagnostics ONLY — no eviction, no confidence change. Equipment
+        hijacks are detector-corroborated, so this is the independent modality
+        the culls lack; grade it from replays before wiring any action."""
+        t = self._adjudicate_task
+        if t is not None and t.done():
+            exc = t.exception()
+            if exc:
+                print(f"  Adjudication pass failed: {exc}")
+        if t is not None and not t.done():
+            return
+        cfg = self.config
+        batch = []  # (identity_id, slot_id, crop_b64)
+        for ident in self.identity_registry.get_active_identities():
+            if (now - ident.last_adjudicate_time) < cfg.adjudicate_cooldown_sec:
+                continue
+            hist = self._ident_pos_history.get(ident.identity_id)
+            if not hist or not track_is_static(
+                    hist, now, cfg.adjudicate_static_sec, cfg.adjudicate_static_move_m):
+                continue
+            robot = self._get_slot_track_if_exists(ident.active_slot)
+            crop = getattr(robot, "appearance_crop_b64", None) if robot else None
+            if not crop:
+                continue
+            batch.append((ident.identity_id, ident.active_slot, crop))
+        if not batch:
+            return
+        for identity_id, _slot, _crop in batch:
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident:
+                ident.last_adjudicate_time = now
+        self._adjudicate_task = asyncio.create_task(self._run_adjudication(batch))
+
+    async def _run_adjudication(self, batch) -> None:
+        results = await asyncio.to_thread(
+            _vllm_classify_crops, [crop for (_i, _s, crop) in batch])
+        for (identity_id, slot_id, _crop), res in zip(batch, results):
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident is None or res.get("error"):
+                continue
+            verdict = res.get("object", "unclear")
+            if verdict == "robot":
+                ident.equipment_streak = 0
+            elif verdict in ("equipment", "person"):
+                ident.equipment_streak += 1
+            self.diagnostic.record_adjudication(
+                frame=self._current_frame, robot_id=slot_id,
+                verdict=verdict, streak=ident.equipment_streak)
+            print(f"  VLM adjudicate: {self._slot_label(slot_id)} -> {verdict} "
+                  f"(streak={ident.equipment_streak})")
 
     async def _read_fused_bumper_numbers_impl(
         self, fused, requested_priorities: dict[int, float], det_to_slot=None
@@ -6664,6 +6722,18 @@ class InferenceJob:
                         # as an event-loop task while the loop keeps decoding.
                         self._schedule_vlm_pass(fused, due_priorities)
 
+                    if getattr(self.config, "equipment_adjudicate", False):
+                        # Position history feeds track_is_static; only paid
+                        # for when the adjudication knob is on.
+                        for ident in self.identity_registry.get_active_identities():
+                            _st = self._get_slot_track_if_exists(ident.active_slot)
+                            _p = getattr(_st, "field_position", None)
+                            if _p is not None:
+                                self._ident_pos_history.setdefault(
+                                    ident.identity_id, deque(maxlen=600)
+                                ).append((current_match_time, float(_p[0]), float(_p[1])))
+                        self._maybe_schedule_adjudication(current_match_time)
+
                 with self._stage("loop.drift_monitor"):
                     if (self._drift_monitor is not None and not self._drift_warned
                             and self._drift_monitor.due(current_match_time)):
@@ -7002,6 +7072,18 @@ class InferenceJob:
             # runs. Awaited, not cancelled — reached on normal break and on the
             # self._stopped break above.
             await self._drain_vlm_task()
+
+            _adj = self._adjudicate_task
+            if _adj is not None:
+                try:
+                    if not _adj.done():
+                        await _adj
+                    elif _adj.exception():
+                        print(f"  Adjudication pass failed (drain): {_adj.exception()}")
+                except Exception as e:
+                    print(f"  Adjudication pass failed (drain): {e}")
+                finally:
+                    self._adjudicate_task = None
 
             # Fold the per-stage accumulators into timings as flat "loop.<stage>"
             # keys (survive the end-of-job round pass) and print one hot-path line.
@@ -8982,6 +9064,70 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
     print(f"  vLLM: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")
     return results
+
+
+_CLASSIFY_PROMPT = (
+    "This image shows ONE object cut out of video of an FRC (FIRST Robotics "
+    "Competition) match. Decide what the object is:\n"
+    '- "robot": a competition robot — a driving machine with wheels/mechanisms '
+    "and a solid RED or BLUE bumper band around its base\n"
+    '- "equipment": static field equipment — a crate, bin, tote, feeder rig, '
+    "machine, or other structure that does not drive\n"
+    '- "person": a human (referees wear striped or orange vests)\n'
+    '- "unclear": you cannot tell\n\n'
+    'Reply with ONLY compact JSON and nothing else: '
+    '{"object": "robot" or "equipment" or "person" or "unclear"}.'
+)
+
+
+def _vllm_classify_crops(crops_b64: list) -> list:
+    """Ask the vLLM server whether each crop is a robot/equipment/person.
+
+    Same transport as _vllm_read_bumpers (probe, then one request per crop).
+    Best-effort: any failure yields {"object": "unclear", "error": ...} —
+    adjudication is an observe-only signal and must never raise into the loop.
+    """
+    try:
+        probe = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+        with urllib.request.urlopen(probe, timeout=3):
+            pass
+    except Exception as e:
+        return [{"object": "unclear", "error": f"vLLM unreachable: {e}"}] * len(crops_b64)
+
+    def _classify_one(crop_b64: str) -> dict:
+        try:
+            img_bytes = base64.b64decode(crop_b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            min_dim = 512
+            if img.width < min_dim or img.height < min_dim:
+                scale = max(min_dim / img.width, min_dim / img.height)
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=92)
+            data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            payload = {
+                "model": VLM_MODEL_NAME,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "text", "text": _CLASSIFY_PROMPT},
+                ]}],
+                "temperature": 0,
+                "max_tokens": 32,
+            }
+            req = urllib.request.Request(
+                f"{VLM_SERVER_URL}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            output_text = (body["choices"][0]["message"]["content"] or "").strip()
+            return {"object": parse_object_class(output_text), "error": None}
+        except Exception as e:
+            return {"object": "unclear", "error": str(e)}
+
+    return [_classify_one(c) for c in crops_b64]
 
 
 _easyocr_reader = None

@@ -216,6 +216,18 @@ KNOBS = [
     # only acts inside explicitly mapped equipment zones (2026cur had none).
     # DEFAULT OFF pending A/B (observe-only via diagnostics until then).
     Knob("surface_gate", "VLM_SURFACE_GATE", bool, False),
+    # VLM equipment adjudication (observe-only): a track static for
+    # adjudicate_static_sec gets its whole-robot crop sent to the reader
+    # with an "is this a robot / equipment / person?" prompt. Verdicts and
+    # per-identity streaks are recorded to diagnostics ONLY — no eviction,
+    # no confidence change — so the signal can be graded against replays
+    # before any action is wired to it. Independent modality: equipment
+    # hijacks are YOLO-corroborated, so detector-based culls can't win
+    # (see size_prior_cull / cull_hijack_enabled notes above).
+    Knob("equipment_adjudicate", "VLM_EQUIPMENT_ADJUDICATE", bool, False),
+    Knob("adjudicate_static_sec", "VLM_ADJUDICATE_STATIC_SEC", float, 6.0, min=1.0),
+    Knob("adjudicate_static_move_m", "VLM_ADJUDICATE_STATIC_MOVE_M", float, 0.5, min=0.0),
+    Knob("adjudicate_cooldown_sec", "VLM_ADJUDICATE_COOLDOWN_SEC", float, 10.0, min=1.0),
     # Phase-exclusive vLLM: stop the server during tracking (its ~11GB pool
     # plus SAM3's ~11GB peak OOMs the 24GB card; it is idle in that phase
     # anyway), start it for the analysis loop's reads, stop it after the job.

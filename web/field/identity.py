@@ -29,6 +29,12 @@ class RobotIdentity:
     # (should_queue_immediate_read) keys off this and last_vlm_time.
     last_immediate_queue_time: float = -999.0
     has_vlm_read: bool = False
+    # VLM equipment adjudication (observe-only): consecutive non-robot
+    # verdicts on this identity's crop, and the last time we asked. The
+    # streak resets on a "robot" verdict; nothing acts on it yet — it is
+    # diagnostic evidence for grading the signal before wiring corrections.
+    equipment_streak: int = 0
+    last_adjudicate_time: float = -999.0
     vlm_agrees: bool = False
     vlm_contradicts: bool = False
     is_ambiguous: bool = False

@@ -62,6 +62,7 @@ from web.field.calibration import (CameraCalibration, Calibrator, CalibrationErr
                                    holdout_field_error, tag_alignment_error, MIN_POSE_TAGS)
 from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
 from web.field.apriltag_detect import detect_tags
+from web.field.drift_monitor import DriftMonitor
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import (
@@ -713,6 +714,13 @@ CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5")
 # manual recalibration). Set to 0 to keep the old abort-straight-to-manual behavior.
 CALIB_AUTOFIX_ENABLED = os.environ.get("CALIB_AUTOFIX_ENABLED", "1") not in ("0", "false", "False")
 
+# Mid-match drift monitor: low-cadence AprilTag re-checks on frames the main
+# loop already decoded. Sustained drift WARNS and records (never aborts — the
+# match is already running); the calibrate page picks the record up like a
+# match-start failure. ~8 detect_tags calls per 150s match at the default.
+CALIB_MONITOR_ENABLED = os.environ.get("CALIB_MONITOR_ENABLED", "1") not in ("0", "false", "False")
+CALIB_MONITOR_INTERVAL_S = float(os.environ.get("CALIB_MONITOR_INTERVAL_S", "20"))
+
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
@@ -994,6 +1002,11 @@ class InferenceJob:
         self.match_key = getattr(self, "match_key", None)
         self._calib_version_id = None
         self.needs_calibration = None
+        # Mid-match drift monitor: real instance built in _init_field_tracking once
+        # calibration is loaded. None here is also the correct disabled state for
+        # any caller that bypasses that method (e.g. mocks it out in tests).
+        self._drift_monitor = None
+        self._drift_warned = False
         self._log_file = None
         self._log_path: Optional[Path] = None
         # Wall-clock creation time, surfaced by /api/job/active so a
@@ -4717,6 +4730,11 @@ class InferenceJob:
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
         self.field_tracking = True
+        self._drift_monitor = (
+            DriftMonitor(CALIB_MONITOR_INTERVAL_S, CALIB_DRIFT_MAX_M, CALIB_CHECK_MIN_TAGS)
+            if (CALIB_MONITOR_ENABLED and CALIB_CHECK_ENABLED and self.calib is not None)
+            else None)
+        self._drift_warned = False
         print(f"  Field tracking ENABLED: event={self.event_key} camera={self.camera} "
               f"season={cal.field_season} mode={cal.mode}")
         return True
@@ -6563,6 +6581,27 @@ class InferenceJob:
                         # read pass no longer blocks frame processing — it runs
                         # as an event-loop task while the loop keeps decoding.
                         self._schedule_vlm_pass(fused, due_priorities)
+
+                with self._stage("loop.drift_monitor"):
+                    if (self._drift_monitor is not None and not self._drift_warned
+                            and self._drift_monitor.due(current_match_time)):
+                        main_view = next((v for v in self.views if v.name == "main"), None)
+                        if main_view is not None:
+                            main_crop = main_view.extract(frame)
+                            detected = detect_tags(main_crop)
+                            err_m, ntags = tag_alignment_error(self.calib, detected, self.field_model)
+                            self._drift_monitor.record(current_match_time, err_m, ntags)
+                            if self._drift_monitor.drifted:
+                                self._drift_warned = True
+                                if self.match_key:
+                                    field_store.record_drift(self.event_key, self.camera,
+                                                             self.match_key, err_m,
+                                                             self._calib_version_id)
+                                await self._warn_degraded(
+                                    "calib_drift",
+                                    f"Calibration drifted mid-match (~{err_m:.2f} m at "
+                                    f"t={current_match_time:.0f}s): positions after this point "
+                                    "are suspect; recalibrate before the next match.")
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()

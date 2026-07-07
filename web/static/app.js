@@ -24,6 +24,7 @@ class VisionScorer {
         this.degradationTitle = document.getElementById('degradationTitle');
         this.degradationList = document.getElementById('degradationList');
         this.statusLog = document.getElementById('statusLog');
+        this.recoveryActions = document.getElementById('recoveryActions');
         this.degradationWarnings = [];
         this.lastWsMessageAt = 0;
         this.stallTimer = null;
@@ -1513,6 +1514,10 @@ class VisionScorer {
             this.statusLog.replaceChildren();
             this.statusLog.style.display = 'block';
         }
+        if (this.recoveryActions) {
+            this.recoveryActions.replaceChildren();
+            this.recoveryActions.style.display = 'none';
+        }
         // Run clocks + tracking panel.
         this.runStartedAt = Date.now();
         this.overlayStreaming = false;
@@ -1954,8 +1959,8 @@ class VisionScorer {
     }
 
     appendContinueAnalysisButton(previousJobId) {
-        if (!this.statusLog || !previousJobId) return;
-        this.statusLog.querySelectorAll('.continue-analysis-row').forEach((n) => n.remove());
+        if (!this.recoveryActions || !previousJobId) return;
+        this.recoveryActions.querySelectorAll('.continue-analysis-row').forEach((n) => n.remove());
         const row = document.createElement('div');
         row.className = 'continue-analysis-row';
         row.style.marginTop = '4px';
@@ -1967,8 +1972,8 @@ class VisionScorer {
                   + 'already-uploaded video (no need to start over).';
         btn.addEventListener('click', () => { btn.disabled = true; this.retryAnalysis(previousJobId); });
         row.appendChild(btn);
-        this.statusLog.appendChild(row);
-        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+        this.recoveryActions.appendChild(row);
+        this.recoveryActions.style.display = 'block';
     }
 
     async retryAnalysis(previousJobId) {
@@ -1995,17 +2000,15 @@ class VisionScorer {
     }
 
     appendCalibrationLink(nc) {
-        if (!this.statusLog) return;
+        if (!this.recoveryActions) return;
         // Only one calibration link per failure — drop any prior one.
-        this.statusLog.querySelectorAll('.calib-link-row').forEach((n) => n.remove());
+        this.recoveryActions.querySelectorAll('.calib-link-row').forEach((n) => n.remove());
         const params = new URLSearchParams();
         if (nc.match_key) params.set('match', nc.match_key);
         if (nc.camera) params.set('camera', nc.camera);
         const qs = params.toString();
         const row = document.createElement('div');
         row.className = 'calib-link-row';
-        const ts = new Date().toLocaleTimeString([], { hour12: false });
-        row.appendChild(document.createTextNode(`${ts}  `));
         const a = document.createElement('a');
         a.href = '/calibrate' + (qs ? `?${qs}` : '');
         a.target = '_blank';
@@ -2016,8 +2019,8 @@ class VisionScorer {
             ? `🔧 Review the auto-fix for ${nc.camera || 'main'} — approve or reject →`
             : `📐 Recalibrate ${nc.camera || 'main'} on the calibration page →`;
         row.appendChild(a);
-        this.statusLog.appendChild(row);
-        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+        this.recoveryActions.appendChild(row);
+        this.recoveryActions.style.display = 'block';
     }
 
     setStatus(text, progress) {

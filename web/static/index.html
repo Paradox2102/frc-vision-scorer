@@ -183,6 +183,11 @@
                 <ul id="degradationList"></ul>
             </div>
 
+            <!-- Calibration-drift recovery affordances (recalibrate link / continue-analysis
+                 button): visible in both modes so a Standard-mode user isn't stranded when
+                 the status log (debug-only) is hidden. -->
+            <div class="recovery-actions" id="recoveryActions" style="display:none;"></div>
+
             <!-- Rolling status history: progress detail that would otherwise be overwritten -->
             <div class="status-log debug-only" id="statusLog" style="display:none;"></div>
 

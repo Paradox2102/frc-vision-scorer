@@ -1524,6 +1524,19 @@ select.g-team, input.g-team { min-width: 72px; }
 }
 .degradation-banner li { margin: 2px 0; }
 
+/* Calibration-drift recovery actions: recalibrate link / continue-analysis button.
+   Ungated (visible in both modes) so a Standard-mode user isn't stranded when
+   the status log (debug-only) is hidden. */
+.recovery-actions {
+    margin: 6px 0;
+    padding: 8px 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+}
+.recovery-actions > * + * { margin-top: 4px; }
+
 /* Rolling status history under the progress bar */
 .status-log {
     margin: 6px 0;

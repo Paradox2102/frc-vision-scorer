@@ -1,12 +1,14 @@
 """Pure helpers for VLM-based field quality checks (no app state, no I/O).
 
-Two consumers in web/app.py:
-- equipment adjudication: is a long-static track actually a robot? Equipment
-  hijacks are YOLO-corroborated (the detector false-fires on the equipment
-  itself), so detector-based culls can't catch them — the VLM is the only
-  independent modality short of a hard-negative retrain.
-- full-field census (Task 4 of the same plan): reconcile what the VLM sees
-  in a whole frame against the live track roster.
+Consumed by the equipment adjudicator in web/app.py: is a long-static track
+actually a robot? Equipment hijacks are YOLO-corroborated (the detector
+false-fires on the equipment itself), so detector-based culls can't catch
+them — the VLM is the only independent modality short of a hard-negative
+retrain.
+
+(A full-field census that reconciled VLM-seen robots against live tracks was
+prototyped and dropped: Qwen3-VL-4B cannot enumerate small robots in the
+cluttered overhead scene. See git history for the reverted attempt.)
 """
 from __future__ import annotations
 

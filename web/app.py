@@ -143,7 +143,7 @@ from web.field.identity_confidence import (
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
 from web.field.track_evidence import MatchEvidence
-from web.field.field_qc import track_is_static, parse_object_class
+from web.field.field_qc import track_is_static, parse_object_class, parse_census, boxes_to_field_points, reconcile_census
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -1214,6 +1214,10 @@ class InferenceJob:
         # the observe-only equipment-adjudication pass (equipment_adjudicate).
         self._adjudicate_task = None
         self._ident_pos_history: dict[int, deque] = {}
+        # Single-flight handle + last-fire time for the observe-only
+        # full-field census (field_qc_enabled).
+        self._field_qc_task = None
+        self._field_qc_last_t = -999.0
         self._claude_vision_max_calls = 20  # Max API calls per match during inference
         self._claude_vision_interval_sec = 5  # Call every 5 seconds until all identified
         self._claude_vision_last_time = 0.0  # Timestamp of last call
@@ -2085,6 +2089,66 @@ class InferenceJob:
                 verdict=verdict, streak=ident.equipment_streak)
             print(f"  VLM adjudicate: {self._slot_label(slot_id)} -> {verdict} "
                   f"(streak={ident.equipment_streak})")
+
+    def _schedule_field_qc(self, frame, now: float, frame_num: int) -> None:
+        """Single-flight full-field census (observe-only). Downscales the main
+        view, snapshots live track positions, and reconciles what the VLM sees
+        against them in a background task. Records to diagnostics ONLY — the
+        grading dataset for wiring seed/evict corrections later."""
+        t = self._field_qc_task
+        if t is not None and t.done():
+            exc = t.exception()
+            if exc:
+                print(f"  Field QC pass failed: {exc}")
+        if t is not None and not t.done():
+            return
+        main_view = next((v for v in self.views if v.name == "main"), None)
+        if main_view is None or getattr(main_view, "calibration", None) is None:
+            return
+        self._field_qc_last_t = now
+        main_crop = main_view.extract(frame)
+        h, w = main_crop.shape[:2]
+        scale = min(1.0, 1280.0 / max(w, 1))
+        small = (cv2.resize(main_crop, (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_AREA)
+                 if scale < 1.0 else main_crop)
+        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return
+        img_b64 = base64.b64encode(buf.tobytes()).decode()
+        active_slots = {i.active_slot for i in
+                        self.identity_registry.get_active_identities()}
+        track_positions = {
+            sid: (float(r.field_position[0]), float(r.field_position[1]))
+            for sid, r in self.robot_tracks.items()
+            if sid in active_slots and getattr(r, "field_position", None) is not None
+        }
+        self._field_qc_task = asyncio.create_task(self._run_field_qc(
+            img_b64, scale, main_view.calibration.image_to_field,
+            track_positions, frame_num))
+
+    async def _run_field_qc(self, img_b64, scale, image_to_field,
+                            track_positions, frame_num) -> None:
+        census = await asyncio.to_thread(_vllm_field_census, img_b64)
+        if census.get("error"):
+            print(f"  Field QC failed: {census['error']}")
+            return
+        pts = boxes_to_field_points(
+            [r["box"] for r in census.get("robots", [])], scale, image_to_field)
+        rec = reconcile_census(
+            pts, track_positions,
+            match_radius_m=getattr(self.config, "field_qc_match_radius_m", 1.5))
+        unmatched_pts = [[round(pts[i][0], 2), round(pts[i][1], 2)]
+                         for i in rec["unmatched_census"]]
+        self.diagnostic.record_field_qc(
+            frame=frame_num, robots_seen=len(pts),
+            lookalikes=census.get("lookalikes", []),
+            matched=rec["matched"], unmatched_census=unmatched_pts,
+            unmatched_tracks=rec["unmatched_tracks"])
+        print(f"  Field QC: VLM sees {len(pts)} robots — "
+              f"{len(rec['matched'])} matched, "
+              f"{len(unmatched_pts)} unseeded-by-tracker, "
+              f"{len(rec['unmatched_tracks'])} tracks-not-seen-by-VLM")
 
     async def _read_fused_bumper_numbers_impl(
         self, fused, requested_priorities: dict[int, float], det_to_slot=None
@@ -6760,6 +6824,13 @@ class InferenceJob:
                                     f"t={current_match_time:.0f}s): positions after this point "
                                     "are suspect; recalibrate before the next match.")
 
+                with self._stage("loop.field_qc"):
+                    if (getattr(self.config, "field_qc_enabled", False)
+                            and current_match_time - self._field_qc_last_t
+                                >= self.config.field_qc_interval_sec):
+                        self._schedule_field_qc(
+                            frame, current_match_time, processed_frame_num)
+
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
                     self.audit_overturn_confirmations()
@@ -7090,6 +7161,18 @@ class InferenceJob:
                 finally:
                     self._adjudicate_task = None
 
+            _fqc = self._field_qc_task
+            if _fqc is not None:
+                try:
+                    if not _fqc.done():
+                        await _fqc
+                    elif _fqc.exception():
+                        print(f"  Field QC pass failed (drain): {_fqc.exception()}")
+                except Exception as e:
+                    print(f"  Field QC pass failed (drain): {e}")
+                finally:
+                    self._field_qc_task = None
+
             # Fold the per-stage accumulators into timings as flat "loop.<stage>"
             # keys (survive the end-of-job round pass) and print one hot-path line.
             for _k, _v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]):
@@ -7157,6 +7240,21 @@ class InferenceJob:
                 pass
             finally:
                 self._adjudicate_task = None
+            # Same idea for the observe-only field-census task: cancel-if-running
+            # / log-if-failed so an exception-triggered teardown never orphans it.
+            try:
+                _fqc = self._field_qc_task
+                if _fqc is not None:
+                    if not _fqc.done():
+                        _fqc.cancel()
+                    else:
+                        exc = _fqc.exception()
+                        if exc is not None:
+                            print(f"  Field QC pass failed (teardown): {exc}")
+            except Exception:
+                pass
+            finally:
+                self._field_qc_task = None
             # Leave the GPU clean for whatever runs next: the vLLM server is
             # only needed during this job's analysis phase, and the next
             # job's tracking would have to stop it anyway.
@@ -9197,6 +9295,71 @@ def _vllm_classify_crops(crops_b64: list) -> list:
             return {"object": "unclear", "error": str(e)}
 
     return [_classify_one(c) for c in crops_b64]
+
+
+_CENSUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "robots": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "box": {"type": "array", "items": {"type": "number"},
+                        "minItems": 4, "maxItems": 4},
+                "color": {"type": "string", "enum": ["red", "blue", "unknown"]},
+            },
+            "required": ["box"],
+        }},
+        "lookalikes": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "box": {"type": "array", "items": {"type": "number"},
+                        "minItems": 4, "maxItems": 4},
+                "kind": {"type": "string"},
+            },
+            "required": ["box"],
+        }},
+    },
+    "required": ["robots"],
+}
+
+_CENSUS_PROMPT = (
+    "This is a full view of an FRC (FIRST Robotics Competition) field during "
+    "a match. Find EVERY competition robot on the field carpet. A robot is a "
+    "driving machine with a solid RED or BLUE bumper band around its base.\n"
+    "Do NOT count as robots: crates, bins, totes, feeder rigs, machines or "
+    "other static field equipment; humans (referees wear striped or orange "
+    "vests); field structures. List robot-LOOKALIKE objects (equipment that "
+    "could be mistaken for a robot) separately under \"lookalikes\".\n\n"
+    "Report pixel coordinates in THIS image as [x1, y1, x2, y2] boxes.\n"
+    'Reply with ONLY compact JSON and nothing else: '
+    '{"robots": [{"box": [x1, y1, x2, y2], "color": "red" or "blue" or "unknown"}], '
+    '"lookalikes": [{"box": [x1, y1, x2, y2], "kind": "<short description>"}]}'
+)
+
+
+def _vllm_field_census(image_b64: str) -> dict:
+    """One full-frame robot census via the vLLM server. Best-effort: any
+    failure returns {"error": ...} — the QC pass must never raise into the loop."""
+    try:
+        probe = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+        with urllib.request.urlopen(probe, timeout=3):
+            pass
+    except Exception as e:
+        return {"error": f"vLLM unreachable: {e}"}
+    try:
+        data_uri = "data:image/jpeg;base64," + image_b64
+        payload = _vlm_chat_payload(
+            data_uri, _CENSUS_PROMPT, max_tokens=512,
+            schema_name="field_census", schema=_CENSUS_SCHEMA,
+        )
+        body = _post_vlm_chat(payload)
+        output_text = (body["choices"][0]["message"]["content"] or "").strip()
+        census = parse_census(output_text)
+        if census is None:
+            return {"error": f"unparseable census: {output_text[:200]!r}"}
+        return census
+    except Exception as e:
+        return {"error": str(e)}
 
 
 _easyocr_reader = None

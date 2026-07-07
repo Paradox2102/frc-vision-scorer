@@ -70,3 +70,92 @@ def parse_object_class(text) -> str:
     if isinstance(value, str) and value.strip().lower() in _OBJECT_CLASSES:
         return value.strip().lower()
     return "unclear"
+
+
+def _clean_box(raw):
+    """[x1,y1,x2,y2] floats, or None if malformed."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        return [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_census(text):
+    """Parse the full-field census reply.
+
+    Returns {"robots": [{"box": [...], "color": red|blue|unknown}],
+             "lookalikes": [{"box": [...], "kind": str}]} with malformed
+    entries dropped, or None when no JSON object could be extracted."""
+    parsed = _extract_json(text)
+    if parsed is None:
+        return None
+    robots = []
+    for entry in parsed.get("robots") or []:
+        if not isinstance(entry, dict):
+            continue
+        box = _clean_box(entry.get("box"))
+        if box is None:
+            continue
+        color = entry.get("color")
+        robots.append({"box": box,
+                       "color": color if color in ("red", "blue") else "unknown"})
+    lookalikes = []
+    for entry in parsed.get("lookalikes") or []:
+        if not isinstance(entry, dict):
+            continue
+        box = _clean_box(entry.get("box"))
+        if box is None:
+            continue
+        lookalikes.append({"box": box, "kind": str(entry.get("kind") or "unknown")})
+    return {"robots": robots, "lookalikes": lookalikes}
+
+
+def boxes_to_field_points(boxes, scale, image_to_field):
+    """Project census boxes to field coordinates via ground contact.
+
+    The VLM saw a frame downscaled by `scale`; divide back to full-view
+    pixels, take the bottom-center (the ground-contact point — same
+    convention as detection projection), and run it through the view's
+    `image_to_field`. Boxes whose projection raises are skipped: the VLM
+    sometimes boxes objects outside the calibrated carpet."""
+    pts = []
+    for box in boxes:
+        u = (box[0] + box[2]) / 2.0 / scale
+        v = box[3] / scale
+        try:
+            xy = image_to_field((u, v))
+            pts.append((float(xy[0]), float(xy[1])))
+        except Exception:
+            continue
+    return pts
+
+
+def reconcile_census(census_pts, track_positions, match_radius_m=1.5):
+    """Greedy nearest one-to-one matching of census points to live tracks.
+
+    census_pts: [(x, y)] field meters; track_positions: {slot_id: (x, y)}.
+    Returns {"matched": [[slot_id, census_idx, dist_m]],
+             "unmatched_census": [census_idx],   # robot the tracker misses
+             "unmatched_tracks": [slot_id]}       # track the VLM can't see
+    """
+    pairs = []
+    for idx, (cx, cy) in enumerate(census_pts):
+        for slot_id, (tx, ty) in track_positions.items():
+            d = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
+            if d <= match_radius_m:
+                pairs.append((d, idx, slot_id))
+    pairs.sort()
+    matched, used_idx, used_slots = [], set(), set()
+    for d, idx, slot_id in pairs:
+        if idx in used_idx or slot_id in used_slots:
+            continue
+        used_idx.add(idx)
+        used_slots.add(slot_id)
+        matched.append([slot_id, idx, round(d, 2)])
+    return {
+        "matched": matched,
+        "unmatched_census": [i for i in range(len(census_pts)) if i not in used_idx],
+        "unmatched_tracks": sorted(s for s in track_positions if s not in used_slots),
+    }

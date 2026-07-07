@@ -130,7 +130,8 @@ class DiagnosticRecorder:
     def record_vlm_read(self, frame: int | None, robot_id: int | None,
                        crop_b64: str | None, legibility: float,
                        raw_read: str | None, matched_team: str | None,
-                       alliance_read: str, confidence: float, vote_weight: float) -> None:
+                       alliance_read: str, confidence: float, vote_weight: float,
+                       surface: str = "unknown") -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -140,6 +141,7 @@ class DiagnosticRecorder:
             "legibility": float(legibility), "raw_read": raw_read,
             "matched_team": matched_team, "alliance_read": alliance_read,
             "confidence": float(confidence), "vote_weight": float(vote_weight),
+            "surface": surface,
         })
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,
@@ -151,6 +153,18 @@ class DiagnosticRecorder:
             "frame": int(frame), "t_ms": self._t_ms(), "type": "vlm_filtered",
             "robot_id": int(robot_id), "crop_b64": crop_b64,
             "legibility": float(legibility), "reason": reason,
+        })
+
+    def record_adjudication(self, frame: int | None, robot_id: int | None,
+                            verdict: str, streak: int) -> None:
+        """Observe-only VLM verdict on whether a static track is a robot."""
+        if frame is None or robot_id is None:
+            logger.warning("record_adjudication: missing required field; dropped")
+            return
+        self._emit({
+            "frame": int(frame), "t_ms": self._t_ms(), "type": "adjudication",
+            "robot_id": int(robot_id), "verdict": str(verdict),
+            "streak": int(streak),
         })
 
     def record_assignment(self, frame: int | None, robot_id: int | None, team: str | None,

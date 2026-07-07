@@ -226,6 +226,30 @@ PROFILES = {
         ("baseline", {}),
         ("leak-clean", {"mask_leak_cleanup": True}),
     ],
+    # Phase-1 3D-geometry hardening (branch geometry-tracking-hardening): the
+    # four behavior-changing tracking knobs enabled together vs current shipped
+    # defaults. vote_ray_gate drops misattributed bumper votes (cross-ray +
+    # stale-pos), size_prior_cull evicts masks geometrically too wide/narrow for
+    # a robot at their field position (catches detector-corroborated equipment
+    # hijacks), start_zone_seed admits low-conf bumpers in the alliance-wall
+    # bands during the opening window (fast-robot seeding), kin_gate rejects
+    # impossible-speed associations. Baseline = defaults (already lever1+2).
+    "geo-hardening": [
+        ("baseline", {}),
+        ("geo4", {"vote_ray_gate": True, "size_prior_cull": True,
+                  "start_zone_seed": True, "kin_gate": True}),
+    ],
+    # Per-knob isolation of the geo4 stack: the stacked run recovered
+    # missed/late robots (start_zone_seed) but regressed existing tracks on
+    # qm11 (3181 94->44%, 6800, 1477) — the signature of a cull/gate evicting
+    # real tracks. Each knob alone vs baseline isolates the regressor.
+    "geo-sweep": [
+        ("baseline", {}),
+        ("start_zone_seed", {"start_zone_seed": True}),
+        ("size_prior_cull", {"size_prior_cull": True}),
+        ("kin_gate", {"kin_gate": True}),
+        ("vote_ray_gate", {"vote_ray_gate": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 
@@ -252,12 +276,35 @@ def post_job(cfg: dict) -> str:
     return json.loads(out)["job_id"]
 
 
+def _replay_saved(job_id: str, tries: int = 10, delay: float = 0.5) -> bool:
+    """True if a replay row with id == job_id exists (success writes one).
+    Polls briefly: the row can lag the websocket close by a moment."""
+    import sqlite3
+    db = REPO / "frc_scorer.db"
+    for _ in range(tries):
+        try:
+            con = sqlite3.connect(db)
+            row = con.execute("SELECT 1 FROM replays WHERE id = ?", (job_id,)).fetchone()
+            con.close()
+            if row:
+                return True
+        except sqlite3.Error:
+            pass
+        time.sleep(delay)
+    return False
+
+
 async def drive(job_id: str) -> str:
     """Connect the job websocket and drain until it completes; return status.
 
     The server signals success with a ``type:"complete"`` message and then
     closes the socket, so a close AFTER seeing 'complete' is a success, not a
-    failure. Errors arrive as a status/error message before the close."""
+    failure. Errors arrive as a status/error message before the close.
+
+    The server can occasionally close the socket before the client reads the
+    terminal message (observed on longer jobs). On an unexpected close we fall
+    back to the durable record: a successful job saves a replay whose id equals
+    the job_id, so a matching replay row means the job completed."""
     uri = f"ws://{HOST}/ws/infer/{job_id}"
     saw_complete = False
     async with websockets.connect(uri, max_size=None, ping_interval=20,
@@ -266,7 +313,9 @@ async def drive(job_id: str) -> str:
             try:
                 msg = json.loads(await ws.recv())
             except websockets.ConnectionClosed:
-                return "completed" if saw_complete else "closed"
+                if saw_complete or _replay_saved(job_id):
+                    return "completed"
+                return "closed"
             except (TypeError, ValueError):
                 continue
             t = msg.get("type")

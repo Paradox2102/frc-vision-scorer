@@ -133,6 +133,46 @@ def test_seed_box_max_aspect_range_validation():
         JobConfig({"seed_box_max_aspect": 21})
 
 
+def test_size_prior_cull_knobs_default_off(monkeypatch):
+    # Geometric hijack cull: equipment hijacks are YOLO-corroborated, so only a
+    # size violation catches them. DEFAULT OFF pending A/B.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.size_prior_cull is False
+    assert cfg.size_prior_hi == 3.0
+    assert cfg.size_prior_lo == 0.25
+    assert cfg.size_prior_boundaries == 3
+
+
+def test_size_prior_cull_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("SIZE_PRIOR_CULL_ENABLED", "1")
+    monkeypatch.setenv("SIZE_PRIOR_HI", "4.0")
+    monkeypatch.setenv("SIZE_PRIOR_LO", "0.2")
+    monkeypatch.setenv("SIZE_PRIOR_BOUNDARIES", "2")
+    cfg = JobConfig()
+    assert cfg.size_prior_cull is True
+    assert cfg.size_prior_hi == 4.0
+    assert cfg.size_prior_lo == 0.2
+    assert cfg.size_prior_boundaries == 2
+    # Per-job override (form fields arrive as strings) beats env.
+    cfg2 = JobConfig({"size_prior_cull": "0", "size_prior_hi": "5.0",
+                      "size_prior_lo": "0.1", "size_prior_boundaries": "4"})
+    assert cfg2.size_prior_cull is False
+    assert cfg2.size_prior_hi == 5.0
+    assert cfg2.size_prior_lo == 0.1
+    assert cfg2.size_prior_boundaries == 4
+
+
+def test_size_prior_cull_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_hi": 0.5})   # min 1.0
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_lo": 1.5})   # max 1.0
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_boundaries": 0})  # min 1
+
+
 def test_mask_leak_cleanup_default_and_override(monkeypatch):
     # qm11/qm10/qm12 gated leak cleanup: drop a mask component only if it is
     # BOTH small AND detached, so a leak onto adjacent structure can't stretch
@@ -147,6 +187,116 @@ def test_mask_leak_cleanup_default_and_override(monkeypatch):
     # Per-job override (form checkbox arrives as a string) beats env.
     assert JobConfig({"mask_leak_cleanup": "1"}).mask_leak_cleanup is True
     assert JobConfig({"mask_leak_cleanup": "0"}).mask_leak_cleanup is False
+
+
+def test_vote_ray_gate_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.vote_ray_gate is False
+    assert cfg.vote_ray_cross_m == 1.5
+    assert cfg.vote_stale_max_m == 2.0
+
+
+def test_vote_ray_gate_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("VOTE_RAY_GATE_ENABLED", "1")
+    monkeypatch.setenv("VOTE_RAY_CROSS_M", "2.0")
+    monkeypatch.setenv("VOTE_STALE_MAX_M", "3.0")
+    cfg = JobConfig()
+    assert cfg.vote_ray_gate is True
+    assert cfg.vote_ray_cross_m == 2.0
+    assert cfg.vote_stale_max_m == 3.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"vote_ray_gate": "false", "vote_ray_cross_m": "1.0",
+                      "vote_stale_max_m": "1.0"})
+    assert cfg2.vote_ray_gate is False
+    assert cfg2.vote_ray_cross_m == 1.0
+    assert cfg2.vote_stale_max_m == 1.0
+
+
+def test_vote_ray_gate_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"vote_ray_cross_m": 0.0})
+    with pytest.raises(ValueError):
+        JobConfig({"vote_stale_max_m": 0.0})
+
+
+def test_kin_gate_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.kin_gate is False
+    assert cfg.kin_max_speed_mps == 6.5
+
+
+def test_kin_gate_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("KIN_GATE_ENABLED", "1")
+    monkeypatch.setenv("KIN_MAX_SPEED_MPS", "7.0")
+    cfg = JobConfig()
+    assert cfg.kin_gate is True
+    assert cfg.kin_max_speed_mps == 7.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"kin_gate": "false", "kin_max_speed_mps": "5.0"})
+    assert cfg2.kin_gate is False
+    assert cfg2.kin_max_speed_mps == 5.0
+
+
+def test_kin_gate_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"kin_max_speed_mps": 0.5})
+
+
+def test_occlusion_portal_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.occlusion_portal is False
+
+
+def test_occlusion_portal_knob_env_and_override(monkeypatch):
+    monkeypatch.setenv("OCCLUSION_PORTAL_ENABLED", "1")
+    cfg = JobConfig()
+    assert cfg.occlusion_portal is True
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"occlusion_portal": "false"})
+    assert cfg2.occlusion_portal is False
+
+
+def test_start_zone_seed_knobs_default_off(monkeypatch):
+    # Autonomous starting-zone seed priors: admit sub-threshold bumper reads
+    # inside alliance-wall starting bands during the opening window. OFF by
+    # default pending A/B.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.start_zone_seed is False
+    assert cfg.start_zone_depth_m == 2.0
+    assert cfg.start_zone_window_s == 6.0
+
+
+def test_start_zone_seed_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("START_ZONE_SEED_ENABLED", "1")
+    monkeypatch.setenv("START_ZONE_DEPTH_M", "3.0")
+    monkeypatch.setenv("START_ZONE_WINDOW_S", "8.0")
+    cfg = JobConfig()
+    assert cfg.start_zone_seed is True
+    assert cfg.start_zone_depth_m == 3.0
+    assert cfg.start_zone_window_s == 8.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"start_zone_seed": "0", "start_zone_depth_m": "1.5",
+                      "start_zone_window_s": "4.0"})
+    assert cfg2.start_zone_seed is False
+    assert cfg2.start_zone_depth_m == 1.5
+    assert cfg2.start_zone_window_s == 4.0
+
+
+def test_start_zone_seed_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_depth_m": 0.1})   # min 0.5
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_depth_m": 9.0})   # max 8.0
+    with pytest.raises(ValueError):
+        JobConfig({"start_zone_window_s": -1.0})  # min 0.0
 
 
 def test_to_dict_round_trip():

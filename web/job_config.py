@@ -89,6 +89,16 @@ KNOBS = [
     # (the auto-start sprint problem); match-long admission tripled roster
     # churn on qm11. 0 disables the scope (blobs whole match).
     Knob("motion_blob_window_s", "MOTION_BLOB_WINDOW_S", float, 6.0, min=0.0),
+    # Autonomous starting-zone seed priors: during the opening window, admit
+    # sub-threshold bumper reads whose ground contact projects into a legal
+    # starting band (within start_zone_depth_m of an alliance wall, full field
+    # width) as SUBORDINATE (strong=False) candidates — robots sit stationary
+    # and rule-constrained at t=0, so grab them before they sprint (qm11 fast
+    # robot never seeded). Reuses det_conf_floor. DEFAULT OFF pending A/B.
+    Knob("start_zone_seed", "START_ZONE_SEED_ENABLED", bool, False),
+    Knob("start_zone_depth_m", "START_ZONE_DEPTH_M", float, 2.0,
+         min=0.5, max=8.0),
+    Knob("start_zone_window_s", "START_ZONE_WINDOW_S", float, 6.0, min=0.0),
     # Seed candidates adopt the union of the bumper-expanded box and the
     # overlapping whole-robot detection (bumper color kept). A blurred
     # bumper expands to a narrow sliver — a poor SAM prompt; the whole-robot
@@ -144,6 +154,18 @@ KNOBS = [
     # bumper — discard the vote. Default ON: it only acts inside explicit
     # equipment footprints, where a robot cannot be.
     Knob("zone_blind_votes", "VLM_ZONE_BLIND_VOTES", bool, True),
+    # Vote ray-consistency gates (identity layer, geometry-only): a bumper
+    # crop's own camera saw it on a specific ground ray, and votes are
+    # applied later by a background task. Two independent checks —
+    # (1) candidate time: reject a crop whose source-camera ray misses the
+    # fused slot position by more than vote_ray_cross_m (wrong merge, never
+    # send to the VLM); (2) vote time: drop a vote if the slot's live
+    # position has since moved farther than vote_stale_max_m from the
+    # crop-time fused position (re-bound between crop and vote). DEFAULT OFF
+    # pending A/B.
+    Knob("vote_ray_gate", "VOTE_RAY_GATE_ENABLED", bool, False),
+    Knob("vote_ray_cross_m", "VOTE_RAY_CROSS_M", float, 1.5, min=0.1),
+    Knob("vote_stale_max_m", "VOTE_STALE_MAX_M", float, 2.0, min=0.1),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
     # Evidence-ranked roster: re-prompt a dark object claimed by a fresh
     # detection in place, and let weak-evidence roster members (dark or
@@ -172,9 +194,40 @@ KNOBS = [
     # Unconditional largest-component regressed qm10/qm12 by dropping those
     # halves. DEFAULT OFF pending re-validation.
     Knob("mask_leak_cleanup", "SAM2_MASK_LEAK_CLEANUP", bool, False),
+    # Size-prior hijack cull: a tracked mask whose pixel width, at its
+    # projected field position, stays far wider (or narrower) than a robot
+    # could appear for size_prior_boundaries consecutive boundaries has latched
+    # onto structure/a pile. Equipment hijacks are YOLO-corroborated, so the
+    # absence cull can't catch them — geometry is the only clean signal.
+    # Independent of cull_hijack_enabled. DEFAULT OFF pending A/B.
+    Knob("size_prior_cull", "SIZE_PRIOR_CULL_ENABLED", bool, False),
+    Knob("size_prior_hi", "SIZE_PRIOR_HI", float, 3.0, min=1.0),
+    Knob("size_prior_lo", "SIZE_PRIOR_LO", float, 0.25, min=0.0, max=1.0),
+    Knob("size_prior_boundaries", "SIZE_PRIOR_BOUNDARIES", int, 3, min=1),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),
+    # Surface-aware vote gate: the bumper readers also report whether the
+    # digits sit on a robot bumper band ("bumper") or are PRINTED on
+    # equipment ("printed") — qm11's OVERFLOW crate base read "1477" at
+    # digit_prob 1.0, a perfect read of the wrong object. The surface value
+    # is always parsed and recorded in diagnostics; when this gate is ON a
+    # "printed" read's vote is dropped. Complements zone_blind_votes, which
+    # only acts inside explicitly mapped equipment zones (2026cur had none).
+    # DEFAULT OFF pending A/B (observe-only via diagnostics until then).
+    Knob("surface_gate", "VLM_SURFACE_GATE", bool, False),
+    # VLM equipment adjudication (observe-only): a track static for
+    # adjudicate_static_sec gets its whole-robot crop sent to the reader
+    # with an "is this a robot / equipment / person?" prompt. Verdicts and
+    # per-identity streaks are recorded to diagnostics ONLY — no eviction,
+    # no confidence change — so the signal can be graded against replays
+    # before any action is wired to it. Independent modality: equipment
+    # hijacks are YOLO-corroborated, so detector-based culls can't win
+    # (see size_prior_cull / cull_hijack_enabled notes above).
+    Knob("equipment_adjudicate", "VLM_EQUIPMENT_ADJUDICATE", bool, False),
+    Knob("adjudicate_static_sec", "VLM_ADJUDICATE_STATIC_SEC", float, 6.0, min=1.0),
+    Knob("adjudicate_static_move_m", "VLM_ADJUDICATE_STATIC_MOVE_M", float, 0.5, min=0.0),
+    Knob("adjudicate_cooldown_sec", "VLM_ADJUDICATE_COOLDOWN_SEC", float, 10.0, min=1.0),
     # Phase-exclusive vLLM: stop the server during tracking (its ~11GB pool
     # plus SAM3's ~11GB peak OOMs the 24GB card; it is idle in that phase
     # anyway), start it for the analysis loop's reads, stop it after the job.
@@ -234,6 +287,22 @@ KNOBS = [
     # over recent frames. Targets the bump/depot mask-hijack after a robot
     # drives behind the hub (qm10 blue side). DEFAULT OFF pending A/B.
     Knob("occlusion_rebind_guard", "OCCLUSION_REBIND_GUARD", bool, False),
+    # Kinematic plausibility gate: hard-reject a tracker association that
+    # implies a robot speed beyond the physical cap (FRC robots sustain
+    # <= ~5.5-6 m/s) — a track "moving" several meters in one frame got
+    # stolen, not driven. Additional to (not a replacement for) the KF's
+    # existing r_scale downweighting of fast measurements. DEFAULT OFF
+    # pending A/B. See tracker.py FieldTracker._kin_violates.
+    Knob("kin_gate", "KIN_GATE_ENABLED", bool, False),
+    Knob("kin_max_speed_mps", "KIN_MAX_SPEED_MPS", float, 6.5, min=1.0),
+    # Occlusion exit portals: when a slot goes into coast behind a hub prism,
+    # predict where its velocity carries it out of the hub shadow and let the
+    # tracker re-acquire a detection near that exit even outside the plain
+    # distance gate (a robot reappearing on the far side of the hub otherwise
+    # waits for the coast-gate to widen, or seeds a duplicate under a new id).
+    # Portal radius grows with coast uncertainty; teleport-through-hub paths
+    # are logged only. DEFAULT OFF pending A/B. See web/field/occlusion_portal.py.
+    Knob("occlusion_portal", "OCCLUSION_PORTAL_ENABLED", bool, False),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

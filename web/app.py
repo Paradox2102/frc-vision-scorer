@@ -62,6 +62,7 @@ from web.field.calibration import (CameraCalibration, Calibrator, CalibrationErr
                                    holdout_field_error, tag_alignment_error, MIN_POSE_TAGS)
 from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
 from web.field.apriltag_detect import detect_tags
+from web.field.drift_monitor import DriftMonitor
 from web.field.composite_layout import load_layout
 from web.field.tracker import FieldTracker, FieldDetection
 from web.field.occlusion import (
@@ -70,6 +71,7 @@ from web.field.occlusion import (
     occluded_by_hub,
     resolve_occlusion,
 )
+from web.field.occlusion_portal import predict_exit, path_crosses_footprint
 from web.field.overlay_geometry import (
     bump_wireframe_edges,
     hub_wireframe_edges,
@@ -120,6 +122,7 @@ from web.field.zones import (
     prism_bounding_zones,
     ray_enters_zones,
     save_zones,
+    start_zones,
 )
 from web.replay_recorder import ReplayRecorder
 from web import database
@@ -131,12 +134,16 @@ from web.field.identity_confidence import (
     decide_vlm_read,
     dedupe_batch_team_reads,
     digit_token_conf,
+    normalize_surface,
     occlusion_blocks_read,
+    surface_vote_multiplier,
     tentative_claim_winners,
+    vote_ray_cross_m,
 )
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
 from web.field.track_evidence import MatchEvidence
+from web.field.field_qc import track_is_static, parse_object_class
 
 # yt-dlp needs a JavaScript runtime (deno) to unlock YouTube's high-res (720p/1080p)
 # formats — without it YouTube only serves a 360p progressive stream. The deno
@@ -354,6 +361,11 @@ VLM_BATCH_READS = os.environ.get("VLM_BATCH_READS", "1") not in ("0", "false", "
 # (sqrt-damped in blend_read_confidence): a wavering read loses its
 # full-weight vote instead of riding the 0.95 exact-roster-match ladder.
 VLM_LOGPROB_CONFIDENCE = os.environ.get("VLM_LOGPROB_CONFIDENCE", "1") not in ("0", "false", "False")
+# Server-side structured output for vLLM reads: constrain generation to the
+# reply schema (OpenAI response_format json_schema) so a read can never be
+# lost to malformed JSON. Automatic single retry without the schema on an
+# HTTP 400 (older vLLM builds). Kill-switch for A/B.
+VLM_GUIDED_JSON = os.environ.get("VLM_GUIDED_JSON", "1") not in ("0", "false", "False")
 # Live-view frame streaming: display sends are rate-capped and pushed through
 # a latest-only queue so a slow websocket client never back-pressures the
 # inference loop. The replay recorder keeps its own full-rate copy.
@@ -710,6 +722,13 @@ CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5")
 # manual recalibration). Set to 0 to keep the old abort-straight-to-manual behavior.
 CALIB_AUTOFIX_ENABLED = os.environ.get("CALIB_AUTOFIX_ENABLED", "1") not in ("0", "false", "False")
 
+# Mid-match drift monitor: low-cadence AprilTag re-checks on frames the main
+# loop already decoded. Sustained drift WARNS and records (never aborts — the
+# match is already running); the calibrate page picks the record up like a
+# match-start failure. ~8 detect_tags calls per 150s match at the default.
+CALIB_MONITOR_ENABLED = os.environ.get("CALIB_MONITOR_ENABLED", "1") not in ("0", "false", "False")
+CALIB_MONITOR_INTERVAL_S = float(os.environ.get("CALIB_MONITOR_INTERVAL_S", "20"))
+
 # Minimum YOLO detection confidence. Raised from the 0.25 default to cut false-positive
 # "robot" detections (people, carts) that otherwise steal canonical slots and inherit labels.
 DET_CONF_THRESHOLD = 0.35
@@ -991,6 +1010,11 @@ class InferenceJob:
         self.match_key = getattr(self, "match_key", None)
         self._calib_version_id = None
         self.needs_calibration = None
+        # Mid-match drift monitor: real instance built in _init_field_tracking once
+        # calibration is loaded. None here is also the correct disabled state for
+        # any caller that bypasses that method (e.g. mocks it out in tests).
+        self._drift_monitor = None
+        self._drift_warned = False
         self._log_file = None
         self._log_path: Optional[Path] = None
         # Wall-clock creation time, surfaced by /api/job/active so a
@@ -1061,6 +1085,13 @@ class InferenceJob:
         self._view_flags: Dict[int, dict] = {}
         self._occ: Dict[int, dict] = {}
         self._occ_by_cam: Dict[str, Dict[int, dict]] = {}
+        # Occlusion exit portals (knob: occlusion_portal). slot_id ->
+        # (exit_x, exit_y, radius_m). Set when a slot transitions into
+        # hub-occluded coasting; radius grows with coast uncertainty; cleared
+        # on re-acquire/expire. Fed into the NEXT frame's tracker update.
+        self._portal_state: Dict[int, tuple] = {}
+        # slot_id -> last-known (x, y), for teleport-suspect logging.
+        self._portal_prev_pos: Dict[int, tuple] = {}
 
         # Video metadata
         self.video_width = 0
@@ -1179,6 +1210,10 @@ class InferenceJob:
         # runs as an event-loop task (create_task) so frame processing never
         # blocks on the 0.6-1.5s generate; only one pass is in flight at a time.
         self._vlm_task = None
+        # Single-flight background handle + per-identity position history for
+        # the observe-only equipment-adjudication pass (equipment_adjudicate).
+        self._adjudicate_task = None
+        self._ident_pos_history: dict[int, deque] = {}
         self._claude_vision_max_calls = 20  # Max API calls per match during inference
         self._claude_vision_interval_sec = 5  # Call every 5 seconds until all identified
         self._claude_vision_last_time = 0.0  # Timestamp of last call
@@ -1455,7 +1490,8 @@ class InferenceJob:
         return (valid_boxes, ball_boxes) if with_balls else valid_boxes
 
     def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
-                               motion_grays=None, blobs_allowed: bool = False):
+                               motion_grays=None, blobs_allowed: bool = False,
+                               zone_probe=None):
         """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
@@ -1467,6 +1503,12 @@ class InferenceJob:
         so a ref walking past the bump (or balls rolling under a misread)
         cannot back a candidate. ``blobs_allowed`` gates the diff-blob
         candidate source (early-match window; the caller knows the clock).
+
+        ``zone_probe(box)->bool``: optional predicate in this frame's pixel
+        space; when it (or ``motion_probe``) admits a sub-conf box, that box
+        rides the SUBORDINATE (strong=False) motion tier. Used for the
+        starting-zone seed prior (boxes whose ground contact projects into a
+        legal opening starting band).
 
         Returns [(box_xyxy, color, strong)] in the input frame's pixel
         coords, in strict priority order: strong YOLO evidence first
@@ -1510,14 +1552,18 @@ class InferenceJob:
             # Motion-gated low-conf admission: with a motion probe available,
             # detect down to det_conf_floor; the sub-conf band survives only
             # where pixels actually moved — and only as the SUBORDINATE tier.
-            gated = motion_probe is not None
+            gated = motion_probe is not None or zone_probe is not None
             run_conf = min(conf, self.config.det_conf_floor) if gated else conf
             res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
                 sv.Detections.from_ultralytics(res)
             )
+
+            def _admit_probe(box, _m=motion_probe, _z=zone_probe):
+                return bool((_m is not None and _m(box))
+                            or (_z is not None and _z(box)))
             strong_dets, motion_dets = partition_low_conf_movers(
-                robots, conf, motion_probe if gated else None)
+                robots, conf, _admit_probe if gated else None)
 
             def _expand(dets):
                 out = []
@@ -1564,6 +1610,24 @@ class InferenceJob:
         return reject_person_candidates(
             tiered, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
+
+    def _make_start_zone_probe(self, view, top_crop_px, elapsed_s):
+        """zone_probe(box)->bool for _sam2_robot_candidates: True when the
+        box's ground contact projects inside a starting band, only while the
+        opening window is open. Boxes are in the view's top-cropped space."""
+        if (not self.config.start_zone_seed
+                or elapsed_s > self.config.start_zone_window_s
+                or view.calibration is None or self.field_model is None):
+            return None
+        zones = start_zones(
+            (self.field_model.length_m, self.field_model.width_m),
+            self.config.start_zone_depth_m)
+
+        def _probe(box):
+            uv = ((box[0] + box[2]) / 2.0, box[3] + top_crop_px)
+            xy = view.calibration.image_to_field(uv)
+            return xy is not None and point_in_zones(xy, zones)
+        return _probe
 
     def _ray_zone_list(self, view):
         """Inflated user zones for the ray-beyond-contact seed gate, or None
@@ -1713,6 +1777,11 @@ class InferenceJob:
             res = _vision_read_bumpers([crop_b64], remaining, remaining_blue, remaining_red)[0]
         team = res.get("team_number")
         if not team:
+            return
+        if surface_vote_multiplier(
+                res.get("surface"),
+                getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+            print(f"  VLM vote dropped [printed-surface]: slot {slot_id} += {team}")
             return
         conf = res.get("confidence", 0.0)
         weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
@@ -1964,6 +2033,59 @@ class InferenceJob:
         finally:
             self._vlm_task = None
 
+    def _maybe_schedule_adjudication(self, now: float) -> None:
+        """Observe-only equipment adjudication: ask the VLM whether long-static
+        tracks are actually robots. Single-flight like the bumper pass; verdicts
+        go to diagnostics ONLY — no eviction, no confidence change. Equipment
+        hijacks are detector-corroborated, so this is the independent modality
+        the culls lack; grade it from replays before wiring any action."""
+        t = self._adjudicate_task
+        if t is not None and t.done():
+            exc = t.exception()
+            if exc:
+                print(f"  Adjudication pass failed: {exc}")
+        if t is not None and not t.done():
+            return
+        cfg = self.config
+        batch = []  # (identity_id, slot_id, crop_b64)
+        for ident in self.identity_registry.get_active_identities():
+            if (now - ident.last_adjudicate_time) < cfg.adjudicate_cooldown_sec:
+                continue
+            hist = self._ident_pos_history.get(ident.identity_id)
+            if not hist or not track_is_static(
+                    hist, now, cfg.adjudicate_static_sec, cfg.adjudicate_static_move_m):
+                continue
+            robot = self._get_slot_track_if_exists(ident.active_slot)
+            crop = getattr(robot, "appearance_crop_b64", None) if robot else None
+            if not crop:
+                continue
+            batch.append((ident.identity_id, ident.active_slot, crop))
+        if not batch:
+            return
+        for identity_id, _slot, _crop in batch:
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident:
+                ident.last_adjudicate_time = now
+        self._adjudicate_task = asyncio.create_task(self._run_adjudication(batch))
+
+    async def _run_adjudication(self, batch) -> None:
+        results = await asyncio.to_thread(
+            _vllm_classify_crops, [crop for (_i, _s, crop) in batch])
+        for (identity_id, slot_id, _crop), res in zip(batch, results):
+            ident = self.identity_registry.identities.get(identity_id)
+            if ident is None or res.get("error"):
+                continue
+            verdict = res.get("object", "unclear")
+            if verdict == "robot":
+                ident.equipment_streak = 0
+            elif verdict in ("equipment", "person"):
+                ident.equipment_streak += 1
+            self.diagnostic.record_adjudication(
+                frame=self._current_frame, robot_id=slot_id,
+                verdict=verdict, streak=ident.equipment_streak)
+            print(f"  VLM adjudicate: {self._slot_label(slot_id)} -> {verdict} "
+                  f"(streak={ident.equipment_streak})")
+
     async def _read_fused_bumper_numbers_impl(
         self, fused, requested_priorities: dict[int, float], det_to_slot=None
     ) -> None:
@@ -1993,7 +2115,7 @@ class InferenceJob:
             if slot_id is not None:
                 slot_to_obs[slot_id] = obs
 
-        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64)
+        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64, crop_pos)
         identities_with_crops = set()
 
         for identity_id, priority in requested_priorities.items():
@@ -2013,14 +2135,22 @@ class InferenceJob:
             # stale relative to `fused`. That is acceptable: these flags only gate
             # crop preference (which camera to trust), not read correctness.
             if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
-                cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
+                cam != "main" and crop_b64 for cam, crop_b64, _w, _pos in obs.evidence
             ):
                 continue
 
             has_any_crop = False
-            for cam, crop_b64, source_weight in obs.evidence:
+            for cam, crop_b64, source_weight, cam_pos in obs.evidence:
                 if crop_b64 is None:
                     continue
+                if self.config.vote_ray_gate and cam_pos is not None:
+                    center = self._camera_centers_xy.get(cam)
+                    if center is not None:
+                        miss = vote_ray_cross_m(center, cam_pos, obs.detection.pos)
+                        if miss is not None and miss > self.config.vote_ray_cross_m:
+                            print(f"  VLM crop dropped [ray-miss]: slot {slot_id} "
+                                  f"cam={cam} cross={miss:.2f}m")
+                            continue
                 has_any_crop = True
                 candidates.append((
                     priority,
@@ -2028,7 +2158,8 @@ class InferenceJob:
                     identity_id,
                     slot_id,
                     cam,
-                    crop_b64
+                    crop_b64,
+                    (float(obs.detection.pos[0]), float(obs.detection.pos[1]))
                 ))
 
             if has_any_crop:
@@ -2083,7 +2214,7 @@ class InferenceJob:
         for cand in chosen:
             crop = _resolve_crop(cand[5])
             if crop:
-                resolved.append(cand[:5] + (crop,))
+                resolved.append(cand[:5] + (crop,) + cand[6:])
         chosen = resolved
         if not chosen:
             print("  VLM skipped: chosen crops resolved empty")
@@ -2100,7 +2231,7 @@ class InferenceJob:
 
         crops = [c[5] for c in chosen]
         expected = []
-        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64 in chosen:
+        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64, *_extra in chosen:
             ident = self.identity_registry.identities.get(identity_id)
             alliance = getattr(ident, "alliance", "unknown")
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
@@ -2137,7 +2268,7 @@ class InferenceJob:
             (r.get("team_number"), float(r.get("confidence", 0.0)), c[1])
             for c, r in zip(chosen, results)
         ])
-        for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64), res) in enumerate(zip(chosen, results)):
+        for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res) in enumerate(zip(chosen, results)):
             robot = self._get_or_create_slot_track(slot_id)
             ident = self.identity_registry.identities.get(identity_id)
             if not robot or not ident:
@@ -2159,6 +2290,7 @@ class InferenceJob:
                 "team_number": team,
                 "confidence": conf,
                 "error": res.get("error"),
+                "surface": res.get("surface", "unknown"),
             })
             ocr_crops.append({
                 "robot_id": robot.robot_id,
@@ -2172,6 +2304,7 @@ class InferenceJob:
                 "error": res.get("error"),
                 "legibility": None,
                 "via": "ocr",
+                "surface": res.get("surface", "unknown"),
             })
             self.diagnostic.record_vlm_read(
                 frame=self._current_frame, robot_id=robot.robot_id,
@@ -2182,6 +2315,7 @@ class InferenceJob:
                 alliance_read=res.get("alliance", "unknown"),
                 confidence=conf,
                 vote_weight=vote_weight,
+                surface=res.get("surface", "unknown"),
             )
 
             # Update success/backoff based on whether read succeeded
@@ -2214,6 +2348,13 @@ class InferenceJob:
                       f"{self._slot_label(slot_id)} += {team} suppressed "
                       f"(stronger read of the same team in this batch)")
                 continue
+            if surface_vote_multiplier(
+                    res.get("surface"),
+                    getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+                print(f"  VLM vote dropped [printed-surface]: "
+                      f"{self._slot_label(slot_id)} += {team} "
+                      f"(digits printed on structure, not a bumper)")
+                continue
             # Zone-blind voting: a read taken while the track sits inside a
             # static-structure footprint is printed equipment text, not a
             # bumper (qm11: R2 read the OVERFLOW crate's "1477" at prob 1.0
@@ -2241,6 +2382,22 @@ class InferenceJob:
                       f"{self._slot_label(slot_id)} += {team} at "
                       f"({_pos[0]:.1f},{_pos[1]:.1f})")
                 continue
+            # Stale-position gate: votes are applied by a background task, so
+            # the slot's LIVE position (_pos) can have moved since the crop
+            # this vote came from was captured. A move farther than a robot
+            # can plausibly drive means the slot was re-bound between crop and
+            # vote — the vote belongs to whatever now occupies the old spot,
+            # not this identity.
+            crop_pos = _extra[0] if _extra else None
+            if (self.config.vote_ray_gate and crop_pos is not None
+                    and _pos is not None):
+                moved = ((_pos[0] - crop_pos[0]) ** 2
+                         + (_pos[1] - crop_pos[1]) ** 2) ** 0.5
+                if moved > self.config.vote_stale_max_m:
+                    print(f"  VLM vote dropped [stale-pos]: "
+                          f"{self._slot_label(slot_id)} += {team} moved "
+                          f"{moved:.1f}m since crop")
+                    continue
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
@@ -2285,7 +2442,7 @@ class InferenceJob:
         # translate those team labels back to durable identities before changing
         # any binding.
         pass_reads = {}
-        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
+        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res in zip(chosen, results):
             team_val = res.get("team_number")
             conf_val = float(res.get("confidence", 0.0))
             if team_val and conf_val >= 0.85:
@@ -2499,6 +2656,7 @@ class InferenceJob:
                 "confidence": float(res.get("confidence", 0.0)),
                 "error": res.get("error"),
                 "legibility": round(score, 4),
+                "surface": res.get("surface", "unknown"),
             })
             self.diagnostic.record_vlm_read(
                 frame=self._current_frame, robot_id=robot.robot_id,
@@ -2509,6 +2667,7 @@ class InferenceJob:
                 alliance_read=res.get("alliance", "unknown"),
                 confidence=float(res.get("confidence", 0.0)),
                 vote_weight=1.0 if float(res.get("confidence", 0.0)) >= 0.85 else 0.5,
+                surface=res.get("surface", "unknown"),
             )
         self.last_ocr_crops = ocr_crops
         self._ocr_crops_dirty = True
@@ -2519,6 +2678,12 @@ class InferenceJob:
                 continue
             robot = self._get_or_create_slot_track(canonical_id)
             if not robot:
+                continue
+            if surface_vote_multiplier(
+                    result.get("surface"),
+                    getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
+                print(f"  VLM vote dropped [printed-surface]: "
+                      f"{self._slot_label(canonical_id)} += {team}")
                 continue
             conf = result.get("confidence", 0.0)
             weight = 1.0 if conf >= 0.85 else 0.5
@@ -3843,6 +4008,58 @@ class InferenceJob:
         """Human label for a slot: B1..B3 / R1..R3."""
         return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
 
+    def _update_portals(self, track_outs, dt) -> None:
+        """Maintain occlusion exit portals across frames (occlusion_portal knob).
+
+        - On a slot transitioning INTO hub-occluded coasting, project its
+          constant-velocity ray through each hub prism and stash the first
+          exit point as (x, y, 0.8) — the seed re-acquisition portal.
+        - While it stays occ-coasting, grow the radius by 0.5*dt per frame
+          (coast uncertainty) up to 2.5 m.
+        - Clear the entry once the slot is re-acquired (visible) or gone.
+        - Log-only teleport suspicion: a slot whose position jumped > 2.0 m
+          this frame along a path crossing a hub, while NOT occ-coasting.
+        """
+        states = {t.slot_id: t for t in track_outs}
+        # Teleport-suspect logging (log-only, never rejects an association).
+        for sid, t in states.items():
+            prev = self._portal_prev_pos.get(sid)
+            new = (float(t.pos[0]), float(t.pos[1]))
+            occ_coasting = (t.state == "coasting"
+                            and self._occ.get(sid, {}).get("cause") == "hub")
+            if (prev is not None and not occ_coasting
+                    and float(np.hypot(new[0] - prev[0], new[1] - prev[1])) > 2.0
+                    and any(path_crosses_footprint(prev, new, p.footprint)
+                            for p in self.hub_prisms)):
+                print(f"  [portal] teleport-suspect slot {sid}: "
+                      f"{prev}->{new} crosses hub")
+            self._portal_prev_pos[sid] = new
+
+        for sid, t in states.items():
+            hub_coasting = (t.state == "coasting"
+                            and self._occ.get(sid, {}).get("cause") == "hub")
+            if not hub_coasting:
+                # Re-acquired or no longer hub-occluded: drop any portal.
+                self._portal_state.pop(sid, None)
+                continue
+            if sid in self._portal_state:
+                # Established portal: grow radius with coast uncertainty.
+                px, py, pr = self._portal_state[sid]
+                self._portal_state[sid] = (px, py, min(2.5, pr + 0.5 * dt))
+                continue
+            # New transition into hub-occluded coasting: predict the exit.
+            for prism in self.hub_prisms:
+                hit = predict_exit(t.pos, t.vel, prism.footprint)
+                if hit is not None:
+                    (ex, ey), _eta = hit
+                    self._portal_state[sid] = (ex, ey, 0.8)
+                    break
+
+        # Drop portals for slots no longer present at all.
+        for sid in [s for s in self._portal_state if s not in states]:
+            self._portal_state.pop(sid, None)
+            self._portal_prev_pos.pop(sid, None)
+
     def _identity_for_slot(self, slot_id: int) -> Optional[RobotIdentity]:
         """Find the active identity currently bound to a slot."""
         if not hasattr(self, "identity_registry") or self.identity_registry is None:
@@ -4099,7 +4316,12 @@ class InferenceJob:
         )
 
         # 3.5 Update live confidence signals
-        from web.field.identity_confidence import ConfidenceSignals, ConfidenceState, calculate_confidence_update
+        from web.field.identity_confidence import (
+            ConfidenceSignals,
+            ConfidenceState,
+            calculate_confidence_update,
+            should_queue_immediate_read,
+        )
         from web.embedder import cosine_similarity
         
         team_counts = {}
@@ -4185,25 +4407,41 @@ class InferenceJob:
             ident.vlm_agrees = False
             ident.vlm_contradicts = False
 
-            # Queue immediate reads on low confidence / bad signals
+            # Queue immediate reads on low confidence / bad signals — gated by
+            # the escalation cooldown so a just-read identity isn't pinned at
+            # priority 10 every frame its condition persists.
             if is_observed:
+                current_match_time = self._current_frame / (self.video_fps or 10.0)
+                allow_immediate = should_queue_immediate_read(
+                    current_match_time,
+                    ident.last_vlm_time,
+                    ident.last_immediate_queue_time,
+                    self.confidence_config.immediate_read_cooldown_sec,
+                )
+                queued = False
                 prev_slot = self._last_bindings.get(ident.identity_id)
                 # re-attachment
-                if prev_slot is None:
+                if prev_slot is None and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
                 # low margins
-                if relink_margin < 0.1:
+                if relink_margin < 0.1 and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
                 # appearance divergence
-                if appearance_divergent:
+                if appearance_divergent and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: appearance divergent")
                 # roster conflict
-                if not roster_uniqueness_ok:
+                if not roster_uniqueness_ok and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: roster conflict")
+                if queued:
+                    ident.last_immediate_queue_time = current_match_time
 
         # 4. Bind new slots to identities
         current_bindings = {}
@@ -4559,7 +4797,9 @@ class InferenceJob:
                 coast_vel_decay=self.config.coast_vel_decay,
                 sticky_max_dist_m=self.config.sticky_max_dist_m,
                 suspect_zones=suspect_zones,
-                occlusion_rebind_guard=self.config.occlusion_rebind_guard)
+                occlusion_rebind_guard=self.config.occlusion_rebind_guard,
+                kin_gate_enabled=self.config.kin_gate,
+                kin_max_speed_mps=self.config.kin_max_speed_mps)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -4581,11 +4821,29 @@ class InferenceJob:
                     selection[_name] = _pick["version_id"]
             self.views = load_views(self.event_key, selection=selection)  # main first; corners if calibrated
             print(f"  Cameras active: {[v.name for v in self.views]}")
+            # Per-camera ground position, for the vote ray-consistency gate
+            # (identity_confidence.vote_ray_cross_m): a bumper crop's own
+            # camera saw it on the ray camera_center -> detection, and a slot
+            # position far off that ray is evidence of a wrong merge.
+            # Homography-mode calibrations have no camera_center (no pose),
+            # so those cameras are simply absent from the map and the gate
+            # no-ops for their evidence (see call site's `center is not None`
+            # guard).
+            self._camera_centers_xy = {}
+            for v in self.views:
+                cc = v.calibration.camera_center if v.calibration else None
+                if cc is not None:
+                    self._camera_centers_xy[v.name] = (float(cc[0]), float(cc[1]))
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
         self.field_tracking = True
+        self._drift_monitor = (
+            DriftMonitor(CALIB_MONITOR_INTERVAL_S, CALIB_DRIFT_MAX_M, CALIB_CHECK_MIN_TAGS)
+            if (CALIB_MONITOR_ENABLED and CALIB_CHECK_ENABLED and self.calib is not None)
+            else None)
+        self._drift_warned = False
         print(f"  Field tracking ENABLED: event={self.event_key} camera={self.camera} "
               f"season={cal.field_season} mode={cal.mode}")
         return True
@@ -4995,6 +5253,12 @@ class InferenceJob:
                             "message": "Pausing vLLM reader to free VRAM for tracking…",
                             "progress": 8.0,
                         })
+                        # The in-process local reader squats ~8GB the same way
+                        # the server does; evict it so the offload probe below
+                        # sees the real budget. It re-loads lazily at the
+                        # analysis loop's first read pass.
+                        if _unload_qwen_vl():
+                            print(f"  [{backend_label}] Unloaded in-process bumper reader to free VRAM for tracking")
                         if not await vllm_lifecycle.ensure_stopped():
                             await self._warn_degraded(
                                 "vllm",
@@ -5053,46 +5317,60 @@ class InferenceJob:
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
                     _t_load = time.perf_counter()
-                    if self.tracking_backend == "sam3":
-                        from web.field.sam3_tracker import Sam3FieldTracker
 
-                        sam2_tracker = Sam3FieldTracker(
-                            checkpoint=SAM3_CHECKPOINT,
-                            device=device,
-                            offload_video_to_cpu=offload_vid,
-                            offload_state_to_cpu=offload_st,
-                            compile_model=(self.config.sam3_compile and device == "cuda"),
-                            max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
-                            use_fa3=SAM3_USE_FA3,
-                            chunk_frames=self.config.sam3_chunk_frames,
-                        )
-                        model_detail = (
-                            f"video model w/ instance prompts, "
-                            f"chunk={self.config.sam3_chunk_frames} frames, "
-                            f"compile={self.config.sam3_compile}"
-                        )
-                    else:
-                        from web.field.sam2_tracker import Sam2FieldTracker
+                    def _load_tracker_and_embedder():
+                        # Runs on a worker thread so the frame-export decode
+                        # pass overlaps the weight load. Nothing here is
+                        # shared with the export path (it needs YOLO and
+                        # calibration only); the barrier after the export
+                        # awaits this task before seeding uses the tracker.
+                        if self.tracking_backend == "sam3":
+                            from web.field.sam3_tracker import Sam3FieldTracker
 
-                        # Per-job encoder size (UI override); falls back to the env default.
-                        job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
-                        sam2_tracker = Sam2FieldTracker(
-                            config=job_config,
-                            checkpoint=job_checkpoint,
-                            device=device,
-                            offload_video_to_cpu=offload_vid,
-                            offload_state_to_cpu=offload_st,
-                            vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
-                        )
-                        model_detail = (
-                            f"{self.model_size} model, "
-                            f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
-                        )
-                    self.robot_embedder = RobotEmbedder()
-                    self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
+                            tracker = Sam3FieldTracker(
+                                checkpoint=SAM3_CHECKPOINT,
+                                device=device,
+                                offload_video_to_cpu=offload_vid,
+                                offload_state_to_cpu=offload_st,
+                                compile_model=(self.config.sam3_compile and device == "cuda"),
+                                max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
+                                use_fa3=SAM3_USE_FA3,
+                                chunk_frames=self.config.sam3_chunk_frames,
+                            )
+                            detail = (
+                                f"video model w/ instance prompts, "
+                                f"chunk={self.config.sam3_chunk_frames} frames, "
+                                f"compile={self.config.sam3_compile}"
+                            )
+                        else:
+                            from web.field.sam2_tracker import Sam2FieldTracker
+
+                            # Per-job encoder size (UI override); falls back to the env default.
+                            job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
+                            tracker = Sam2FieldTracker(
+                                config=job_config,
+                                checkpoint=job_checkpoint,
+                                device=device,
+                                offload_video_to_cpu=offload_vid,
+                                offload_state_to_cpu=offload_st,
+                                vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
+                            )
+                            detail = (
+                                f"{self.model_size} model, "
+                                f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
+                            )
+                        embedder = RobotEmbedder()
+                        self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
+                        return tracker, detail, embedder
+
+                    model_load_task = asyncio.create_task(
+                        asyncio.to_thread(_load_tracker_and_embedder))
+                    # One tick hands the load to its worker thread before the
+                    # export loop below starts decoding.
+                    await asyncio.sleep(0)
+                    # Optimistic: the plan/export phase needs no tracker; the
+                    # barrier after the export downgrades on load failure.
                     self.use_sam2 = True
-                    print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
-                          f"and RobotEmbedder on {device}")
                 except Exception as e:
                     backend_label = (
                         "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
@@ -5259,7 +5537,9 @@ class InferenceJob:
                                                 max(0.0,
                                                     (prompt_frame - prompt_source_frame)
                                                     / max(self.video_fps, 1e-6)),
-                                                self.config.motion_blob_window_s))
+                                                self.config.motion_blob_window_s),
+                                            zone_probe=self._make_start_zone_probe(
+                                                view, top_crop_px, 0.0))
                                         full_boxes = [
                                             (
                                                 box[0],
@@ -5341,6 +5621,22 @@ class InferenceJob:
                 print(f"  [{self.tracker_tag}] Exported {exported} frames/view across {N} view(s) in "
                       f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
 
+                # Barrier: the overlapped tracker/embedder load must be
+                # resident before seeding. On failure, degrade to Kalman
+                # exactly as the old inline load did.
+                try:
+                    sam2_tracker, model_detail, self.robot_embedder = await model_load_task
+                    print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
+                          f"and RobotEmbedder on {device}")
+                except Exception as e:
+                    await self._warn_degraded(
+                        self.tracker_tag.lower(),
+                        f"[{backend_label}] Failed to initialize tracker/embedder: "
+                        f"{e}. Falling back to Kalman tracking.",
+                    )
+                    self.use_sam2 = False
+                    self.robot_embedder = None
+            if self.use_sam2:
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
@@ -5474,13 +5770,17 @@ class InferenceJob:
                                         motion_grays = (
                                             cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
                                             cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+                                elapsed = max(
+                                    0.0,
+                                    (source_frame - prompt_source_frame)
+                                    / max(self.video_fps, 1e-6))
                                 merged = self._sam2_robot_candidates(
                                     crop, motion_grays=motion_grays,
                                     blobs_allowed=blob_window_open(
-                                        max(0.0,
-                                            (source_frame - prompt_source_frame)
-                                            / max(self.video_fps, 1e-6)),
-                                        self.config.motion_blob_window_s))
+                                        elapsed,
+                                        self.config.motion_blob_window_s),
+                                    zone_probe=self._make_start_zone_probe(
+                                        view, top_crop_px, elapsed))
                                 # Field-filter in full-view coords (restore the
                                 # top-crop offset). No blocked_zones: detect_fn
                                 # output also corroborates existing masks (a
@@ -5614,6 +5914,26 @@ class InferenceJob:
                             ),
                         )
 
+                        # Size-prior hijack cull (A/B knob): expected robot pixel
+                        # width at a field position, in SAM2 export pixel space.
+                        # Width is invariant to the top-crop y-offset, so only
+                        # _sam2_scale matters (unlike _project_fn, which needs
+                        # _y_off). Independent of the corroboration machinery:
+                        # equipment hijacks are detector-corroborated.
+                        _expected_px_fn = None
+                        if self.config.size_prior_cull:
+                            from web.field.detect_bridge import expected_robot_pixel_width
+
+                            def _make_expected_px_fn(cal, scale, robot_w=1.1):
+                                def _fn(xy):
+                                    if xy is None:
+                                        return None
+                                    px = expected_robot_pixel_width(xy, cal, robot_w)
+                                    return None if px is None else px * scale
+                                return _fn
+                            _expected_px_fn = _make_expected_px_fn(
+                                view.calibration, _sam2_scale)
+
                         # Motion override (A/B knob): frame-diff motion probe
                         # over this view's exported frames; boxes at boundaries
                         # are in the same scaled/cropped pixel space as the
@@ -5718,6 +6038,14 @@ class InferenceJob:
                             # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
                             opening_reprompt_every=opening_reprompt_every,
                             opening_window_frames=opening_window_frames,
+                            # Size-prior hijack cull: geometric width violation
+                            # is the one signal a detector false-fire can't
+                            # corroborate (equipment hijacks are YOLO-backed).
+                            expected_px_fn=_expected_px_fn,
+                            size_prior_cull=self.config.size_prior_cull,
+                            size_prior_hi=self.config.size_prior_hi,
+                            size_prior_lo=self.config.size_prior_lo,
+                            size_prior_boundaries=self.config.size_prior_boundaries,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -6121,6 +6449,10 @@ class InferenceJob:
                                     track_id=obj_id,
                                     embedding=det_embed,
                                     robot_crop_b64=robot_crop_b64,
+                                    # Payload only: SAM per-object confidence for
+                                    # this frame (None on the legacy detector path).
+                                    tracker_prob=(info.get("evidence") or {}).get(
+                                        "tracker_prob"),
                                 )
 
                                 # Defer the JPEG encode; only top-K chosen crops resolve.
@@ -6200,7 +6532,10 @@ class InferenceJob:
 
                     field_dets = [obs.detection for obs in fused]
                     dt = self.frame_skip / (self.video_fps or 30.0)
-                    track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                    portals = (self._portal_state
+                               if self.config.occlusion_portal else None)
+                    track_outs = self.field_tracker.update(
+                        field_dets, self._view_flags, dt, portals=portals)
                     if TRACKER_TRACE:
                         ft = self.field_tracker
                         self._tracker_trace = getattr(self, "_tracker_trace", [])
@@ -6262,6 +6597,9 @@ class InferenceJob:
                     self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
                     self._view_flags = self._occ   # feed forward to next frame's tracker
 
+                    if self.config.occlusion_portal:
+                        self._update_portals(track_outs, dt)
+
                     # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
                     # Mirror each slot's fused-track appearance embedding (kept in the
                     # FusedTrackRegistry, keyed by fused id) onto its RobotTrack. Without
@@ -6310,6 +6648,15 @@ class InferenceJob:
                         robot.last_seen_frame = frame_num
                         tracked_robot_boxes.append((t.slot_id, t.box))
                         if auto_core and auto_core[0] <= frame_num <= auto_core[1]:
+                            # Per-sample quality signals (payload only). `_occ` is
+                            # the merged occlusion dict keyed by slot_id; it may be
+                            # one frame stale (background-task schedule) — an honest
+                            # approximation for path-quality metrics. Store the
+                            # occlusion cause string when the bumper is occluded,
+                            # else None; tracker_prob is the SAM confidence of the
+                            # detection that measured this slot (None if absent).
+                            _occ_slot = (self._occ or {}).get(t.slot_id) or {}
+                            _tp = t.tracker_prob
                             self.autonomous_paths[self._slot_label(t.slot_id)].append({
                                 "frame_num": frame_num,
                                 "timestamp": round(
@@ -6319,6 +6666,12 @@ class InferenceJob:
                                     round(float(t.pos[0]), 4),
                                     round(float(t.pos[1]), 4),
                                 ],
+                                "corner_only": bool(t.corner_only),
+                                "occluded": (_occ_slot.get("cause")
+                                             if _occ_slot.get("bumper_occluded")
+                                             else None),
+                                "tracker_prob": (round(float(_tp), 4)
+                                                 if _tp is not None else None),
                             })
                     # Coasting tracks keep their stale last_position untouched.
 
@@ -6392,6 +6745,39 @@ class InferenceJob:
                         # read pass no longer blocks frame processing — it runs
                         # as an event-loop task while the loop keeps decoding.
                         self._schedule_vlm_pass(fused, due_priorities)
+
+                    if getattr(self.config, "equipment_adjudicate", False):
+                        # Position history feeds track_is_static; only paid
+                        # for when the adjudication knob is on.
+                        for ident in self.identity_registry.get_active_identities():
+                            _st = self._get_slot_track_if_exists(ident.active_slot)
+                            _p = getattr(_st, "field_position", None)
+                            if _p is not None:
+                                self._ident_pos_history.setdefault(
+                                    ident.identity_id, deque(maxlen=600)
+                                ).append((current_match_time, float(_p[0]), float(_p[1])))
+                        self._maybe_schedule_adjudication(current_match_time)
+
+                with self._stage("loop.drift_monitor"):
+                    if (self._drift_monitor is not None and not self._drift_warned
+                            and self._drift_monitor.due(current_match_time)):
+                        main_view = next((v for v in self.views if v.name == "main"), None)
+                        if main_view is not None:
+                            main_crop = main_view.extract(frame)
+                            detected = detect_tags(main_crop)
+                            err_m, ntags = tag_alignment_error(self.calib, detected, self.field_model)
+                            self._drift_monitor.record(current_match_time, err_m, ntags)
+                            if self._drift_monitor.drifted:
+                                self._drift_warned = True
+                                if self.match_key:
+                                    field_store.record_drift(self.event_key, self.camera,
+                                                             self.match_key, err_m,
+                                                             self._calib_version_id)
+                                await self._warn_degraded(
+                                    "calib_drift",
+                                    f"Calibration drifted mid-match (~{err_m:.2f} m at "
+                                    f"t={current_match_time:.0f}s): positions after this point "
+                                    "are suspect; recalibrate before the next match.")
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -6711,6 +7097,18 @@ class InferenceJob:
             # self._stopped break above.
             await self._drain_vlm_task()
 
+            _adj = self._adjudicate_task
+            if _adj is not None:
+                try:
+                    if not _adj.done():
+                        await _adj
+                    elif _adj.exception():
+                        print(f"  Adjudication pass failed (drain): {_adj.exception()}")
+                except Exception as e:
+                    print(f"  Adjudication pass failed (drain): {e}")
+                finally:
+                    self._adjudicate_task = None
+
             # Fold the per-stage accumulators into timings as flat "loop.<stage>"
             # keys (survive the end-of-job round pass) and print one hot-path line.
             for _k, _v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]):
@@ -6761,6 +7159,23 @@ class InferenceJob:
                 await self._drain_vlm_task()
             except Exception:
                 pass
+            # Same idea for the observe-only adjudication task: don't let an
+            # exception-triggered teardown orphan it. This is the failure
+            # path, so we cancel rather than await (awaiting could block
+            # teardown up to the 120s HTTP timeout).
+            try:
+                _adj = self._adjudicate_task
+                if _adj is not None:
+                    if not _adj.done():
+                        _adj.cancel()
+                    else:
+                        exc = _adj.exception()
+                        if exc is not None:
+                            print(f"  Adjudication pass failed (teardown): {exc}")
+            except Exception:
+                pass
+            finally:
+                self._adjudicate_task = None
             # Leave the GPU clean for whatever runs next: the vLLM server is
             # only needed during this job's analysis phase, and the next
             # job's tracking would have to stop it anyway.
@@ -8048,6 +8463,27 @@ _qwen_vl_model = None
 _qwen_vl_processor = None
 
 
+def _unload_qwen_vl() -> bool:
+    """Drop the cached in-process bumper reader and return its VRAM to the pool.
+
+    The local reader holds ~8GB for the life of the server, which pushes
+    SAM3's offload heuristic below its 16GB-free threshold. Phase
+    exclusivity calls this before tracking; the next read pass re-loads
+    lazily via _get_qwen_vl(). Returns True when a model was unloaded.
+    """
+    global _qwen_vl_model, _qwen_vl_processor
+    if _qwen_vl_model is None and _qwen_vl_processor is None:
+        return False
+    _qwen_vl_model = None
+    _qwen_vl_processor = None
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return True
+
+
 def _get_qwen_vl():
     """Lazy-load the bumper-reading VLM (VLM_MODEL_NAME) on first use; cached after.
 
@@ -8320,7 +8756,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     def _error_entry(e):
         return {"team_number": None, "alliance": "unknown", "confidence": 0,
-                "raw_read": None, "error": str(e)}
+                "raw_read": None, "error": str(e), "surface": "unknown"}
 
     # ---- Phase 1: one (messages, context) item per decodable crop ----
     results: list = [None] * len(robot_crops_b64)
@@ -8365,7 +8801,10 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 "color looks surprising.\n\n"
                 'Reply with ONLY compact JSON and nothing else: '
                 '{"team": "<the digits, or null if you cannot read them>", '
-                '"color": "red" or "blue"}.'
+                '"color": "red" or "blue", '
+                '"surface": "bumper" if the digits are on a robot\'s bumper band, '
+                'or "printed" if they are printed on a crate, bin, sign, or other '
+                'field structure}.'
             )
             messages = [
                 {"role": "user", "content": [
@@ -8454,6 +8893,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
 
         team = None
         color = "unknown"
+        surface = "unknown"
         try:
             clean = output_text
             if "```" in clean:
@@ -8467,6 +8907,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
                 parsed = json.loads(clean[start:end])
                 team = parsed.get("team")
                 color = parsed.get("color", "unknown")
+                surface = normalize_surface(parsed.get("surface"))
                 if team is not None:
                     team = str(team)
         except (json.JSONDecodeError, Exception):
@@ -8492,6 +8933,7 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
             "confidence": confidence,
             "raw_read": read,
             "digit_prob": digit_prob,
+            "surface": surface,
         }
 
     results = [r if r is not None else _error_entry("skipped") for r in results]
@@ -8499,6 +8941,77 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     print(f"  Qwen VL: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")
     return results
+
+
+_BUMPER_READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "team": {"type": ["string", "null"]},
+        "color": {"type": "string", "enum": ["red", "blue"]},
+        "surface": {"type": "string", "enum": ["bumper", "printed", "unclear"]},
+    },
+    "required": ["team", "color"],
+}
+
+_OBJECT_CLASS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "object": {"type": "string",
+                   "enum": ["robot", "equipment", "person", "unclear"]},
+    },
+    "required": ["object"],
+}
+
+
+def _vlm_chat_payload(data_uri: str, prompt: str, *, max_tokens: int,
+                      logprobs: bool = False, schema_name: str | None = None,
+                      schema: dict | None = None, guided: bool | None = None) -> dict:
+    """One vLLM chat/completions payload: image + text, optional logprobs and
+    structured output. `guided=None` defers to the VLM_GUIDED_JSON kill-switch."""
+    if guided is None:
+        guided = VLM_GUIDED_JSON
+    payload = {
+        "model": VLM_MODEL_NAME,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": data_uri}},
+            {"type": "text", "text": prompt},
+        ]}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if logprobs:
+        payload["logprobs"] = True
+    if guided and schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name or "reply", "schema": schema},
+        }
+    return payload
+
+
+def _post_vlm_chat(payload: dict) -> dict:
+    """POST one chat payload to the vLLM server, returning the parsed body.
+
+    If the server 400s a structured-output payload (older build without
+    json_schema support), retry ONCE without response_format — a degraded
+    read beats a dead one."""
+    def _post(p: dict) -> dict:
+        req = urllib.request.Request(
+            f"{VLM_SERVER_URL}/chat/completions",
+            data=json.dumps(p).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    try:
+        return _post(payload)
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and "response_format" in payload:
+            retry = {k: v for k, v in payload.items() if k != "response_format"}
+            print("  vLLM rejected response_format (400); retrying unguided")
+            return _post(retry)
+        raise
 
 
 def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
@@ -8531,7 +9044,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     def _error_entry(e):
         return {"team_number": None, "alliance": "unknown", "confidence": 0,
-                "raw_read": None, "error": str(e)}
+                "raw_read": None, "error": str(e), "surface": "unknown"}
 
     def _read_one(idx: int, crop_b64: str) -> dict:
         img_bytes = base64.b64decode(crop_b64)
@@ -8574,26 +9087,17 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             "color looks surprising.\n\n"
             'Reply with ONLY compact JSON and nothing else: '
             '{"team": "<the digits, or null if you cannot read them>", '
-            '"color": "red" or "blue"}.'
+            '"color": "red" or "blue", '
+            '"surface": "bumper" if the digits are on a robot\'s bumper band, '
+            'or "printed" if they are printed on a crate, bin, sign, or other '
+            'field structure}.'
         )
-        payload = {
-            "model": VLM_MODEL_NAME,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": data_uri}},
-                {"type": "text", "text": prompt},
-            ]}],
-            "temperature": 0,
-            "max_tokens": 64,
-            "logprobs": VLM_LOGPROB_CONFIDENCE,
-        }
-        req = urllib.request.Request(
-            f"{VLM_SERVER_URL}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        payload = _vlm_chat_payload(
+            data_uri, prompt, max_tokens=64,
+            logprobs=VLM_LOGPROB_CONFIDENCE,
+            schema_name="bumper_read", schema=_BUMPER_READ_SCHEMA,
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        body = _post_vlm_chat(payload)
         choice = body["choices"][0]
         output_text = (choice["message"]["content"] or "").strip()
 
@@ -8606,6 +9110,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
 
         team = None
         color = "unknown"
+        surface = "unknown"
         try:
             clean = output_text
             if "```" in clean:
@@ -8619,6 +9124,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
                 parsed = json.loads(clean[start:end])
                 team = parsed.get("team")
                 color = parsed.get("color", "unknown")
+                surface = normalize_surface(parsed.get("surface"))
                 if team is not None:
                     team = str(team)
         except (json.JSONDecodeError, Exception):
@@ -8639,6 +9145,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             "confidence": confidence,
             "raw_read": read,
             "digit_prob": digit_prob,
+            "surface": surface,
         }
 
     results: list = [None] * len(robot_crops_b64)
@@ -8657,6 +9164,58 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
     print(f"  vLLM: identified {identified}/{len(robot_crops_b64)} robots: "
           f"{[r['team_number'] for r in results]}")
     return results
+
+
+_CLASSIFY_PROMPT = (
+    "This image shows ONE object cut out of video of an FRC (FIRST Robotics "
+    "Competition) match. Decide what the object is:\n"
+    '- "robot": a competition robot — a driving machine with wheels/mechanisms '
+    "and a solid RED or BLUE bumper band around its base\n"
+    '- "equipment": static field equipment — a crate, bin, tote, feeder rig, '
+    "machine, or other structure that does not drive\n"
+    '- "person": a human (referees wear striped or orange vests)\n'
+    '- "unclear": you cannot tell\n\n'
+    'Reply with ONLY compact JSON and nothing else: '
+    '{"object": "robot" or "equipment" or "person" or "unclear"}.'
+)
+
+
+def _vllm_classify_crops(crops_b64: list) -> list:
+    """Ask the vLLM server whether each crop is a robot/equipment/person.
+
+    Same transport as _vllm_read_bumpers (probe, then one request per crop).
+    Best-effort: any failure yields {"object": "unclear", "error": ...} —
+    adjudication is an observe-only signal and must never raise into the loop.
+    """
+    try:
+        probe = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+        with urllib.request.urlopen(probe, timeout=3):
+            pass
+    except Exception as e:
+        return [{"object": "unclear", "error": f"vLLM unreachable: {e}"} for _ in crops_b64]
+
+    def _classify_one(crop_b64: str) -> dict:
+        try:
+            img_bytes = base64.b64decode(crop_b64)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            min_dim = 512
+            if img.width < min_dim or img.height < min_dim:
+                scale = max(min_dim / img.width, min_dim / img.height)
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=92)
+            data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            payload = _vlm_chat_payload(
+                data_uri, _CLASSIFY_PROMPT, max_tokens=32,
+                schema_name="object_class", schema=_OBJECT_CLASS_SCHEMA,
+            )
+            body = _post_vlm_chat(payload)
+            output_text = (body["choices"][0]["message"]["content"] or "").strip()
+            return {"object": parse_object_class(output_text), "error": None}
+        except Exception as e:
+            return {"object": "unclear", "error": str(e)}
+
+    return [_classify_one(c) for c in crops_b64]
 
 
 _easyocr_reader = None

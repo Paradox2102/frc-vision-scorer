@@ -336,6 +336,7 @@ class Sam3PredictorAdapter:
             outputs = response.get("outputs") or {}
             raw_obj_ids = outputs.get("out_obj_ids", [])
             raw_masks = outputs.get("out_binary_masks", [])
+            raw_probs = outputs.get("out_tracker_probs")
             if hasattr(raw_obj_ids, "detach"):
                 raw_obj_ids = raw_obj_ids.detach().cpu().numpy()
             if hasattr(raw_masks, "detach"):
@@ -344,6 +345,17 @@ class Sam3PredictorAdapter:
             masks = np.asarray(raw_masks)
             if masks.ndim == 2:
                 masks = masks[None, ...]
+
+            # Per-object tracker confidence, aligned with obj_ids. Absent on
+            # older models / stubs; flatten (N,1)->(N,); drop it defensively
+            # if it doesn't line up rather than mis-attaching scores.
+            probs = None
+            if raw_probs is not None:
+                if hasattr(raw_probs, "detach"):
+                    raw_probs = raw_probs.detach().cpu().numpy()
+                probs = np.asarray(raw_probs, dtype=np.float64).reshape(-1)
+                if probs.shape[0] != obj_ids.shape[0]:
+                    probs = None
             global_idx = int(response["frame_index"]) + chunk["lo"]
             last_global = global_idx
 
@@ -357,6 +369,7 @@ class Sam3PredictorAdapter:
                 global_idx,
                 obj_ids,
                 torch.as_tensor(masks, dtype=torch.float32),
+                probs,
             )
 
         # continue into the next chunk if the caller's range extends past it

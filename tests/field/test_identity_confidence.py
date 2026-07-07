@@ -3,7 +3,8 @@ from web.field.identity_confidence import (
     ConfidenceConfig,
     ConfidenceSignals,
     ConfidenceState,
-    calculate_confidence_update
+    calculate_confidence_update,
+    vote_ray_cross_m,
 )
 
 def test_decay_on_occlusion():
@@ -61,6 +62,20 @@ def test_confirmed_floor():
     config = ConfidenceConfig(confirmed_floor=0.85)
     state = ConfidenceState(confidence=0.5, is_confirmed=True)
     signals = ConfidenceSignals(is_observed=True, is_confirmed=True)
-    
+
     update = calculate_confidence_update(state, signals, config)
     assert update.new_confidence == 0.87 # max(0.5, 0.85) + 0.02
+
+
+def test_vote_ray_cross_on_ray_is_zero():
+    # camera at origin, detection at (4,0): fused pos on the same ray -> ~0
+    assert vote_ray_cross_m((0, 0), (4.0, 0.0), (6.0, 0.0)) < 1e-9
+
+
+def test_vote_ray_cross_lateral_miss():
+    # fused position 2m laterally off the camera->det ray
+    assert abs(vote_ray_cross_m((0, 0), (4.0, 0.0), (4.0, 2.0)) - 2.0) < 1e-9
+
+
+def test_vote_ray_cross_degenerate_returns_none():
+    assert vote_ray_cross_m((3.0, 1.0), (3.0, 1.0), (5.0, 5.0)) is None

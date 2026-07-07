@@ -179,7 +179,11 @@ def test_confidence_wiring_and_decisions():
     assert ident.confidence == pytest.approx(0.51)  # 0.52 - 0.01 decay
     
     # Step 3: Test low relink margin drops confidence and queues immediate read
-    # We pass an assignment evidence with a margin of 0.05
+    # We pass an assignment evidence with a margin of 0.05.
+    # Advance the clock past the escalation cooldown: step 1's re-attachment
+    # queued an immediate read at t=0.0, and a second escalation within
+    # immediate_read_cooldown_sec is deliberately suppressed.
+    job._current_frame = 30  # 3.0s at 10fps
     job.field_tracker.assignment_evidence = {
         0: {"detection_idx": 0, "margin": 0.05, "type": "reappeared"}
     }

@@ -29,6 +29,16 @@ def point_in_zones(xy, zones) -> bool:
     return False
 
 
+def start_zones(field_dims, depth_m) -> list:
+    """Legal autonomous starting bands: robots start touching (or near) their
+    alliance wall, so seed-time priors only apply within ``depth_m`` of each
+    end wall, full field width. Season rules vary; depth is a knob, and these
+    complement (never replace) the exclusion zones."""
+    L, W = float(field_dims[0]), float(field_dims[1])
+    d = float(depth_m)
+    return [(0.0, 0.0, d, W), (L - d, 0.0, L, W)]
+
+
 def prism_bounding_zones(prisms, margin=0.2) -> list:
     """Convert static prism footprints to rectangular no-robot zones."""
     zones = []

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from web.field.sam2_tracker import mask_to_box, bottom_center, match_new_detections
+from web.field.sam2_tracker import (
+    mask_to_box,
+    bottom_center,
+    match_new_detections,
+    size_prior_ratio,
+    size_prior_violation,
+)
 
 
 def test_mask_to_box_tight_bbox():
@@ -654,6 +660,8 @@ def test_sam2_tracker_evidence_generation():
     # Frame 0 initial check
     assert result[0][1]["evidence"]["type"] == "initial"
     assert result[0][1]["evidence"]["gap_len"] == 0
+    # Legacy 3-tuple predictors carry no tracker confidence.
+    assert result[0][1]["evidence"]["tracker_prob"] is None
     
     # Frame 1 propagated check
     assert result[1][1]["evidence"]["type"] == "propagated"
@@ -670,6 +678,52 @@ def test_sam2_tracker_evidence_generation():
     assert result[4][3]["evidence"]["type"] == "reprompted_new_id"
     assert result[4][3]["evidence"]["gap_len"] == 0
     assert result[5][3]["evidence"]["type"] == "propagated"
+
+
+class ProbsFourTupleStub:
+    """Predictor yielding SAM3-style 4-tuples (adds per-object tracker probs)."""
+
+    H = 20
+    W = 30
+    _rects_per_frame = [
+        [(2, 2, 6, 6), (15, 3, 20, 8)],
+        [(3, 3, 7, 7), (16, 4, 21, 9)],
+    ]
+    _probs_per_frame = [
+        [0.91, 0.44],
+        [0.88, 0.40],
+    ]
+
+    def init_state(self, video_path, **kwargs):
+        return {}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None):
+        pass
+
+    def propagate_in_video(self, state):
+        obj_ids = [1, 2]
+        for f_idx, rects in enumerate(self._rects_per_frame):
+            mask_logits = _make_mask_array(self.H, self.W, rects)
+            probs = np.asarray(self._probs_per_frame[f_idx], dtype=np.float32)
+            yield f_idx, obj_ids, mask_logits, probs
+
+    def reset_state(self, state):
+        pass
+
+
+def test_sam2_tracker_carries_tracker_prob_from_four_tuples():
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = ProbsFourTupleStub()
+    tracker = Sam2FieldTracker(predictor=stub)
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+    )
+    assert result[0][1]["evidence"]["tracker_prob"] == pytest.approx(0.91)
+    assert result[0][2]["evidence"]["tracker_prob"] == pytest.approx(0.44)
+    assert result[1][1]["evidence"]["tracker_prob"] == pytest.approx(0.88)
 
 
 def test_sam2_diagnostics_logging():
@@ -2871,3 +2925,114 @@ def test_mask_leak_cleanup_default_off_byte_identical():
     assert any(box[2] == 60 for entry in default_boxes.values()
                for box in entry.values()), \
         "expected the union box (leak included) when the knob is off"
+
+
+def test_size_prior_ratio_basic():
+    assert size_prior_ratio((10, 10, 110, 60), 50.0) == 2.0
+
+
+def test_size_prior_ratio_unmeasurable():
+    assert size_prior_ratio((10, 10, 110, 60), None) is None
+    assert size_prior_ratio((10, 10, 110, 60), 0.0) is None
+    assert size_prior_ratio((110, 10, 10, 60), 50.0) is None  # degenerate box
+
+
+def test_size_prior_violation_band():
+    assert size_prior_violation(3.5, hi=3.0, lo=0.25)
+    assert size_prior_violation(0.1, hi=3.0, lo=0.25)
+    assert not size_prior_violation(1.0, hi=3.0, lo=0.25)
+    assert not size_prior_violation(None, hi=3.0, lo=0.25)
+
+
+# ---------------------------------------------------------------------------
+# Size-prior hijack cull: a tracked mask far wider than a robot could appear
+# at its projected field position for sustained boundaries has latched onto
+# structure/a pile. Geometry is the one channel a detector false-fire cannot
+# corroborate, so this cull fires INDEPENDENT of the absence machinery
+# (cull_enabled). CullStubPredictor masks are 4 px wide.
+# ---------------------------------------------------------------------------
+
+def _track_with_expected_px(stub, expected_px_fn, **overrides):
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    kwargs = dict(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        # Corroborate both objects at every boundary: the size cull must be
+        # able to evict a DETECTOR-CORROBORATED mask (YOLO false-fires on the
+        # equipment itself), which the absence cull structurally cannot.
+        detect_fn=lambda *_a: [stub._rect_for(1), stub._rect_for(2)],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=False,
+        project_fn=lambda box: bottom_center(box),
+        expected_px_fn=expected_px_fn,
+        diagnostics=diag,
+    )
+    kwargs.update(overrides)
+    result = tracker.track(**kwargs)
+    return result, diag
+
+
+def test_size_prior_cull_evicts_oversized_mask():
+    """A 4-px mask whose expected width is 1 px (ratio 4.0 > hi 3.0) for 3
+    consecutive boundaries is culled when size_prior_cull=True, even though the
+    detector corroborates it at every boundary."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: 1.0,
+        size_prior_cull=True, size_prior_boundaries=3)
+    culled = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
+    assert culled, f"expected a size-prior cull, got none: {diag._events}"
+    assert all(e.get("reason") == "size_prior_violation" for e in culled)
+    # Both objects are oversized; both should be gone by the final frame.
+    assert 1 not in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_disabled_by_default_keeps_object():
+    """Same oversized scenario with the default size_prior_cull=False leaves
+    the object tracked."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: 1.0, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_never_culls_unmeasurable():
+    """expected_px_fn returning None (no calibration pose at that position) is
+    unmeasurable, never a violation — the object survives with the cull on."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: None,
+        size_prior_cull=True, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_requires_sustained_violation():
+    """A single-boundary violation (expected width dips only at the first
+    boundary) does not reach the size_prior_boundaries threshold, so the object
+    is spared."""
+    stub = CullStubPredictor()
+    calls = {"n": 0}
+
+    def expected_px_fn(xy):
+        calls["n"] += 1
+        # ratio 4.0 (violation) for the first boundary's two objects, then
+        # ratio 1.0 (in-band) — one violating boundary can't reach 3-in-a-row.
+        return 1.0 if calls["n"] <= 2 else 4.0
+
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=expected_px_fn,
+        size_prior_cull=True, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]

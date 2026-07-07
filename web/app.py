@@ -7135,6 +7135,23 @@ class InferenceJob:
                 await self._drain_vlm_task()
             except Exception:
                 pass
+            # Same idea for the observe-only adjudication task: don't let an
+            # exception-triggered teardown orphan it. This is the failure
+            # path, so we cancel rather than await (awaiting could block
+            # teardown up to the 120s HTTP timeout).
+            try:
+                _adj = self._adjudicate_task
+                if _adj is not None:
+                    if not _adj.done():
+                        _adj.cancel()
+                    else:
+                        exc = _adj.exception()
+                        if exc is not None:
+                            print(f"  Adjudication pass failed (teardown): {exc}")
+            except Exception:
+                pass
+            finally:
+                self._adjudicate_task = None
             # Leave the GPU clean for whatever runs next: the vLLM server is
             # only needed during this job's analysis phase, and the next
             # job's tracking would have to stop it anyway.
@@ -9092,7 +9109,7 @@ def _vllm_classify_crops(crops_b64: list) -> list:
         with urllib.request.urlopen(probe, timeout=3):
             pass
     except Exception as e:
-        return [{"object": "unclear", "error": f"vLLM unreachable: {e}"}] * len(crops_b64)
+        return [{"object": "unclear", "error": f"vLLM unreachable: {e}"} for _ in crops_b64]
 
     def _classify_one(crop_b64: str) -> dict:
         try:

@@ -2659,3 +2659,215 @@ def test_bootstrap_rejects_implausible_seed_box(tmp_path):
     assert stub.add_calls == [(0, 1)]
     assert metadata == {1: "blue"}
     assert 1 in result[CullStubPredictor.NUM_FRAMES - 1]
+
+
+# ---------------------------------------------------------------------------
+# qm11/qm10/qm12 GATED leak cleanup — clean_disconnected_leaks helper + wiring
+#
+# A robot is one blob. When SAM leaks the mask onto an adjacent structure (a
+# bump/ramp beside the robot) mask_to_box returns the union bbox spanning both,
+# so the rendered box stretches and the projected field position (box
+# bottom-center) lands between them. Unconditional largest-component drops that
+# leak but ALSO drops legitimate secondary components — a robot arm, or a robot
+# split by hub/ball occlusion into two blobs — which shifts box bottom-center
+# and REGRESSED qm10/qm12 (red meanNN worsened). The gated cleaner drops a
+# component only if it is BOTH small (area < min_frac of the largest) AND
+# detached (bbox gap > gap_px). The knob defaults OFF pending re-validation;
+# when off, behavior must be byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def test_leak_cleanup_drops_small_far_blob():
+    from web.field.sam2_tracker import clean_disconnected_leaks
+    mask = np.zeros((40, 60), bool)
+    mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
+    mask[2:5, 50:55] = True     # small (15px < 15% of 400) + far (gap > 10px)
+    cleaned = clean_disconnected_leaks(mask)
+    # Small AND detached -> dropped; only the big blob survives.
+    assert mask_to_box(cleaned) == (10, 10, 30, 30)
+    assert not cleaned[2:5, 50:55].any()
+    assert cleaned[10:30, 10:30].all()
+
+
+def test_leak_cleanup_keeps_large_far_blob():
+    """A SECOND blob far away but LARGE (an occlusion-split robot half) is KEPT.
+
+    This is the qm10/qm12 regression-fixer: unconditional largest-component
+    wrongly dropped this component, shifting box bottom-center. area >= 15% of
+    the largest keeps it despite the gap.
+    """
+    from web.field.sam2_tracker import clean_disconnected_leaks
+    mask = np.zeros((40, 60), bool)
+    mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
+    mask[10:26, 44:54] = True   # 16x10 = 160px (>= 15% of 400) but far (gap>10)
+    cleaned = clean_disconnected_leaks(mask)
+    # Large component kept -> union bbox spans both.
+    assert cleaned[10:30, 10:30].all()
+    assert cleaned[10:26, 44:54].all()
+    assert mask_to_box(cleaned) == (10, 10, 54, 30)
+
+
+def test_leak_cleanup_keeps_small_adjacent_blob():
+    """A small blob touching/near the body (a robot arm) is KEPT — small but
+    NOT detached (bbox gap <= gap_px)."""
+    from web.field.sam2_tracker import clean_disconnected_leaks
+    mask = np.zeros((40, 60), bool)
+    mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
+    # Small 4x3 = 12px (< 15% of 400) but only ~2px from the body's right edge.
+    mask[14:18, 32:35] = True
+    cleaned = clean_disconnected_leaks(mask)
+    assert cleaned[10:30, 10:30].all()
+    assert cleaned[14:18, 32:35].all()   # arm kept (adjacent)
+
+
+def test_leak_cleanup_single_blob_unchanged():
+    from web.field.sam2_tracker import clean_disconnected_leaks
+    mask = np.zeros((20, 20), bool)
+    mask[3:9, 4:11] = True
+    cleaned = clean_disconnected_leaks(mask)
+    assert np.array_equal(cleaned, mask)
+
+
+def test_leak_cleanup_empty_unchanged():
+    from web.field.sam2_tracker import clean_disconnected_leaks
+    mask = np.zeros((10, 10), bool)
+    cleaned = clean_disconnected_leaks(mask)
+    assert not cleaned.any()
+    assert cleaned.shape == mask.shape
+
+
+class _LeakStubPredictor(RepromptStubPredictor):
+    """RepromptStubPredictor whose object 1 mask leaks onto a second blob.
+
+    Object 1's per-frame mask is a robot blob at its normal location PLUS a
+    small disconnected leak blob far to the right. Every other object keeps a
+    single clean blob. Used to prove the gated leak cleanup tightens the
+    emitted box (and drops the leak) at both mask sites.
+    """
+
+    # Leak blob well clear of every _rect_for(oid) (oid<=9 -> x<=58); place it
+    # at the far right edge as a small, disconnected patch. 3x3 = 9px is under
+    # 15% of obj1's 80px primary blob (12px) AND the gap to it exceeds 10px, so
+    # the gated cleaner drops it.
+    _LEAK = (57, 14, 60, 17)   # 3x3 = 9px, small AND far from obj1's blob
+
+    def _rect_for(self, oid):
+        # Object 1 gets a LARGER primary blob so it is unambiguously the largest
+        # component once the leak is dropped; others keep the base geometry.
+        if oid == 1:
+            return (6, 2, 14, 12)   # 8x10 = 80px primary blob for obj 1
+        x0 = oid * 6
+        return (x0, 2, x0 + 4, 6)
+
+    def propagate_in_video(self, state, start_frame_idx=None,
+                           max_frame_num_to_track=None, reverse=False):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        if reverse:
+            end = max(0, start - (max_frame_num_to_track or start))
+            frame_range = range(start, end - 1, -1)
+        else:
+            if max_frame_num_to_track is None:
+                end = self.NUM_FRAMES - 1
+            else:
+                end = min(start + max_frame_num_to_track, self.NUM_FRAMES - 1)
+            frame_range = range(start, end + 1)
+        for f in frame_range:
+            active = sorted(
+                oid for oid, af in state["objs"].items()
+                if af <= f or reverse
+            )
+            num_obj = len(active)
+            arr = np.zeros((num_obj, 1, self.H, self.W), dtype=np.float32)
+            for i, oid in enumerate(active):
+                x1, y1, x2, y2 = self._rect_for(oid)
+                arr[i, 0, y1:y2, x1:x2] = 1.0
+                if oid == 1:
+                    lx1, ly1, lx2, ly2 = self._LEAK
+                    arr[i, 0, ly1:ly2, lx1:lx2] = 1.0   # disconnected leak blob
+            yield f, active, FakeTensor(arr)
+
+    def reset_state(self, state):
+        pass
+
+
+def test_mask_leak_cleanup_untangles_stretched_box():
+    """With the knob on, object 1's emitted box tightens to its primary blob;
+    the union box that spans the small, detached leak is gone."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = _LeakStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1)],   # only obj 1 (the leaky one)
+        reprompt_every=2,
+        detect_fn=lambda *_a: [stub._rect_for(1)],
+        object_metadata={1: "blue"},
+        max_objects=6,
+        mask_leak_cleanup=True,
+    )
+    # Union bbox (leak included) would be x2=60 (leak right edge); the primary
+    # blob's tight box is (6,2,14,12). Assert the leak is dropped everywhere.
+    for f_idx, entry in result.items():
+        if 1 in entry:
+            box = entry[1]["box"]
+            assert box == (6, 2, 14, 12), f"frame {f_idx}: box not tightened: {box}"
+            # Stored mask is the cleaned mask (leak dropped) for downstream IoS.
+            assert not entry[1]["mask"][14:17, 57:60].any()
+
+
+def test_mask_leak_cleanup_runs_without_error_on_plain_stub():
+    """The knob on a normal single-blob stub runs without error and still
+    produces the expected boxes (no-crash regression)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [stub._rect_for(1), stub._rect_for(2)],
+        object_metadata={1: "blue", 2: "red"},
+        max_objects=6,
+        mask_leak_cleanup=True,
+    )
+    assert set(result.keys()) == {0, 1, 2, 3, 4, 5}
+    assert result[0][1]["box"] == stub._rect_for(1)
+    assert result[5][2]["box"] == stub._rect_for(2)
+
+
+def test_mask_leak_cleanup_default_off_byte_identical():
+    """Default kwargs and explicit mask_leak_cleanup=False produce
+    identical results and add_calls (back-compat)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    def run(**extra):
+        stub = _LeakStubPredictor()
+        tracker = Sam2FieldTracker(predictor=stub)
+        result = tracker.track(
+            frames_dir="ignored_by_stub",
+            prompt_idx=0,
+            prompt_boxes=[stub._rect_for(1)],
+            reprompt_every=2,
+            detect_fn=lambda *_a: [stub._rect_for(1)],
+            object_metadata={1: "blue"},
+            max_objects=6,
+            **extra,
+        )
+        boxes = {f: {o: e["box"] for o, e in entry.items()}
+                 for f, entry in result.items()}
+        return list(stub.add_calls), boxes
+
+    default_adds, default_boxes = run()
+    off_adds, off_boxes = run(mask_leak_cleanup=False)
+
+    assert off_adds == default_adds
+    assert off_boxes == default_boxes
+    # And with the knob off, the leak IS included -> union box spans to x2=60.
+    assert any(box[2] == 60 for entry in default_boxes.values()
+               for box in entry.values()), \
+        "expected the union box (leak included) when the knob is off"

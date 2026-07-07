@@ -133,6 +133,22 @@ def test_seed_box_max_aspect_range_validation():
         JobConfig({"seed_box_max_aspect": 21})
 
 
+def test_mask_leak_cleanup_default_and_override(monkeypatch):
+    # qm11/qm10/qm12 gated leak cleanup: drop a mask component only if it is
+    # BOTH small AND detached, so a leak onto adjacent structure can't stretch
+    # the box while a robot arm / occlusion-split half is preserved. DEFAULT
+    # OFF pending re-validation.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    assert JobConfig().mask_leak_cleanup is False
+    # Env var flips the default on.
+    monkeypatch.setenv("SAM2_MASK_LEAK_CLEANUP", "1")
+    assert JobConfig().mask_leak_cleanup is True
+    # Per-job override (form checkbox arrives as a string) beats env.
+    assert JobConfig({"mask_leak_cleanup": "1"}).mask_leak_cleanup is True
+    assert JobConfig({"mask_leak_cleanup": "0"}).mask_leak_cleanup is False
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

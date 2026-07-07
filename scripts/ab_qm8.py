@@ -218,6 +218,14 @@ PROFILES = {
                       "sam2_prompt_offset_seconds": 0.0,
                       "opening_reprompt_seconds": 0.5, "opening_window_seconds": 6.0}),
     ],
+    # qm11/qm10/qm12 gated leak cleanup: mask leaked onto a bump; the gated
+    # cleaner drops a component only if BOTH small AND detached, tightening the
+    # box (and field pos) without dropping a legit arm / occlusion-split half.
+    # Baseline here = current shipped default (lever1+2).
+    "leak-clean": [
+        ("baseline", {}),
+        ("leak-clean", {"mask_leak_cleanup": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

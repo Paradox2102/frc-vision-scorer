@@ -160,6 +160,14 @@ KNOBS = [
     # motion_fn. qm12: a static hub-face sliver evicted a real robot.
     # DEFAULT ON — validated 2026-07-06 (no-op unless motion_override is also on).
     Knob("evict_requires_motion", "EVICT_REQUIRES_MOTION", bool, True),
+    # qm11/qm10/qm12 gated leak cleanup: a robot's SAM mask sometimes leaks onto
+    # an adjacent bump/ramp, so mask_to_box returns the union bbox spanning both
+    # and the projected field position lands between them. Drop a mask component
+    # only when it is BOTH small AND detached — a legitimate secondary component
+    # (a robot arm, or a robot split by hub/ball occlusion) is preserved.
+    # Unconditional largest-component regressed qm10/qm12 by dropping those
+    # halves. DEFAULT OFF pending re-validation.
+    Knob("mask_leak_cleanup", "SAM2_MASK_LEAK_CLEANUP", bool, False),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),

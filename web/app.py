@@ -5550,6 +5550,12 @@ class InferenceJob:
                             # a static candidate may evict from the capped roster.
                             seed_box_max_aspect=self.config.seed_box_max_aspect,
                             evict_requires_motion=self.config.evict_requires_motion,
+                            # qm11/qm10/qm12 gated leak cleanup: drop a mask
+                            # component only if BOTH small AND detached, so a leak
+                            # onto adjacent structure can't stretch the box /
+                            # field position while an arm / occlusion-split half
+                            # is preserved.
+                            mask_leak_cleanup=self.config.mask_leak_cleanup,
                             # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
                             opening_reprompt_every=opening_reprompt_every,
                             opening_window_frames=opening_window_frames,

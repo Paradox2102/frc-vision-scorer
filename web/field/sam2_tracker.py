@@ -166,6 +166,23 @@ EVICT_REQUIRES_MOTION = os.environ.get("SAM2_EVICT_REQUIRES_MOTION", "0") not in
 OPENING_REPROMPT_EVERY = int(os.environ.get("SAM2_OPENING_REPROMPT_EVERY", "0"))   # 0 disables
 OPENING_WINDOW_FRAMES = int(os.environ.get("SAM2_OPENING_WINDOW_FRAMES", "0"))
 
+# Largest-connected-component mask reduction (qm11 stretched-box fix). A robot
+# is one blob; when SAM leaks the mask onto adjacent structure (a bump/ramp
+# beside the robot) mask_to_box returns the union bbox spanning both, so the
+# rendered box stretches and the projected field position (box bottom-center)
+# lands between the robot and the leak. Dropping ONLY components that are BOTH
+# small AND detached removes the leak before the box / plausibility / stored
+# mask are computed while preserving a legitimate secondary component (a robot
+# arm, or a robot split by hub/ball occlusion into two blobs). DEFAULT OFF
+# pending re-validation. Unconditional largest-component (the earlier attempt)
+# regressed qm10/qm12 by dropping those legitimate halves.
+MASK_LEAK_CLEANUP = os.environ.get("SAM2_MASK_LEAK_CLEANUP", "0") not in ("0", "false", "False")
+# Gating thresholds for the leak cleaner. A component is dropped only when it is
+# BOTH small (area < MASK_LEAK_MAX_FRAC * largest_area) AND detached (Chebyshev
+# bbox gap from the largest component > MASK_LEAK_GAP_PX px).
+MASK_LEAK_MAX_FRAC = float(os.environ.get("SAM2_MASK_LEAK_MAX_FRAC", "0.15"))
+MASK_LEAK_GAP_PX = float(os.environ.get("SAM2_MASK_LEAK_GAP_PX", "10"))
+
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the tight bounding box of nonzero pixels as (x1, y1, x2, y2).
@@ -177,6 +194,110 @@ def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     if xs.size == 0:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    """Return a copy of `mask` with only its largest 8-connected True region.
+
+    A robot is one blob; when a SAM mask leaks onto adjacent structure (a bump,
+    a ramp) the union bbox stretches across both and the projected field
+    position (box bottom-center) lands between them. Keeping the largest
+    component drops the leak. Single-component masks are returned unchanged.
+    Empty masks are returned unchanged.
+    """
+    if not mask.any():
+        return mask
+    mask_bool = mask.astype(bool)
+    # scipy/cv2 imported locally so the module stays torch/cv2-light at import
+    # time (mirrors make_frame_diff_motion_fn's local `import cv2`).
+    try:
+        from scipy import ndimage
+        # 8-connectivity: full 3x3 structuring element.
+        structure = np.ones((3, 3), dtype=bool)
+        labels, n = ndimage.label(mask_bool, structure=structure)
+        if n <= 1:
+            return mask
+        # Count pixels per label (index 0 is background) and keep the biggest.
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        keep = int(counts.argmax())
+        return labels == keep
+    except ImportError:
+        import cv2
+        n, labels = cv2.connectedComponents(
+            mask_bool.astype(np.uint8), connectivity=8)
+        if n <= 2:  # background + at most one component
+            return mask
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        keep = int(counts.argmax())
+        return labels == keep
+
+
+def clean_disconnected_leaks(
+    mask: np.ndarray,
+    min_frac: float = MASK_LEAK_MAX_FRAC,
+    gap_px: float = MASK_LEAK_GAP_PX,
+) -> np.ndarray:
+    """Drop a mask component only if it is BOTH small AND detached from the body.
+
+    Keeps the largest 8-connected component, plus every other component that is
+    either large (area >= min_frac * largest_area) OR spatially near the largest
+    (bbox gap <= gap_px px). Removes only components that are small AND separated
+    by a clear gap -- a SAM mask that leaked onto separate structure (a bump).
+    Preserves an arm touching the body and an occlusion-split second half, which
+    unconditional largest-component wrongly dropped (regressed qm10/qm12).
+    Single-component and empty masks are returned unchanged.
+    """
+    if not mask.any():
+        return mask
+    mask_bool = mask.astype(bool)
+    # scipy/cv2 imported locally so the module stays torch/cv2-light at import
+    # time (mirrors make_frame_diff_motion_fn's local `import cv2`).
+    try:
+        from scipy import ndimage
+        # 8-connectivity: full 3x3 structuring element.
+        structure = np.ones((3, 3), dtype=bool)
+        labels, n = ndimage.label(mask_bool, structure=structure)
+    except ImportError:
+        import cv2
+        n_cc, labels = cv2.connectedComponents(
+            mask_bool.astype(np.uint8), connectivity=8)
+        n = n_cc - 1  # cv2 counts background as label 0; n = # foreground labels
+    if n <= 1:
+        return mask  # single component (or none) — nothing to gate
+
+    # Per-component area (pixel count) and tight bbox. Label 0 is background.
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0
+    largest = int(counts.argmax())
+    largest_area = int(counts[largest])
+
+    def _bbox(comp_label):
+        ys, xs = np.where(labels == comp_label)
+        return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    def _bbox_gap(a, b):
+        # Chebyshev gap between two rectangles (x1,y1,x2,y2); 0 if they overlap
+        # or touch, else the larger of the horizontal/vertical separations.
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        dx = max(0, max(ax1 - bx2, bx1 - ax2))
+        dy = max(0, max(ay1 - by2, by1 - ay2))
+        return max(dx, dy)
+
+    largest_bbox = _bbox(largest)
+    keep = labels == largest
+    for lbl in range(1, len(counts)):
+        if lbl == largest or counts[lbl] == 0:
+            continue
+        area = int(counts[lbl])
+        is_large = area >= min_frac * largest_area
+        is_near = _bbox_gap(_bbox(lbl), largest_bbox) <= gap_px
+        if is_large or is_near:
+            keep |= labels == lbl
+        # else: small AND detached -> drop (a leak onto separate structure).
+    return keep
 
 
 def plausible_robot_mask(
@@ -750,6 +871,7 @@ class Sam2FieldTracker:
         reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
         seed_box_max_aspect: float = SEED_BOX_MAX_ASPECT,
         evict_requires_motion: bool = EVICT_REQUIRES_MOTION,
+        mask_leak_cleanup: bool = MASK_LEAK_CLEANUP,
         opening_reprompt_every: int | None = None,
         opening_window_frames: int | None = None,
         seed_gate_fn=None,
@@ -842,6 +964,20 @@ class Sam2FieldTracker:
                 recorded. When ``motion_fn`` is None this gate is inert (motion
                 evidence is unavailable, so eviction proceeds exactly as today).
                 Default False.
+            mask_leak_cleanup: qm11/qm10/qm12 gated leak cleanup. When True,
+                each per-frame SAM mask is passed through
+                :func:`clean_disconnected_leaks` BEFORE the box / plausibility /
+                stored mask are computed. It drops a mask component ONLY when it
+                is BOTH small (area below MASK_LEAK_MAX_FRAC of the largest) AND
+                detached (bbox gap above MASK_LEAK_GAP_PX) — a leak onto adjacent
+                structure (a bump/ramp) that would otherwise stretch the box and
+                drag the projected field position between the robot and the leak.
+                A legitimate secondary component (a robot arm, or a robot split
+                by hub/ball occlusion into two blobs) is PRESERVED — unconditional
+                largest-component wrongly dropped those and regressed qm10/qm12.
+                The cleaned mask is what gets stored, so downstream
+                IoS/corroboration also use it. Default False (behavior
+                byte-identical) pending re-validation.
             opening_reprompt_every: qm12 opening-window dense reprompt. When this
                 and ``opening_window_frames`` are both > 0, chunks that START
                 within the first ``opening_window_frames`` of tracking propagate
@@ -1097,6 +1233,12 @@ class Sam2FieldTracker:
                         mask2d = bool_arr[i].astype(bool)
                     else:
                         mask2d = bool_arr.astype(bool)
+                    if mask_leak_cleanup:
+                        # qm11/qm10/qm12: drop a mask component only if BOTH
+                        # small AND detached (a leak onto adjacent structure)
+                        # before the box / plausibility / stored mask; a robot
+                        # arm or occlusion-split half is preserved.
+                        mask2d = clean_disconnected_leaks(mask2d)
                     box = mask_to_box(mask2d)
                     if box is None:
                         if diagnostics:
@@ -1186,6 +1328,11 @@ class Sam2FieldTracker:
                             mask2d = bool_arr[i].astype(bool)
                         else:
                             mask2d = bool_arr.astype(bool)
+                        if mask_leak_cleanup:
+                            # qm11/qm10/qm12: drop a mask component only if BOTH
+                            # small AND detached (a leak onto adjacent structure)
+                            # before the box / plausibility / stored mask.
+                            mask2d = clean_disconnected_leaks(mask2d)
                         box = mask_to_box(mask2d)
                         if box is None or not plausible_robot_mask(mask2d):
                             continue

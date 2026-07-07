@@ -160,6 +160,11 @@ def _expected_robot_pixel_width(field_xy, calibration, robot_width_m):
     return ((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5
 
 
+# Public alias: the size-prior hijack cull (sam2 wiring in app.py) consumes the
+# forward-projected expectation; keep the private name for in-module callers.
+expected_robot_pixel_width = _expected_robot_pixel_width
+
+
 def box_exceeds_frac(box, frame_shape, max_box_frac):
     """True if box spans more than max_box_frac of the frame in either dimension.
     Calibration-independent backstop against oversized detections."""

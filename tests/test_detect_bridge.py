@@ -407,3 +407,13 @@ def test_uncalibrated_mode_still_applies_backstop_without_pose():
         frame_shape=(377, 960, 3), frac_backstop="uncalibrated",
     )
     assert dets == []
+
+
+def test_expected_robot_pixel_width_public_alias():
+    """expected_robot_pixel_width is a public re-export of the private
+    _expected_robot_pixel_width, for use by the sam2 size-prior hijack cull."""
+    from web.field.detect_bridge import (
+        expected_robot_pixel_width,
+        _expected_robot_pixel_width,
+    )
+    assert expected_robot_pixel_width is _expected_robot_pixel_width

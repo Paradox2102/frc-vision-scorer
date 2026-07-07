@@ -2871,3 +2871,23 @@ def test_mask_leak_cleanup_default_off_byte_identical():
     assert any(box[2] == 60 for entry in default_boxes.values()
                for box in entry.values()), \
         "expected the union box (leak included) when the knob is off"
+
+
+from web.field.sam2_tracker import size_prior_ratio, size_prior_violation
+
+
+def test_size_prior_ratio_basic():
+    assert size_prior_ratio((10, 10, 110, 60), 50.0) == 2.0
+
+
+def test_size_prior_ratio_unmeasurable():
+    assert size_prior_ratio((10, 10, 110, 60), None) is None
+    assert size_prior_ratio((10, 10, 110, 60), 0.0) is None
+    assert size_prior_ratio((110, 10, 10, 60), 50.0) is None  # degenerate box
+
+
+def test_size_prior_violation_band():
+    assert size_prior_violation(3.5, hi=3.0, lo=0.25)
+    assert size_prior_violation(0.1, hi=3.0, lo=0.25)
+    assert not size_prior_violation(1.0, hi=3.0, lo=0.25)
+    assert not size_prior_violation(None, hi=3.0, lo=0.25)

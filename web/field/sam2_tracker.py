@@ -365,6 +365,26 @@ def plausible_seed_box(box, max_aspect: float) -> bool:
     return (h / w) <= max_aspect
 
 
+def size_prior_ratio(box, expected_px):
+    """Ratio of a mask box's pixel width to the geometrically expected robot
+    width at its field position, or None when unmeasurable (no calibration
+    pose, degenerate box, or no expectation)."""
+    if expected_px is None or expected_px <= 0:
+        return None
+    w = float(box[2]) - float(box[0])
+    if w <= 0:
+        return None
+    return w / expected_px
+
+
+def size_prior_violation(ratio, hi, lo):
+    """A tracked mask far wider than a robot could appear at its position has
+    latched onto structure/a pile; far narrower is a sliver/fragment. Geometry
+    is the one channel a detector false-fire cannot corroborate — this is the
+    hijack signal that works even when YOLO fires on the equipment itself."""
+    return ratio is not None and (ratio > hi or ratio < lo)
+
+
 def bottom_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
     """Return the bottom-center point of a box as (cx, y_bottom).
 

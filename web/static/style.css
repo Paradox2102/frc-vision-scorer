@@ -122,6 +122,37 @@ nav {
     box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
 }
 
+/* ---- Standard / Debug mode gating ---- */
+body[data-mode="standard"] .debug-only { display: none !important; }
+body[data-mode="debug"] .standard-only { display: none !important; }
+
+/* Segmented Standard|Debug pill at the right of the nav */
+.mode-toggle {
+    display: inline-flex;
+    margin-left: 0.75rem;
+    gap: 2px;
+    padding: 2px;
+    background: rgb(0 0 0 / 0.25);
+    border-radius: calc(var(--radius) - 2px);
+}
+.mode-toggle-btn {
+    padding: 0.3rem 0.7rem;
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--radius) - 4px);
+    color: var(--muted-foreground);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s, background-color 0.15s;
+}
+.mode-toggle-btn:hover { color: var(--foreground); }
+body[data-mode="standard"] .mode-toggle-btn[data-mode="standard"],
+body[data-mode="debug"] .mode-toggle-btn[data-mode="debug"] {
+    background: var(--foreground);
+    color: var(--background);
+}
+
 /* ========== Event Setup ========== */
 .event-section {
     max-width: 600px;

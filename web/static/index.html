@@ -6,7 +6,7 @@
     <title>FRC Vision Scorer</title>
     <link rel="stylesheet" href="/static/style.css?v=20260612d">
 </head>
-<body>
+<body data-mode="standard">
     <div class="container">
         <header>
             <h1>FRC Vision Scorer</h1>
@@ -14,9 +14,13 @@
                 <button class="nav-btn active" data-view="scorer">Scorer</button>
                 <button class="nav-btn" data-view="replays">Replays</button>
                 <button class="nav-btn" data-view="history">Match History</button>
-                <button class="nav-btn" data-view="gallery">Gallery</button>
-                <button class="nav-btn" data-view="settings">Settings</button>
-                <a href="/static/calibrate.html" class="nav-btn" style="text-decoration: none;" target="_blank">Calibration</a>
+                <button class="nav-btn debug-only" data-view="gallery">Gallery</button>
+                <button class="nav-btn debug-only" data-view="settings">Settings</button>
+                <a href="/static/calibrate.html" class="nav-btn debug-only" style="text-decoration: none;" target="_blank">Calibration</a>
+                <span class="mode-toggle" id="modeToggle" role="group" aria-label="UI mode">
+                    <button type="button" class="mode-toggle-btn" data-mode="standard">Standard</button>
+                    <button type="button" class="mode-toggle-btn" data-mode="debug">Debug</button>
+                </span>
             </nav>
         </header>
 
@@ -100,7 +104,7 @@
                                  starts/stops the vLLM server around the phases that need
                                  it, and reads fall back to the in-process model
                                  automatically if it fails to come up. -->
-                            <div class="input-group">
+                            <div class="input-group debug-only">
                                 <label for="trackingBackend">Segmentation tracker:</label>
                                 <select id="trackingBackend">
                                     <!-- options populated from /api/sam2_models -->
@@ -111,7 +115,7 @@
                                     SAM 2.1 remains as the legacy fallback.
                                 </small>
                             </div>
-                            <div class="input-group" id="sam3ChunkGroup">
+                            <div class="input-group debug-only" id="sam3ChunkGroup">
                                 <label for="sam3ChunkFrames">SAM 3 chunk window (frames):</label>
                                 <input type="number" id="sam3ChunkFrames" min="16" max="2000" step="50" placeholder="400 (default)">
                                 <small style="color:#889;display:block;margin-top:4px;">
@@ -121,7 +125,7 @@
                                     this phase), so the 400 default is fine; leave empty.
                                 </small>
                             </div>
-                            <div class="input-group" id="sam2ModelGroup">
+                            <div class="input-group debug-only" id="sam2ModelGroup">
                                 <label for="sam2ModelSize">Model size (SAM 2 only):</label>
                                 <select id="sam2ModelSize">
                                     <!-- options populated from /api/sam2_models -->
@@ -131,7 +135,7 @@
                                     Sizes marked “needs download” have no checkpoint on disk yet.
                                 </small>
                             </div>
-                            <div class="input-group" id="sam2VramGroup">
+                            <div class="input-group debug-only" id="sam2VramGroup">
                                 <label for="sam2MaxGpuFrames">VRAM budget (SAM 2 only, frames):</label>
                                 <input type="number" id="sam2MaxGpuFrames" min="0" step="100" placeholder="0 = auto (CPU offload)">
                                 <small style="color:#889;display:block;margin-top:4px;">
@@ -149,7 +153,7 @@
                                     auto countdown.
                                 </small>
                             </div>
-                            <div class="input-group">
+                            <div class="input-group debug-only">
                                 <label><input type="checkbox" id="fieldWireframeOverlay"> Field wireframe overlay</label>
                                 <small style="color:#889;display:block;margin-top:4px;">
                                     Draw the reprojected field (perimeter, grid, hubs, bumps,
@@ -179,7 +183,7 @@
             </div>
 
             <!-- Rolling status history: progress detail that would otherwise be overwritten -->
-            <div class="status-log" id="statusLog" style="display:none;"></div>
+            <div class="status-log debug-only" id="statusLog" style="display:none;"></div>
 
             <div class="inference-controls" id="inferenceControls" style="display:none;">
                 <button id="startInferenceBtn" class="inference-btn start-btn" style="display:none;">Start Inference</button>
@@ -193,11 +197,12 @@
                 <div class="video-column">
                     <div class="hud-overlay">
                         <div class="hud-left">
-                            <span class="hud-item"><span class="hud-label">Tracker</span> <span id="hudBackend" class="hud-backend">—</span></span>
-                            <span class="hud-item"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
-                            <span class="hud-item"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
-                            <span class="hud-item"><span class="hud-label">Reader</span> <span id="hudReader">local idle</span></span>
-                            <span class="hud-item"><span class="hud-label">Started</span> <span id="hudStartTime">—</span></span>
+                            <span class="hud-item debug-only"><span class="hud-label">Tracker</span> <span id="hudBackend" class="hud-backend">—</span></span>
+                            <span class="hud-item debug-only"><span class="hud-label">Frame</span> <span id="hudFrame">0 / 0</span></span>
+                            <span class="hud-item debug-only"><span class="hud-label">FPS</span> <span id="hudFps">0</span></span>
+                            <span class="hud-item debug-only"><span class="hud-label">Reader</span> <span id="hudReader">local idle</span></span>
+                            <span class="hud-item standard-only"><span class="hud-label">Teams</span> <span id="hudTeams">0 / 6</span></span>
+                            <span class="hud-item debug-only"><span class="hud-label">Started</span> <span id="hudStartTime">—</span></span>
                             <span class="hud-item"><span class="hud-label">Elapsed</span> <span id="hudElapsed">0:00</span></span>
                         </div>
                         <div class="hud-scores">
@@ -214,7 +219,7 @@
                     <div class="video-container">
                         <!-- Tracking phase: per-view seed frames + propagation progress.
                              Hidden once the analysis loop starts streaming overlay frames. -->
-                        <div id="trackingPanel" class="tracking-panel" style="display:none;">
+                        <div id="trackingPanel" class="tracking-panel debug-only" style="display:none;">
                             <div class="tracking-panel-title">Tracking phase — per-camera propagation</div>
                             <div id="trackingCards" class="tracking-cards"></div>
                         </div>
@@ -253,7 +258,7 @@
                         </table>
                     </div>
 
-                    <div class="vlm-card">
+                    <div class="vlm-card debug-only">
                         <div class="vlm-header">BUMPER READS</div>
                         <div class="vlm-crops" id="vlmCrops">
                             <p class="empty-state">No VLM crops sent yet</p>
@@ -272,7 +277,7 @@
             <!-- Step 4: Post-Inference Edit & Save -->
             <section class="results-section" id="resultsSection" style="display:none;">
                 <h2>Review & Save Results</h2>
-                <div class="processing-time-card" id="processingTimeCard" style="display:none;">
+                <div class="processing-time-card debug-only" id="processingTimeCard" style="display:none;">
                     <h3>Processing Time</h3>
                     <div class="timing-breakdown" id="processingTimeBreakdown"></div>
                 </div>
@@ -386,10 +391,10 @@
                     <div class="replay-player-bar">
                         <button class="btn-small" id="replayBackBtn">&larr; Back to Library</button>
                         <span class="replay-player-label" id="replayPlayerLabel"></span>
-                        <span class="replay-player-id" id="replayPlayerId" title="Job ID"></span>
+                        <span class="replay-player-id debug-only" id="replayPlayerId" title="Job ID"></span>
                         <span class="replay-export-group">
                             <a class="btn-small" id="replayDownloadVideo" download>&#11015; Video</a>
-                            <a class="btn-small" id="replayDownloadData" download>&#11015; Data (JSON)</a>
+                            <a class="btn-small debug-only" id="replayDownloadData" download>&#11015; Data (JSON)</a>
                         </span>
                     </div>
                     <section class="main-layout">
@@ -413,7 +418,7 @@
                             <div class="video-container">
                                 <video id="replayVideo" controls playsinline preload="metadata" style="width:100%;display:block;height:auto;"></video>
                             </div>
-                            <div class="replay-timing-card" id="replayTimingCard" style="display:none;">
+                            <div class="replay-timing-card debug-only" id="replayTimingCard" style="display:none;">
                                 <div class="timeline-header">PROCESSING TIME</div>
                                 <div class="timing-breakdown" id="replayTimingBreakdown"></div>
                             </div>

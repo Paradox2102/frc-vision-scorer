@@ -64,6 +64,11 @@ class VisionScorer {
     }
 
     init() {
+        // UI mode (standard | debug). Standard is the default; the mode is a
+        // pure CSS gate (see style.css) so WebSocket data keeps flowing into
+        // hidden nodes and toggling works mid-run with no re-fetch.
+        this.initModeToggle();
+
         // Event form
         document.getElementById('eventForm').addEventListener('submit', (e) => this.handleEventLoad(e));
 
@@ -128,6 +133,41 @@ class VisionScorer {
 
         // Check if we have an active event
         this.checkExistingEvent();
+    }
+
+    // --- UI mode (Standard / Debug) ---
+
+    initModeToggle() {
+        let mode = 'standard';
+        try {
+            const saved = localStorage.getItem('uiMode');
+            if (saved === 'debug' || saved === 'standard') mode = saved;
+        } catch (e) { /* localStorage unavailable — fall back to default */ }
+        this.setMode(mode, false);
+        const toggle = document.getElementById('modeToggle');
+        if (toggle) {
+            toggle.querySelectorAll('.mode-toggle-btn').forEach(btn => {
+                btn.addEventListener('click', () => this.setMode(btn.dataset.mode, true));
+            });
+        }
+    }
+
+    setMode(mode, persist) {
+        mode = mode === 'debug' ? 'debug' : 'standard';
+        document.body.dataset.mode = mode;
+        if (persist) {
+            try { localStorage.setItem('uiMode', mode); } catch (e) { /* ignore */ }
+        }
+        // A debug-only view can be active when switching to standard; the CSS
+        // hides its nav tab but the view div itself is toggled by switchView,
+        // so kick the user back to the scorer.
+        if (mode === 'standard') {
+            const active = document.querySelector('.nav-btn.active');
+            const activeView = active && active.dataset.view;
+            if (activeView === 'gallery' || activeView === 'settings') {
+                this.switchView('scorer');
+            }
+        }
     }
 
     // --- Navigation ---
@@ -1352,6 +1392,9 @@ class VisionScorer {
         this.viewCards = {};
         if (this.trackingCards) this.trackingCards.replaceChildren();
         if (this.trackingPanel) this.trackingPanel.style.display = 'none';
+        // Clear the previous run's outputs so a re-run (retry) doesn't leak
+        // stale crops/rows/events into the new run.
+        this.clearRunOutputs();
         this.lastWsMessageAt = Date.now();
         if (this.stallTimer) clearInterval(this.stallTimer);
         // Stall watchdog: tracking can be quiet for a while, but minutes of
@@ -1362,11 +1405,34 @@ class VisionScorer {
             const quiet = Math.round((Date.now() - this.lastWsMessageAt) / 1000);
             if (quiet >= 120) {
                 const currentProgress = parseFloat(this.progressBar.style.width) || 0;
-                this.setStatus(`No updates for ${quiet}s — job may be stalled. ` +
-                               `Results so far are preserved; check /api/debug/tasks if it persists.`,
+                // User-facing message stays mode-agnostic; the debug diagnostics
+                // link goes into the status log (which is itself debug-only).
+                this.setStatus(`No updates for ${quiet}s — job may be stalled; ` +
+                               `results so far are preserved.`,
                                currentProgress);
+                this.appendDebugTasksLink();
             }
         }, 15000);
+    }
+
+    // Debug-only diagnostics link, appended to the status log. Built with DOM
+    // APIs (like appendCalibrationLink) so it opens /api/debug/tasks in a new tab.
+    appendDebugTasksLink() {
+        if (!this.statusLog) return;
+        // One diagnostics link per stall — drop any prior one.
+        this.statusLog.querySelectorAll('.debug-tasks-row').forEach((n) => n.remove());
+        const row = document.createElement('div');
+        row.className = 'debug-tasks-row';
+        const ts = new Date().toLocaleTimeString([], { hour12: false });
+        row.appendChild(document.createTextNode(`${ts}  job may be stalled — `));
+        const a = document.createElement('a');
+        a.href = '/api/debug/tasks';
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = 'inspect running tasks →';
+        row.appendChild(a);
+        this.statusLog.appendChild(row);
+        this.statusLog.scrollTop = this.statusLog.scrollHeight;
     }
 
     appendStatusLog(text) {
@@ -1445,6 +1511,23 @@ class VisionScorer {
         this.updateRobotTables(data.robots);
         this.updateVlmCrops(data.ocr_crops);
         this.updateTimeline(data.scoring_events);
+        this.updateTeamsSummary(data.robots);
+    }
+
+    // Standard-mode HUD: confirmed team identities over the known roster.
+    // Roster is 6 when both alliances are populated, else the count of
+    // distinct slots we've actually seen so the ratio stays honest early on.
+    updateTeamsSummary(robots) {
+        const el = document.getElementById('hudTeams');
+        if (!el) return;
+        const list = Array.isArray(robots) ? robots : [];
+        const confirmed = list.filter(r => r.confirmed).length;
+        const blueSlots = list.some(r => r.alliance === 'blue');
+        const redSlots = list.some(r => r.alliance === 'red');
+        const roster = (blueSlots && redSlots)
+            ? 6
+            : list.filter(r => typeof r.slot === 'string' && /^[BR][1-3]$/.test(r.slot)).length;
+        el.textContent = `${confirmed} / ${roster || 6}`;
     }
 
     drawFrame(frameDataBase64) {
@@ -1482,11 +1565,12 @@ class VisionScorer {
             // tell a locked read from a guess at a glance.
             let teamCell = '—';
             if (robot && robot.team_number) {
+                const num = this.escapeHtml(robot.team_number);
                 teamCell = robot.confirmed
-                    ? `<span class="team-confirmed">${robot.team_number} ✓</span>`
-                    : `<span class="team-tentative">${robot.team_number}</span>`;
+                    ? `<span class="team-confirmed">${num} ✓</span>`
+                    : `<span class="team-tentative">${num}</span>`;
             } else if (robot && robot.team_candidate) {
-                teamCell = `<span class="team-candidate">${robot.team_candidate}?</span>`;
+                teamCell = `<span class="team-candidate">${this.escapeHtml(robot.team_candidate)}?</span>`;
             }
             return `
                 <tr>
@@ -1593,7 +1677,7 @@ class VisionScorer {
                 <div class="timeline-event ${event.alliance}${onSeek ? ' clickable' : ''}${activeClass}"${clickAttrs}>
                     <div class="timeline-event-info">
                         <div class="timeline-event-time">
-                            Frame ${frame} | ${timestamp}
+                            <span class="debug-only">Frame ${frame} | </span>${timestamp}
                         </div>
                         <div class="timeline-event-details">
                             <span class="timeline-event-alliance ${event.alliance}">
@@ -2051,14 +2135,31 @@ class VisionScorer {
         if (this.blueAllianceScore) this.blueAllianceScore.textContent = '0';
         if (this.redAllianceScore) this.redAllianceScore.textContent = '0';
 
-        // Reset robot tables
-        this.blueRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
-        this.redRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
-        if (this.vlmCrops) this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
-        this.latestVlmCrops.clear();
-        this.timelineContainer.innerHTML = '<p class="empty-state">No events yet</p>';
+        // Robot tables, VLM crops, timeline — shared with resetRunIndicators.
+        this.clearRunOutputs();
 
         this.setStatus('Ready', 0);
+    }
+
+    // Restore the live-output panels to their empty states. Shared by
+    // resetToMatchSelect (full flow reset) and resetRunIndicators (per-run
+    // reset) so a re-run doesn't leak the previous run's crops/rows/events.
+    clearRunOutputs() {
+        if (this.blueRobotsTable) {
+            this.blueRobotsTable.innerHTML =
+                '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
+        }
+        if (this.redRobotsTable) {
+            this.redRobotsTable.innerHTML =
+                '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
+        }
+        this.latestVlmCrops.clear();
+        if (this.vlmCrops) {
+            this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
+        }
+        if (this.timelineContainer) {
+            this.timelineContainer.innerHTML = '<p class="empty-state">No events yet</p>';
+        }
     }
 
     // --- Match History ---
@@ -2127,7 +2228,7 @@ class VisionScorer {
         let html = '';
         for (const event of filtered) {
             html += `<div class="history-event">
-                    <h3>${event.event_name} <span class="event-year">${event.year}</span></h3>
+                    <h3>${this.escapeHtml(event.event_name)} <span class="event-year">${this.escapeHtml(event.year)}</span></h3>
                     <table class="history-table">
                         <thead>
                             <tr>
@@ -2173,9 +2274,9 @@ class VisionScorer {
 
                 html += `
                         <tr>
-                            <td><strong>${matchLabel}</strong></td>
-                            <td class="team-cell blue">${blueTeams}</td>
-                            <td class="team-cell red">${redTeams}</td>
+                            <td><strong>${this.escapeHtml(matchLabel)}</strong></td>
+                            <td class="team-cell blue">${this.escapeHtml(blueTeams)}</td>
+                            <td class="team-cell red">${this.escapeHtml(redTeams)}</td>
                             <td>${tbaScore}</td>
                             <td>${predScore}</td>
                             <td><span class="status-badge ${statusClass}">${statusLabel}</span></td>

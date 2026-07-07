@@ -167,26 +167,6 @@ class DiagnosticRecorder:
             "streak": int(streak),
         })
 
-    def record_field_qc(self, frame: int | None, robots_seen: int,
-                        lookalikes: list, matched: list,
-                        unmatched_census: list, unmatched_tracks: list) -> None:
-        """Observe-only full-field census reconciliation snapshot.
-
-        Grading caveat: `unmatched_tracks` includes legitimately occluded or
-        coasting robots (their stale field_position is invisible to the VLM)
-        — not every entry is a ghost track."""
-        if frame is None:
-            logger.warning("record_field_qc: missing frame; dropped")
-            return
-        self._emit({
-            "frame": int(frame), "t_ms": self._t_ms(), "type": "field_qc",
-            "robots_seen": int(robots_seen),
-            "lookalikes": list(lookalikes or []),
-            "matched": list(matched or []),
-            "unmatched_census": list(unmatched_census or []),
-            "unmatched_tracks": list(unmatched_tracks or []),
-        })
-
     def record_assignment(self, frame: int | None, robot_id: int | None, team: str | None,
                          alliance: str, confirmed: bool,
                          votes_for_assigned: float, votes_total: float,

@@ -228,21 +228,6 @@ KNOBS = [
     Knob("adjudicate_static_sec", "VLM_ADJUDICATE_STATIC_SEC", float, 6.0, min=1.0),
     Knob("adjudicate_static_move_m", "VLM_ADJUDICATE_STATIC_MOVE_M", float, 0.5, min=0.0),
     Knob("adjudicate_cooldown_sec", "VLM_ADJUDICATE_COOLDOWN_SEC", float, 10.0, min=1.0),
-    # Full-field VLM census (observe-only): every field_qc_interval_sec send
-    # a downscaled main-view frame to the reader asking for a box on EVERY
-    # robot plus robot-lookalike equipment, project the boxes to field
-    # coords, and reconcile against live tracks. Mismatches — a robot the
-    # tracker never seeded (qm11: 6800), a track the VLM says isn't a robot
-    # (equipment hijacks) — are recorded to diagnostics ONLY. This is the
-    # grading dataset for wiring seed/evict corrections later; census reads
-    # run single-flight so they never starve identity bumper reads.
-    # NOTE for grading: unmatched_tracks includes legitimately occluded/
-    # coasting robots (stale field_position) — not every entry is a ghost.
-    # DEFAULT OFF pending A/B.
-    Knob("field_qc_enabled", "VLM_FIELD_QC", bool, False),
-    Knob("field_qc_interval_sec", "VLM_FIELD_QC_INTERVAL_SEC", float, 5.0, min=1.0),
-    Knob("field_qc_match_radius_m", "VLM_FIELD_QC_MATCH_RADIUS_M", float, 1.5,
-         min=0.1, max=10.0),
     # Phase-exclusive vLLM: stop the server during tracking (its ~11GB pool
     # plus SAM3's ~11GB peak OOMs the 24GB card; it is idle in that phase
     # anyway), start it for the analysis loop's reads, stop it after the job.

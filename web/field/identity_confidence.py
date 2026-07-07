@@ -29,6 +29,10 @@ class ConfidenceConfig:
         os.environ.get("VLM_NOVELTY_MIN_MOVE_M", "0.5")))
     novelty_skip_max_sec: float = field(default_factory=lambda: float(
         os.environ.get("VLM_NOVELTY_SKIP_MAX_SEC", "8.0")))
+    # Immediate-read escalations gain nothing within a second of the last
+    # read/queue — the unconfirmed retry cadence already covers that window.
+    immediate_read_cooldown_sec: float = field(default_factory=lambda: float(
+        os.environ.get("VLM_IMMEDIATE_COOLDOWN_SEC", "1.0")))
 
 @dataclass
 class ConfidenceSignals:
@@ -161,6 +165,27 @@ def decide_vlm_read(
             return ReadDecision(due=True, reason="unconfirmed_retry", priority=priority, is_audit=False)
         else:
             return ReadDecision(due=False, reason="unconfirmed_not_due", priority=0.0, is_audit=False)
+
+
+def should_queue_immediate_read(
+    current_match_time: float,
+    last_vlm_time: float,
+    last_immediate_queue_time: float,
+    cooldown_sec: float,
+) -> bool:
+    """Rate-limit priority-10 immediate-read escalations per identity.
+
+    The escalation triggers (re-attachment, low margin, appearance
+    divergence, roster conflict) re-fire every frame their condition
+    holds; an identity read or queued within the cooldown gains nothing
+    from another escalation. Sentinel -999 times fail open so a fresh
+    identity's first re-attachment still reads immediately.
+    """
+    if (current_match_time - last_vlm_time) < cooldown_sec:
+        return False
+    if (current_match_time - last_immediate_queue_time) < cooldown_sec:
+        return False
+    return True
 
 
 def occlusion_blocks_read(occ_entry) -> bool:

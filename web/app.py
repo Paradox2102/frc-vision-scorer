@@ -4228,7 +4228,12 @@ class InferenceJob:
         )
 
         # 3.5 Update live confidence signals
-        from web.field.identity_confidence import ConfidenceSignals, ConfidenceState, calculate_confidence_update
+        from web.field.identity_confidence import (
+            ConfidenceSignals,
+            ConfidenceState,
+            calculate_confidence_update,
+            should_queue_immediate_read,
+        )
         from web.embedder import cosine_similarity
         
         team_counts = {}
@@ -4314,25 +4319,41 @@ class InferenceJob:
             ident.vlm_agrees = False
             ident.vlm_contradicts = False
 
-            # Queue immediate reads on low confidence / bad signals
+            # Queue immediate reads on low confidence / bad signals — gated by
+            # the escalation cooldown so a just-read identity isn't pinned at
+            # priority 10 every frame its condition persists.
             if is_observed:
+                current_match_time = self._current_frame / (self.video_fps or 10.0)
+                allow_immediate = should_queue_immediate_read(
+                    current_match_time,
+                    ident.last_vlm_time,
+                    ident.last_immediate_queue_time,
+                    self.confidence_config.immediate_read_cooldown_sec,
+                )
+                queued = False
                 prev_slot = self._last_bindings.get(ident.identity_id)
                 # re-attachment
-                if prev_slot is None:
+                if prev_slot is None and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
                 # low margins
-                if relink_margin < 0.1:
+                if relink_margin < 0.1 and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
                 # appearance divergence
-                if appearance_divergent:
+                if appearance_divergent and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: appearance divergent")
                 # roster conflict
-                if not roster_uniqueness_ok:
+                if not roster_uniqueness_ok and allow_immediate:
                     ident.needs_immediate_read = True
+                    queued = True
                     print(f"  Immediate read queued for identity {ident.identity_id}: roster conflict")
+                if queued:
+                    ident.last_immediate_queue_time = current_match_time
 
         # 4. Bind new slots to identities
         current_bindings = {}
@@ -5144,6 +5165,12 @@ class InferenceJob:
                             "message": "Pausing vLLM reader to free VRAM for tracking…",
                             "progress": 8.0,
                         })
+                        # The in-process local reader squats ~8GB the same way
+                        # the server does; evict it so the offload probe below
+                        # sees the real budget. It re-loads lazily at the
+                        # analysis loop's first read pass.
+                        if _unload_qwen_vl():
+                            print(f"  [{backend_label}] Unloaded in-process bumper reader to free VRAM for tracking")
                         if not await vllm_lifecycle.ensure_stopped():
                             await self._warn_degraded(
                                 "vllm",
@@ -5202,46 +5229,60 @@ class InferenceJob:
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
                     _t_load = time.perf_counter()
-                    if self.tracking_backend == "sam3":
-                        from web.field.sam3_tracker import Sam3FieldTracker
 
-                        sam2_tracker = Sam3FieldTracker(
-                            checkpoint=SAM3_CHECKPOINT,
-                            device=device,
-                            offload_video_to_cpu=offload_vid,
-                            offload_state_to_cpu=offload_st,
-                            compile_model=(self.config.sam3_compile and device == "cuda"),
-                            max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
-                            use_fa3=SAM3_USE_FA3,
-                            chunk_frames=self.config.sam3_chunk_frames,
-                        )
-                        model_detail = (
-                            f"video model w/ instance prompts, "
-                            f"chunk={self.config.sam3_chunk_frames} frames, "
-                            f"compile={self.config.sam3_compile}"
-                        )
-                    else:
-                        from web.field.sam2_tracker import Sam2FieldTracker
+                    def _load_tracker_and_embedder():
+                        # Runs on a worker thread so the frame-export decode
+                        # pass overlaps the weight load. Nothing here is
+                        # shared with the export path (it needs YOLO and
+                        # calibration only); the barrier after the export
+                        # awaits this task before seeding uses the tracker.
+                        if self.tracking_backend == "sam3":
+                            from web.field.sam3_tracker import Sam3FieldTracker
 
-                        # Per-job encoder size (UI override); falls back to the env default.
-                        job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
-                        sam2_tracker = Sam2FieldTracker(
-                            config=job_config,
-                            checkpoint=job_checkpoint,
-                            device=device,
-                            offload_video_to_cpu=offload_vid,
-                            offload_state_to_cpu=offload_st,
-                            vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
-                        )
-                        model_detail = (
-                            f"{self.model_size} model, "
-                            f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
-                        )
-                    self.robot_embedder = RobotEmbedder()
-                    self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
+                            tracker = Sam3FieldTracker(
+                                checkpoint=SAM3_CHECKPOINT,
+                                device=device,
+                                offload_video_to_cpu=offload_vid,
+                                offload_state_to_cpu=offload_st,
+                                compile_model=(self.config.sam3_compile and device == "cuda"),
+                                max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
+                                use_fa3=SAM3_USE_FA3,
+                                chunk_frames=self.config.sam3_chunk_frames,
+                            )
+                            detail = (
+                                f"video model w/ instance prompts, "
+                                f"chunk={self.config.sam3_chunk_frames} frames, "
+                                f"compile={self.config.sam3_compile}"
+                            )
+                        else:
+                            from web.field.sam2_tracker import Sam2FieldTracker
+
+                            # Per-job encoder size (UI override); falls back to the env default.
+                            job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
+                            tracker = Sam2FieldTracker(
+                                config=job_config,
+                                checkpoint=job_checkpoint,
+                                device=device,
+                                offload_video_to_cpu=offload_vid,
+                                offload_state_to_cpu=offload_st,
+                                vos_optimized=(self.config.sam2_vos_optimized and device == "cuda"),
+                            )
+                            detail = (
+                                f"{self.model_size} model, "
+                                f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
+                            )
+                        embedder = RobotEmbedder()
+                        self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
+                        return tracker, detail, embedder
+
+                    model_load_task = asyncio.create_task(
+                        asyncio.to_thread(_load_tracker_and_embedder))
+                    # One tick hands the load to its worker thread before the
+                    # export loop below starts decoding.
+                    await asyncio.sleep(0)
+                    # Optimistic: the plan/export phase needs no tracker; the
+                    # barrier after the export downgrades on load failure.
                     self.use_sam2 = True
-                    print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
-                          f"and RobotEmbedder on {device}")
                 except Exception as e:
                     backend_label = (
                         "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
@@ -5492,6 +5533,22 @@ class InferenceJob:
                 print(f"  [{self.tracker_tag}] Exported {exported} frames/view across {N} view(s) in "
                       f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
 
+                # Barrier: the overlapped tracker/embedder load must be
+                # resident before seeding. On failure, degrade to Kalman
+                # exactly as the old inline load did.
+                try:
+                    sam2_tracker, model_detail, self.robot_embedder = await model_load_task
+                    print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
+                          f"and RobotEmbedder on {device}")
+                except Exception as e:
+                    await self._warn_degraded(
+                        self.tracker_tag.lower(),
+                        f"[{backend_label}] Failed to initialize tracker/embedder: "
+                        f"{e}. Falling back to Kalman tracking.",
+                    )
+                    self.use_sam2 = False
+                    self.robot_embedder = None
+            if self.use_sam2:
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
@@ -8256,6 +8313,27 @@ def _claude_vision_read_bumpers(robot_crops_b64: list, match_teams: list,
 # Bumper-number reading VLM (VLM_MODEL_NAME, default Qwen3-VL-8B) — lazy-loaded, cached
 _qwen_vl_model = None
 _qwen_vl_processor = None
+
+
+def _unload_qwen_vl() -> bool:
+    """Drop the cached in-process bumper reader and return its VRAM to the pool.
+
+    The local reader holds ~8GB for the life of the server, which pushes
+    SAM3's offload heuristic below its 16GB-free threshold. Phase
+    exclusivity calls this before tracking; the next read pass re-loads
+    lazily via _get_qwen_vl(). Returns True when a model was unloaded.
+    """
+    global _qwen_vl_model, _qwen_vl_processor
+    if _qwen_vl_model is None and _qwen_vl_processor is None:
+        return False
+    _qwen_vl_model = None
+    _qwen_vl_processor = None
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return True
 
 
 def _get_qwen_vl():

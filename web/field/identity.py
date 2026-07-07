@@ -25,6 +25,9 @@ class RobotIdentity:
     backoff_until: float = -999.0
     vlm_fail_count: int = 0
     needs_immediate_read: bool = False
+    # Last time an immediate read was queued — the escalation cooldown
+    # (should_queue_immediate_read) keys off this and last_vlm_time.
+    last_immediate_queue_time: float = -999.0
     has_vlm_read: bool = False
     vlm_agrees: bool = False
     vlm_contradicts: bool = False

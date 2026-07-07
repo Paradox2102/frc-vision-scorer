@@ -60,6 +60,29 @@ class VisionScorer {
         // Timeline
         this.timelineContainer = document.getElementById('timelineContainer');
 
+        // Header job pill (both modes)
+        this.jobPill = document.getElementById('jobPill');
+        this._jobPollTimer = null;
+
+        // Diagnostic viewer (debug-only)
+        this.diagnosticToggleBtn = document.getElementById('diagnosticToggleBtn');
+        this.diagnosticPanel = document.getElementById('diagnosticPanel');
+        this.diagnosticFilter = document.getElementById('diagnosticFilter');
+        this.diagnosticReloadBtn = document.getElementById('diagnosticReloadBtn');
+        this.diagnosticStatus = document.getElementById('diagnosticStatus');
+        this.diagnosticLines = document.getElementById('diagnosticLines');
+        this._diagnosticRawLines = [];
+        this._diagnosticTotalLines = 0;
+
+        this.replayDiagnosticToggleBtn = document.getElementById('replayDiagnosticToggleBtn');
+        this.replayDiagnosticPanel = document.getElementById('replayDiagnosticPanel');
+        this.replayDiagnosticFilter = document.getElementById('replayDiagnosticFilter');
+        this.replayDiagnosticReloadBtn = document.getElementById('replayDiagnosticReloadBtn');
+        this.replayDiagnosticStatus = document.getElementById('replayDiagnosticStatus');
+        this.replayDiagnosticLines = document.getElementById('replayDiagnosticLines');
+        this._replayDiagnosticRawLines = [];
+        this._replayDiagnosticTotalLines = 0;
+
         this.init();
     }
 
@@ -135,6 +158,12 @@ class VisionScorer {
 
         // Check if we have an active event
         this.checkExistingEvent();
+
+        // Header job pill (both modes)
+        this.initJobPill();
+
+        // Diagnostic viewer (debug-only)
+        this.initDiagnosticViewer();
     }
 
     // --- UI mode (Standard / Debug) ---
@@ -196,6 +225,8 @@ class VisionScorer {
         } else if (view === 'settings') {
             this.loadSettings();
         }
+
+        this.renderJobPill();
     }
 
     // --- Settings (runtime knob overrides) ---
@@ -1159,6 +1190,7 @@ class VisionScorer {
             }
 
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
 
             // Store the match video URL for calibration frame grab
             this._pendingMatchVideoUrl = youtubeUrl || null;
@@ -1180,6 +1212,7 @@ class VisionScorer {
             const data = await resp.json();
             if (!data.job_id) return;
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
             this.jobFinished = false;
             this.videoSection.style.display = 'grid';
             this.setInferenceControlState('running');
@@ -1197,6 +1230,63 @@ class VisionScorer {
         } catch (e) {
             // No active job or server unreachable — normal page load.
         }
+    }
+
+    // --- Header job pill (both modes) ---
+
+    initJobPill() {
+        if (!this.jobPill) return;
+        this.jobPill.addEventListener('click', () => this.onJobPillClick());
+
+        const poll = () => this.pollActiveJob();
+        poll();
+        this._jobPollTimer = setInterval(() => {
+            if (document.hidden) return;
+            poll();
+        }, 5000);
+
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) poll();
+        });
+    }
+
+    async pollActiveJob() {
+        try {
+            const resp = await fetch('/api/job/active');
+            const data = await resp.json();
+            this._lastActiveJob = data && data.job_id ? data : null;
+        } catch (e) {
+            this._lastActiveJob = null;
+        }
+        this.renderJobPill();
+    }
+
+    renderJobPill() {
+        if (!this.jobPill) return;
+        const data = this._lastActiveJob;
+        if (!data || !data.job_id) {
+            this.jobPill.style.display = 'none';
+            return;
+        }
+        const activeNav = document.querySelector('.nav-btn.active');
+        const activeView = activeNav && activeNav.dataset.view;
+        const show = activeView !== 'scorer' || this.jobId !== data.job_id;
+        if (!show) {
+            this.jobPill.style.display = 'none';
+            return;
+        }
+        // No markup here — textContent is enough and needs no HTML-escaping.
+        this.jobPill.textContent = `⏳ ${data.match_key || 'job'} — ${data.status || ''}`;
+        this.jobPill.style.display = 'inline-flex';
+    }
+
+    onJobPillClick() {
+        const data = this._lastActiveJob;
+        this.switchView('scorer');
+        if (data && data.job_id && this.jobId == null) {
+            this.rejoinActiveJob();
+        }
+        this.renderJobPill();
     }
 
     _showInferenceView() {
@@ -1894,6 +1984,7 @@ class VisionScorer {
             // Fresh job id; drive it exactly like a new run (the websocket start path
             // runs process_video, which re-scans calibration before tracking).
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
             this.jobFinished = false;
             this.resetRunIndicators();
             this.setInferenceControlState('running');
@@ -2171,6 +2262,8 @@ class VisionScorer {
         // Reset state
         this.inferenceResults = null;
         this.jobId = null;
+        this.refreshDiagnosticButtonVisibility();
+        if (this.diagnosticPanel) this.diagnosticPanel.style.display = 'none';
 
         // Reset UI
         document.getElementById('matchSelect').value = '';
@@ -2453,6 +2546,148 @@ class VisionScorer {
         }
     }
 
+    // --- Diagnostic viewer (debug-only) ---
+
+    initDiagnosticViewer() {
+        const MAX_LINES = 2000;
+        this._diagnosticMaxLines = MAX_LINES;
+        this.refreshDiagnosticButtonVisibility();
+
+        // Scorer-view instance, keyed off the live job id.
+        if (this.diagnosticToggleBtn) {
+            this.diagnosticToggleBtn.addEventListener('click', () => {
+                const showing = this.diagnosticPanel.style.display !== 'none';
+                if (showing) {
+                    this.diagnosticPanel.style.display = 'none';
+                } else {
+                    this.diagnosticPanel.style.display = 'block';
+                    this.loadDiagnostic(this.jobId, {
+                        panel: this.diagnosticPanel,
+                        statusEl: this.diagnosticStatus,
+                        linesEl: this.diagnosticLines,
+                        rawKey: '_diagnosticRawLines',
+                        totalKey: '_diagnosticTotalLines',
+                        filterValue: this.diagnosticFilter ? this.diagnosticFilter.value : '',
+                    });
+                }
+            });
+        }
+        if (this.diagnosticReloadBtn) {
+            this.diagnosticReloadBtn.addEventListener('click', () => {
+                this.loadDiagnostic(this.jobId, {
+                    panel: this.diagnosticPanel,
+                    statusEl: this.diagnosticStatus,
+                    linesEl: this.diagnosticLines,
+                    rawKey: '_diagnosticRawLines',
+                    totalKey: '_diagnosticTotalLines',
+                    filterValue: this.diagnosticFilter ? this.diagnosticFilter.value : '',
+                });
+            });
+        }
+        if (this.diagnosticFilter) {
+            this.diagnosticFilter.addEventListener('input', () => {
+                this.renderDiagnosticLines(this._diagnosticRawLines, this._diagnosticTotalLines,
+                    this.diagnosticStatus, this.diagnosticLines, this.diagnosticFilter.value);
+            });
+        }
+
+        // Replay-player instance, keyed off the replay/job id from openReplay().
+        if (this.replayDiagnosticToggleBtn) {
+            this.replayDiagnosticToggleBtn.addEventListener('click', () => {
+                const showing = this.replayDiagnosticPanel.style.display !== 'none';
+                if (showing) {
+                    this.replayDiagnosticPanel.style.display = 'none';
+                } else {
+                    this.replayDiagnosticPanel.style.display = 'block';
+                    this.loadDiagnostic(this._replayDiagnosticJobId, {
+                        panel: this.replayDiagnosticPanel,
+                        statusEl: this.replayDiagnosticStatus,
+                        linesEl: this.replayDiagnosticLines,
+                        rawKey: '_replayDiagnosticRawLines',
+                        totalKey: '_replayDiagnosticTotalLines',
+                        filterValue: this.replayDiagnosticFilter ? this.replayDiagnosticFilter.value : '',
+                    });
+                }
+            });
+        }
+        if (this.replayDiagnosticReloadBtn) {
+            this.replayDiagnosticReloadBtn.addEventListener('click', () => {
+                this.loadDiagnostic(this._replayDiagnosticJobId, {
+                    panel: this.replayDiagnosticPanel,
+                    statusEl: this.replayDiagnosticStatus,
+                    linesEl: this.replayDiagnosticLines,
+                    rawKey: '_replayDiagnosticRawLines',
+                    totalKey: '_replayDiagnosticTotalLines',
+                    filterValue: this.replayDiagnosticFilter ? this.replayDiagnosticFilter.value : '',
+                });
+            });
+        }
+        if (this.replayDiagnosticFilter) {
+            this.replayDiagnosticFilter.addEventListener('input', () => {
+                this.renderDiagnosticLines(this._replayDiagnosticRawLines, this._replayDiagnosticTotalLines,
+                    this.replayDiagnosticStatus, this.replayDiagnosticLines, this.replayDiagnosticFilter.value);
+            });
+        }
+    }
+
+    // Reveal the scorer-view "Diagnostics" button once a job id exists (call
+    // whenever this.jobId is assigned: handleSubmit, rejoinActiveJob, etc).
+    refreshDiagnosticButtonVisibility() {
+        if (this.diagnosticToggleBtn) {
+            this.diagnosticToggleBtn.style.display = this.jobId ? 'inline-flex' : 'none';
+        }
+    }
+
+    async loadDiagnostic(key, target) {
+        const { statusEl, linesEl, rawKey, totalKey } = target;
+        if (!key) {
+            if (statusEl) statusEl.textContent = 'no diagnostic data';
+            if (linesEl) linesEl.textContent = '';
+            this[rawKey] = [];
+            this[totalKey] = 0;
+            return;
+        }
+        if (statusEl) statusEl.textContent = 'Loading…';
+        try {
+            const resp = await fetch(`/api/diagnostic/${encodeURIComponent(key)}`);
+            if (resp.status === 404) {
+                if (statusEl) statusEl.textContent = 'no diagnostic data';
+                if (linesEl) linesEl.textContent = '';
+                this[rawKey] = [];
+                this[totalKey] = 0;
+                return;
+            }
+            if (!resp.ok) {
+                if (statusEl) statusEl.textContent = `Failed to load diagnostics (${resp.status})`;
+                return;
+            }
+            const text = await resp.text();
+            const allLines = text.split('\n').filter(line => line.length > 0);
+            const total = allLines.length;
+            const kept = allLines.slice(-this._diagnosticMaxLines);
+            this[rawKey] = kept;
+            this[totalKey] = total;
+            this.renderDiagnosticLines(kept, total, statusEl, linesEl, target.filterValue || '');
+        } catch (e) {
+            if (statusEl) statusEl.textContent = `Failed to load diagnostics: ${e.message}`;
+        }
+    }
+
+    renderDiagnosticLines(kept, total, statusEl, linesEl, filterValue) {
+        if (!linesEl) return;
+        const filter = (filterValue || '').trim();
+        const filtered = filter ? kept.filter(line => line.includes(filter)) : kept;
+        if (statusEl) {
+            const capNote = total > this._diagnosticMaxLines
+                ? `showing last ${this._diagnosticMaxLines} of ~${total}`
+                : `${total} line${total === 1 ? '' : 's'}`;
+            const filterNote = filter ? ` (${filtered.length} match filter)` : '';
+            statusEl.textContent = capNote + filterNote;
+        }
+        // escapeHtml per line — diagnostic content is untrusted job output.
+        linesEl.innerHTML = filtered.map(line => this.escapeHtml(line)).join('\n');
+    }
+
     // --- Match Replay Player ---
 
     async openReplay(id) {
@@ -2477,6 +2712,16 @@ class VisionScorer {
             '<tr><td colspan="3" class="empty-state">No robots</td></tr>';
         document.getElementById('replayTimelineContainer').innerHTML =
             '<p class="empty-state">No events</p>';
+
+        // Diagnostic viewer tracks the replay/job id being viewed; collapse and
+        // clear any previously loaded lines so switching replays can't leak data.
+        this._replayDiagnosticJobId = id;
+        this._replayDiagnosticRawLines = [];
+        this._replayDiagnosticTotalLines = 0;
+        if (this.replayDiagnosticPanel) this.replayDiagnosticPanel.style.display = 'none';
+        if (this.replayDiagnosticLines) this.replayDiagnosticLines.textContent = '';
+        if (this.replayDiagnosticStatus) this.replayDiagnosticStatus.textContent = '';
+        if (this.replayDiagnosticFilter) this.replayDiagnosticFilter.value = '';
 
         try {
             const resp = await fetch(`/api/replays/${id}`);

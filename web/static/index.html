@@ -10,6 +10,7 @@
     <div class="container">
         <header>
             <h1>FRC Vision Scorer</h1>
+            <button type="button" class="job-pill" id="jobPill" style="display:none;"></button>
             <nav id="mainNav">
                 <button class="nav-btn active" data-view="scorer">Scorer</button>
                 <button class="nav-btn" data-view="replays">Replays</button>
@@ -184,6 +185,17 @@
 
             <!-- Rolling status history: progress detail that would otherwise be overwritten -->
             <div class="status-log debug-only" id="statusLog" style="display:none;"></div>
+
+            <!-- Diagnostic viewer: raw NDJSON diagnostic stream for the running/loaded job -->
+            <button class="btn-small debug-only" id="diagnosticToggleBtn" style="display:none;">Diagnostics</button>
+            <div class="diagnostic-panel debug-only" id="diagnosticPanel" style="display:none;">
+                <div class="diagnostic-toolbar">
+                    <input type="text" id="diagnosticFilter" placeholder="Filter…">
+                    <button class="btn-small" id="diagnosticReloadBtn">Reload</button>
+                </div>
+                <div class="diagnostic-status" id="diagnosticStatus"></div>
+                <pre class="diagnostic-lines" id="diagnosticLines"></pre>
+            </div>
 
             <div class="inference-controls" id="inferenceControls" style="display:none;">
                 <button id="startInferenceBtn" class="inference-btn start-btn" style="display:none;">Start Inference</button>
@@ -393,9 +405,18 @@
                         <span class="replay-player-label" id="replayPlayerLabel"></span>
                         <span class="replay-player-id debug-only" id="replayPlayerId" title="Job ID"></span>
                         <span class="replay-export-group">
+                            <button class="btn-small debug-only" id="replayDiagnosticToggleBtn">Diagnostics</button>
                             <a class="btn-small" id="replayDownloadVideo" download>&#11015; Video</a>
                             <a class="btn-small debug-only" id="replayDownloadData" download>&#11015; Data (JSON)</a>
                         </span>
+                    </div>
+                    <div class="diagnostic-panel debug-only" id="replayDiagnosticPanel" style="display:none;">
+                        <div class="diagnostic-toolbar">
+                            <input type="text" id="replayDiagnosticFilter" placeholder="Filter…">
+                            <button class="btn-small" id="replayDiagnosticReloadBtn">Reload</button>
+                        </div>
+                        <div class="diagnostic-status" id="replayDiagnosticStatus"></div>
+                        <pre class="diagnostic-lines" id="replayDiagnosticLines"></pre>
                     </div>
                     <section class="main-layout">
                         <div class="video-column">

@@ -153,6 +153,21 @@ body[data-mode="debug"] .mode-toggle-btn[data-mode="debug"] {
     color: var(--background);
 }
 
+/* Header job pill: visible in both modes when a job is running out of view */
+.job-pill {
+    margin-left: 0.75rem;
+    padding: 0.3rem 0.7rem;
+    background: var(--blue-bg);
+    border: 1px solid var(--blue-border);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--blue-alliance);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.job-pill:hover { filter: brightness(1.15); }
+
 /* ========== Event Setup ========== */
 .event-section {
     max-width: 600px;
@@ -1523,6 +1538,40 @@ select.g-team, input.g-team { min-width: 72px; }
     line-height: 1.5;
     color: var(--muted-foreground);
     white-space: pre-wrap;
+}
+
+/* Diagnostic viewer: raw NDJSON diagnostic stream (debug-only) */
+.diagnostic-panel {
+    margin: 6px 0;
+    padding: 8px 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.diagnostic-toolbar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 6px;
+}
+.diagnostic-toolbar input {
+    flex: 1;
+    font-size: 0.8rem;
+}
+.diagnostic-status {
+    font-size: 0.75rem;
+    color: var(--muted-foreground);
+    margin-bottom: 4px;
+}
+.diagnostic-lines {
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 0;
+    font-family: ui-monospace, monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--muted-foreground);
+    white-space: pre-wrap;
+    word-break: break-all;
 }
 
 /* Tracking-phase panel: per-view seed frames + propagation progress */

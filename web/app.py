@@ -2013,12 +2013,12 @@ class InferenceJob:
             # stale relative to `fused`. That is acceptable: these flags only gate
             # crop preference (which camera to trust), not read correctness.
             if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
-                cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
+                cam != "main" and crop_b64 for cam, crop_b64, _w, _pos in obs.evidence
             ):
                 continue
 
             has_any_crop = False
-            for cam, crop_b64, source_weight in obs.evidence:
+            for cam, crop_b64, source_weight, cam_pos in obs.evidence:
                 if crop_b64 is None:
                     continue
                 has_any_crop = True

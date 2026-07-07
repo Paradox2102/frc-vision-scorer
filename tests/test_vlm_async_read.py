@@ -41,7 +41,7 @@ def _make_job():
 
 
 def _fused_obs():
-    return [types.SimpleNamespace(evidence=[("main", "fakecropb64", 1.0)])]
+    return [types.SimpleNamespace(evidence=[("main", "fakecropb64", 1.0, (4.0, 3.0))])]
 
 
 def test_vlm_read_runs_off_event_loop(monkeypatch):

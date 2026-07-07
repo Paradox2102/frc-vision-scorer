@@ -157,9 +157,9 @@ def test_inseparable_evidence_triggers_vlm_and_resolves(base_job):
     # We mock _vision_read_bumpers
     with patch("web.app._vision_read_bumpers", return_value=mock_qwen_results):
         # We need to construct the fused obs evidence to match
-        fused_obs1.evidence = [("main", "crop1_b64", 1.0)]
-        fused_obs2.evidence = [("main", "crop2_b64", 1.0)]
-        
+        fused_obs1.evidence = [("main", "crop1_b64", 1.0, (1.0, 1.0))]
+        fused_obs2.evidence = [("main", "crop2_b64", 1.0, (2.0, 2.0))]
+
         # Trigger read_fused_bumper_numbers with priorities
         priorities = {0: 10.0, 1: 10.0}
         asyncio.run(base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities))
@@ -213,8 +213,8 @@ def test_unreadable_crops_remains_ambiguous(base_job):
     ]
     
     with patch("web.app._vision_read_bumpers", return_value=mock_qwen_results):
-        fused_obs1.evidence = [("main", "crop1_b64", 1.0)]
-        fused_obs2.evidence = [("main", "crop2_b64", 1.0)]
+        fused_obs1.evidence = [("main", "crop1_b64", 1.0, (1.0, 1.0))]
+        fused_obs2.evidence = [("main", "crop2_b64", 1.0, (2.0, 2.0))]
         priorities = {0: 10.0, 1: 10.0}
         asyncio.run(base_job.read_fused_bumper_numbers([fused_obs1, fused_obs2], priorities))
         
@@ -238,7 +238,7 @@ def test_confirmation_uses_identity_id_when_slot_differs(base_job):
     robot.consecutive_tracker = MagicMock()
     robot.consecutive_tracker.update.return_value = ("2199", True)
     fused = MagicMock()
-    fused.evidence = [("corner_right", "crop", 2.5)]
+    fused.evidence = [("corner_right", "crop", 2.5, (4.0, 3.0))]
 
     with patch("web.app._vision_read_bumpers", return_value=[
         {"team_number": "2199", "confidence": 0.95}

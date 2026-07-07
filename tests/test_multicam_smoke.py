@@ -81,7 +81,7 @@ def test_corner_cameras_add_occluded_field_coverage():
 
         fused = fuse_detections(per_camera, weights=weights)
         for obs in fused:
-            if any(cam != "main" for (cam, _, _) in obs.evidence):
+            if any(cam != "main" for (cam, _, _, _) in obs.evidence):
                 fused_with_corner += 1
 
         # (a) occlusion-fill: flag fused positions occluded for MAIN by the hub,
@@ -90,7 +90,7 @@ def test_corner_cameras_add_occluded_field_coverage():
                   for i, obs in enumerate(fused)]
         main_occ = resolve_occlusion(main_view.calibration, pseudo, [], prisms)
         for i, obs in enumerate(fused):
-            has_corner = any(cam != "main" for (cam, _, _) in obs.evidence)
+            has_corner = any(cam != "main" for (cam, _, _, _) in obs.evidence)
             if has_corner and main_occ.get(i, {}).get("view_occluded"):
                 occ_fill += 1
     cap.release()

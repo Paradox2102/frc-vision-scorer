@@ -9,7 +9,7 @@ def _det(x, y, color="blue", box=(0, 0, 10, 10)):
 
 def _obs(pos, box, tid, cam):
     det = FieldDetection(pos=pos, color="blue", box=box, track_id=tid)
-    return FusedObservation(detection=det, evidence=[(cam, b"crop", 1.0)],
+    return FusedObservation(detection=det, evidence=[(cam, b"crop", 1.0, pos)],
                             members=[(cam, tid)], track_id=tid)
 
 
@@ -82,7 +82,7 @@ def test_single_camera_passthrough():
     obs = fused[0]
     assert isinstance(obs, FusedObservation)
     assert abs(obs.detection.pos[0] - 1.0) < 1e-9
-    assert obs.evidence == [("main", b"crop", 1.0)]
+    assert obs.evidence == [("main", b"crop", 1.0, (1.0, 2.0))]
 
 
 def test_merges_two_cameras_same_robot():
@@ -205,7 +205,7 @@ def test_hub_occluded_main_yields_position_to_visible_corner():
 
     assert fused[0].detection.pos == (5.3, 3.1)
     assert fused[0].detection.box == (0, 0, 10, 10)
-    assert {camera for camera, _crop, _weight in fused[0].evidence} == {
+    assert {camera for camera, _crop, _weight, _pos in fused[0].evidence} == {
         "main", "corner_left",
     }
 
@@ -257,7 +257,7 @@ def test_member_weight_scales_with_detection_score():
     # the full-score member, not the midpoint (8.2).
     assert abs(obs.detection.pos[0] - 8.0667) < 1e-3
     # Evidence carries the effective (camera * score) weight.
-    weights = {cam: w for (cam, _crop, w) in obs.evidence}
+    weights = {cam: w for (cam, _crop, w, _pos) in obs.evidence}
     assert abs(weights["corner_left"] - 1.0) < 1e-9
     assert abs(weights["corner_right"] - 0.2) < 1e-9
 
@@ -269,7 +269,20 @@ def test_default_score_keeps_existing_weighting():
         "corner_left": [(FieldDetection(pos=(5.2, 3.1), color="blue", box=None), b"c")],
     }
     fused = fuse_detections(per_cam, weights={"main": 1.0, "corner_left": 2.5}, radius_m=0.6)
-    assert fused[0].evidence == [("main", b"m", 1.0), ("corner_left", b"c", 2.5)]
+    assert fused[0].evidence == [("main", b"m", 1.0, (5.0, 3.0)),
+                                  ("corner_left", b"c", 2.5, (5.2, 3.1))]
+
+
+def test_evidence_carries_per_camera_position():
+    det_main = FieldDetection(pos=(4.0, 3.0), color="blue", box=(0, 0, 10, 10))
+    det_corner = FieldDetection(pos=(4.5, 3.2), color="blue", box=None)
+    fused = fuse_detections(
+        {"main": [(det_main, b"m")], "corner_left": [(det_corner, b"c")]},
+        {"main": 1.0, "corner_left": 2.5})
+    assert len(fused) == 1
+    by_cam = {e[0]: e[3] for e in fused[0].evidence}
+    assert by_cam["main"] == (4.0, 3.0)
+    assert by_cam["corner_left"] == (4.5, 3.2)
 
 
 # --- ray-aware cross-camera gating -----------------------------------------

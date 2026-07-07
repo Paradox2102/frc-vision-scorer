@@ -361,6 +361,11 @@ VLM_BATCH_READS = os.environ.get("VLM_BATCH_READS", "1") not in ("0", "false", "
 # (sqrt-damped in blend_read_confidence): a wavering read loses its
 # full-weight vote instead of riding the 0.95 exact-roster-match ladder.
 VLM_LOGPROB_CONFIDENCE = os.environ.get("VLM_LOGPROB_CONFIDENCE", "1") not in ("0", "false", "False")
+# Server-side structured output for vLLM reads: constrain generation to the
+# reply schema (OpenAI response_format json_schema) so a read can never be
+# lost to malformed JSON. Automatic single retry without the schema on an
+# HTTP 400 (older vLLM builds). Kill-switch for A/B.
+VLM_GUIDED_JSON = os.environ.get("VLM_GUIDED_JSON", "1") not in ("0", "false", "False")
 # Live-view frame streaming: display sends are rate-capped and pushed through
 # a latest-only queue so a slow websocket client never back-pressures the
 # inference loop. The replay recorder keeps its own full-rate copy.
@@ -8919,6 +8924,77 @@ def _qwen_vl_read_bumpers(robot_crops_b64: list, match_teams: list,
     return results
 
 
+_BUMPER_READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "team": {"type": ["string", "null"]},
+        "color": {"type": "string", "enum": ["red", "blue"]},
+        "surface": {"type": "string", "enum": ["bumper", "printed", "unclear"]},
+    },
+    "required": ["team", "color"],
+}
+
+_OBJECT_CLASS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "object": {"type": "string",
+                   "enum": ["robot", "equipment", "person", "unclear"]},
+    },
+    "required": ["object"],
+}
+
+
+def _vlm_chat_payload(data_uri: str, prompt: str, *, max_tokens: int,
+                      logprobs: bool = False, schema_name: str | None = None,
+                      schema: dict | None = None, guided: bool | None = None) -> dict:
+    """One vLLM chat/completions payload: image + text, optional logprobs and
+    structured output. `guided=None` defers to the VLM_GUIDED_JSON kill-switch."""
+    if guided is None:
+        guided = VLM_GUIDED_JSON
+    payload = {
+        "model": VLM_MODEL_NAME,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": data_uri}},
+            {"type": "text", "text": prompt},
+        ]}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if logprobs:
+        payload["logprobs"] = True
+    if guided and schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name or "reply", "schema": schema},
+        }
+    return payload
+
+
+def _post_vlm_chat(payload: dict) -> dict:
+    """POST one chat payload to the vLLM server, returning the parsed body.
+
+    If the server 400s a structured-output payload (older build without
+    json_schema support), retry ONCE without response_format — a degraded
+    read beats a dead one."""
+    def _post(p: dict) -> dict:
+        req = urllib.request.Request(
+            f"{VLM_SERVER_URL}/chat/completions",
+            data=json.dumps(p).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    try:
+        return _post(payload)
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and "response_format" in payload:
+            retry = {k: v for k, v in payload.items() if k != "response_format"}
+            print("  vLLM rejected response_format (400); retrying unguided")
+            return _post(retry)
+        raise
+
+
 def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
                        blue_teams: list, red_teams: list,
                        expected_alliances: Optional[list] = None) -> list:
@@ -8997,24 +9073,12 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             'or "printed" if they are printed on a crate, bin, sign, or other '
             'field structure}.'
         )
-        payload = {
-            "model": VLM_MODEL_NAME,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": data_uri}},
-                {"type": "text", "text": prompt},
-            ]}],
-            "temperature": 0,
-            "max_tokens": 64,
-            "logprobs": VLM_LOGPROB_CONFIDENCE,
-        }
-        req = urllib.request.Request(
-            f"{VLM_SERVER_URL}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        payload = _vlm_chat_payload(
+            data_uri, prompt, max_tokens=64,
+            logprobs=VLM_LOGPROB_CONFIDENCE,
+            schema_name="bumper_read", schema=_BUMPER_READ_SCHEMA,
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        body = _post_vlm_chat(payload)
         choice = body["choices"][0]
         output_text = (choice["message"]["content"] or "").strip()
 
@@ -9122,23 +9186,11 @@ def _vllm_classify_crops(crops_b64: list) -> list:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=92)
             data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-            payload = {
-                "model": VLM_MODEL_NAME,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": _CLASSIFY_PROMPT},
-                ]}],
-                "temperature": 0,
-                "max_tokens": 32,
-            }
-            req = urllib.request.Request(
-                f"{VLM_SERVER_URL}/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            payload = _vlm_chat_payload(
+                data_uri, _CLASSIFY_PROMPT, max_tokens=32,
+                schema_name="object_class", schema=_OBJECT_CLASS_SCHEMA,
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+            body = _post_vlm_chat(payload)
             output_text = (body["choices"][0]["message"]["content"] or "").strip()
             return {"object": parse_object_class(output_text), "error": None}
         except Exception as e:

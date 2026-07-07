@@ -351,7 +351,14 @@ class VisionScorer {
                 if (errEl) errEl.textContent = body.error || `HTTP ${resp.status}`;
                 return;
             }
-            if (row) row.replaceWith(this.settingRow(body.knob));
+            if (row) {
+                row.replaceWith(this.settingRow(body.knob));
+                // The fresh row ignores any active filter; re-apply it so the
+                // saved row doesn't pop back into a filtered-out section (and
+                // section header visible-counts stay correct).
+                const filterInput = document.getElementById('settingsFilter');
+                if (filterInput) this.filterSettings(filterInput.value);
+            }
         } catch (e) {
             if (errEl) errEl.textContent = 'request failed';
         }

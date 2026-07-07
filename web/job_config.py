@@ -371,7 +371,7 @@ KNOBS = [
     # cover auto. Needs a clean clock lock on the auto countdown; if the scan
     # can't find auto, the job logs a warning and runs the legacy full range.
     Knob("auto_period_only", "AUTO_PERIOD_ONLY", bool, False,
-         section="Fusion & field position"),
+         section="Match scope"),
     # --- live-view streaming ---
     Knob("frame_stream_interval_sec", "FRAME_STREAM_INTERVAL_SEC", float, 0.1,
          min=0.0, max=5.0, section="Streaming & output"),

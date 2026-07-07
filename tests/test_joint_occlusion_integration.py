@@ -8,6 +8,7 @@ from web.field.identity import IdentityRegistry, IdentityObservation, RobotIdent
 from web.field.identity_confidence import ConfidenceConfig
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+from web.job_config import JobConfig
 
 def _e(*vals):
     v = np.array(vals, dtype=np.float32)
@@ -16,6 +17,8 @@ def _e(*vals):
 @pytest.fixture
 def base_job():
     job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig()
+    job._camera_centers_xy = {}
     job.identity_registry = IdentityRegistry()
     job.confidence_config = ConfidenceConfig()
     job.co_occlusion_tracker = CoOcclusionTracker(re_emergence_window=30)

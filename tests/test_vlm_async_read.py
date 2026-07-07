@@ -11,10 +11,13 @@ import types
 
 import web.app as app_module
 from web.app import InferenceJob
+from web.job_config import JobConfig
 
 
 def _make_job():
     job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig()
+    job._camera_centers_xy = {}
     job.match_teams = ["4174"]
     job.match_blue_teams = ["4174"]
     job.match_red_teams = []
@@ -41,7 +44,10 @@ def _make_job():
 
 
 def _fused_obs():
-    return [types.SimpleNamespace(evidence=[("main", "fakecropb64", 1.0, (4.0, 3.0))])]
+    return [types.SimpleNamespace(
+        evidence=[("main", "fakecropb64", 1.0, (4.0, 3.0))],
+        detection=types.SimpleNamespace(pos=(4.0, 3.0)),
+    )]
 
 
 def test_vlm_read_runs_off_event_loop(monkeypatch):

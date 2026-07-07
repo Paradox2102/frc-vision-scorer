@@ -133,6 +133,7 @@ from web.field.identity_confidence import (
     digit_token_conf,
     occlusion_blocks_read,
     tentative_claim_winners,
+    vote_ray_cross_m,
 )
 from web.field.identity_ambiguity import CoOcclusionTracker
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder, DiagnosticEvents, DiagnosticReasons
@@ -1993,7 +1994,7 @@ class InferenceJob:
             if slot_id is not None:
                 slot_to_obs[slot_id] = obs
 
-        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64)
+        candidates = []  # (priority, source_weight, identity_id, slot_id, cam, crop_b64, crop_pos)
         identities_with_crops = set()
 
         for identity_id, priority in requested_priorities.items():
@@ -2021,6 +2022,14 @@ class InferenceJob:
             for cam, crop_b64, source_weight, cam_pos in obs.evidence:
                 if crop_b64 is None:
                     continue
+                if self.config.vote_ray_gate and cam_pos is not None:
+                    center = self._camera_centers_xy.get(cam)
+                    if center is not None:
+                        miss = vote_ray_cross_m(center, cam_pos, obs.detection.pos)
+                        if miss is not None and miss > self.config.vote_ray_cross_m:
+                            print(f"  VLM crop dropped [ray-miss]: slot {slot_id} "
+                                  f"cam={cam} cross={miss:.2f}m")
+                            continue
                 has_any_crop = True
                 candidates.append((
                     priority,
@@ -2028,7 +2037,8 @@ class InferenceJob:
                     identity_id,
                     slot_id,
                     cam,
-                    crop_b64
+                    crop_b64,
+                    (float(obs.detection.pos[0]), float(obs.detection.pos[1]))
                 ))
 
             if has_any_crop:
@@ -2083,7 +2093,7 @@ class InferenceJob:
         for cand in chosen:
             crop = _resolve_crop(cand[5])
             if crop:
-                resolved.append(cand[:5] + (crop,))
+                resolved.append(cand[:5] + (crop,) + cand[6:])
         chosen = resolved
         if not chosen:
             print("  VLM skipped: chosen crops resolved empty")
@@ -2100,7 +2110,7 @@ class InferenceJob:
 
         crops = [c[5] for c in chosen]
         expected = []
-        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64 in chosen:
+        for _priority, _w, identity_id, _slot_id, _cam, _crop_b64, *_extra in chosen:
             ident = self.identity_registry.identities.get(identity_id)
             alliance = getattr(ident, "alliance", "unknown")
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
@@ -2137,7 +2147,7 @@ class InferenceJob:
             (r.get("team_number"), float(r.get("confidence", 0.0)), c[1])
             for c, r in zip(chosen, results)
         ])
-        for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64), res) in enumerate(zip(chosen, results)):
+        for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res) in enumerate(zip(chosen, results)):
             robot = self._get_or_create_slot_track(slot_id)
             ident = self.identity_registry.identities.get(identity_id)
             if not robot or not ident:
@@ -2241,6 +2251,22 @@ class InferenceJob:
                       f"{self._slot_label(slot_id)} += {team} at "
                       f"({_pos[0]:.1f},{_pos[1]:.1f})")
                 continue
+            # Stale-position gate: votes are applied by a background task, so
+            # the slot's LIVE position (_pos) can have moved since the crop
+            # this vote came from was captured. A move farther than a robot
+            # can plausibly drive means the slot was re-bound between crop and
+            # vote — the vote belongs to whatever now occupies the old spot,
+            # not this identity.
+            crop_pos = _extra[0] if _extra else None
+            if (self.config.vote_ray_gate and crop_pos is not None
+                    and _pos is not None):
+                moved = ((_pos[0] - crop_pos[0]) ** 2
+                         + (_pos[1] - crop_pos[1]) ** 2) ** 0.5
+                if moved > self.config.vote_stale_max_m:
+                    print(f"  VLM vote dropped [stale-pos]: "
+                          f"{self._slot_label(slot_id)} += {team} moved "
+                          f"{moved:.1f}m since crop")
+                    continue
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
@@ -2285,7 +2311,7 @@ class InferenceJob:
         # translate those team labels back to durable identities before changing
         # any binding.
         pass_reads = {}
-        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64), res in zip(chosen, results):
+        for (_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res in zip(chosen, results):
             team_val = res.get("team_number")
             conf_val = float(res.get("confidence", 0.0))
             if team_val and conf_val >= 0.85:
@@ -4581,6 +4607,19 @@ class InferenceJob:
                     selection[_name] = _pick["version_id"]
             self.views = load_views(self.event_key, selection=selection)  # main first; corners if calibrated
             print(f"  Cameras active: {[v.name for v in self.views]}")
+            # Per-camera ground position, for the vote ray-consistency gate
+            # (identity_confidence.vote_ray_cross_m): a bumper crop's own
+            # camera saw it on the ray camera_center -> detection, and a slot
+            # position far off that ray is evidence of a wrong merge.
+            # Homography-mode calibrations have no camera_center (no pose),
+            # so those cameras are simply absent from the map and the gate
+            # no-ops for their evidence (see call site's `center is not None`
+            # guard).
+            self._camera_centers_xy = {}
+            for v in self.views:
+                cc = v.calibration.camera_center if v.calibration else None
+                if cc is not None:
+                    self._camera_centers_xy[v.name] = (float(cc[0]), float(cc[1]))
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
             print(f"  FIELD TRACKING DISABLED: {self.error}")

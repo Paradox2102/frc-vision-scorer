@@ -149,6 +149,38 @@ def test_mask_leak_cleanup_default_and_override(monkeypatch):
     assert JobConfig({"mask_leak_cleanup": "0"}).mask_leak_cleanup is False
 
 
+def test_vote_ray_gate_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.vote_ray_gate is False
+    assert cfg.vote_ray_cross_m == 1.5
+    assert cfg.vote_stale_max_m == 2.0
+
+
+def test_vote_ray_gate_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("VOTE_RAY_GATE_ENABLED", "1")
+    monkeypatch.setenv("VOTE_RAY_CROSS_M", "2.0")
+    monkeypatch.setenv("VOTE_STALE_MAX_M", "3.0")
+    cfg = JobConfig()
+    assert cfg.vote_ray_gate is True
+    assert cfg.vote_ray_cross_m == 2.0
+    assert cfg.vote_stale_max_m == 3.0
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"vote_ray_gate": "false", "vote_ray_cross_m": "1.0",
+                      "vote_stale_max_m": "1.0"})
+    assert cfg2.vote_ray_gate is False
+    assert cfg2.vote_ray_cross_m == 1.0
+    assert cfg2.vote_stale_max_m == 1.0
+
+
+def test_vote_ray_gate_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"vote_ray_cross_m": 0.0})
+    with pytest.raises(ValueError):
+        JobConfig({"vote_stale_max_m": 0.0})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

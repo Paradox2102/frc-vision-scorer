@@ -144,6 +144,18 @@ KNOBS = [
     # bumper — discard the vote. Default ON: it only acts inside explicit
     # equipment footprints, where a robot cannot be.
     Knob("zone_blind_votes", "VLM_ZONE_BLIND_VOTES", bool, True),
+    # Vote ray-consistency gates (identity layer, geometry-only): a bumper
+    # crop's own camera saw it on a specific ground ray, and votes are
+    # applied later by a background task. Two independent checks —
+    # (1) candidate time: reject a crop whose source-camera ray misses the
+    # fused slot position by more than vote_ray_cross_m (wrong merge, never
+    # send to the VLM); (2) vote time: drop a vote if the slot's live
+    # position has since moved farther than vote_stale_max_m from the
+    # crop-time fused position (re-bound between crop and vote). DEFAULT OFF
+    # pending A/B.
+    Knob("vote_ray_gate", "VOTE_RAY_GATE_ENABLED", bool, False),
+    Knob("vote_ray_cross_m", "VOTE_RAY_CROSS_M", float, 1.5, min=0.1),
+    Knob("vote_stale_max_m", "VOTE_STALE_MAX_M", float, 2.0, min=0.1),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False),
     # Evidence-ranked roster: re-prompt a dark object claimed by a fresh
     # detection in place, and let weak-evidence roster members (dark or

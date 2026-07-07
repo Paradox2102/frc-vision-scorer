@@ -245,6 +245,25 @@ def tentative_claim_winners(vote_maps):
     return {team: rid for team, (rid, _t) in winners.items()}
 
 
+def vote_ray_cross_m(cam_center_xy, cam_det_pos, fused_pos):
+    """Perpendicular (cross-ray) distance in meters of ``fused_pos`` from the
+    ground ray ``cam_center_xy`` -> ``cam_det_pos``.
+
+    Bearing is the trustworthy component of every camera's projection (range
+    is not, especially for low corner cameras — see fusion._ray_gate_score).
+    A bumper crop is misattributed when the slot position it votes into does
+    not sit near the ray its own camera saw it on. Returns None when the
+    camera and detection coincide (no defined ray)."""
+    cx, cy = float(cam_center_xy[0]), float(cam_center_xy[1])
+    dx, dy = float(cam_det_pos[0]) - cx, float(cam_det_pos[1]) - cy
+    n = (dx * dx + dy * dy) ** 0.5
+    if n < 1e-6:
+        return None
+    ux, uy = dx / n, dy / n
+    rx, ry = float(fused_pos[0]) - cx, float(fused_pos[1]) - cy
+    return abs(rx * uy - ry * ux)
+
+
 def best_owned_team(votes, robot_id, winners):
     """The robot's highest-voted team among those it actually OWNS per
     ``tentative_claim_winners`` — ``(team, vote)`` or ``(None, 0.0)``."""

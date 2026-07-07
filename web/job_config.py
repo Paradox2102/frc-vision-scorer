@@ -184,6 +184,16 @@ KNOBS = [
     # Unconditional largest-component regressed qm10/qm12 by dropping those
     # halves. DEFAULT OFF pending re-validation.
     Knob("mask_leak_cleanup", "SAM2_MASK_LEAK_CLEANUP", bool, False),
+    # Size-prior hijack cull: a tracked mask whose pixel width, at its
+    # projected field position, stays far wider (or narrower) than a robot
+    # could appear for size_prior_boundaries consecutive boundaries has latched
+    # onto structure/a pile. Equipment hijacks are YOLO-corroborated, so the
+    # absence cull can't catch them — geometry is the only clean signal.
+    # Independent of cull_hijack_enabled. DEFAULT OFF pending A/B.
+    Knob("size_prior_cull", "SIZE_PRIOR_CULL_ENABLED", bool, False),
+    Knob("size_prior_hi", "SIZE_PRIOR_HI", float, 3.0, min=1.0),
+    Knob("size_prior_lo", "SIZE_PRIOR_LO", float, 0.25, min=0.0, max=1.0),
+    Knob("size_prior_boundaries", "SIZE_PRIOR_BOUNDARIES", int, 3, min=1),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),

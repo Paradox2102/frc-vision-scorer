@@ -5653,6 +5653,26 @@ class InferenceJob:
                             ),
                         )
 
+                        # Size-prior hijack cull (A/B knob): expected robot pixel
+                        # width at a field position, in SAM2 export pixel space.
+                        # Width is invariant to the top-crop y-offset, so only
+                        # _sam2_scale matters (unlike _project_fn, which needs
+                        # _y_off). Independent of the corroboration machinery:
+                        # equipment hijacks are detector-corroborated.
+                        _expected_px_fn = None
+                        if self.config.size_prior_cull:
+                            from web.field.detect_bridge import expected_robot_pixel_width
+
+                            def _make_expected_px_fn(cal, scale, robot_w=1.1):
+                                def _fn(xy):
+                                    if xy is None:
+                                        return None
+                                    px = expected_robot_pixel_width(xy, cal, robot_w)
+                                    return None if px is None else px * scale
+                                return _fn
+                            _expected_px_fn = _make_expected_px_fn(
+                                view.calibration, _sam2_scale)
+
                         # Motion override (A/B knob): frame-diff motion probe
                         # over this view's exported frames; boxes at boundaries
                         # are in the same scaled/cropped pixel space as the
@@ -5757,6 +5777,14 @@ class InferenceJob:
                             # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
                             opening_reprompt_every=opening_reprompt_every,
                             opening_window_frames=opening_window_frames,
+                            # Size-prior hijack cull: geometric width violation
+                            # is the one signal a detector false-fire can't
+                            # corroborate (equipment hijacks are YOLO-backed).
+                            expected_px_fn=_expected_px_fn,
+                            size_prior_cull=self.config.size_prior_cull,
+                            size_prior_hi=self.config.size_prior_hi,
+                            size_prior_lo=self.config.size_prior_lo,
+                            size_prior_boundaries=self.config.size_prior_boundaries,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed

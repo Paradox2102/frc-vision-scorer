@@ -64,6 +64,20 @@ CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 PERSON_VETO_COVERAGE = float(os.environ.get("SAM2_PERSON_VETO_COVERAGE", "0.5"))
 PERSON_VETO_BOUNDARIES = int(os.environ.get("SAM2_PERSON_VETO_BOUNDARIES", "2"))
 
+# Size-prior hijack cull: a tracked mask whose pixel width, at its projected
+# field position, is far wider than a robot could appear (or far narrower) for
+# sustained boundaries has latched onto structure/a pile/a sliver. Equipment
+# hijacks are YOLO-CORROBORATED — the detector false-fires on the equipment
+# itself — so the absence-based cull structurally cannot catch them. Geometry
+# is the one channel a detector false-fire cannot corroborate, so this cull
+# fires INDEPENDENT of cull_enabled / corroboration. Enabled by passing
+# expected_px_fn to track() with size_prior_cull=True. DEFAULT OFF pending A/B.
+SIZE_PRIOR_CULL_ENABLED = os.environ.get(
+    "SIZE_PRIOR_CULL_ENABLED", "0") not in ("0", "false", "False")
+SIZE_PRIOR_HI = float(os.environ.get("SIZE_PRIOR_HI", "3.0"))
+SIZE_PRIOR_LO = float(os.environ.get("SIZE_PRIOR_LO", "0.25"))
+SIZE_PRIOR_BOUNDARIES = int(os.environ.get("SIZE_PRIOR_BOUNDARIES", "3"))
+
 # Capped-roster eviction. When the active roster is full and a fresh detection
 # matches no tracked mask, the least-corroborated *stationary* active object may
 # be evicted to make room. Uses the same evidence bar as the hijack cull
@@ -901,6 +915,11 @@ class Sam2FieldTracker:
         person_fn=None,
         person_veto_coverage: float = PERSON_VETO_COVERAGE,
         person_veto_boundaries: int = PERSON_VETO_BOUNDARIES,
+        expected_px_fn=None,
+        size_prior_cull: bool = SIZE_PRIOR_CULL_ENABLED,
+        size_prior_hi: float = SIZE_PRIOR_HI,
+        size_prior_lo: float = SIZE_PRIOR_LO,
+        size_prior_boundaries: int = SIZE_PRIOR_BOUNDARIES,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
     ) -> dict[int, dict[int, dict]]:
@@ -1034,6 +1053,21 @@ class Sam2FieldTracker:
                 meters ``(x, y)``, or None when unprojectable; measures stationarity
                 in field space so camera pan can't disguise a static structure as
                 moving. When None, falls back to pixel bottom-center.
+            expected_px_fn: Callable mapping a field ``(x, y)`` to the expected
+                robot pixel width there (already in this tracker's export pixel
+                space), or None when unmeasurable. Drives the size-prior cull.
+            size_prior_cull: When True, an object whose mask box violates the
+                size prior (too wide/too narrow vs ``expected_px_fn``) at every
+                one of ``size_prior_boundaries`` consecutive boundaries is
+                culled. INDEPENDENT of ``cull_enabled``/corroboration: equipment
+                hijacks are detector-corroborated, so geometry is the only clean
+                signal. A None expectation is unmeasurable, never a violation.
+            size_prior_hi: Ratio (mask width / expected width) above which the
+                mask is implausibly wide (latched onto structure/a pile).
+            size_prior_lo: Ratio below which the mask is implausibly narrow (a
+                sliver/fragment).
+            size_prior_boundaries: Consecutive violating boundaries required to
+                cull.
             progress_cb: Optional callback taking (processed_count, total_frames).
             diagnostics: Optional IdentityDiagnosticRecorder-like object.
 
@@ -1075,6 +1109,10 @@ class Sam2FieldTracker:
         dark_reanchor_attempts: dict[int, int] = {}
         dark_reanchor_last: dict[int, int] = {}
         field_pos_window: dict[int, list] = {}
+        # oid -> last `size_prior_boundaries` size-prior violation outcomes
+        # (True == violated). Sustained all-True culls the object independent
+        # of corroboration (equipment hijacks are detector-corroborated).
+        size_violation_history: dict[int, deque] = {}
         # oid -> consecutive boundaries with >= person_veto_coverage overlap
         person_overlap_counts: dict[int, int] = {}
         # oid -> (pending color, consecutive colored-corroboration count)
@@ -1597,6 +1635,40 @@ class Sam2FieldTracker:
                                         },
                                     )
 
+                            # ---- Size-prior violation bookkeeping + cull.
+                            # Reuse `pos` (already projected above). Independent
+                            # of corroboration: a detector-corroborated mask 4x
+                            # too wide has latched onto structure the detector
+                            # itself false-fires on. A None ratio (no pose /
+                            # degenerate box / no expectation) is unmeasurable,
+                            # never a violation. ----
+                            svh = size_violation_history.setdefault(
+                                oid, deque(maxlen=size_prior_boundaries))
+                            ratio = size_prior_ratio(
+                                box,
+                                expected_px_fn(pos)
+                                if (expected_px_fn is not None and pos is not None)
+                                else None,
+                            )
+                            svh.append(size_prior_violation(
+                                ratio, size_prior_hi, size_prior_lo))
+                            if (size_prior_cull
+                                    and len(svh) == size_prior_boundaries
+                                    and all(svh)):
+                                culled_set.add(oid)
+                                if diagnostics:
+                                    diagnostics.increment(f"{self.DIAG_PREFIX}_objects_culled")
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.object_culled",
+                                        reason="size_prior_violation",
+                                        details={
+                                            "object_id": oid,
+                                            "frame_idx": last_idx,
+                                            "ratio": ratio,
+                                            "boundaries": len(svh),
+                                        },
+                                    )
+
                         if culled_set:
                             active_objects = [o for o in active_objects if o not in culled_set]
                             for o in list(culled_set):
@@ -1735,6 +1807,7 @@ class Sam2FieldTracker:
                                 # of this boundary (a second detection over the
                                 # same robot cannot also re-anchor it).
                                 corroboration_history.pop(oid, None)
+                                size_violation_history.pop(oid, None)
                                 bx1, by1, bx2, by2 = int_boxes[idx]
                                 refreshed = np.zeros((h, w), bool)
                                 refreshed[by1:by2, bx1:bx2] = True
@@ -1875,6 +1948,7 @@ class Sam2FieldTracker:
                                     # of this boundary (so a second detection over
                                     # the same robot can't also re-anchor it).
                                     corroboration_history.pop(best_oid, None)
+                                    size_violation_history.pop(best_oid, None)
                                     existing[best_oid] = reanchor_box_mask
                                     boundary_mask_record[best_oid] = (
                                         boundary_no, float(reanchor_box_area),

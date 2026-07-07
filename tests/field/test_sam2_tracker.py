@@ -2894,3 +2894,97 @@ def test_size_prior_violation_band():
     assert size_prior_violation(0.1, hi=3.0, lo=0.25)
     assert not size_prior_violation(1.0, hi=3.0, lo=0.25)
     assert not size_prior_violation(None, hi=3.0, lo=0.25)
+
+
+# ---------------------------------------------------------------------------
+# Size-prior hijack cull: a tracked mask far wider than a robot could appear
+# at its projected field position for sustained boundaries has latched onto
+# structure/a pile. Geometry is the one channel a detector false-fire cannot
+# corroborate, so this cull fires INDEPENDENT of the absence machinery
+# (cull_enabled). CullStubPredictor masks are 4 px wide.
+# ---------------------------------------------------------------------------
+
+def _track_with_expected_px(stub, expected_px_fn, **overrides):
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+    kwargs = dict(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        # Corroborate both objects at every boundary: the size cull must be
+        # able to evict a DETECTOR-CORROBORATED mask (YOLO false-fires on the
+        # equipment itself), which the absence cull structurally cannot.
+        detect_fn=lambda *_a: [stub._rect_for(1), stub._rect_for(2)],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=False,
+        project_fn=lambda box: bottom_center(box),
+        expected_px_fn=expected_px_fn,
+        diagnostics=diag,
+    )
+    kwargs.update(overrides)
+    result = tracker.track(**kwargs)
+    return result, diag
+
+
+def test_size_prior_cull_evicts_oversized_mask():
+    """A 4-px mask whose expected width is 1 px (ratio 4.0 > hi 3.0) for 3
+    consecutive boundaries is culled when size_prior_cull=True, even though the
+    detector corroborates it at every boundary."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: 1.0,
+        size_prior_cull=True, size_prior_boundaries=3)
+    culled = [e for e in diag._events if e.get("event") == "sam2.object_culled"]
+    assert culled, f"expected a size-prior cull, got none: {diag._events}"
+    assert all(e.get("reason") == "size_prior_violation" for e in culled)
+    # Both objects are oversized; both should be gone by the final frame.
+    assert 1 not in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_disabled_by_default_keeps_object():
+    """Same oversized scenario with the default size_prior_cull=False leaves
+    the object tracked."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: 1.0, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_never_culls_unmeasurable():
+    """expected_px_fn returning None (no calibration pose at that position) is
+    unmeasurable, never a violation — the object survives with the cull on."""
+    stub = CullStubPredictor()
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=lambda xy: None,
+        size_prior_cull=True, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_size_prior_cull_requires_sustained_violation():
+    """A single-boundary violation (expected width dips only at the first
+    boundary) does not reach the size_prior_boundaries threshold, so the object
+    is spared."""
+    stub = CullStubPredictor()
+    calls = {"n": 0}
+
+    def expected_px_fn(xy):
+        calls["n"] += 1
+        # ratio 4.0 (violation) for the first boundary's two objects, then
+        # ratio 1.0 (in-band) — one violating boundary can't reach 3-in-a-row.
+        return 1.0 if calls["n"] <= 2 else 4.0
+
+    result, diag = _track_with_expected_px(
+        stub, expected_px_fn=expected_px_fn,
+        size_prior_cull=True, size_prior_boundaries=3)
+    assert not [e for e in diag._events
+                if e.get("event") == "sam2.object_culled"]
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 in result[stub.NUM_FRAMES - 1]

@@ -89,6 +89,7 @@ class DiagnosticReasons:
     MASK_IMPLAUSIBLE = "mask_implausible"
     DETECTOR_ABSENT_STATIONARY = "detector_absent_stationary"
     PERSON_OVERLAP = "person_overlap"
+    SIZE_PRIOR_VIOLATION = "size_prior_violation"
     ALREADY_TRACKED = "already_tracked"
     EVICTED_FOR_NEW_DETECTION = "evicted_for_new_detection"
     STATIC_STRUCTURE = "static_structure"

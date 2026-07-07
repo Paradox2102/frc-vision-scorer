@@ -133,6 +133,46 @@ def test_seed_box_max_aspect_range_validation():
         JobConfig({"seed_box_max_aspect": 21})
 
 
+def test_size_prior_cull_knobs_default_off(monkeypatch):
+    # Geometric hijack cull: equipment hijacks are YOLO-corroborated, so only a
+    # size violation catches them. DEFAULT OFF pending A/B.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.size_prior_cull is False
+    assert cfg.size_prior_hi == 3.0
+    assert cfg.size_prior_lo == 0.25
+    assert cfg.size_prior_boundaries == 3
+
+
+def test_size_prior_cull_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("SIZE_PRIOR_CULL_ENABLED", "1")
+    monkeypatch.setenv("SIZE_PRIOR_HI", "4.0")
+    monkeypatch.setenv("SIZE_PRIOR_LO", "0.2")
+    monkeypatch.setenv("SIZE_PRIOR_BOUNDARIES", "2")
+    cfg = JobConfig()
+    assert cfg.size_prior_cull is True
+    assert cfg.size_prior_hi == 4.0
+    assert cfg.size_prior_lo == 0.2
+    assert cfg.size_prior_boundaries == 2
+    # Per-job override (form fields arrive as strings) beats env.
+    cfg2 = JobConfig({"size_prior_cull": "0", "size_prior_hi": "5.0",
+                      "size_prior_lo": "0.1", "size_prior_boundaries": "4"})
+    assert cfg2.size_prior_cull is False
+    assert cfg2.size_prior_hi == 5.0
+    assert cfg2.size_prior_lo == 0.1
+    assert cfg2.size_prior_boundaries == 4
+
+
+def test_size_prior_cull_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_hi": 0.5})   # min 1.0
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_lo": 1.5})   # max 1.0
+    with pytest.raises(ValueError):
+        JobConfig({"size_prior_boundaries": 0})  # min 1
+
+
 def test_mask_leak_cleanup_default_and_override(monkeypatch):
     # qm11/qm10/qm12 gated leak cleanup: drop a mask component only if it is
     # BOTH small AND detached, so a leak onto adjacent structure can't stretch

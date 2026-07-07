@@ -258,6 +258,138 @@ def test_reprompt_respects_max_objects_cap():
     assert set(result[5].keys()) == {1, 2}
 
 
+# ---------------------------------------------------------------------------
+# qm12 lever 2 — opening-window dense reprompt
+# ---------------------------------------------------------------------------
+
+class _LongRepromptStub(RepromptStubPredictor):
+    """RepromptStubPredictor with more frames, for observing boundary spacing."""
+    NUM_FRAMES = 12
+
+
+def _new_obj_seed_frame(add_calls, obj_id):
+    """Frame index at which obj_id was first seeded, or None."""
+    for f_idx, oid in add_calls:
+        if oid == obj_id:
+            return f_idx
+    return None
+
+
+def test_opening_dense_reprompt_seeds_new_robot_sooner():
+    """During the opening window a smaller reprompt step seeds a newly
+    detected robot at an EARLIER frame than the normal reprompt interval."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    overlap_box = RepromptStubPredictor()._rect_for(1)  # matches tracked obj 1
+    new_box = RepromptStubPredictor()._rect_for(3)      # unmatched -> new robot
+
+    def make_detect_fn():
+        # The new robot only becomes visible from frame 1 onward. With the
+        # normal step (reprompt_every=2) the first boundary at/after frame 1
+        # is frame 2; the dense step (1) has a boundary AT frame 1.
+        def detect_fn(local_idx, frame_path):
+            boxes = [(overlap_box, "blue")]
+            if local_idx >= 1:
+                boxes.append((new_box, "red"))
+            return boxes
+        return detect_fn
+
+    def run(dense):
+        stub = RepromptStubPredictor()
+        tracker = Sam2FieldTracker(predictor=stub)
+        kwargs = dict(
+            frames_dir="ignored_by_stub",
+            prompt_idx=0,
+            prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+            reprompt_every=2,
+            detect_fn=make_detect_fn(),
+            object_metadata={1: "blue", 2: "red"},
+            max_objects=6,
+        )
+        if dense:
+            kwargs["opening_reprompt_every"] = 1
+            kwargs["opening_window_frames"] = RepromptStubPredictor.NUM_FRAMES
+        tracker.track(**kwargs)
+        return _new_obj_seed_frame(stub.add_calls, 3)
+
+    normal_seed = run(dense=False)
+    dense_seed = run(dense=True)
+
+    assert normal_seed == 2, f"expected normal seed at frame 2, got {normal_seed}"
+    assert dense_seed == 1, f"expected dense seed at frame 1, got {dense_seed}"
+    assert dense_seed < normal_seed
+
+
+def test_opening_window_reverts_after_window():
+    """The dense step applies only while (cursor-bootstrap_idx) <
+    opening_window_frames; later chunks fall back to reprompt_every."""
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = _LongRepromptStub()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diagnostics = IdentityDiagnosticRecorder()
+
+    tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=3,
+        detect_fn=lambda *_a: [stub._rect_for(1), stub._rect_for(2)],
+        object_metadata={1: "blue", 2: "red"},
+        max_objects=6,
+        opening_reprompt_every=1,
+        opening_window_frames=2,   # only cursor 0,1 are inside the window
+        diagnostics=diagnostics,
+    )
+
+    boundaries = [ev["details"]["end_frame"]
+                  for ev in diagnostics._events
+                  if ev["event"] == "sam2.chunk_complete"]
+
+    # Dense while (cursor-bootstrap) < 2: cursor 0 -> end 1. Then cursor 2 is
+    # outside the window, so step reverts to reprompt_every=3: 2 -> 5, 6 -> 9,
+    # 10 -> 11. Early boundary spacing is small (1), later spacing is normal (3+).
+    assert boundaries[0] == 1, f"first boundary should be dense (frame 1), got {boundaries}"
+    assert boundaries == [1, 5, 9, 11], f"unexpected boundary sequence: {boundaries}"
+
+
+def test_opening_dense_disabled_by_default():
+    """With the feature off (default kwargs) the add_calls and chunk boundaries
+    are byte-identical to a run that never knew about the feature."""
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    def run(**extra):
+        stub = _LongRepromptStub()
+        tracker = Sam2FieldTracker(predictor=stub)
+        diagnostics = IdentityDiagnosticRecorder()
+        tracker.track(
+            frames_dir="ignored_by_stub",
+            prompt_idx=0,
+            prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+            reprompt_every=3,
+            detect_fn=lambda *_a: [stub._rect_for(1), stub._rect_for(2),
+                                   stub._rect_for(3)],
+            object_metadata={1: "blue", 2: "red"},
+            max_objects=6,
+            diagnostics=diagnostics,
+            **extra,
+        )
+        boundaries = [ev["details"]["end_frame"]
+                      for ev in diagnostics._events
+                      if ev["event"] == "sam2.chunk_complete"]
+        return list(stub.add_calls), boundaries
+
+    # Baseline: feature never mentioned.
+    base_adds, base_boundaries = run()
+    # Explicitly-off: both knobs 0 (== the resolved default).
+    off_adds, off_boundaries = run(opening_reprompt_every=0, opening_window_frames=0)
+
+    assert off_adds == base_adds
+    assert off_boundaries == base_boundaries
+
+
 def test_empty_initial_prompt_bootstraps_from_later_detection(tmp_path):
     from web.field.sam2_tracker import Sam2FieldTracker
 
@@ -2288,3 +2420,242 @@ def test_corrob_gate_error_fails_open():
     )
     assert 2 not in _culled_ids(diag)
     assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+# ---------------------------------------------------------------------------
+# Seed-box aspect gate + motion-required eviction (qm12 static-sliver fix).
+#
+# In match 86d6e154 qm12 a static vertical sliver on the blue hub face
+# (box [320.8, 145.0, 334.5, 206.1] — aspect h/w = 4.47) recurred at every
+# chunk boundary. Once unmatched on a capped roster it EVICTED a real robot
+# object to seed itself, then emitted mask_implausible masks for 7 frames.
+# The two gates below stop that: reject a geometrically implausible seed box
+# before it can seed OR evict, and (separately) require motion evidence before
+# a candidate may evict a tracked object.
+# ---------------------------------------------------------------------------
+
+
+def test_plausible_seed_box_rejects_tall_thin_sliver():
+    from web.field.sam2_tracker import plausible_seed_box
+    # The qm12 sliver: 13.7w x 61.1h, aspect 4.47 — rejected at max_aspect=3.0.
+    assert plausible_seed_box((320.8, 145.0, 334.5, 206.1), 3.0) is False
+
+
+def test_plausible_seed_box_keeps_square_box():
+    from web.field.sam2_tracker import plausible_seed_box
+    # A 4x4 robot box (aspect 1.0) is kept.
+    assert plausible_seed_box((10, 2, 14, 6), 3.0) is True
+
+
+def test_plausible_seed_box_keeps_wide_box():
+    from web.field.sam2_tracker import plausible_seed_box
+    # A wide box (aspect < 1) is kept.
+    assert plausible_seed_box((10, 2, 40, 10), 3.0) is True
+
+
+def test_plausible_seed_box_rejects_degenerate_box():
+    from web.field.sam2_tracker import plausible_seed_box
+    assert plausible_seed_box((10, 2, 10, 6), 3.0) is False   # zero width
+    assert plausible_seed_box((10, 6, 14, 6), 3.0) is False   # zero height
+    assert plausible_seed_box((14, 6, 10, 2), 3.0) is False   # inverted
+
+
+def test_plausible_seed_box_keeps_tall_box_just_under_threshold():
+    from web.field.sam2_tracker import plausible_seed_box
+    # 4w x 11h -> aspect 2.75 < 3.0 -> kept.
+    assert plausible_seed_box((10, 2, 14, 13), 3.0) is True
+
+
+# A tall-thin candidate box for the tracker tests: 4w x 28h -> aspect 7.0, at
+# x in [150, 154) which overlaps no tracked object (objs 1,2 live at x 10, 20).
+_SLIVER_BOX = (150, 2, 154, 30)
+
+
+def test_implausible_seed_box_never_seeds_or_evicts():
+    """A tall-thin static detection must not seed a new object NOR evict a real
+    track, even when the roster is capped and the sliver is unmatched."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Obj 1 corroborated every boundary; obj 2 never; plus the tall-thin
+        # unmatched sliver (would evict obj 2 without the gate).
+        return [(stub._rect_for(1), "blue"), (_SLIVER_BOX, "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, seed_box_max_aspect=3.0,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    # No eviction of any object.
+    assert _culled_ids(diag) == set()
+    # Obj 3 (the sliver's would-be id) is never added.
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    # A distinguishable rejection diagnostic was recorded.
+    rejects = [e for e in diag._events
+               if e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "implausible_seed_box"]
+    assert rejects, "expected an implausible_seed_box rejection"
+    # The gate does nothing else: obj 2 survives.
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+def test_seed_box_gate_disabled_by_default():
+    """With the gate off (default kwargs) the identical scenario evicts obj 2
+    and seeds obj 3 — proves default behavior is unchanged."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (_SLIVER_BOX, "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,  # seed_box_max_aspect defaults OFF
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert 2 in _culled_ids(diag)
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+    assert 3 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+
+
+def test_static_candidate_cannot_evict_when_motion_required():
+    """With evict_requires_motion=True and a motion_fn reporting the candidate
+    static, eviction is skipped (candidate falls through to roster_cap). With
+    motion_fn reporting motion, eviction proceeds."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+
+    # --- static candidate: no eviction ---
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # Obj 1 corroborated; obj 2 never; a plausible unmatched new robot.
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        evict_requires_motion=True,
+        motion_fn=lambda local_idx, box: False,  # candidate is static
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert _culled_ids(diag) == set()
+    assert all(oid != 3 for (_f, oid) in stub.add_calls)
+    assert any(e.get("event") == "sam2.object_culled" for e in diag._events) is False
+    assert any(e.get("event") == "sam2.eviction_skipped"
+               and e.get("reason") == "static_candidate" for e in diag._events)
+    assert any(e.get("event") == "sam2.reprompt_rejected"
+               and e.get("reason") == "roster_cap" for e in diag._events)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+    # --- moving candidate: eviction proceeds ---
+    stub2 = CullStubPredictor()
+    tracker2 = Sam2FieldTracker(predictor=stub2)
+    diag2 = _ident_diag()
+    tracker2.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub2._rect_for(1), stub2._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        evict_requires_motion=True,
+        motion_fn=lambda local_idx, box: True,  # candidate is moving
+        project_fn=lambda box: bottom_center(box), diagnostics=diag2,
+    )
+    assert 2 in _culled_ids(diag2)
+    assert any(oid == 3 for (_f, oid) in stub2.add_calls)
+
+
+def test_evict_requires_motion_noop_without_motion_fn():
+    """evict_requires_motion=True with motion_fn=None must NOT disable eviction
+    — the gate only blocks when motion evidence is actually available."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        return [(stub._rect_for(1), "blue"), (stub._rect_for(15), "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20,
+        cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        evict_requires_motion=True, motion_fn=None,  # no motion probe
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    # Eviction proceeds exactly as today.
+    assert 2 in _culled_ids(diag)
+    assert any(oid == 3 for (_f, oid) in stub.add_calls)
+    assert 3 in result[stub.NUM_FRAMES - 1]
+    assert not any(e.get("event") == "sam2.eviction_skipped"
+                   for e in diag._events)
+
+
+def test_bootstrap_rejects_implausible_seed_box(tmp_path):
+    """The bootstrap seeding path also filters implausible boxes: a tall-thin
+    box in the first detection is skipped while a plausible box is seeded."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    for idx in range(CullStubPredictor.NUM_FRAMES):
+        (tmp_path / f"{idx:05d}.jpg").touch()
+
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 0:
+            # A tall-thin sliver (rejected) and a plausible robot box (seeded).
+            return [(_SLIVER_BOX, "red"), (stub._rect_for(1), "blue")]
+        return []
+
+    metadata = {}
+    result = tracker.track(
+        frames_dir=str(tmp_path),
+        prompt_idx=0,
+        prompt_boxes=[],
+        reprompt_every=2,
+        detect_fn=detect_fn,
+        object_metadata=metadata,
+        max_active_objects=6,
+        max_lifetime_objects=20,
+        seed_box_max_aspect=3.0,
+    )
+    # Exactly one object bootstrapped, from the plausible box (obj 1), not the
+    # sliver. It sits at obj 1's location, not the sliver's x.
+    assert stub.add_calls == [(0, 1)]
+    assert metadata == {1: "blue"}
+    assert 1 in result[CullStubPredictor.NUM_FRAMES - 1]

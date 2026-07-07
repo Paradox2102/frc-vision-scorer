@@ -48,9 +48,20 @@ KNOBS = [
     # upsamples (no information) and inflates mask RAM.
     Knob("sam2_export_scale", "SAM2_EXPORT_SCALE", float, 0.5, min=0.25, max=1.0),
     Knob("sam2_max_gpu_frames", "SAM2_MAX_GPU_FRAMES", int, 0, min=0),
-    Knob("sam2_prompt_offset_seconds", "SAM2_PROMPT_OFFSET_SECONDS", float, 3.0,
+    # Seed at the active-period open (0.0) rather than +3s: the +3s single seed
+    # left clock 0:20->0:17 untracked and missed robots still en route. Validated
+    # 2026-07-06 as lever 2 across qm8/10/11/12 (agg meanNN improved on every
+    # match; 6800/870 late-start robots now seed at ~0 lag).
+    Knob("sam2_prompt_offset_seconds", "SAM2_PROMPT_OFFSET_SECONDS", float, 0.0,
          min=0.0),
     Knob("reprompt_seconds", "REPROMPT_SECONDS", float, 2.0, min=0.1),
+    # qm12 0:20-0:16 — during the first `opening_window_seconds` of active
+    # tracking, re-prompt every `opening_reprompt_seconds` (denser than
+    # reprompt_seconds) so robots streaming into center seed within a fraction
+    # of a second instead of waiting a full ~2s boundary; 0 on either disables.
+    # DEFAULT ON (0.5s / 6s) — validated 2026-07-06, no cross-match regression.
+    Knob("opening_reprompt_seconds", "OPENING_REPROMPT_SECONDS", float, 0.5, min=0.0),
+    Knob("opening_window_seconds", "OPENING_WINDOW_SECONDS", float, 6.0, min=0.0),
     # Motion override: frame-diff pixel motion as positive robot evidence at
     # re-prompt boundaries — a moving detection claimed by a stationary mask
     # seeds anyway, and may evict a stationary once-absent object from a
@@ -137,6 +148,18 @@ KNOBS = [
     Knob("dark_reanchor_enabled", "SAM2_DARK_REANCHOR_ENABLED", bool, True),
     Knob("evict_dark_frames", "SAM2_EVICT_DARK_FRAMES", int, 8, min=1),
     Knob("evict_min_absences", "SAM2_EVICT_MIN_ABSENCES", int, 2, min=1),
+    # Seed-box plausibility gate: a detection box taller than this aspect
+    # (h/w) may not seed, re-anchor, or evict at SAM reprompt boundaries; 0
+    # disables. qm12 hub-face sliver (aspect 4.47) evicted a real track.
+    # DEFAULT ON (3.0) — validated 2026-07-06; blocked the sliver hijack with
+    # no cross-match regression (rejects only geometrically-impossible boxes).
+    Knob("seed_box_max_aspect", "SEED_BOX_MAX_ASPECT", float, 3.0, min=0.0, max=20.0),
+    # Capped-roster eviction requires the candidate detection to prove pixel
+    # motion when a motion probe is available (motion_override); static
+    # candidates fall through to roster_cap rejection. No-op without
+    # motion_fn. qm12: a static hub-face sliver evicted a real robot.
+    # DEFAULT ON — validated 2026-07-06 (no-op unless motion_override is also on).
+    Knob("evict_requires_motion", "EVICT_REQUIRES_MOTION", bool, True),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm")),

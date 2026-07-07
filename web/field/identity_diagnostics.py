@@ -25,6 +25,7 @@ class DiagnosticEvents:
     SAM2_MOTION_OVERRIDE = "sam2.motion_override"
     SAM2_DETECTOR_ERROR = "sam2.detector_error"
     SAM2_COLOR_BACKFILLED = "sam2.color_backfilled"
+    SAM2_EVICTION_SKIPPED = "sam2.eviction_skipped"
 
     # Fusion
     FUSION_ASSIGNMENT = "fusion.assignment"
@@ -91,6 +92,11 @@ class DiagnosticReasons:
     ALREADY_TRACKED = "already_tracked"
     EVICTED_FOR_NEW_DETECTION = "evicted_for_new_detection"
     STATIC_STRUCTURE = "static_structure"
+    # qm12 static-sliver fix: a candidate seed box too tall-and-thin to be a
+    # robot (rejected before it can seed or evict), and a static candidate
+    # barred from evicting a tracked object when eviction requires motion.
+    IMPLAUSIBLE_SEED_BOX = "implausible_seed_box"
+    STATIC_CANDIDATE = "static_candidate"
 
 
 ALL_EVENTS = {getattr(DiagnosticEvents, k) for k in dir(DiagnosticEvents) if not k.startswith("_")}

@@ -138,6 +138,34 @@ EVICT_MIN_ABSENCES = int(os.environ.get("SAM2_EVICT_MIN_ABSENCES", "2"))
 # bumper clipping the mask; two agreeing in a row is deliberate evidence.
 COLOR_BACKFILL_VOTES = int(os.environ.get("SAM2_COLOR_BACKFILL_VOTES", "2"))
 
+# Seed-box aspect gate + motion-required eviction (qm12 static-sliver fix).
+# In match 86d6e154 qm12 a static vertical sliver detection on the blue hub
+# face — box [320.8, 145.0, 334.5, 206.1], 13.7w x 61.1h, aspect h/w = 4.47 —
+# recurred at every chunk boundary. Once it became unmatched on a capped
+# roster it EVICTED a real robot object to seed itself, then emitted
+# mask_implausible masks for 7 straight frames. Two independent gates close
+# the two enabling holes:
+#   1. A candidate seed BOX that is geometrically impossible for a robot
+#      (too tall-and-thin) is rejected before it can re-anchor, seed, OR
+#      evict — the aspect gate previously only guarded SAM OUTPUT masks.
+#   2. Eviction may require the candidate to show real pixel motion, so a
+#      STATIC detection can never displace a tracked robot.
+# Both DEFAULT OFF pending an A/B gate — the existing behavior is unchanged
+# until a per-job override or env var turns them on.
+SEED_BOX_MAX_ASPECT = float(os.environ.get("SAM2_SEED_BOX_MAX_ASPECT", "0"))   # <=0 disables
+EVICT_REQUIRES_MOTION = os.environ.get("SAM2_EVICT_REQUIRES_MOTION", "0") not in ("0", "false", "False")
+
+# Opening-window dense reprompt (qm12 0:20-0:16 fix). Robots stream into the
+# center during the first couple seconds after the active period opens, but the
+# tracker only re-seeds new objects at chunk boundaries spaced reprompt_every
+# frames apart (default ~2s), so a robot arriving mid-opening waits up to a full
+# boundary to be tracked. When both are > 0, chunks that START within the first
+# OPENING_WINDOW_FRAMES of tracking use the smaller OPENING_REPROMPT_EVERY step
+# so those robots seed within a fraction of a second; after the window the
+# normal reprompt_every resumes. Both 0 (default) leaves behavior byte-identical.
+OPENING_REPROMPT_EVERY = int(os.environ.get("SAM2_OPENING_REPROMPT_EVERY", "0"))   # 0 disables
+OPENING_WINDOW_FRAMES = int(os.environ.get("SAM2_OPENING_WINDOW_FRAMES", "0"))
+
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the tight bounding box of nonzero pixels as (x1, y1, x2, y2).
@@ -191,6 +219,29 @@ def plausible_robot_mask(
     band = max(1, int(round(h * base_band_frac)))
     base_width = int(row_widths[-band:].max())
     return (base_width / widest) >= min_base_ratio
+
+
+def plausible_seed_box(box, max_aspect: float) -> bool:
+    """Return False for a detection box too tall-and-thin to be a robot.
+
+    A robot's detection box is roughly as wide as it is tall; a field fixture
+    (the qm12 hub-face sliver was 13.7w x 61.1h, aspect 4.47) is a narrow
+    vertical stripe. This is a cheap pre-check on the *candidate box* — the
+    complement of :func:`plausible_robot_mask`, which only ever ran on SAM
+    output masks. Applied before a box may re-anchor, seed a new object, or
+    evict a tracked one, so a geometrically impossible detection does nothing.
+
+    Rejects when height/width > ``max_aspect``. A degenerate box (width or
+    height <= 0) is also rejected. Callers gate on ``max_aspect > 0``; this
+    helper does not check that, so passing a non-positive ``max_aspect`` here
+    would reject everything (never done — the call sites bypass it when off).
+    """
+    x1, y1, x2, y2 = box
+    w = float(x2) - float(x1)
+    h = float(y2) - float(y1)
+    if w <= 0 or h <= 0:
+        return False
+    return (h / w) <= max_aspect
 
 
 def bottom_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -697,6 +748,10 @@ class Sam2FieldTracker:
         reanchor_max_boundary_gap: int = REANCHOR_MAX_BOUNDARY_GAP,
         reanchor_max_jump_m: float = REANCHOR_MAX_JUMP_M,
         reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
+        seed_box_max_aspect: float = SEED_BOX_MAX_ASPECT,
+        evict_requires_motion: bool = EVICT_REQUIRES_MOTION,
+        opening_reprompt_every: int | None = None,
+        opening_window_frames: int | None = None,
         seed_gate_fn=None,
         corrob_gate_fn=None,
         project_fn=None,
@@ -771,6 +826,37 @@ class Sam2FieldTracker:
                 new id — preserving identity across propagation collapse.
             reanchor_ios: Min IoS (over smaller) of the sliver mask vs the
                 detection box required to re-anchor.
+            seed_box_max_aspect: When > 0, a candidate detection box whose
+                height/width exceeds this ratio (a tall-thin field sliver, not
+                a robot) is rejected at every chunk boundary before it can
+                re-anchor, seed a new object, or evict a tracked one, and at
+                bootstrap. ``0`` (the default) disables the gate — behavior is
+                unchanged. See :func:`plausible_seed_box`. Rejections record a
+                ``reprompt_rejected`` diagnostic with reason
+                ``implausible_seed_box``.
+            evict_requires_motion: When True AND a ``motion_fn`` is supplied, a
+                capped-roster candidate that shows no pixel motion may not evict
+                any tracked object — the eviction is skipped (the candidate then
+                falls through to the normal ``roster_cap`` rejection) and an
+                ``eviction_skipped``/``static_candidate`` diagnostic is
+                recorded. When ``motion_fn`` is None this gate is inert (motion
+                evidence is unavailable, so eviction proceeds exactly as today).
+                Default False.
+            opening_reprompt_every: qm12 opening-window dense reprompt. When this
+                and ``opening_window_frames`` are both > 0, chunks that START
+                within the first ``opening_window_frames`` of tracking propagate
+                ``min(reprompt_every, opening_reprompt_every)`` frames instead of
+                the full ``reprompt_every`` — new robots streaming into the
+                center during the period opening (clock 0:20-0:16) seed within a
+                fraction of a second instead of waiting a full ~2s boundary.
+                After the window the normal ``reprompt_every`` resumes. ``None``
+                resolves to ``OPENING_REPROMPT_EVERY``; 0 (default) disables the
+                dense step, leaving behavior byte-identical.
+            opening_window_frames: Length of the dense-reprompt window, in
+                processed frames measured from ``bootstrap_idx`` (the cursor
+                origin). ``None`` resolves to ``OPENING_WINDOW_FRAMES``; 0
+                (default) disables. Only meaningful together with
+                ``opening_reprompt_every``.
             motion_fn: Optional ``(local_idx, box) -> bool``; True means the
                 detection box shows real pixel motion at this boundary (e.g.
                 frame-diff energy above threshold). Motion is positive
@@ -873,6 +959,9 @@ class Sam2FieldTracker:
         self._processed_count = 0
 
         reprompting = bool(reprompt_every) and detect_fn is not None
+        # qm12 opening-window dense reprompt knobs (None -> module default).
+        oe = opening_reprompt_every if opening_reprompt_every is not None else OPENING_REPROMPT_EVERY
+        ow = opening_window_frames if opening_window_frames is not None else OPENING_WINDOW_FRAMES
         detected = []
         detect_fn_error_logged = False  # first-error print guard (one line per track())
         motion_fn_error_logged = False  # same guard for motion_fn
@@ -909,6 +998,15 @@ class Sam2FieldTracker:
                 except Exception:
                     detected = []
                 bootstrap_boxes, bootstrap_metadata = _normalize_detections(detected)
+                if seed_box_max_aspect > 0:
+                    # A geometrically implausible box (tall-thin field sliver)
+                    # can never *found* an object, so drop it before seeding.
+                    gated = [
+                        (b, m) for b, m in zip(bootstrap_boxes, bootstrap_metadata)
+                        if plausible_seed_box(b, seed_box_max_aspect)
+                    ]
+                    bootstrap_boxes = [b for b, _m in gated]
+                    bootstrap_metadata = [m for _b, m in gated]
                 if seed_gate_fn is not None:
                     gated = [
                         (b, m) for b, m in zip(bootstrap_boxes, bootstrap_metadata)
@@ -1119,7 +1217,16 @@ class Sam2FieldTracker:
                 cursor = bootstrap_idx
                 last_end = bootstrap_idx - 1
                 while True:
-                    last_idx = _record_chunk(cursor, reprompt_every)
+                    # qm12 opening-window: a chunk that STARTS within the first
+                    # `ow` frames of tracking (measured from bootstrap_idx, the
+                    # cursor origin) propagates a smaller step so robots
+                    # streaming into center at the period opening (0:20-0:16)
+                    # seed at the next dense boundary instead of waiting a full
+                    # reprompt_every. After the window the normal step resumes.
+                    step = reprompt_every
+                    if oe > 0 and ow > 0 and (cursor - bootstrap_idx) < ow:
+                        step = min(step, oe)
+                    last_idx = _record_chunk(cursor, step)
                     if last_idx is None or last_idx <= last_end:
                         break  # no forward progress -> end of video
                     last_end = last_idx
@@ -1508,6 +1615,25 @@ class Sam2FieldTracker:
                                     details={"frame_idx": last_idx, "box": list(box_val)},
                                 )
                         for j in new_indices:
+                            if seed_box_max_aspect > 0 and not plausible_seed_box(
+                                    new_boxes[j], seed_box_max_aspect):
+                                # A geometrically impossible detection (tall-thin
+                                # field sliver, qm12 hub face) must do NOTHING:
+                                # not re-anchor, not seed, not evict a real
+                                # track. Gate at the loop top covers the
+                                # motion-override additions to new_indices too.
+                                if diagnostics:
+                                    bx1, by1, bx2, by2 = int_boxes[j]
+                                    aspect = (round((by2 - by1) / (bx2 - bx1), 2)
+                                              if bx2 > bx1 else None)
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.reprompt_rejected",
+                                        reason="implausible_seed_box",
+                                        details={"frame_idx": last_idx,
+                                                 "box": list(new_boxes[j]),
+                                                 "aspect": aspect},
+                                    )
+                                continue
                             if reanchor_enabled and existing:
                                 # A detection is only in new_indices because no
                                 # healthy mask claimed it — but a color-consistent
@@ -1617,7 +1743,26 @@ class Sam2FieldTracker:
                             ]
                             roster_capped = len(active_objects) >= max_active_objects
                             lifetime_capped = (next_obj_id - 1) >= max_lifetime_objects
-                            if roster_capped and not lifetime_capped and evict_when_capped:
+                            # Motion-required eviction: a STATIC candidate must
+                            # not displace a tracked robot (qm12 — a static hub
+                            # sliver evicted a real object). Only blocks when
+                            # motion evidence is actually available; with
+                            # motion_fn None, _candidate_moving is always False
+                            # and this gate stays inert so eviction is unchanged.
+                            evict_blocked_static = (
+                                evict_requires_motion
+                                and motion_fn is not None
+                                and not _candidate_moving(j))
+                            if (roster_capped and not lifetime_capped
+                                    and evict_when_capped and evict_blocked_static):
+                                if diagnostics:
+                                    diagnostics.record(
+                                        f"{self.DIAG_PREFIX}.eviction_skipped",
+                                        reason="static_candidate",
+                                        details={"frame_idx": last_idx,
+                                                 "box": list(new_boxes[j])},
+                                    )
+                            elif roster_capped and not lifetime_capped and evict_when_capped:
                                 # An unmatched detection is concrete evidence a
                                 # roster slot is wrongly held. The roster keeps
                                 # the objects most likely to be robots: evict

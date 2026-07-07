@@ -99,6 +99,40 @@ def test_field_wireframe_overlay_default_and_override(monkeypatch):
     assert JobConfig({"field_wireframe_overlay": "1"}).field_wireframe_overlay is True
 
 
+def test_seed_gate_knobs_default_on(monkeypatch):
+    # qm12 fix landed as the default 2026-07-06 after cross-match validation
+    # (qm8/10/11/12): seed-box gate on, motion-gated eviction on, seed at the
+    # period open, and the opening-window dense reprompt on.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.seed_box_max_aspect == 3.0
+    assert cfg.evict_requires_motion is True
+    assert cfg.sam2_prompt_offset_seconds == 0.0
+    assert cfg.opening_reprompt_seconds == 0.5
+    assert cfg.opening_window_seconds == 6.0
+
+
+def test_seed_gate_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("SEED_BOX_MAX_ASPECT", "3.0")
+    monkeypatch.setenv("EVICT_REQUIRES_MOTION", "1")
+    cfg = JobConfig()
+    assert cfg.seed_box_max_aspect == 3.0
+    assert cfg.evict_requires_motion is True
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"seed_box_max_aspect": "4.47",
+                      "evict_requires_motion": "false"})
+    assert cfg2.seed_box_max_aspect == 4.47
+    assert cfg2.evict_requires_motion is False
+
+
+def test_seed_box_max_aspect_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"seed_box_max_aspect": -1})
+    with pytest.raises(ValueError):
+        JobConfig({"seed_box_max_aspect": 21})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

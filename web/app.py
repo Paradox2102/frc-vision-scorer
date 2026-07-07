@@ -3827,7 +3827,11 @@ class InferenceJob:
         for event in self.field_tracker.binding_events:
             if event["event"] == "slot_expired":
                 slot_id = event["slot_id"]
-                for ident in self.identity_registry.identities.values():
+                # Snapshot: the await below yields the event loop, and a
+                # concurrent coroutine can add/remove identities mid-iteration
+                # (qm11's heavy identity churn hit "dict changed size during
+                # iteration"). Iterating a list copy is stable across the await.
+                for ident in list(self.identity_registry.identities.values()):
                     if ident.active_slot == slot_id:
                         ident.active_slot = None
                         if not getattr(self, "_mock_db", False):
@@ -5382,6 +5386,11 @@ class InferenceJob:
                         eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
                         eff_fps /= view_stride
                         reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
+                        # qm12 opening-window dense reprompt (same eff_fps local-frame
+                        # space as reprompt_every). Both 0 -> feature off.
+                        opening_reprompt_every = (max(1, int(round(self.config.opening_reprompt_seconds * eff_fps)))
+                                                  if self.config.opening_reprompt_seconds > 0 else 0)
+                        opening_window_frames = int(round(self.config.opening_window_seconds * eff_fps))
 
                         # Build a projector mapping a SAM2 mask box (tracker/0.5x
                         # top-cropped pixel coords) to field meters, for the
@@ -5536,6 +5545,14 @@ class InferenceJob:
                             evict_dark_frames=scale_frame_knob(
                                 self.config.evict_dark_frames, view_stride),
                             evict_min_absences=self.config.evict_min_absences,
+                            # qm12 hub-face sliver: reject geometrically
+                            # implausible seed boxes, and require motion before
+                            # a static candidate may evict from the capped roster.
+                            seed_box_max_aspect=self.config.seed_box_max_aspect,
+                            evict_requires_motion=self.config.evict_requires_motion,
+                            # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
+                            opening_reprompt_every=opening_reprompt_every,
+                            opening_window_frames=opening_window_frames,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed

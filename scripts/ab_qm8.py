@@ -188,6 +188,36 @@ PROFILES = {
                            "motion_seed_blobs": True,
                            "seed_union_extent": True}),
     ],
+    # qm12 (86d6e154) root cause: a static vertical sliver on the blue hub
+    # face (box aspect h/w=4.47) seeded a SAM object and EVICTED a real robot
+    # from the capped roster. seed_box_max_aspect rejects implausibly tall
+    # seed boxes before they can seed/re-anchor/evict; evict_requires_motion
+    # keeps a non-moving candidate from evicting when motion evidence exists.
+    "seed-gate": [
+        ("baseline", {}),
+        ("seed-gate", {"seed_box_max_aspect": 3.0,
+                       "evict_requires_motion": True}),
+    ],
+    # qm12 lever 2 (opening-window dense reprompt) stacked on lever 1. B-only:
+    # the baseline A was scored in the seed-gate run just prior. Seeds at period
+    # start (offset 0) and re-prompts every 0.5s for the first 6s so robots
+    # streaming into center during 0:20-0:16 seed promptly instead of waiting a
+    # 2s boundary; lever-1 gates keep static junk out of the freed roster slots.
+    "seed-open": [
+        ("lever1+2", {"seed_box_max_aspect": 3.0, "evict_requires_motion": True,
+                      "sam2_prompt_offset_seconds": 0.0,
+                      "opening_reprompt_seconds": 0.5, "opening_window_seconds": 6.0}),
+    ],
+    # Full A/B pair (baseline + lever1+2) for cross-match regression checking
+    # before landing the seed-gate + opening-dense-reprompt config as a default.
+    # qm12 was the target match; run this on matches WITHOUT the hub-face sliver
+    # failure (qm8/qm10/qm11) to confirm the gates don't regress them.
+    "seed-open-ab": [
+        ("baseline", {}),
+        ("lever1+2", {"seed_box_max_aspect": 3.0, "evict_requires_motion": True,
+                      "sam2_prompt_offset_seconds": 0.0,
+                      "opening_reprompt_seconds": 0.5, "opening_window_seconds": 6.0}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

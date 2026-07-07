@@ -6449,6 +6449,10 @@ class InferenceJob:
                                     track_id=obj_id,
                                     embedding=det_embed,
                                     robot_crop_b64=robot_crop_b64,
+                                    # Payload only: SAM per-object confidence for
+                                    # this frame (None on the legacy detector path).
+                                    tracker_prob=(info.get("evidence") or {}).get(
+                                        "tracker_prob"),
                                 )
 
                                 # Defer the JPEG encode; only top-K chosen crops resolve.
@@ -6644,6 +6648,15 @@ class InferenceJob:
                         robot.last_seen_frame = frame_num
                         tracked_robot_boxes.append((t.slot_id, t.box))
                         if auto_core and auto_core[0] <= frame_num <= auto_core[1]:
+                            # Per-sample quality signals (payload only). `_occ` is
+                            # the merged occlusion dict keyed by slot_id; it may be
+                            # one frame stale (background-task schedule) — an honest
+                            # approximation for path-quality metrics. Store the
+                            # occlusion cause string when the bumper is occluded,
+                            # else None; tracker_prob is the SAM confidence of the
+                            # detection that measured this slot (None if absent).
+                            _occ_slot = (self._occ or {}).get(t.slot_id) or {}
+                            _tp = t.tracker_prob
                             self.autonomous_paths[self._slot_label(t.slot_id)].append({
                                 "frame_num": frame_num,
                                 "timestamp": round(
@@ -6653,6 +6666,12 @@ class InferenceJob:
                                     round(float(t.pos[0]), 4),
                                     round(float(t.pos[1]), 4),
                                 ],
+                                "corner_only": bool(t.corner_only),
+                                "occluded": (_occ_slot.get("cause")
+                                             if _occ_slot.get("bumper_occluded")
+                                             else None),
+                                "tracker_prob": (round(float(_tp), 4)
+                                                 if _tp is not None else None),
                             })
                     # Coasting tracks keep their stale last_position untouched.
 

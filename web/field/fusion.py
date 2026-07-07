@@ -282,7 +282,8 @@ def _merge_fused_group(group, ref_local: int) -> FusedObservation:
     rd = ref.detection
     det = FieldDetection(pos=rd.pos, color=rd.color, box=rd.box,
                          score=rd.score, track_id=rd.track_id, embedding=emb,
-                         robot_crop_b64=rd.robot_crop_b64)
+                         robot_crop_b64=rd.robot_crop_b64,
+                         tracker_prob=rd.tracker_prob)
     # Carry the registry's per-detection relink annotations forward if present.
     for attr in ("relink_margin", "relink_evidence"):
         if hasattr(rd, attr):
@@ -332,6 +333,12 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     # tracker because its output is drawn/cropped in main-view coordinates.
     # Corner-only observations remain visible in their own HUD panels and radar.
     box = main_members[0][1].box if main_members else None
+    # tracker_prob is PAYLOAD ONLY (path-sample quality). Carry the value from the
+    # max-weight member — the detection that most influenced the fused position —
+    # ignoring members with no prob. Never feeds fusion weights or the tracker.
+    prob_members = [(w, det.tracker_prob) for (cam, det, _crop, w) in cluster
+                    if det.tracker_prob is not None]
+    tracker_prob = max(prob_members)[1] if prob_members else None
     evidence = [(cam, crop, w, (float(det.pos[0]), float(det.pos[1])))
                 for (cam, det, crop, w) in cluster]
     # Keep one deterministic member key per camera. Same-camera duplicates are a
@@ -356,7 +363,7 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
         merged_embedding = None
 
     return FusedObservation(
-        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box, embedding=merged_embedding),
+        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box, embedding=merged_embedding, tracker_prob=tracker_prob),
         evidence=evidence,
         members=members,
     )

@@ -26,6 +26,11 @@ class FieldDetection:
     embedding: Optional[np.ndarray] = None
     # Masked whole-robot crop (base64 JPEG) behind `embedding`, for the gallery UI.
     robot_crop_b64: Optional[str] = None
+    # SAM tracker per-object confidence for this frame (SAM3 out_tracker_probs),
+    # or None. PAYLOAD ONLY — recorded onto the matched slot for path-sample
+    # quality metadata; it never enters cost, gating, fusion weights, or any
+    # tracking decision.
+    tracker_prob: Optional[float] = None
 
 
 @dataclass
@@ -39,6 +44,10 @@ class TrackOut:
     # Position currently sourced from corner cameras only (no main-view box).
     # Corner ground projections have poor range; the map flags these dots.
     corner_only: bool = False
+    # SAM tracker confidence of the detection that last measured this slot, or
+    # None (legacy / no prob / coasting-from-a-prob-less measurement). Payload
+    # only — see FieldDetection.tracker_prob.
+    tracker_prob: Optional[float] = None
 
 
 class _KF:
@@ -83,6 +92,10 @@ class _Track:
     coasting: bool = False
     active: bool = False
     corner_only: bool = False
+    # SAM tracker confidence of the detection that last measured this slot (payload
+    # only, for path-sample quality metadata). None until a prob-carrying
+    # detection measures the slot; left untouched while the slot coasts.
+    tracker_prob: Optional[float] = None
     # Went into coast while hub-occluded; stays set until re-acquired. Gates the
     # occlusion re-acquisition guard (suspect-zone detections need motion proof).
     occ_coasting: bool = False
@@ -496,6 +509,7 @@ class FieldTracker:
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
                 slot.corner_only = d.box is None
+                slot.tracker_prob = d.tracker_prob  # payload only
                 slot.missed = 0
                 slot.hits = 1
                 slot.coasting = False
@@ -527,6 +541,7 @@ class FieldTracker:
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
                 slot.corner_only = d.box is None
+                slot.tracker_prob = d.tracker_prob  # payload only
                 slot.missed = 0
                 slot.hits = 1
                 slot.coasting = False
@@ -558,6 +573,9 @@ class FieldTracker:
                 scale *= (speed / self.max_speed) ** 2
         t.kf.update(d.pos, r_scale=scale)
         t.corner_only = d.box is None
+        # Payload: record the measuring detection's SAM confidence on the slot.
+        # After the KF update so it can never feed back into the state estimate.
+        t.tracker_prob = d.tracker_prob
 
     def _best_assignment(self, cost):
         """Brute-force minimum-cost assignment for ≤3×3 cost matrices.
@@ -588,5 +606,6 @@ class FieldTracker:
                     t.slot_id, t.alliance, t.kf.pos, t.kf.vel,
                     t.box, "coasting" if t.coasting else "visible",
                     corner_only=t.corner_only,
+                    tracker_prob=t.tracker_prob,
                 ))
         return out

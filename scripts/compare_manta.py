@@ -38,7 +38,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.manta_client import GridCalibration, MantaClient, parse_auto_field  # noqa: E402
 from web.field.manta import match_number_from_key  # noqa: E402  (single source of truth)
-from web.field.path_quality import coverage, gap_segments, tracked_length_m  # noqa: E402
+from web.field.path_quality import (  # noqa: E402
+    coverage, gap_segments, quality_summary, tracked_length_m,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 DB_PATH = REPO / "frc_scorer.db"
@@ -102,6 +104,59 @@ def _directed_mean_nn(a: np.ndarray, b: np.ndarray) -> float:
     # (na, nb) pairwise distances; small auto paths so the dense matrix is fine.
     d = np.linalg.norm(a[:, None, :] - b[None, :, :], axis=2)
     return float(d.min(axis=1).mean())
+
+
+def _sample_weights(samples) -> np.ndarray:
+    """Per-sample confidence weights from ``tracker_prob``. A missing/None prob
+    weights 1.0 so legacy replays (no prob) reduce to the unweighted metric —
+    weighted == unweighted, preserving historical comparability."""
+    w = []
+    for s in samples:
+        p = s.get("tracker_prob")
+        w.append(float(p) if p is not None else 1.0)
+    return np.asarray(w, float)
+
+
+def weighted_mean_nn_m(ours: np.ndarray, truth: np.ndarray, samples) -> float:
+    """Mean nearest-neighbor distance from each of OUR points to the Manta path,
+    weighted by that sample's ``tracker_prob``. Unlike the symmetric unweighted
+    ``mean_nn_m``, this is directed (ours -> truth) so a low-confidence point can
+    be down-weighted; deleting a tracked point therefore cannot silently improve
+    the score, because the confidence-weighted contribution is surfaced. With all
+    probs None the weights are all 1.0 and this equals the plain directed mean NN.
+    """
+    ours = np.asarray(ours, float).reshape(-1, 2)
+    truth = np.asarray(truth, float).reshape(-1, 2)
+    nn = np.linalg.norm(ours[:, None, :] - truth[None, :, :], axis=2).min(axis=1)
+    w = _sample_weights(samples)
+    if len(w) != len(nn):
+        # Defensive: fall back to unweighted if counts disagree (shouldn't happen;
+        # samples and path_m come from the same slot record).
+        return float(nn.mean()) if len(nn) else 0.0
+    tot = float(w.sum())
+    return float((nn * w).sum() / tot) if tot > 0 else float(nn.mean())
+
+
+def quality_metrics(samples, ours: np.ndarray, truth: np.ndarray,
+                    coverage_frac: float | None = None) -> dict:
+    """Confidence-aware metrics added ALONGSIDE the unweighted PathMetrics.
+
+    Returns ``weighted_mean_nn_m`` (see :func:`weighted_mean_nn_m`),
+    ``coverage_conf`` (``coverage_frac`` x mean tracker_prob, or None when no
+    sample carries a prob), and the :func:`quality_summary` fields. The point:
+    a run that tracks less must not score better solely by deleting points —
+    confidence-weighted coverage makes the tradeoff visible.
+    """
+    qs = quality_summary(samples)
+    mean_prob = qs["mean_tracker_prob"]
+    cov_conf = (round(coverage_frac * mean_prob, 4)
+                if coverage_frac is not None and mean_prob is not None else None)
+    out = {
+        "weighted_mean_nn_m": round(weighted_mean_nn_m(ours, truth, samples), 3),
+        "coverage_conf": cov_conf,
+    }
+    out.update(qs)
+    return out
 
 
 def compare_paths(ours: np.ndarray, truth: np.ndarray) -> PathMetrics:
@@ -281,11 +336,16 @@ def assign_alliance(
                 samples = ours[(match_number, alliance, op)]["samples"]
                 cov = summarize_our_path(samples, window_s=window_s)
                 first_ts = min(s["timestamp"] for s in samples)
+                qm = quality_metrics(
+                    samples,
+                    ours[(match_number, alliance, op)]["path_m"],
+                    truth[(match_number, alliance, tp)]["path_m"],
+                    coverage_frac=cov.get("coverage_frac"))
                 pairs.append({
                     "our_slot": ours[(match_number, alliance, op)]["slot"],
                     "manta_pos": tp,
                     "manta_team": truth[(match_number, alliance, tp)]["team_number"],
-                    "flip_y": fy, **metrics.as_row(), **cov,
+                    "flip_y": fy, **metrics.as_row(), **cov, **qm,
                     "start_lag_s": round(first_ts - window_start, 4)
                                    if window_start is not None else None,
                 })
@@ -351,12 +411,15 @@ def main() -> None:
             results.append({"key": key, "matched": False, **ours[key], "path_m": None})
             continue
         flip_y, metrics, truth = scored
+        samples = ours[key]["samples"]
+        cov = summarize_our_path(samples)
         results.append({
             "match_number": match_number, "alliance": alliance, "position": pos,
             "slot": ours[key]["slot"], "match_key": ours[key]["match_key"],
             "manta_team": truth["team_number"], "flip_y": flip_y,
-            "matched": True, **metrics.as_row(),
-            **summarize_our_path(ours[key]["samples"]),
+            "matched": True, **metrics.as_row(), **cov,
+            **quality_metrics(samples, ours[key]["path_m"], truth["path_m"],
+                              coverage_frac=cov.get("coverage_frac")),
         })
 
     matched = [r for r in results if r.get("matched")]

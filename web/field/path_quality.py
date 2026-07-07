@@ -77,3 +77,35 @@ def coverage(timestamps, max_gap_s: float = 1.0, window_s: float | None = None) 
         "n_gaps": len(gaps),
         "max_gap_s": round(max(gaps), 4) if gaps else 0.0,
     }
+
+
+def quality_summary(samples) -> dict:
+    """Aggregate the per-sample quality signals attached to auto-path samples.
+
+    Newer samples carry ``tracker_prob`` (SAM per-object confidence, float or
+    None), ``corner_only`` (bool) and ``occluded`` (cause string or None). Legacy
+    replays predate these keys; such samples are EXCLUDED from the tracker_prob
+    aggregates (which are reported None with ``n_with_prob=0`` when none carry a
+    prob) and treated as not-corner-only / not-occluded for the flag fractions.
+    A sample with ``tracker_prob`` explicitly None counts as prob-less too.
+
+    Returns ``mean_tracker_prob``, ``min_tracker_prob``, ``frac_low_conf``
+    (prob < 0.5, over the prob-carrying samples), ``frac_corner_only``,
+    ``frac_occluded`` (over all samples), ``n_samples`` and ``n_with_prob``.
+    """
+    n = len(samples)
+    probs = [float(s["tracker_prob"]) for s in samples
+             if s.get("tracker_prob") is not None]
+    n_with_prob = len(probs)
+    corner = sum(1 for s in samples if s.get("corner_only"))
+    occ = sum(1 for s in samples if s.get("occluded"))
+    return {
+        "n_samples": n,
+        "n_with_prob": n_with_prob,
+        "mean_tracker_prob": round(sum(probs) / n_with_prob, 4) if probs else None,
+        "min_tracker_prob": round(min(probs), 4) if probs else None,
+        "frac_low_conf": (round(sum(1 for p in probs if p < 0.5) / n_with_prob, 4)
+                          if probs else None),
+        "frac_corner_only": round(corner / n, 4) if n else 0.0,
+        "frac_occluded": round(occ / n, 4) if n else 0.0,
+    }

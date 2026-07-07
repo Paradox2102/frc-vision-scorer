@@ -100,6 +100,10 @@ KNOBS = [
     # Default lowered 400->200 for 24GB cards: 400 peaked the whole card and OOM'd
     # when other state was co-resident (see web/field/sam3_tracker.py header).
     Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 200, min=16, max=2000),
+    # torch.compile for SAM3 mask propagation. First run pays inductor
+    # compile warm-up (cached on disk thereafter); A/B knob for the
+    # propagation stage that dominates tracking wall time.
+    Knob("sam3_compile", "SAM3_COMPILE", bool, False),
     # Corner-cam decimation: track corner views at track_fps/stride. SAM
     # propagation cost scales with frames/view (export resolution is NOT a
     # lever — the model resizes everything to a fixed square). Stride 2 cut

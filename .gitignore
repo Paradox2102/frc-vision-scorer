@@ -10,6 +10,10 @@ build/
 data/videos/
 data/frames/
 data/results/
+# Hard-negative / distill training datasets (images + YOLO caches) — kept local,
+# not in git (516MB); belong in dataset storage, not shared history.
+data/bumper_hardneg_2026cur/
+data/hub_zone_distill/
 models/*.pt
 models/*.onnx
 

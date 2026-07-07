@@ -24,6 +24,11 @@ echo "Logs: /tmp/frc-vllm.log"
 # kernels; vLLM's native torch sampler is fine for 64-token reads.
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
+# Mount the dev sleep routes (/sleep, /wake_up, /is_sleeping) that
+# web/vllm_lifecycle.py uses to offload the GPU pool between phases instead
+# of killing the process — this is what kills the ~60s per-job cold start.
+export VLLM_SERVER_DEV_MODE=1
+
 # min/max_pixels mirror the in-process AutoProcessor settings so both
 # providers feed the model identical resolutions.
 #
@@ -36,6 +41,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # script as its argument is relocation-proof.
 "$PROJECT_ROOT/.venv-vllm/bin/python" "$PROJECT_ROOT/.venv-vllm/bin/vllm" serve "$MODEL" \
   --port "$PORT" \
+  --enable-sleep-mode \
   --dtype float16 \
   --gpu-memory-utilization "$UTIL" \
   --max-model-len 8192 \

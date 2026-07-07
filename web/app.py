@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -641,7 +642,6 @@ def _sam2_checkpoint_present(size: str) -> bool:
 # propagate_in_video per chunk, which trips "accessing tensor output of CUDAGraphs that
 # has been overwritten").  Only safe with reprompt disabled.  Enable via SAM2_VOS_OPTIMIZED=1.
 SAM2_VOS_OPTIMIZED = os.environ.get("SAM2_VOS_OPTIMIZED", "0") not in ("0", "false", "False")
-SAM3_COMPILE = os.environ.get("SAM3_COMPILE", "0") not in ("0", "false", "False")
 SAM3_USE_FA3 = os.environ.get("SAM3_USE_FA3", "0") not in ("0", "false", "False")
 SAM3_CHECKPOINT = os.environ.get("SAM3_CHECKPOINT") or None
 
@@ -941,6 +941,33 @@ def _apply_gallery_vote(robot, gallery,
     return (verdict, team, sim)
 
 
+class _LazyCrop:
+    """Deferred bumper-crop encode. Detections carry one of these instead of an
+    eager base64 string; the VLM dispatcher resolves it only for the top-K
+    candidates it actually sends (most processed frames dispatch no read at
+    all, and each pass sends at most VLM_TOP_K of the ~6-18 per-frame crops).
+    Memoized so status payloads / crop capture reuse the first encode."""
+    __slots__ = ("_fn", "_done", "_val")
+
+    def __init__(self, fn):
+        self._fn = fn
+        self._done = False
+        self._val = None
+
+    def __call__(self):
+        if not self._done:
+            self._val = self._fn()
+            self._done = True
+            self._fn = None  # release the captured view frame
+        return self._val
+
+
+def _resolve_crop(crop):
+    """Evidence crops are either eager base64 strings (tests, corner sweep) or
+    _LazyCrop thunks (per-frame detections). Returns str or None."""
+    return crop() if callable(crop) else crop
+
+
 class InferenceJob:
     """Manages a single video inference job"""
     
@@ -1057,6 +1084,10 @@ class InferenceJob:
         # space; main's map equals sam2_source_to_local.
         self.sam2_view_source_to_local: Dict[str, Dict[int, int]] = {}
         self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
+        # Analysis-loop stage accumulators. Also (re)initialized in the run loop
+        # next to self.timings, but declared here so crop-encode timers work when
+        # _bumper_crop_b64 / _masked_robot_crop_b64 fire on early pre-loop paths.
+        self._loop_stage_s = defaultdict(float)
         # Per-job A/B knobs, all resolved through self.config (override > env >
         # default). The attributes survive because downstream plumbing and the
         # job-control endpoints read them directly.
@@ -1144,6 +1175,10 @@ class InferenceJob:
 
         # Claude Vision: track when we've called it during inference
         self._claude_vision_calls = 0
+        # Single-flight background handle for the VLM bumper-read pass. The read
+        # runs as an event-loop task (create_task) so frame processing never
+        # blocks on the 0.6-1.5s generate; only one pass is in flight at a time.
+        self._vlm_task = None
         self._claude_vision_max_calls = 20  # Max API calls per match during inference
         self._claude_vision_interval_sec = 5  # Call every 5 seconds until all identified
         self._claude_vision_last_time = 0.0  # Timestamp of last call
@@ -1284,6 +1319,23 @@ class InferenceJob:
                 for team in matching_teams:
                     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + vote_share
 
+    @contextmanager
+    def _stage(self, name):
+        """Accumulate wall time for one analysis-loop stage. Timers may nest
+        (sub-stages are also inside their parent's span); the report labels
+        which keys overlap. ~100ns overhead per use — negligible at 8fps."""
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            # Lazy-init: direct callers of _stage-wrapped methods (e.g. the
+            # VLM read pass exercised by unit tests) build the job via __new__
+            # and never enter the analysis loop that sets up the accumulator.
+            acc = getattr(self, "_loop_stage_s", None)
+            if acc is None:
+                acc = self._loop_stage_s = defaultdict(float)
+            acc[name] += time.perf_counter() - t0
+
     def _bumper_crop_b64(
         self,
         frame: np.ndarray,
@@ -1300,50 +1352,51 @@ class InferenceJob:
         the rejected crop is recorded as a vlm_filtered diagnostic (preserving the prior
         behavior of vision_identify_robots).
         """
-        x1, y1, x2, y2 = map(int, box)
-        fh, fw = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(fw, x2), min(fh, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
+        with self._stage("loop.crop_encode"):
+            x1, y1, x2, y2 = map(int, box)
+            fh, fw = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(fw, x2), min(fh, y2)
+            if x2 <= x1 or y2 <= y1:
+                return None
 
-        crop = (
-            frame[y1:y2, x1:x2]
-            if box_is_bumper
-            else bumper_crop(frame, (x1, y1, x2, y2))
-        )
-        if crop is None or crop.size == 0:
-            crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None
+            crop = (
+                frame[y1:y2, x1:x2]
+                if box_is_bumper
+                else bumper_crop(frame, (x1, y1, x2, y2))
+            )
+            if crop is None or crop.size == 0:
+                crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
 
-        score = legibility_score(crop)
-        if enforce_floor and score < LEGIBILITY_FLOOR:
-            # Record the rejected crop so the diagnostic view can show why this robot
-            # went unread.
-            if robot_id is not None:
-                try:
-                    _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    rejected_b64 = base64.b64encode(buf).decode('utf-8')
-                except Exception as e:
-                    print(f"  vlm_filtered: imencode failed for robot {robot_id}: {e}")
-                    rejected_b64 = ""
-                self.diagnostic.record_vlm_filtered(
-                    frame=self._current_frame, robot_id=robot_id,
-                    crop_b64=rejected_b64, legibility=score,
-                    reason="below_legibility_floor",
-                )
-            return None
+            score = legibility_score(crop)
+            if enforce_floor and score < LEGIBILITY_FLOOR:
+                # Record the rejected crop so the diagnostic view can show why this robot
+                # went unread.
+                if robot_id is not None:
+                    try:
+                        _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                        rejected_b64 = base64.b64encode(buf).decode('utf-8')
+                    except Exception as e:
+                        print(f"  vlm_filtered: imencode failed for robot {robot_id}: {e}")
+                        rejected_b64 = ""
+                    self.diagnostic.record_vlm_filtered(
+                        frame=self._current_frame, robot_id=robot_id,
+                        crop_b64=rejected_b64, legibility=score,
+                        reason="below_legibility_floor",
+                    )
+                return None
 
-        # Upscale so the bumper crop is at least ~384px tall (existing behavior).
-        if crop.shape[0] < 384:
-            scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
-            # LINEAR over CUBIC: 3-6x faster and the VLM is insensitive to
-            # upscale interpolation (unlike the OCR preprocess paths).
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-        _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        crop_b64 = base64.b64encode(buf).decode('utf-8')
-        return crop_b64, score
+            # Upscale so the bumper crop is at least ~384px tall (existing behavior).
+            if crop.shape[0] < 384:
+                scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
+                # LINEAR over CUBIC: 3-6x faster and the VLM is insensitive to
+                # upscale interpolation (unlike the OCR preprocess paths).
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            _, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            crop_b64 = base64.b64encode(buf).decode('utf-8')
+            return crop_b64, score
 
     def _masked_robot_crop_b64(self, frame: np.ndarray, box, mask=None):
         """Crop the whole SAM2-detected robot (background blacked out via `mask`),
@@ -1353,23 +1406,24 @@ class InferenceJob:
         DINOv2 embeds — so the gallery shows the whole robot, not the bumper band.
         Returns a base64 string, or None when the box is empty.
         """
-        x1, y1, x2, y2 = map(int, box)
-        fh, fw = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(fw, x2), min(fh, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        crop = _apply_mask(frame[y1:y2, x1:x2], mask)
-        if crop.size == 0:
-            return None
-        if crop.shape[0] < 192:
-            scale = max(2, int(np.ceil(192 / max(1, crop.shape[0]))))
-            # LINEAR over CUBIC: runs per detection per frame; display-only image.
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-        ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok:
-            return None
-        return base64.b64encode(buf).decode('utf-8')
+        with self._stage("loop.crop_encode"):
+            x1, y1, x2, y2 = map(int, box)
+            fh, fw = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(fw, x2), min(fh, y2)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            crop = _apply_mask(frame[y1:y2, x1:x2], mask)
+            if crop.size == 0:
+                return None
+            if crop.shape[0] < 192:
+                scale = max(2, int(np.ceil(192 / max(1, crop.shape[0]))))
+                # LINEAR over CUBIC: runs per detection per frame; display-only image.
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                return None
+            return base64.b64encode(buf).decode('utf-8')
 
     def _detect_whole_robots(self, frame: np.ndarray, with_balls: bool = False):
         """Run YOLO model on the frame, select only the whole-robot class, and
@@ -1618,14 +1672,13 @@ class InferenceJob:
             )
         paired = []
         for d in field_dets:
-            cb = self._bumper_crop_b64(
-                frame,
-                d.box,
-                enforce_floor=False,
-                box_is_bumper=self.bumper_model is not None,
-            )
-            crop_b64 = cb[0] if cb is not None else None
-            paired.append((d, crop_b64))
+            # Defer the JPEG encode: only the top-K candidates the VLM actually
+            # dispatches get resolved (see read_fused_bumper_numbers). Bind loop
+            # vars via default args to avoid late-binding capture bugs.
+            def _enc(_f=frame, _b=d.box, _bm=self.bumper_model is not None):
+                cb = self._bumper_crop_b64(_f, _b, enforce_floor=False, box_is_bumper=_bm)
+                return cb[0] if cb is not None else None
+            paired.append((d, _LazyCrop(_enc)))
         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
         return paired, person_boxes, person_boxes_all
 
@@ -1840,7 +1893,9 @@ class InferenceJob:
                 print(f"  Gallery-confirmed: Robot {slot_id} = Team {robot.team_number} "
                       f"(appearance {sim:.2f})")
 
-    async def read_fused_bumper_numbers(self, fused, requested_priorities: dict[int, float]) -> None:
+    async def read_fused_bumper_numbers(
+        self, fused, requested_priorities: dict[int, float], det_to_slot=None
+    ) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
         Accepts requested_priorities: dict mapping identity_id -> priority.
@@ -1848,7 +1903,70 @@ class InferenceJob:
         The VLM generate runs on a worker thread (CUDA releases the GIL) so the
         event loop keeps servicing websocket keepalives and pause/stop during a
         100-500ms read; all identity-state mutation stays on the loop.
+
+        The loop now schedules this as a background task (asyncio.create_task),
+        so the body starts running at the NEXT loop yield point — possibly after
+        the field tracker has advanced to a newer frame. det_to_slot lets the
+        caller pin the slot mapping to the scheduling frame (snapshotting
+        field_tracker.last_det_to_slot). When None (direct/synchronous callers,
+        incl. tests) it falls back to the live tracker attr.
+
+        The whole body is wrapped in the vlm.pass_async stage so the true
+        read-pass wall cost stays visible in the profile without implying it
+        blocks the loop.
         """
+        with self._stage("vlm.pass_async"):
+            await self._read_fused_bumper_numbers_impl(
+                fused, requested_priorities, det_to_slot)
+
+    def _schedule_vlm_pass(self, fused, due_priorities) -> None:
+        """Single-flight schedule of the background bumper-read pass.
+
+        Only one pass runs at a time. If a pass is already in flight this is a
+        no-op: the due identities stay due and the next frame re-checks — no
+        queueing, no pileup on the vLLM server. A finished previous pass has
+        its exception surfaced (logged) here so one failed read can't silently
+        swallow errors, and never kills the loop.
+        """
+        _t = self._vlm_task
+        if _t is not None and _t.done():
+            exc = _t.exception()  # retrieve + surface the previous pass
+            if exc:
+                print(f"  VLM pass failed: {exc}")
+        if _t is not None and not _t.done():
+            return  # a pass is in flight — stay due, re-check next frame
+        self._claude_vision_calls += 1
+        # Pin the detection->slot mapping to THIS frame: the task body starts at
+        # the next loop yield, by which point last_det_to_slot may describe a
+        # newer frame whose indices don't line up with this `fused` snapshot.
+        _det_to_slot = dict(self.field_tracker.last_det_to_slot)
+        self._vlm_task = asyncio.create_task(
+            self.read_fused_bumper_numbers(
+                fused, due_priorities, det_to_slot=_det_to_slot))
+
+    async def _drain_vlm_task(self) -> None:
+        """Await any in-flight background VLM read so its votes land before
+        final team assignment. A failed pass is logged, never raised — a dead
+        read must not abort finalization. Awaits (does not cancel) so the last
+        pass's identity mutations complete on the loop."""
+        t = self._vlm_task
+        if t is None:
+            return
+        try:
+            if not t.done():
+                await t
+            else:
+                exc = t.exception()
+                if exc:
+                    print(f"  VLM pass failed (drain): {exc}")
+        except Exception as e:
+            print(f"  VLM pass failed (drain): {e}")
+        finally:
+            self._vlm_task = None
+
+    async def _read_fused_bumper_numbers_impl(
+        self, fused, requested_priorities: dict[int, float], det_to_slot=None
+    ) -> None:
         if not self.match_teams:
             self.vlm_status.update({
                 "provider": getattr(self, "team_reader", "local"),
@@ -1863,10 +1981,15 @@ class InferenceJob:
 
         current_match_time = self._current_frame / (self.video_fps or 10.0)
 
-        # Map slot_id -> obs
+        # Map slot_id -> obs. det_to_slot is the frame-indexed detection->slot
+        # mapping; when the pass runs as a background task it MUST be the
+        # snapshot captured at scheduling time (see caller) so indices into
+        # this frame's `fused` don't mismatch a newer frame's live mapping.
+        if det_to_slot is None:
+            det_to_slot = self.field_tracker.last_det_to_slot
         slot_to_obs = {}
         for i, obs in enumerate(fused):
-            slot_id = self.field_tracker.last_det_to_slot.get(i)
+            slot_id = det_to_slot.get(i)
             if slot_id is not None:
                 slot_to_obs[slot_id] = obs
 
@@ -1882,7 +2005,13 @@ class InferenceJob:
             if obs is None:
                 continue
 
-            # Occlusion check
+            # Occlusion check. crop_b64 here may be a lazy _LazyCrop thunk (not yet
+            # encoded); a thunk is truthy, so this preserves today's behavior where
+            # the eager encode virtually never returned None (enforce_floor=False).
+            # Truthiness means "a corner crop is available", not "resolves non-None".
+            # NOTE: with the background-task schedule self._occ may be one frame
+            # stale relative to `fused`. That is acceptable: these flags only gate
+            # crop preference (which camera to trust), not read correctness.
             if self._occ.get(slot_id, {}).get("bumper_occluded") and not any(
                 cam != "main" and crop_b64 for cam, crop_b64, _w in obs.evidence
             ):
@@ -1946,6 +2075,28 @@ class InferenceJob:
             chosen_identities.add(identity_id)
             if len(chosen) >= VLM_TOP_K:
                 break
+
+        # Resolve lazy crops for only the chosen candidates — this is the point
+        # of _LazyCrop: at most VLM_TOP_K encodes per pass instead of one per
+        # detection per frame. A None resolution (degenerate box) is dropped.
+        resolved = []
+        for cand in chosen:
+            crop = _resolve_crop(cand[5])
+            if crop:
+                resolved.append(cand[:5] + (crop,))
+        chosen = resolved
+        if not chosen:
+            print("  VLM skipped: chosen crops resolved empty")
+            self.vlm_status.update({
+                "provider": getattr(self, "team_reader", "local"),
+                "last_frame": self._current_frame,
+                "last_candidates": len(candidates),
+                "last_sent": 0,
+                "last_results": [],
+                "last_error": "chosen crops resolved empty",
+            })
+            self._ocr_crops_dirty = True
+            return
 
         crops = [c[5] for c in chosen]
         expected = []
@@ -2068,6 +2219,11 @@ class InferenceJob:
             # bumper (qm11: R2 read the OVERFLOW crate's "1477" at prob 1.0
             # from [11.3,2.1] — inside the bin zone — and it tied the one
             # real "4256" read so nothing ever locked).
+            # robot.field_position is the track's LIVE position: with the
+            # background-task schedule it may be ~0.1-0.3 match-seconds newer
+            # than the crop this vote came from. That sub-metre drift is well
+            # inside the inflate_zones(0.3) margin below, so the zone-blind
+            # gate stays correct; no reconciliation needed.
             _pos = getattr(robot, "field_position", None)
             try:
                 _pos = (float(_pos[0]), float(_pos[1]))
@@ -4695,6 +4851,9 @@ class InferenceJob:
                     self.gallery = None
             # Per-phase processing timers (seconds). `total` is filled at the end.
             self.timings = {}
+            # Analysis-loop stage accumulators; folded into timings as
+            # "loop.<stage>" keys so every run self-profiles its hot path.
+            self._loop_stage_s = defaultdict(float)
             self._proc_t0 = time.perf_counter()
 
             # Open video
@@ -4902,7 +5061,7 @@ class InferenceJob:
                             device=device,
                             offload_video_to_cpu=offload_vid,
                             offload_state_to_cpu=offload_st,
-                            compile_model=(SAM3_COMPILE and device == "cuda"),
+                            compile_model=(self.config.sam3_compile and device == "cuda"),
                             max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
                             use_fa3=SAM3_USE_FA3,
                             chunk_frames=self.config.sam3_chunk_frames,
@@ -4910,7 +5069,7 @@ class InferenceJob:
                         model_detail = (
                             f"video model w/ instance prompts, "
                             f"chunk={self.config.sam3_chunk_frames} frames, "
-                            f"compile={SAM3_COMPILE}"
+                            f"compile={self.config.sam3_compile}"
                         )
                     else:
                         from web.field.sam2_tracker import Sam2FieldTracker
@@ -5793,7 +5952,8 @@ class InferenceJob:
 
             _loop_t0 = time.perf_counter()
             while True:
-                ret, frame = cap.read()
+                with self._stage("loop.decode"):
+                    ret, frame = cap.read()
                 if not ret:
                     break
                 if frame_num > last_processing_frame:
@@ -5822,8 +5982,9 @@ class InferenceJob:
                 
                 # Existing 3-class YOLO intentionally feeds fuel/hub detection
                 # and their HUD annotations; robots come from the bumper model.
-                results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                detections = sv.Detections.from_ultralytics(results)
+                with self._stage("loop.yolo_main"):
+                    results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                    detections = sv.Detections.from_ultralytics(results)
                 
                 # Update hub positions (alliance assignment is static from setup)
                 self.update_hub_positions(detections)
@@ -5833,296 +5994,302 @@ class InferenceJob:
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
                 person_evidence_boxes_by_cam = {}
                 
-                if self.use_sam2:
-                    SAM2_SCALE = self.sam2_export_scale
-                    for view in self.views:
-                        paired = []
-                        view_raw = self.sam2_raw.get(view.name, {})
-                        # Per-view index space: a decimated corner view has no
-                        # entry for dropped frames -> clean gap (same as
-                        # occlusion), never a stale-box reuse.
-                        local_idx = self.sam2_view_source_to_local.get(
-                            view.name, {}).get(frame_num)
+                with self._stage("loop.evidence_build"):
+                    if self.use_sam2:
+                        SAM2_SCALE = self.sam2_export_scale
+                        for view in self.views:
+                            paired = []
+                            view_raw = self.sam2_raw.get(view.name, {})
+                            # Per-view index space: a decimated corner view has no
+                            # entry for dropped frames -> clean gap (same as
+                            # occlusion), never a stale-box reuse.
+                            local_idx = self.sam2_view_source_to_local.get(
+                                view.name, {}).get(frame_num)
                         
-                        view_frame = view.extract(frame)
-                        cal = view.calibration
-                        # SAM2 tracked a top-cropped view; add the excluded rows back
-                        # so box y-coords are in full-crop space (what cal/masks expect).
-                        top_crop_frac = (getattr(cal, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                        sam2_y_offset = int(view_frame.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
+                            view_frame = view.extract(frame)
+                            cal = view.calibration
+                            # SAM2 tracked a top-cropped view; add the excluded rows back
+                            # so box y-coords are in full-crop space (what cal/masks expect).
+                            top_crop_frac = (getattr(cal, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                            sam2_y_offset = int(view_frame.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
                         
-                        # Prepare small frame for DINOv2 embedding if robot_embedder is loaded
-                        small_frame = None
-                        if self.robot_embedder is not None:
-                            new_w = int(view_frame.shape[1] * SAM2_SCALE)
-                            new_h = int(view_frame.shape[0] * SAM2_SCALE)
-                            small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                            # Prepare small frame for DINOv2 embedding if robot_embedder is loaded
+                            small_frame = None
+                            if self.robot_embedder is not None:
+                                new_w = int(view_frame.shape[1] * SAM2_SCALE)
+                                new_h = int(view_frame.shape[0] * SAM2_SCALE)
+                                small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                        person_results = self.person_model(
-                            view_frame,
-                            classes=[0],
-                            conf=DET_CONF_THRESHOLD,
-                            verbose=False,
-                        )[0]
-                        pdets = sv.Detections.from_ultralytics(person_results)
-                        person_boxes_all = [
-                            tuple(pdets.xyxy[i]) for i in range(len(pdets))
-                        ]
+                            with self._stage("loop.person_det"):
+                                person_results = self.person_model(
+                                    view_frame,
+                                    classes=[0],
+                                    conf=DET_CONF_THRESHOLD,
+                                    verbose=False,
+                                )[0]
+                                pdets = sv.Detections.from_ultralytics(person_results)
+                            person_boxes_all = [
+                                tuple(pdets.xyxy[i]) for i in range(len(pdets))
+                            ]
 
-                        embed_candidates = []
-                        for obj_id, info in view_raw.get(local_idx, {}).items():
-                            x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
-                            fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
-                                                  x2 / SAM2_SCALE, y2 / SAM2_SCALE + sam2_y_offset)
-                            cx = (fx1 + fx2) / 2.0
-                            cy = (fy1 + fy2) / 2.0
-                            is_masked = False
-                            for (mx, my, mw, mh) in view.masks:
-                                if mx <= cx <= mx + mw and my <= cy <= my + mh:
-                                    is_masked = True
-                                    break
-                            if is_masked:
-                                continue
-                            full_box = (fx1, fy1, fx2, fy2)
-                            if not reject_person_candidates(
-                                [(full_box, None)],
-                                person_boxes_all,
-                                PERSON_ROBOT_REJECT_COVERAGE,
-                            ):
-                                continue
-                            # No blocked_zones here: these are tracked masks
-                            # (post-seeding evidence); zones gate seeding only.
-                            if not filter_field_robot_boxes(
-                                [full_box],
-                                cal,
-                                self.field_dims,
-                                frame_shape=view_frame.shape,
-                                frac_backstop=self.config.det_frac_backstop,
-                            ):
-                                continue
-                            uv = ((fx1 + fx2) / 2.0, fy2)
-                            xy = cal.image_to_field(uv)
-                            corner_weight = corner_detection_weight(
-                                view.name, xy, self.field_dims
-                            )
-                            if corner_weight <= 0.0:
-                                continue
+                            embed_candidates = []
+                            for obj_id, info in view_raw.get(local_idx, {}).items():
+                                x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
+                                fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
+                                                      x2 / SAM2_SCALE, y2 / SAM2_SCALE + sam2_y_offset)
+                                cx = (fx1 + fx2) / 2.0
+                                cy = (fy1 + fy2) / 2.0
+                                is_masked = False
+                                for (mx, my, mw, mh) in view.masks:
+                                    if mx <= cx <= mx + mw and my <= cy <= my + mh:
+                                        is_masked = True
+                                        break
+                                if is_masked:
+                                    continue
+                                full_box = (fx1, fy1, fx2, fy2)
+                                if not reject_person_candidates(
+                                    [(full_box, None)],
+                                    person_boxes_all,
+                                    PERSON_ROBOT_REJECT_COVERAGE,
+                                ):
+                                    continue
+                                # No blocked_zones here: these are tracked masks
+                                # (post-seeding evidence); zones gate seeding only.
+                                if not filter_field_robot_boxes(
+                                    [full_box],
+                                    cal,
+                                    self.field_dims,
+                                    frame_shape=view_frame.shape,
+                                    frac_backstop=self.config.det_frac_backstop,
+                                ):
+                                    continue
+                                uv = ((fx1 + fx2) / 2.0, fy2)
+                                xy = cal.image_to_field(uv)
+                                corner_weight = corner_detection_weight(
+                                    view.name, xy, self.field_dims
+                                )
+                                if corner_weight <= 0.0:
+                                    continue
                             
-                            color = (
-                                self.sam2_obj_color.get(view.name, {}).get(obj_id)
-                                or "unknown"
-                            )
+                                color = (
+                                    self.sam2_obj_color.get(view.name, {}).get(obj_id)
+                                    or "unknown"
+                                )
 
-                            box_s = None
-                            sub_mask = None
-                            if small_frame is not None:
-                                # small_frame is the full-crop at 0.5x; index it with the
-                                # offset-corrected box scaled back to 0.5x (== raw box when
-                                # no top-crop is configured).
-                                box_s = (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
-                                         fx2 * SAM2_SCALE, fy2 * SAM2_SCALE)
-                                # SAM2 mask is in raw 0.5x top-cropped coords (same space
-                                # as info["box"]); slice the box region out as a box-local
-                                # mask so the signature covers the robot, not the field.
-                                mask2d = info.get("mask")
-                                if mask2d is not None:
-                                    sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
-                                    if sub_mask.size == 0:
-                                        sub_mask = None
-                            embed_candidates.append(
-                                (obj_id, full_box, xy, corner_weight, color,
-                                 box_s, sub_mask))
+                                box_s = None
+                                sub_mask = None
+                                if small_frame is not None:
+                                    # small_frame is the full-crop at 0.5x; index it with the
+                                    # offset-corrected box scaled back to 0.5x (== raw box when
+                                    # no top-crop is configured).
+                                    box_s = (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
+                                             fx2 * SAM2_SCALE, fy2 * SAM2_SCALE)
+                                    # SAM2 mask is in raw 0.5x top-cropped coords (same space
+                                    # as info["box"]); slice the box region out as a box-local
+                                    # mask so the signature covers the robot, not the field.
+                                    mask2d = info.get("mask")
+                                    if mask2d is not None:
+                                        sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
+                                        if sub_mask.size == 0:
+                                            sub_mask = None
+                                embed_candidates.append(
+                                    (obj_id, full_box, xy, corner_weight, color,
+                                     box_s, sub_mask))
 
-                        # One DINOv2 forward pass for every robot in this view
-                        # (embed() is embed_batch([box])[0], so semantics match).
-                        det_embeds = [None] * len(embed_candidates)
-                        if small_frame is not None and embed_candidates:
-                            det_embeds = self.robot_embedder.embed_batch(
-                                small_frame,
-                                [c[5] for c in embed_candidates],
-                                masks=[c[6] for c in embed_candidates])
+                            # One DINOv2 forward pass for every robot in this view
+                            # (embed() is embed_batch([box])[0], so semantics match).
+                            det_embeds = [None] * len(embed_candidates)
+                            if small_frame is not None and embed_candidates:
+                                with self._stage("loop.embed"):
+                                    det_embeds = self.robot_embedder.embed_batch(
+                                        small_frame,
+                                        [c[5] for c in embed_candidates],
+                                        masks=[c[6] for c in embed_candidates])
 
-                        for (obj_id, full_box, xy, corner_weight, color, box_s,
-                             sub_mask), det_embed in zip(embed_candidates, det_embeds):
-                            robot_crop_b64 = None
-                            if small_frame is not None:
-                                robot_crop_b64 = self._masked_robot_crop_b64(
-                                    small_frame, box_s, sub_mask)
+                            for (obj_id, full_box, xy, corner_weight, color, box_s,
+                                 sub_mask), det_embed in zip(embed_candidates, det_embeds):
+                                robot_crop_b64 = None
+                                if small_frame is not None:
+                                    robot_crop_b64 = self._masked_robot_crop_b64(
+                                        small_frame, box_s, sub_mask)
 
-                            det = FieldDetection(
-                                pos=xy,
-                                color=color,
-                                box=full_box,
-                                score=corner_weight,
-                                track_id=obj_id,
-                                embedding=det_embed,
-                                robot_crop_b64=robot_crop_b64,
-                            )
+                                det = FieldDetection(
+                                    pos=xy,
+                                    color=color,
+                                    box=full_box,
+                                    score=corner_weight,
+                                    track_id=obj_id,
+                                    embedding=det_embed,
+                                    robot_crop_b64=robot_crop_b64,
+                                )
 
-                            cb = self._bumper_crop_b64(view_frame, det.box, enforce_floor=False)
-                            crop_b64 = cb[0] if cb is not None else None
-                            paired.append((det, crop_b64))
+                                # Defer the JPEG encode; only top-K chosen crops resolve.
+                                def _enc(_f=view_frame, _b=det.box):
+                                    cb = self._bumper_crop_b64(_f, _b, enforce_floor=False)
+                                    return cb[0] if cb is not None else None
+                                paired.append((det, _LazyCrop(_enc)))
 
 
-                        person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
+                            person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
                         
-                        per_camera[view.name] = paired
-                        person_boxes_by_cam[view.name] = person_boxes
-                        person_evidence_boxes_by_cam[view.name] = person_boxes_all
-                else:
-                    for view in self.views:
-                        pre = detections if view.name == "main" else None
-                        paired, pboxes, raw_pboxes = self._detect_view(
-                            view,
-                            frame,
-                            precomputed_dets=pre,
-                            frame_num=frame_num,
+                            per_camera[view.name] = paired
+                            person_boxes_by_cam[view.name] = person_boxes
+                            person_evidence_boxes_by_cam[view.name] = person_boxes_all
+                    else:
+                        for view in self.views:
+                            pre = detections if view.name == "main" else None
+                            paired, pboxes, raw_pboxes = self._detect_view(
+                                view,
+                                frame,
+                                precomputed_dets=pre,
+                                frame_num=frame_num,
+                            )
+                            per_camera[view.name] = paired
+                            person_boxes_by_cam[view.name] = pboxes
+                            person_evidence_boxes_by_cam[view.name] = raw_pboxes
+
+                with self._stage("loop.fuse_track"):
+                    weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
+                               for v in self.views}
+                    camera_centers = {
+                        v.name: v.calibration.camera_center
+                        for v in self.views
+                        if v.calibration.camera_center is not None
+                    }
+
+                    def _hub_blocks_camera(camera_name, field_pos):
+                        center = camera_centers.get(camera_name)
+                        return center is not None and any(
+                            occluded_by_hub(center, prism, field_pos)
+                            for prism in self.hub_prisms
                         )
-                        per_camera[view.name] = paired
-                        person_boxes_by_cam[view.name] = pboxes
-                        person_evidence_boxes_by_cam[view.name] = raw_pboxes
 
-                weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
-                           for v in self.views}
-                camera_centers = {
-                    v.name: v.calibration.camera_center
-                    for v in self.views
-                    if v.calibration.camera_center is not None
-                }
+                    fused = fuse_detections(
+                        per_camera,
+                        weights=weights,
+                        is_hub_occluded=_hub_blocks_camera,
+                        camera_centers=(
+                            {name: (float(c[0]), float(c[1]))
+                             for name, c in camera_centers.items()}
+                            if self.config.fuse_ray_gate else None),
+                        ray_cross_m=self.config.fuse_ray_cross_m,
+                    )   # list[FusedObservation]
 
-                def _hub_blocks_camera(camera_name, field_pos):
-                    center = camera_centers.get(camera_name)
-                    return center is not None and any(
-                        occluded_by_hub(center, prism, field_pos)
-                        for prism in self.hub_prisms
-                    )
-
-                fused = fuse_detections(
-                    per_camera,
-                    weights=weights,
-                    is_hub_occluded=_hub_blocks_camera,
-                    camera_centers=(
-                        {name: (float(c[0]), float(c[1]))
-                         for name, c in camera_centers.items()}
-                        if self.config.fuse_ray_gate else None),
-                    ray_cross_m=self.config.fuse_ray_cross_m,
-                )   # list[FusedObservation]
-
-                # Cross-view merge rate is the health signal for multi-camera
-                # identity: silent fusion failure looks like per-view identity
-                # disagreement downstream (split fused tracks, slot churn).
-                if frame_num - getattr(self, "_last_fusion_log", -(10 ** 9)) >= 600:
-                    self._last_fusion_log = frame_num
-                    _multi = sum(
-                        1 for o in fused if len({m[0] for m in o.members}) > 1)
-                    print(f"  [fusion] frame {frame_num}: {len(fused)} fused obs, "
-                          f"{_multi} cross-view, "
-                          f"{sum(len(d) for d in per_camera.values())} raw dets")
+                    # Cross-view merge rate is the health signal for multi-camera
+                    # identity: silent fusion failure looks like per-view identity
+                    # disagreement downstream (split fused tracks, slot churn).
+                    if frame_num - getattr(self, "_last_fusion_log", -(10 ** 9)) >= 600:
+                        self._last_fusion_log = frame_num
+                        _multi = sum(
+                            1 for o in fused if len({m[0] for m in o.members}) > 1)
+                        print(f"  [fusion] frame {frame_num}: {len(fused)} fused obs, "
+                              f"{_multi} cross-view, "
+                              f"{sum(len(d) for d in per_camera.values())} raw dets")
                 
-                ev_list = []
-                if self.use_sam2:
-                    ev_list = self.fused_registry.assign(fused)
-                    # A fused track_id is one physical robot; collapse any same-id
-                    # split (e.g. a duplicate corner-camera mask whose projection
-                    # slid away) into one observation so it can't seed a phantom
-                    # slot (the B1<->B3 churn). Corner identity/bearing evidence is
-                    # unioned in, and a lone corner obs (main occluded) still
-                    # carries the track — so hand-off between cameras is preserved.
-                    fused, ev_list = merge_same_id_observations(
-                        fused, ev_list, main_guard=self.config.merge_main_guard)
+                    ev_list = []
+                    if self.use_sam2:
+                        ev_list = self.fused_registry.assign(fused)
+                        # A fused track_id is one physical robot; collapse any same-id
+                        # split (e.g. a duplicate corner-camera mask whose projection
+                        # slid away) into one observation so it can't seed a phantom
+                        # slot (the B1<->B3 churn). Corner identity/bearing evidence is
+                        # unioned in, and a lone corner obs (main occluded) still
+                        # carries the track — so hand-off between cameras is preserved.
+                        fused, ev_list = merge_same_id_observations(
+                            fused, ev_list, main_guard=self.config.merge_main_guard)
 
-                field_dets = [obs.detection for obs in fused]
-                dt = self.frame_skip / (self.video_fps or 30.0)
-                track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
-                if TRACKER_TRACE:
-                    ft = self.field_tracker
-                    self._tracker_trace = getattr(self, "_tracker_trace", [])
-                    self._tracker_trace.append({
-                        "frame": frame_num,
-                        "fused": [{
-                            "pos": [round(float(o.detection.pos[0]), 2),
-                                    round(float(o.detection.pos[1]), 2)],
-                            "cams": sorted({m[0] for m in o.members}),
-                            "has_main_box": o.detection.box is not None,
-                            "color": o.detection.color,
-                            "tid": o.track_id,
-                        } for o in fused],
-                        "tracks": [{
-                            "slot": t.slot_id, "label": self._slot_label(t.slot_id),
-                            "pos": [round(float(t.pos[0]), 2), round(float(t.pos[1]), 2)],
-                            "state": t.state, "corner_only": t.corner_only,
-                        } for t in track_outs],
-                        "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
-                        "events": [dict(e) for e in ft.binding_events],
-                        # Raw per-camera detections BEFORE fusion — shows whether a
-                        # robot vanished from detection itself (SAM3 gave up / occluded /
-                        # left frame) vs was detected but lost in fusion/tracking.
-                        "raw": {cam: [{
-                            "pos": [round(float(d.pos[0]), 2), round(float(d.pos[1]), 2)],
-                            "color": d.color, "has_box": d.box is not None,
-                            "tid": d.track_id, "score": round(float(d.score or 1.0), 2),
-                        } for (d, _crop) in dets] for cam, dets in per_camera.items()},
-                    })
-                try:
-                    self._record_frame_evidence(
-                        fused,
-                        frame_num,
-                        person_evidence_boxes_by_cam.get("main", []),
-                    )
-                except Exception as e:
-                    await self._warn_degraded(
-                        "frame_evidence",
-                        f"Frame evidence recording failed ({e}); backward "
-                        f"re-resolution will be incomplete for this run.",
-                    )
-                await self._sync_identity_registry_frame(
-                    fused, ev_list, track_outs,
-                    main_person_boxes=person_evidence_boxes_by_cam.get("main", []),
-                    log_frame_num=frame_num)
+                    field_dets = [obs.detection for obs in fused]
+                    dt = self.frame_skip / (self.video_fps or 30.0)
+                    track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                    if TRACKER_TRACE:
+                        ft = self.field_tracker
+                        self._tracker_trace = getattr(self, "_tracker_trace", [])
+                        self._tracker_trace.append({
+                            "frame": frame_num,
+                            "fused": [{
+                                "pos": [round(float(o.detection.pos[0]), 2),
+                                        round(float(o.detection.pos[1]), 2)],
+                                "cams": sorted({m[0] for m in o.members}),
+                                "has_main_box": o.detection.box is not None,
+                                "color": o.detection.color,
+                                "tid": o.track_id,
+                            } for o in fused],
+                            "tracks": [{
+                                "slot": t.slot_id, "label": self._slot_label(t.slot_id),
+                                "pos": [round(float(t.pos[0]), 2), round(float(t.pos[1]), 2)],
+                                "state": t.state, "corner_only": t.corner_only,
+                            } for t in track_outs],
+                            "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
+                            "events": [dict(e) for e in ft.binding_events],
+                            # Raw per-camera detections BEFORE fusion — shows whether a
+                            # robot vanished from detection itself (SAM3 gave up / occluded /
+                            # left frame) vs was detected but lost in fusion/tracking.
+                            "raw": {cam: [{
+                                "pos": [round(float(d.pos[0]), 2), round(float(d.pos[1]), 2)],
+                                "color": d.color, "has_box": d.box is not None,
+                                "tid": d.track_id, "score": round(float(d.score or 1.0), 2),
+                            } for (d, _crop) in dets] for cam, dets in per_camera.items()},
+                        })
+                    try:
+                        self._record_frame_evidence(
+                            fused,
+                            frame_num,
+                            person_evidence_boxes_by_cam.get("main", []),
+                        )
+                    except Exception as e:
+                        await self._warn_degraded(
+                            "frame_evidence",
+                            f"Frame evidence recording failed ({e}); backward "
+                            f"re-resolution will be incomplete for this run.",
+                        )
+                    await self._sync_identity_registry_frame(
+                        fused, ev_list, track_outs,
+                        main_person_boxes=person_evidence_boxes_by_cam.get("main", []),
+                        log_frame_num=frame_num)
 
-                # 5. Resolve occlusion from every posed camera and merge: a track
-                #    is occluded only if occluded in ALL posed cameras.
-                occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
-                             for t in track_outs]
-                posed = [v for v in self.views
-                         if v.calibration.camera_center is not None]
-                self._occ_by_cam = {
-                    v.name: resolve_occlusion(
-                        v.calibration, occ_input,
-                        person_boxes_by_cam.get(v.name, []), self.hub_prisms)
-                    for v in posed
-                }
-                self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
-                self._view_flags = self._occ   # feed forward to next frame's tracker
+                    # 5. Resolve occlusion from every posed camera and merge: a track
+                    #    is occluded only if occluded in ALL posed cameras.
+                    occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
+                                 for t in track_outs]
+                    posed = [v for v in self.views
+                             if v.calibration.camera_center is not None]
+                    self._occ_by_cam = {
+                        v.name: resolve_occlusion(
+                            v.calibration, occ_input,
+                            person_boxes_by_cam.get(v.name, []), self.hub_prisms)
+                        for v in posed
+                    }
+                    self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
+                    self._view_flags = self._occ   # feed forward to next frame's tracker
 
-                # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
-                # Mirror each slot's fused-track appearance embedding (kept in the
-                # FusedTrackRegistry, keyed by fused id) onto its RobotTrack. Without
-                # this the per-slot appearance_embedding stays None on the field path,
-                # so the appearance gallery never deposits or queries anything.
-                slot_to_embedding = {}
-                slot_to_robot_crop = {}  # slot -> latest masked whole-robot crop (main cam)
-                if self.use_sam2 and self.field_tracker is not None:
-                    for tid, slot in self.field_tracker._id_to_slot.items():
-                        emb = self.fused_registry.get_embedding(tid)
-                        if emb is not None:
-                            slot_to_embedding[slot] = emb
-                    # Mirror the main-camera robot crop behind that embedding so the
-                    # gallery / replay-review UI can show the whole robot.
-                    for obs in fused:
-                        if obs.track_id is None:
-                            continue
-                        slot = self.field_tracker._id_to_slot.get(obs.track_id)
-                        if slot is None:
-                            continue
-                        for cam, det_id in obs.members:
-                            if cam != "main":
+                    # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
+                    # Mirror each slot's fused-track appearance embedding (kept in the
+                    # FusedTrackRegistry, keyed by fused id) onto its RobotTrack. Without
+                    # this the per-slot appearance_embedding stays None on the field path,
+                    # so the appearance gallery never deposits or queries anything.
+                    slot_to_embedding = {}
+                    slot_to_robot_crop = {}  # slot -> latest masked whole-robot crop (main cam)
+                    if self.use_sam2 and self.field_tracker is not None:
+                        for tid, slot in self.field_tracker._id_to_slot.items():
+                            emb = self.fused_registry.get_embedding(tid)
+                            if emb is not None:
+                                slot_to_embedding[slot] = emb
+                        # Mirror the main-camera robot crop behind that embedding so the
+                        # gallery / replay-review UI can show the whole robot.
+                        for obs in fused:
+                            if obs.track_id is None:
                                 continue
-                            md = next((d for (d, _) in per_camera.get("main", [])
-                                       if d.track_id == det_id), None)
-                            if md is not None and md.robot_crop_b64:
-                                slot_to_robot_crop[slot] = md.robot_crop_b64
-                            break
+                            slot = self.field_tracker._id_to_slot.get(obs.track_id)
+                            if slot is None:
+                                continue
+                            for cam, det_id in obs.members:
+                                if cam != "main":
+                                    continue
+                                md = next((d for (d, _) in per_camera.get("main", [])
+                                           if d.track_id == det_id), None)
+                                if md is not None and md.robot_crop_b64:
+                                    slot_to_robot_crop[slot] = md.robot_crop_b64
+                                break
 
                 tracked_robot_boxes = []  # (slot_id, box) for visible tracks
                 for t in track_outs:
@@ -6155,73 +6322,76 @@ class InferenceJob:
                             })
                     # Coasting tracks keep their stale last_position untouched.
 
-                # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
-                # free, so there's no per-match call cap (the old 20-call budget was a
-                # paid-API leftover). We schedule VLM reads per-identity based on match seconds.
-                current_match_time = processed_frame_num / (self.video_fps or 10.0)
-                unconfirmed_count = sum(
-                    1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
-                )
-                
-                due_priorities = {}
-                for ident in self.identity_registry.identities.values():
-                    if ident.active_slot is None:
-                        continue
-                    # Occlusion gate: a bumper hidden in EVERY camera cannot
-                    # be read — at best a wasted call, at worst a garbage-crop
-                    # contradiction against a correct lock. The
-                    # needs_immediate_read flag is NOT cleared, so the read
-                    # fires on the first visible frame.
-                    if VLM_OCCLUSION_GATE and occlusion_blocks_read(
-                            (self._occ or {}).get(ident.active_slot)):
-                        self.identity_diagnostics.increment(
-                            "vlm_scheduled.occluded_skip")
-                        continue
-                    # Novelty inputs: a failed read of an unmoved robot is
-                    # the same unreadable view again (decide_vlm_read gates
-                    # it, bounded by novelty_skip_max_sec).
-                    last_failed = (ident.last_vlm_time > ident.last_success_time)
-                    moved = True
-                    slot_track = self._get_slot_track_if_exists(ident.active_slot)
-                    cur_pos = getattr(slot_track, "field_position", None)
-                    if ident.last_vlm_pos is not None and cur_pos is not None:
-                        moved = (
-                            (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
-                            + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
-                        ) ** 0.5 >= self.confidence_config.novelty_min_move_m
-                    decision = decide_vlm_read(
-                        is_confirmed=ident.is_confirmed,
-                        confidence=ident.confidence,
-                        last_vlm_time=ident.last_vlm_time,
-                        last_success_time=ident.last_success_time,
-                        backoff_until=ident.backoff_until,
-                        needs_immediate_read=ident.needs_immediate_read,
-                        current_match_time=current_match_time,
-                        unconfirmed_count=unconfirmed_count,
-                        config=self.confidence_config,
-                        last_read_failed=last_failed,
-                        moved_since_read=moved,
+                with self._stage("loop.vlm"):
+                    # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
+                    # free, so there's no per-match call cap (the old 20-call budget was a
+                    # paid-API leftover). We schedule VLM reads per-identity based on match seconds.
+                    current_match_time = processed_frame_num / (self.video_fps or 10.0)
+                    unconfirmed_count = sum(
+                        1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
                     )
-                    if decision.due:
-                        due_priorities[ident.identity_id] = decision.priority
-                        self.identity_diagnostics.increment(
-                            f"vlm_scheduled.{decision.reason}"
+                
+                    due_priorities = {}
+                    for ident in self.identity_registry.identities.values():
+                        if ident.active_slot is None:
+                            continue
+                        # Occlusion gate: a bumper hidden in EVERY camera cannot
+                        # be read — at best a wasted call, at worst a garbage-crop
+                        # contradiction against a correct lock. The
+                        # needs_immediate_read flag is NOT cleared, so the read
+                        # fires on the first visible frame.
+                        if VLM_OCCLUSION_GATE and occlusion_blocks_read(
+                                (self._occ or {}).get(ident.active_slot)):
+                            self.identity_diagnostics.increment(
+                                "vlm_scheduled.occluded_skip")
+                            continue
+                        # Novelty inputs: a failed read of an unmoved robot is
+                        # the same unreadable view again (decide_vlm_read gates
+                        # it, bounded by novelty_skip_max_sec).
+                        last_failed = (ident.last_vlm_time > ident.last_success_time)
+                        moved = True
+                        slot_track = self._get_slot_track_if_exists(ident.active_slot)
+                        cur_pos = getattr(slot_track, "field_position", None)
+                        if ident.last_vlm_pos is not None and cur_pos is not None:
+                            moved = (
+                                (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
+                                + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
+                            ) ** 0.5 >= self.confidence_config.novelty_min_move_m
+                        decision = decide_vlm_read(
+                            is_confirmed=ident.is_confirmed,
+                            confidence=ident.confidence,
+                            last_vlm_time=ident.last_vlm_time,
+                            last_success_time=ident.last_success_time,
+                            backoff_until=ident.backoff_until,
+                            needs_immediate_read=ident.needs_immediate_read,
+                            current_match_time=current_match_time,
+                            unconfirmed_count=unconfirmed_count,
+                            config=self.confidence_config,
+                            last_read_failed=last_failed,
+                            moved_since_read=moved,
                         )
-                        self.identity_diagnostics.record(
-                            DiagnosticEvents.VLM_SCHEDULED,
-                            identity_id=ident.identity_id,
-                            reason_type=decision.reason,
-                            priority=decision.priority,
-                            is_audit=decision.is_audit,
-                        )
+                        if decision.due:
+                            due_priorities[ident.identity_id] = decision.priority
+                            self.identity_diagnostics.increment(
+                                f"vlm_scheduled.{decision.reason}"
+                            )
+                            self.identity_diagnostics.record(
+                                DiagnosticEvents.VLM_SCHEDULED,
+                                identity_id=ident.identity_id,
+                                reason_type=decision.reason,
+                                priority=decision.priority,
+                                is_audit=decision.is_audit,
+                            )
 
-                self.vlm_status.update({
-                    "unconfirmed": unconfirmed_count,
-                    "due_count": len(due_priorities),
-                })
-                if bool(fused) and len(due_priorities) > 0:
-                    self._claude_vision_calls += 1
-                    await self.read_fused_bumper_numbers(fused, due_priorities)
+                    self.vlm_status.update({
+                        "unconfirmed": unconfirmed_count,
+                        "due_count": len(due_priorities),
+                    })
+                    if bool(fused) and len(due_priorities) > 0:
+                        # Single-flight background schedule (see the method): the
+                        # read pass no longer blocks frame processing — it runs
+                        # as an event-loop task while the loop keeps decoding.
+                        self._schedule_vlm_pass(fused, due_priorities)
 
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
@@ -6235,274 +6405,278 @@ class InferenceJob:
                 # OCR AUTHORITATIVE SCORING:
                 # a single valid OCR read (close to previous read) becomes the score.
                 # Trajectories are used only for per-robot attribution.
-                if processed_frame_num >= 10 and processed_frame_num % OCR_FRAME_INTERVAL == 0:
-                    if processed_frame_num <= 20:
-                        print(f"  [DEBUG] OCR regions: {self.ocr_regions}")
-                        print(f"  [DEBUG] overhead_frame shape: {overhead_frame.shape}")
-                    for alliance in ["blue", "red"]:
-                        ocr_val = self.ocr_score(overhead_frame, alliance)
-                        if processed_frame_num <= 50:
-                            print(f"  [DEBUG] OCR {alliance}: {ocr_val}")
-                        if ocr_val is not None:
-                            last_ocr = self._last_ocr.get(alliance)
-                            if last_ocr is not None and abs(ocr_val - last_ocr) > 20:
-                                continue  # Likely a misread, skip
-                            self._last_ocr[alliance] = ocr_val
+                with self._stage("loop.ocr"):
+                    if processed_frame_num >= 10 and processed_frame_num % OCR_FRAME_INTERVAL == 0:
+                        if processed_frame_num <= 20:
+                            print(f"  [DEBUG] OCR regions: {self.ocr_regions}")
+                            print(f"  [DEBUG] overhead_frame shape: {overhead_frame.shape}")
+                        for alliance in ["blue", "red"]:
+                            ocr_val = self.ocr_score(overhead_frame, alliance)
+                            if processed_frame_num <= 50:
+                                print(f"  [DEBUG] OCR {alliance}: {ocr_val}")
+                            if ocr_val is not None:
+                                last_ocr = self._last_ocr.get(alliance)
+                                if last_ocr is not None and abs(ocr_val - last_ocr) > 20:
+                                    continue  # Likely a misread, skip
+                                self._last_ocr[alliance] = ocr_val
                             
-                            current = self.alliance_scores[alliance]
-                            if ocr_val != current:
-                                if ocr_val > current:
-                                    # OCR says we undercounted — add missing goals and attribute each.
-                                    missing = ocr_val - current
-                                    timestamp = frame_num / self.video_fps
-                                    for _ in range(missing):
-                                        self.attribute_score(alliance, processed_frame_num, timestamp)
-                                    self.alliance_scores[alliance] = ocr_val
-                                    print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (+{missing} attributed)")
-                                elif ocr_val < current:
-                                    # OCR says we overcounted — adjust down immediately.
-                                    self.alliance_scores[alliance] = ocr_val
-                                    self._adjust_robot_scores_down(alliance, ocr_val)
-                                    print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (corrected down)")
+                                current = self.alliance_scores[alliance]
+                                if ocr_val != current:
+                                    if ocr_val > current:
+                                        # OCR says we undercounted — add missing goals and attribute each.
+                                        missing = ocr_val - current
+                                        timestamp = frame_num / self.video_fps
+                                        for _ in range(missing):
+                                            self.attribute_score(alliance, processed_frame_num, timestamp)
+                                        self.alliance_scores[alliance] = ocr_val
+                                        print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (+{missing} attributed)")
+                                    elif ocr_val < current:
+                                        # OCR says we overcounted — adjust down immediately.
+                                        self.alliance_scores[alliance] = ocr_val
+                                        self._adjust_robot_scores_down(alliance, ocr_val)
+                                        print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (corrected down)")
                 
-                # Draw annotations
-                annotated_frame = overhead_frame.copy()
-                # Optional verification pass: lay the reprojected field wireframe down
-                # first so robot/ball/hub HUD draws on top of it (and it's baked into
-                # both the live stream and the recorded replay).
-                self._maybe_draw_field_wireframe(annotated_frame)
-                track_by_slot = {t.slot_id: t for t in track_outs}
+                with self._stage("loop.hud"):
+                    # Draw annotations
+                    annotated_frame = overhead_frame.copy()
+                    # Optional verification pass: lay the reprojected field wireframe down
+                    # first so robot/ball/hub HUD draws on top of it (and it's baked into
+                    # both the live stream and the recorded replay).
+                    self._maybe_draw_field_wireframe(annotated_frame)
+                    track_by_slot = {t.slot_id: t for t in track_outs}
                 
-                # Draw detections
-                for i in range(len(detections)):
-                    box = detections.xyxy[i]
-                    class_id = detections.class_id[i]
+                    # Draw detections
+                    for i in range(len(detections)):
+                        box = detections.xyxy[i]
+                        class_id = detections.class_id[i]
                     
-                    x1, y1, x2, y2 = map(int, box)
+                        x1, y1, x2, y2 = map(int, box)
                     
-                    if class_id == 0:  # fuel_ball
-                        color = (0, 255, 255)  # Yellow
-                        label = "ball"
-                    elif class_id == 1:  # robot
-                        continue
-                    else:  # hub_opening
-                        color = (0, 255, 0)  # Green
-                        label = "hub"
-
-                    # Per-ball boxes are visual noise (hundreds of balls per frame); skip
-                    # when disabled.  Hub boxes (class_id 2) are kept regardless.
-                    if class_id == 0 and not HUD_DRAW_BALL_BOXES:
-                        continue
-
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                    # Label with background for readability
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                    cv2.rectangle(annotated_frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 0), -1)
-                    cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                # Robots are drawn from visible tracker slots. Their boxes and
-                # alliance colors originate from the bumper-model path.
-                for slot_id, box in tracked_robot_boxes:
-                    robot = self._get_slot_track_if_exists(slot_id)
-                    if robot is None:
-                        continue
-                    label, _confirmed = self._team_hud_label(
-                        robot, self._slot_label(slot_id)
-                    )
-                    track = track_by_slot.get(slot_id)
-                    mask = None
-                    if self.use_sam2:
-                        local_idx = self.sam2_source_to_local.get(frame_num)
-                        registry_track_id = next(
-                            (
-                                track_id
-                                for track_id, mapped_slot in
-                                self.field_tracker._id_to_slot.items()
-                                if mapped_slot == slot_id
-                            ),
-                            None,
-                        )
-                        if registry_track_id is not None:
-                            obs = next(
-                                (
-                                    item for item in fused
-                                    if item.track_id == registry_track_id
-                                ),
-                                None,
-                            )
-                            if obs is not None:
-                                for camera, det_id in obs.members:
-                                    if camera != "main" or "main" not in self.sam2_raw:
-                                        continue
-                                    entry = self.sam2_raw["main"].get(
-                                        local_idx, {}
-                                    ).get(det_id)
-                                    if entry is not None:
-                                        mask2d = entry.get("mask")
-                                        if mask2d is not None:
-                                            main_view = next(
-                                                (
-                                                    view
-                                                    for view in self.views
-                                                    if view.name == "main"
-                                                ),
-                                                None,
-                                            )
-                                            top_offset_px = 0
-                                            if main_view is not None:
-                                                top_crop_frac = (
-                                                    getattr(
-                                                        main_view.calibration,
-                                                        "robot_track_top_crop",
-                                                        0.0,
-                                                    )
-                                                    or 0.0
-                                                ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                                top_offset_px = int(
-                                                    overhead_frame.shape[0]
-                                                    * top_crop_frac
-                                                )
-                                            mask = _restore_sam2_mask_to_view(
-                                                mask2d,
-                                                overhead_frame.shape,
-                                                top_offset_px,
-                                            )
-                                    break
-                    self._draw_bumper_hud(
-                        annotated_frame,
-                        box,
-                        robot.alliance,
-                        label,
-                        slot_id=slot_id,
-                        cal=self.calib,
-                        field_pos=(
-                            track.pos if track else robot.field_position
-                        ),
-                        vel=track.vel if track else None,
-                        mask=mask,
-                    )
-
-                # Coasting tracks: position alive, mask gone. Without a ghost
-                # they are indistinguishable from never-seen robots in the
-                # camera view (they only show on the field map).
-                if HUD_DRAW_COASTING_GHOST:
-                    drawn_slots = {sid for sid, _ in tracked_robot_boxes}
-                    for slot_id, gbox in select_coasting_ghosts(track_outs):
-                        if slot_id in drawn_slots:
+                        if class_id == 0:  # fuel_ball
+                            color = (0, 255, 255)  # Yellow
+                            label = "ball"
+                        elif class_id == 1:  # robot
                             continue
+                        else:  # hub_opening
+                            color = (0, 255, 0)  # Green
+                            label = "hub"
+
+                        # Per-ball boxes are visual noise (hundreds of balls per frame); skip
+                        # when disabled.  Hub boxes (class_id 2) are kept regardless.
+                        if class_id == 0 and not HUD_DRAW_BALL_BOXES:
+                            continue
+
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        # Label with background for readability
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                        cv2.rectangle(annotated_frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 0), -1)
+                        cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                    # Robots are drawn from visible tracker slots. Their boxes and
+                    # alliance colors originate from the bumper-model path.
+                    for slot_id, box in tracked_robot_boxes:
                         robot = self._get_slot_track_if_exists(slot_id)
                         if robot is None:
                             continue
-                        label, _ = self._team_hud_label(
-                            robot, self._slot_label(slot_id))
-                        gcolor = ((153, 60, 0) if robot.alliance == "blue"
-                                  else (0, 30, 153))
-                        draw_dashed_box(annotated_frame, gbox, gcolor, thickness=2)
-                        gx1, gy1 = int(gbox[0]), int(gbox[1])
-                        cv2.putText(annotated_frame, f"{label} coast",
-                                    (gx1, max(12, gy1 - 5)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, gcolor, 1,
-                                    cv2.LINE_AA)
+                        label, _confirmed = self._team_hud_label(
+                            robot, self._slot_label(slot_id)
+                        )
+                        track = track_by_slot.get(slot_id)
+                        mask = None
+                        if self.use_sam2:
+                            local_idx = self.sam2_source_to_local.get(frame_num)
+                            registry_track_id = next(
+                                (
+                                    track_id
+                                    for track_id, mapped_slot in
+                                    self.field_tracker._id_to_slot.items()
+                                    if mapped_slot == slot_id
+                                ),
+                                None,
+                            )
+                            if registry_track_id is not None:
+                                obs = next(
+                                    (
+                                        item for item in fused
+                                        if item.track_id == registry_track_id
+                                    ),
+                                    None,
+                                )
+                                if obs is not None:
+                                    for camera, det_id in obs.members:
+                                        if camera != "main" or "main" not in self.sam2_raw:
+                                            continue
+                                        entry = self.sam2_raw["main"].get(
+                                            local_idx, {}
+                                        ).get(det_id)
+                                        if entry is not None:
+                                            mask2d = entry.get("mask")
+                                            if mask2d is not None:
+                                                main_view = next(
+                                                    (
+                                                        view
+                                                        for view in self.views
+                                                        if view.name == "main"
+                                                    ),
+                                                    None,
+                                                )
+                                                top_offset_px = 0
+                                                if main_view is not None:
+                                                    top_crop_frac = (
+                                                        getattr(
+                                                            main_view.calibration,
+                                                            "robot_track_top_crop",
+                                                            0.0,
+                                                        )
+                                                        or 0.0
+                                                    ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                                    top_offset_px = int(
+                                                        overhead_frame.shape[0]
+                                                        * top_crop_frac
+                                                    )
+                                                mask = _restore_sam2_mask_to_view(
+                                                    mask2d,
+                                                    overhead_frame.shape,
+                                                    top_offset_px,
+                                                )
+                                        break
+                        self._draw_bumper_hud(
+                            annotated_frame,
+                            box,
+                            robot.alliance,
+                            label,
+                            slot_id=slot_id,
+                            cal=self.calib,
+                            field_pos=(
+                                track.pos if track else robot.field_position
+                            ),
+                            vel=track.vel if track else None,
+                            mask=mask,
+                        )
 
-                # Draw hubs
-                for hub in self.hubs:
-                    color = (255, 0, 0) if hub.alliance == "blue" else (0, 0, 255)
-                    cv2.circle(annotated_frame, (int(hub.x), int(hub.y)), 20, color, 3)
-                    cv2.putText(annotated_frame, f"{hub.alliance} hub",
-                               (int(hub.x) - 30, int(hub.y) - 25),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # Coasting tracks: position alive, mask gone. Without a ghost
+                    # they are indistinguishable from never-seen robots in the
+                    # camera view (they only show on the field map).
+                    if HUD_DRAW_COASTING_GHOST:
+                        drawn_slots = {sid for sid, _ in tracked_robot_boxes}
+                        for slot_id, gbox in select_coasting_ghosts(track_outs):
+                            if slot_id in drawn_slots:
+                                continue
+                            robot = self._get_slot_track_if_exists(slot_id)
+                            if robot is None:
+                                continue
+                            label, _ = self._team_hud_label(
+                                robot, self._slot_label(slot_id))
+                            gcolor = ((153, 60, 0) if robot.alliance == "blue"
+                                      else (0, 30, 153))
+                            draw_dashed_box(annotated_frame, gbox, gcolor, thickness=2)
+                            gx1, gy1 = int(gbox[0]), int(gbox[1])
+                            cv2.putText(annotated_frame, f"{label} coast",
+                                        (gx1, max(12, gy1 - 5)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, gcolor, 1,
+                                        cv2.LINE_AA)
 
-                # Draw OCR score regions so user can verify placement
-                for region_key, (rx, ry, rw, rh) in self.ocr_regions.items():
-                    if "blue" in region_key:
-                        rect_color = (255, 0, 0)  # Blue in BGR
-                    elif "red" in region_key:
-                        rect_color = (0, 0, 255)  # Red in BGR
-                    else:
-                        rect_color = (0, 255, 255)  # Yellow in BGR
-                    cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
-                    cv2.putText(annotated_frame, region_key,
-                               (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
+                    # Draw hubs
+                    for hub in self.hubs:
+                        color = (255, 0, 0) if hub.alliance == "blue" else (0, 0, 255)
+                        cv2.circle(annotated_frame, (int(hub.x), int(hub.y)), 20, color, 3)
+                        cv2.putText(annotated_frame, f"{hub.alliance} hub",
+                                   (int(hub.x) - 30, int(hub.y) - 25),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # Radar + corner camera HUD panels live in a right rail, not over the video.
-                radar_tracks = []
-                radar_seen_slots = set()
-                for t in track_outs:
-                    if t.state == "empty":
-                        continue
-                    radar_seen_slots.add(t.slot_id)
-                    trail = self._radar_trails.setdefault(
-                        t.slot_id, deque(maxlen=16))
-                    trail.append(t.pos)
-                    slot_track = self._get_slot_track_if_exists(t.slot_id)
-                    team = slot_track.team_number if slot_track is not None else None
-                    radar_tracks.append(RadarTrack(
-                        pos=t.pos, alliance=t.alliance,
-                        team=team or self._slot_label(t.slot_id),
-                        slot_id=t.slot_id, state=t.state,
-                        corner_only=t.corner_only, trail=tuple(trail)))
-                # A slot that vanished re-seeds its trail from scratch.
-                for sid in list(self._radar_trails):
-                    if sid not in radar_seen_slots:
-                        del self._radar_trails[sid]
-                radar_img = self.radar.render(radar_tracks)
-                camera_panels = [
-                    self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
-                    for v in self.views if v.name != "main"
-                ]
-                annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)
+                    # Draw OCR score regions so user can verify placement
+                    for region_key, (rx, ry, rw, rh) in self.ocr_regions.items():
+                        if "blue" in region_key:
+                            rect_color = (255, 0, 0)  # Blue in BGR
+                        elif "red" in region_key:
+                            rect_color = (0, 0, 255)  # Red in BGR
+                        else:
+                            rect_color = (0, 255, 255)  # Yellow in BGR
+                        cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
+                        cv2.putText(annotated_frame, region_key,
+                                   (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
 
-                # --- Replay recording: capture the composited HUD frame + metadata
-                try:
-                    if not self._replay.is_open:
-                        eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 8.0
-                        self._replay.open_lazy(annotated_frame, eff_fps, REPLAYS_DIR / self.job_id)
-                    self._replay.add_frame(annotated_frame, {
-                        "frame_num": frame_num,
-                        "scores": dict(self.alliance_scores),
-                        "robots": [
-                            {
-                                "slot": self._slot_label(t.slot_id),
-                                "alliance": t.alliance,
-                                "team_number": self._get_display_team_number(self._get_or_create_slot_track(t.slot_id)),
-                                "confirmed": self._get_or_create_slot_track(t.slot_id).team_number_confirmed,
-                                "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
-                            }
-                            for t in track_outs if t.state != "empty"
-                        ],
-                    })
-                except Exception as e:
-                    print(f"[replay] frame record error: {e}")
+                    # Radar + corner camera HUD panels live in a right rail, not over the video.
+                    radar_tracks = []
+                    radar_seen_slots = set()
+                    for t in track_outs:
+                        if t.state == "empty":
+                            continue
+                        radar_seen_slots.add(t.slot_id)
+                        trail = self._radar_trails.setdefault(
+                            t.slot_id, deque(maxlen=16))
+                        trail.append(t.pos)
+                        slot_track = self._get_slot_track_if_exists(t.slot_id)
+                        team = slot_track.team_number if slot_track is not None else None
+                        radar_tracks.append(RadarTrack(
+                            pos=t.pos, alliance=t.alliance,
+                            team=team or self._slot_label(t.slot_id),
+                            slot_id=t.slot_id, state=t.state,
+                            corner_only=t.corner_only, trail=tuple(trail)))
+                    # A slot that vanished re-seeds its trail from scratch.
+                    for sid in list(self._radar_trails):
+                        if sid not in radar_seen_slots:
+                            del self._radar_trails[sid]
+                    radar_img = self.radar.render(radar_tracks)
+                    camera_panels = [
+                        self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
+                        for v in self.views if v.name != "main"
+                    ]
+                    annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)
+
+                with self._stage("loop.replay"):
+                    # --- Replay recording: capture the composited HUD frame + metadata
+                    try:
+                        if not self._replay.is_open:
+                            eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 8.0
+                            self._replay.open_lazy(annotated_frame, eff_fps, REPLAYS_DIR / self.job_id)
+                        self._replay.add_frame(annotated_frame, {
+                            "frame_num": frame_num,
+                            "scores": dict(self.alliance_scores),
+                            "robots": [
+                                {
+                                    "slot": self._slot_label(t.slot_id),
+                                    "alliance": t.alliance,
+                                    "team_number": self._get_display_team_number(self._get_or_create_slot_track(t.slot_id)),
+                                    "confirmed": self._get_or_create_slot_track(t.slot_id).team_number_confirmed,
+                                    "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
+                                }
+                                for t in track_outs if t.state != "empty"
+                            ],
+                        })
+                    except Exception as e:
+                        print(f"[replay] frame record error: {e}")
 
                 # Stream frame data via the latest-only queue: build display
                 # rows and encode only when a send is due, and never wait on
                 # the client.
-                if self.websocket and self._frame_stream_due(time.perf_counter()):
-                    robots_data = self._canonical_robot_rows()
-                    events_data = self._recent_events_data()
-                    _, buffer = cv2.imencode(
-                        '.jpg', annotated_frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, self.config.frame_stream_jpeg_quality])
-                    frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                    # Only stream the VLM crops on frames where a fresh batch exists,
-                    # to avoid resending the same images every frame.
-                    ocr_crops_payload = self.last_ocr_crops if self._ocr_crops_dirty else None
-                    self._ocr_crops_dirty = False
-                    self._enqueue_frame_payload(jsonify({
-                        "type": "frame",
-                        "frame_num": frame_num,
-                        "processed_frame_num": processed_frame_num,
-                        "total_frames": self.total_frames,
-                        "fps": self.video_fps,
-                        "frame_data": frame_b64,
-                        "backend": self.tracking_backend,
-                        "scores": self.alliance_scores,
-                        "robots": robots_data,
-                        "scoring_events": events_data,
-                        "ocr_crops": ocr_crops_payload,
-                        "vlm_status": self.vlm_status,
-                    }))
+                with self._stage("loop.ws_emit"):
+                    if self.websocket and self._frame_stream_due(time.perf_counter()):
+                        robots_data = self._canonical_robot_rows()
+                        events_data = self._recent_events_data()
+                        _, buffer = cv2.imencode(
+                            '.jpg', annotated_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, self.config.frame_stream_jpeg_quality])
+                        frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                        # Only stream the VLM crops on frames where a fresh batch exists,
+                        # to avoid resending the same images every frame.
+                        ocr_crops_payload = self.last_ocr_crops if self._ocr_crops_dirty else None
+                        self._ocr_crops_dirty = False
+                        self._enqueue_frame_payload(jsonify({
+                            "type": "frame",
+                            "frame_num": frame_num,
+                            "processed_frame_num": processed_frame_num,
+                            "total_frames": self.total_frames,
+                            "fps": self.video_fps,
+                            "frame_data": frame_b64,
+                            "backend": self.tracking_backend,
+                            "scores": self.alliance_scores,
+                            "robots": robots_data,
+                            "scoring_events": events_data,
+                            "ocr_crops": ocr_crops_payload,
+                            "vlm_status": self.vlm_status,
+                        }))
 
                 self._current_frame = frame_num
                 previous_processed_source_frame = frame_num
@@ -6531,6 +6705,23 @@ class InferenceJob:
                 frame_num += 1
                 processed_frame_num += 1
             
+            # Drain the in-flight background VLM pass (if any) BEFORE finalizing:
+            # its votes must land before assign_teams_from_votes/finalization
+            # runs. Awaited, not cancelled — reached on normal break and on the
+            # self._stopped break above.
+            await self._drain_vlm_task()
+
+            # Fold the per-stage accumulators into timings as flat "loop.<stage>"
+            # keys (survive the end-of-job round pass) and print one hot-path line.
+            for _k, _v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]):
+                self.timings[_k] = round(_v, 2)
+            if self._loop_stage_s:
+                _tot = time.perf_counter() - _loop_t0
+                _acct = sum(v for k, v in self._loop_stage_s.items()
+                            if k not in ("loop.person_det", "loop.embed", "loop.crop_encode"))  # nested inside evidence_build
+                print("  [profile] analysis loop stages (s): "
+                      + ", ".join(f"{k.split('.',1)[1]}={v:.1f}" for k, v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]))
+                      + f" | accounted {_acct:.1f}/{_tot:.1f}s")
             self.timings["analysis_loop"] = round(time.perf_counter() - _loop_t0, 2)
             self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
             self.status = "completed"
@@ -6563,6 +6754,13 @@ class InferenceJob:
                 "error": str(e)
             })
         finally:
+            # Defensive drain for the exception path (the normal path already
+            # drained before finalizing): don't orphan an in-flight background
+            # VLM task. Idempotent — a no-op once _vlm_task is None.
+            try:
+                await self._drain_vlm_task()
+            except Exception:
+                pass
             # Leave the GPU clean for whatever runs next: the vLLM server is
             # only needed during this job's analysis phase, and the next
             # job's tracking would have to stop it anyway.
@@ -9128,11 +9326,34 @@ async def infer(
     try:
         # Handle video source
         if video_file:
-            # Save uploaded file
-            video_path = UPLOAD_DIR / f"{job_id}_{video_file.filename}"
-            with open(video_path, "wb") as f:
-                shutil.copyfileobj(video_file.file, f)
-        
+            # Content-addressed storage: A/B reruns of the same match re-upload
+            # the identical file under a new job_id every time. Hash while
+            # streaming to a temp file, then dedupe on (digest, size) so repeat
+            # uploads reuse the existing file instead of duplicating ~100MB+
+            # videos on disk. Jobs are keyed by job_id, not filename, so
+            # sharing one file across jobs is safe.
+            suffix = Path(video_file.filename or "").suffix or ".mp4"
+            temp_path = UPLOAD_DIR / f"{job_id}.part"
+            md5 = hashlib.md5()
+            try:
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = video_file.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        md5.update(chunk)
+                        f.write(chunk)
+                final_path = UPLOAD_DIR / f"video_{md5.hexdigest()}{suffix}"
+                if final_path.exists() and final_path.stat().st_size == temp_path.stat().st_size:
+                    temp_path.unlink()
+                    print(f"  [upload] dedupe hit: reusing {final_path.name}")
+                else:
+                    os.replace(temp_path, final_path)
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                raise
+            video_path = final_path
+
         elif youtube_url:
             # Download YouTube video
             video_path = UPLOAD_DIR / f"{job_id}.mp4"

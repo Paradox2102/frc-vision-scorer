@@ -660,6 +660,8 @@ def test_sam2_tracker_evidence_generation():
     # Frame 0 initial check
     assert result[0][1]["evidence"]["type"] == "initial"
     assert result[0][1]["evidence"]["gap_len"] == 0
+    # Legacy 3-tuple predictors carry no tracker confidence.
+    assert result[0][1]["evidence"]["tracker_prob"] is None
     
     # Frame 1 propagated check
     assert result[1][1]["evidence"]["type"] == "propagated"
@@ -676,6 +678,52 @@ def test_sam2_tracker_evidence_generation():
     assert result[4][3]["evidence"]["type"] == "reprompted_new_id"
     assert result[4][3]["evidence"]["gap_len"] == 0
     assert result[5][3]["evidence"]["type"] == "propagated"
+
+
+class ProbsFourTupleStub:
+    """Predictor yielding SAM3-style 4-tuples (adds per-object tracker probs)."""
+
+    H = 20
+    W = 30
+    _rects_per_frame = [
+        [(2, 2, 6, 6), (15, 3, 20, 8)],
+        [(3, 3, 7, 7), (16, 4, 21, 9)],
+    ]
+    _probs_per_frame = [
+        [0.91, 0.44],
+        [0.88, 0.40],
+    ]
+
+    def init_state(self, video_path, **kwargs):
+        return {}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None):
+        pass
+
+    def propagate_in_video(self, state):
+        obj_ids = [1, 2]
+        for f_idx, rects in enumerate(self._rects_per_frame):
+            mask_logits = _make_mask_array(self.H, self.W, rects)
+            probs = np.asarray(self._probs_per_frame[f_idx], dtype=np.float32)
+            yield f_idx, obj_ids, mask_logits, probs
+
+    def reset_state(self, state):
+        pass
+
+
+def test_sam2_tracker_carries_tracker_prob_from_four_tuples():
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = ProbsFourTupleStub()
+    tracker = Sam2FieldTracker(predictor=stub)
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+    )
+    assert result[0][1]["evidence"]["tracker_prob"] == pytest.approx(0.91)
+    assert result[0][2]["evidence"]["tracker_prob"] == pytest.approx(0.44)
+    assert result[1][1]["evidence"]["tracker_prob"] == pytest.approx(0.88)
 
 
 def test_sam2_diagnostics_logging():

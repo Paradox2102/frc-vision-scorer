@@ -1274,9 +1274,11 @@ class Sam2FieldTracker:
         def _record_chunk(start_frame_idx, max_frame_num_to_track):
             """Propagate one chunk; record masks; return the last frame index seen."""
             last_idx = None
-            for f_idx, obj_ids, mask_logits in _propagate(
-                start_frame_idx, max_frame_num_to_track
-            ):
+            for out in _propagate(start_frame_idx, max_frame_num_to_track):
+                # SAM2 / legacy stubs yield 3-tuples; the SAM3 adapter appends
+                # per-object tracker confidence as a 4th element (may be None).
+                f_idx, obj_ids, mask_logits, *rest = out
+                tracker_probs = rest[0] if rest else None
                 f_idx_int = int(f_idx)
                 # mask_logits may be a real torch tensor (N,1,H,W) or a stub.
                 bool_arr = (mask_logits > 0).cpu().numpy()
@@ -1342,6 +1344,12 @@ class Sam2FieldTracker:
                         "type": ev_type,
                         "gap_len": gap_len,
                         "detector_overlap": overlap,
+                        "tracker_prob": (
+                            float(tracker_probs[i])
+                            if tracker_probs is not None
+                            and i < len(tracker_probs)
+                            else None
+                        ),
                     }
                     frame_entry[oid_int] = {
                         "box": box,
@@ -1370,11 +1378,13 @@ class Sam2FieldTracker:
 
         try:
             if propagate_backward and bootstrap_idx > 0:
-                for f_idx, obj_ids, mask_logits in _propagate(
+                for out in _propagate(
                     bootstrap_idx,
                     bootstrap_idx,
                     reverse=True,
                 ):
+                    f_idx, obj_ids, mask_logits, *rest = out
+                    tracker_probs = rest[0] if rest else None
                     f_idx_int = int(f_idx)
                     bool_arr = (mask_logits > 0).cpu().numpy()
                     frame_entry: dict[int, dict] = {}
@@ -1402,6 +1412,12 @@ class Sam2FieldTracker:
                                 "gap_len": 0,
                                 "detector_overlap": birth_detector_overlap.get(
                                     oid_int, 0.0
+                                ),
+                                "tracker_prob": (
+                                    float(tracker_probs[i])
+                                    if tracker_probs is not None
+                                    and i < len(tracker_probs)
+                                    else None
                                 ),
                             },
                         }

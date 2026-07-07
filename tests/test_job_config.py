@@ -246,6 +246,22 @@ def test_kin_gate_range_validation():
         JobConfig({"kin_max_speed_mps": 0.5})
 
 
+def test_occlusion_portal_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.occlusion_portal is False
+
+
+def test_occlusion_portal_knob_env_and_override(monkeypatch):
+    monkeypatch.setenv("OCCLUSION_PORTAL_ENABLED", "1")
+    cfg = JobConfig()
+    assert cfg.occlusion_portal is True
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"occlusion_portal": "false"})
+    assert cfg2.occlusion_portal is False
+
+
 def test_start_zone_seed_knobs_default_off(monkeypatch):
     # Autonomous starting-zone seed priors: admit sub-threshold bumper reads
     # inside alliance-wall starting bands during the opening window. OFF by

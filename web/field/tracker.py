@@ -204,9 +204,14 @@ class FieldTracker:
             np.asarray(d.pos, float) - np.asarray(t.kf.pos, float)))
         return (dist / gap_s) > self.kin_max_speed
 
-    def update(self, detections, occlusion, dt):
+    def update(self, detections, occlusion, dt, portals=None):
         self.binding_events = []
         self.assignment_evidence = {}
+        # Portal gate: {slot_id: (x, y, radius_m)}. Only consulted for slots
+        # that are occ_coasting; lets an occluded slot re-acquire a detection
+        # near its predicted hub-exit point even outside the plain distance
+        # gate. Empty/None when the occlusion_portal knob is off.
+        self._portals = dict(portals or {})
         self._frame_idx += 1
         if self.occlusion_rebind_guard:
             self._record_det_history(detections)
@@ -393,7 +398,18 @@ class FieldTracker:
                     # Widen the gate for coasting tracks (more missed frames →
                     # wider gate), but cap the multiplier to prevent teleportation.
                     effective_gate = self.gate * min(4.0, 1.0 + 0.5 * t.missed)
-                    if dist <= effective_gate:
+                    in_gate = dist <= effective_gate
+                    # Portal second chance: an occlusion-coasting slot may
+                    # re-acquire a detection near its predicted hub-exit point
+                    # even beyond the plain distance gate.
+                    portal = self._portals.get(t.slot_id) if t.occ_coasting else None
+                    if not in_gate and portal is not None:
+                        px, py, pr = portal
+                        d_portal = float(np.hypot(d.pos[0] - px, d.pos[1] - py))
+                        if d_portal <= pr:
+                            in_gate = True
+                            dist = d_portal + 0.5   # small penalty vs direct matches
+                    if in_gate:
                         if self._kin_violates(t, d, dt):
                             # Implied speed exceeds the physical cap: leave
                             # this pair at cost=inf so it can't win the

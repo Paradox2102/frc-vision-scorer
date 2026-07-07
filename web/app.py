@@ -70,6 +70,7 @@ from web.field.occlusion import (
     occluded_by_hub,
     resolve_occlusion,
 )
+from web.field.occlusion_portal import predict_exit, path_crosses_footprint
 from web.field.overlay_geometry import (
     bump_wireframe_edges,
     hub_wireframe_edges,
@@ -1063,6 +1064,13 @@ class InferenceJob:
         self._view_flags: Dict[int, dict] = {}
         self._occ: Dict[int, dict] = {}
         self._occ_by_cam: Dict[str, Dict[int, dict]] = {}
+        # Occlusion exit portals (knob: occlusion_portal). slot_id ->
+        # (exit_x, exit_y, radius_m). Set when a slot transitions into
+        # hub-occluded coasting; radius grows with coast uncertainty; cleared
+        # on re-acquire/expire. Fed into the NEXT frame's tracker update.
+        self._portal_state: Dict[int, tuple] = {}
+        # slot_id -> last-known (x, y), for teleport-suspect logging.
+        self._portal_prev_pos: Dict[int, tuple] = {}
 
         # Video metadata
         self.video_width = 0
@@ -3899,6 +3907,58 @@ class InferenceJob:
         """Human label for a slot: B1..B3 / R1..R3."""
         return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
 
+    def _update_portals(self, track_outs, dt) -> None:
+        """Maintain occlusion exit portals across frames (occlusion_portal knob).
+
+        - On a slot transitioning INTO hub-occluded coasting, project its
+          constant-velocity ray through each hub prism and stash the first
+          exit point as (x, y, 0.8) — the seed re-acquisition portal.
+        - While it stays occ-coasting, grow the radius by 0.5*dt per frame
+          (coast uncertainty) up to 2.5 m.
+        - Clear the entry once the slot is re-acquired (visible) or gone.
+        - Log-only teleport suspicion: a slot whose position jumped > 2.0 m
+          this frame along a path crossing a hub, while NOT occ-coasting.
+        """
+        states = {t.slot_id: t for t in track_outs}
+        # Teleport-suspect logging (log-only, never rejects an association).
+        for sid, t in states.items():
+            prev = self._portal_prev_pos.get(sid)
+            new = (float(t.pos[0]), float(t.pos[1]))
+            occ_coasting = (t.state == "coasting"
+                            and self._occ.get(sid, {}).get("cause") == "hub")
+            if (prev is not None and not occ_coasting
+                    and float(np.hypot(new[0] - prev[0], new[1] - prev[1])) > 2.0
+                    and any(path_crosses_footprint(prev, new, p.footprint)
+                            for p in self.hub_prisms)):
+                print(f"  [portal] teleport-suspect slot {sid}: "
+                      f"{prev}->{new} crosses hub")
+            self._portal_prev_pos[sid] = new
+
+        for sid, t in states.items():
+            hub_coasting = (t.state == "coasting"
+                            and self._occ.get(sid, {}).get("cause") == "hub")
+            if not hub_coasting:
+                # Re-acquired or no longer hub-occluded: drop any portal.
+                self._portal_state.pop(sid, None)
+                continue
+            if sid in self._portal_state:
+                # Established portal: grow radius with coast uncertainty.
+                px, py, pr = self._portal_state[sid]
+                self._portal_state[sid] = (px, py, min(2.5, pr + 0.5 * dt))
+                continue
+            # New transition into hub-occluded coasting: predict the exit.
+            for prism in self.hub_prisms:
+                hit = predict_exit(t.pos, t.vel, prism.footprint)
+                if hit is not None:
+                    (ex, ey), _eta = hit
+                    self._portal_state[sid] = (ex, ey, 0.8)
+                    break
+
+        # Drop portals for slots no longer present at all.
+        for sid in [s for s in self._portal_state if s not in states]:
+            self._portal_state.pop(sid, None)
+            self._portal_prev_pos.pop(sid, None)
+
     def _identity_for_slot(self, slot_id: int) -> Optional[RobotIdentity]:
         """Find the active identity currently bound to a slot."""
         if not hasattr(self, "identity_registry") or self.identity_registry is None:
@@ -6305,7 +6365,10 @@ class InferenceJob:
 
                     field_dets = [obs.detection for obs in fused]
                     dt = self.frame_skip / (self.video_fps or 30.0)
-                    track_outs = self.field_tracker.update(field_dets, self._view_flags, dt)
+                    portals = (self._portal_state
+                               if self.config.occlusion_portal else None)
+                    track_outs = self.field_tracker.update(
+                        field_dets, self._view_flags, dt, portals=portals)
                     if TRACKER_TRACE:
                         ft = self.field_tracker
                         self._tracker_trace = getattr(self, "_tracker_trace", [])
@@ -6366,6 +6429,9 @@ class InferenceJob:
                     }
                     self._occ = _merge_occlusion(list(self._occ_by_cam.values()))
                     self._view_flags = self._occ   # feed forward to next frame's tracker
+
+                    if self.config.occlusion_portal:
+                        self._update_portals(track_outs, dt)
 
                     # 6. Sync RobotTracks by slot_id and build the box list for HUD/VLM.
                     # Mirror each slot's fused-track appearance embedding (kept in the

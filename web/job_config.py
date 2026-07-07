@@ -274,6 +274,14 @@ KNOBS = [
     # pending A/B. See tracker.py FieldTracker._kin_violates.
     Knob("kin_gate", "KIN_GATE_ENABLED", bool, False),
     Knob("kin_max_speed_mps", "KIN_MAX_SPEED_MPS", float, 6.5, min=1.0),
+    # Occlusion exit portals: when a slot goes into coast behind a hub prism,
+    # predict where its velocity carries it out of the hub shadow and let the
+    # tracker re-acquire a detection near that exit even outside the plain
+    # distance gate (a robot reappearing on the far side of the hub otherwise
+    # waits for the coast-gate to widen, or seeds a duplicate under a new id).
+    # Portal radius grows with coast uncertainty; teleport-through-hub paths
+    # are logged only. DEFAULT OFF pending A/B. See web/field/occlusion_portal.py.
+    Knob("occlusion_portal", "OCCLUSION_PORTAL_ENABLED", bool, False),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

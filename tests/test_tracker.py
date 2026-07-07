@@ -165,3 +165,44 @@ def test_kinematic_gate_default_off_preserves_behavior():
     d1 = FieldDetection(pos=(7.0, 2.0), color="blue", box=(0, 0, 5, 5))
     tr.update([d1], {}, dt=0.125)
     assert not any(e["event"] == "kinematic_reject" for e in tr.binding_events)
+
+
+def _drive_into_occ_coast(tr, sid, seed_pos=(5.0, 3.0)):
+    """Seed a blue slot, drive it hub-occluded, then miss frames so it enters
+    occ_coasting via the public API (as existing occlusion tests do)."""
+    tr.update([_det(*seed_pos, "blue")], {}, 0.1)
+    # Miss frames while marked view_occluded -> slot coasts and sets occ_coasting.
+    for _ in range(3):
+        tr.update([], {sid: {"view_occluded": True}}, 0.1)
+
+
+def test_portal_reacquire_outside_gate():
+    # gate small so the far detection is well outside even gate*4.
+    tr = FieldTracker(field_length=16.541, gate_m=0.5,
+                      max_coast_open=90, max_coast_occluded=90)
+    sid = [t for t in tr.tracks if t.alliance == "blue"][0].slot_id
+    _drive_into_occ_coast(tr, sid)
+    slot = [t for t in tr.tracks if t.slot_id == sid][0]
+    assert slot.occ_coasting
+    # Detection at (9.2, 3.1): >> gate*4 (=2.0) from the coasting slot near (5,3).
+    far = _det(9.2, 3.1, "blue")
+    out = tr.update([far], {sid: {"view_occluded": True}},
+                    0.1, portals={sid: (9.0, 3.0, 1.0)})
+    reacq = [t for t in out if t.slot_id == sid][0]
+    # Portal accepted the association: slot re-acquired (visible) and the far
+    # detection bound to it. (Exact KF pos lags — the jump trips the
+    # max-speed r_scale downweight — but the binding is the contract.)
+    assert reacq.state == "visible"
+    assert tr.last_det_to_slot.get(0) == sid
+
+
+def test_portal_off_no_reacquire():
+    tr = FieldTracker(field_length=16.541, gate_m=0.5,
+                      max_coast_open=90, max_coast_occluded=90)
+    sid = [t for t in tr.tracks if t.alliance == "blue"][0].slot_id
+    _drive_into_occ_coast(tr, sid)
+    far = _det(9.2, 3.1, "blue")
+    # No portals passed: the far detection must NOT re-acquire the coasting slot.
+    out = tr.update([far], {sid: {"view_occluded": True}}, 0.1)
+    reacq = [t for t in out if t.slot_id == sid][0]
+    assert not (abs(reacq.pos[0] - 9.2) < 1.0 and abs(reacq.pos[1] - 3.1) < 1.0)

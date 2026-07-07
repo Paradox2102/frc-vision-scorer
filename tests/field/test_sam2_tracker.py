@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from web.field.sam2_tracker import mask_to_box, bottom_center, match_new_detections
+from web.field.sam2_tracker import (
+    mask_to_box,
+    bottom_center,
+    match_new_detections,
+    size_prior_ratio,
+    size_prior_violation,
+)
 
 
 def test_mask_to_box_tight_bbox():
@@ -2871,9 +2877,6 @@ def test_mask_leak_cleanup_default_off_byte_identical():
     assert any(box[2] == 60 for entry in default_boxes.values()
                for box in entry.values()), \
         "expected the union box (leak included) when the knob is off"
-
-
-from web.field.sam2_tracker import size_prior_ratio, size_prior_violation
 
 
 def test_size_prior_ratio_basic():

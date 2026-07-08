@@ -6328,6 +6328,11 @@ class InferenceJob:
             # Seeds the field tracker's slots from this frame so VLM reads bind to
             # slot ids (the same identity the main loop uses).
             early_ocr_source_frame = prompt_source_frame
+            # The main per-frame loop doesn't advance self._current_frame
+            # until it starts (below), so without this the early pass would
+            # log/gate against a stale frame 0 (record_vlm_read diagnostics
+            # and the det_gated_vlm_reads archive lookup both key off this).
+            self._current_frame = early_ocr_source_frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, early_ocr_source_frame)
             ret, early_ocr_frame = cap.read()
             if ret and self.match_teams:

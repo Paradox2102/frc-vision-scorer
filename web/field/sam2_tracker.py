@@ -14,9 +14,19 @@ from __future__ import annotations
 import os
 from collections import deque
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable, Optional
 
 import numpy as np
+
+
+class TrackStopped(Exception):
+    """Raised by ``Sam2FieldTracker.track`` when ``should_stop`` returns True.
+
+    Propagation runs on a worker thread (via ``asyncio.to_thread`` in the web
+    app) and cannot be killed from outside, so the loop polls a caller-supplied
+    predicate once per propagated frame and raises this to unwind cooperatively.
+    The web app treats it as a user stop, NOT as a tracker failure.
+    """
 
 # Mask-shape plausibility knobs. A robot's SAM2 mask is a compact blob that
 # stands on the carpet — roughly as wide as it is tall and widest near its
@@ -922,6 +932,7 @@ class Sam2FieldTracker:
         size_prior_boundaries: int = SIZE_PRIOR_BOUNDARIES,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> dict[int, dict[int, dict]]:
         """Run offline SAM2 propagation over a directory of frames.
 
@@ -1070,6 +1081,12 @@ class Sam2FieldTracker:
                 cull.
             progress_cb: Optional callback taking (processed_count, total_frames).
             diagnostics: Optional IdentityDiagnosticRecorder-like object.
+            should_stop: Optional predicate polled once per propagated frame.
+                When it returns True the loop raises ``TrackStopped`` after the
+                predictor state is reset (the ``finally`` below) — a cooperative
+                abort for a user STOP, since the propagation thread can't be
+                killed from outside. Callers treat this as a stop, not a
+                tracker failure.
 
         Returns:
             Nested dict ``{frame_idx: {obj_id: {"box": (x1,y1,x2,y2),
@@ -1364,6 +1381,11 @@ class Sam2FieldTracker:
                         progress_cb(self._processed_count, total_work_frames)
                     except Exception:
                         pass
+                # Cooperative stop: checked once per propagated frame so a user
+                # STOP takes effect within a frame's propagation time rather
+                # than after the whole (multi-minute) chunk/view completes.
+                if should_stop is not None and should_stop():
+                    raise TrackStopped()
             if diagnostics and last_idx is not None:
                 diagnostics.record(
                     f"{self.DIAG_PREFIX}.chunk_complete",
@@ -1431,6 +1453,9 @@ class Sam2FieldTracker:
                             )
                         except Exception:
                             pass
+                    # Cooperative stop, per propagated frame (backward pass).
+                    if should_stop is not None and should_stop():
+                        raise TrackStopped()
 
             if not reprompting:
                 _record_chunk(None, None)

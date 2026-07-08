@@ -264,3 +264,59 @@ def test_ensure_started_falls_back_to_cold_start_when_wake_times_out():
     assert result is True
     # Wedged sleeper killed, then cold-started.
     assert launches == ["stop", "start"]
+
+
+def test_ensure_started_aborts_cold_start_wait_on_should_stop():
+    """A user STOP during the ~90s cold-start wait returns False within a poll
+    interval instead of blocking until ready_timeout."""
+    launches = []
+    polls = {"n": 0}
+
+    async def run_script(name):
+        launches.append(name)
+
+    def check():
+        polls["n"] += 1
+        return False  # never comes up on its own
+
+    stop = {"flag": False}
+
+    def should_stop():
+        # Request stop after the first readiness poll.
+        stop["flag"] = polls["n"] >= 1
+        return stop["flag"]
+
+    result = asyncio.run(ensure_started(
+        check_fn=check,
+        run_script=run_script,
+        sleep=_noop_sleep(),
+        ready_timeout=10_000,  # huge: only should_stop can end the loop promptly
+        http_fn=_FakeHttp(is_sleeping_states=[False]),  # nothing running
+        should_stop=should_stop,
+    ))
+    assert result is False
+    assert launches == ["start"]  # it did attempt the cold start
+    assert polls["n"] <= 2  # bailed almost immediately, not after 10k timeout
+
+
+def test_ensure_started_should_stop_none_polls_to_ready():
+    """Default (should_stop unset) preserves the existing poll-to-ready path."""
+    launches = []
+    polls = {"n": 0}
+
+    async def run_script(name):
+        launches.append(name)
+
+    def check():
+        polls["n"] += 1
+        return polls["n"] >= 3  # up on the 3rd poll
+
+    result = asyncio.run(ensure_started(
+        check_fn=check,
+        run_script=run_script,
+        sleep=_noop_sleep(),
+        ready_timeout=10,
+        http_fn=_FakeHttp(is_sleeping_states=[False]),
+    ))
+    assert result is True
+    assert launches == ["start"]

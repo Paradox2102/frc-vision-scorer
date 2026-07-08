@@ -56,6 +56,7 @@ from web.legibility import legibility_score
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
+from web.field.sam2_tracker import TrackStopped
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
 from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
@@ -987,9 +988,21 @@ def _resolve_crop(crop):
     return crop() if callable(crop) else crop
 
 
+class JobStopped(Exception):
+    """Raised inside ``process_video`` when the user's STOP flag is seen.
+
+    Every long phase runs on a worker thread (``asyncio.to_thread``) that can't
+    be killed from outside, so the pipeline polls ``self._stopped`` at each
+    phase boundary and inside the hot loops and raises this to unwind. The
+    ``process_video`` handler turns it into a terminal ``error`` state (unless
+    the analysis loop has already started, which keeps its partial-results
+    behavior) and always runs the ``finally`` cleanup.
+    """
+
+
 class InferenceJob:
     """Manages a single video inference job"""
-    
+
     def __init__(self, job_id: str, video_path: Path, team_reader: str = "local",
                  match_key: Optional[str] = None,
                  config: Optional[JobConfig] = None):
@@ -1353,6 +1366,16 @@ class InferenceJob:
                 vote_share = EASYOCR_VOTE_WEIGHT / len(matching_teams)
                 for team in matching_teams:
                     robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0) + vote_share
+
+    def _raise_if_stopped(self) -> None:
+        """Raise ``JobStopped`` if the user has requested a stop.
+
+        Called at every phase boundary in ``process_video`` so a STOP set
+        during a long synchronous phase takes effect promptly instead of only
+        at the queue-wait / analysis-loop poll points.
+        """
+        if self._stopped:
+            raise JobStopped()
 
     @contextmanager
     def _stage(self, name):
@@ -5153,6 +5176,7 @@ class InferenceJob:
                 auto_only=self.config.auto_period_only,
             )
             self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
+            self._raise_if_stopped()  # phase boundary: after clock scan
             if self.timer_gate_fallback:
                 fallback_start = min(TITLE_SCREEN_FRAMES, max(0, self.total_frames - 1))
                 self.processing_ranges = [
@@ -5209,6 +5233,7 @@ class InferenceJob:
                     except Exception:
                         pass
                 return
+            self._raise_if_stopped()  # phase boundary: after calibration check
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
@@ -5469,6 +5494,10 @@ class InferenceJob:
                 # are exactly TITLE_SCREEN_FRAMES + k*frame_skip, byte-identical to before,
                 # but decoding is linear instead of seek-thrashing and happens only once.
                 view_dirs = {v.name: tempfile.TemporaryDirectory() for v in self.views}
+                # Registered on the job so the process_video `finally` can sweep
+                # any dirs a mid-phase JobStopped/TrackStopped left behind (the
+                # per-view loop only cleans the view it just propagated).
+                self._view_export_dirs = view_dirs
                 view_prompt_boxes: dict[str, list] = {v.name: [] for v in self.views}
                 view_prompt_colors: dict[str, list] = {v.name: [] for v in self.views}
                 # Per-view grayscale of the previous kept frame, for the seed
@@ -5612,7 +5641,15 @@ class InferenceJob:
                                 pct = (exported / max(1, len(all_frames))) * EXPORT_PCT
                                 msg = f"[{self.tracker_tag}] Exporting frames ({exported}/{len(all_frames)}) across {N} view(s)..."
                                 await safe_send_status(msg, pct)
+                                # Per-batch stop poll: abort export within ~20
+                                # frames of a STOP instead of exporting the whole
+                                # active window first. The `finally` below still
+                                # releases cap_pre; JobStopped unwinds past it.
+                                if self._stopped:
+                                    raise JobStopped()
                         fpos += 1
+                except JobStopped:
+                    raise  # user stop: unwind to the process_video handler
                 except Exception as e:
                     print(f"  [{self.tracker_tag}] Error during single-pass frame export: {e}")
                 finally:
@@ -5620,6 +5657,8 @@ class InferenceJob:
                 self.timings["frame_export"] = self.timings.get("frame_export", 0.0) + (time.perf_counter() - export_t0)
                 print(f"  [{self.tracker_tag}] Exported {exported} frames/view across {N} view(s) in "
                       f"{time.perf_counter() - export_t0:.1f}s (single sequential decode pass)")
+
+                self._raise_if_stopped()  # phase boundary: after frame export
 
                 # Barrier: the overlapped tracker/embedder load must be
                 # resident before seeding. On failure, degrade to Kalman
@@ -5637,6 +5676,7 @@ class InferenceJob:
                     self.use_sam2 = False
                     self.robot_embedder = None
             if self.use_sam2:
+                self._raise_if_stopped()  # phase boundary: after model load
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
@@ -6046,6 +6086,12 @@ class InferenceJob:
                             size_prior_hi=self.config.size_prior_hi,
                             size_prior_lo=self.config.size_prior_lo,
                             size_prior_boundaries=self.config.size_prior_boundaries,
+                            # Cooperative stop: the tracker polls this once per
+                            # propagated frame and raises TrackStopped so a user
+                            # STOP aborts this (longest) phase within a frame's
+                            # propagation time. Covers both SAM2 and SAM3 (the
+                            # SAM3 tracker inherits this track() method).
+                            should_stop=lambda: self._stopped,
                         )
                         elapsed = time.perf_counter() - t0
                         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -6058,6 +6104,12 @@ class InferenceJob:
                             f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
                             base_pct + span_pct,
                         )
+                    except TrackStopped:
+                        # User stop — NOT a tracker failure. The finally below
+                        # releases this view's caps/tempdir; re-raise so the
+                        # process_video handler ends the job as a clean stop
+                        # rather than a degraded "no tracks" warning.
+                        raise
                     except Exception as e:
                         print(f"  [{self.tracker_tag}] Error during propagation for view {view.name}: {e}")
                         # A dead view means a mostly-empty overlay for that
@@ -6074,6 +6126,11 @@ class InferenceJob:
                             if _state.get("cap") is not None:
                                 _state["cap"].release()
                         tmp_dir_obj.cleanup()
+                    # Phase boundary: after each view's propagation. A stop set
+                    # DURING propagation already raised TrackStopped above; this
+                    # catches one set in the window after track() returned so we
+                    # never start seeding/propagating the next view.
+                    self._raise_if_stopped()
 
                 if not self.sam2_raw:
                     await self._warn_degraded(
@@ -6098,6 +6155,7 @@ class InferenceJob:
             # OCR pass just below) issue bumper reads, so bring the vLLM
             # server back now. On failure the read path falls back to the
             # in-process Qwen reader — degraded speed, not a dead job.
+            self._raise_if_stopped()  # phase boundary: before vLLM startup
             if (self.config.vllm_phase_exclusive
                     and getattr(self, "team_reader", "local") == "vllm"):
                 from web import vllm_lifecycle
@@ -6125,7 +6183,13 @@ class InferenceJob:
                     "message": "Starting vLLM reader for the analysis phase (~90s model load)…",
                     "progress": 55.0,
                 })
-                if not await vllm_lifecycle.ensure_started():
+                started = await vllm_lifecycle.ensure_started(
+                    should_stop=lambda: self._stopped)
+                # ensure_started returns early (False) on stop; distinguish a
+                # user stop from a genuine startup failure so we don't waste a
+                # degradation warning on a job we're about to end.
+                self._raise_if_stopped()  # phase boundary: after vLLM startup
+                if not started:
                     # The server never came up. Switch this job to the
                     # in-process reader for the rest of the run so every read
                     # batch skips the doomed vLLM round-trip (and its
@@ -7141,6 +7205,21 @@ class InferenceJob:
                 "config": self.config.non_defaults(),
             }))
         
+        except (JobStopped, TrackStopped):
+            # User pressed STOP before the analysis loop began (every
+            # _raise_if_stopped poll and the tracker's TrackStopped fire only
+            # in the pre-loop phases; the analysis loop itself stops via its
+            # own `if self._stopped: break`, which finalizes with partial
+            # results and never raises). Terminal `error` state with the
+            # standard error message, same websocket path as other job errors.
+            # The finally below still runs all cleanup.
+            self.status = "error"
+            self.error = "Stopped by user"
+            print("  process_video: stopped by user before the analysis loop")
+            await self._send_ws({
+                "type": "error",
+                "error": self.error,
+            })
         except Exception as e:
             self.status = "error"
             self.error = str(e)
@@ -7196,6 +7275,18 @@ class InferenceJob:
             self._close_log_file()
             if cap is not None:
                 cap.release()
+            # Sweep per-view frame-export tempdirs a mid-phase stop (or any
+            # exception) left behind: the per-view propagation loop only cleans
+            # the view it just finished, so a JobStopped/TrackStopped raised
+            # during export or an early view would otherwise strand the rest
+            # for GC-time finalizers. cleanup() on an already-cleaned dir is a
+            # no-op failure we swallow.
+            for _vd in (getattr(self, "_view_export_dirs", None) or {}).values():
+                try:
+                    _vd.cleanup()
+                except Exception:
+                    pass
+            self._view_export_dirs = None
             # Finalize processing timings (covers partial/errored runs the success
             # path never reached) and round to 2 decimals for display/storage.
             timings = getattr(self, "timings", {}) or {}

@@ -24,6 +24,7 @@ class VisionScorer {
         this.degradationTitle = document.getElementById('degradationTitle');
         this.degradationList = document.getElementById('degradationList');
         this.statusLog = document.getElementById('statusLog');
+        this.recoveryActions = document.getElementById('recoveryActions');
         this.degradationWarnings = [];
         this.lastWsMessageAt = 0;
         this.stallTimer = null;
@@ -60,10 +61,38 @@ class VisionScorer {
         // Timeline
         this.timelineContainer = document.getElementById('timelineContainer');
 
+        // Header job pill (both modes)
+        this.jobPill = document.getElementById('jobPill');
+        this._jobPollTimer = null;
+
+        // Diagnostic viewer (debug-only)
+        this.diagnosticToggleBtn = document.getElementById('diagnosticToggleBtn');
+        this.diagnosticPanel = document.getElementById('diagnosticPanel');
+        this.diagnosticFilter = document.getElementById('diagnosticFilter');
+        this.diagnosticReloadBtn = document.getElementById('diagnosticReloadBtn');
+        this.diagnosticStatus = document.getElementById('diagnosticStatus');
+        this.diagnosticLines = document.getElementById('diagnosticLines');
+        this._diagnosticRawLines = [];
+        this._diagnosticTotalLines = 0;
+
+        this.replayDiagnosticToggleBtn = document.getElementById('replayDiagnosticToggleBtn');
+        this.replayDiagnosticPanel = document.getElementById('replayDiagnosticPanel');
+        this.replayDiagnosticFilter = document.getElementById('replayDiagnosticFilter');
+        this.replayDiagnosticReloadBtn = document.getElementById('replayDiagnosticReloadBtn');
+        this.replayDiagnosticStatus = document.getElementById('replayDiagnosticStatus');
+        this.replayDiagnosticLines = document.getElementById('replayDiagnosticLines');
+        this._replayDiagnosticRawLines = [];
+        this._replayDiagnosticTotalLines = 0;
+
         this.init();
     }
 
     init() {
+        // UI mode (standard | debug). Standard is the default; the mode is a
+        // pure CSS gate (see style.css) so WebSocket data keeps flowing into
+        // hidden nodes and toggling works mid-run with no re-fetch.
+        this.initModeToggle();
+
         // Event form
         document.getElementById('eventForm').addEventListener('submit', (e) => this.handleEventLoad(e));
 
@@ -114,6 +143,8 @@ class VisionScorer {
         // Settings
         const settingsResetBtn = document.getElementById('settingsResetBtn');
         if (settingsResetBtn) settingsResetBtn.addEventListener('click', () => this.resetAllSettings());
+        const settingsFilter = document.getElementById('settingsFilter');
+        if (settingsFilter) settingsFilter.addEventListener('input', () => this.filterSettings(settingsFilter.value));
 
         // Modal
         document.getElementById('modalClose').addEventListener('click', () => this.closeModal());
@@ -128,6 +159,47 @@ class VisionScorer {
 
         // Check if we have an active event
         this.checkExistingEvent();
+
+        // Header job pill (both modes)
+        this.initJobPill();
+
+        // Diagnostic viewer (debug-only)
+        this.initDiagnosticViewer();
+    }
+
+    // --- UI mode (Standard / Debug) ---
+
+    initModeToggle() {
+        let mode = 'standard';
+        try {
+            const saved = localStorage.getItem('uiMode');
+            if (saved === 'debug' || saved === 'standard') mode = saved;
+        } catch (e) { /* localStorage unavailable — fall back to default */ }
+        this.setMode(mode, false);
+        const toggle = document.getElementById('modeToggle');
+        if (toggle) {
+            toggle.querySelectorAll('.mode-toggle-btn').forEach(btn => {
+                btn.addEventListener('click', () => this.setMode(btn.dataset.mode, true));
+            });
+        }
+    }
+
+    setMode(mode, persist) {
+        mode = mode === 'debug' ? 'debug' : 'standard';
+        document.body.dataset.mode = mode;
+        if (persist) {
+            try { localStorage.setItem('uiMode', mode); } catch (e) { /* ignore */ }
+        }
+        // A debug-only view can be active when switching to standard; the CSS
+        // hides its nav tab but the view div itself is toggled by switchView,
+        // so kick the user back to the scorer.
+        if (mode === 'standard') {
+            const active = document.querySelector('.nav-btn.active');
+            const activeView = active && active.dataset.view;
+            if (activeView === 'gallery' || activeView === 'settings') {
+                this.switchView('scorer');
+            }
+        }
     }
 
     // --- Navigation ---
@@ -154,6 +226,8 @@ class VisionScorer {
         } else if (view === 'settings') {
             this.loadSettings();
         }
+
+        this.renderJobPill();
     }
 
     // --- Settings (runtime knob overrides) ---
@@ -166,10 +240,53 @@ class VisionScorer {
             if (!resp.ok) { list.innerHTML = '<p class="empty-state">Failed to load settings</p>'; return; }
             const { knobs } = await resp.json();
             list.innerHTML = '';
-            knobs.forEach(k => list.appendChild(this.settingRow(k)));
+            // Group by section, preserving first-appearance order from the registry.
+            const sections = new Map();
+            knobs.forEach(k => {
+                const name = k.section || 'misc';
+                if (!sections.has(name)) sections.set(name, []);
+                sections.get(name).push(k);
+            });
+            sections.forEach((rows, section) => {
+                const header = document.createElement('div');
+                header.className = 'settings-section-header';
+                header.dataset.section = section;
+                header.innerHTML = `<span class="settings-section-name">${section}</span>` +
+                    `<span class="settings-section-count">${rows.length}</span>`;
+                list.appendChild(header);
+                rows.forEach(k => list.appendChild(this.settingRow(k)));
+            });
+            const filterInput = document.getElementById('settingsFilter');
+            if (filterInput) this.filterSettings(filterInput.value);
         } catch (e) {
             list.innerHTML = '<p class="empty-state">Failed to load settings</p>';
         }
+    }
+
+    filterSettings(query) {
+        const list = document.getElementById('settingsList');
+        if (!list) return;
+        const q = query.trim().toLowerCase();
+        let currentHeader = null;
+        let currentHeaderVisibleCount = 0;
+        const flushHeader = () => {
+            if (currentHeader) currentHeader.style.display = currentHeaderVisibleCount > 0 ? '' : 'none';
+        };
+        Array.from(list.children).forEach(el => {
+            if (el.classList.contains('settings-section-header')) {
+                flushHeader();
+                currentHeader = el;
+                currentHeaderVisibleCount = 0;
+                return;
+            }
+            if (!el.classList.contains('setting-row')) return;
+            const name = (el.dataset.name || '').toLowerCase();
+            const env = (el.querySelector('.setting-env')?.textContent || '').toLowerCase();
+            const visible = !q || name.includes(q) || env.includes(q);
+            el.style.display = visible ? '' : 'none';
+            if (visible) currentHeaderVisibleCount++;
+        });
+        flushHeader();
     }
 
     settingControl(k) {
@@ -266,7 +383,14 @@ class VisionScorer {
                 if (errEl) errEl.textContent = body.error || `HTTP ${resp.status}`;
                 return;
             }
-            if (row) row.replaceWith(this.settingRow(body.knob));
+            if (row) {
+                row.replaceWith(this.settingRow(body.knob));
+                // The fresh row ignores any active filter; re-apply it so the
+                // saved row doesn't pop back into a filtered-out section (and
+                // section header visible-counts stay correct).
+                const filterInput = document.getElementById('settingsFilter');
+                if (filterInput) this.filterSettings(filterInput.value);
+            }
         } catch (e) {
             if (errEl) errEl.textContent = 'request failed';
         }
@@ -1067,6 +1191,7 @@ class VisionScorer {
             }
 
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
 
             // Store the match video URL for calibration frame grab
             this._pendingMatchVideoUrl = youtubeUrl || null;
@@ -1088,6 +1213,7 @@ class VisionScorer {
             const data = await resp.json();
             if (!data.job_id) return;
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
             this.jobFinished = false;
             this.videoSection.style.display = 'grid';
             this.setInferenceControlState('running');
@@ -1105,6 +1231,63 @@ class VisionScorer {
         } catch (e) {
             // No active job or server unreachable — normal page load.
         }
+    }
+
+    // --- Header job pill (both modes) ---
+
+    initJobPill() {
+        if (!this.jobPill) return;
+        this.jobPill.addEventListener('click', () => this.onJobPillClick());
+
+        const poll = () => this.pollActiveJob();
+        poll();
+        this._jobPollTimer = setInterval(() => {
+            if (document.hidden) return;
+            poll();
+        }, 5000);
+
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) poll();
+        });
+    }
+
+    async pollActiveJob() {
+        try {
+            const resp = await fetch('/api/job/active');
+            const data = await resp.json();
+            this._lastActiveJob = data && data.job_id ? data : null;
+        } catch (e) {
+            this._lastActiveJob = null;
+        }
+        this.renderJobPill();
+    }
+
+    renderJobPill() {
+        if (!this.jobPill) return;
+        const data = this._lastActiveJob;
+        if (!data || !data.job_id) {
+            this.jobPill.style.display = 'none';
+            return;
+        }
+        const activeNav = document.querySelector('.nav-btn.active');
+        const activeView = activeNav && activeNav.dataset.view;
+        const show = activeView !== 'scorer' || this.jobId !== data.job_id;
+        if (!show) {
+            this.jobPill.style.display = 'none';
+            return;
+        }
+        // No markup here — textContent is enough and needs no HTML-escaping.
+        this.jobPill.textContent = `⏳ ${data.match_key || 'job'} — ${data.status || ''}`;
+        this.jobPill.style.display = 'inline-flex';
+    }
+
+    onJobPillClick() {
+        const data = this._lastActiveJob;
+        this.switchView('scorer');
+        if (data && data.job_id && this.jobId == null) {
+            this.rejoinActiveJob();
+        }
+        this.renderJobPill();
     }
 
     _showInferenceView() {
@@ -1331,6 +1514,10 @@ class VisionScorer {
             this.statusLog.replaceChildren();
             this.statusLog.style.display = 'block';
         }
+        if (this.recoveryActions) {
+            this.recoveryActions.replaceChildren();
+            this.recoveryActions.style.display = 'none';
+        }
         // Run clocks + tracking panel.
         this.runStartedAt = Date.now();
         this.overlayStreaming = false;
@@ -1352,6 +1539,9 @@ class VisionScorer {
         this.viewCards = {};
         if (this.trackingCards) this.trackingCards.replaceChildren();
         if (this.trackingPanel) this.trackingPanel.style.display = 'none';
+        // Clear the previous run's outputs so a re-run (retry) doesn't leak
+        // stale crops/rows/events into the new run.
+        this.clearRunOutputs();
         this.lastWsMessageAt = Date.now();
         if (this.stallTimer) clearInterval(this.stallTimer);
         // Stall watchdog: tracking can be quiet for a while, but minutes of
@@ -1362,11 +1552,34 @@ class VisionScorer {
             const quiet = Math.round((Date.now() - this.lastWsMessageAt) / 1000);
             if (quiet >= 120) {
                 const currentProgress = parseFloat(this.progressBar.style.width) || 0;
-                this.setStatus(`No updates for ${quiet}s — job may be stalled. ` +
-                               `Results so far are preserved; check /api/debug/tasks if it persists.`,
+                // User-facing message stays mode-agnostic; the debug diagnostics
+                // link goes into the status log (which is itself debug-only).
+                this.setStatus(`No updates for ${quiet}s — job may be stalled; ` +
+                               `results so far are preserved.`,
                                currentProgress);
+                this.appendDebugTasksLink();
             }
         }, 15000);
+    }
+
+    // Debug-only diagnostics link, appended to the status log. Built with DOM
+    // APIs (like appendCalibrationLink) so it opens /api/debug/tasks in a new tab.
+    appendDebugTasksLink() {
+        if (!this.statusLog) return;
+        // One diagnostics link per stall — drop any prior one.
+        this.statusLog.querySelectorAll('.debug-tasks-row').forEach((n) => n.remove());
+        const row = document.createElement('div');
+        row.className = 'debug-tasks-row';
+        const ts = new Date().toLocaleTimeString([], { hour12: false });
+        row.appendChild(document.createTextNode(`${ts}  job may be stalled — `));
+        const a = document.createElement('a');
+        a.href = '/api/debug/tasks';
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = 'inspect running tasks →';
+        row.appendChild(a);
+        this.statusLog.appendChild(row);
+        this.statusLog.scrollTop = this.statusLog.scrollHeight;
     }
 
     appendStatusLog(text) {
@@ -1445,6 +1658,23 @@ class VisionScorer {
         this.updateRobotTables(data.robots);
         this.updateVlmCrops(data.ocr_crops);
         this.updateTimeline(data.scoring_events);
+        this.updateTeamsSummary(data.robots);
+    }
+
+    // Standard-mode HUD: confirmed team identities over the known roster.
+    // Roster is 6 when both alliances are populated, else the count of
+    // distinct slots we've actually seen so the ratio stays honest early on.
+    updateTeamsSummary(robots) {
+        const el = document.getElementById('hudTeams');
+        if (!el) return;
+        const list = Array.isArray(robots) ? robots : [];
+        const confirmed = list.filter(r => r.confirmed).length;
+        const blueSlots = list.some(r => r.alliance === 'blue');
+        const redSlots = list.some(r => r.alliance === 'red');
+        const roster = (blueSlots && redSlots)
+            ? 6
+            : list.filter(r => typeof r.slot === 'string' && /^[BR][1-3]$/.test(r.slot)).length;
+        el.textContent = `${confirmed} / ${roster || 6}`;
     }
 
     drawFrame(frameDataBase64) {
@@ -1482,11 +1712,12 @@ class VisionScorer {
             // tell a locked read from a guess at a glance.
             let teamCell = '—';
             if (robot && robot.team_number) {
+                const num = this.escapeHtml(robot.team_number);
                 teamCell = robot.confirmed
-                    ? `<span class="team-confirmed">${robot.team_number} ✓</span>`
-                    : `<span class="team-tentative">${robot.team_number}</span>`;
+                    ? `<span class="team-confirmed">${num} ✓</span>`
+                    : `<span class="team-tentative">${num}</span>`;
             } else if (robot && robot.team_candidate) {
-                teamCell = `<span class="team-candidate">${robot.team_candidate}?</span>`;
+                teamCell = `<span class="team-candidate">${this.escapeHtml(robot.team_candidate)}?</span>`;
             }
             return `
                 <tr>
@@ -1593,7 +1824,7 @@ class VisionScorer {
                 <div class="timeline-event ${event.alliance}${onSeek ? ' clickable' : ''}${activeClass}"${clickAttrs}>
                     <div class="timeline-event-info">
                         <div class="timeline-event-time">
-                            Frame ${frame} | ${timestamp}
+                            <span class="debug-only">Frame ${frame} | </span>${timestamp}
                         </div>
                         <div class="timeline-event-details">
                             <span class="timeline-event-alliance ${event.alliance}">
@@ -1728,8 +1959,8 @@ class VisionScorer {
     }
 
     appendContinueAnalysisButton(previousJobId) {
-        if (!this.statusLog || !previousJobId) return;
-        this.statusLog.querySelectorAll('.continue-analysis-row').forEach((n) => n.remove());
+        if (!this.recoveryActions || !previousJobId) return;
+        this.recoveryActions.querySelectorAll('.continue-analysis-row').forEach((n) => n.remove());
         const row = document.createElement('div');
         row.className = 'continue-analysis-row';
         row.style.marginTop = '4px';
@@ -1741,8 +1972,8 @@ class VisionScorer {
                   + 'already-uploaded video (no need to start over).';
         btn.addEventListener('click', () => { btn.disabled = true; this.retryAnalysis(previousJobId); });
         row.appendChild(btn);
-        this.statusLog.appendChild(row);
-        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+        this.recoveryActions.appendChild(row);
+        this.recoveryActions.style.display = 'block';
     }
 
     async retryAnalysis(previousJobId) {
@@ -1758,6 +1989,7 @@ class VisionScorer {
             // Fresh job id; drive it exactly like a new run (the websocket start path
             // runs process_video, which re-scans calibration before tracking).
             this.jobId = data.job_id;
+            this.refreshDiagnosticButtonVisibility();
             this.jobFinished = false;
             this.resetRunIndicators();
             this.setInferenceControlState('running');
@@ -1768,17 +2000,15 @@ class VisionScorer {
     }
 
     appendCalibrationLink(nc) {
-        if (!this.statusLog) return;
+        if (!this.recoveryActions) return;
         // Only one calibration link per failure — drop any prior one.
-        this.statusLog.querySelectorAll('.calib-link-row').forEach((n) => n.remove());
+        this.recoveryActions.querySelectorAll('.calib-link-row').forEach((n) => n.remove());
         const params = new URLSearchParams();
         if (nc.match_key) params.set('match', nc.match_key);
         if (nc.camera) params.set('camera', nc.camera);
         const qs = params.toString();
         const row = document.createElement('div');
         row.className = 'calib-link-row';
-        const ts = new Date().toLocaleTimeString([], { hour12: false });
-        row.appendChild(document.createTextNode(`${ts}  `));
         const a = document.createElement('a');
         a.href = '/calibrate' + (qs ? `?${qs}` : '');
         a.target = '_blank';
@@ -1789,8 +2019,8 @@ class VisionScorer {
             ? `🔧 Review the auto-fix for ${nc.camera || 'main'} — approve or reject →`
             : `📐 Recalibrate ${nc.camera || 'main'} on the calibration page →`;
         row.appendChild(a);
-        this.statusLog.appendChild(row);
-        this.statusLog.scrollTop = this.statusLog.scrollHeight;
+        this.recoveryActions.appendChild(row);
+        this.recoveryActions.style.display = 'block';
     }
 
     setStatus(text, progress) {
@@ -2035,6 +2265,8 @@ class VisionScorer {
         // Reset state
         this.inferenceResults = null;
         this.jobId = null;
+        this.refreshDiagnosticButtonVisibility();
+        if (this.diagnosticPanel) this.diagnosticPanel.style.display = 'none';
 
         // Reset UI
         document.getElementById('matchSelect').value = '';
@@ -2051,14 +2283,31 @@ class VisionScorer {
         if (this.blueAllianceScore) this.blueAllianceScore.textContent = '0';
         if (this.redAllianceScore) this.redAllianceScore.textContent = '0';
 
-        // Reset robot tables
-        this.blueRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
-        this.redRobotsTable.innerHTML = '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
-        if (this.vlmCrops) this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
-        this.latestVlmCrops.clear();
-        this.timelineContainer.innerHTML = '<p class="empty-state">No events yet</p>';
+        // Robot tables, VLM crops, timeline — shared with resetRunIndicators.
+        this.clearRunOutputs();
 
         this.setStatus('Ready', 0);
+    }
+
+    // Restore the live-output panels to their empty states. Shared by
+    // resetToMatchSelect (full flow reset) and resetRunIndicators (per-run
+    // reset) so a re-run doesn't leak the previous run's crops/rows/events.
+    clearRunOutputs() {
+        if (this.blueRobotsTable) {
+            this.blueRobotsTable.innerHTML =
+                '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
+        }
+        if (this.redRobotsTable) {
+            this.redRobotsTable.innerHTML =
+                '<tr><td colspan="3" class="empty-state">Waiting for detection...</td></tr>';
+        }
+        this.latestVlmCrops.clear();
+        if (this.vlmCrops) {
+            this.vlmCrops.innerHTML = '<p class="empty-state">No VLM crops sent yet</p>';
+        }
+        if (this.timelineContainer) {
+            this.timelineContainer.innerHTML = '<p class="empty-state">No events yet</p>';
+        }
     }
 
     // --- Match History ---
@@ -2127,7 +2376,7 @@ class VisionScorer {
         let html = '';
         for (const event of filtered) {
             html += `<div class="history-event">
-                    <h3>${event.event_name} <span class="event-year">${event.year}</span></h3>
+                    <h3>${this.escapeHtml(event.event_name)} <span class="event-year">${this.escapeHtml(event.year)}</span></h3>
                     <table class="history-table">
                         <thead>
                             <tr>
@@ -2173,9 +2422,9 @@ class VisionScorer {
 
                 html += `
                         <tr>
-                            <td><strong>${matchLabel}</strong></td>
-                            <td class="team-cell blue">${blueTeams}</td>
-                            <td class="team-cell red">${redTeams}</td>
+                            <td><strong>${this.escapeHtml(matchLabel)}</strong></td>
+                            <td class="team-cell blue">${this.escapeHtml(blueTeams)}</td>
+                            <td class="team-cell red">${this.escapeHtml(redTeams)}</td>
                             <td>${tbaScore}</td>
                             <td>${predScore}</td>
                             <td><span class="status-badge ${statusClass}">${statusLabel}</span></td>
@@ -2300,6 +2549,148 @@ class VisionScorer {
         }
     }
 
+    // --- Diagnostic viewer (debug-only) ---
+
+    initDiagnosticViewer() {
+        const MAX_LINES = 2000;
+        this._diagnosticMaxLines = MAX_LINES;
+        this.refreshDiagnosticButtonVisibility();
+
+        // Scorer-view instance, keyed off the live job id.
+        if (this.diagnosticToggleBtn) {
+            this.diagnosticToggleBtn.addEventListener('click', () => {
+                const showing = this.diagnosticPanel.style.display !== 'none';
+                if (showing) {
+                    this.diagnosticPanel.style.display = 'none';
+                } else {
+                    this.diagnosticPanel.style.display = 'block';
+                    this.loadDiagnostic(this.jobId, {
+                        panel: this.diagnosticPanel,
+                        statusEl: this.diagnosticStatus,
+                        linesEl: this.diagnosticLines,
+                        rawKey: '_diagnosticRawLines',
+                        totalKey: '_diagnosticTotalLines',
+                        filterValue: this.diagnosticFilter ? this.diagnosticFilter.value : '',
+                    });
+                }
+            });
+        }
+        if (this.diagnosticReloadBtn) {
+            this.diagnosticReloadBtn.addEventListener('click', () => {
+                this.loadDiagnostic(this.jobId, {
+                    panel: this.diagnosticPanel,
+                    statusEl: this.diagnosticStatus,
+                    linesEl: this.diagnosticLines,
+                    rawKey: '_diagnosticRawLines',
+                    totalKey: '_diagnosticTotalLines',
+                    filterValue: this.diagnosticFilter ? this.diagnosticFilter.value : '',
+                });
+            });
+        }
+        if (this.diagnosticFilter) {
+            this.diagnosticFilter.addEventListener('input', () => {
+                this.renderDiagnosticLines(this._diagnosticRawLines, this._diagnosticTotalLines,
+                    this.diagnosticStatus, this.diagnosticLines, this.diagnosticFilter.value);
+            });
+        }
+
+        // Replay-player instance, keyed off the replay/job id from openReplay().
+        if (this.replayDiagnosticToggleBtn) {
+            this.replayDiagnosticToggleBtn.addEventListener('click', () => {
+                const showing = this.replayDiagnosticPanel.style.display !== 'none';
+                if (showing) {
+                    this.replayDiagnosticPanel.style.display = 'none';
+                } else {
+                    this.replayDiagnosticPanel.style.display = 'block';
+                    this.loadDiagnostic(this._replayDiagnosticJobId, {
+                        panel: this.replayDiagnosticPanel,
+                        statusEl: this.replayDiagnosticStatus,
+                        linesEl: this.replayDiagnosticLines,
+                        rawKey: '_replayDiagnosticRawLines',
+                        totalKey: '_replayDiagnosticTotalLines',
+                        filterValue: this.replayDiagnosticFilter ? this.replayDiagnosticFilter.value : '',
+                    });
+                }
+            });
+        }
+        if (this.replayDiagnosticReloadBtn) {
+            this.replayDiagnosticReloadBtn.addEventListener('click', () => {
+                this.loadDiagnostic(this._replayDiagnosticJobId, {
+                    panel: this.replayDiagnosticPanel,
+                    statusEl: this.replayDiagnosticStatus,
+                    linesEl: this.replayDiagnosticLines,
+                    rawKey: '_replayDiagnosticRawLines',
+                    totalKey: '_replayDiagnosticTotalLines',
+                    filterValue: this.replayDiagnosticFilter ? this.replayDiagnosticFilter.value : '',
+                });
+            });
+        }
+        if (this.replayDiagnosticFilter) {
+            this.replayDiagnosticFilter.addEventListener('input', () => {
+                this.renderDiagnosticLines(this._replayDiagnosticRawLines, this._replayDiagnosticTotalLines,
+                    this.replayDiagnosticStatus, this.replayDiagnosticLines, this.replayDiagnosticFilter.value);
+            });
+        }
+    }
+
+    // Reveal the scorer-view "Diagnostics" button once a job id exists (call
+    // whenever this.jobId is assigned: handleSubmit, rejoinActiveJob, etc).
+    refreshDiagnosticButtonVisibility() {
+        if (this.diagnosticToggleBtn) {
+            this.diagnosticToggleBtn.style.display = this.jobId ? 'inline-flex' : 'none';
+        }
+    }
+
+    async loadDiagnostic(key, target) {
+        const { statusEl, linesEl, rawKey, totalKey } = target;
+        if (!key) {
+            if (statusEl) statusEl.textContent = 'no diagnostic data';
+            if (linesEl) linesEl.textContent = '';
+            this[rawKey] = [];
+            this[totalKey] = 0;
+            return;
+        }
+        if (statusEl) statusEl.textContent = 'Loading…';
+        try {
+            const resp = await fetch(`/api/diagnostic/${encodeURIComponent(key)}`);
+            if (resp.status === 404) {
+                if (statusEl) statusEl.textContent = 'no diagnostic data';
+                if (linesEl) linesEl.textContent = '';
+                this[rawKey] = [];
+                this[totalKey] = 0;
+                return;
+            }
+            if (!resp.ok) {
+                if (statusEl) statusEl.textContent = `Failed to load diagnostics (${resp.status})`;
+                return;
+            }
+            const text = await resp.text();
+            const allLines = text.split('\n').filter(line => line.length > 0);
+            const total = allLines.length;
+            const kept = allLines.slice(-this._diagnosticMaxLines);
+            this[rawKey] = kept;
+            this[totalKey] = total;
+            this.renderDiagnosticLines(kept, total, statusEl, linesEl, target.filterValue || '');
+        } catch (e) {
+            if (statusEl) statusEl.textContent = `Failed to load diagnostics: ${e.message}`;
+        }
+    }
+
+    renderDiagnosticLines(kept, total, statusEl, linesEl, filterValue) {
+        if (!linesEl) return;
+        const filter = (filterValue || '').trim();
+        const filtered = filter ? kept.filter(line => line.includes(filter)) : kept;
+        if (statusEl) {
+            const capNote = total > this._diagnosticMaxLines
+                ? `showing last ${this._diagnosticMaxLines} of ~${total}`
+                : `${total} line${total === 1 ? '' : 's'}`;
+            const filterNote = filter ? ` (${filtered.length} match filter)` : '';
+            statusEl.textContent = capNote + filterNote;
+        }
+        // escapeHtml per line — diagnostic content is untrusted job output.
+        linesEl.innerHTML = filtered.map(line => this.escapeHtml(line)).join('\n');
+    }
+
     // --- Match Replay Player ---
 
     async openReplay(id) {
@@ -2324,6 +2715,16 @@ class VisionScorer {
             '<tr><td colspan="3" class="empty-state">No robots</td></tr>';
         document.getElementById('replayTimelineContainer').innerHTML =
             '<p class="empty-state">No events</p>';
+
+        // Diagnostic viewer tracks the replay/job id being viewed; collapse and
+        // clear any previously loaded lines so switching replays can't leak data.
+        this._replayDiagnosticJobId = id;
+        this._replayDiagnosticRawLines = [];
+        this._replayDiagnosticTotalLines = 0;
+        if (this.replayDiagnosticPanel) this.replayDiagnosticPanel.style.display = 'none';
+        if (this.replayDiagnosticLines) this.replayDiagnosticLines.textContent = '';
+        if (this.replayDiagnosticStatus) this.replayDiagnosticStatus.textContent = '';
+        if (this.replayDiagnosticFilter) this.replayDiagnosticFilter.value = '';
 
         try {
             const resp = await fetch(`/api/replays/${id}`);

@@ -122,6 +122,52 @@ nav {
     box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
 }
 
+/* ---- Standard / Debug mode gating ---- */
+body[data-mode="standard"] .debug-only { display: none !important; }
+body[data-mode="debug"] .standard-only { display: none !important; }
+
+/* Segmented Standard|Debug pill at the right of the nav */
+.mode-toggle {
+    display: inline-flex;
+    margin-left: 0.75rem;
+    gap: 2px;
+    padding: 2px;
+    background: rgb(0 0 0 / 0.25);
+    border-radius: calc(var(--radius) - 2px);
+}
+.mode-toggle-btn {
+    padding: 0.3rem 0.7rem;
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--radius) - 4px);
+    color: var(--muted-foreground);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s, background-color 0.15s;
+}
+.mode-toggle-btn:hover { color: var(--foreground); }
+body[data-mode="standard"] .mode-toggle-btn[data-mode="standard"],
+body[data-mode="debug"] .mode-toggle-btn[data-mode="debug"] {
+    background: var(--foreground);
+    color: var(--background);
+}
+
+/* Header job pill: visible in both modes when a job is running out of view */
+.job-pill {
+    margin-left: 0.75rem;
+    padding: 0.3rem 0.7rem;
+    background: var(--blue-bg);
+    border: 1px solid var(--blue-border);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--blue-alliance);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.job-pill:hover { filter: brightness(1.15); }
+
 /* ========== Event Setup ========== */
 .event-section {
     max-width: 600px;
@@ -1478,6 +1524,19 @@ select.g-team, input.g-team { min-width: 72px; }
 }
 .degradation-banner li { margin: 2px 0; }
 
+/* Calibration-drift recovery actions: recalibrate link / continue-analysis button.
+   Ungated (visible in both modes) so a Standard-mode user isn't stranded when
+   the status log (debug-only) is hidden. */
+.recovery-actions {
+    margin: 6px 0;
+    padding: 8px 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+}
+.recovery-actions > * + * { margin-top: 4px; }
+
 /* Rolling status history under the progress bar */
 .status-log {
     margin: 6px 0;
@@ -1492,6 +1551,40 @@ select.g-team, input.g-team { min-width: 72px; }
     line-height: 1.5;
     color: var(--muted-foreground);
     white-space: pre-wrap;
+}
+
+/* Diagnostic viewer: raw NDJSON diagnostic stream (debug-only) */
+.diagnostic-panel {
+    margin: 6px 0;
+    padding: 8px 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.diagnostic-toolbar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 6px;
+}
+.diagnostic-toolbar input {
+    flex: 1;
+    font-size: 0.8rem;
+}
+.diagnostic-status {
+    font-size: 0.75rem;
+    color: var(--muted-foreground);
+    margin-bottom: 4px;
+}
+.diagnostic-lines {
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 0;
+    font-family: ui-monospace, monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--muted-foreground);
+    white-space: pre-wrap;
+    word-break: break-all;
 }
 
 /* Tracking-phase panel: per-view seed frames + propagation progress */
@@ -1567,8 +1660,43 @@ select.g-team, input.g-team { min-width: 72px; }
 .settings-reset-all {
     font-size: 0.8rem;
 }
+.settings-filter {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0 0 12px;
+    padding: 0.5rem 0.75rem;
+    background: var(--background);
+    border: 1px solid var(--input);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--foreground);
+    font-size: 0.85rem;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
+}
 .settings-list {
     margin-top: 12px;
+}
+.settings-section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 10px 12px 6px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+}
+.settings-section-header:first-child {
+    border-top: none;
+}
+.settings-section-name {
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted-foreground);
+}
+.settings-section-count {
+    font-size: 0.72rem;
+    color: var(--muted-foreground);
+    font-family: ui-monospace, monospace;
 }
 .setting-row {
     display: grid;

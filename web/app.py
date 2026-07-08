@@ -2708,8 +2708,17 @@ class InferenceJob:
                     and getattr(self, "detection_archive", None) is not None):
                 _gap = int(self.config.det_gate_max_age_s
                            * (self.video_fps or 10.0))
-                _ok = self.detection_archive.corroborates(
-                    "main", self._current_frame, box, max_gap_frames=_gap)
+                try:
+                    _ok = self.detection_archive.corroborates(
+                        "main", self._current_frame, box, max_gap_frames=_gap)
+                except Exception:
+                    # Mirror detection_archive.record()'s "telemetry must
+                    # never break detection" contract: a gate failure must
+                    # fail open, exactly like no-coverage (None), not skip
+                    # or crash the identify pass.
+                    _ok = None
+                    self.identity_diagnostics.increment(
+                        "vlm_read.det_gate_error")
                 if _ok is False:  # None = no coverage -> fail open
                     self.identity_diagnostics.increment(
                         "vlm_read.det_gate_skip")

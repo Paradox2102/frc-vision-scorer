@@ -3295,3 +3295,35 @@ def test_prompt_with_negatives_falls_back_when_predictor_lacks_points():
     p = BoxOnly()
     _prompt_with_negatives(p, {}, 3, 7, (1, 2, 3, 4), [(9.0, 9.0)])
     assert p.calls == [(3, 7, (1.0, 2.0, 3.0, 4.0))]
+
+
+def test_prompt_with_negatives_propagates_real_error_from_supporting_predictor():
+    """A predictor whose add_new_points_or_box accepts points/labels but
+    raises for an internal reason must have that error propagate -- it must
+    NOT be swallowed and silently retried as a box-only call."""
+    from web.field.sam2_tracker import _prompt_with_negatives
+
+    class BuggyPointsPredictor:
+        def __init__(self): self.calls = []
+        def add_new_points_or_box(self, state, *, frame_idx, obj_id, box=None,
+                                   points=None, labels=None):
+            raise TypeError("internal bug")
+
+    p = BuggyPointsPredictor()
+    try:
+        _prompt_with_negatives(p, {}, 3, 7, (1, 2, 3, 4), [(9.0, 9.0)])
+    except TypeError as exc:
+        assert "internal bug" in str(exc)
+    else:
+        raise AssertionError("expected TypeError to propagate")
+
+    class SupportingPredictor:
+        def __init__(self): self.calls = []
+        def add_new_points_or_box(self, state, *, frame_idx, obj_id, box=None,
+                                   points=None, labels=None):
+            self.calls.append((frame_idx, obj_id, tuple(box), tuple(map(tuple, points)),
+                                tuple(labels)))
+
+    p2 = SupportingPredictor()
+    _prompt_with_negatives(p2, {}, 3, 7, (1, 2, 3, 4), [(9.0, 9.0)])
+    assert p2.calls == [(3, 7, (1.0, 2.0, 3.0, 4.0), ((9.0, 9.0),), (0,))]

@@ -11,6 +11,7 @@ The module is split into two tiers:
 """
 from __future__ import annotations
 
+import inspect
 import os
 from collections import deque
 from contextlib import contextmanager
@@ -699,21 +700,38 @@ def negative_points_for(target_box, other_boxes, max_points: int = None,
     return [p for _d, p in out[:max_points]]
 
 
+def _predictor_accepts_points(predictor) -> bool:
+    """Whether ``predictor.add_new_points_or_box`` supports a ``points`` kwarg.
+
+    Uses signature introspection rather than a try/except TypeError probe so
+    that a genuine internal error from a supporting predictor (bad dtype,
+    bad shape, etc.) propagates instead of being mistaken for "unsupported
+    kwarg" and silently degraded to a box-only call.
+    """
+    try:
+        sig = inspect.signature(predictor.add_new_points_or_box)
+    except (TypeError, ValueError):
+        # Not introspectable (e.g. some C callables) -- assume unsupported,
+        # the safe/conservative default.
+        return False
+    for param in sig.parameters.values():
+        if param.name == "points" or param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 def _prompt_with_negatives(predictor, state, frame_idx, obj_id, box, neg_points):
     """add_new_points_or_box with optional negative points; degrades to a
     box-only prompt when the predictor doesn't take point kwargs (stubs,
     legacy adapters)."""
-    if neg_points:
-        try:
-            predictor.add_new_points_or_box(
-                state, frame_idx=frame_idx, obj_id=obj_id,
-                box=np.asarray(box, dtype=np.float32),
-                points=np.asarray(neg_points, dtype=np.float32),
-                labels=np.zeros(len(neg_points), dtype=np.int32),
-            )
-            return
-        except TypeError:
-            pass
+    if neg_points and _predictor_accepts_points(predictor):
+        predictor.add_new_points_or_box(
+            state, frame_idx=frame_idx, obj_id=obj_id,
+            box=np.asarray(box, dtype=np.float32),
+            points=np.asarray(neg_points, dtype=np.float32),
+            labels=np.zeros(len(neg_points), dtype=np.int32),
+        )
+        return
     predictor.add_new_points_or_box(
         state, frame_idx=frame_idx, obj_id=obj_id,
         box=np.asarray(box, dtype=np.float32))

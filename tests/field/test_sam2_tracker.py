@@ -3127,3 +3127,38 @@ def test_track_should_stop_resets_predictor_state_on_abort():
             should_stop=lambda: True,
         )
     assert reset["called"] is True
+
+
+def test_normalize_detections_accepts_corrob_only_triples():
+    from web.field.sam2_tracker import normalize_detections
+    items = [((1, 2, 3, 4), "red"), ((5, 6, 7, 8), "blue", True), (9, 10, 11, 12)]
+    boxes, meta, corrob_only = normalize_detections(items)
+    assert boxes == [(1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12)]
+    assert meta == ["red", "blue", None]
+    assert corrob_only == [False, True, False]
+
+
+def test_corrob_only_detection_never_seeds_but_corroborates():
+    """A corrob-only box at a new location must NOT create an object, but a
+    corrob-only box over a tracked mask must count as corroboration (no
+    absence accrues)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    new_box = stub._rect_for(3)       # unmatched location
+    overlap_box = stub._rect_for(1)   # over tracked obj 1
+
+    def detect_fn(local_idx, frame_path):
+        # obj 1 corroborated ONLY by a weak (corrob-only) detection; the new
+        # location is also weak so it must not seed.
+        return [(overlap_box, "blue", True), (new_box, "red", True)]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, max_objects=6,
+    )
+    # No third object was ever seeded.
+    assert all(set(frame.keys()) <= {1, 2} for frame in result.values())
+    assert all(oid in (1, 2) for _f, oid in stub.add_calls)

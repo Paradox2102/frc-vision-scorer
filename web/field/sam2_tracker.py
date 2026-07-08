@@ -632,6 +632,29 @@ def corroborating_colors(
     return out
 
 
+def normalize_detections(items):
+    """Normalize detect_fn output into (boxes, metadata, corrob_only) lists.
+
+    Accepted item shapes: a bare 4-box, ``(box, metadata)``, or
+    ``(box, metadata, corrob_only)``. corrob_only detections count as
+    presence evidence (corroboration, color backfill) but may never seed,
+    match, re-anchor, or evict — the sub-seed-confidence band exists so a
+    weakly-detected parked robot does not accrue absences (see
+    corrob_conf_floor in job_config.py)."""
+    boxes, metadata, corrob_only = [], [], []
+    for item in items or []:
+        if (isinstance(item, tuple) and len(item) in (2, 3)
+                and hasattr(item[0], "__len__") and len(item[0]) == 4):
+            boxes.append(item[0])
+            metadata.append(item[1])
+            corrob_only.append(bool(item[2]) if len(item) == 3 else False)
+        else:
+            boxes.append(item)
+            metadata.append(None)
+            corrob_only.append(False)
+    return boxes, metadata, corrob_only
+
+
 def is_stationary(positions, max_span_m: float) -> bool:
     """Return True if all known field positions lie within ``max_span_m``.
 
@@ -1203,23 +1226,6 @@ class Sam2FieldTracker:
         person_fn_error_logged = False  # same guard for person_fn
         corrob_gate_error_logged = False  # same guard for corrob_gate_fn
 
-        def _normalize_detections(items):
-            boxes = []
-            metadata = []
-            for item in items or []:
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 2
-                    and hasattr(item[0], "__len__")
-                    and len(item[0]) == 4
-                ):
-                    boxes.append(item[0])
-                    metadata.append(item[1])
-                else:
-                    boxes.append(item)
-                    metadata.append(None)
-            return boxes, metadata
-
         # Real SAM2 cannot propagate an empty state. If the prompt frame contains
         # no robot, search the exported video until the detector finds one, prompt
         # there, and begin propagation from that frame.
@@ -1232,7 +1238,13 @@ class Sam2FieldTracker:
                     ) or []
                 except Exception:
                     detected = []
-                bootstrap_boxes, bootstrap_metadata = _normalize_detections(detected)
+                bootstrap_boxes, bootstrap_metadata, _bs_corrob = normalize_detections(detected)
+                gated = [
+                    (b, m) for b, m, c in zip(bootstrap_boxes, bootstrap_metadata, _bs_corrob)
+                    if not c
+                ]
+                bootstrap_boxes = [b for b, _m in gated]
+                bootstrap_metadata = [m for _b, m in gated]
                 if seed_box_max_aspect > 0:
                     # A geometrically implausible box (tall-thin field sliver)
                     # can never *found* an object, so drop it before seeding.
@@ -1543,6 +1555,7 @@ class Sam2FieldTracker:
                     run_detector = detect_fn is not None
                     detector_available = False
                     new_boxes, new_metadata = [], []
+                    corrob_extra_boxes, corrob_extra_meta = [], []
                     if run_detector:
                         frame_path = (
                             frame_paths[last_idx] if last_idx < len(frame_paths) else None
@@ -1568,12 +1581,25 @@ class Sam2FieldTracker:
                             detector_available = False
                         else:
                             detector_available = True
-                            new_boxes, new_metadata = _normalize_detections(detected)
+                            all_boxes, all_metadata, all_corrob = normalize_detections(detected)
+                            # Seedable detections drive matching/seeding/eviction;
+                            # corrob-only detections join them ONLY for
+                            # corroboration bookkeeping below.
+                            new_boxes = [b for b, c in zip(all_boxes, all_corrob) if not c]
+                            new_metadata = [m for m, c in zip(all_metadata, all_corrob) if not c]
+                            corrob_extra_boxes = [
+                                b for b, c in zip(all_boxes, all_corrob) if c]
+                            corrob_extra_meta = [
+                                m for m, c in zip(all_metadata, all_corrob) if c]
                             if diagnostics:
-                                for box in new_boxes:
+                                for box, c in zip(all_boxes, all_corrob):
                                     diagnostics.record(
                                         f"{self.DIAG_PREFIX}.reprompt_candidate",
-                                        details={"frame_idx": last_idx, "box": list(box)},
+                                        details={
+                                            "frame_idx": last_idx,
+                                            "box": list(box),
+                                            "corrob_only": bool(c),
+                                        },
                                     )
 
                     # Lazy per-boundary motion probe: True means candidate j
@@ -1613,7 +1639,8 @@ class Sam2FieldTracker:
                         # still sees the full detection list (the seed gate has
                         # its own zone test). Fails OPEN per box: a broken
                         # projector must not blind the whole roster.
-                        corrob_boxes, corrob_metadata = new_boxes, new_metadata
+                        corrob_boxes = list(new_boxes) + corrob_extra_boxes
+                        corrob_metadata = list(new_metadata) + corrob_extra_meta
                         if corrob_gate_fn is not None and new_boxes:
                             kept_boxes, kept_meta = [], []
                             for _j, _b in enumerate(new_boxes):

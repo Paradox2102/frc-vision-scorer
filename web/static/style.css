@@ -126,6 +126,15 @@ nav {
 body[data-mode="standard"] .debug-only { display: none !important; }
 body[data-mode="debug"] .standard-only { display: none !important; }
 
+/* Calibration tab: iframe fills the space below the header, no double
+   scrollbar. Offset matches the measured header+nav box (incl. .container's
+   0.5rem top/bottom padding). */
+#calibrationFrame {
+    height: calc(100vh - 108px);
+    min-height: 640px;
+    background: transparent;
+}
+
 /* Segmented Standard|Debug pill at the right of the nav */
 .mode-toggle {
     display: inline-flex;

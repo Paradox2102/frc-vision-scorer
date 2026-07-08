@@ -17,7 +17,7 @@
                 <button class="nav-btn" data-view="history">Match History</button>
                 <button class="nav-btn debug-only" data-view="gallery">Gallery</button>
                 <button class="nav-btn debug-only" data-view="settings">Settings</button>
-                <a href="/static/calibrate.html" class="nav-btn debug-only" style="text-decoration: none;" target="_blank">Calibration</a>
+                <button class="nav-btn debug-only" data-view="calibration">Calibration</button>
                 <span class="mode-toggle" id="modeToggle" role="group" aria-label="UI mode">
                     <button type="button" class="mode-toggle-btn" data-mode="standard">Standard</button>
                     <button type="button" class="mode-toggle-btn" data-mode="debug">Debug</button>
@@ -520,6 +520,10 @@
           </div>
           <input id="settingsFilter" type="text" class="settings-filter" placeholder="Filter by name or env var…">
           <div id="settingsList" class="settings-list"></div>
+        </div>
+
+        <div id="calibrationView" style="display:none">
+          <iframe id="calibrationFrame" title="Field calibration" style="width:100%; border:0; display:block;"></iframe>
         </div>
 
     </div>

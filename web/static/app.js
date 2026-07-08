@@ -204,7 +204,7 @@ class VisionScorer {
 
     // --- Navigation ---
 
-    switchView(view) {
+    switchView(view, params) {
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
         document.querySelector(`.nav-btn[data-view="${view}"]`).classList.add('active');
 
@@ -213,6 +213,7 @@ class VisionScorer {
         document.getElementById('replaysView').style.display = view === 'replays' ? 'block' : 'none';
         document.getElementById('galleryView').style.display = view === 'gallery' ? 'block' : 'none';
         document.getElementById('settingsView').style.display = view === 'settings' ? 'block' : 'none';
+        document.getElementById('calibrationView').style.display = view === 'calibration' ? 'block' : 'none';
 
         if (view === 'history') {
             this.loadHistory();
@@ -225,6 +226,18 @@ class VisionScorer {
             this.loadGallery();
         } else if (view === 'settings') {
             this.loadSettings();
+        } else if (view === 'calibration') {
+            // Lazy-load: don't let calibrate.html start grabbing frames /
+            // hitting APIs until the tab is actually opened. A non-empty
+            // params query string forces a reload (deep-link recovery flow
+            // wants that specific match/camera targeted); otherwise leave an
+            // already-loaded iframe alone so in-progress state isn't reset.
+            const iframe = document.getElementById('calibrationFrame');
+            if (params) {
+                iframe.src = '/static/calibrate.html' + params;
+            } else if (!iframe.src) {
+                iframe.src = '/static/calibrate.html';
+            }
         }
 
         this.renderJobPill();
@@ -2011,13 +2024,16 @@ class VisionScorer {
         row.className = 'calib-link-row';
         const a = document.createElement('a');
         a.href = '/calibrate' + (qs ? `?${qs}` : '');
-        a.target = '_blank';
         a.rel = 'noopener';
         a.style.color = '#80ffb4';
         a.style.fontWeight = 'bold';
         a.textContent = nc.autofix_pending
             ? `🔧 Review the auto-fix for ${nc.camera || 'main'} — approve or reject →`
             : `📐 Recalibrate ${nc.camera || 'main'} on the calibration page →`;
+        a.addEventListener('click', (event) => {
+            event.preventDefault();
+            this.switchView('calibration', qs ? `?${qs}` : '');
+        });
         row.appendChild(a);
         this.recoveryActions.appendChild(row);
         this.recoveryActions.style.display = 'block';

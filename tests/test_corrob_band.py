@@ -98,6 +98,30 @@ def test_corrob_floor_captures_sub_conf_band_not_admitted_elsewhere():
     assert len(box) == 4
 
 
+def test_corrob_band_excludes_already_strong_detection():
+    """A detection promoted to the strong tier must not also leak into the
+    corrob band as a duplicate: it clears both `conf` (strong) and
+    `corrob_floor` (corrob-eligible), so the exclusion set must actually
+    exclude it by box value rather than relying solely on the later
+    geometric dedupe_against(..., tiered) fallback.
+    """
+    job, person_from_ultralytics = _make_job()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    # BOX_STRONG at conf 0.6 clears both conf=0.4 (strong) and
+    # corrob_floor=0.1 (corrob-eligible).
+    dets = _bumper_detections([BOX_STRONG], [0], [0.6])
+    job.bumper_model = MagicMock(return_value=[MagicMock()])
+
+    with patch("supervision.Detections.from_ultralytics",
+               side_effect=[person_from_ultralytics(None), dets]):
+        result, band = job._sam2_robot_candidates(
+            frame, conf=0.4, corrob_floor=0.1, with_corrob_band=True)
+
+    assert len(result) == 1
+    assert result[0][2] is True  # appears once, in the strong tier
+    assert band == []  # not duplicated into the corrob band
+
+
 def test_corrob_band_excludes_detections_below_floor():
     job, person_from_ultralytics = _make_job()
     frame = np.zeros((480, 640, 3), dtype=np.uint8)

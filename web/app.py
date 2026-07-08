@@ -1613,10 +1613,23 @@ class InferenceJob:
             motion_bumpers = _expand(motion_dets)
             corrob_dets = []
             if corrob_floor > 0:
-                taken = {id(d) for d in strong_dets} | {id(d) for d in motion_dets}
+                # Exclude detections already promoted to the strong/motion
+                # tiers, keyed by box VALUE (not object identity):
+                # partition_low_conf_movers rebuilds fresh tuples, so
+                # id(d) never matches across strong_dets/motion_dets and
+                # robots. The later dedupe_against(corrob_bumpers, ...)
+                # still handles expanded-box overlap, but this keeps the
+                # exclusion set doing real, direct work.
+                _key = lambda d: tuple(round(float(v), 3) for v in d[0])
+                taken = {_key(d) for d in strong_dets} | {_key(d) for d in motion_dets}
                 corrob_dets = [d for d in robots
-                               if id(d) not in taken and d[2] >= corrob_floor]
+                               if _key(d) not in taken and d[2] >= corrob_floor]
             corrob_bumpers = _expand(corrob_dets)
+            # Cross-class double-reads of one blurred bumper (per-class NMS)
+            # must not inflate corrob-band presence-evidence count either;
+            # mirror the strong-tier dedupe (dedupe_against(..., tiered)
+            # below won't catch these since neither box is in `tiered`).
+            corrob_bumpers = dedupe_seed_robots(corrob_bumpers, ROBOT_FILL_IOS)
         # Cross-class double-reads of one blurred bumper (per-class NMS)
         # must not seed duplicate objects.
         strong_bumpers = dedupe_seed_robots(strong_bumpers, ROBOT_FILL_IOS)

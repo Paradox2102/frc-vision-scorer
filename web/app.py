@@ -106,6 +106,7 @@ from web.field.detect_schema import (
     select_gap_fills,
 )
 from web.field.hard_negatives import HardNegativeLogger
+from web.field.detection_archive import DetectionArchive
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
 from web.field.manta import overlay_paths_for_job
@@ -1244,6 +1245,13 @@ class InferenceJob:
         # (falls back to job_id) so negatives accumulate across runs of an event.
         self.hard_neg_logger = HardNegativeLogger(
             HARD_NEG_DIR / (self.event_key or self.job_id)
+        )
+        # Per-boundary detection archive: every re-prompt boundary's YOLO
+        # detections (all views, full-res coords), beside diagnostics.
+        # Pure telemetry — best-effort, never alters detection/tracking.
+        self.detection_archive = (
+            DetectionArchive(str(UPLOAD_DIR / f"detections_{self.job_id}.jsonl"))
+            if self.config.detection_archive else DetectionArchive(None)
         )
 
     def extract_team_numbers(self, frame: np.ndarray) -> None:
@@ -5962,6 +5970,16 @@ class InferenceJob:
                                      corrob_band[i][1], True)
                                     for i in corrob_keep
                                 ]
+                                try:
+                                    self.detection_archive.record(
+                                        view.name, local_idx, source_frame,
+                                        [(full_boxes[idx], merged[idx][1], False)
+                                         for idx in keep
+                                         if merged[idx][2] or idx in kept_motion]
+                                        + [(corrob_full[i], corrob_band[i][1], True)
+                                           for i in corrob_keep])
+                                except Exception:
+                                    pass  # telemetry must never break detection
                                 return out
                             return detect_fn
 
@@ -7299,6 +7317,7 @@ class InferenceJob:
                       + f" | accounted {_acct:.1f}/{_tot:.1f}s")
             self.timings["analysis_loop"] = round(time.perf_counter() - _loop_t0, 2)
             self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
+            self.detection_archive.close()
             self.status = "completed"
 
             # Deliver any in-flight frame before the complete message.
@@ -7383,6 +7402,10 @@ class InferenceJob:
                 pass
             try:
                 self.diagnostic.close()
+            except Exception:
+                pass
+            try:
+                self.detection_archive.close()
             except Exception:
                 pass
             self._close_log_file()

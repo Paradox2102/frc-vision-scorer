@@ -282,6 +282,12 @@ KNOBS = [
          section="Track hygiene"),
     Knob("evict_prob_immune", "SAM2_EVICT_PROB_IMMUNE", float, 0.0, min=0.0, max=1.0,
          section="Track hygiene"),
+    # Per-boundary detection archive (pure telemetry, no behavior change):
+    # every re-prompt boundary's detections, all views, full-res view coords,
+    # to detections.jsonl beside diagnostics. Feeds det-gated VLM reads and
+    # hard-negative mining; ~KBs per match.
+    Knob("detection_archive", "DETECTION_ARCHIVE", bool, True,
+         section="Track hygiene"),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm"), section="Identity & votes"),

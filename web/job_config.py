@@ -122,8 +122,12 @@ KNOBS = [
     # Negative-point prompting: seed/re-anchor prompts carry label-0 points at
     # the centers of OTHER concurrent detections near the prompt box, so SAM
     # conditions against bleeding onto a neighboring robot / adjacent
-    # structure from birth. DEFAULT OFF pending A/B.
-    Knob("neg_point_prompts", "SAM2_NEG_POINT_PROMPTS", bool, False,
+    # structure from birth. DEFAULT ON — validated 2026-07-08 (qm8/9/10 auto
+    # A/B): neutral on the easy matches, big qm10 win (aggNN 0.644->0.509,
+    # rescued blue 59 coverage 24%->94%), no regressions. Module env default
+    # (SAM2_NEG_POINT_PROMPTS) stays off for direct/library callers; the
+    # pipeline passes this Knob value into track().
+    Knob("neg_point_prompts", "SAM2_NEG_POINT_PROMPTS", bool, True,
          section="Seeding & re-seeding"),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False,
          section="Tracking backend"),
@@ -184,6 +188,10 @@ KNOBS = [
     # presence evidence (a parked robot rendering weak detections must not
     # accrue absences toward cull/eviction) but can never seed, match,
     # re-anchor, or evict. 0 disables (single-threshold behavior).
+    # SHELVED 2026-07-08: A/B'd qm8/9/10 auto (byte-identical to baseline —
+    # the band fires but flips no downstream decision) and qm11 full (inert).
+    # No benefit shown; kept default-off for a future match where roster
+    # contention actually turns on a weak detection.
     Knob("corrob_conf_floor", "CORROB_CONF_FLOOR", float, 0.0, min=0.0, max=1.0,
          section="Track hygiene"),
     # Zone-blind VOTING (identity layer): a VLM read taken while the track's
@@ -212,6 +220,12 @@ KNOBS = [
     # slot being voted into (sqrt damped, floored at 0.25). Votes cast while
     # the tracker itself is unsure of the mask (mid-hijack, mid-occlusion)
     # are exactly the misattributed votes that flip identity locks.
+    # SHELVED 2026-07-08 (UNPROVEN, not disproven): the Manta A/B harness
+    # scores auto-period POSITION via geometric pairing and is blind to
+    # team-label features, so it can't measure this. On qm11 full it left
+    # identity counters + the visible misattribution unchanged vs baseline.
+    # Needs a team-label-accuracy metric (our team per robot vs roster) to
+    # judge; revisit then.
     Knob("vote_prob_weight", "VLM_VOTE_PROB_WEIGHT", bool, False,
          section="Identity & votes"),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False,
@@ -232,8 +246,11 @@ KNOBS = [
     # fell below the match threshold. When a partial-overlap claimant
     # persists for misalign_boundaries CONSECUTIVE boundaries, re-prompt that
     # SAME id at the detection box instead of churning a new id or hitting
-    # the roster cap. DEFAULT OFF pending A/B.
-    Knob("misalign_reanchor", "SAM2_MISALIGN_REANCHOR", bool, False,
+    # the roster cap. DEFAULT ON — validated 2026-07-08 (qm8/9/10 auto A/B):
+    # neutral on the easy matches, big qm10 win (aggNN 0.644->0.520), no
+    # regressions. Module env default (SAM2_MISALIGN_REANCHOR) stays off for
+    # direct/library callers; the pipeline passes this Knob value into track().
+    Knob("misalign_reanchor", "SAM2_MISALIGN_REANCHOR", bool, True,
          section="Track hygiene"),
     Knob("misalign_ios_min", "SAM2_MISALIGN_IOS_MIN", float, 0.2, min=0.05, max=0.5,
          section="Track hygiene"),
@@ -291,6 +308,10 @@ KNOBS = [
     # can't tell static junk from a robot parked in a corner blind spot).
     # evict_prob_immune grants HIGH mean confidence immunity from the weak
     # capped-roster eviction tiers. Both default 0.0 = OFF.
+    # SHELVED 2026-07-08: cull_low_prob_max is inert unless cull_hijack_enabled
+    # (itself off), so it was untestable standalone. evict_prob_immune A/B'd
+    # qm8/9/10 auto + qm11 full — tiny mixed deltas with small coverage
+    # regressions (qm8 2724 41->37, qm9 1024 81->72), no net benefit. Kept off.
     Knob("cull_low_prob_max", "SAM2_CULL_LOW_PROB_MAX", float, 0.0, min=0.0, max=1.0,
          section="Track hygiene"),
     Knob("evict_prob_immune", "SAM2_EVICT_PROB_IMMUNE", float, 0.0, min=0.0, max=1.0,
@@ -306,6 +327,11 @@ KNOBS = [
     # det_gate_max_age_s. A hijacked track YOLO no longer fires on stops
     # earning reads — and stops casting misattributed votes. Fails open when
     # the archive has no boundary coverage for that view/time.
+    # SHELVED 2026-07-08 (UNPROVEN + too narrow): on qm11 full it fired only
+    # 2 gate-skips of ~3950 scheduled reads — it currently gates only the
+    # one-shot early-OCR pass (_vision_identify_robots_impl), not the teleop
+    # VLM scheduler (_schedule_vlm_pass). Extend its scope to teleop reads and
+    # evaluate with a label-accuracy metric before enabling.
     Knob("det_gated_vlm_reads", "DET_GATED_VLM_READS", bool, False,
          section="Track hygiene"),
     Knob("det_gate_max_age_s", "DET_GATE_MAX_AGE_S", float, 4.0, min=0.5, max=30.0,

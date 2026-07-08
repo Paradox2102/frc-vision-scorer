@@ -279,6 +279,38 @@ PROFILES = {
         ("baseline", {}),
         ("mask_footprint", {"mask_footprint_pos": True}),
     ],
+    # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
+    # fusion knobs vs current shipped defaults (baseline). Each alone — not
+    # stacked — so a regressor is attributable (the geo4 stack masked which
+    # knob hurt qm11). corrob_conf_floor admits a sub-seed-conf corroborate-
+    # only band (weak/blurry fast robots stop accruing absences); neg_point_
+    # prompts conditions SAM against bleeding onto neighbors at seed/re-anchor;
+    # misalign_reanchor re-prompts a drifted healthy mask (between the dark and
+    # sliver cases); evict_prob_immune spares high-tracker_prob objects from
+    # weak-tier eviction. vote_prob_weight + det_gated_vlm_reads are identity
+    # features (weak signal on ~15s auto) — evaluate those on full matches.
+    "fusion-sweep": [
+        ("baseline", {}),
+        ("corrob-floor", {"corrob_conf_floor": 0.25}),
+        ("neg-points", {"neg_point_prompts": True}),
+        ("misalign", {"misalign_reanchor": True}),
+        ("evict-prob", {"evict_prob_immune": 0.8}),
+    ],
+    # Full-match A/B for the "other" fusion features the auto sweep left
+    # inconclusive: corrob_conf_floor + evict_prob_immune were inert/mixed on
+    # ~15s auto, and vote_prob_weight + det_gated_vlm_reads are IDENTITY
+    # features that need teleop's VLM reads to exercise at all. auto_period_
+    # only:False processes the whole match. Split into single-config profiles
+    # so the driver can restart the server between each — full-match jobs grow
+    # SAM3 session VRAM and 20+ back-to-back jobs OOM-hung the auto sweep at
+    # qm11. (Note: score() still measures AUTO-period Manta position; identity
+    # gains show up as team-coverage/pairing shifts, weaker than a pure
+    # label-accuracy metric — read those configs' per-team coverage.)
+    "full-base":    [("baseline",     {"auto_period_only": False})],
+    "full-corrob":  [("corrob-floor", {"auto_period_only": False, "corrob_conf_floor": 0.25})],
+    "full-evict":   [("evict-prob",   {"auto_period_only": False, "evict_prob_immune": 0.8})],
+    "full-vote":    [("vote-prob",    {"auto_period_only": False, "vote_prob_weight": True})],
+    "full-detgate": [("det-gated",    {"auto_period_only": False, "det_gated_vlm_reads": True})],
 }
 CONFIGS = PROFILES["full"]
 

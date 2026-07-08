@@ -3327,3 +3327,107 @@ def test_prompt_with_negatives_propagates_real_error_from_supporting_predictor()
     p2 = SupportingPredictor()
     _prompt_with_negatives(p2, {}, 3, 7, (1, 2, 3, 4), [(9.0, 9.0)])
     assert p2.calls == [(3, 7, (1.0, 2.0, 3.0, 4.0), ((9.0, 9.0),), (0,))]
+
+
+# ---------------------------------------------------------------------------
+# Task 9 — misaligned-mask re-anchor
+# ---------------------------------------------------------------------------
+
+def _hw_rect_mask(H, W, r):
+    m = np.zeros((H, W), bool)
+    m[r[1]:r[3], r[0]:r[2]] = True
+    return m
+
+
+def test_best_partial_claimant_finds_drifted_healthy_mask():
+    from web.field.sam2_tracker import best_partial_claimant
+    H, W = 20, 60
+    # healthy mask at x 0-10; detection box at x 6-16 -> partial overlap
+    mask = _hw_rect_mask(H, W, (0, 2, 10, 12))
+    box_mask = _hw_rect_mask(H, W, (6, 2, 16, 12))
+    oid, ios = best_partial_claimant(
+        {1: mask}, {1: "red"}, {1: int(mask.sum())},
+        box_mask, int(box_mask.sum()), "red",
+        ios_lo=0.2, ios_hi=0.5, min_area_frac=0.1)
+    assert oid == 1 and 0.2 <= ios < 0.5
+
+
+def test_best_partial_claimant_rejects_color_conflict_and_slivers():
+    from web.field.sam2_tracker import best_partial_claimant
+    H, W = 20, 60
+    mask = _hw_rect_mask(H, W, (0, 2, 10, 12))
+    box_mask = _hw_rect_mask(H, W, (6, 2, 16, 12))
+    area = int(box_mask.sum())
+    # color conflict
+    oid, _ = best_partial_claimant({1: mask}, {1: "blue"}, {1: int(mask.sum())},
+                                   box_mask, area, "red", 0.2, 0.5, 0.1)
+    assert oid is None
+    # sliver (too small to be a "healthy drifted" mask)
+    sliver = _hw_rect_mask(H, W, (6, 2, 8, 4))
+    oid, _ = best_partial_claimant({1: sliver}, {1: "red"}, {1: int(sliver.sum())},
+                                   box_mask, area, "red", 0.2, 0.5, 0.1)
+    assert oid is None
+
+
+def test_misalign_drift_box_ios_lands_in_band():
+    """Sanity-check the RepromptStubPredictor geometry used below: the drift
+    box's IoS over obj 1's static rect (6,2,10,6) must land in [0.2, 0.5) —
+    inside the misalign band and below new_obj_ios_thresh (0.5)."""
+    from web.field.sam2_tracker import _ios
+    H, W = 20, 60
+    obj1 = _hw_rect_mask(H, W, (6, 2, 10, 6))
+    drift_box = _hw_rect_mask(H, W, (9, 2, 15, 6))
+    ios = _ios(obj1, drift_box)
+    assert 0.2 <= ios < 0.5, f"drift box IoS {ios} not in expected band"
+
+
+def test_misalign_reanchor_reprompts_same_id_after_streak():
+    """A detection persistently half-overlapping a healthy tracked mask must
+    re-prompt that SAME object id (no new id churn) once the streak is met."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    # obj 1's stub mask sits at x in [6,10); a box at x 9-15 overlaps it
+    # at IoS 0.25 -- inside [0.2, 0.5) per the sanity check above.
+    drift_box = (9, 2, 15, 6)
+
+    def detect_fn(local_idx, frame_path):
+        return [(drift_box, "blue")]
+
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1)], reprompt_every=2,
+        detect_fn=detect_fn, object_metadata={1: "blue"}, max_objects=6,
+        misalign_reanchor=True, misalign_boundaries=2,
+    )
+    # obj 1 re-prompted at a later frame; NO new object id was created.
+    later_prompts = [(f, o) for f, o in stub.add_calls if f > 0]
+    assert later_prompts and all(o == 1 for _f, o in later_prompts)
+
+
+def test_misalign_reanchor_disabled_by_default_is_inert():
+    """misalign_reanchor defaults OFF: the same drifting-detection scenario
+    produces byte-identical add_calls whether or not the kwarg is mentioned."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    drift_box = (9, 2, 15, 6)
+
+    def run(**extra):
+        stub = RepromptStubPredictor()
+        tracker = Sam2FieldTracker(predictor=stub)
+
+        def detect_fn(local_idx, frame_path):
+            return [(drift_box, "blue")]
+
+        tracker.track(
+            frames_dir="ignored_by_stub", prompt_idx=0,
+            prompt_boxes=[stub._rect_for(1)], reprompt_every=2,
+            detect_fn=detect_fn, object_metadata={1: "blue"}, max_objects=6,
+            **extra,
+        )
+        return list(stub.add_calls)
+
+    baseline = run()
+    explicit_off = run(misalign_reanchor=False)
+    assert baseline == explicit_off

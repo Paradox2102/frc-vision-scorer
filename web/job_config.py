@@ -226,6 +226,19 @@ KNOBS = [
          section="Track hygiene"),
     Knob("evict_min_absences", "SAM2_EVICT_MIN_ABSENCES", int, 2, min=1,
          section="Track hygiene"),
+    # Misaligned-mask re-anchor: the common drift case between dark (total
+    # mask loss) and sliver (area collapse) re-anchor — a healthy-size,
+    # color-consistent mask that slid off its robot until detection overlap
+    # fell below the match threshold. When a partial-overlap claimant
+    # persists for misalign_boundaries CONSECUTIVE boundaries, re-prompt that
+    # SAME id at the detection box instead of churning a new id or hitting
+    # the roster cap. DEFAULT OFF pending A/B.
+    Knob("misalign_reanchor", "SAM2_MISALIGN_REANCHOR", bool, False,
+         section="Track hygiene"),
+    Knob("misalign_ios_min", "SAM2_MISALIGN_IOS_MIN", float, 0.2, min=0.05, max=0.5,
+         section="Track hygiene"),
+    Knob("misalign_boundaries", "SAM2_MISALIGN_BOUNDARIES", int, 2, min=1, max=10,
+         section="Track hygiene"),
     # Seed-box plausibility gate: a detection box taller than this aspect
     # (h/w) may not seed, re-anchor, or evict at SAM reprompt boundaries; 0
     # disables. qm12 hub-face sliver (aspect 4.47) evicted a real track.

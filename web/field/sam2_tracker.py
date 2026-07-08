@@ -153,6 +153,20 @@ DARK_REANCHOR_FRAMES = int(os.environ.get("SAM2_DARK_REANCHOR_FRAMES", "2"))
 DARK_REANCHOR_MAX_ATTEMPTS = int(
     os.environ.get("SAM2_DARK_REANCHOR_MAX_ATTEMPTS", "3"))
 
+# Misaligned-mask re-anchor: dark re-anchor needs total mask loss and the
+# sliver re-anchor needs area collapse, but the COMMON drift case is a
+# healthy-size mask that slid off its robot until detection overlap fell
+# below the 0.5 match threshold — the unmatched detection then churns a new
+# id or hits the roster cap. When a healthy, color-consistent mask partially
+# overlaps an unmatched detection for misalign_boundaries CONSECUTIVE
+# boundaries, re-prompt that SAME id at the detection box. Consecutiveness +
+# the [ios_min, match-threshold) band keep one-boundary flybys and true new
+# robots out. DEFAULT OFF pending A/B.
+MISALIGN_REANCHOR = os.environ.get(
+    "SAM2_MISALIGN_REANCHOR", "0") not in ("0", "false", "False")
+MISALIGN_IOS_MIN = float(os.environ.get("SAM2_MISALIGN_IOS_MIN", "0.2"))
+MISALIGN_BOUNDARIES = int(os.environ.get("SAM2_MISALIGN_BOUNDARIES", "2"))
+
 # Capped-roster eviction, dark tier: an object whose mask has been absent for
 # >= this many frames (yet not retired) may be evicted for a fresh unmatched
 # detection even without the full stationary-absence evidence bar.
@@ -522,6 +536,26 @@ def _ios(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
         return 0.0
     intersection = int((mask_a & mask_b).sum())
     return intersection / smaller
+
+
+def best_partial_claimant(existing, existing_colors, mask_areas, box_mask,
+                          box_area, color, ios_lo, ios_hi, min_area_frac):
+    """The healthy (area >= min_area_frac * box_area), color-consistent mask
+    with the highest IoS against ``box_mask`` inside [ios_lo, ios_hi) — the
+    drifted-claimant candidate for the misaligned-mask re-anchor. Returns
+    (oid, ios) or (None, 0.0)."""
+    best_oid, best = None, 0.0
+    for oid, mask in existing.items():
+        e_col = (existing_colors or {}).get(oid)
+        if (e_col in {"red", "blue"} and color in {"red", "blue"}
+                and e_col != color):
+            continue
+        if mask_areas.get(oid, 0) < min_area_frac * box_area:
+            continue  # sliver -> the sliver re-anchor's jurisdiction
+        s = _ios(mask, box_mask)
+        if ios_lo <= s < ios_hi and s > best:
+            best_oid, best = oid, s
+    return best_oid, best
 
 
 def match_new_detections(
@@ -1072,6 +1106,9 @@ class Sam2FieldTracker:
         reanchor_max_boundary_gap: int = REANCHOR_MAX_BOUNDARY_GAP,
         reanchor_max_jump_m: float = REANCHOR_MAX_JUMP_M,
         reanchor_max_jump_px: float = REANCHOR_MAX_JUMP_PX,
+        misalign_reanchor: bool = MISALIGN_REANCHOR,
+        misalign_ios_min: float = MISALIGN_IOS_MIN,
+        misalign_boundaries: int = MISALIGN_BOUNDARIES,
         seed_box_max_aspect: float = SEED_BOX_MAX_ASPECT,
         evict_requires_motion: bool = EVICT_REQUIRES_MOTION,
         mask_leak_cleanup: bool = MASK_LEAK_CLEANUP,
@@ -1160,6 +1197,16 @@ class Sam2FieldTracker:
                 new id — preserving identity across propagation collapse.
             reanchor_ios: Min IoS (over smaller) of the sliver mask vs the
                 detection box required to re-anchor.
+            misalign_reanchor: When True, a healthy, color-consistent mask
+                that partially overlaps an unmatched detection (IoS in
+                ``[misalign_ios_min, new_obj_ios_thresh)``) for
+                ``misalign_boundaries`` CONSECUTIVE boundaries re-prompts that
+                SAME object id at the detection box — the drift case between
+                dark and sliver re-anchor. DEFAULT OFF.
+            misalign_ios_min: Lower bound of the partial-overlap band used to
+                find a misaligned-mask claimant.
+            misalign_boundaries: Consecutive boundaries a partial claimant
+                must persist before it is re-anchored.
             seed_box_max_aspect: When > 0, a candidate detection box whose
                 height/width exceeds this ratio (a tall-thin field sliver, not
                 a robot) is rejected at every chunk boundary before it can
@@ -1328,6 +1375,11 @@ class Sam2FieldTracker:
         # it. Recency + locality guards read it before any re-anchor.
         boundary_no = 0
         boundary_mask_record: dict[int, tuple] = {}
+        # Misaligned-mask re-anchor: consecutive-boundary streak of a partial
+        # (drifted) claim per object id. Reset (pruned away) for any object
+        # that gets no partial-claimant hit at a boundary -- consecutiveness
+        # is the whole point (a one-boundary flyby must not re-anchor).
+        misalign_streak: dict[int, int] = {}
 
         def _box_area(box) -> float:
             return max(0.0, float(box[2]) - float(box[0])) * \
@@ -1674,6 +1726,14 @@ class Sam2FieldTracker:
                                         f"{self.DIAG_PREFIX}.object_retired",
                                         details={"object_id": oid, "frame_idx": last_idx},
                                     )
+
+                    # A retired/culled object can no longer accrue a misalign
+                    # streak; prune to the active set computed above.
+                    if misalign_streak:
+                        active_set = set(active_objects)
+                        misalign_streak = {
+                            o: s for o, s in misalign_streak.items()
+                            if o in active_set}
 
                     # Latest mask + color per active object (for corroboration & seeding).
                     existing = {}
@@ -2109,6 +2169,7 @@ class Sam2FieldTracker:
                                     reason="already_tracked",
                                     details={"frame_idx": last_idx, "box": list(box_val)},
                                 )
+                        mis_hits: set[int] = set()
                         for j in new_indices:
                             if seed_box_max_aspect > 0 and not plausible_seed_box(
                                     new_boxes[j], seed_box_max_aspect):
@@ -2129,6 +2190,76 @@ class Sam2FieldTracker:
                                                  "aspect": aspect},
                                     )
                                 continue
+                            if misalign_reanchor and existing:
+                                bx1, by1, bx2, by2 = int_boxes[j]
+                                mis_box_mask = np.zeros((h, w), bool)
+                                mis_box_mask[by1:by2, bx1:bx2] = True
+                                mis_areas = {o: int(m.sum())
+                                             for o, m in existing.items()}
+                                cand, cand_ios = best_partial_claimant(
+                                    existing, existing_colors, mis_areas,
+                                    mis_box_mask, int(mis_box_mask.sum()),
+                                    new_metadata[j] if j < len(new_metadata) else None,
+                                    misalign_ios_min, new_obj_ios_thresh,
+                                    SEED_MIN_MASK_AREA_FRAC)
+                                if cand is not None:
+                                    mis_hits.add(cand)
+                                    streak = misalign_streak.get(cand, 0) + 1
+                                    misalign_streak[cand] = streak
+                                    if streak >= misalign_boundaries:
+                                        negs = (negative_points_for(
+                                            new_boxes[j],
+                                            [b for q, b in enumerate(int_boxes)
+                                             if q != j])
+                                            if neg_point_prompts else [])
+                                        _prompt_with_negatives(
+                                            predictor, state, last_idx, cand,
+                                            new_boxes[j], negs)
+                                        misalign_streak.pop(cand, None)
+                                        corroboration_history.pop(cand, None)
+                                        size_violation_history.pop(cand, None)
+                                        prob_window.pop(cand, None)
+                                        prob_accum.pop(cand, None)
+                                        existing[cand] = mis_box_mask
+                                        boundary_mask_record[cand] = (
+                                            boundary_no,
+                                            float(mis_box_mask.sum()),
+                                            tuple(int_boxes[j]))
+                                        if diagnostics:
+                                            diagnostics.increment(
+                                                f"{self.DIAG_PREFIX}_objects_reanchored")
+                                            diagnostics.record(
+                                                f"{self.DIAG_PREFIX}.object_reanchored",
+                                                reason="misaligned_mask",
+                                                details={
+                                                    "object_id": cand,
+                                                    "frame_idx": last_idx,
+                                                    "box": list(new_boxes[j]),
+                                                    "ios": round(cand_ios, 3),
+                                                    "streak": streak,
+                                                },
+                                            )
+                                        continue
+                                    # Streak building but not yet met: this
+                                    # detection is provisionally attributed to
+                                    # `cand` (its drift is being watched) and
+                                    # must NOT seed a churned replacement id
+                                    # while under evaluation — that would
+                                    # defeat the whole point of waiting for
+                                    # consecutive confirmation.
+                                    if diagnostics:
+                                        diagnostics.record(
+                                            f"{self.DIAG_PREFIX}.reprompt_rejected",
+                                            reason="misaligned_mask_pending",
+                                            details={
+                                                "frame_idx": last_idx,
+                                                "object_id": cand,
+                                                "box": list(new_boxes[j]),
+                                                "ios": round(cand_ios, 3),
+                                                "streak": streak,
+                                            },
+                                        )
+                                    continue
                             if reanchor_enabled and existing:
                                 # A detection is only in new_indices because no
                                 # healthy mask claimed it — but a color-consistent
@@ -2345,6 +2476,14 @@ class Sam2FieldTracker:
                             if object_metadata is not None:
                                 object_metadata[next_obj_id] = new_metadata[j]
                             next_obj_id += 1
+
+                        # Consecutiveness: an object with no partial-claimant
+                        # hit THIS boundary had its drift streak broken (a
+                        # one-boundary flyby, or the mask re-aligned) -- drop it
+                        # so a later hit starts a fresh streak.
+                        misalign_streak = {
+                            o: s for o, s in misalign_streak.items()
+                            if o in mis_hits}
 
                     # Refresh re-anchor snapshots — only for objects whose mask
                     # was actually emitted within the chunk that just ended. A

@@ -6187,6 +6187,11 @@ class InferenceJob:
                             evict_dark_frames=scale_frame_knob(
                                 self.config.evict_dark_frames, view_stride),
                             evict_min_absences=self.config.evict_min_absences,
+                            # Misaligned-mask re-anchor: drift correction
+                            # between dark and sliver re-anchor.
+                            misalign_reanchor=self.config.misalign_reanchor,
+                            misalign_ios_min=self.config.misalign_ios_min,
+                            misalign_boundaries=self.config.misalign_boundaries,
                             # qm12 hub-face sliver: reject geometrically
                             # implausible seed boxes, and require motion before
                             # a static candidate may evict from the capped roster.

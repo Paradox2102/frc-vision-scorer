@@ -2704,6 +2704,16 @@ class InferenceJob:
                 continue  # skip confirmed unless this is a re-read pass
             if self._occ.get(canonical_id, {}).get("bumper_occluded"):
                 continue  # bumper hidden by hub/person/robot — don't read it
+            if (getattr(self.config, "det_gated_vlm_reads", False)
+                    and getattr(self, "detection_archive", None) is not None):
+                _gap = int(self.config.det_gate_max_age_s
+                           * (self.video_fps or 10.0))
+                _ok = self.detection_archive.corroborates(
+                    "main", self._current_frame, box, max_gap_frames=_gap)
+                if _ok is False:  # None = no coverage -> fail open
+                    self.identity_diagnostics.increment(
+                        "vlm_read.det_gate_skip")
+                    continue
 
             cb = self._bumper_crop_b64(
                 frame,

@@ -288,6 +288,15 @@ KNOBS = [
     # hard-negative mining; ~KBs per match.
     Knob("detection_archive", "DETECTION_ARCHIVE", bool, True,
          section="Track hygiene"),
+    # Detection-gated VLM reads: only read a bumper crop whose track box is
+    # backed by an archived detection (same view, IoS >= 0.3) within
+    # det_gate_max_age_s. A hijacked track YOLO no longer fires on stops
+    # earning reads — and stops casting misattributed votes. Fails open when
+    # the archive has no boundary coverage for that view/time.
+    Knob("det_gated_vlm_reads", "DET_GATED_VLM_READS", bool, False,
+         section="Track hygiene"),
+    Knob("det_gate_max_age_s", "DET_GATE_MAX_AGE_S", float, 4.0, min=0.5, max=30.0,
+         section="Track hygiene"),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm"), section="Identity & votes"),

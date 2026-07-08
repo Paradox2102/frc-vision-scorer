@@ -1514,7 +1514,8 @@ class InferenceJob:
 
     def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
                                motion_grays=None, blobs_allowed: bool = False,
-                               zone_probe=None):
+                               zone_probe=None, corrob_floor: float = 0.0,
+                               with_corrob_band: bool = False):
         """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
@@ -1532,6 +1533,14 @@ class InferenceJob:
         rides the SUBORDINATE (strong=False) motion tier. Used for the
         starting-zone seed prior (boxes whose ground contact projects into a
         legal opening starting band).
+
+        ``corrob_floor``: when > 0, the detector runs down to this
+        confidence floor (below ``det_conf_floor`` if lower) and detections
+        in [corrob_floor, conf) that neither the motion nor zone probe
+        admitted are captured separately as a corroborate-only band —
+        presence evidence that can never seed/match/evict. Returned only
+        when ``with_corrob_band`` is True (as a second return value); 0
+        (the default) produces an empty band and leaves behavior unchanged.
 
         Returns [(box_xyxy, color, strong)] in the input frame's pixel
         coords, in strict priority order: strong YOLO evidence first
@@ -1571,12 +1580,15 @@ class InferenceJob:
 
         strong_bumpers = []
         motion_bumpers = []
+        corrob_bumpers = []
         if self.bumper_model is not None:
             # Motion-gated low-conf admission: with a motion probe available,
             # detect down to det_conf_floor; the sub-conf band survives only
             # where pixels actually moved — and only as the SUBORDINATE tier.
             gated = motion_probe is not None or zone_probe is not None
             run_conf = min(conf, self.config.det_conf_floor) if gated else conf
+            if corrob_floor > 0:
+                run_conf = min(run_conf, corrob_floor)
             res = self.bumper_model(frame, conf=run_conf, verbose=False)[0]
             robots, _balls, _hubs = self.det_schema.split(
                 sv.Detections.from_ultralytics(res)
@@ -1599,6 +1611,12 @@ class InferenceJob:
 
             strong_bumpers = _expand(strong_dets)
             motion_bumpers = _expand(motion_dets)
+            corrob_dets = []
+            if corrob_floor > 0:
+                taken = {id(d) for d in strong_dets} | {id(d) for d in motion_dets}
+                corrob_dets = [d for d in robots
+                               if id(d) not in taken and d[2] >= corrob_floor]
+            corrob_bumpers = _expand(corrob_dets)
         # Cross-class double-reads of one blurred bumper (per-class NMS)
         # must not seed duplicate objects.
         strong_bumpers = dedupe_seed_robots(strong_bumpers, ROBOT_FILL_IOS)
@@ -1625,14 +1643,27 @@ class InferenceJob:
                 [(mb, "unknown") for mb in motion_boxes], covered,
                 MOTION_TIER_DEDUP_IOS, inflate=MOTION_TIER_INFLATE)
         tiered += [(box, color, False) for box, color in motion_tier]
+        # Corroborate-only band: sub-seed-confidence detections the motion/
+        # zone probes did not already admit into `tiered`. Deduped against
+        # the final tier list so a strong (or motion) candidate is never
+        # shadowed by its own weaker corrob-band echo. These boxes skip the
+        # pile/person vetoes below: they cast no seeds, and vetoing presence
+        # evidence recreates the false-absence problem the band exists to
+        # prevent.
+        corrob_band = dedupe_against(
+            corrob_bumpers, [box for box, _c, _s in tiered],
+            MOTION_TIER_DEDUP_IOS, inflate=MOTION_TIER_INFLATE)
         # Ball-pile veto: the whole-robot class fires on dense ball piles;
         # a colorless candidate mostly covered by ball detections is not a
         # robot (bumper-colored candidates are exempt — robots carry balls).
         tiered = reject_ball_pile_candidates(
             tiered, ball_boxes, BALL_PILE_COVERAGE)
-        return reject_person_candidates(
+        result = reject_person_candidates(
             tiered, person_boxes, PERSON_ROBOT_REJECT_COVERAGE
         )
+        if with_corrob_band:
+            return result, corrob_band
+        return result
 
     def _make_start_zone_probe(self, view, top_crop_px, elapsed_s):
         """zone_probe(box)->bool for _sam2_robot_candidates: True when the
@@ -5820,7 +5851,10 @@ class InferenceJob:
                                         elapsed,
                                         self.config.motion_blob_window_s),
                                     zone_probe=self._make_start_zone_probe(
-                                        view, top_crop_px, elapsed))
+                                        view, top_crop_px, elapsed),
+                                    corrob_floor=self.config.corrob_conf_floor,
+                                    with_corrob_band=True)
+                                merged, corrob_band = merged
                                 # Field-filter in full-view coords (restore the
                                 # top-crop offset). No blocked_zones: detect_fn
                                 # output also corroborates existing masks (a
@@ -5869,14 +5903,34 @@ class InferenceJob:
                                         strong_halves,
                                         [h for _i, h in motion_entries],
                                         max_per_half=3))
-                                return [
-                                    (
-                                        tuple(v * SAM2_SCALE for v in merged[idx][0]),
-                                        merged[idx][1],
-                                    )
+                                # Corroborate-only band: same field filter as
+                                # the main cascade, but these boxes never
+                                # compete for a roster seat — they ride as
+                                # corrob_only 3-tuples so the tracker counts
+                                # them as presence evidence without seeding,
+                                # matching, re-anchoring, or evicting on them.
+                                corrob_full = [
+                                    (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
+                                    for b, _c in corrob_band
+                                ]
+                                corrob_keep = filter_field_robot_boxes(
+                                    corrob_full, view.calibration, self.field_dims,
+                                    frame_shape=(crop.shape[0] + top_crop_px,
+                                                 crop.shape[1], 3),
+                                    frac_backstop=self.config.det_frac_backstop,
+                                ) if corrob_full else []
+                                out = [
+                                    (tuple(v * SAM2_SCALE for v in merged[idx][0]),
+                                     merged[idx][1])
                                     for idx in keep
                                     if merged[idx][2] or idx in kept_motion
                                 ]
+                                out += [
+                                    (tuple(v * SAM2_SCALE for v in corrob_band[i][0]),
+                                     corrob_band[i][1], True)
+                                    for i in corrob_keep
+                                ]
+                                return out
                             return detect_fn
 
                         # Re-detect roughly every REPROMPT_SECONDS of tracked footage.

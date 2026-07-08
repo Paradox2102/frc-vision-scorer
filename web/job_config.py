@@ -171,6 +171,15 @@ KNOBS = [
     # so blinding corroboration there is safe. Pair with cull_hijack_enabled.
     Knob("zone_blind_corroboration", "ZONE_BLIND_CORROB", bool, False,
          section="Track hygiene"),
+    # Corroboration confidence floor (seed/corroborate threshold split): at
+    # re-prompt boundaries the bumper detector runs down to this floor, and
+    # detections in [corrob_conf_floor, seed conf) that the motion/zone
+    # probes did NOT admit ride a corroborate-only band — they count as
+    # presence evidence (a parked robot rendering weak detections must not
+    # accrue absences toward cull/eviction) but can never seed, match,
+    # re-anchor, or evict. 0 disables (single-threshold behavior).
+    Knob("corrob_conf_floor", "CORROB_CONF_FLOOR", float, 0.0, min=0.0, max=1.0,
+         section="Track hygiene"),
     # Zone-blind VOTING (identity layer): a VLM read taken while the track's
     # field position is inside a raw static zone is printed equipment text
     # (2026cur OVERFLOW crate reads "1477" at digit_prob 1.0), never a

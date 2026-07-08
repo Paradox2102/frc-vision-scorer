@@ -312,6 +312,31 @@ def test_start_zone_seed_range_validation():
         JobConfig({"start_zone_window_s": -1.0})  # min 0.0
 
 
+def test_corrob_conf_floor_knob_default_off(monkeypatch):
+    # Corroboration confidence floor: 0 disables the sub-seed-confidence
+    # corroborate-only detection band (single-threshold behavior).
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.corrob_conf_floor == 0.0
+
+
+def test_corrob_conf_floor_knob_env_and_override(monkeypatch):
+    monkeypatch.setenv("CORROB_CONF_FLOOR", "0.2")
+    cfg = JobConfig()
+    assert cfg.corrob_conf_floor == 0.2
+    # Form fields arrive as strings; per-job override beats env.
+    cfg2 = JobConfig({"corrob_conf_floor": "0.35"})
+    assert cfg2.corrob_conf_floor == 0.35
+
+
+def test_corrob_conf_floor_range_validation():
+    with pytest.raises(ValueError):
+        JobConfig({"corrob_conf_floor": -0.1})   # min 0.0
+    with pytest.raises(ValueError):
+        JobConfig({"corrob_conf_floor": 1.1})    # max 1.0
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

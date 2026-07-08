@@ -107,6 +107,7 @@ from web.field.detect_schema import (
 )
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.detection_archive import DetectionArchive
+from web.field.hardneg_miner import mine_hard_negatives
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
 from web.field.manta import overlay_paths_for_job
@@ -5327,6 +5328,7 @@ class InferenceJob:
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
+            self._view_mine_info = {}
             self.sam2_obj_color = {}
             self._replay = ReplayRecorder()
             self.robot_embedder = None
@@ -5814,6 +5816,7 @@ class InferenceJob:
                         )
 
                     _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
+                    self.identity_diagnostics.set_context(view=view.name)
                     try:
                         def make_progress_cb(b_pct, sp_pct, v_name):
                             throttle = {"last": 0.0}
@@ -6049,6 +6052,17 @@ class InferenceJob:
 
                         _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
 
+                        # Hard-negative mining (post-job, best-effort): capture
+                        # the pieces mine_hard_negatives needs to map a cull
+                        # event's SAM2-space box back to a full-res frame —
+                        # frame_idx -> source video frame, the SAM2 export
+                        # scale/crop offset, and this view's extract() crop.
+                        self._view_mine_info[view.name] = {
+                            "source_frames": list(view_plan.source_frames),
+                            "scale": _sam2_scale, "y_off": _y_off,
+                            "extract": view.extract,
+                        }
+
                         # Seed gate: a detection projecting into a static zone
                         # cannot found a NEW SAM2 object (a robot is never born
                         # inside a field element) but still corroborates masks.
@@ -6259,6 +6273,12 @@ class InferenceJob:
                             f"({type(e).__name__}): {e}",
                         )
                     finally:
+                        # clear_context() wipes ALL ambient keys, including the
+                        # job_id set once at job init (record() reads it back
+                        # out of _context, not details) — restore it so later
+                        # views' events keep their job_id field.
+                        self.identity_diagnostics.clear_context()
+                        self.identity_diagnostics.set_context(job_id=self.job_id)
                         for _state in _detect_caps:
                             if _state.get("cap") is not None:
                                 _state["cap"].release()
@@ -6286,6 +6306,17 @@ class InferenceJob:
                 # memory to the vLLM server (empty_cache cannot free live
                 # tensors).
                 del sam2_tracker
+
+                if self.config.hardneg_mine:
+                    try:
+                        events = self.identity_diagnostics._events
+                        n = await asyncio.to_thread(
+                            mine_hard_negatives, events, str(self.video_path),
+                            self._view_mine_info,
+                            str(UPLOAD_DIR / f"hard_negatives_{self.job_id}"))
+                        print(f"  [hardneg] mined {n} frames")
+                    except Exception as e:
+                        print(f"  [hardneg] mining failed (non-fatal): {e}")
             # -------------------------------------
 
             # Tracking precompute is done; the analysis loop (and the early

@@ -310,6 +310,13 @@ KNOBS = [
          section="Track hygiene"),
     Knob("det_gate_max_age_s", "DET_GATE_MAX_AGE_S", float, 4.0, min=0.5, max=30.0,
          section="Track hygiene"),
+    # Hard-negative mining: post-job, decode the frames named by cull/reject
+    # diagnostics (size-prior, person-overlap, static-structure,
+    # implausible-seed-box) and export HardNegativeLogger artifacts for
+    # scripts/build_hardneg_dataset.py. Best-effort and non-fatal; OFF by
+    # default since it's a retrain-loop aid, not a runtime behavior change.
+    Knob("hardneg_mine", "HARDNEG_MINE", bool, False,
+         section="Track hygiene"),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm"), section="Identity & votes"),

@@ -156,6 +156,13 @@ class IdentityDiagnosticRecorder:
             if fields:
                 details.update(fields)
 
+            # Ambient context (set_context) is merged in first so explicit
+            # details/fields win on key collision — e.g. the view-agnostic
+            # tracker can't know its own view name, but per-call details
+            # should never be shadowed by stale context.
+            if self._context:
+                details = {**self._context, **details}
+
             payload = {
                 "schema_version": 1,
                 "event": event,

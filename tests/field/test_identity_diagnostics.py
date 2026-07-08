@@ -119,7 +119,20 @@ def test_counters_and_gauges():
     recorder = IdentityDiagnosticRecorder()
     recorder.increment("matches_processed", 2)
     recorder.gauge("active_slots", 4)
-    
+
     summary = recorder.summary()
     assert summary["counters"]["matches_processed"] == 2
     assert summary["gauges"]["active_slots"] == 4
+
+
+def test_set_context_merges_into_details():
+    d = IdentityDiagnosticRecorder()
+    d.set_context(view="corner1")
+    d.record("sam2.object_culled", reason="size_prior_violation",
+             details={"object_id": 3, "frame_idx": 12, "box": [1, 2, 3, 4]})
+    d.clear_context()
+    d.record("sam2.object_culled", reason="person_overlap",
+             details={"object_id": 4})
+    evs = d._events
+    assert evs[-2]["details"]["view"] == "corner1"
+    assert "view" not in evs[-1]["details"]

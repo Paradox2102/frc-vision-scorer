@@ -202,6 +202,12 @@ KNOBS = [
          section="Identity & votes"),
     Knob("vote_stale_max_m", "VOTE_STALE_MAX_M", float, 2.0, min=0.1,
          section="Identity & votes"),
+    # Weight VLM team votes by the SAM tracker's per-object confidence in the
+    # slot being voted into (sqrt damped, floored at 0.25). Votes cast while
+    # the tracker itself is unsure of the mask (mid-hijack, mid-occlusion)
+    # are exactly the misattributed votes that flip identity locks.
+    Knob("vote_prob_weight", "VLM_VOTE_PROB_WEIGHT", bool, False,
+         section="Identity & votes"),
     Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False,
          section="Track hygiene"),
     # Evidence-ranked roster: re-prompt a dark object claimed by a fresh

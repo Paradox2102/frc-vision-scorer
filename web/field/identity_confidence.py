@@ -318,3 +318,15 @@ def surface_vote_multiplier(surface, gate_enabled: bool) -> float:
     if gate_enabled and normalize_surface(surface) == "printed":
         return 0.0
     return 1.0
+
+
+def prob_vote_multiplier(prob, enabled: bool) -> float:
+    """Scale a VLM vote by the SAM tracker's own confidence in the track the
+    vote lands on. sqrt damping mirrors blend_read_confidence; the 0.25 floor
+    keeps a low-prob vote a weak signal rather than erasing it (identity can
+    still converge on a track SAM3 dislikes). None (SAM2 backend, or the slot
+    was coasting) and a disabled gate leave the vote unchanged."""
+    if not enabled or prob is None:
+        return 1.0
+    p = max(0.0, min(1.0, float(prob)))
+    return round(max(0.25, p ** 0.5), 3)

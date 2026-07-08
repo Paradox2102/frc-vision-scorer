@@ -79,3 +79,12 @@ def test_vote_ray_cross_lateral_miss():
 
 def test_vote_ray_cross_degenerate_returns_none():
     assert vote_ray_cross_m((3.0, 1.0), (3.0, 1.0), (5.0, 5.0)) is None
+
+
+def test_prob_vote_multiplier():
+    from web.field.identity_confidence import prob_vote_multiplier
+    assert prob_vote_multiplier(None, True) == 1.0     # no prob -> unchanged
+    assert prob_vote_multiplier(0.81, False) == 1.0    # gate off -> unchanged
+    assert prob_vote_multiplier(0.81, True) == 0.9     # sqrt damping
+    assert prob_vote_multiplier(0.0, True) == 0.25     # floored, never zero
+    assert prob_vote_multiplier(1.5, True) == 1.0      # clamped

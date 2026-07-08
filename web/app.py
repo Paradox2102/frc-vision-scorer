@@ -137,6 +137,7 @@ from web.field.identity_confidence import (
     digit_token_conf,
     normalize_surface,
     occlusion_blocks_read,
+    prob_vote_multiplier,
     surface_vote_multiplier,
     tentative_claim_winners,
     vote_ray_cross_m,
@@ -1852,6 +1853,9 @@ class InferenceJob:
             return
         conf = res.get("confidence", 0.0)
         weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
+        weight *= prob_vote_multiplier(
+            getattr(robot, "last_tracker_prob", None),
+            getattr(getattr(self, "config", None), "vote_prob_weight", False))
         if robot.team_ocr_votes is None:
             robot.team_ocr_votes = {}
         robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
@@ -2350,6 +2354,9 @@ class InferenceJob:
             self._capture_slot_crop(robot.robot_id, crop_b64, conf, robot.appearance_embedding,
                                     robot_crop_b64=robot.appearance_crop_b64)
             vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
+            vote_weight *= prob_vote_multiplier(
+                getattr(robot, "last_tracker_prob", None),
+                getattr(getattr(self, "config", None), "vote_prob_weight", False))
             status_results.append({
                 "slot": self._slot_label(slot_id),
                 "source": cam,
@@ -2754,6 +2761,9 @@ class InferenceJob:
                 continue
             conf = result.get("confidence", 0.0)
             weight = 1.0 if conf >= 0.85 else 0.5
+            weight *= prob_vote_multiplier(
+                getattr(robot, "last_tracker_prob", None),
+                getattr(getattr(self, "config", None), "vote_prob_weight", False))
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
@@ -6787,6 +6797,7 @@ class InferenceJob:
                     robot = self._get_or_create_slot_track(t.slot_id)
                     robot.alliance = t.alliance  # slot (bumper-color) alliance wins
                     robot.field_position = t.pos  # field meters, for consumers that want it
+                    robot.last_tracker_prob = t.tracker_prob
                     _emb = slot_to_embedding.get(t.slot_id)
                     if _emb is not None:
                         robot.appearance_embedding = _emb

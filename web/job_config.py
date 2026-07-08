@@ -119,6 +119,12 @@ KNOBS = [
     # detector knows the true extent. DEFAULT OFF pending A/B.
     Knob("seed_union_extent", "SEED_UNION_EXTENT_ENABLED", bool, False,
          section="Seeding & re-seeding"),
+    # Negative-point prompting: seed/re-anchor prompts carry label-0 points at
+    # the centers of OTHER concurrent detections near the prompt box, so SAM
+    # conditions against bleeding onto a neighboring robot / adjacent
+    # structure from birth. DEFAULT OFF pending A/B.
+    Knob("neg_point_prompts", "SAM2_NEG_POINT_PROMPTS", bool, False,
+         section="Seeding & re-seeding"),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False,
          section="Tracking backend"),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).

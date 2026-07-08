@@ -3258,3 +3258,40 @@ def test_pick_evictable_prob_immunity_spares_tier25():
                           prob_means={1: 0.9}, prob_immune=0.8, **kwargs) is None
     assert pick_evictable([1], hist, window, moving_candidate=True,
                           prob_means={1: 0.3}, prob_immune=0.8, **kwargs) == 1
+
+
+def test_negative_points_for_picks_nearby_neighbor_centers():
+    from web.field.sam2_tracker import negative_points_for
+    target = (10, 10, 20, 20)
+    others = [
+        (21, 10, 27, 20),    # adjacent -> center (24, 15) inside 1.5x inflation
+        (100, 100, 110, 110) # far -> excluded
+    ]
+    pts = negative_points_for(target, others)
+    assert pts == [(24.0, 15.0)]
+
+
+def test_negative_points_for_caps_and_orders_by_distance():
+    from web.field.sam2_tracker import negative_points_for
+    target = (0, 0, 10, 10)
+    others = [(10 + i, 0, 12 + i, 4) for i in range(6)]  # 6 near neighbors
+    pts = negative_points_for(target, others, max_points=4)
+    assert len(pts) == 4
+    # nearest first
+    d = [((x - 5) ** 2 + (y - 5) ** 2) for x, y in pts]
+    assert d == sorted(d)
+
+
+def test_prompt_with_negatives_falls_back_when_predictor_lacks_points():
+    """Stub predictors (and legacy paths) accept only box=; the helper must
+    degrade to a box-only prompt instead of crashing."""
+    from web.field.sam2_tracker import _prompt_with_negatives
+
+    class BoxOnly:
+        def __init__(self): self.calls = []
+        def add_new_points_or_box(self, state, frame_idx, obj_id, box=None):
+            self.calls.append((frame_idx, obj_id, tuple(box)))
+
+    p = BoxOnly()
+    _prompt_with_negatives(p, {}, 3, 7, (1, 2, 3, 4), [(9.0, 9.0)])
+    assert p.calls == [(3, 7, (1.0, 2.0, 3.0, 4.0))]

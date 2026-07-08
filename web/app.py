@@ -6177,6 +6177,10 @@ class InferenceJob:
                             # eviction immunity. Both default 0.0 = OFF.
                             cull_low_prob_max=self.config.cull_low_prob_max,
                             evict_prob_immune=self.config.evict_prob_immune,
+                            # Negative-point prompting: label-0 points at
+                            # neighbor detection centers, so SAM conditions
+                            # against bleeding onto them from birth.
+                            neg_point_prompts=self.config.neg_point_prompts,
                             # Cooperative stop: the tracker polls this once per
                             # propagated frame and raises TrackStopped so a user
                             # STOP aborts this (longest) phase within a frame's

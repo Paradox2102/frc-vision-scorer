@@ -663,6 +663,62 @@ def normalize_detections(items):
     return boxes, metadata, corrob_only
 
 
+# Negative-point prompting: seed/re-anchor prompts carry label-0 points at
+# the centers of OTHER concurrent detections near the prompt box, so SAM
+# conditions against bleeding onto a neighboring robot / adjacent structure
+# from birth — prevention at the prompt, where the culls above only treat
+# symptoms. DEFAULT OFF pending A/B.
+NEG_POINT_PROMPTS = os.environ.get(
+    "SAM2_NEG_POINT_PROMPTS", "0") not in ("0", "false", "False")
+NEG_POINT_MAX = int(os.environ.get("SAM2_NEG_POINT_MAX", "4"))
+NEG_POINT_INFLATE = float(os.environ.get("SAM2_NEG_POINT_INFLATE", "1.5"))
+
+
+def negative_points_for(target_box, other_boxes, max_points: int = None,
+                        inflate: float = None):
+    """Centers of ``other_boxes`` that fall inside ``target_box`` inflated by
+    ``inflate`` — nearest first, capped at ``max_points``. A neighbor's center
+    is the strongest single-pixel statement of "not this object"."""
+    if max_points is None:
+        max_points = NEG_POINT_MAX
+    if inflate is None:
+        inflate = NEG_POINT_INFLATE
+    x1, y1, x2, y2 = (float(v) for v in target_box)
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    # Half-extent of the inflated window is the FULL box dimension times
+    # inflate (not half-width times inflate) — inflate=1.5 on a 10px box
+    # reaches a neighbor centered 9px away, one box-width beyond the edge.
+    hw, hh = (x2 - x1) * inflate, (y2 - y1) * inflate
+    out = []
+    for b in other_boxes:
+        ox = (float(b[0]) + float(b[2])) / 2.0
+        oy = (float(b[1]) + float(b[3])) / 2.0
+        if abs(ox - cx) <= hw and abs(oy - cy) <= hh:
+            out.append(((ox - cx) ** 2 + (oy - cy) ** 2, (ox, oy)))
+    out.sort(key=lambda t: t[0])
+    return [p for _d, p in out[:max_points]]
+
+
+def _prompt_with_negatives(predictor, state, frame_idx, obj_id, box, neg_points):
+    """add_new_points_or_box with optional negative points; degrades to a
+    box-only prompt when the predictor doesn't take point kwargs (stubs,
+    legacy adapters)."""
+    if neg_points:
+        try:
+            predictor.add_new_points_or_box(
+                state, frame_idx=frame_idx, obj_id=obj_id,
+                box=np.asarray(box, dtype=np.float32),
+                points=np.asarray(neg_points, dtype=np.float32),
+                labels=np.zeros(len(neg_points), dtype=np.int32),
+            )
+            return
+        except TypeError:
+            pass
+    predictor.add_new_points_or_box(
+        state, frame_idx=frame_idx, obj_id=obj_id,
+        box=np.asarray(box, dtype=np.float32))
+
+
 def is_stationary(positions, max_span_m: float) -> bool:
     """Return True if all known field positions lie within ``max_span_m``.
 
@@ -1017,6 +1073,7 @@ class Sam2FieldTracker:
         size_prior_boundaries: int = SIZE_PRIOR_BOUNDARIES,
         cull_low_prob_max: float = CULL_LOW_PROB_MAX,
         evict_prob_immune: float = EVICT_PROB_IMMUNE,
+        neg_point_prompts: bool = NEG_POINT_PROMPTS,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
         should_stop: Optional[Callable[[], bool]] = None,
@@ -1969,10 +2026,12 @@ class Sam2FieldTracker:
                             if (dark_reanchor_enabled and lv is not None
                                     and (last_idx - lv) >= dark_reanchor_frames
                                     and oid not in dark_reanchored):
-                                predictor.add_new_points_or_box(
-                                    state, frame_idx=last_idx, obj_id=oid,
-                                    box=np.asarray(box_val, dtype=np.float32),
-                                )
+                                negs = negative_points_for(
+                                    box_val,
+                                    [b for q, b in enumerate(int_boxes) if q != idx]
+                                ) if neg_point_prompts else []
+                                _prompt_with_negatives(
+                                    predictor, state, last_idx, oid, box_val, negs)
                                 dark_reanchored.add(oid)
                                 dark_reanchor_attempts[oid] = (
                                     dark_reanchor_attempts.get(oid, 0) + 1)
@@ -2116,10 +2175,13 @@ class Sam2FieldTracker:
                                         best_oid = oid
                                         best_score = score
                                 if best_oid is not None:
-                                    predictor.add_new_points_or_box(
-                                        state, frame_idx=last_idx, obj_id=best_oid,
-                                        box=np.asarray(new_boxes[j], dtype=np.float32),
-                                    )
+                                    negs = negative_points_for(
+                                        new_boxes[j],
+                                        [b for q, b in enumerate(int_boxes) if q != j]
+                                    ) if neg_point_prompts else []
+                                    _prompt_with_negatives(
+                                        predictor, state, last_idx, best_oid,
+                                        new_boxes[j], negs)
                                     # The fresh prompt re-conditions the object;
                                     # sliver-era absence evidence is stale, and the
                                     # restored extent must be visible to the rest
@@ -2244,10 +2306,13 @@ class Sam2FieldTracker:
                                 score = _ios(existing_mask, box_mask)
                                 if score > best_ios:
                                     best_ios = score
-                            predictor.add_new_points_or_box(
-                                state, frame_idx=last_idx, obj_id=next_obj_id,
-                                box=np.asarray(new_boxes[j], dtype=np.float32),
-                            )
+                            negs = negative_points_for(
+                                new_boxes[j],
+                                [b for q, b in enumerate(int_boxes) if q != j]
+                            ) if neg_point_prompts else []
+                            _prompt_with_negatives(
+                                predictor, state, last_idx, next_obj_id,
+                                new_boxes[j], negs)
                             first_prompted_frame[next_obj_id] = last_idx
                             birth_detector_overlap[next_obj_id] = best_ios
                             boundary_mask_record[next_obj_id] = (

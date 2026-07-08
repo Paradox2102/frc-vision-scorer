@@ -1641,9 +1641,14 @@ class Sam2FieldTracker:
                         # projector must not blind the whole roster.
                         corrob_boxes = list(new_boxes) + corrob_extra_boxes
                         corrob_metadata = list(new_metadata) + corrob_extra_meta
-                        if corrob_gate_fn is not None and new_boxes:
+                        if corrob_gate_fn is not None and corrob_boxes:
+                            # Gate the COMBINED evidence list (seedable + corrob-
+                            # only) — a corrob-only detection is presence evidence
+                            # too, so a zone gate must vet it identically or the
+                            # band silently vanishes whenever zone-blind
+                            # corroboration is configured.
                             kept_boxes, kept_meta = [], []
-                            for _j, _b in enumerate(new_boxes):
+                            for _j, _b in enumerate(corrob_boxes):
                                 try:
                                     _ok = bool(corrob_gate_fn(_b))
                                 except Exception as exc:
@@ -1656,7 +1661,8 @@ class Sam2FieldTracker:
                                 if _ok:
                                     kept_boxes.append(_b)
                                     kept_meta.append(
-                                        new_metadata[_j] if _j < len(new_metadata) else None)
+                                        corrob_metadata[_j]
+                                        if _j < len(corrob_metadata) else None)
                             corrob_boxes, corrob_metadata = kept_boxes, kept_meta
                         for oid, mask in list(existing.items()):
                             corroborated = mask_corroborated(

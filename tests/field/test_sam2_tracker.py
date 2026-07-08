@@ -2503,6 +2503,41 @@ def test_corrob_gate_error_fails_open():
     assert 2 in result[stub.NUM_FRAMES - 1]
 
 
+def test_corrob_only_detection_survives_gate_filter():
+    """A corrob-only detection that PASSES the gate must still count as
+    corroboration — the gate filter runs over the combined (seedable +
+    corrob-only) evidence, so a gate-passing corrob-only box keeps its
+    object alive instead of being silently dropped."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    stub = CullStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    diag = _ident_diag()
+
+    def detect_fn(local_idx, frame_path):
+        # obj 1 backed by a seedable box; obj 2 backed ONLY by a corrob-only
+        # box. Both sit outside the gated (equipment) zone.
+        return [(stub._rect_for(1), "blue"),
+                (stub._rect_for(2), "red", True)]
+
+    def corrob_gate_fn(box):
+        # gate rejects a far-off equipment footprint neither object touches
+        return not (40 <= (box[0] + box[2]) / 2 <= 50)
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_corrob_ios=0.3, cull_stationary_m=0.5,
+        corrob_gate_fn=corrob_gate_fn,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    # obj 2's corrob-only detection survived the gate -> no absence -> no cull.
+    assert 2 not in _culled_ids(diag)
+    assert 2 in result[stub.NUM_FRAMES - 1]
+
+
 # ---------------------------------------------------------------------------
 # Seed-box aspect gate + motion-required eviction (qm12 static-sliver fix).
 #

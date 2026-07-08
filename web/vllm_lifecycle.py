@@ -137,8 +137,13 @@ async def _try_wake(
     sleep: Callable[[float], Awaitable[None]],
     timeout: float,
     now: Callable[[], float] | None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> bool:
-    """POST /wake_up and poll until is_sleeping is False AND readiness passes."""
+    """POST /wake_up and poll until is_sleeping is False AND readiness passes.
+
+    Returns False early (giving up the wake) if ``should_stop`` fires, so a
+    user STOP does not have to wait out the full readiness timeout.
+    """
     try:
         status, _ = http_fn("POST", "/wake_up")
     except Exception:
@@ -148,6 +153,8 @@ async def _try_wake(
     clock = now or asyncio.get_event_loop().time
     deadline = clock() + timeout
     while clock() < deadline:
+        if should_stop is not None and should_stop():
+            return False
         if _is_sleeping(http_fn) is False and check_fn():
             return True
         await sleep(_POLL_SECONDS)
@@ -172,6 +179,7 @@ async def ensure_started(
     ready_timeout: float = VLLM_START_TIMEOUT,
     now: Callable[[], float] | None = None,
     http_fn: HttpFn = _default_http,
+    should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """Bring the vLLM server up; True when it is serving, False on timeout.
 
@@ -179,14 +187,21 @@ async def ensure_started(
     it (no process launch). If it is up and awake, we are done. If nothing is
     running, cold-start via the launch script. If a sleeper refuses to wake,
     tear it down and cold-start so a wedged sleeper never strands the job.
+
+    ``should_stop`` (optional) is polled inside the wait loops so a user STOP
+    aborts the ~90s startup wait within a poll interval instead of blocking
+    until the readiness timeout; it returns False (server not up) in that case.
     """
     if check_fn():
         # Server answers /v1/models — but it might be a sleeper (readiness
         # alone can't tell). Only wake if /is_sleeping explicitly says True.
         if _is_sleeping(http_fn) is not True:
             return True
-        if await _try_wake(http_fn, check_fn, sleep, ready_timeout, now):
+        if await _try_wake(http_fn, check_fn, sleep, ready_timeout, now,
+                           should_stop):
             return True
+        if should_stop is not None and should_stop():
+            return False
         # Wedged sleeper: kill it, then fall through to a clean cold start.
         await run_script("stop")
 
@@ -194,6 +209,8 @@ async def ensure_started(
     clock = now or asyncio.get_event_loop().time
     deadline = clock() + ready_timeout
     while clock() < deadline:
+        if should_stop is not None and should_stop():
+            return False
         if check_fn():
             return True
         await sleep(_POLL_SECONDS)

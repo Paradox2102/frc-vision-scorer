@@ -3063,3 +3063,67 @@ def test_size_prior_cull_requires_sustained_violation():
                 if e.get("event") == "sam2.object_culled"]
     assert 1 in result[stub.NUM_FRAMES - 1]
     assert 2 in result[stub.NUM_FRAMES - 1]
+
+
+# ---------------------------------------------------------------------------
+# should_stop — cooperative abort of propagation (Task 1: reliable STOP)
+# ---------------------------------------------------------------------------
+
+def test_track_should_stop_aborts_forward_propagation():
+    """When ``should_stop`` returns True the forward pass raises TrackStopped
+    at the next per-frame poll instead of running to the end of the video."""
+    from web.field.sam2_tracker import Sam2FieldTracker, TrackStopped
+
+    stub = StubPredictor()  # 3 frames, 2 objects, forward-only (no reprompt)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    seen = {"n": 0}
+
+    def should_stop():
+        # Stop after the first propagated frame has been recorded.
+        seen["n"] += 1
+        return seen["n"] >= 1
+
+    with pytest.raises(TrackStopped):
+        tracker.track(
+            frames_dir="ignored_by_stub",
+            prompt_idx=0,
+            prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+            should_stop=should_stop,
+        )
+    # It bailed early rather than polling once per frame for all 3 frames.
+    assert seen["n"] == 1
+
+
+def test_track_should_stop_none_runs_to_completion():
+    """Default (should_stop=None) is a no-op — full propagation, no raise."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = StubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    result = tracker.track(
+        frames_dir="ignored_by_stub",
+        prompt_idx=0,
+        prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+        should_stop=None,
+    )
+    assert set(result.keys()) == {0, 1, 2}  # all frames present
+
+
+def test_track_should_stop_resets_predictor_state_on_abort():
+    """The ``finally`` cleanup (reset_state) still runs when should_stop fires."""
+    from web.field.sam2_tracker import Sam2FieldTracker, TrackStopped
+
+    stub = StubPredictor()
+    reset = {"called": False}
+    stub.reset_state = lambda state: reset.__setitem__("called", True)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    with pytest.raises(TrackStopped):
+        tracker.track(
+            frames_dir="ignored_by_stub",
+            prompt_idx=0,
+            prompt_boxes=[(2, 2, 6, 6), (15, 3, 20, 8)],
+            should_stop=lambda: True,
+        )
+    assert reset["called"] is True

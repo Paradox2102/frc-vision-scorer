@@ -382,3 +382,50 @@ def test_sam3_tracker_uses_sam3_tags_for_logs_and_diagnostics(tmp_path):
     )
     assert diag.events, "expected diagnostics events"
     assert all(e.startswith("sam3.") for e in diag.events), diag.events
+
+
+def test_sam3_tracker_should_stop_aborts_and_closes_chunk_session(tmp_path):
+    """Task 1 (reliable STOP): ``should_stop`` reaches the SAM3 tracker through
+    the inherited ``track()`` and aborts propagation mid-stream. The chunk
+    session must still be torn down (close_session + temp dir removed) by the
+    ``finally: predictor.reset_state(state)`` cleanup."""
+    from web.field.sam2_tracker import TrackStopped
+
+    _write_frames(tmp_path, 8)
+    raw = ActionHistoryStubPredictor()
+    tracker = Sam3FieldTracker(predictor=raw)
+
+    polls = {"n": 0}
+
+    def should_stop():
+        # Let the first propagated frame land, then request the stop.
+        polls["n"] += 1
+        return polls["n"] >= 2
+
+    with pytest.raises(TrackStopped):
+        tracker.track(
+            str(tmp_path),
+            prompt_idx=0,
+            prompt_boxes=[(3, 2, 8, 6)],
+            should_stop=should_stop,
+        )
+
+    # It bailed after ~2 frames, not the full 8-frame stream.
+    assert polls["n"] == 2
+    # Cleanup ran: exactly one chunk session was opened and it was closed.
+    opened = sum(r["type"] == "start_session" for r in raw.requests)
+    closed = sum(r["type"] == "close_session" for r in raw.requests)
+    assert opened == 1 and closed == 1
+
+
+def test_sam3_tracker_should_stop_none_is_default_full_run(tmp_path):
+    """Without should_stop the SAM3 tracker's behavior is unchanged."""
+    _write_frames(tmp_path, 4)
+    raw = ActionHistoryStubPredictor()
+    tracker = Sam3FieldTracker(predictor=raw)
+    results = tracker.track(
+        str(tmp_path),
+        prompt_idx=0,
+        prompt_boxes=[(3, 2, 8, 6)],
+    )
+    assert set(results.keys()) == {0, 1, 2, 3}

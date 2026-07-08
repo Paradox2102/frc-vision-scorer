@@ -385,7 +385,15 @@ class Sam3PredictorAdapter:
 
 class Sam3FieldTracker(Sam2FieldTracker):
     """Run the field tracker with Meta's SAM3 video model (instance prompts,
-    chunked sessions)."""
+    chunked sessions).
+
+    ``track(..., should_stop=...)`` (cooperative user-STOP abort) is inherited
+    from ``Sam2FieldTracker`` and works here too: the shared loop polls the
+    predicate once per propagated frame of the adapter's stream and raises
+    ``TrackStopped``; the ``finally`` cleanup calls this adapter's
+    ``reset_state``, which closes the live chunk session and removes its
+    temp dir.
+    """
 
     LOG_TAG = "SAM3"
     DIAG_PREFIX = "sam3"

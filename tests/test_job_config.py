@@ -6,7 +6,7 @@ knob fails the submit with a clear error instead of failing mid-inference.
 """
 import pytest
 
-from web.job_config import JobConfig, KNOBS
+from web.job_config import JobConfig, KNOBS, describe_knobs
 
 
 def test_defaults_without_env(monkeypatch):
@@ -317,3 +317,22 @@ def test_to_dict_round_trip():
     d = cfg.to_dict()
     assert d["sam2_model_size"] == "large"
     assert JobConfig(d).to_dict() == d
+
+
+def test_every_knob_has_a_non_empty_section():
+    # Settings UI groups knobs by section; an unset section silently falls
+    # back to "misc" (see Knob.section default) which would hide the knob's
+    # real grouping instead of failing loudly. Assert every knob was tagged.
+    for knob in KNOBS:
+        assert isinstance(knob.section, str) and knob.section.strip(), (
+            f"{knob.name} has no section")
+        assert knob.section != "misc", (
+            f"{knob.name} left at the 'misc' fallback; assign a real section")
+
+
+def test_describe_knobs_carries_section():
+    by_name = {k.name: k for k in KNOBS}
+    for entry in describe_knobs():
+        knob = by_name[entry["name"]]
+        assert entry["section"] == knob.section
+        assert entry["section"].strip()

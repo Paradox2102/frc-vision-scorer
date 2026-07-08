@@ -250,6 +250,35 @@ PROFILES = {
         ("kin_gate", {"kin_gate": True}),
         ("vote_ray_gate", {"vote_ray_gate": True}),
     ],
+    # sam3_compile speed A/B: torch.compile on the propagation stage (now the
+    # dominant job cost). The first compile run pays inductor warm-up, so the
+    # arm runs twice in the same server process; compare compile-warm against
+    # baseline, and confirm Manta scores are unchanged (compile must be
+    # numerically neutral or it doesn't ship).
+    "sam3-compile": [
+        ("baseline", {}),
+        ("compile-cold", {"sam3_compile": True}),
+        ("compile-warm", {"sam3_compile": True}),
+    ],
+    # VLM equipment adjudicator (branch vlm-quality-checks), observe-only:
+    # long-static tracks are classified robot/equipment/person and written as
+    # adjudication diagnostic records without touching tracking. Run on a FULL
+    # match (NOT auto_period_only) so parked/hijacked tracks accumulate the
+    # static window — auto-only sprints never sit still long enough to fire.
+    # Manta score should match baseline since nothing acts on the verdicts.
+    # (The full-field census was prototyped and dropped — see git history.)
+    "vlm-qc": [
+        ("adjudicate", {"equipment_adjudicate": True}),
+    ],
+    # Mask-footprint field position: derive each robot's ground contact from
+    # the SAM mask's carpet-contact band instead of the tracked box bottom-
+    # center (an extended intake/arm stretches the box off the true contact).
+    # Payload-neutral to identity; the expected win is tighter field positions,
+    # so watch the Manta mean-NN / weighted-NN drop vs baseline.
+    "mask-footprint": [
+        ("baseline", {}),
+        ("mask_footprint", {"mask_footprint_pos": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

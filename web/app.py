@@ -1872,6 +1872,15 @@ class InferenceJob:
         crop reads a different roster team with high confidence, keep the vote and
         clear the lock so the normal one-to-one assignment can correct the HUD and
         scoring attribution on the next identity pass.
+
+        NOTE: this override is intentionally NOT damped by ``vote_prob_weight``
+        (the tracker_prob vote weighting applied to the additive vote paths).
+        It is the escape hatch for a *wrong* confirmed lock — including one
+        caused by a hijack — and tracker_prob runs lowest exactly during a
+        hijack, so damping the unlock by it would trap a track in the bad lock
+        it most needs to leave. Weighting reduces routine vote *accumulation*
+        on shaky tracks; this high-bar (>=0.9, exact-roster) correction is a
+        separate mechanism.
         """
         if not robot or not robot.team_number_confirmed or not robot.team_number:
             return

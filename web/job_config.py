@@ -259,6 +259,17 @@ KNOBS = [
          section="Track hygiene"),
     Knob("size_prior_boundaries", "SIZE_PRIOR_BOUNDARIES", int, 3, min=1,
          section="Track hygiene"),
+    # tracker_prob gates (SAM3 only — SAM2 emits no per-object confidence, so
+    # both stay inert there). cull_low_prob_max requires LOW mean tracker
+    # confidence before the absence cull may fire — the positive
+    # discriminator the qm24 false-cull failure lacked (absence+stationarity
+    # can't tell static junk from a robot parked in a corner blind spot).
+    # evict_prob_immune grants HIGH mean confidence immunity from the weak
+    # capped-roster eviction tiers. Both default 0.0 = OFF.
+    Knob("cull_low_prob_max", "SAM2_CULL_LOW_PROB_MAX", float, 0.0, min=0.0, max=1.0,
+         section="Track hygiene"),
+    Knob("evict_prob_immune", "SAM2_EVICT_PROB_IMMUNE", float, 0.0, min=0.0, max=1.0,
+         section="Track hygiene"),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm"), section="Identity & votes"),

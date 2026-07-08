@@ -66,6 +66,14 @@ CULL_CORROB_IOS = float(os.environ.get("CULL_CORROB_IOS", "0.3"))
 # Max field-position span over the window to count as stationary.
 CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 
+# tracker_prob gates (SAM3 only — SAM2 emits no per-object confidence, so
+# both gates are inert there). The absence cull's qm24 failure was that
+# absence+stationarity cannot tell static junk from a robot parked in a
+# corner detector blind spot; the tracker's OWN confidence is the missing
+# positive discriminator — junk masks hold low prob, real robots high.
+CULL_LOW_PROB_MAX = float(os.environ.get("SAM2_CULL_LOW_PROB_MAX", "0"))     # 0 disables
+EVICT_PROB_IMMUNE = float(os.environ.get("SAM2_EVICT_PROB_IMMUNE", "0"))    # 0 disables
+
 # Person-overlap veto: a stationary mask that sits mostly inside a person
 # detection for consecutive boundaries is a hijacked track — a robot is never
 # a person, so this is the POSITIVE hijack signal the absence-based cull
@@ -672,6 +680,14 @@ def is_stationary(positions, max_span_m: float) -> bool:
     return span < max_span_m
 
 
+def mean_or_none(vals):
+    """Mean of the non-None entries, or None when empty/all-None. Used for the
+    per-boundary tracker_prob window (SAM3 confidence; SAM2 yields no probs,
+    so None keeps every prob-conditioned gate inert)."""
+    xs = [float(v) for v in vals if v is not None]
+    return (sum(xs) / len(xs)) if xs else None
+
+
 def cull_enabled_for_view(requested, view_name: str, main_only: bool):
     """Scope the absence-based hijack cull to the main view.
 
@@ -711,7 +727,9 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
                    last_visible_frame=None, current_idx=None,
                    dark_frames: int | None = None,
                    min_absences: int = EVICT_MIN_ABSENCES,
-                   moving_candidate: bool = False) -> int | None:
+                   moving_candidate: bool = False,
+                   prob_means: dict | None = None,
+                   prob_immune: float = 0.0) -> int | None:
     """Return the active object best justified for eviction, or None.
 
     The roster should hold the objects MOST LIKELY to be robots; a fresh
@@ -735,6 +753,13 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
     boundary is never evictable, and neither is one without history yet (a
     just-seeded object has had no chance to prove itself). Ties go to the
     smaller (older) object id.
+
+    ``prob_means``/``prob_immune``: when a candidate's mean tracker_prob (SAM3
+    confidence; see ``mean_or_none``) is at or above ``prob_immune`` (> 0), it
+    is spared from tiers 1, 2.5, and 3 — the tracker's own confidence is
+    positive evidence the eviction-worthiness tiers below can't see. Tier 2
+    (dark) is EXEMPT: a dark object's prob window is stale (no fresh frames
+    to average), so a high value there is not live evidence.
     """
     def _evidence(oid):
         hist = corroboration_history.get(oid)
@@ -742,9 +767,17 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
             return None  # no history yet, or detector just backed it
         return hist
 
+    def _immune(oid):
+        if prob_immune <= 0 or not prob_means:
+            return False
+        p = prob_means.get(oid)
+        return p is not None and p >= prob_immune
+
     # Tier 1: stationary + absent_enough(k).
     best, best_absent = None, -1
     for oid in active_objects:
+        if _immune(oid):
+            continue
         hist = _evidence(oid)
         if not hist or not absent_enough(hist, k):
             continue
@@ -756,7 +789,8 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
     if best is not None:
         return best
 
-    # Tier 2: dark mask (no emission for >= dark_frames).
+    # Tier 2: dark mask (no emission for >= dark_frames). Exempt from
+    # immunity — a dark object's prob window is stale, not live evidence.
     if (last_visible_frame is not None and current_idx is not None
             and dark_frames is not None):
         best, best_dark = None, -1
@@ -779,6 +813,8 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
     if moving_candidate:
         best, best_absent = None, -1
         for oid in active_objects:
+            if _immune(oid):
+                continue
             hist = _evidence(oid)
             if not hist:
                 continue
@@ -795,6 +831,8 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
     # Tier 3: least corroborated, motion irrelevant.
     best, best_absent = None, -1
     for oid in active_objects:
+        if _immune(oid):
+            continue
         hist = _evidence(oid)
         if not hist:
             continue
@@ -977,6 +1015,8 @@ class Sam2FieldTracker:
         size_prior_hi: float = SIZE_PRIOR_HI,
         size_prior_lo: float = SIZE_PRIOR_LO,
         size_prior_boundaries: int = SIZE_PRIOR_BOUNDARIES,
+        cull_low_prob_max: float = CULL_LOW_PROB_MAX,
+        evict_prob_immune: float = EVICT_PROB_IMMUNE,
         progress_cb=None,
         diagnostics: Optional[Any] = None,
         should_stop: Optional[Callable[[], bool]] = None,
@@ -1126,6 +1166,24 @@ class Sam2FieldTracker:
                 sliver/fragment).
             size_prior_boundaries: Consecutive violating boundaries required to
                 cull.
+            cull_low_prob_max: When > 0, the absence cull (above) additionally
+                requires the object's mean tracker_prob (SAM3 per-object
+                confidence, windowed like corroboration) to be below this
+                value. This is the positive discriminator the qm24 false-cull
+                failure lacked: absence+stationarity alone cannot tell static
+                junk from a robot parked in a corner detector blind spot, but
+                junk holds low tracker confidence while a real robot holds
+                high. A None mean (SAM2, or no evidence yet) always allows the
+                cull — unmeasurable is not evidence of high confidence. 0 (the
+                default) disables the gate — behavior is unchanged.
+            evict_prob_immune: When > 0, a capped-roster eviction candidate
+                (``pick_evictable``) whose mean tracker_prob is at or above
+                this value is spared from the weak eviction tiers (stationary-
+                absent, motion-proven-vs-absentee, least-corroborated) — high
+                tracker confidence is positive evidence the tiers can't see.
+                The dark tier is exempt (a dark object's window is stale, not
+                live evidence). 0 (the default) disables the gate — behavior
+                is unchanged.
             progress_cb: Optional callback taking (processed_count, total_frames).
             diagnostics: Optional IdentityDiagnosticRecorder-like object.
             should_stop: Optional predicate polled once per propagated frame.
@@ -1168,6 +1226,13 @@ class Sam2FieldTracker:
         retired_set: set[int] = set()
         culled_set: set[int] = set()
         corroboration_history: dict[int, deque] = {}
+        # tracker_prob bookkeeping (SAM3 only — SAM2 emits None, so both
+        # prob-conditioned gates stay inert). prob_accum collects the
+        # per-frame tracker_prob for an object between boundaries;
+        # prob_window holds the per-boundary mean (mean_or_none of a flushed
+        # prob_accum), sized like corroboration_history.
+        prob_accum: dict[int, list] = {}
+        prob_window: dict[int, deque] = {}
         # Dark re-anchor budget: consecutive attempts per object and the
         # boundary frame of the last attempt (for success detection).
         dark_reanchor_attempts: dict[int, int] = {}
@@ -1404,6 +1469,9 @@ class Sam2FieldTracker:
                             else None
                         ),
                     }
+                    if evidence["tracker_prob"] is not None:
+                        prob_accum.setdefault(oid_int, []).append(
+                            evidence["tracker_prob"])
                     frame_entry[oid_int] = {
                         "box": box,
                         "mask": mask2d,
@@ -1676,6 +1744,10 @@ class Sam2FieldTracker:
                                 oid, deque(maxlen=cull_evidence_window))
                             hist.append(bool(corroborated))
 
+                            pw = prob_window.setdefault(
+                                oid, deque(maxlen=cull_evidence_window))
+                            pw.append(mean_or_none(prob_accum.pop(oid, [])))
+
                             # Color backfill for unknown-colored objects: commit
                             # the corroborating bumper color after enough
                             # CONSECUTIVE agreeing boundaries; mixed colors (two
@@ -1713,7 +1785,12 @@ class Sam2FieldTracker:
                             if len(win) > cull_evidence_window:
                                 del win[0]
 
-                            if (cull_enabled
+                            prob_mean = mean_or_none(prob_window.get(oid, []))
+                            prob_allows_cull = (
+                                cull_low_prob_max <= 0
+                                or prob_mean is None
+                                or prob_mean < cull_low_prob_max)
+                            if (cull_enabled and prob_allows_cull
                                     and absent_enough(hist, cull_uncorroborated_reprompts)
                                     and is_stationary(win, cull_stationary_m)):
                                 culled_set.add(oid)
@@ -1730,6 +1807,7 @@ class Sam2FieldTracker:
                                             "frame_idx": last_idx,
                                             "absences": sum(1 for c in hist if not c),
                                             "window": len(hist),
+                                            "prob_mean": prob_mean,
                                         },
                                     )
 
@@ -1906,6 +1984,8 @@ class Sam2FieldTracker:
                                 # same robot cannot also re-anchor it).
                                 corroboration_history.pop(oid, None)
                                 size_violation_history.pop(oid, None)
+                                prob_window.pop(oid, None)
+                                prob_accum.pop(oid, None)
                                 bx1, by1, bx2, by2 = int_boxes[idx]
                                 refreshed = np.zeros((h, w), bool)
                                 refreshed[by1:by2, bx1:bx2] = True
@@ -2047,6 +2127,8 @@ class Sam2FieldTracker:
                                     # the same robot can't also re-anchor it).
                                     corroboration_history.pop(best_oid, None)
                                     size_violation_history.pop(best_oid, None)
+                                    prob_window.pop(best_oid, None)
+                                    prob_accum.pop(best_oid, None)
                                     existing[best_oid] = reanchor_box_mask
                                     boundary_mask_record[best_oid] = (
                                         boundary_no, float(reanchor_box_area),
@@ -2118,6 +2200,10 @@ class Sam2FieldTracker:
                                     dark_frames=evict_dark_frames,
                                     min_absences=evict_min_absences,
                                     moving_candidate=_candidate_moving(j),
+                                    prob_means={
+                                        o: mean_or_none(prob_window.get(o, []))
+                                        for o in active_objects},
+                                    prob_immune=evict_prob_immune,
                                 )
                                 if victim is not None:
                                     culled_set.add(victim)

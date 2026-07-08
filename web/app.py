@@ -6153,6 +6153,11 @@ class InferenceJob:
                             size_prior_hi=self.config.size_prior_hi,
                             size_prior_lo=self.config.size_prior_lo,
                             size_prior_boundaries=self.config.size_prior_boundaries,
+                            # tracker_prob gates: LOW mean confidence gates the
+                            # absence cull, HIGH mean confidence grants
+                            # eviction immunity. Both default 0.0 = OFF.
+                            cull_low_prob_max=self.config.cull_low_prob_max,
+                            evict_prob_immune=self.config.evict_prob_immune,
                             # Cooperative stop: the tracker polls this once per
                             # propagated frame and raises TrackStopped so a user
                             # STOP aborts this (longest) phase within a frame's

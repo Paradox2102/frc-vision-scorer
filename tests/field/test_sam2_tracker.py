@@ -3197,3 +3197,29 @@ def test_corrob_only_detection_never_seeds_but_corroborates():
     # No third object was ever seeded.
     assert all(set(frame.keys()) <= {1, 2} for frame in result.values())
     assert all(oid in (1, 2) for _f, oid in stub.add_calls)
+
+
+# --------------------------------------------------------------------------- #
+# tracker_prob bookkeeping: low-prob cull gate + eviction immunity
+# --------------------------------------------------------------------------- #
+def test_mean_or_none():
+    from web.field.sam2_tracker import mean_or_none
+    assert mean_or_none([]) is None
+    assert mean_or_none([0.5, None, 0.7]) == 0.6
+
+
+def test_pick_evictable_prob_immunity_spares_high_prob_object():
+    from web.field.sam2_tracker import pick_evictable
+    from collections import deque
+    # obj 1: 2 absences (tier-3 evictable). With high mean prob + immunity
+    # threshold it must be spared; without immunity it is the victim.
+    hist = {1: deque([False, False], maxlen=5)}
+    assert pick_evictable([1], hist, {}, k=3, stationary_m=0.5,
+                          min_absences=2) == 1
+    assert pick_evictable([1], hist, {}, k=3, stationary_m=0.5,
+                          min_absences=2,
+                          prob_means={1: 0.9}, prob_immune=0.8) is None
+    # Low prob stays evictable even with immunity enabled.
+    assert pick_evictable([1], hist, {}, k=3, stationary_m=0.5,
+                          min_absences=2,
+                          prob_means={1: 0.3}, prob_immune=0.8) == 1

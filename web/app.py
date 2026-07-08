@@ -5816,473 +5816,467 @@ class InferenceJob:
                         )
 
                     _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
-                    self.identity_diagnostics.set_context(view=view.name)
-                    try:
-                        def make_progress_cb(b_pct, sp_pct, v_name):
-                            throttle = {"last": 0.0}
+                    with self.identity_diagnostics.scoped_context(view=view.name):
+                        try:
+                            def make_progress_cb(b_pct, sp_pct, v_name):
+                                throttle = {"last": 0.0}
 
-                            def progress_cb(current, total):
-                                pct = b_pct + (current / max(1, total)) * sp_pct
-                                msg = f"[{self.tracker_tag}] View '{v_name}': tracking frame {current}/{total}..."
-                                loop.call_soon_threadsafe(
-                                    lambda: asyncio.create_task(safe_send_status(msg, pct))
-                                )
-                                # Structured per-view progress for the tracking
-                                # panel, throttled so a fast view can't flood
-                                # the socket.
-                                now_s = time.monotonic()
-                                if now_s - throttle["last"] >= 0.5 or current >= total:
-                                    throttle["last"] = now_s
-                                    payload = {
-                                        "type": "tracking_progress",
-                                        "view": v_name,
-                                        "current": current,
-                                        "total": total,
-                                        "pct": round(pct, 1),
-                                    }
+                                def progress_cb(current, total):
+                                    pct = b_pct + (current / max(1, total)) * sp_pct
+                                    msg = f"[{self.tracker_tag}] View '{v_name}': tracking frame {current}/{total}..."
                                     loop.call_soon_threadsafe(
-                                        lambda p=payload: asyncio.create_task(
-                                            self._send_ws(p))
+                                        lambda: asyncio.create_task(safe_send_status(msg, pct))
                                     )
-                            return progress_cb
+                                    # Structured per-view progress for the tracking
+                                    # panel, throttled so a fast view can't flood
+                                    # the socket.
+                                    now_s = time.monotonic()
+                                    if now_s - throttle["last"] >= 0.5 or current >= total:
+                                        throttle["last"] = now_s
+                                        payload = {
+                                            "type": "tracking_progress",
+                                            "view": v_name,
+                                            "current": current,
+                                            "total": total,
+                                            "pct": round(pct, 1),
+                                        }
+                                        loop.call_soon_threadsafe(
+                                            lambda p=payload: asyncio.create_task(
+                                                self._send_ws(p))
+                                        )
+                                return progress_cb
 
-                        # Periodic re-prompting: re-run the detector cascade at chunk
-                        # boundaries so robots that start occluded (e.g. behind the
-                        # hub) get picked up once they emerge.  Detection runs on the
-                        # FULL-RESOLUTION source frame (decoded on demand — one seek
-                        # per ~2s of footage), not the 0.5x JPEG export SAM2 tracks:
-                        # the re-acquisition path exists for the hard cases, so it
-                        # must not have the worst recall of the three detect paths.
-                        # Returned boxes are scaled into SAM2 (0.5x, top-cropped)
-                        # coords to match the masks.
-                        def make_detect_fn(detect_caps):
-                            state = {"cap": None, "pos": None}
-                            detect_caps.append(state)
+                            # Periodic re-prompting: re-run the detector cascade at chunk
+                            # boundaries so robots that start occluded (e.g. behind the
+                            # hub) get picked up once they emerge.  Detection runs on the
+                            # FULL-RESOLUTION source frame (decoded on demand — one seek
+                            # per ~2s of footage), not the 0.5x JPEG export SAM2 tracks:
+                            # the re-acquisition path exists for the hard cases, so it
+                            # must not have the worst recall of the three detect paths.
+                            # Returned boxes are scaled into SAM2 (0.5x, top-cropped)
+                            # coords to match the masks.
+                            def make_detect_fn(detect_caps):
+                                state = {"cap": None, "pos": None}
+                                detect_caps.append(state)
 
-                            def detect_fn(local_idx, frame_path):
-                                # local_idx is in THIS view's (possibly
-                                # decimated) index space.
-                                if local_idx is None or local_idx >= len(view_plan.source_frames):
-                                    return None
-                                source_frame = view_plan.source_frames[local_idx]
-                                if state["cap"] is None:
-                                    state["cap"] = cv2.VideoCapture(str(self.video_path))
-                                cap_l = state["cap"]
-                                if state["pos"] != source_frame:
-                                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-                                ok, fr = cap_l.read()
-                                state["pos"] = source_frame + 1
-                                if not ok or fr is None:
-                                    return None
-                                crop = view.extract(fr)
-                                top_crop_frac = (
-                                    getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0
-                                ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                top_crop_px = (
-                                    int(crop.shape[0] * top_crop_frac)
-                                    if top_crop_frac > 0 else 0
-                                )
-                                if top_crop_px:
-                                    crop = crop[top_crop_px:, :]
-                                # Motion evidence: diff against the previous
-                                # kept frame in this view's plan (one extra
-                                # decode per boundary; the YOLO pass beside
-                                # it dwarfs the cost).
-                                motion_grays = None
-                                if ((self.config.motion_gated_conf
-                                        or self.config.motion_seed_blobs)
-                                        and local_idx > 0):
-                                    prev_sf = view_plan.source_frames[local_idx - 1]
-                                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, prev_sf)
-                                    ok_p, fr_p = cap_l.read()
-                                    state["pos"] = prev_sf + 1
-                                    if ok_p and fr_p is not None:
-                                        pcrop = view.extract(fr_p)
-                                        if top_crop_px:
-                                            pcrop = pcrop[top_crop_px:, :]
-                                        motion_grays = (
-                                            cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
-                                            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
-                                elapsed = max(
-                                    0.0,
-                                    (source_frame - prompt_source_frame)
-                                    / max(self.video_fps, 1e-6))
-                                merged = self._sam2_robot_candidates(
-                                    crop, motion_grays=motion_grays,
-                                    blobs_allowed=blob_window_open(
-                                        elapsed,
-                                        self.config.motion_blob_window_s),
-                                    zone_probe=self._make_start_zone_probe(
-                                        view, top_crop_px, elapsed),
-                                    corrob_floor=self.config.corrob_conf_floor,
-                                    with_corrob_band=True)
-                                merged, corrob_band = merged
-                                # Field-filter in full-view coords (restore the
-                                # top-crop offset). No blocked_zones: detect_fn
-                                # output also corroborates existing masks (a
-                                # zone-parked robot must stay detector-present);
-                                # seeding inside zones is blocked by seed_gate_fn.
-                                full_boxes = [
-                                    (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
-                                    for b, _c, _strong in merged
-                                ]
-                                keep = filter_field_robot_boxes(
-                                    full_boxes,
-                                    view.calibration,
-                                    self.field_dims,
-                                    frame_shape=(
-                                        crop.shape[0] + top_crop_px,
-                                        crop.shape[1],
-                                        3,
-                                    ),
-                                    frac_backstop=self.config.det_frac_backstop,
-                                )
-                                # YOLO priority at boundaries too: motion
-                                # hints share the per-half quota (3 = slots
-                                # per alliance) AFTER every strong candidate
-                                # is counted — the seed-frame rule, applied
-                                # at every re-prompt. Tier order is also
-                                # preserved (strong first), so the tracker
-                                # hands roster seats to YOLO evidence first.
-                                strong_halves = []
-                                motion_entries = []   # (candidate_idx, half)
-                                for idx in keep:
-                                    box, _color, strong = merged[idx]
-                                    fb = full_boxes[idx]
-                                    uv = ((fb[0] + fb[2]) / 2.0, fb[3])
-                                    xy = view.calibration.image_to_field(uv)
-                                    half = None
-                                    if xy is not None and self.field_model is not None:
-                                        half = self.field_model.alliance_side(xy)
-                                    if strong:
-                                        if half is not None:
-                                            strong_halves.append(half)
-                                    else:
-                                        motion_entries.append((idx, half))
-                                kept_motion = set(
-                                    motion_entries[i][0]
-                                    for i in select_gap_fills(
-                                        strong_halves,
-                                        [h for _i, h in motion_entries],
-                                        max_per_half=3))
-                                # Corroborate-only band: same field filter as
-                                # the main cascade, but these boxes never
-                                # compete for a roster seat — they ride as
-                                # corrob_only 3-tuples so the tracker counts
-                                # them as presence evidence without seeding,
-                                # matching, re-anchoring, or evicting on them.
-                                corrob_full = [
-                                    (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
-                                    for b, _c in corrob_band
-                                ]
-                                corrob_keep = filter_field_robot_boxes(
-                                    corrob_full, view.calibration, self.field_dims,
-                                    frame_shape=(crop.shape[0] + top_crop_px,
-                                                 crop.shape[1], 3),
-                                    frac_backstop=self.config.det_frac_backstop,
-                                ) if corrob_full else []
-                                out = [
-                                    (tuple(v * SAM2_SCALE for v in merged[idx][0]),
-                                     merged[idx][1])
-                                    for idx in keep
-                                    if merged[idx][2] or idx in kept_motion
-                                ]
-                                out += [
-                                    (tuple(v * SAM2_SCALE for v in corrob_band[i][0]),
-                                     corrob_band[i][1], True)
-                                    for i in corrob_keep
-                                ]
-                                try:
-                                    self.detection_archive.record(
-                                        view.name, local_idx, source_frame,
-                                        [(full_boxes[idx], merged[idx][1], False)
-                                         for idx in keep
-                                         if merged[idx][2] or idx in kept_motion]
-                                        + [(corrob_full[i], corrob_band[i][1], True)
-                                           for i in corrob_keep])
-                                except Exception:
-                                    pass  # telemetry must never break detection
-                                return out
-                            return detect_fn
-
-                        # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
-                        # Decimated views see 1/stride the frames, so divide to
-                        # keep the same wall-clock cadence.
-                        eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
-                        eff_fps /= view_stride
-                        reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
-                        # qm12 opening-window dense reprompt (same eff_fps local-frame
-                        # space as reprompt_every). Both 0 -> feature off.
-                        opening_reprompt_every = (max(1, int(round(self.config.opening_reprompt_seconds * eff_fps)))
-                                                  if self.config.opening_reprompt_seconds > 0 else 0)
-                        opening_window_frames = int(round(self.config.opening_window_seconds * eff_fps))
-
-                        # Build a projector mapping a SAM2 mask box (tracker/0.5x
-                        # top-cropped pixel coords) to field meters, for the
-                        # mask-hijack cull's stationarity test. Exported frames are
-                        # ALREADY top-cropped, so we recover the CROPPED full-res
-                        # height and reconstruct the consumer's offset
-                        # (original_h * tc) via cropped_full_h * tc / (1 - tc).
-                        _sam2_scale = self.sam2_export_scale
-                        _top_crop = (
-                            (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
-                            if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                        )
-                        _exported = sorted(
-                            f for f in os.listdir(tmp_dir_obj.name)
-                            if f.endswith(".jpg") or f.endswith(".jpeg")
-                        )
-                        _cropped_full_h = None
-                        if _exported:
-                            _img0 = cv2.imread(os.path.join(tmp_dir_obj.name, _exported[0]))
-                            if _img0 is not None:
-                                _cropped_full_h = int(round(_img0.shape[0] / _sam2_scale))
-                        _y_off = (
-                            int(_cropped_full_h * _top_crop / max(1.0 - _top_crop, 1e-6))
-                            if (_cropped_full_h is not None and _top_crop > 0) else 0
-                        )
-
-                        def _make_project_fn(cal, y_off, scale):
-                            def _project(box):
-                                x1, y1, x2, y2 = box
-                                fx1, fx2 = x1 / scale, x2 / scale
-                                fy2 = y2 / scale + y_off
-                                return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
-                            return _project
-
-                        _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
-
-                        # Hard-negative mining (post-job, best-effort): capture
-                        # the pieces mine_hard_negatives needs to map a cull
-                        # event's SAM2-space box back to a full-res frame —
-                        # frame_idx -> source video frame, the SAM2 export
-                        # scale/crop offset, and this view's extract() crop.
-                        self._view_mine_info[view.name] = {
-                            "source_frames": list(view_plan.source_frames),
-                            "scale": _sam2_scale, "y_off": _y_off,
-                            "extract": view.extract,
-                        }
-
-                        # Seed gate: a detection projecting into a static zone
-                        # cannot found a NEW SAM2 object (a robot is never born
-                        # inside a field element) but still corroborates masks.
-                        # Low cameras also test the viewing ray beyond the
-                        # contact — an occluded structure base projects short
-                        # of its zone (qm28 outpost phantom).
-                        def _make_seed_gate_fn(project, zones, ray_zones, cam_xy):
-                            def _gate(box):
-                                xy = project(box)
-                                if xy is None:
-                                    return True
-                                if point_in_zones(xy, zones):
-                                    return False
-                                if ray_zones and cam_xy is not None:
-                                    return not ray_enters_zones(cam_xy, xy, ray_zones)
-                                return True
-                            return _gate
-
-                        _cam_center = view.calibration.camera_center
-                        _seed_gate_fn = _make_seed_gate_fn(
-                            _project_fn,
-                            self.static_seed_zones,
-                            self._ray_zone_list(view),
-                            None if _cam_center is None else (
-                                float(_cam_center[0]), float(_cam_center[1])
-                            ),
-                        )
-
-                        # Size-prior hijack cull (A/B knob): expected robot pixel
-                        # width at a field position, in SAM2 export pixel space.
-                        # Width is invariant to the top-crop y-offset, so only
-                        # _sam2_scale matters (unlike _project_fn, which needs
-                        # _y_off). Independent of the corroboration machinery:
-                        # equipment hijacks are detector-corroborated.
-                        _expected_px_fn = None
-                        if self.config.size_prior_cull:
-                            from web.field.detect_bridge import expected_robot_pixel_width
-
-                            def _make_expected_px_fn(cal, scale, robot_w=1.1):
-                                def _fn(xy):
-                                    if xy is None:
+                                def detect_fn(local_idx, frame_path):
+                                    # local_idx is in THIS view's (possibly
+                                    # decimated) index space.
+                                    if local_idx is None or local_idx >= len(view_plan.source_frames):
                                         return None
-                                    px = expected_robot_pixel_width(xy, cal, robot_w)
-                                    return None if px is None else px * scale
-                                return _fn
-                            _expected_px_fn = _make_expected_px_fn(
-                                view.calibration, _sam2_scale)
+                                    source_frame = view_plan.source_frames[local_idx]
+                                    if state["cap"] is None:
+                                        state["cap"] = cv2.VideoCapture(str(self.video_path))
+                                    cap_l = state["cap"]
+                                    if state["pos"] != source_frame:
+                                        cap_l.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                                    ok, fr = cap_l.read()
+                                    state["pos"] = source_frame + 1
+                                    if not ok or fr is None:
+                                        return None
+                                    crop = view.extract(fr)
+                                    top_crop_frac = (
+                                        getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0
+                                    ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                                    top_crop_px = (
+                                        int(crop.shape[0] * top_crop_frac)
+                                        if top_crop_frac > 0 else 0
+                                    )
+                                    if top_crop_px:
+                                        crop = crop[top_crop_px:, :]
+                                    # Motion evidence: diff against the previous
+                                    # kept frame in this view's plan (one extra
+                                    # decode per boundary; the YOLO pass beside
+                                    # it dwarfs the cost).
+                                    motion_grays = None
+                                    if ((self.config.motion_gated_conf
+                                            or self.config.motion_seed_blobs)
+                                            and local_idx > 0):
+                                        prev_sf = view_plan.source_frames[local_idx - 1]
+                                        cap_l.set(cv2.CAP_PROP_POS_FRAMES, prev_sf)
+                                        ok_p, fr_p = cap_l.read()
+                                        state["pos"] = prev_sf + 1
+                                        if ok_p and fr_p is not None:
+                                            pcrop = view.extract(fr_p)
+                                            if top_crop_px:
+                                                pcrop = pcrop[top_crop_px:, :]
+                                            motion_grays = (
+                                                cv2.cvtColor(pcrop, cv2.COLOR_BGR2GRAY),
+                                                cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+                                    elapsed = max(
+                                        0.0,
+                                        (source_frame - prompt_source_frame)
+                                        / max(self.video_fps, 1e-6))
+                                    merged = self._sam2_robot_candidates(
+                                        crop, motion_grays=motion_grays,
+                                        blobs_allowed=blob_window_open(
+                                            elapsed,
+                                            self.config.motion_blob_window_s),
+                                        zone_probe=self._make_start_zone_probe(
+                                            view, top_crop_px, elapsed),
+                                        corrob_floor=self.config.corrob_conf_floor,
+                                        with_corrob_band=True)
+                                    merged, corrob_band = merged
+                                    # Field-filter in full-view coords (restore the
+                                    # top-crop offset). No blocked_zones: detect_fn
+                                    # output also corroborates existing masks (a
+                                    # zone-parked robot must stay detector-present);
+                                    # seeding inside zones is blocked by seed_gate_fn.
+                                    full_boxes = [
+                                        (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
+                                        for b, _c, _strong in merged
+                                    ]
+                                    keep = filter_field_robot_boxes(
+                                        full_boxes,
+                                        view.calibration,
+                                        self.field_dims,
+                                        frame_shape=(
+                                            crop.shape[0] + top_crop_px,
+                                            crop.shape[1],
+                                            3,
+                                        ),
+                                        frac_backstop=self.config.det_frac_backstop,
+                                    )
+                                    # YOLO priority at boundaries too: motion
+                                    # hints share the per-half quota (3 = slots
+                                    # per alliance) AFTER every strong candidate
+                                    # is counted — the seed-frame rule, applied
+                                    # at every re-prompt. Tier order is also
+                                    # preserved (strong first), so the tracker
+                                    # hands roster seats to YOLO evidence first.
+                                    strong_halves = []
+                                    motion_entries = []   # (candidate_idx, half)
+                                    for idx in keep:
+                                        box, _color, strong = merged[idx]
+                                        fb = full_boxes[idx]
+                                        uv = ((fb[0] + fb[2]) / 2.0, fb[3])
+                                        xy = view.calibration.image_to_field(uv)
+                                        half = None
+                                        if xy is not None and self.field_model is not None:
+                                            half = self.field_model.alliance_side(xy)
+                                        if strong:
+                                            if half is not None:
+                                                strong_halves.append(half)
+                                        else:
+                                            motion_entries.append((idx, half))
+                                    kept_motion = set(
+                                        motion_entries[i][0]
+                                        for i in select_gap_fills(
+                                            strong_halves,
+                                            [h for _i, h in motion_entries],
+                                            max_per_half=3))
+                                    # Corroborate-only band: same field filter as
+                                    # the main cascade, but these boxes never
+                                    # compete for a roster seat — they ride as
+                                    # corrob_only 3-tuples so the tracker counts
+                                    # them as presence evidence without seeding,
+                                    # matching, re-anchoring, or evicting on them.
+                                    corrob_full = [
+                                        (b[0], b[1] + top_crop_px, b[2], b[3] + top_crop_px)
+                                        for b, _c in corrob_band
+                                    ]
+                                    corrob_keep = filter_field_robot_boxes(
+                                        corrob_full, view.calibration, self.field_dims,
+                                        frame_shape=(crop.shape[0] + top_crop_px,
+                                                     crop.shape[1], 3),
+                                        frac_backstop=self.config.det_frac_backstop,
+                                    ) if corrob_full else []
+                                    out = [
+                                        (tuple(v * SAM2_SCALE for v in merged[idx][0]),
+                                         merged[idx][1])
+                                        for idx in keep
+                                        if merged[idx][2] or idx in kept_motion
+                                    ]
+                                    out += [
+                                        (tuple(v * SAM2_SCALE for v in corrob_band[i][0]),
+                                         corrob_band[i][1], True)
+                                        for i in corrob_keep
+                                    ]
+                                    try:
+                                        self.detection_archive.record(
+                                            view.name, local_idx, source_frame,
+                                            [(full_boxes[idx], merged[idx][1], False)
+                                             for idx in keep
+                                             if merged[idx][2] or idx in kept_motion]
+                                            + [(corrob_full[i], corrob_band[i][1], True)
+                                               for i in corrob_keep])
+                                    except Exception:
+                                        pass  # telemetry must never break detection
+                                    return out
+                                return detect_fn
 
-                        # Motion override (A/B knob): frame-diff motion probe
-                        # over this view's exported frames; boxes at boundaries
-                        # are in the same scaled/cropped pixel space as the
-                        # jpgs, so no coordinate translation is needed.
-                        _motion_fn = None
-                        if self.config.motion_override:
-                            from web.field.sam2_tracker import make_frame_diff_motion_fn
-                            _motion_fn = make_frame_diff_motion_fn(
-                                tmp_dir_obj.name,
-                                self.config.motion_energy_thresh,
+                            # Re-detect roughly every REPROMPT_SECONDS of tracked footage.
+                            # Decimated views see 1/stride the frames, so divide to
+                            # keep the same wall-clock cadence.
+                            eff_fps = (self.video_fps / self.frame_skip) if (self.video_fps and self.frame_skip) else 10.0
+                            eff_fps /= view_stride
+                            reprompt_every = max(1, int(round(self.config.reprompt_seconds * eff_fps)))
+                            # qm12 opening-window dense reprompt (same eff_fps local-frame
+                            # space as reprompt_every). Both 0 -> feature off.
+                            opening_reprompt_every = (max(1, int(round(self.config.opening_reprompt_seconds * eff_fps)))
+                                                      if self.config.opening_reprompt_seconds > 0 else 0)
+                            opening_window_frames = int(round(self.config.opening_window_seconds * eff_fps))
+
+                            # Build a projector mapping a SAM2 mask box (tracker/0.5x
+                            # top-cropped pixel coords) to field meters, for the
+                            # mask-hijack cull's stationarity test. Exported frames are
+                            # ALREADY top-cropped, so we recover the CROPPED full-res
+                            # height and reconstruct the consumer's offset
+                            # (original_h * tc) via cropped_full_h * tc / (1 - tc).
+                            _sam2_scale = self.sam2_export_scale
+                            _top_crop = (
+                                (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
+                                if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                            )
+                            _exported = sorted(
+                                f for f in os.listdir(tmp_dir_obj.name)
+                                if f.endswith(".jpg") or f.endswith(".jpeg")
+                            )
+                            _cropped_full_h = None
+                            if _exported:
+                                _img0 = cv2.imread(os.path.join(tmp_dir_obj.name, _exported[0]))
+                                if _img0 is not None:
+                                    _cropped_full_h = int(round(_img0.shape[0] / _sam2_scale))
+                            _y_off = (
+                                int(_cropped_full_h * _top_crop / max(1.0 - _top_crop, 1e-6))
+                                if (_cropped_full_h is not None and _top_crop > 0) else 0
                             )
 
-                        # Person-overlap veto (A/B knob): person YOLO on the
-                        # exported tracking frame itself — boxes come back in
-                        # the same scaled/cropped pixel space as the masks, so
-                        # no coordinate translation and no extra video decode.
-                        _person_fn = None
-                        if self.config.person_veto_enabled:
-                            def _person_fn(local_idx, frame_path):
-                                if not frame_path:
-                                    return []
-                                img = cv2.imread(frame_path)
-                                if img is None:
-                                    return []
-                                res = self.person_model(
-                                    img, classes=[0], conf=DET_CONF_THRESHOLD,
-                                    verbose=False)[0]
-                                dets = sv.Detections.from_ultralytics(res)
-                                return [tuple(dets.xyxy[i]) for i in range(len(dets))]
+                            def _make_project_fn(cal, y_off, scale):
+                                def _project(box):
+                                    x1, y1, x2, y2 = box
+                                    fx1, fx2 = x1 / scale, x2 / scale
+                                    fy2 = y2 / scale + y_off
+                                    return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
+                                return _project
 
-                        # Zone-blind corroboration (A/B knob): detections whose
-                        # ground contact lands inside a raw static zone are
-                        # invisible to the tracker's corroboration bookkeeping.
-                        _corrob_gate_fn = None
-                        if (self.config.zone_blind_corroboration
-                                and getattr(self, "user_seed_zones_raw", None)):
-                            def _make_corrob_gate(project, zones):
+                            _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
+
+                            # Hard-negative mining (post-job, best-effort): capture
+                            # the pieces mine_hard_negatives needs to map a cull
+                            # event's SAM2-space box back to a full-res frame —
+                            # frame_idx -> source video frame, the SAM2 export
+                            # scale/crop offset, and this view's extract() crop.
+                            self._view_mine_info[view.name] = {
+                                "source_frames": list(view_plan.source_frames),
+                                "scale": _sam2_scale, "y_off": _y_off,
+                                "extract": view.extract,
+                            }
+
+                            # Seed gate: a detection projecting into a static zone
+                            # cannot found a NEW SAM2 object (a robot is never born
+                            # inside a field element) but still corroborates masks.
+                            # Low cameras also test the viewing ray beyond the
+                            # contact — an occluded structure base projects short
+                            # of its zone (qm28 outpost phantom).
+                            def _make_seed_gate_fn(project, zones, ray_zones, cam_xy):
                                 def _gate(box):
                                     xy = project(box)
                                     if xy is None:
                                         return True
-                                    return not point_in_zones(xy, zones)
+                                    if point_in_zones(xy, zones):
+                                        return False
+                                    if ray_zones and cam_xy is not None:
+                                        return not ray_enters_zones(cam_xy, xy, ray_zones)
+                                    return True
                                 return _gate
-                            _corrob_gate_fn = _make_corrob_gate(
-                                _project_fn, self.user_seed_zones_raw)
 
-                        # Main-view cull scoping: corner views are the qm24
-                        # false-cull victims; None still defers to env knobs
-                        # on the main view.
-                        from web.field.sam2_tracker import cull_enabled_for_view
-                        _cull_enabled = cull_enabled_for_view(
-                            self.cull_hijack_enabled, view.name,
-                            self.config.cull_main_view_only)
+                            _cam_center = view.calibration.camera_center
+                            _seed_gate_fn = _make_seed_gate_fn(
+                                _project_fn,
+                                self.static_seed_zones,
+                                self._ray_zone_list(view),
+                                None if _cam_center is None else (
+                                    float(_cam_center[0]), float(_cam_center[1])
+                                ),
+                            )
 
-                        t0 = time.perf_counter()
-                        view_tracks = await asyncio.to_thread(
-                            sam2_tracker.track,
-                            frames_dir=tmp_dir_obj.name,
-                            prompt_idx=view_plan.prompt_idx,
-                            prompt_boxes=prompt_boxes_scaled,
-                            reprompt_every=reprompt_every,
-                            detect_fn=make_detect_fn(_detect_caps),
-                            motion_fn=_motion_fn,
-                            person_fn=_person_fn,
-                            object_metadata=self.sam2_obj_color[view.name],
-                            max_objects=MAX_TRACKED_ROBOTS,
-                            max_active_objects=MAX_TRACKED_ROBOTS,
-                            # Capped-roster eviction (sam2_tracker) re-seeds robots
-                            # under fresh ids, so lifetime id churn is higher than the
-                            # old 3x budget; qm24 hit 20 ids by the final frame.
-                            max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
-                            propagate_backward=True,
-                            progress_cb=make_progress_cb(base_pct, span_pct, view.name),
-                            diagnostics=self.identity_diagnostics,
-                            project_fn=_project_fn,
-                            seed_gate_fn=_seed_gate_fn,
-                            corrob_gate_fn=_corrob_gate_fn,
-                            # None defers to the tracker's env-knob defaults.
-                            **({"cull_enabled": _cull_enabled}
-                               if _cull_enabled is not None else {}),
-                            **({"reanchor_enabled": self.reanchor_enabled}
-                               if self.reanchor_enabled is not None else {}),
-                            dark_reanchor_enabled=self.config.dark_reanchor_enabled,
-                            # Frame-denominated wall-clock threshold: rescale
-                            # for decimated views ("dark for ~1s" must not
-                            # become ~2s on a stride-2 corner). Absence counts
-                            # are per re-prompt cycle, already rescaled above.
-                            evict_dark_frames=scale_frame_knob(
-                                self.config.evict_dark_frames, view_stride),
-                            evict_min_absences=self.config.evict_min_absences,
-                            # Misaligned-mask re-anchor: drift correction
-                            # between dark and sliver re-anchor.
-                            misalign_reanchor=self.config.misalign_reanchor,
-                            misalign_ios_min=self.config.misalign_ios_min,
-                            misalign_boundaries=self.config.misalign_boundaries,
-                            # qm12 hub-face sliver: reject geometrically
-                            # implausible seed boxes, and require motion before
-                            # a static candidate may evict from the capped roster.
-                            seed_box_max_aspect=self.config.seed_box_max_aspect,
-                            evict_requires_motion=self.config.evict_requires_motion,
-                            # qm11/qm10/qm12 gated leak cleanup: drop a mask
-                            # component only if BOTH small AND detached, so a leak
-                            # onto adjacent structure can't stretch the box /
-                            # field position while an arm / occlusion-split half
-                            # is preserved.
-                            mask_leak_cleanup=self.config.mask_leak_cleanup,
-                            # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
-                            opening_reprompt_every=opening_reprompt_every,
-                            opening_window_frames=opening_window_frames,
-                            # Size-prior hijack cull: geometric width violation
-                            # is the one signal a detector false-fire can't
-                            # corroborate (equipment hijacks are YOLO-backed).
-                            expected_px_fn=_expected_px_fn,
-                            size_prior_cull=self.config.size_prior_cull,
-                            size_prior_hi=self.config.size_prior_hi,
-                            size_prior_lo=self.config.size_prior_lo,
-                            size_prior_boundaries=self.config.size_prior_boundaries,
-                            # tracker_prob gates: LOW mean confidence gates the
-                            # absence cull, HIGH mean confidence grants
-                            # eviction immunity. Both default 0.0 = OFF.
-                            cull_low_prob_max=self.config.cull_low_prob_max,
-                            evict_prob_immune=self.config.evict_prob_immune,
-                            # Negative-point prompting: label-0 points at
-                            # neighbor detection centers, so SAM conditions
-                            # against bleeding onto them from birth.
-                            neg_point_prompts=self.config.neg_point_prompts,
-                            # Cooperative stop: the tracker polls this once per
-                            # propagated frame and raises TrackStopped so a user
-                            # STOP aborts this (longest) phase within a frame's
-                            # propagation time. Covers both SAM2 and SAM3 (the
-                            # SAM3 tracker inherits this track() method).
-                            should_stop=lambda: self._stopped,
-                        )
-                        elapsed = time.perf_counter() - t0
-                        self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
-                        n = len(view_tracks)
-                        print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
-                              f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
-                        self.sam2_raw[view.name] = view_tracks
+                            # Size-prior hijack cull (A/B knob): expected robot pixel
+                            # width at a field position, in SAM2 export pixel space.
+                            # Width is invariant to the top-crop y-offset, so only
+                            # _sam2_scale matters (unlike _project_fn, which needs
+                            # _y_off). Independent of the corroboration machinery:
+                            # equipment hijacks are detector-corroborated.
+                            _expected_px_fn = None
+                            if self.config.size_prior_cull:
+                                from web.field.detect_bridge import expected_robot_pixel_width
 
-                        await safe_send_status(
-                            f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
-                            base_pct + span_pct,
-                        )
-                    except TrackStopped:
-                        # User stop — NOT a tracker failure. The finally below
-                        # releases this view's caps/tempdir; re-raise so the
-                        # process_video handler ends the job as a clean stop
-                        # rather than a degraded "no tracks" warning.
-                        raise
-                    except Exception as e:
-                        print(f"  [{self.tracker_tag}] Error during propagation for view {view.name}: {e}")
-                        # A dead view means a mostly-empty overlay for that
-                        # camera; without this warning the job still reports
-                        # "completed" and the gap reads as a tracker bug
-                        # (it has been a VRAM OOM all three times so far).
-                        await self._warn_degraded(
-                            self.tracker_tag.lower(),
-                            f"View '{view.name}' produced no tracks "
-                            f"({type(e).__name__}): {e}",
-                        )
-                    finally:
-                        # clear_context() wipes ALL ambient keys, including the
-                        # job_id set once at job init (record() reads it back
-                        # out of _context, not details) — restore it so later
-                        # views' events keep their job_id field.
-                        self.identity_diagnostics.clear_context()
-                        self.identity_diagnostics.set_context(job_id=self.job_id)
-                        for _state in _detect_caps:
-                            if _state.get("cap") is not None:
-                                _state["cap"].release()
-                        tmp_dir_obj.cleanup()
+                                def _make_expected_px_fn(cal, scale, robot_w=1.1):
+                                    def _fn(xy):
+                                        if xy is None:
+                                            return None
+                                        px = expected_robot_pixel_width(xy, cal, robot_w)
+                                        return None if px is None else px * scale
+                                    return _fn
+                                _expected_px_fn = _make_expected_px_fn(
+                                    view.calibration, _sam2_scale)
+
+                            # Motion override (A/B knob): frame-diff motion probe
+                            # over this view's exported frames; boxes at boundaries
+                            # are in the same scaled/cropped pixel space as the
+                            # jpgs, so no coordinate translation is needed.
+                            _motion_fn = None
+                            if self.config.motion_override:
+                                from web.field.sam2_tracker import make_frame_diff_motion_fn
+                                _motion_fn = make_frame_diff_motion_fn(
+                                    tmp_dir_obj.name,
+                                    self.config.motion_energy_thresh,
+                                )
+
+                            # Person-overlap veto (A/B knob): person YOLO on the
+                            # exported tracking frame itself — boxes come back in
+                            # the same scaled/cropped pixel space as the masks, so
+                            # no coordinate translation and no extra video decode.
+                            _person_fn = None
+                            if self.config.person_veto_enabled:
+                                def _person_fn(local_idx, frame_path):
+                                    if not frame_path:
+                                        return []
+                                    img = cv2.imread(frame_path)
+                                    if img is None:
+                                        return []
+                                    res = self.person_model(
+                                        img, classes=[0], conf=DET_CONF_THRESHOLD,
+                                        verbose=False)[0]
+                                    dets = sv.Detections.from_ultralytics(res)
+                                    return [tuple(dets.xyxy[i]) for i in range(len(dets))]
+
+                            # Zone-blind corroboration (A/B knob): detections whose
+                            # ground contact lands inside a raw static zone are
+                            # invisible to the tracker's corroboration bookkeeping.
+                            _corrob_gate_fn = None
+                            if (self.config.zone_blind_corroboration
+                                    and getattr(self, "user_seed_zones_raw", None)):
+                                def _make_corrob_gate(project, zones):
+                                    def _gate(box):
+                                        xy = project(box)
+                                        if xy is None:
+                                            return True
+                                        return not point_in_zones(xy, zones)
+                                    return _gate
+                                _corrob_gate_fn = _make_corrob_gate(
+                                    _project_fn, self.user_seed_zones_raw)
+
+                            # Main-view cull scoping: corner views are the qm24
+                            # false-cull victims; None still defers to env knobs
+                            # on the main view.
+                            from web.field.sam2_tracker import cull_enabled_for_view
+                            _cull_enabled = cull_enabled_for_view(
+                                self.cull_hijack_enabled, view.name,
+                                self.config.cull_main_view_only)
+
+                            t0 = time.perf_counter()
+                            view_tracks = await asyncio.to_thread(
+                                sam2_tracker.track,
+                                frames_dir=tmp_dir_obj.name,
+                                prompt_idx=view_plan.prompt_idx,
+                                prompt_boxes=prompt_boxes_scaled,
+                                reprompt_every=reprompt_every,
+                                detect_fn=make_detect_fn(_detect_caps),
+                                motion_fn=_motion_fn,
+                                person_fn=_person_fn,
+                                object_metadata=self.sam2_obj_color[view.name],
+                                max_objects=MAX_TRACKED_ROBOTS,
+                                max_active_objects=MAX_TRACKED_ROBOTS,
+                                # Capped-roster eviction (sam2_tracker) re-seeds robots
+                                # under fresh ids, so lifetime id churn is higher than the
+                                # old 3x budget; qm24 hit 20 ids by the final frame.
+                                max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
+                                propagate_backward=True,
+                                progress_cb=make_progress_cb(base_pct, span_pct, view.name),
+                                diagnostics=self.identity_diagnostics,
+                                project_fn=_project_fn,
+                                seed_gate_fn=_seed_gate_fn,
+                                corrob_gate_fn=_corrob_gate_fn,
+                                # None defers to the tracker's env-knob defaults.
+                                **({"cull_enabled": _cull_enabled}
+                                   if _cull_enabled is not None else {}),
+                                **({"reanchor_enabled": self.reanchor_enabled}
+                                   if self.reanchor_enabled is not None else {}),
+                                dark_reanchor_enabled=self.config.dark_reanchor_enabled,
+                                # Frame-denominated wall-clock threshold: rescale
+                                # for decimated views ("dark for ~1s" must not
+                                # become ~2s on a stride-2 corner). Absence counts
+                                # are per re-prompt cycle, already rescaled above.
+                                evict_dark_frames=scale_frame_knob(
+                                    self.config.evict_dark_frames, view_stride),
+                                evict_min_absences=self.config.evict_min_absences,
+                                # Misaligned-mask re-anchor: drift correction
+                                # between dark and sliver re-anchor.
+                                misalign_reanchor=self.config.misalign_reanchor,
+                                misalign_ios_min=self.config.misalign_ios_min,
+                                misalign_boundaries=self.config.misalign_boundaries,
+                                # qm12 hub-face sliver: reject geometrically
+                                # implausible seed boxes, and require motion before
+                                # a static candidate may evict from the capped roster.
+                                seed_box_max_aspect=self.config.seed_box_max_aspect,
+                                evict_requires_motion=self.config.evict_requires_motion,
+                                # qm11/qm10/qm12 gated leak cleanup: drop a mask
+                                # component only if BOTH small AND detached, so a leak
+                                # onto adjacent structure can't stretch the box /
+                                # field position while an arm / occlusion-split half
+                                # is preserved.
+                                mask_leak_cleanup=self.config.mask_leak_cleanup,
+                                # qm12 opening-window dense reprompt (0:20-0:16 stream-in).
+                                opening_reprompt_every=opening_reprompt_every,
+                                opening_window_frames=opening_window_frames,
+                                # Size-prior hijack cull: geometric width violation
+                                # is the one signal a detector false-fire can't
+                                # corroborate (equipment hijacks are YOLO-backed).
+                                expected_px_fn=_expected_px_fn,
+                                size_prior_cull=self.config.size_prior_cull,
+                                size_prior_hi=self.config.size_prior_hi,
+                                size_prior_lo=self.config.size_prior_lo,
+                                size_prior_boundaries=self.config.size_prior_boundaries,
+                                # tracker_prob gates: LOW mean confidence gates the
+                                # absence cull, HIGH mean confidence grants
+                                # eviction immunity. Both default 0.0 = OFF.
+                                cull_low_prob_max=self.config.cull_low_prob_max,
+                                evict_prob_immune=self.config.evict_prob_immune,
+                                # Negative-point prompting: label-0 points at
+                                # neighbor detection centers, so SAM conditions
+                                # against bleeding onto them from birth.
+                                neg_point_prompts=self.config.neg_point_prompts,
+                                # Cooperative stop: the tracker polls this once per
+                                # propagated frame and raises TrackStopped so a user
+                                # STOP aborts this (longest) phase within a frame's
+                                # propagation time. Covers both SAM2 and SAM3 (the
+                                # SAM3 tracker inherits this track() method).
+                                should_stop=lambda: self._stopped,
+                            )
+                            elapsed = time.perf_counter() - t0
+                            self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
+                            n = len(view_tracks)
+                            print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
+                                  f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
+                            self.sam2_raw[view.name] = view_tracks
+
+                            await safe_send_status(
+                                f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
+                                base_pct + span_pct,
+                            )
+                        except TrackStopped:
+                            # User stop — NOT a tracker failure. The finally below
+                            # releases this view's caps/tempdir; re-raise so the
+                            # process_video handler ends the job as a clean stop
+                            # rather than a degraded "no tracks" warning.
+                            raise
+                        except Exception as e:
+                            print(f"  [{self.tracker_tag}] Error during propagation for view {view.name}: {e}")
+                            # A dead view means a mostly-empty overlay for that
+                            # camera; without this warning the job still reports
+                            # "completed" and the gap reads as a tracker bug
+                            # (it has been a VRAM OOM all three times so far).
+                            await self._warn_degraded(
+                                self.tracker_tag.lower(),
+                                f"View '{view.name}' produced no tracks "
+                                f"({type(e).__name__}): {e}",
+                            )
+                        finally:
+                            for _state in _detect_caps:
+                                if _state.get("cap") is not None:
+                                    _state["cap"].release()
+                            tmp_dir_obj.cleanup()
                     # Phase boundary: after each view's propagation. A stop set
                     # DURING propagation already raised TrackStopped above; this
                     # catches one set in the window after track() returned so we

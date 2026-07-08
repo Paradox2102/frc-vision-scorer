@@ -129,6 +129,18 @@ class IdentityDiagnosticRecorder:
         """Clear the shared metadata context."""
         self._context.clear()
 
+    @contextmanager
+    def scoped_context(self, **kv):
+        """Temporarily merge kv into the ambient context, restoring the
+        prior context on exit — so a nested scope (e.g. per-view tagging)
+        can't clobber ambient keys set at a broader scope (e.g. job_id)."""
+        prev = dict(self._context)
+        self._context.update(kv)
+        try:
+            yield
+        finally:
+            self._context = prev
+
     def increment(self, counter: str, amount: int = 1) -> None:
         """Increment a diagnostic counter."""
         self._counters[counter] = self._counters.get(counter, 0) + amount

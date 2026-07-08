@@ -136,3 +136,34 @@ def test_set_context_merges_into_details():
     evs = d._events
     assert evs[-2]["details"]["view"] == "corner1"
     assert "view" not in evs[-1]["details"]
+
+
+def test_scoped_context_restores_prior_context():
+    d = IdentityDiagnosticRecorder()
+    d.set_context(job_id="job-42")
+
+    with d.scoped_context(view="corner1"):
+        d.record("sam2.object_culled", reason="size_prior_violation",
+                  details={"object_id": 1})
+        # An explicit details key must still win over an ambient one set
+        # inside the scope.
+        d.record("sam2.object_culled", reason="person_overlap",
+                  details={"object_id": 2, "view": "explicit_override"})
+
+    d.record("sam2.object_culled", reason="static_candidate",
+              details={"object_id": 3})
+
+    evs = d._events
+    # Inside the scope: both the broader-scope job_id and the per-scope
+    # view key are present.
+    assert evs[0]["job_id"] == "job-42"
+    assert evs[0]["details"]["view"] == "corner1"
+
+    # Explicit details key wins over the ambient one.
+    assert evs[1]["job_id"] == "job-42"
+    assert evs[1]["details"]["view"] == "explicit_override"
+
+    # After exiting the scope: view is gone, but job_id (set at a broader
+    # scope) survives — this is the bug the scoped_context primitive fixes.
+    assert evs[2]["job_id"] == "job-42"
+    assert "view" not in evs[2]["details"]

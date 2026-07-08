@@ -247,6 +247,64 @@ def test_sam3_adapter_translates_box_and_stream_contract(tmp_path):
     assert sum(r["type"] == "close_session" for r in raw.requests) == 1
 
 
+def test_add_prompt_forwards_negative_points_as_label_zero(tmp_path):
+    _write_frames(tmp_path, 5)
+    raw = StubSam3Predictor()
+    adapter = Sam3PredictorAdapter(raw)
+    state = adapter.init_state(video_path=str(tmp_path))
+
+    adapter.add_new_points_or_box(
+        state,
+        frame_idx=0,
+        obj_id=1,
+        box=(10, 10, 20, 20),
+        points=[(30.0, 15.0)],
+        labels=[0],
+    )
+    # No chunk open yet: prompt stays pending.
+    assert not any(r["type"] == "add_prompt" for r in raw.requests)
+
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=0))
+    adapter.reset_state(state)
+
+    req = next(r for r in raw.requests if r["type"] == "add_prompt")
+    width, height = state["video_size"]
+    # box corners (labels 2,3) followed by the negative point (label 0), all
+    # normalized by video_size.
+    assert req["point_labels"] == [2, 3, 0]
+    assert req["points"] == [
+        [10 / width, 10 / height],
+        [20 / width, 20 / height],
+        [30.0 / width, 15.0 / height],
+    ]
+
+
+def test_add_prompt_ignores_positive_label_points(tmp_path):
+    _write_frames(tmp_path, 5)
+    raw = StubSam3Predictor()
+    adapter = Sam3PredictorAdapter(raw)
+    state = adapter.init_state(video_path=str(tmp_path))
+
+    adapter.add_new_points_or_box(
+        state,
+        frame_idx=0,
+        obj_id=1,
+        box=(10, 10, 20, 20),
+        points=[(30.0, 15.0), (5.0, 5.0)],
+        labels=[0, 1],
+    )
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=0))
+    adapter.reset_state(state)
+
+    req = next(r for r in raw.requests if r["type"] == "add_prompt")
+    # Only the label-0 point rides along; the label-1 (positive) point is
+    # dropped since it would fight the box corners.
+    assert req["point_labels"] == [2, 3, 0]
+    assert len(req["points"]) == 3
+
+
 def test_sam3_adapter_reseeds_across_chunk_boundary(tmp_path):
     _write_frames(tmp_path, 6)
     raw = StubSam3Predictor()

@@ -130,7 +130,8 @@ class Sam3PredictorAdapter:
             # obj_id -> (global_frame_idx, xyxy box) most recent evidence;
             # prompts and observed masks both update it
             "last_box": {},
-            # prompts not yet sent to any session: [(global_idx, obj_id, box)]
+            # prompts not yet sent to any session:
+            # [(global_idx, obj_id, box, neg_points)]
             "pending": [],
             "closed": False,
         }
@@ -142,14 +143,20 @@ class Sam3PredictorAdapter:
         frame_idx: int,
         obj_id: int,
         box,
+        points=None,
+        labels=None,
     ) -> None:
         box = tuple(float(v) for v in box)
+        # Only label-0 (negative) extras are meaningful here; positive points
+        # would fight the box corners the adapter already sends as labels 2,3.
+        neg = [tuple(float(v) for v in p)
+               for p, l in zip(points or [], labels or []) if int(l) == 0]
         state["last_box"][int(obj_id)] = (int(frame_idx), box)
         chunk = state["chunk"]
         if chunk is not None and chunk["lo"] <= frame_idx < chunk["hi"]:
-            self._send_prompt(state, frame_idx, obj_id, box)
+            self._send_prompt(state, frame_idx, obj_id, box, neg=neg)
         else:
-            state["pending"].append((int(frame_idx), int(obj_id), box))
+            state["pending"].append((int(frame_idx), int(obj_id), box, neg))
 
     def propagate_in_video(
         self,
@@ -195,21 +202,27 @@ class Sam3PredictorAdapter:
 
     # ── chunk-session internals ──────────────────────────────────────
 
-    def _send_prompt(self, state: dict, frame_idx: int, obj_id: int, box) -> None:
+    def _send_prompt(self, state: dict, frame_idx: int, obj_id: int, box,
+                      neg=None) -> None:
         chunk = state["chunk"]
         width, height = state["video_size"]
         x1, y1, x2, y2 = box
         # Box -> two corner points with SAM2's box labels (2: TL, 3: BR), in
         # normalized coordinates: the instance path keeps stable obj_ids and
         # adds/refines incrementally instead of resetting state.
+        pts = [[x1 / width, y1 / height], [x2 / width, y2 / height]]
+        lbl = [2, 3]
+        for nx, ny in (neg or []):
+            pts.append([nx / width, ny / height])
+            lbl.append(0)
         self._predictor.handle_request(
             {
                 "type": "add_prompt",
                 "session_id": chunk["session_id"],
                 "frame_index": int(frame_idx) - chunk["lo"],
                 "obj_id": int(obj_id),
-                "points": [[x1 / width, y1 / height], [x2 / width, y2 / height]],
-                "point_labels": [2, 3],
+                "points": pts,
+                "point_labels": lbl,
                 "rel_coordinates": True,
             }
         )
@@ -253,13 +266,13 @@ class Sam3PredictorAdapter:
         # Seed: pending prompts that fall in this window, then carried
         # objects (fresh mask evidence only) that have no pending prompt here.
         seed_frame = (hi - 1) if reverse else lo
-        pending_here = [(f, o, b) for (f, o, b) in state["pending"]
+        pending_here = [(f, o, b, n) for (f, o, b, n) in state["pending"]
                         if lo <= f < hi]
-        state["pending"] = [(f, o, b) for (f, o, b) in state["pending"]
+        state["pending"] = [(f, o, b, n) for (f, o, b, n) in state["pending"]
                             if not (lo <= f < hi)]
         prompted_ids = set()
-        for f, o, b in pending_here:
-            self._send_prompt(state, f, o, b)
+        for f, o, b, n in pending_here:
+            self._send_prompt(state, f, o, b, neg=n)
             prompted_ids.add(o)
         for obj_id, (seen_idx, box) in sorted(state["last_box"].items()):
             if obj_id in prompted_ids:

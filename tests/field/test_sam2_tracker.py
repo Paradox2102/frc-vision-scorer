@@ -3223,3 +3223,38 @@ def test_pick_evictable_prob_immunity_spares_high_prob_object():
     assert pick_evictable([1], hist, {}, k=3, stationary_m=0.5,
                           min_absences=2,
                           prob_means={1: 0.3}, prob_immune=0.8) == 1
+
+
+def test_pick_evictable_prob_immunity_spares_tier1():
+    from web.field.sam2_tracker import pick_evictable
+    from collections import deque
+    # obj 1: stationary + 3 windowed absences with k=3 -> classic tier-1
+    # victim (min_absences left at its permissive default so tier 3 would
+    # also claim it; tier 1 fires first regardless). High mean prob must
+    # spare it; low prob leaves it evictable.
+    hist = {1: deque([False, False, False], maxlen=5)}
+    window = {1: [(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)]}
+    assert pick_evictable([1], hist, window, k=3, stationary_m=0.5) == 1
+    assert pick_evictable([1], hist, window, k=3, stationary_m=0.5,
+                          prob_means={1: 0.9}, prob_immune=0.8) is None
+    assert pick_evictable([1], hist, window, k=3, stationary_m=0.5,
+                          prob_means={1: 0.3}, prob_immune=0.8) == 1
+
+
+def test_pick_evictable_prob_immunity_spares_tier25():
+    from web.field.sam2_tracker import pick_evictable
+    from collections import deque
+    # obj 1: stationary, hist[-2] is False (unproven at the prior boundary)
+    # and hist[-1] is False (absent now), but only 3 absences against an
+    # unreachable k=99 and min_absences=99 -- tiers 1 and 3 are out of
+    # reach, and dark_frames is omitted so tier 2 can't fire either. Only
+    # the motion-proven tier 2.5 path can evict it.
+    hist = {1: deque([False, False, False], maxlen=5)}
+    window = {1: [(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)]}
+    kwargs = dict(k=99, stationary_m=0.5, min_absences=99)
+    assert pick_evictable([1], hist, window, moving_candidate=True,
+                          **kwargs) == 1
+    assert pick_evictable([1], hist, window, moving_candidate=True,
+                          prob_means={1: 0.9}, prob_immune=0.8, **kwargs) is None
+    assert pick_evictable([1], hist, window, moving_candidate=True,
+                          prob_means={1: 0.3}, prob_immune=0.8, **kwargs) == 1

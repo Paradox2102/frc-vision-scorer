@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 import web.database as database
+from web.embedder import ACTIVE_MODEL, DEFAULT_MODEL
 
 
 @pytest.fixture()
@@ -176,3 +177,77 @@ def test_previous_gallery_exemplars_verified_only_composes_with_team_filter(db):
     assert len(rows) == 1
     assert rows[0]["team"] == "111"
     assert rows[0]["verified"]
+
+
+# --- embed_model tag / cross-model filtering ---
+
+def test_gallery_exemplar_stamped_with_embed_model_round_trips(db):
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026x", "team": "111", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        "embed_model": ACTIVE_MODEL,
+    }))
+    rows = asyncio.run(db.get_gallery_exemplars("2026x"))
+    assert len(rows) == 1
+    assert rows[0]["embed_model"] == ACTIVE_MODEL
+
+
+def test_gallery_load_filters_out_rows_from_a_different_embed_model(db):
+    # A row tagged with a model other than the one this process is running
+    # must be invisible to gallery reads: comparing its vector against a
+    # different backbone's vectors would be a garbage cosine comparison, not
+    # a real re-ID signal. It should look like the exemplar doesn't exist.
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026x", "team": "111", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        "embed_model": "timm/vit_small_patch16_dinov3.lvd1689m",
+    }))
+    assert asyncio.run(db.get_gallery_exemplars("2026x")) == []
+
+
+def test_gallery_load_treats_null_embed_model_as_dinov2_small(db):
+    # Rows written before this column existed (or by any caller that forgot
+    # to stamp it) have embed_model = NULL; treat that as dinov2-small, the
+    # only backend that ever ran pre-migration, rather than as "unknown".
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026x", "team": "111", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+    }))
+    rows = asyncio.run(db.get_gallery_exemplars("2026x"))
+    if ACTIVE_MODEL == DEFAULT_MODEL:
+        assert len(rows) == 1
+        assert rows[0]["embed_model"] is None  # stored as NULL...
+    else:
+        # ...but if this suite ever runs with ROBOT_EMBEDDER_MODEL pointed at
+        # something else, a NULL (== dinov2-small) row correctly stays hidden.
+        assert rows == []
+
+
+def test_previous_gallery_exemplars_filters_mismatched_embed_model(db):
+    # This is the function that feeds AppearanceGallery.from_rows() for
+    # match-time querying, so it's the one that actually guards against
+    # cross-model cosine comparisons.
+    event_id = asyncio.run(db.upsert_event(
+        "2026wamon", "WAMon", 2026, "Somewhere", "2026-03-01", "2026-03-03"
+    ))
+    for number in (1, 2):
+        asyncio.run(db.upsert_match(
+            event_id, f"2026wamon_qm{number}", "qm", number
+        ))
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026wamon", "source_match_key": "2026wamon_qm1",
+        "team": "111", "alliance_color": "blue",
+        "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        "embed_model": ACTIVE_MODEL,
+    }))
+    asyncio.run(db.insert_gallery_exemplar({
+        "event_key": "2026wamon", "source_match_key": "2026wamon_qm1",
+        "team": "222", "alliance_color": "blue",
+        "embedding": _emb_bytes(0, 1, 0), "legibility": 0.9,
+        "embed_model": "some-other-model",
+    }))
+
+    rows = asyncio.run(db.get_previous_gallery_exemplars(
+        "2026wamon", "2026wamon_qm2"
+    ))
+    assert [row["team"] for row in rows] == ["111"]

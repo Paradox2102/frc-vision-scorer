@@ -1,9 +1,20 @@
+import importlib
+import sys
+import types
+
 import numpy as np
 import pytest
 
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask, _clamp_box
 
 EMBED_DIM = 384
+
+
+def _synthetic_frame():
+    # Self-contained: unlike sample_frame/second_frame, needs no dataset on
+    # disk, so the timm-backend tests below always run (never skip).
+    rng = np.random.default_rng(0)
+    return (rng.random((64, 64, 3)) * 255).astype(np.uint8)
 
 
 def test_apply_mask_zeros_background():
@@ -111,3 +122,114 @@ def test_masked_embedding_differs_from_unmasked(sample_frame):
     assert masked.shape == (EMBED_DIM,)
     assert np.linalg.norm(masked) == pytest.approx(1.0, abs=1e-4)
     assert cosine_similarity(plain, masked) < 0.999
+
+
+# --- ROBOT_EMBEDDER_MODEL / timm backend ---
+
+def test_env_var_resolves_active_model(monkeypatch):
+    # ACTIVE_MODEL is resolved once at import time so RobotEmbedder() (no
+    # args) picks up a DINOv3 rollout with zero code changes; reload the
+    # module to re-run that resolution under a patched environment.
+    monkeypatch.setenv("ROBOT_EMBEDDER_MODEL", "timm/vit_small_patch16_dinov3.lvd1689m")
+    import web.embedder as embedder_mod
+    try:
+        importlib.reload(embedder_mod)
+        assert embedder_mod.ACTIVE_MODEL == "timm/vit_small_patch16_dinov3.lvd1689m"
+        assert embedder_mod.RobotEmbedder().model_name == "timm/vit_small_patch16_dinov3.lvd1689m"
+        # explicit ctor arg still wins over the env-resolved default
+        explicit = embedder_mod.RobotEmbedder(model_name="facebook/dinov2-small")
+        assert explicit.model_name == "facebook/dinov2-small"
+    finally:
+        monkeypatch.delenv("ROBOT_EMBEDDER_MODEL", raising=False)
+        importlib.reload(embedder_mod)  # restore ACTIVE_MODEL for later tests
+
+
+def _install_fake_timm(monkeypatch):
+    """Stub the `timm` module so the timm backend can be exercised without
+    downloading real weights.
+
+    forward_features() returns 3 tokens: a distinctive CLS token (all 9s) at
+    index 0, and two all-zero patch tokens. Avg-pooling all tokens would blend
+    in the zeros and shift the result away from the CLS direction, so a test
+    that asserts the output equals the (normalized) CLS token also proves the
+    avg-pool path was NOT taken.
+    """
+    import torch
+
+    class FakeTimmModel:
+        def __init__(self):
+            self.pooled_forward_called = False
+            self.forward_features_called = False
+
+        def to(self, device):
+            return self
+
+        def eval(self):  # torch.nn.Module.eval() (inference mode), not the builtin
+            return self
+
+        def forward_features(self, batch):
+            self.forward_features_called = True
+            n = batch.shape[0]
+            cls = torch.full((n, 1, 4), 9.0)
+            patches = torch.zeros(n, 2, 4)
+            return torch.cat([cls, patches], dim=1)
+
+        def __call__(self, *args, **kwargs):
+            # This is the avg-pool trap: timm's default pooled forward() must
+            # never be called by embed_batch. Surface it loudly if it is.
+            self.pooled_forward_called = True
+            raise AssertionError(
+                "RobotEmbedder must call forward_features()[:, 0], not the "
+                "model's pooled forward()")
+
+    class FakeTimmData:
+        @staticmethod
+        def resolve_model_data_config(model):
+            return {}
+
+        @staticmethod
+        def create_transform(is_training=False, **kwargs):
+            return lambda pil_img: torch.zeros(3, 4, 4)
+
+    fake_model = FakeTimmModel()
+    fake_timm = types.SimpleNamespace(
+        create_model=lambda name, pretrained, num_classes: fake_model,
+        data=FakeTimmData(),
+    )
+    monkeypatch.setitem(sys.modules, "timm", fake_timm)
+    return fake_model
+
+
+def test_timm_path_extracts_cls_token_not_avg_pool(monkeypatch):
+    fake_model = _install_fake_timm(monkeypatch)
+    emb = RobotEmbedder(model_name="timm/vit_small_patch16_dinov3.lvd1689m")
+    frame = _synthetic_frame()
+    v = emb.embed(frame, (0, 0, 64, 64))
+
+    assert v is not None
+    assert fake_model.forward_features_called
+    assert not fake_model.pooled_forward_called
+    # CLS token was a constant [9, 9, 9, 9] -> L2-normalized is [0.5]*4.
+    # If avg-pool over all 3 tokens had been used instead, the all-zero patch
+    # tokens would pull this well away from 0.5.
+    assert np.allclose(v, 0.5, atol=1e-5)
+
+
+def test_timm_import_failure_degrades_gracefully(monkeypatch, capsys):
+    # Simulate "timm isn't installed": a None entry in sys.modules makes the
+    # next `import timm` raise ImportError, same as a genuinely missing package.
+    monkeypatch.setitem(sys.modules, "timm", None)
+    emb = RobotEmbedder(model_name="timm/vit_small_patch16_dinov3.lvd1689m")
+    frame = _synthetic_frame()
+
+    v = emb.embed(frame, (0, 0, 64, 64))
+
+    assert v is None
+    assert emb._load_failed is True
+    out = capsys.readouterr().out
+    assert "failed to load" in out
+    assert "position-only re-ID" in out
+
+    # Latched: a second call doesn't retry the (still-failing) load.
+    v2 = emb.embed(frame, (0, 0, 64, 64))
+    assert v2 is None

@@ -6016,6 +6016,18 @@ class InferenceJob:
                             opening_reprompt_every = (max(1, int(round(self.config.opening_reprompt_seconds * eff_fps)))
                                                       if self.config.opening_reprompt_seconds > 0 else 0)
                             opening_window_frames = int(round(self.config.opening_window_seconds * eff_fps))
+                            # Late-seed backward backfill (A/B knob): same
+                            # seconds->frames conversion as reprompt_every,
+                            # which already divides by view_stride above —
+                            # no separate scale_frame_knob call needed here.
+                            # backfill_min_lived_frames has no knob of its
+                            # own; rescale the tracker's frame-denominated
+                            # default the same way evict_dark_frames is below.
+                            backfill_max_frames = max(1, int(round(
+                                self.config.backfill_seconds * eff_fps)))
+                            from web.field.sam2_tracker import BACKFILL_MIN_LIVED_FRAMES
+                            backfill_min_lived_frames = scale_frame_knob(
+                                BACKFILL_MIN_LIVED_FRAMES, view_stride)
 
                             # Build a projector mapping a SAM2 mask box (tracker/0.5x
                             # top-cropped pixel coords) to field meters, for the
@@ -6237,6 +6249,12 @@ class InferenceJob:
                                 # neighbor detection centers, so SAM conditions
                                 # against bleeding onto them from birth.
                                 neg_point_prompts=self.config.neg_point_prompts,
+                                # Late-seed backward backfill: recover a late-
+                                # seeded robot's pre-seed history by bounded
+                                # reverse propagation after the forward loop.
+                                late_seed_backfill=self.config.late_seed_backfill,
+                                backfill_max_frames=backfill_max_frames,
+                                backfill_min_lived_frames=backfill_min_lived_frames,
                                 # Cooperative stop: the tracker polls this once per
                                 # propagated frame and raises TrackStopped so a user
                                 # STOP aborts this (longest) phase within a frame's

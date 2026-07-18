@@ -50,6 +50,22 @@ each live object's latest observed box (fresh within SAM3_RESEED_MAX_AGE)
 before every windowed propagate, keeping the full roster on the partial
 path; per-object tracker states persist within the session, so this is a
 re-anchor, not a cold re-seed.
+
+Late-seed backward backfill (solo_ids)
+---------------------------------------
+
+``sam2_tracker.Sam2FieldTracker.track`` (shared by this adapter) can, after
+its forward loop finishes, re-prompt a late-seeded object at its own seed
+frame and propagate BACKWARD to recover history YOLO missed. Doing that
+naively would hit both roster-carry loops above (``_open_chunk_for`` and
+``_stream_chunk``) and re-seed/re-prompt the WHOLE live roster across every
+boundary the reverse pass crosses — wasted compute, and a regression of every
+other object's ``last_box`` to the backfill's own reverse timeline. Setting
+``state["solo_ids"]`` to the backfill's target obj_ids confines both loops to
+just those ids for the duration of the reverse pass; the per-frame
+``last_box`` update in ``_stream_chunk`` is NOT gated by ``solo_ids``, since
+it's what lets a target keep propagating across a reverse chunk boundary.
+``None`` (the default) leaves both loops covering the full roster, unchanged.
 """
 from __future__ import annotations
 
@@ -134,6 +150,11 @@ class Sam3PredictorAdapter:
             # [(global_idx, obj_id, box, neg_points)]
             "pending": [],
             "closed": False,
+            # Late-seed backward backfill scoping (sam2_tracker.py): when set
+            # to a set of obj_ids, the roster-carry loops below re-prompt
+            # ONLY those ids instead of the whole live roster. None (default)
+            # is the normal full-roster behavior.
+            "solo_ids": None,
         }
 
     def add_new_points_or_box(
@@ -274,8 +295,16 @@ class Sam3PredictorAdapter:
         for f, o, b, n in pending_here:
             self._send_prompt(state, f, o, b, neg=n)
             prompted_ids.add(o)
+        solo = state.get("solo_ids")
         for obj_id, (seen_idx, box) in sorted(state["last_box"].items()):
             if obj_id in prompted_ids:
+                continue
+            if solo is not None and obj_id not in solo:
+                # Late-seed backfill (sam2_tracker.py): during a reverse
+                # backfill pass this loop would otherwise re-seed the WHOLE
+                # live roster across the boundary — wasted compute, and it
+                # would drag every other object's `last_box` backward too.
+                # `solo_ids` confines the chunk to just the backfill targets.
                 continue
             if abs(seed_frame - seen_idx) > SAM3_RESEED_MAX_AGE:
                 continue  # stale: let detector re-prompts recover it
@@ -321,9 +350,12 @@ class Sam3PredictorAdapter:
         # latest observed box before each window so the whole roster rides
         # ``propagation_partial``; stale objects stay with the detector
         # re-prompt recovery path, same rule as the chunk-boundary re-seed.
+        solo = state.get("solo_ids")
         for obj_id, (seen_idx, box) in sorted(state["last_box"].items()):
             if obj_id in chunk["prompted"]:
                 continue
+            if solo is not None and obj_id not in solo:
+                continue  # backfill scoping — see _open_chunk_for
             if not (chunk["lo"] <= seen_idx < chunk["hi"]):
                 continue
             if abs(start_global - seen_idx) > SAM3_RESEED_MAX_AGE:

@@ -230,6 +230,34 @@ MASK_LEAK_CLEANUP = os.environ.get("SAM2_MASK_LEAK_CLEANUP", "0") not in ("0", "
 MASK_LEAK_MAX_FRAC = float(os.environ.get("SAM2_MASK_LEAK_MAX_FRAC", "0.15"))
 MASK_LEAK_GAP_PX = float(os.environ.get("SAM2_MASK_LEAK_GAP_PX", "10"))
 
+# Late-seed backward backfill. YOLO seeds an object only at the prompt frame
+# or a later reprompt boundary; a robot first detected at +6s is forward-only
+# today, so its first ~6s of history is permanently lost even though SAM2/SAM3
+# can propagate backward from the seed frame exactly as well as forward. After
+# the forward tracking loop finishes, each surviving late-seeded object is
+# re-prompted at its OWN seed frame and propagated backward a bounded span;
+# recovered masks are merged into `results` (never overwriting a frame an
+# earlier/original object already occupies). DEFAULT OFF pending A/B.
+LATE_SEED_BACKFILL = os.environ.get(
+    "SAM2_LATE_SEED_BACKFILL", "0") not in ("0", "false", "False")
+# Max frames to propagate backward from an object's seed frame.
+BACKFILL_MAX_FRAMES = int(os.environ.get("SAM2_BACKFILL_MAX_FRAMES", "32"))
+# Minimum lived span (last_visible_frame - first_prompted_frame) required
+# before an object is worth backfilling — a short-lived seed is frequently
+# roster pollution from a static structure (qm12 seed/roster pollution), and
+# spending a reverse propagation pass on it is wasted compute.
+BACKFILL_MIN_LIVED_FRAMES = int(os.environ.get("SAM2_BACKFILL_MIN_LIVED", "8"))
+# Consecutive frames with NO target mask recovered during backward propagation
+# before giving up on the group — the object either didn't exist yet at that
+# point in the video, or backward propagation lost it; stopping early keeps it
+# from latching onto background.
+BACKFILL_DARK_STOP = int(os.environ.get("SAM2_BACKFILL_DARK_STOP", "4"))
+# Max IoS (over smaller) a recovered mask may score against another object's
+# mask already stored in that frame. Above this the "late seed" is most likely
+# a re-detection of an already-tracked robot under a new id — storing it would
+# double-count the same robot in fusion.
+BACKFILL_OVERLAP_IOS = float(os.environ.get("SAM2_BACKFILL_OVERLAP_IOS", "0.5"))
+
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     """Return the tight bounding box of nonzero pixels as (x1, y1, x2, y2).
@@ -1112,6 +1140,9 @@ class Sam2FieldTracker:
         seed_box_max_aspect: float = SEED_BOX_MAX_ASPECT,
         evict_requires_motion: bool = EVICT_REQUIRES_MOTION,
         mask_leak_cleanup: bool = MASK_LEAK_CLEANUP,
+        late_seed_backfill: bool = LATE_SEED_BACKFILL,
+        backfill_max_frames: int = BACKFILL_MAX_FRAMES,
+        backfill_min_lived_frames: int = BACKFILL_MIN_LIVED_FRAMES,
         opening_reprompt_every: int | None = None,
         opening_window_frames: int | None = None,
         seed_gate_fn=None,
@@ -1237,6 +1268,27 @@ class Sam2FieldTracker:
                 The cleaned mask is what gets stored, so downstream
                 IoS/corroboration also use it. Default False (behavior
                 byte-identical) pending re-validation.
+            late_seed_backfill: When True, after the forward tracking loop
+                finishes, each surviving NEW object seeded at a late reprompt
+                boundary (not a dark/sliver/misalign re-anchor, which reuse an
+                existing id) is re-prompted at its own seed frame and
+                propagated BACKWARD up to ``backfill_max_frames``, recovering
+                the history YOLO missed by seeding late. Recovered masks are
+                merged into ``results`` — a frame already holding that object
+                is left untouched, and a recovered mask that heavily overlaps
+                another object's mask already stored in that frame is dropped
+                (see :data:`BACKFILL_OVERLAP_IOS`) rather than double-counting
+                the same robot under two ids. Backward propagation for one
+                object stops early after :data:`BACKFILL_DARK_STOP` consecutive
+                frames with no recovered mask. DEFAULT OFF pending A/B.
+            backfill_max_frames: Max frames to propagate backward from an
+                object's seed frame. ``None``-like knobs resolve to
+                :data:`BACKFILL_MAX_FRAMES`.
+            backfill_min_lived_frames: An object must have lived at least this
+                many frames (``last_visible_frame - first_prompted_frame``)
+                before backfill is attempted — a short-lived seed is
+                frequently roster pollution from a static structure, and
+                backfilling it wastes a reverse propagation pass.
             opening_reprompt_every: qm12 opening-window dense reprompt. When this
                 and ``opening_window_frames`` are both > 0, chunks that START
                 within the first ``opening_window_frames`` of tracking propagate
@@ -1380,6 +1432,11 @@ class Sam2FieldTracker:
         # that gets no partial-claimant hit at a boundary -- consecutiveness
         # is the whole point (a one-boundary flyby must not re-anchor).
         misalign_streak: dict[int, int] = {}
+        # Late-seed backward backfill: (seed_frame, obj_id, box) collected at
+        # the moment each NEW object is seeded (not re-anchored) at a chunk
+        # boundary, so the post-loop backfill phase knows where to re-prompt
+        # and how far it can propagate backward.
+        backfill_requests: list = []
 
         def _box_area(box) -> float:
             return max(0.0, float(box[2]) - float(box[0])) * \
@@ -2475,6 +2532,13 @@ class Sam2FieldTracker:
                                 )
                             if object_metadata is not None:
                                 object_metadata[next_obj_id] = new_metadata[j]
+                            if late_seed_backfill:
+                                # Only a genuinely NEW id qualifies — this site
+                                # is reached only when nothing re-anchored the
+                                # detection under an existing id (every
+                                # re-anchor path above `continue`s before here).
+                                backfill_requests.append(
+                                    (last_idx, next_obj_id, tuple(new_boxes[j])))
                             next_obj_id += 1
 
                         # Consecutiveness: an object with no partial-claimant
@@ -2499,6 +2563,153 @@ class Sam2FieldTracker:
                                 boundary_no, float(int(m.sum())), mb)
 
                     cursor = last_idx + 1
+
+            # ---- Late-seed backward backfill ----
+            # The forward loop is done: every surviving late-seeded object's
+            # full forward life is already in `results`. Re-prompt each one at
+            # its OWN seed frame and propagate backward a bounded span,
+            # recovering the pre-seed history YOLO missed by seeding late.
+            if late_seed_backfill and backfill_requests:
+                # Filter to objects worth the compute: culled objects have
+                # nothing to recover, and a short-lived seed is frequently
+                # roster pollution from a static structure (qm12) rather than
+                # a real robot whose early history is worth chasing.
+                surviving = []
+                for seed_frame, oid, box in backfill_requests:
+                    if oid in culled_set:
+                        continue
+                    lv = last_visible_frame.get(oid)
+                    if lv is None:
+                        continue
+                    if lv - seed_frame < backfill_min_lived_frames:
+                        continue
+                    surviving.append((seed_frame, oid, box))
+
+                # Group by seed frame and walk DESCENDING — minimizes SAM3
+                # reverse-chunk churn (a later seed's reverse span is a subset
+                # of an earlier seed's, so processing late-to-early reuses
+                # freshly-opened chunks instead of reopening them).
+                groups: dict[int, list] = {}
+                for seed_frame, oid, box in surviving:
+                    groups.setdefault(seed_frame, []).append((oid, box))
+
+                total_objects_backfilled = 0
+                total_frames_recovered = 0
+                for seed_frame in sorted(groups, reverse=True):
+                    targets = groups[seed_frame]
+                    target_ids = {oid for oid, _box in targets}
+                    if isinstance(state, dict):
+                        # Adapter scoping (SAM3): confine the reverse pass to
+                        # ONLY these ids so the carried-roster re-seed loops
+                        # don't drag every other live object backward too.
+                        # Harmless for real SAM2 / plain stubs.
+                        state["solo_ids"] = target_ids
+                    for oid, box in targets:
+                        predictor.add_new_points_or_box(
+                            state, frame_idx=seed_frame, obj_id=oid,
+                            box=np.asarray(box, dtype=np.float32))
+
+                    span = min(backfill_max_frames, seed_frame)
+                    per_object_frames = {oid: 0 for oid, _box in targets}
+                    dark_streak = 0
+                    dark_stopped = False
+                    if span > 0:
+                        for out in _propagate(seed_frame, span, reverse=True):
+                            f_idx, obj_ids, mask_logits, *rest = out
+                            tracker_probs = rest[0] if rest else None
+                            f_idx_int = int(f_idx)
+                            bool_arr = (mask_logits > 0).cpu().numpy()
+                            stored_this_frame = False
+                            for i, obj_id in enumerate(obj_ids):
+                                oid_int = int(obj_id)
+                                if oid_int not in target_ids:
+                                    continue  # this group backfills ONLY its own targets
+                                if bool_arr.ndim == 4:
+                                    mask2d = bool_arr[i, 0].astype(bool)
+                                elif bool_arr.ndim == 3:
+                                    mask2d = bool_arr[i].astype(bool)
+                                else:
+                                    mask2d = bool_arr.astype(bool)
+                                if mask_leak_cleanup:
+                                    mask2d = clean_disconnected_leaks(mask2d)
+                                box_rec = mask_to_box(mask2d)
+                                if box_rec is None or not plausible_robot_mask(mask2d):
+                                    continue
+                                entry = results.setdefault(f_idx_int, {})
+                                if oid_int in entry:
+                                    continue  # merge, never clobber — already tracked
+                                # Overlap guard: a recovered mask that heavily
+                                # overlaps another object's mask ALREADY in this
+                                # frame is most likely a re-detection of an
+                                # already-tracked robot under this new id —
+                                # storing it would double-count the robot.
+                                overlaps_other = any(
+                                    _ios(mask2d, other["mask"]) > BACKFILL_OVERLAP_IOS
+                                    for other_oid, other in entry.items()
+                                    if other_oid != oid_int
+                                )
+                                if overlaps_other:
+                                    continue
+                                entry[oid_int] = {
+                                    "box": box_rec,
+                                    "mask": mask2d,
+                                    "evidence": {
+                                        "type": "backfilled",
+                                        "gap_len": 0,
+                                        "detector_overlap": birth_detector_overlap.get(
+                                            oid_int, 0.0),
+                                        "tracker_prob": (
+                                            float(tracker_probs[i])
+                                            if tracker_probs is not None
+                                            and i < len(tracker_probs)
+                                            else None
+                                        ),
+                                    },
+                                }
+                                per_object_frames[oid_int] += 1
+                                total_frames_recovered += 1
+                                stored_this_frame = True
+                            if stored_this_frame:
+                                dark_streak = 0
+                            else:
+                                dark_streak += 1
+                                if dark_streak >= BACKFILL_DARK_STOP:
+                                    dark_stopped = True
+                                    break
+                            # Cooperative stop, same contract as the other loops.
+                            if should_stop is not None and should_stop():
+                                raise TrackStopped()
+
+                    if isinstance(state, dict):
+                        state["solo_ids"] = None
+
+                    if dark_stopped:
+                        stop_reason = "dark"
+                    elif seed_frame - span <= 0:
+                        stop_reason = "video_start"
+                    else:
+                        stop_reason = "span"
+                    for oid, _box in targets:
+                        n = per_object_frames.get(oid, 0)
+                        if diagnostics:
+                            diagnostics.record(
+                                f"{self.DIAG_PREFIX}.backfill",
+                                details={
+                                    "object_id": oid,
+                                    "seed_frame": seed_frame,
+                                    "frames_recovered": n,
+                                    "stop_reason": stop_reason,
+                                },
+                            )
+                        if n > 0:
+                            total_objects_backfilled += 1
+                            if diagnostics:
+                                diagnostics.increment(
+                                    f"{self.DIAG_PREFIX}_backfilled_objects")
+
+                print(f"  [{self.LOG_TAG}] late-seed backfill: "
+                      f"{total_objects_backfilled} objects, "
+                      f"{total_frames_recovered} frames recovered")
         finally:
             if hasattr(predictor, "reset_state"):
                 predictor.reset_state(state)

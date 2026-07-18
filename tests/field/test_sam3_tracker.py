@@ -487,3 +487,69 @@ def test_sam3_tracker_should_stop_none_is_default_full_run(tmp_path):
         prompt_boxes=[(3, 2, 8, 6)],
     )
     assert set(results.keys()) == {0, 1, 2, 3}
+
+
+# ---------------------------------------------------------------------------
+# Late-seed backward backfill scoping (state["solo_ids"])
+# ---------------------------------------------------------------------------
+
+def test_solo_ids_scopes_stream_chunk_window_refresh(tmp_path):
+    """Late-seed backfill scoping: with state['solo_ids'] set, _stream_chunk's
+    per-window roster refresh re-prompts ONLY the target ids — otherwise a
+    reverse backfill pass would drag every other live object along too
+    (wasted compute, and a regression of their last_box to the backfill's own
+    reverse timeline)."""
+    _write_frames(tmp_path, 24)
+    raw = ActionHistoryStubPredictor()
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=64)
+    state = adapter.init_state(video_path=str(tmp_path))
+    adapter.add_new_points_or_box(
+        state, frame_idx=0, obj_id=1, box=np.array([1, 1, 5, 5], np.float32)
+    )
+    adapter.add_new_points_or_box(
+        state, frame_idx=0, obj_id=2, box=np.array([4, 2, 9, 6], np.float32)
+    )
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=7))
+
+    # Without solo_ids the next window would refresh BOTH live objects (as
+    # test_sam3_adapter_keeps_roster_alive_across_windowed_propagates shows).
+    # Scope this window to obj 1 only.
+    state["solo_ids"] = {1}
+    raw.requests.clear()
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=8,
+                                         max_frame_num_to_track=7))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert {p["obj_id"] for p in prompts} == {1}, (
+        "solo_ids must confine the window refresh to the backfill target")
+    assert all(set(ids.tolist()) == {1} for _, ids, *_ in w2)
+    adapter.reset_state(state)
+
+
+def test_solo_ids_scopes_open_chunk_for_boundary_reseed(tmp_path):
+    """Same scoping contract at the chunk-boundary re-seed (_open_chunk_for):
+    solo_ids must exclude a carried object even when its last_box is fresh
+    enough to normally qualify for a boundary re-seed."""
+    _write_frames(tmp_path, 6)
+    raw = StubSam3Predictor()
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=16)
+    state = adapter.init_state(video_path=str(tmp_path))
+    adapter.add_new_points_or_box(
+        state, frame_idx=0, obj_id=3, box=np.array([2, 2, 6, 6], np.float32)
+    )
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=5))
+    # state["last_box"] now holds obj 3 (its prompt) and obj 7 (the stub's
+    # streamed mask) — same setup as
+    # test_sam3_adapter_reseeds_across_chunk_boundary, which (without
+    # solo_ids) re-seeds both under their SAME ids at the next boundary.
+    adapter._close_chunk(state)
+    raw.requests.clear()
+    state["solo_ids"] = {3}
+    list(adapter.propagate_in_video(state, start_frame_idx=2,
+                                    max_frame_num_to_track=3))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert prompts, "expected a boundary re-seed prompt"
+    assert {p["obj_id"] for p in prompts} == {3}, (
+        "solo_ids must exclude obj 7 from the boundary re-seed")
+    adapter.reset_state(state)

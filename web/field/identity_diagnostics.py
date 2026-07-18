@@ -26,6 +26,7 @@ class DiagnosticEvents:
     SAM2_DETECTOR_ERROR = "sam2.detector_error"
     SAM2_COLOR_BACKFILLED = "sam2.color_backfilled"
     SAM2_EVICTION_SKIPPED = "sam2.eviction_skipped"
+    SAM2_BACKFILL = "sam2.backfill"
 
     # Fusion
     FUSION_ASSIGNMENT = "fusion.assignment"

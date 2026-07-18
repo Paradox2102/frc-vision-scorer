@@ -3431,3 +3431,260 @@ def test_misalign_reanchor_disabled_by_default_is_inert():
     baseline = run()
     explicit_off = run(misalign_reanchor=False)
     assert baseline == explicit_off
+
+
+# ---------------------------------------------------------------------------
+# Late-seed backward backfill
+# ---------------------------------------------------------------------------
+
+class BackfillStubPredictor:
+    """Stub supporting both the forward chunked-reprompt loop (like
+    RepromptStubPredictor) and a fully-controllable reverse pass, for testing
+    late_seed_backfill. Object ``oid``'s FORWARD mask is the static rect
+    ``rects[oid]``. Its REVERSE-pass visibility is explicit per frame via
+    ``back_visible`` ({oid: set(frame_idx)}) — any frame not in that set
+    yields no mask for that object when propagating backward, modeling a
+    tracker that has lost (or never had) the object at that point. ``back_rects``
+    optionally overrides the mask placed at a specific (oid, frame) during the
+    reverse pass, independent of the object's normal forward rect — used to
+    plant a recovered mask on top of another object's mask (overlap-guard test).
+    """
+
+    H = 20
+    W = 60
+
+    def __init__(self, rects, back_visible=None, back_rects=None, num_frames=12):
+        self._rects = rects
+        self._back_visible = back_visible or {}
+        self._back_rects = back_rects or {}
+        self.NUM_FRAMES = num_frames
+        self.add_calls: list[tuple[int, int]] = []
+
+    def init_state(self, video_path: str, **kwargs) -> dict:
+        return {"objs": {}}
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box=None) -> None:
+        state["objs"][obj_id] = frame_idx
+        self.add_calls.append((frame_idx, obj_id))
+
+    def propagate_in_video(self, state, start_frame_idx=None,
+                           max_frame_num_to_track=None, reverse=False):
+        start = 0 if start_frame_idx is None else start_frame_idx
+        if reverse:
+            span = start if max_frame_num_to_track is None else max_frame_num_to_track
+            end = max(0, start - span)
+            frame_range = range(start, end - 1, -1)
+            for f in frame_range:
+                active = [oid for oid in sorted(state["objs"])
+                         if f in self._back_visible.get(oid, ())]
+                rects = [self._back_rects.get((oid, f), self._rects[oid])
+                        for oid in active]
+                yield f, active, _make_mask_array(self.H, self.W, rects)
+        else:
+            end = (self.NUM_FRAMES - 1 if max_frame_num_to_track is None
+                  else min(start + max_frame_num_to_track, self.NUM_FRAMES - 1))
+            for f in range(start, end + 1):
+                active = sorted(oid for oid, af in state["objs"].items() if af <= f)
+                rects = [self._rects[oid] for oid in active]
+                yield f, active, _make_mask_array(self.H, self.W, rects)
+
+    def reset_state(self, state) -> None:
+        pass
+
+
+def test_late_seed_backfill_default_off_no_early_frames():
+    """Without late_seed_backfill, a late-seeded object has no history before
+    the boundary it was seeded at — the pre-existing forward-only behavior is
+    byte-identical."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    stub = RepromptStubPredictor()
+    tracker = Sam2FieldTracker(predictor=stub)
+    overlap_box = stub._rect_for(1)
+    new_box = stub._rect_for(3)
+
+    def detect_fn(local_idx, frame_path):
+        return [(overlap_box, "blue"), (new_box, "red")]
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn, max_objects=6,
+    )
+    # Object 3 is seeded at the boundary (frame 2); default OFF means no
+    # backward recovery — it must be absent from every earlier frame.
+    assert 3 not in result[0]
+    assert 3 not in result[1]
+    assert 3 in result[3]
+
+
+def test_late_seed_backfill_recovers_pre_seed_history_without_clobbering():
+    """ON: masks appear before the seed frame with evidence type
+    'backfilled', and pre-existing objects' entries in those same frames are
+    left untouched (merge, never clobber)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
+    back_visible = {3: {0, 1, 2, 3, 4}}
+    stub = BackfillStubPredictor(rects, back_visible, num_frames=8)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 4:
+            return [(rects[3], "red")]
+        return []
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[rects[1], rects[2]], reprompt_every=4,
+        detect_fn=detect_fn, late_seed_backfill=True,
+        backfill_max_frames=8, backfill_min_lived_frames=1,
+    )
+    # Forward: seeded at the frame-4 boundary; frame 4 itself was already
+    # recorded by the chunk that ended there BEFORE the reprompt ran (the
+    # existing chunked-reprompt timing), so obj 3's first FORWARD sighting is
+    # frame 5.
+    assert result[5][3]["evidence"]["type"] == "reprompted_new_id"
+    # Backfill recovered frames 0-4 (the reverse pass starts AT the seed
+    # frame, so it fills the "seam" frame the forward chunk missed too).
+    for f in range(5):
+        assert 3 in result[f], f"expected backfilled object 3 at frame {f}"
+        assert result[f][3]["evidence"]["type"] == "backfilled"
+    # Pre-existing objects 1 and 2 are UNTOUCHED at a frame backfill wrote
+    # into — a clobbering bug would have replaced frame 0's whole entry with
+    # just {3: ...}.
+    assert set(result[0].keys()) == {1, 2, 3}
+
+
+def test_late_seed_backfill_stops_at_dark_streak():
+    """Backward propagation gives up after BACKFILL_DARK_STOP consecutive
+    frames with no recovered mask, even though an earlier frame in the
+    requested span could (per the stub) still produce one."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (40, 2, 45, 7)}
+    # Visible at the seed frame (8) and one before (7); dark for the next 4
+    # (6,5,4,3) — exactly BACKFILL_DARK_STOP — so the pass must give up
+    # before reaching frame 1, even though frame 1 is (per the stub) visible.
+    back_visible = {3: {8, 7, 1}}
+    stub = BackfillStubPredictor(rects, back_visible, num_frames=14)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 8:
+            return [(rects[3], "red")]
+        return []
+
+    diag = _ident_diag()
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[rects[1], rects[2]], reprompt_every=8,
+        detect_fn=detect_fn, late_seed_backfill=True,
+        backfill_max_frames=8, backfill_min_lived_frames=1,
+        diagnostics=diag,
+    )
+    assert 3 in result[8] and 3 in result[7]
+    for f in (6, 5, 4, 3, 2, 1, 0):
+        assert 3 not in result.get(f, {}), (
+            f"backfill must have stopped before reaching frame {f}")
+    backfill_events = [e for e in diag._events if e.get("event") == "sam2.backfill"]
+    ev = next(e for e in backfill_events if e["details"]["object_id"] == 3)
+    assert ev["details"]["stop_reason"] == "dark"
+    assert ev["details"]["frames_recovered"] == 2
+
+
+def test_late_seed_backfill_skips_short_lived_object():
+    """An object whose lived span (last_visible - first_prompted) is below
+    backfill_min_lived_frames is never backfilled — short-lived seeds are
+    frequently roster pollution from a static structure (qm12)."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
+    back_visible = {3: {0, 1, 2, 3, 4}}   # fully recoverable per the stub
+    stub = BackfillStubPredictor(rects, back_visible, num_frames=8)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 4:
+            return [(rects[3], "red")]
+        return []
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[rects[1], rects[2]], reprompt_every=4,
+        detect_fn=detect_fn, late_seed_backfill=True,
+        backfill_max_frames=8, backfill_min_lived_frames=100,  # unreachable
+    )
+    for f in range(5):
+        assert 3 not in result[f], (
+            f"short-lived object 3 must not be backfilled (frame {f})")
+
+
+def test_late_seed_backfill_skips_culled_object():
+    """A late-seeded object that gets spontaneously culled before the forward
+    loop ends is never backfilled — there is no history worth recovering for
+    a hijacked/junk track, and it must not even reach the reverse-propagate
+    call (CullStubPredictor.propagate_in_video doesn't accept ``reverse=``, so
+    reaching it for this object would raise instead of silently no-op'ing)."""
+    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+
+    stub = CullStubPredictor()
+    new_box = (150, 2, 154, 6)  # unmatched -> seeds a NEW object (id 3)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 2:
+            return [stub._rect_for(1), stub._rect_for(2), new_box]
+        return [stub._rect_for(1), stub._rect_for(2)]  # obj 3 never re-corroborated
+
+    diag = _ident_diag()
+    tracker = Sam2FieldTracker(predictor=stub)
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2, detect_fn=detect_fn,
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5, project_fn=lambda box: bottom_center(box),
+        diagnostics=diag,
+        late_seed_backfill=True, backfill_max_frames=8, backfill_min_lived_frames=1,
+    )
+    assert 3 in _culled_ids(diag), "test setup expected object 3 to be culled"
+    # The backfill phase must have skipped it entirely — no backfill
+    # diagnostic for object 3, and (since the stub would TypeError on a
+    # reverse= propagate call) no crash either.
+    backfill_events = [e for e in diag._events if e.get("event") == "sam2.backfill"]
+    assert all(e["details"]["object_id"] != 3 for e in backfill_events)
+
+
+def test_late_seed_backfill_overlap_guard_drops_double_counted_mask():
+    """A recovered mask that heavily overlaps another object's mask ALREADY
+    stored in that frame is dropped — it is most likely a re-detection of the
+    already-tracked robot under a new id, and storing it would double-count
+    the same robot in fusion."""
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
+    back_visible = {3: {0, 1, 2, 3, 4}}
+    # At frame 1 (only), the "recovered" mask for object 3 is placed directly
+    # on top of object 1's mask (full overlap, IoS 1.0 > BACKFILL_OVERLAP_IOS).
+    back_rects = {(3, 1): rects[1]}
+    stub = BackfillStubPredictor(rects, back_visible, back_rects, num_frames=8)
+    tracker = Sam2FieldTracker(predictor=stub)
+
+    def detect_fn(local_idx, frame_path):
+        if local_idx == 4:
+            return [(rects[3], "red")]
+        return []
+
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[rects[1], rects[2]], reprompt_every=4,
+        detect_fn=detect_fn, late_seed_backfill=True,
+        backfill_max_frames=8, backfill_min_lived_frames=1,
+    )
+    # Frame 1: object 3's recovered mask collided with object 1's -> dropped.
+    assert 3 not in result[1]
+    assert 1 in result[1]  # object 1's own entry is untouched
+    # Every OTHER backfilled frame (no overlap there) still recovers obj 3.
+    for f in (0, 2, 3, 4):
+        assert 3 in result[f], f"expected object 3 recovered at frame {f}"

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from web.app import InferenceJob
 
@@ -56,3 +57,34 @@ def test_websocket_failure_is_detached_and_not_raised():
         assert await job._send_ws({"type": "complete"}) is False
 
     asyncio.run(run())
+
+
+class HangingWebSocket:
+    """send_json awaits forever — a stalled transport. uvicorn's ws send can
+    await indefinitely on one, even after the client disconnects."""
+
+    async def send_json(self, payload):
+        await asyncio.Event().wait()  # never resolves
+
+
+def test_websocket_send_timeout_detaches_socket(monkeypatch):
+    """A send exceeding WS_SEND_TIMEOUT gets the transport-failure treatment
+    (return False, socket detached) instead of wedging the sender forever —
+    the root of the 60+ minute job-completion hang."""
+    import web.app as app_module
+    monkeypatch.setattr(app_module, "WS_SEND_TIMEOUT", 0.05)
+
+    async def run():
+        job = _job_with_websocket(HangingWebSocket())
+        t0 = time.perf_counter()
+        ok = await job._send_ws({"type": "complete"})
+        elapsed = time.perf_counter() - t0
+        return ok, elapsed, job
+
+    ok, elapsed, job = asyncio.run(run())
+    assert ok is False
+    assert job.websocket is None       # detached like a transport failure
+    assert elapsed < 1.0, f"send blocked for {elapsed:.2f}s past the bound"
+    # wait_for cancelled the underlying send, so the send lock is free again
+    # for other senders (a still-held lock would wedge every later send).
+    assert not job._websocket_send_lock.locked()

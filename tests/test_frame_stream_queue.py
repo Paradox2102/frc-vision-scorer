@@ -156,3 +156,60 @@ def test_sender_delivers_then_stops_cleanly():
     ws, job = asyncio.run(run())
     assert [m["frame_num"] for m in ws.messages] == [7]
     assert job._frame_sender_task is None
+
+
+class WedgedWebSocket:
+    """Every send awaits forever — a stalled transport. uvicorn's ws send can
+    await indefinitely on one, even after the client disconnects."""
+
+    async def send_json(self, payload):
+        await asyncio.Event().wait()  # never resolves
+
+
+def test_stop_ws_senders_bounded_when_sender_wedged(monkeypatch):
+    """Completion must never hang on a sender wedged inside a stalled send.
+    Observed live: a finished job blocked 60+ minutes in the drain's put()
+    on a full maxsize-1 queue — status already "completed", `complete` never
+    sent, replay row never saved. The bounded send times out (detaching the
+    socket so the backlog short-circuits), the sentinel lands, drain returns."""
+    import web.app as app_module
+    monkeypatch.setattr(app_module, "WS_SEND_TIMEOUT", 0.05)
+    monkeypatch.setattr(app_module, "WS_STOP_GRACE", 0.2)
+
+    async def run():
+        job = _make_job(WedgedWebSocket())
+        job._enqueue_frame_payload({"type": "frame", "frame_num": 0})
+        await asyncio.sleep(0.02)  # sender picks up frame 0, wedges in send
+        # A second payload keeps the maxsize-1 queue FULL at stop time — the
+        # exact shape of the production hang (unbounded put blocked forever).
+        job._enqueue_frame_payload({"type": "frame", "frame_num": 1})
+        t0 = time.perf_counter()
+        await job._stop_ws_senders(drain=True)
+        return time.perf_counter() - t0, job
+
+    elapsed, job = asyncio.run(run())
+    assert elapsed < 2.0, f"completion drain hung for {elapsed:.2f}s"
+    assert job.websocket is None  # the timed-out send detached the socket
+    assert job._frame_sender_task is None
+
+
+def test_stop_ws_senders_healthy_drain_keeps_ordering(monkeypatch):
+    """Bounding the drain must not turn it into a data race: a healthy (just
+    slow-ish) transport still receives BOTH the in-flight and the queued
+    payload, in order, before the drain returns — the sentinel lands behind
+    the pending payload."""
+    import web.app as app_module
+    monkeypatch.setattr(app_module, "WS_SEND_TIMEOUT", 5.0)
+    monkeypatch.setattr(app_module, "WS_STOP_GRACE", 5.0)
+
+    async def run():
+        ws = RecordingWebSocket(delay=0.05)
+        job = _make_job(ws)
+        job._enqueue_frame_payload({"type": "frame", "frame_num": 0})
+        await asyncio.sleep(0.01)  # sender in flight on frame 0
+        job._enqueue_frame_payload({"type": "frame", "frame_num": 1})  # queue full
+        await job._stop_ws_senders(drain=True)
+        return ws
+
+    ws = asyncio.run(run())
+    assert [m["frame_num"] for m in ws.messages] == [0, 1]

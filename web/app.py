@@ -375,6 +375,16 @@ VLM_GUIDED_JSON = os.environ.get("VLM_GUIDED_JSON", "1") not in ("0", "false", "
 # inference loop. The replay recorder keeps its own full-rate copy.
 FRAME_STREAM_INTERVAL_SEC = float(os.environ.get("FRAME_STREAM_INTERVAL_SEC", "0.1"))
 FRAME_STREAM_JPEG_QUALITY = int(os.environ.get("FRAME_STREAM_JPEG_QUALITY", "70"))
+# Upper bound on any single websocket send. uvicorn's ws send can await
+# indefinitely on a stalled transport — even across a client disconnect —
+# which left a finished job wedged in its completion drain for 60+ minutes
+# (status already "completed", `complete` never sent, replay never saved).
+# On timeout the socket is treated as failed, same as a transport error.
+WS_SEND_TIMEOUT = float(os.environ.get("WS_SEND_TIMEOUT", "30"))
+# Scheduling slack over WS_SEND_TIMEOUT when the completion drain waits for a
+# sender task: at most ONE in-flight send resolves at the timeout (it detaches
+# the socket, so every queued payload behind it short-circuits on None).
+WS_STOP_GRACE = float(os.environ.get("WS_STOP_GRACE", "5"))
 # Never schedule a read for a slot whose bumper is occluded in EVERY camera.
 VLM_OCCLUSION_GATE = os.environ.get("VLM_OCCLUSION_GATE", "1") not in ("0", "false", "False")
 AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
@@ -3145,12 +3155,39 @@ class InferenceJob:
         pending = {k: t for k, t in tasks.items() if t is not None and not t.done()}
         for kind, task in pending.items():
             if drain:
-                await queues[kind].put(None)  # blocks until backlog is consumed
+                # Hand off the stop sentinel WITHOUT ever blocking completion
+                # forever: an unbounded put() on these maxsize-1 queues wedged
+                # a finished job for 60+ minutes when its sender was stuck
+                # inside a stalled send. Fast path first; a full queue means
+                # the sender is mid-send (or not yet scheduled), so give it
+                # one bounded-send window (bounded _send_ws frees the slot
+                # within WS_SEND_TIMEOUT) — the sentinel still lands BEHIND
+                # any pending payload, preserving drain-before-complete
+                # ordering for healthy senders — then give up and cancel.
+                try:
+                    queues[kind].put_nowait(None)
+                except asyncio.QueueFull:
+                    try:
+                        await asyncio.wait_for(
+                            queues[kind].put(None),
+                            timeout=WS_SEND_TIMEOUT + WS_STOP_GRACE)
+                    except asyncio.TimeoutError:
+                        task.cancel()
             else:
                 task.cancel()
         for task in pending.values():
             try:
-                await task
+                # Bounded for the same reason: at most one in-flight send
+                # resolves at WS_SEND_TIMEOUT (detaching the socket, so the
+                # rest of the backlog short-circuits); a task still alive
+                # past that is wedged — cancel it rather than hang the job.
+                await asyncio.wait_for(task, timeout=WS_SEND_TIMEOUT + WS_STOP_GRACE)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 pass
         diag_drops = getattr(self, "_ws_drop_counts", {}).get("diag", 0)
@@ -3189,8 +3226,23 @@ class InferenceJob:
             async with self._websocket_send_lock:
                 if self.websocket is not websocket:
                     return False
-                await websocket.send_json(payload)
+                # Bounded: uvicorn's send can await forever on a stalled
+                # transport (even after the client disconnects), wedging any
+                # sender under the send lock. wait_for CANCELS the underlying
+                # send on timeout, which also releases the send lock for the
+                # other senders; the socket is treated as failed below.
+                await asyncio.wait_for(
+                    websocket.send_json(payload), timeout=WS_SEND_TIMEOUT)
             return True
+        except asyncio.TimeoutError:
+            # Same treatment as a transport failure: a send that can't finish
+            # within the bound is a dead/stalled socket, not a slow client
+            # (queue shedding already absorbs slow-client backpressure).
+            if self.websocket is websocket:
+                self.websocket = None
+            print(f"  WebSocket send timed out after {WS_SEND_TIMEOUT}s; "
+                  f"detaching socket")
+            return False
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             if self.websocket is websocket:
                 self.websocket = None

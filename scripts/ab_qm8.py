@@ -28,6 +28,11 @@ MATCH = 8
 RESULTS = Path("/tmp/frc-ab-qm8.json")
 
 TRACKER_SIDE = {"merge_main_guard": True, "sticky_max_dist_m": 2.5}
+# Validated qm11 sprint recipe (meanNN 1.105->0.738): seed at the auto-period
+# open, motion override + motion-gated low-conf admission, whole-robot union
+# seed extents. Shared by the endgame profiles and the backfill A/B below.
+SPRINT = {"sam2_prompt_offset_seconds": 0.0, "motion_override": True,
+          "motion_gated_conf": True, "seed_union_extent": True}
 PROFILES = {
     "full": [
         ("baseline", {}),
@@ -158,20 +163,14 @@ PROFILES = {
     # motion_override promotes; the stack frees the seats clutter holds.
     # Single sprint+stack run (vote-fix validation etc.).
     "endgame-stack": [
-        ("sprint+stack", {"sam2_prompt_offset_seconds": 0.0,
-                          "motion_override": True, "motion_gated_conf": True,
-                          "seed_union_extent": True,
+        ("sprint+stack", {**SPRINT,
                           "zone_blind_corroboration": True,
                           "cull_hijack_enabled": True,
                           "person_veto_enabled": True}),
     ],
     "endgame": [
-        ("sprint", {"sam2_prompt_offset_seconds": 0.0,
-                    "motion_override": True, "motion_gated_conf": True,
-                    "seed_union_extent": True}),
-        ("sprint+stack", {"sam2_prompt_offset_seconds": 0.0,
-                          "motion_override": True, "motion_gated_conf": True,
-                          "seed_union_extent": True,
+        ("sprint", SPRINT),
+        ("sprint+stack", {**SPRINT,
                           "zone_blind_corroboration": True,
                           "cull_hijack_enabled": True,
                           "person_veto_enabled": True}),
@@ -311,6 +310,18 @@ PROFILES = {
     "full-evict":   [("evict-prob",   {"auto_period_only": False, "evict_prob_immune": 0.8})],
     "full-vote":    [("vote-prob",    {"auto_period_only": False, "vote_prob_weight": True})],
     "full-detgate": [("det-gated",    {"auto_period_only": False, "det_gated_vlm_reads": True})],
+    # late_seed_backfill A/B (qm11): recovers the pre-seed history of a robot
+    # first detected at a late reprompt boundary by bounded reverse propagation
+    # at end of track. Runs on the sprint recipe — with plain defaults the
+    # sprinting robot never seeds late, leaving backfill inert. Expect per-team
+    # auto coverage gains for late-seeded teams; meanNN should not regress.
+    # Two repeats per arm to gauge the known run-to-run nondeterminism.
+    "backfill": [
+        ("sprint", SPRINT),
+        ("sprint+backfill", {**SPRINT, "late_seed_backfill": True}),
+        ("sprint-b", SPRINT),
+        ("sprint+backfill-b", {**SPRINT, "late_seed_backfill": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

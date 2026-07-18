@@ -170,8 +170,15 @@ class Sam3PredictorAdapter:
         box = tuple(float(v) for v in box)
         # Only label-0 (negative) extras are meaningful here; positive points
         # would fight the box corners the adapter already sends as labels 2,3.
+        # points/labels arrive as ndarrays from _prompt_with_negatives (the
+        # real SAM2 predictor takes them natively); `x or []` on a
+        # multi-element ndarray raises "truth value ... is ambiguous", which
+        # killed a whole view's tracking once neg_point_prompts defaulted on —
+        # so gate on None explicitly.
+        pts = [] if points is None else points
+        lbls = [] if labels is None else labels
         neg = [tuple(float(v) for v in p)
-               for p, l in zip(points or [], labels or []) if int(l) == 0]
+               for p, l in zip(pts, lbls) if int(l) == 0]
         state["last_box"][int(obj_id)] = (int(frame_idx), box)
         chunk = state["chunk"]
         if chunk is not None and chunk["lo"] <= frame_idx < chunk["hi"]:

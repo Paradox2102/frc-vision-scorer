@@ -280,6 +280,43 @@ def test_add_prompt_forwards_negative_points_as_label_zero(tmp_path):
     ]
 
 
+def test_add_prompt_accepts_ndarray_points_and_labels(tmp_path):
+    """_prompt_with_negatives (sam2_tracker) passes points/labels as ndarrays,
+    which the real SAM2 predictor takes natively. The adapter's old
+    ``points or []`` raised "truth value of an array ... is ambiguous" on any
+    multi-element ndarray — with neg_point_prompts default-ON that killed a
+    whole view's tracking (qm11 corner_right)."""
+    _write_frames(tmp_path, 5)
+    raw = StubSam3Predictor()
+    adapter = Sam3PredictorAdapter(raw)
+    state = adapter.init_state(video_path=str(tmp_path))
+
+    # Exactly what _prompt_with_negatives sends: float32 (N,2) points and an
+    # int32 zeros label vector. Must not raise.
+    adapter.add_new_points_or_box(
+        state,
+        frame_idx=0,
+        obj_id=1,
+        box=(10, 10, 20, 20),
+        points=np.asarray([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32),
+        labels=np.zeros(2, dtype=np.int32),
+    )
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=0))
+    adapter.reset_state(state)
+
+    req = next(r for r in raw.requests if r["type"] == "add_prompt")
+    width, height = state["video_size"]
+    # Both negatives ride along after the box corners (labels 2,3 then 0,0).
+    assert req["point_labels"] == [2, 3, 0, 0]
+    assert req["points"] == [
+        [10 / width, 10 / height],
+        [20 / width, 20 / height],
+        [10.0 / width, 20.0 / height],
+        [30.0 / width, 40.0 / height],
+    ]
+
+
 def test_add_prompt_ignores_positive_label_points(tmp_path):
     _write_frames(tmp_path, 5)
     raw = StubSam3Predictor()

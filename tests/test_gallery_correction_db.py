@@ -66,3 +66,51 @@ def test_gallery_migration_adds_columns_to_old_table(tmp_path, monkeypatch):
         "event_key": "e", "team": "9", "alliance_color": "red",
         "embedding": _b(0, 1, 0), "legibility": 0.5, "image": b"i", "verified": 1}))
     assert asyncio.run(database.get_gallery_exemplars("e"))[0]["verified"] == 1
+
+
+def test_gallery_migration_backfills_embed_model_on_preexisting_rows(tmp_path, monkeypatch):
+    # Rows written by an old schema (no embed_model column at all) predate
+    # this feature and were all embedded with dinov2-small, the only backend
+    # that ever ran; init_db() must both ALTER-add the column and backfill
+    # those rows rather than leaving them NULL.
+    import sqlite3
+    dbfile = tmp_path / "old_embed_model.db"
+    con = sqlite3.connect(dbfile)
+    con.execute("CREATE TABLE appearance_gallery (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "event_key TEXT, team TEXT, alliance_color TEXT, embedding BLOB, legibility REAL, "
+                "created_at TEXT)")
+    con.execute(
+        "INSERT INTO appearance_gallery (event_key, team, alliance_color, embedding, legibility) "
+        "VALUES ('e', '9', 'red', ?, 0.5)", (_b(0, 1, 0),))
+    con.commit(); con.close()
+
+    monkeypatch.setattr(database, "DB_PATH", dbfile)
+    asyncio.run(database.init_db())
+
+    con = sqlite3.connect(dbfile)
+    row = con.execute("SELECT embed_model FROM appearance_gallery WHERE team = '9'").fetchone()
+    con.close()
+    assert row[0] == "facebook/dinov2-small"
+
+
+def test_match_robot_crop_migration_adds_embed_model_column(tmp_path, monkeypatch):
+    # match_robot_crop predates embed_model too; init_db() must ALTER-add it
+    # without error even on a table that already has the identity_id schema
+    # (so the rename/rebuild migration in _migrate_identity_tables is a no-op).
+    import sqlite3
+    dbfile = tmp_path / "old_crop.db"
+    con = sqlite3.connect(dbfile)
+    con.execute("CREATE TABLE match_robot_crop (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "job_id TEXT NOT NULL, identity_id INTEGER NOT NULL, legibility REAL, "
+                "embedding BLOB, image BLOB)")
+    con.execute(
+        "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding) "
+        "VALUES ('job1', 0, 0.9, ?)", (_b(1, 0, 0),))
+    con.commit(); con.close()
+
+    monkeypatch.setattr(database, "DB_PATH", dbfile)
+    asyncio.run(database.init_db())
+
+    crops = asyncio.run(database.get_match_crops("job1", 0))
+    assert len(crops) == 1
+    assert crops[0]["embed_model"] == "facebook/dinov2-small"  # backfilled

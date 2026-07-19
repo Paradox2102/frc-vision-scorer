@@ -1994,6 +1994,9 @@ class InferenceJob:
             "image": image_bytes,
             "verified": 0,
             "job_id": self.job_id,
+            # Tag with the model that actually produced this vector, so a later
+            # switch to a different embedder can't cosine-compare across spaces.
+            "embed_model": getattr(getattr(self, "robot_embedder", None), "model_name", None),
         })
 
     def _record_frame_evidence(self, fused, frame_num, main_person_boxes):
@@ -7650,12 +7653,18 @@ class InferenceJob:
                         "confidence": (crops[0]["quality"] if crops else None),
                     })
                     for c in crops:
+                        has_embedding = c["embedding"] is not None
                         crop_rows.append({
                             "job_id": self.job_id, "identity_id": identity_id,
                             "legibility": c["quality"],
-                            "embedding": (None if c["embedding"] is None
-                                          else np.asarray(c["embedding"], dtype=np.float32).tobytes()),
+                            "embedding": (np.asarray(c["embedding"], dtype=np.float32).tobytes()
+                                          if has_embedding else None),
                             "image": _thumbnail_bytes(c.get("robot_crop_b64") or c["crop_b64"]),
+                            # Tag with the model that produced this vector (None
+                            # alongside a None embedding — nothing to mismatch).
+                            "embed_model": (getattr(getattr(self, "robot_embedder", None),
+                                                     "model_name", None)
+                                            if has_embedding else None),
                         })
                 await database.upsert_match_robot_identities(identity_rows)
                 await database.insert_match_robot_crops(crop_rows)
@@ -10628,7 +10637,10 @@ async def correct_replay_identity(job_id: str, request: Request):
                     "source_match_key": replay.get("match_key"),
                     "team": team, "alliance_color": color,
                     "embedding": c["embedding"], "legibility": c["legibility"],
-                    "image": c["image"], "verified": 1, "job_id": job_id})
+                    "image": c["image"], "verified": 1, "job_id": job_id,
+                    # Carry the crop's own embed_model forward — it may have
+                    # been captured by an older model than the current job.
+                    "embed_model": c["embed_model"]})
                 minted += 1
     return {"status": "ok", "slot": resolved_slot if resolved_slot is not None else -1,
             "identity_id": resolved_identity_id, "team_number": team,

@@ -7,7 +7,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
+from web.embedder import ACTIVE_MODEL, DEFAULT_MODEL
+
 DB_PATH = Path(__file__).parent.parent / "frc_scorer.db"
+
+# Every row written before this feature shipped was embedded with dinov2-small;
+# NULL embed_model (pre-migration rows, or a row some other path forgot to
+# stamp) is treated as that model rather than as "unknown".
+_LEGACY_EMBED_MODEL = DEFAULT_MODEL
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -108,6 +115,7 @@ CREATE TABLE IF NOT EXISTS appearance_gallery (
     image BLOB,
     verified INTEGER DEFAULT 0,
     job_id TEXT,
+    embed_model TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_gallery_event ON appearance_gallery(event_key, alliance_color);
@@ -140,7 +148,8 @@ CREATE TABLE IF NOT EXISTS match_robot_crop (
     identity_id INTEGER NOT NULL,
     legibility REAL,
     embedding BLOB,
-    image BLOB
+    image BLOB,
+    embed_model TEXT
 );
 """
 
@@ -223,12 +232,29 @@ async def init_db():
             "verified INTEGER DEFAULT 0",
             "job_id TEXT",
             "source_match_key TEXT",
+            "embed_model TEXT",
         ):
             try:
                 await db.execute(f"ALTER TABLE appearance_gallery ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
         await _migrate_identity_tables(db)
+        # match_robot_crop may have just been rebuilt (above) by an older-schema
+        # rename/recreate that predates embed_model; add it post-hoc too.
+        for col_def in ("embed_model TEXT",):
+            try:
+                await db.execute(f"ALTER TABLE match_robot_crop ADD COLUMN {col_def}")
+            except Exception:
+                pass  # column already exists
+        # Every embedding written before this column existed came from dinov2-small
+        # (the only backend that ever ran) — pin that fact so a future default-model
+        # change can't reinterpret old rows as "unknown model".
+        await db.execute(
+            "UPDATE appearance_gallery SET embed_model = ? WHERE embed_model IS NULL",
+            (_LEGACY_EMBED_MODEL,))
+        await db.execute(
+            "UPDATE match_robot_crop SET embed_model = ? WHERE embed_model IS NULL",
+            (_LEGACY_EMBED_MODEL,))
         await db.commit()
 
 
@@ -673,12 +699,12 @@ async def insert_gallery_exemplar(row: Dict[str, Any]) -> None:
         await db.execute(
             "INSERT INTO appearance_gallery "
             "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
-            "image, verified, job_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "image, verified, job_id, embed_model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (row["event_key"], row.get("source_match_key"),
              row["team"], row["alliance_color"],
              row["embedding"], row.get("legibility"), row.get("image"),
-             int(row.get("verified", 0)), row.get("job_id")))
+             int(row.get("verified", 0)), row.get("job_id"), row.get("embed_model")))
         await db.commit()
 
 
@@ -693,12 +719,12 @@ async def insert_gallery_exemplars(rows: List[Dict[str, Any]]) -> None:
         await db.executemany(
             "INSERT INTO appearance_gallery "
             "(event_key, source_match_key, team, alliance_color, embedding, legibility, "
-            "image, verified, job_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "image, verified, job_id, embed_model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(row["event_key"], row.get("source_match_key"),
               row["team"], row["alliance_color"],
               row["embedding"], row.get("legibility"), row.get("image"),
-              int(row.get("verified", 0)), row.get("job_id"))
+              int(row.get("verified", 0)), row.get("job_id"), row.get("embed_model"))
              for row in rows])
         await db.commit()
 
@@ -706,13 +732,18 @@ async def insert_gallery_exemplars(rows: List[Dict[str, Any]]) -> None:
 async def get_gallery_exemplars(
     event_key: str, teams: Optional[List[str]] = None
 ) -> List[Dict]:
-    """Gallery exemplars for an event, optionally limited to specific teams."""
+    """Gallery exemplars for an event, optionally limited to specific teams.
+
+    Scoped to the active embed_model (NULL rows count as dinov2-small, the
+    only backend that ever ran pre-migration) — a row from a different model
+    is a different vector space and must not surface as if it matches.
+    """
     team_filter = list(dict.fromkeys(
         str(team) for team in (teams or [])
         if team is not None and str(team)
     ))
-    where = "event_key = ?"
-    params: List[Any] = [event_key]
+    where = "event_key = ? AND COALESCE(embed_model, ?) = ?"
+    params: List[Any] = [event_key, _LEGACY_EMBED_MODEL, ACTIVE_MODEL]
     if team_filter:
         where += f" AND team IN ({','.join('?' for _ in team_filter)})"
         params.extend(team_filter)
@@ -721,7 +752,7 @@ async def get_gallery_exemplars(
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
-            "image, verified, job_id "
+            "image, verified, job_id, embed_model "
             f"FROM appearance_gallery WHERE {where} ORDER BY id", params)
         return [dict(r) for r in await cursor.fetchall()]
 
@@ -799,10 +830,18 @@ async def get_previous_gallery_exemplars(
             params.extend(team_filter)
         if verified_only:
             where += " AND verified = 1"
+        # A stored embedding is only comparable to a freshly computed one if
+        # both came from the same backbone. Rows from a different (or absent
+        # -> pre-migration dinov2-small) embed_model are excluded rather than
+        # cosine-compared against the current model's vectors: that would be
+        # a silent garbage comparison, not a real re-ID signal. The team just
+        # has no exemplars yet for the new model, which is fine — cold start.
+        where += " AND COALESCE(embed_model, ?) = ?"
+        params.extend([_LEGACY_EMBED_MODEL, ACTIVE_MODEL])
 
         cursor = await db.execute(
             "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "
-            "image, verified, job_id "
+            "image, verified, job_id, embed_model "
             f"FROM appearance_gallery WHERE {where} ORDER BY id",
             params,
         )
@@ -876,10 +915,10 @@ async def insert_match_robot_crop(row: Dict[str, Any]) -> None:
         raise KeyError("Either 'identity_id' or 'slot' must be provided in row")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image, embed_model) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (row["job_id"], identity_id, row.get("legibility"), row.get("embedding"),
-             row.get("image")))
+             row.get("image"), row.get("embed_model")))
         await db.commit()
 
 
@@ -916,13 +955,13 @@ async def insert_match_robot_crops(rows: List[Dict[str, Any]]) -> None:
         return
     params = [
         (row["job_id"], _identity_key(row), row.get("legibility"),
-         row.get("embedding"), row.get("image"))
+         row.get("embedding"), row.get("image"), row.get("embed_model"))
         for row in rows
     ]
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany(
-            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image) "
-            "VALUES (?, ?, ?, ?, ?)", params)
+            "INSERT INTO match_robot_crop (job_id, identity_id, legibility, embedding, image, embed_model) "
+            "VALUES (?, ?, ?, ?, ?, ?)", params)
         await db.commit()
 
 

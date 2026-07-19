@@ -206,3 +206,42 @@ def test_portal_off_no_reacquire():
     out = tr.update([far], {sid: {"view_occluded": True}}, 0.1)
     reacq = [t for t in out if t.slot_id == sid][0]
     assert not (abs(reacq.pos[0] - 9.2) < 1.0 and abs(reacq.pos[1] - 3.1) < 1.0)
+
+
+def test_history_off_by_default():
+    trk = FieldTracker(field_length=16.541)
+    _step(trk, [_det(2, 2, "blue")])
+    assert trk.history == {}
+
+
+def test_history_recording_segments_and_gaps():
+    trk = FieldTracker(field_length=16.541, max_coast_open=2, record_history=True)
+    red = [_det(13, 2, "red"), _det(12, 5, "red"), _det(14, 7, "red")]
+    trk.update([_det(2.0, 2.0, "blue")] + red, {}, 0.1, frame_num=100)  # seed
+    trk.update([_det(2.2, 2.0, "blue")] + red, {}, 0.1, frame_num=101)  # measure
+    trk.update(red, {}, 0.1, frame_num=102)  # miss 1 -> coast record
+    trk.update(red, {}, 0.1, frame_num=103)  # miss 2 -> coast record
+    trk.update(red, {}, 0.1, frame_num=104)  # miss 3 > budget -> expire, no record
+    trk.update([_det(5.0, 2.0, "blue")] + red, {}, 0.1, frame_num=105)  # re-seed
+    # blue slots are 0..2; seeding uses the first free slot both times
+    segs = trk.history[0]
+    assert len(segs) == 2
+    seg1, seg2 = segs
+    assert [r["frame_num"] for r in seg1] == [100, 101, 102, 103]
+    assert seg1[0]["seed"] is True and seg1[0]["z"] == (2.0, 2.0)
+    assert seg1[1]["seed"] is False and seg1[1]["z"] == (2.2, 2.0)
+    assert seg1[1]["r_scale"] == 1.0
+    assert seg1[2]["z"] is None and seg1[2]["r_scale"] is None
+    assert seg1[3]["z"] is None
+    assert seg2[0]["seed"] is True and seg2[0]["z"] == (5.0, 2.0)
+    assert seg2[0]["frame_num"] == 105
+
+
+def test_history_records_corner_only_r_scale():
+    trk = FieldTracker(field_length=16.541, record_history=True)
+    trk.update([_det(2.0, 2.0, "blue")], {}, 0.1, frame_num=1)  # seed (has box)
+    corner = FieldDetection(pos=(2.1, 2.0), color="blue", box=None, score=0.9)
+    trk.update([corner], {}, 0.1, frame_num=2)
+    rec = trk.history[0][0][1]
+    assert rec["r_scale"] == 8.0          # corner_only_r_scale default
+    assert rec["corner_only"] is True

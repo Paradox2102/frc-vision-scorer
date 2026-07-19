@@ -367,6 +367,14 @@ KNOBS = [
     # same way reprompt_seconds is, and rescaled for decimated corner views).
     Knob("backfill_seconds", "SAM2_BACKFILL_SECONDS", float, 4.0,
          min=0.5, max=20.0, section="Track hygiene"),
+    # Offline RTS smoothing of exported 2D paths (web/field/smoother.py):
+    # re-filter each slot's recorded measurements forward (no coast decay)
+    # and smooth backward, then rewrite autonomous_paths field_pos and fill
+    # in-gap samples (flagged interpolated=true, tracker_prob null). Live
+    # HUD/radar and all tracking decisions stay causal. DEFAULT OFF pending
+    # qm8-qm12 compare_manta A/B.
+    Knob("rts_smooth", "RTS_SMOOTH", bool, False,
+         section="Track hygiene"),
     # --- identity / VLM ---
     Knob("team_reader", "TEAM_READER", str, "local",
          choices=("local", "deepseek", "vllm"), section="Identity & votes"),

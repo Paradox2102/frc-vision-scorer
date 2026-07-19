@@ -38,6 +38,12 @@ def rts_smooth_segment(records, q=Q_ACCEL, r=R_MEAS):
     the causal path already covers that display case)."""
     if not records:
         return []
+    measured = [i for i, rec in enumerate(records) if rec["z"] is not None]
+    if not measured:
+        # Defensive: producer invariant guarantees the seed record carries z,
+        # but an all-coast segment has nothing to smooth against.
+        return []
+    last = measured[-1]
     z0 = records[0]["z"]
     x = np.array([z0[0], z0[1], 0.0, 0.0], float)
     P = np.diag([r, r, 4.0, 4.0])          # mirrors _KF.__init__
@@ -48,7 +54,8 @@ def rts_smooth_segment(records, q=Q_ACCEL, r=R_MEAS):
         xp = F @ x
         Pp = F @ P @ F.T + Q
         if rec["z"] is not None:
-            R = (r * float(rec["r_scale"] or 1.0)) * np.eye(2)
+            r_scale = rec["r_scale"] if rec["r_scale"] is not None else 1.0
+            R = (r * float(r_scale)) * np.eye(2)
             S = _H @ Pp @ _H.T + R
             K = Pp @ _H.T @ np.linalg.inv(S)
             x = xp + K @ (np.asarray(rec["z"], float) - _H @ xp)
@@ -58,17 +65,14 @@ def rts_smooth_segment(records, q=Q_ACCEL, r=R_MEAS):
         xs_p.append(xp); Ps_p.append(Pp)
         xs_f.append(x); Ps_f.append(P)
 
-    last = max(i for i, rec in enumerate(records) if rec["z"] is not None)
     n = last + 1
     xs_s = [None] * n
     xs_s[-1] = xs_f[last]
-    Ps_prev = Ps_f[last]
     for k in range(n - 2, -1, -1):
         F, _ = _fq(records[k + 1]["dt"], q)
         # C = P_f F^T inv(P_p);  solve for stability instead of inv()
         C = np.linalg.solve(Ps_p[k + 1].T, (Ps_f[k] @ F.T).T).T
         xs_s[k] = xs_f[k] + C @ (xs_s[k + 1] - xs_p[k + 1])
-        Ps_prev = Ps_f[k] + C @ (Ps_prev - Ps_p[k + 1]) @ C.T
 
     return [{
         "frame_num": records[k]["frame_num"],

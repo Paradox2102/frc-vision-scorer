@@ -4968,7 +4968,8 @@ class InferenceJob:
                 suspect_zones=suspect_zones,
                 occlusion_rebind_guard=self.config.occlusion_rebind_guard,
                 kin_gate_enabled=self.config.kin_gate,
-                kin_max_speed_mps=self.config.kin_max_speed_mps)
+                kin_max_speed_mps=self.config.kin_max_speed_mps,
+                record_history=self.config.rts_smooth)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -6537,7 +6538,7 @@ class InferenceJob:
                         frame_num=early_ocr_source_frame,
                     )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
-                early_outs = self.field_tracker.update(early_field_dets, {}, early_dt)
+                early_outs = self.field_tracker.update(early_field_dets, {}, early_dt, frame_num=early_ocr_source_frame)
                 from web.field.fusion import FusedObservation
                 early_fused = [FusedObservation(detection=d, evidence=[]) for d in early_field_dets]
                 await self._sync_identity_registry_frame(
@@ -6856,7 +6857,8 @@ class InferenceJob:
                     portals = (self._portal_state
                                if self.config.occlusion_portal else None)
                     track_outs = self.field_tracker.update(
-                        field_dets, self._view_flags, dt, portals=portals)
+                        field_dets, self._view_flags, dt, portals=portals,
+                        frame_num=frame_num)
                     if TRACKER_TRACE:
                         ft = self.field_tracker
                         self._tracker_trace = getattr(self, "_tracker_trace", [])
@@ -7446,6 +7448,31 @@ class InferenceJob:
             self.timings["total"] = round(time.perf_counter() - self._proc_t0, 2)
             self.detection_archive.close()
             self.status = "completed"
+
+            # Offline RTS smoothing of autonomous_paths. Placed here — after the
+            # tracking loop, before the WS "complete" send — so the post-match
+            # summary the client receives and the persisted replay artifact are
+            # smoothed from one place (no client-vs-meta.json divergence);
+            # per-frame live rendering during the loop stayed causal. The later
+            # gated _reresolve_replay_frames/filter_paths_by_dropped pass
+            # composes correctly: it filters the already-smoothed dict in
+            # place, so dropped ranges still get removed, interpolated samples
+            # included.
+            if self.config.rts_smooth and self.field_tracker is not None:
+                # Offline pass: never let a smoothing failure kill a job that
+                # already finished tracking.
+                try:
+                    from web.field.smoother import (smooth_history,
+                                                    apply_smoothed_paths)
+                    stats = apply_smoothed_paths(
+                        self.autonomous_paths,
+                        smooth_history(self.field_tracker.history),
+                        self._slot_label,
+                        self.video_fps or 1.0)
+                    print(f"  [rts] smoothed autonomous_paths "
+                          f"(label: replaced, inserted): {stats}")
+                except Exception as e:
+                    print(f"  [rts] smoothing failed, exporting causal paths: {e}")
 
             # Deliver any in-flight frame before the complete message.
             await self._stop_ws_senders(drain=True)

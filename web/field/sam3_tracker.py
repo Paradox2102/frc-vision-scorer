@@ -85,6 +85,10 @@ SAM3_CHUNK_FRAMES = int(os.environ.get("SAM3_CHUNK_FRAMES", "200"))
 # Only re-seed an object across a boundary if its mask was non-empty within
 # this many recent frames (stale boxes hijack background clutter).
 SAM3_RESEED_MAX_AGE = int(os.environ.get("SAM3_RESEED_MAX_AGE", "24"))
+# SAM 3.1 Object Multiplex builder opt-in (see job_config.sam3_multiplex for
+# the full rationale/risk note). Module env default stays off for direct/
+# library callers; the pipeline passes the Knob value into the constructor.
+SAM3_MULTIPLEX = os.environ.get("SAM3_MULTIPLEX", "0") not in ("0", "false", "False")
 
 
 def _list_frame_paths(frames_dir: str) -> list[str]:
@@ -445,6 +449,14 @@ class Sam3FieldTracker(Sam2FieldTracker):
     ``TrackStopped``; the ``finally`` cleanup calls this adapter's
     ``reset_state``, which closes the live chunk session and removes its
     temp dir.
+
+    ``multiplex=True`` (the ``sam3_multiplex`` knob) swaps the base SAM3
+    video predictor for Meta's SAM 3.1 Object Multiplex builder
+    (``build_sam3_predictor(version="sam3.1", ...)``). Both predictors
+    dispatch through the same ``Sam3BasePredictor.handle_request`` /
+    ``handle_stream_request`` protocol, so ``Sam3PredictorAdapter`` below is
+    unchanged either way -- only the predictor construction differs. See
+    job_config.sam3_multiplex for the tracking-behavior caveat.
     """
 
     LOG_TAG = "SAM3"
@@ -462,25 +474,50 @@ class Sam3FieldTracker(Sam2FieldTracker):
         max_objects: int = 20,
         use_fa3: bool = True,  # accepted for call-site compat; multiplex-only
         chunk_frames: int | None = None,
+        multiplex: bool = SAM3_MULTIPLEX,
     ) -> None:
         if device != "cuda":
             raise RuntimeError("SAM 3 video model currently requires CUDA")
 
         if predictor is None:
-            from sam3.model_builder import build_sam3_video_predictor
-
             checkpoint = checkpoint or os.environ.get("SAM3_CHECKPOINT") or None
-            predictor = build_sam3_video_predictor(
-                checkpoint_path=checkpoint,
-                compile=compile_model,
-            )
-            # Instance-tracking capacity is a model attribute, not a builder
-            # arg; raise it so re-prompting can exceed the demo default.
-            model = getattr(predictor, "model", None)
-            if model is not None and hasattr(model, "max_num_objects"):
-                model.max_num_objects = max(
-                    int(getattr(model, "max_num_objects", 0) or 0), int(max_objects)
+
+            if multiplex:
+                # SAM 3.1 Object Multiplex: joint multi-object propagation
+                # through the SAME handle_request/handle_stream_request
+                # protocol (Sam3BasePredictor), so Sam3PredictorAdapter needs
+                # no changes. use_fa3 is forced False here regardless of the
+                # use_fa3 param above: the builder's own default is True, and
+                # FlashAttention-3 is NOT installed on this host (see
+                # docs/SAM3.md) -- passing the builder's default would break
+                # at model-build time. Bucket capacity (max_num_objects /
+                # multiplex_count, both default 16) is left untouched: our
+                # ~6-robot rosters fit comfortably, and an untested larger
+                # capacity is a bigger risk than the default.
+                from sam3.model_builder import build_sam3_predictor
+
+                predictor = build_sam3_predictor(
+                    version="sam3.1",
+                    checkpoint_path=checkpoint,
+                    compile=compile_model,
+                    use_fa3=False,
                 )
+            else:
+                from sam3.model_builder import build_sam3_video_predictor
+
+                predictor = build_sam3_video_predictor(
+                    checkpoint_path=checkpoint,
+                    compile=compile_model,
+                )
+                # Instance-tracking capacity is a model attribute, not a
+                # builder arg; raise it so re-prompting can exceed the demo
+                # default.
+                model = getattr(predictor, "model", None)
+                if model is not None and hasattr(model, "max_num_objects"):
+                    model.max_num_objects = max(
+                        int(getattr(model, "max_num_objects", 0) or 0),
+                        int(max_objects),
+                    )
 
         super().__init__(
             predictor=Sam3PredictorAdapter(

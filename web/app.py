@@ -5509,11 +5509,13 @@ class InferenceJob:
                                 max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
                                 use_fa3=SAM3_USE_FA3,
                                 chunk_frames=self.config.sam3_chunk_frames,
+                                multiplex=self.config.sam3_multiplex,
                             )
                             detail = (
                                 f"video model w/ instance prompts, "
                                 f"chunk={self.config.sam3_chunk_frames} frames, "
-                                f"compile={self.config.sam3_compile}"
+                                f"compile={self.config.sam3_compile}, "
+                                f"multiplex={self.config.sam3_multiplex}"
                             )
                         else:
                             from web.field.sam2_tracker import Sam2FieldTracker

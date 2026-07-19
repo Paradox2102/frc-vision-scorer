@@ -563,6 +563,64 @@ def test_solo_ids_scopes_stream_chunk_window_refresh(tmp_path):
     adapter.reset_state(state)
 
 
+# ---------------------------------------------------------------------------
+# sam3_multiplex: builder selection (SAM 3.1 Object Multiplex opt-in)
+# ---------------------------------------------------------------------------
+
+def _patch_sam3_builders(monkeypatch):
+    """Stub out both model_builder entry points so __init__'s predictor-build
+    branch runs with no real model load / no download, and record the kwargs
+    each was called with."""
+    import sam3.model_builder as model_builder
+
+    calls = {"video": None, "multiplex": None}
+
+    def fake_build_sam3_video_predictor(**kwargs):
+        calls["video"] = kwargs
+        return object()
+
+    def fake_build_sam3_predictor(**kwargs):
+        calls["multiplex"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        model_builder, "build_sam3_video_predictor", fake_build_sam3_video_predictor
+    )
+    monkeypatch.setattr(
+        model_builder, "build_sam3_predictor", fake_build_sam3_predictor
+    )
+    return calls
+
+
+def test_sam3_multiplex_off_uses_base_builder_unchanged(monkeypatch):
+    """Default (multiplex=False): today's exact call to
+    build_sam3_video_predictor, untouched by the new knob."""
+    calls = _patch_sam3_builders(monkeypatch)
+
+    Sam3FieldTracker(checkpoint="ckpt.pt", compile_model=True, multiplex=False)
+
+    assert calls["multiplex"] is None
+    assert calls["video"] == {"checkpoint_path": "ckpt.pt", "compile": True}
+
+
+def test_sam3_multiplex_on_uses_multiplex_builder_with_fa3_forced_off(monkeypatch):
+    """multiplex=True selects the SAM 3.1 Object Multiplex builder
+    (build_sam3_predictor(version="sam3.1", ...)) instead of the base video
+    predictor, with use_fa3 forced False -- FlashAttention-3 is not installed
+    on this host, and the builder's own default is use_fa3=True."""
+    calls = _patch_sam3_builders(monkeypatch)
+
+    Sam3FieldTracker(checkpoint="ckpt.pt", compile_model=True, multiplex=True)
+
+    assert calls["video"] is None
+    assert calls["multiplex"] == {
+        "version": "sam3.1",
+        "checkpoint_path": "ckpt.pt",
+        "compile": True,
+        "use_fa3": False,
+    }
+
+
 def test_solo_ids_scopes_open_chunk_for_boundary_reseed(tmp_path):
     """Same scoping contract at the chunk-boundary re-seed (_open_chunk_for):
     solo_ids must exclude a carried object even when its last_box is fresh

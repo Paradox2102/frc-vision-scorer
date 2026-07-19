@@ -137,6 +137,14 @@ KNOBS = [
     # when other state was co-resident (see web/field/sam3_tracker.py header).
     Knob("sam3_chunk_frames", "SAM3_CHUNK_FRAMES", int, 200, min=16, max=2000,
          section="Tracking backend"),
+    # SAM 3.1 Object Multiplex builder — joint multi-object propagation
+    # (~2x propagation throughput, ~half VRAM per Meta); NOT a pure perf
+    # toggle: the multiplex builder bakes in different tracking heuristics
+    # (new_det_thresh 0.65 vs 0.7, score_threshold_detection 0.4 vs 0.5,
+    # boundary suppression on, masklet confirmation on), so mask/re-seed/
+    # occlusion behavior shifts. DEFAULT OFF pending qm8-qm12 A/B.
+    Knob("sam3_multiplex", "SAM3_MULTIPLEX", bool, False,
+         section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

@@ -108,7 +108,8 @@ class FieldTracker:
                  max_speed_m_s=5.5, sticky_max_dist_m=0.0,
                  suspect_zones=None, occlusion_rebind_guard=False,
                  guard_motion_m=0.3, guard_motion_window=5,
-                 kin_gate_enabled=False, kin_max_speed_mps=6.5):
+                 kin_gate_enabled=False, kin_max_speed_mps=6.5,
+                 record_history=False):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -150,6 +151,12 @@ class FieldTracker:
         self.kin_max_speed = float(kin_max_speed_mps)
         self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
         self._frame_idx = 0
+        # Opt-in measurement history for the offline RTS smoothing pass
+        # (web/field/smoother.py). Observation-only: never read by any
+        # tracking decision. slot_id -> list of segments; a segment is the
+        # record list from one seed until the frame before expiry.
+        self.record_history = bool(record_history)
+        self.history: dict[int, list[list[dict]]] = {}
         self.tracks = []
         sid = 0
         for a in ALLIANCES:
@@ -217,9 +224,11 @@ class FieldTracker:
             np.asarray(d.pos, float) - np.asarray(t.kf.pos, float)))
         return (dist / gap_s) > self.kin_max_speed
 
-    def update(self, detections, occlusion, dt, portals=None):
+    def update(self, detections, occlusion, dt, portals=None, frame_num=None):
         self.binding_events = []
         self.assignment_evidence = {}
+        self._pending_meas: dict[int, tuple] = {}   # slot_id -> (z, r_scale)
+        self._pending_seed: set[int] = set()
         # Portal gate: {slot_id: (x, y, radius_m)}. Only consulted for slots
         # that are occ_coasting; lets an occluded slot re-acquire a detection
         # near its predicted hub-exit point even outside the plain distance
@@ -283,6 +292,25 @@ class FieldTracker:
                         "track_id": tid,
                         "alliance": t.alliance,
                     })
+
+        if self.record_history:
+            for t in self.tracks:
+                if not t.active:
+                    continue
+                meas = self._pending_meas.get(t.slot_id)
+                rec = {
+                    "frame_num": frame_num,
+                    "dt": float(dt),
+                    "z": meas[0] if meas else None,
+                    "r_scale": meas[1] if meas else None,
+                    "seed": t.slot_id in self._pending_seed,
+                    "corner_only": bool(t.corner_only),
+                }
+                segs = self.history.setdefault(t.slot_id, [])
+                if rec["seed"] or not segs:
+                    segs.append([rec])
+                else:
+                    segs[-1].append(rec)
 
         return self._emit()
 
@@ -514,6 +542,10 @@ class FieldTracker:
                 slot.hits = 1
                 slot.coasting = False
                 slot.active = True
+                if self.record_history:
+                    self._pending_seed.add(slot.slot_id)
+                    self._pending_meas[slot.slot_id] = (
+                        (float(d.pos[0]), float(d.pos[1])), 1.0)
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
                 if d.track_id is not None and d.track_id not in ambiguous_tids:
                     self._id_to_slot[d.track_id] = slot.slot_id
@@ -546,6 +578,10 @@ class FieldTracker:
                 slot.hits = 1
                 slot.coasting = False
                 slot.active = True
+                if self.record_history:
+                    self._pending_seed.add(slot.slot_id)
+                    self._pending_meas[slot.slot_id] = (
+                        (float(d.pos[0]), float(d.pos[1])), 1.0)
                 self.last_det_to_slot[idxs[j]] = slot.slot_id
                 if d.track_id is not None and d.track_id not in ambiguous_tids:
                     self._id_to_slot[d.track_id] = slot.slot_id
@@ -576,6 +612,9 @@ class FieldTracker:
         # Payload: record the measuring detection's SAM confidence on the slot.
         # After the KF update so it can never feed back into the state estimate.
         t.tracker_prob = d.tracker_prob
+        if self.record_history:
+            self._pending_meas[t.slot_id] = (
+                (float(d.pos[0]), float(d.pos[1])), float(scale))
 
     def _best_assignment(self, cost):
         """Brute-force minimum-cost assignment for ≤3×3 cost matrices.

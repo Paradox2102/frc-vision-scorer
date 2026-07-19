@@ -98,3 +98,45 @@ def smooth_history(history, q=Q_ACCEL, r=R_MEAS):
                     "corner_only": o["corner_only"],
                 }
     return out
+
+
+def apply_smoothed_paths(paths, smoothed, label_for_slot, fps):
+    """Rewrite exported autonomous_paths in place with smoothed positions.
+
+    Existing samples get their field_pos replaced; smoothed frames strictly
+    inside a label's existing frame range that have no sample (occlusion /
+    corner-only stretches, which the export loop skips) are inserted as
+    synthetic samples flagged interpolated=True with tracker_prob None, so
+    downstream consumers can tell inference from measurement. Returns
+    {label: (n_replaced, n_inserted)} for the job log."""
+    stats: dict[str, tuple[int, int]] = {}
+    fps = float(fps) if fps else 1.0
+    for slot_id, frames in (smoothed or {}).items():
+        label = label_for_slot(slot_id)
+        samples = paths.get(label)
+        if not samples:
+            continue
+        by_frame = {s["frame_num"]: s for s in samples}
+        fmin, fmax = min(by_frame), max(by_frame)
+        replaced = inserted = 0
+        for fn, info in frames.items():
+            px = round(float(info["pos"][0]), 4)
+            py = round(float(info["pos"][1]), 4)
+            s = by_frame.get(fn)
+            if s is not None:
+                s["field_pos"] = [px, py]
+                replaced += 1
+            elif fmin < fn < fmax:
+                samples.append({
+                    "frame_num": fn,
+                    "timestamp": round(fn / fps, 4),
+                    "field_pos": [px, py],
+                    "corner_only": bool(info["corner_only"]),
+                    "occluded": None,
+                    "tracker_prob": None,
+                    "interpolated": True,
+                })
+                inserted += 1
+        samples.sort(key=lambda s: s["frame_num"])
+        stats[label] = (replaced, inserted)
+    return stats

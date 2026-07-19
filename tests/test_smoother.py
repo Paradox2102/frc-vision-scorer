@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from web.field.smoother import rts_smooth_segment, smooth_history
+from web.field.smoother import apply_smoothed_paths, rts_smooth_segment, smooth_history
 
 DT = 0.125  # 8 fps, the default SAM2_TRACK_FPS
 
@@ -110,3 +110,42 @@ def test_smooth_history_shapes_and_none_frames():
     assert set(result.keys()) == {3}
     assert set(result[3].keys()) == {1, 2, 3, 4}      # frame None omitted
     assert result[3][4]["measured"] is True
+
+
+def _sample(fn, x, y, fps=8.0):
+    return {"frame_num": fn, "timestamp": round(fn / fps, 4),
+            "field_pos": [x, y], "corner_only": False,
+            "occluded": None, "tracker_prob": 0.9}
+
+
+def test_apply_replaces_and_inserts():
+    paths = {"B1": [_sample(10, 1.0, 1.0), _sample(14, 2.0, 1.0)]}
+    smoothed = {0: {
+        10: {"pos": (1.05, 1.0), "measured": True, "corner_only": False},
+        12: {"pos": (1.50, 1.0), "measured": False, "corner_only": True},
+        14: {"pos": (1.95, 1.0), "measured": True, "corner_only": False},
+    }}
+    stats = apply_smoothed_paths(paths, smoothed, lambda s: "B1", fps=8.0)
+    assert stats == {"B1": (2, 1)}
+    samples = paths["B1"]
+    assert [s["frame_num"] for s in samples] == [10, 12, 14]
+    assert samples[0]["field_pos"] == [1.05, 1.0]
+    assert samples[0]["tracker_prob"] == 0.9          # payload preserved
+    ins = samples[1]
+    assert ins["interpolated"] is True
+    assert ins["corner_only"] is True
+    assert ins["tracker_prob"] is None and ins["occluded"] is None
+    assert ins["timestamp"] == pytest.approx(12 / 8.0)
+
+
+def test_apply_no_insert_outside_sample_range_or_unknown_label():
+    paths = {"B1": [_sample(10, 1.0, 1.0), _sample(14, 2.0, 1.0)]}
+    smoothed = {
+        0: {8: {"pos": (0.5, 1.0), "measured": True, "corner_only": False},
+            16: {"pos": (2.5, 1.0), "measured": True, "corner_only": False}},
+        5: {10: {"pos": (9.0, 9.0), "measured": True, "corner_only": False}},
+    }
+    stats = apply_smoothed_paths(
+        paths, smoothed, lambda s: {0: "B1", 5: "R3"}[s], fps=8.0)
+    assert stats == {"B1": (0, 0)}                    # R3 absent from paths
+    assert [s["frame_num"] for s in paths["B1"]] == [10, 14]  # nothing inserted

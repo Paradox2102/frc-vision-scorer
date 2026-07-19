@@ -45,6 +45,7 @@ __all__ = [
     "combine_scores",
     "assign_teams_global",
     "merge_global_assignment",
+    "build_slot_evidence",
 ]
 
 # Fixed slot-id -> alliance convention used throughout the pipeline.
@@ -257,3 +258,102 @@ def merge_global_assignment(
         )
 
     return new_meta, changes
+
+
+def build_slot_evidence(
+    vlm_read_rows: list[dict] | None,
+    identity_log: list[dict],
+    team_ocr_votes_by_slot: dict[int, dict[str, float]],
+    gallery_scores_by_slot: dict[int, dict[str, float]],
+    slot_alliance,
+) -> tuple[dict[int, SlotEvidence], dict]:
+    """Aggregate raw per-frame VLM reads (or a fallback vote source) into
+    per-slot :class:`SlotEvidence`, plus gallery scores.
+
+    Pure function: no file I/O, no mutation of any input. The app-side
+    caller (Task 3) is responsible for loading ``vlm_read_rows`` from the
+    diagnostics JSONL and for computing ``gallery_scores_by_slot``.
+
+    Read path (used when ``vlm_read_rows`` is not ``None`` and at least one
+    row is successfully attributed to a slot): each row's ``robot_id`` (an
+    identity id) is bound to the slot it occupied *at that exact frame* via
+    ``identity_log``. This exact-frame binding is a deliberate misattribution
+    guard -- crediting a read to whichever slot an identity happens to
+    occupy *now* (rather than at the read's own frame) would silently move
+    votes across a re-seed or identity swap. A read whose (frame, robot_id)
+    has no binding is dropped and counted in
+    ``stats["reads_dropped_misattributed"]``; its ``vote_weight`` (already
+    fully baked with confidence/surface/prob multipliers upstream) is
+    accumulated as-is into ``read_scores[matched_team]`` on a hit.
+
+    Fallback path (``vlm_read_rows`` is ``None``, empty, or every row failed
+    to attribute -- e.g. all misattributed or lacking a ``matched_team``):
+    ``read_scores`` is populated directly from ``team_ocr_votes_by_slot``
+    instead, and ``stats["fallback_used"]`` is ``True``.
+
+    Gallery scores are always attached from ``gallery_scores_by_slot`` for
+    every slot that ends up in the returned evidence dict, independent of
+    which read path ran. The slot universe is the union of: slots with a
+    successful read attribution (read path only), slots in
+    ``team_ocr_votes_by_slot`` (fallback path only), and slots in
+    ``gallery_scores_by_slot`` (always) -- so a slot with gallery evidence
+    alone is still a valid assignment candidate.
+
+    Returns ``(evidence, stats)`` where
+    ``stats = {"reads_used": int, "reads_dropped_misattributed": int,
+    "fallback_used": bool}``.
+    """
+    frame_identity_to_slot: dict[tuple[int, int], int] = {
+        (row["frame_num"], row["identity_id"]): row["slot_id"] for row in identity_log
+    }
+
+    read_scores_by_slot: dict[int, dict[str, float]] = {}
+    reads_used = 0
+    reads_dropped_misattributed = 0
+
+    if vlm_read_rows:
+        for row in vlm_read_rows:
+            matched_team = row.get("matched_team")
+            if matched_team is None:
+                continue  # no team vote carried by this row
+            slot_id = frame_identity_to_slot.get((row["frame"], row["robot_id"]))
+            if slot_id is None:
+                reads_dropped_misattributed += 1
+                continue
+            slot_scores = read_scores_by_slot.setdefault(slot_id, {})
+            slot_scores[matched_team] = slot_scores.get(matched_team, 0.0) + row.get(
+                "vote_weight", 0.0
+            )
+            reads_used += 1
+
+    fallback_used = vlm_read_rows is None or len(vlm_read_rows) == 0 or reads_used == 0
+    if fallback_used:
+        read_scores_by_slot = {
+            slot_id: dict(votes) for slot_id, votes in team_ocr_votes_by_slot.items()
+        }
+        reads_used = 0
+
+    frames_seen_by_slot: dict[int, int] = {}
+    for row in identity_log:
+        slot_id = row["slot_id"]
+        frames_seen_by_slot[slot_id] = frames_seen_by_slot.get(slot_id, 0) + 1
+
+    slot_ids = set(read_scores_by_slot) | set(gallery_scores_by_slot)
+
+    evidence: dict[int, SlotEvidence] = {
+        slot_id: SlotEvidence(
+            slot_id=slot_id,
+            alliance=slot_alliance(slot_id),
+            read_scores=dict(read_scores_by_slot.get(slot_id, {})),
+            gallery_scores=dict(gallery_scores_by_slot.get(slot_id, {})),
+            frames_seen=frames_seen_by_slot.get(slot_id, 0),
+        )
+        for slot_id in slot_ids
+    }
+
+    stats = {
+        "reads_used": reads_used,
+        "reads_dropped_misattributed": reads_dropped_misattributed,
+        "fallback_used": fallback_used,
+    }
+    return evidence, stats

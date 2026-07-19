@@ -10,6 +10,7 @@ import pytest
 from web.field.identity_resolve import (
     SlotEvidence,
     assign_teams_global,
+    build_slot_evidence,
     combine_scores,
     merge_global_assignment,
 )
@@ -275,3 +276,198 @@ def test_alliance_mismatch_raises():
     evidence = {0: _ev(0, "red", read_scores={"4444": 9.0})}
     with pytest.raises(ValueError):
         assign_teams_global(evidence, blue_roster=BLUE_ROSTER, red_roster=RED_ROSTER)
+
+
+# ---------------------------------------------------------------------------
+# build_slot_evidence
+# ---------------------------------------------------------------------------
+
+
+def _slot_alliance(slot_id):
+    return "blue" if slot_id in (0, 1, 2) else "red"
+
+
+def _id_row(frame_num, identity_id, slot_id, alliance):
+    return {
+        "frame_num": frame_num,
+        "identity_id": identity_id,
+        "slot_id": slot_id,
+        "alliance": alliance,
+    }
+
+
+def _vlm_row(frame, robot_id, matched_team, vote_weight=1.0, **extra):
+    row = {
+        "type": "vlm_read",
+        "frame": frame,
+        "robot_id": robot_id,
+        "matched_team": matched_team,
+        "confidence": 0.9,
+        "vote_weight": vote_weight,
+        "alliance_read": "blue",
+        "surface": "front",
+        "legibility": 0.8,
+    }
+    row.update(extra)
+    return row
+
+
+def test_build_slot_evidence_sums_reads_by_slot_and_team():
+    identity_log = [
+        _id_row(10, 1, 0, "blue"),
+        _id_row(20, 1, 0, "blue"),
+        _id_row(10, 2, 3, "red"),
+        _id_row(20, 2, 3, "red"),
+    ]
+    vlm_read_rows = [
+        _vlm_row(10, 1, "1111", vote_weight=2.0),
+        _vlm_row(20, 1, "1111", vote_weight=1.5),
+        _vlm_row(10, 2, "4444", vote_weight=3.0),
+        _vlm_row(20, 2, "5555", vote_weight=1.0),
+    ]
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot={}, gallery_scores_by_slot={},
+        slot_alliance=_slot_alliance,
+    )
+    assert evidence[0].read_scores == {"1111": 3.5}
+    assert evidence[3].read_scores == {"4444": 3.0, "5555": 1.0}
+    assert evidence[0].frames_seen == 2
+    assert evidence[3].frames_seen == 2
+    assert evidence[0].alliance == "blue"
+    assert evidence[3].alliance == "red"
+    assert stats == {
+        "reads_used": 4,
+        "reads_dropped_misattributed": 0,
+        "fallback_used": False,
+    }
+
+
+def test_build_slot_evidence_drops_misattributed_read():
+    # identity 1 is only bound to slot 0 at frame 10; a read at frame 99 for
+    # the same identity has no binding and must be dropped, not attributed.
+    identity_log = [_id_row(10, 1, 0, "blue")]
+    vlm_read_rows = [
+        _vlm_row(10, 1, "1111", vote_weight=2.0),  # bound -> counted
+        _vlm_row(99, 1, "2222", vote_weight=5.0),  # unbound at frame 99 -> dropped
+    ]
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot={}, gallery_scores_by_slot={},
+        slot_alliance=_slot_alliance,
+    )
+    assert evidence[0].read_scores == {"1111": 2.0}
+    assert "2222" not in evidence[0].read_scores
+    assert stats["reads_used"] == 1
+    assert stats["reads_dropped_misattributed"] == 1
+    assert stats["fallback_used"] is False
+
+
+def test_build_slot_evidence_fallback_when_rows_none():
+    team_ocr_votes_by_slot = {0: {"1111": 4.0}, 3: {"4444": 2.0}}
+    evidence, stats = build_slot_evidence(
+        None, identity_log=[], team_ocr_votes_by_slot=team_ocr_votes_by_slot,
+        gallery_scores_by_slot={}, slot_alliance=_slot_alliance,
+    )
+    assert evidence[0].read_scores == {"1111": 4.0}
+    assert evidence[3].read_scores == {"4444": 2.0}
+    assert stats == {
+        "reads_used": 0,
+        "reads_dropped_misattributed": 0,
+        "fallback_used": True,
+    }
+
+
+def test_build_slot_evidence_fallback_when_rows_empty_list():
+    team_ocr_votes_by_slot = {0: {"1111": 4.0}}
+    evidence, stats = build_slot_evidence(
+        [], identity_log=[], team_ocr_votes_by_slot=team_ocr_votes_by_slot,
+        gallery_scores_by_slot={}, slot_alliance=_slot_alliance,
+    )
+    assert evidence[0].read_scores == {"1111": 4.0}
+    assert stats["fallback_used"] is True
+    assert stats["reads_dropped_misattributed"] == 0
+
+
+def test_build_slot_evidence_falls_back_when_all_reads_misattributed():
+    # Every row either has no matched_team or has no identity_log binding at
+    # its frame -> zero usable reads -> must fall back to OCR votes, but the
+    # misattribution drop still gets counted before the fallback kicks in.
+    identity_log = [_id_row(10, 1, 0, "blue")]
+    vlm_read_rows = [
+        _vlm_row(99, 1, "1111", vote_weight=5.0),  # unbound -> dropped
+        _vlm_row(10, 1, None, vote_weight=0.0),  # no team vote -> skipped, not a drop
+    ]
+    team_ocr_votes_by_slot = {0: {"9999": 1.0}}
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot=team_ocr_votes_by_slot,
+        gallery_scores_by_slot={}, slot_alliance=_slot_alliance,
+    )
+    assert evidence[0].read_scores == {"9999": 1.0}
+    assert stats["fallback_used"] is True
+    assert stats["reads_used"] == 0
+    assert stats["reads_dropped_misattributed"] == 1
+
+
+def test_build_slot_evidence_attaches_gallery_to_every_slot_incl_gallery_only():
+    identity_log = [_id_row(10, 1, 0, "blue")]
+    vlm_read_rows = [_vlm_row(10, 1, "1111", vote_weight=2.0)]
+    gallery_scores_by_slot = {0: {"1111": 0.5}, 1: {"2222": 0.9}}
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot={},
+        gallery_scores_by_slot=gallery_scores_by_slot, slot_alliance=_slot_alliance,
+    )
+    # slot 1 has no reads and no identity_log rows, but gallery evidence alone
+    # is enough to make it a candidate slot.
+    assert set(evidence.keys()) == {0, 1}
+    assert evidence[0].gallery_scores == {"1111": 0.5}
+    assert evidence[1].gallery_scores == {"2222": 0.9}
+    assert evidence[1].read_scores == {}
+    assert evidence[1].frames_seen == 0
+    assert evidence[1].alliance == "blue"
+    assert stats["fallback_used"] is False
+
+
+def test_build_slot_evidence_fallback_slot_universe_excludes_ocr_only_when_reads_used():
+    # Read path is active (>=1 usable read); an OCR-vote slot with no read
+    # binding and no gallery evidence must NOT appear in the evidence dict --
+    # team_ocr_votes_by_slot is only consulted on fallback.
+    identity_log = [_id_row(10, 1, 0, "blue")]
+    vlm_read_rows = [_vlm_row(10, 1, "1111", vote_weight=2.0)]
+    team_ocr_votes_by_slot = {5: {"6666": 9.0}}
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot=team_ocr_votes_by_slot,
+        gallery_scores_by_slot={}, slot_alliance=_slot_alliance,
+    )
+    assert set(evidence.keys()) == {0}
+    assert stats["fallback_used"] is False
+
+
+def test_build_slot_evidence_does_not_mutate_inputs():
+    identity_log = [_id_row(10, 1, 0, "blue"), _id_row(99, 2, 3, "red")]
+    vlm_read_rows = [
+        _vlm_row(10, 1, "1111", vote_weight=2.0),
+        _vlm_row(50, 2, "2222", vote_weight=1.0),  # dropped (unbound)
+    ]
+    team_ocr_votes_by_slot = {0: {"1111": 4.0}}
+    gallery_scores_by_slot = {0: {"1111": 0.5}, 3: {"4444": 0.2}}
+
+    identity_log_snapshot = [dict(r) for r in identity_log]
+    vlm_rows_snapshot = [dict(r) for r in vlm_read_rows]
+    ocr_votes_snapshot = {k: dict(v) for k, v in team_ocr_votes_by_slot.items()}
+    gallery_snapshot = {k: dict(v) for k, v in gallery_scores_by_slot.items()}
+
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, team_ocr_votes_by_slot=team_ocr_votes_by_slot,
+        gallery_scores_by_slot=gallery_scores_by_slot, slot_alliance=_slot_alliance,
+    )
+
+    assert identity_log == identity_log_snapshot
+    assert vlm_read_rows == vlm_rows_snapshot
+    assert team_ocr_votes_by_slot == ocr_votes_snapshot
+    assert gallery_scores_by_slot == gallery_snapshot
+
+    # Mutating the returned evidence's dicts must not reach back into the
+    # caller's gallery/OCR-vote dicts (no aliasing).
+    evidence[0].gallery_scores["9999"] = 123.0
+    evidence[0].read_scores["8888"] = 456.0
+    assert "9999" not in gallery_scores_by_slot[0]
+    assert "8888" not in team_ocr_votes_by_slot.get(0, {})

@@ -427,6 +427,44 @@ def test_merge_same_pair_reswap_is_identity():
         assert results[f][1]["box"] == b1 and results[f][2]["box"] == b2
 
 
+def test_merge_chained_swaps_share_oid():
+    # Chained renames sharing an oid: physical robots A,B,C on raw TBD streams
+    # 1,2,3. Crossing (1,2) effective f3 puts A on raw2 / B on raw1; crossing
+    # (2,3) effective f7 then puts A on raw3 / C on raw2. Events are in RAW
+    # history-label space (ExitMachine settles against never-renamed history),
+    # so the composed correction from f7 on must be raw1->2, raw2->3, raw3->1
+    # (output label i always carries physical robot i's box).
+    cfg = SelectiveConfig()
+    b1 = (10, 10, 30, 30)      # raw stream 1's box
+    b2 = (50, 10, 70, 30)      # raw stream 2's box
+    b3 = (110, 10, 130, 30)    # raw stream 3's box
+    history = {f: {1: _obs(b1), 2: _obs(b2), 3: _obs(b3)} for f in range(10)}
+    o12 = WindowOutcome(
+        spec=WindowSpec(oid=1, seed_frame=0, entry_frame=3, trigger="margin"),
+        state="swap", swap_to=2, close_frame=5, masks={}, probs={})
+    o23 = WindowOutcome(
+        spec=WindowSpec(oid=2, seed_frame=4, entry_frame=7, trigger="margin"),
+        state="swap", swap_to=3, close_frame=9, masks={}, probs={})
+    results, renames = merge_selective_results(history, [o12, o23], cfg)
+    assert [(e.frame, {e.a, e.b}) for e in renames] == [(3, {1, 2}), (7, {2, 3})]
+    # pre-f3: identity
+    for f in (0, 1, 2):
+        assert results[f][1]["box"] == b1
+        assert results[f][2]["box"] == b2
+        assert results[f][3]["box"] == b3
+    # f3-f6: only (1,2) -> label1=raw2, label2=raw1, label3=raw3
+    for f in (3, 4, 5, 6):
+        assert results[f][1]["box"] == b2
+        assert results[f][2]["box"] == b1
+        assert results[f][3]["box"] == b3
+    # >= f7: composed cycle raw1->2, raw2->3, raw3->1 ->
+    # label1=raw3's entry, label2=raw1's, label3=raw2's.
+    for f in (7, 8, 9):
+        assert results[f][1]["box"] == b3
+        assert results[f][2]["box"] == b1
+        assert results[f][3]["box"] == b2
+
+
 def test_merge_rename_dedup_identical_pairs():
     cfg = SelectiveConfig()
     box = (10, 10, 30, 30)

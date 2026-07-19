@@ -611,26 +611,29 @@ def _apply_renames(results, events):
     when a later, independent swap lands (1<->2 at f=3 and 3<->4 at f=7 both
     apply from f=7 on) and makes a same-pair re-swap cancel out (swap twice =
     identity from the second event onward -- SAM detected a swap back).
+
+    Events live in RAW history-label space (the ExitMachine settles against
+    the never-renamed TBD history), so each transposition composes on the
+    INPUT (raw) side of the running raw->corrected mapping: raw streams a and
+    b trade their corrected destinations. Chains sharing an oid depend on
+    this direction: (1,2)@f3 then (2,3)@f7 must yield raw1->2, raw2->3,
+    raw3->1 (physical robot i keeps output label i), not the inverse cycle.
     """
     if not events:
         return
     # Chronological order; pair order breaks ties deterministically when two
     # distinct transpositions share a frame.
     ordered = sorted(events, key=lambda e: (e.frame, min(e.a, e.b), max(e.a, e.b)))
-    perm: dict[int, int] = {}          # composed relabel: original -> current
+    perm: dict[int, int] = {}          # composed relabel: raw oid -> corrected
     ei = 0
     for f in sorted(results):
         while ei < len(ordered) and ordered[ei].frame <= f:
             ev = ordered[ei]
             ei += 1
-            # Compose the transposition on the OUTPUT side of the running
-            # mapping: labels currently equal to a/b trade places.
-            swap = {ev.a: ev.b, ev.b: ev.a}
-            new = {}
-            for x in set(perm) | {ev.a, ev.b}:
-                y = perm.get(x, x)
-                new[x] = swap.get(y, y)
-            perm = {k: v for k, v in new.items() if k != v}
+            # Input-side composition: raw a and b swap corrected destinations.
+            va, vb = perm.get(ev.a, ev.a), perm.get(ev.b, ev.b)
+            perm[ev.a], perm[ev.b] = vb, va
+            perm = {k: v for k, v in perm.items() if k != v}
         if not perm:
             continue
         relabeled = {perm.get(oid, oid): entry

@@ -344,17 +344,24 @@ KNOBS = [
     Knob("hardneg_mine", "HARDNEG_MINE", bool, False,
          section="Track hygiene"),
     # Late-seed backward backfill: a robot first detected at a LATE reprompt
-    # boundary (e.g. +6s) is forward-only today, permanently losing its
-    # earlier history even though SAM2/SAM3 can propagate backward from the
-    # seed frame just as well as forward. When True, after the forward
-    # tracking loop finishes, each surviving late-seeded object is re-prompted
-    # at its own seed frame and propagated backward a bounded span
+    # boundary (e.g. +6s) was forward-only, permanently losing its earlier
+    # history even though SAM2/SAM3 can propagate backward from the seed
+    # frame just as well as forward. When True, after the forward tracking
+    # loop finishes, each surviving late-seeded object is re-prompted at its
+    # own seed frame and propagated backward a bounded span
     # (backfill_seconds), merging recovered masks into the results dict
-    # (never clobbering a frame an earlier object already occupies). DEFAULT
-    # OFF pending A/B — module env default (SAM2_LATE_SEED_BACKFILL) stays off
-    # for direct/library callers; the pipeline passes this Knob value into
-    # track().
-    Knob("late_seed_backfill", "SAM2_LATE_SEED_BACKFILL", bool, False,
+    # (never clobbering a frame an earlier object already occupies).
+    # DEFAULT ON — validated 2026-07-18 (qm11 auto A/B, 3 runs/arm on the
+    # sprint stack): agg meanNN 1.105 -> 0.743/0.743/0.913 (baseline
+    # byte-identical across runs; the backfill arm has residual
+    # nondeterminism), red meanNN halved (0.972 -> ~0.45-0.50), late-seeded
+    # teams recovered (6800 21->85/85/58%, 1477 43->99%, 2992 7->100%,
+    # start-lags -> 0), ~+20% auto-job wall time. The apparent 4786 coverage
+    # drop is a Hungarian pairing flip in compare_manta over identical
+    # physical tracks, not lost tracking. Module env default
+    # (SAM2_LATE_SEED_BACKFILL) stays off for direct/library callers; the
+    # pipeline passes this Knob value into track().
+    Knob("late_seed_backfill", "SAM2_LATE_SEED_BACKFILL", bool, True,
          section="Track hygiene"),
     # How far back to recover, in wall-clock seconds (converted to frames the
     # same way reprompt_seconds is, and rescaled for decimated corner views).

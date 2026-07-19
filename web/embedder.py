@@ -1,8 +1,9 @@
-"""DINOv2 appearance embeddings for robot re-identification.
+"""Appearance embeddings (DINOv3 ViT-S by default) for robot re-identification.
 
 FRC-agnostic: images in, L2-normalized vectors out. Swap the embedding backend
-by setting ROBOT_EMBEDDER_MODEL (e.g. to a SigLIP checkpoint, or to a
-"timm/..." name for the timm backend below) — no caller changes.
+by setting ROBOT_EMBEDDER_MODEL (e.g. to a SigLIP checkpoint, a transformers
+name like facebook/dinov2-small, or a "timm/..." name for the timm backend
+below) — no caller changes.
 """
 from __future__ import annotations
 
@@ -12,9 +13,13 @@ from typing import Optional
 import cv2
 import numpy as np
 
-DEFAULT_MODEL = "facebook/dinov2-small"  # 384-dim CLS embedding
-# Active model, resolved once at import time. Lets a DINOv3 rollout be an
-# environment flip (e.g. ROBOT_EMBEDDER_MODEL=timm/vit_small_patch16_dinov3.lvd1689m)
+# DINOv3 ViT-S, 384-dim CLS via the timm backend (the facebook/ repos are HF-
+# gated; the timm/ mirror is open). Beats dinov2-small on the production-crop
+# re-ID eval — relink AUC 0.9525 vs 0.9420; at the 0.55 relink floor 82.8%/4.86%
+# true/false pass vs 80.3%/5.92% — with the same similarity scale.
+DEFAULT_MODEL = "timm/vit_small_patch16_dinov3.lvd1689m"
+# Active model, resolved once at import time. Lets an embedder rollout/rollback
+# be an environment flip (e.g. ROBOT_EMBEDDER_MODEL=facebook/dinov2-small)
 # with no code change; RobotEmbedder() with no args picks this up.
 ACTIVE_MODEL = os.environ.get("ROBOT_EMBEDDER_MODEL", DEFAULT_MODEL)
 MIN_CROP_PX = 10  # boxes smaller than this on either side yield no embedding

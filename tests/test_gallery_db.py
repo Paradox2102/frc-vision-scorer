@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 import web.database as database
-from web.embedder import ACTIVE_MODEL, DEFAULT_MODEL
+from web.embedder import ACTIVE_MODEL
 
 
 @pytest.fixture()
@@ -17,18 +17,26 @@ def _emb_bytes(*vals):
     return np.array(vals, dtype=np.float32).tobytes()
 
 
+# Production writes always stamp embed_model with the live embedder's
+# model_name (gallery reads are scoped to the active model, NULL == the
+# pre-migration dinov2-small legacy); the generic CRUD tests below stamp
+# ACTIVE_MODEL the same way so they test their own semantics, not the tag's.
+
 def test_insert_and_fetch_gallery_exemplars_by_event(db):
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026wamon", "team": "1787", "alliance_color": "blue",
         "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        "embed_model": ACTIVE_MODEL,
     }))
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026wamon", "team": "254", "alliance_color": "red",
         "embedding": _emb_bytes(0, 1, 0), "legibility": 0.8,
+        "embed_model": ACTIVE_MODEL,
     }))
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026other", "team": "9", "alliance_color": "red",
         "embedding": _emb_bytes(0, 0, 1), "legibility": 0.7,
+        "embed_model": ACTIVE_MODEL,
     }))
 
     rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
@@ -50,10 +58,12 @@ def test_get_gallery_exemplars_filters_to_match_teams(db):
         asyncio.run(db.insert_gallery_exemplar({
             "event_key": "2026hop", "team": team, "alliance_color": "blue",
             "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+            "embed_model": ACTIVE_MODEL,
         }))
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026other", "team": "573", "alliance_color": "blue",
         "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
+        "embed_model": ACTIVE_MODEL,
     }))
 
     roster = ["573", 9785, "581", "1732", "4698", "3297", "573"]
@@ -71,6 +81,7 @@ def test_gallery_exemplar_records_source_job_id(db):
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026wamon", "team": "1787", "alliance_color": "blue",
         "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9, "job_id": "job-abc",
+        "embed_model": ACTIVE_MODEL,
     }))
     rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
     assert rows[0]["job_id"] == "job-abc"
@@ -81,6 +92,7 @@ def test_gallery_exemplar_job_id_optional(db):
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026wamon", "team": "254", "alliance_color": "red",
         "embedding": _emb_bytes(0, 1, 0), "legibility": 0.8,
+        "embed_model": ACTIVE_MODEL,
     }))
     rows = asyncio.run(db.get_gallery_exemplars("2026wamon"))
     assert rows[0]["job_id"] is None
@@ -108,6 +120,7 @@ def test_previous_gallery_exemplars_excludes_current_future_and_unknown(db):
             "alliance_color": "blue",
             "embedding": _emb_bytes(1, 0, 0),
             "legibility": 0.9,
+            "embed_model": ACTIVE_MODEL,
         }))
 
     rows = asyncio.run(db.get_previous_gallery_exemplars(
@@ -136,6 +149,7 @@ def test_previous_gallery_exemplars_verified_only(db):
             "embedding": _emb_bytes(1, 0, 0),
             "legibility": 0.9,
             "verified": verified,
+            "embed_model": ACTIVE_MODEL,
         }))
 
     rows = asyncio.run(db.get_previous_gallery_exemplars(
@@ -169,6 +183,7 @@ def test_previous_gallery_exemplars_verified_only_composes_with_team_filter(db):
             "embedding": _emb_bytes(1, 0, 0),
             "legibility": 0.9,
             "verified": verified,
+            "embed_model": ACTIVE_MODEL,
         }))
 
     rows = asyncio.run(db.get_previous_gallery_exemplars(
@@ -197,11 +212,15 @@ def test_gallery_load_filters_out_rows_from_a_different_embed_model(db):
     # must be invisible to gallery reads: comparing its vector against a
     # different backbone's vectors would be a garbage cosine comparison, not
     # a real re-ID signal. It should look like the exemplar doesn't exist.
+    # dinov2-small is the legacy backend — a genuinely different model from
+    # the DINOv3 default this suite normally runs with.
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026x", "team": "111", "alliance_color": "blue",
         "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
-        "embed_model": "timm/vit_small_patch16_dinov3.lvd1689m",
+        "embed_model": "facebook/dinov2-small",
     }))
+    if ACTIVE_MODEL == "facebook/dinov2-small":
+        pytest.skip("suite running with the legacy model as active")
     assert asyncio.run(db.get_gallery_exemplars("2026x")) == []
 
 
@@ -214,12 +233,13 @@ def test_gallery_load_treats_null_embed_model_as_dinov2_small(db):
         "embedding": _emb_bytes(1, 0, 0), "legibility": 0.9,
     }))
     rows = asyncio.run(db.get_gallery_exemplars("2026x"))
-    if ACTIVE_MODEL == DEFAULT_MODEL:
+    if ACTIVE_MODEL == "facebook/dinov2-small":
+        # Only a dinov2-small process may see a NULL (== dinov2-small) row.
         assert len(rows) == 1
         assert rows[0]["embed_model"] is None  # stored as NULL...
     else:
-        # ...but if this suite ever runs with ROBOT_EMBEDDER_MODEL pointed at
-        # something else, a NULL (== dinov2-small) row correctly stays hidden.
+        # ...under the DINOv3 default (or any other model) the legacy row
+        # correctly stays hidden — its vectors live in a different space.
         assert rows == []
 
 

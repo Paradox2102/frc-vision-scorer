@@ -231,13 +231,15 @@ MASK_LEAK_MAX_FRAC = float(os.environ.get("SAM2_MASK_LEAK_MAX_FRAC", "0.15"))
 MASK_LEAK_GAP_PX = float(os.environ.get("SAM2_MASK_LEAK_GAP_PX", "10"))
 
 # Late-seed backward backfill. YOLO seeds an object only at the prompt frame
-# or a later reprompt boundary; a robot first detected at +6s is forward-only
-# today, so its first ~6s of history is permanently lost even though SAM2/SAM3
+# or a later reprompt boundary; a robot first detected at +6s was forward-only,
+# so its first ~6s of history was permanently lost even though SAM2/SAM3
 # can propagate backward from the seed frame exactly as well as forward. After
 # the forward tracking loop finishes, each surviving late-seeded object is
 # re-prompted at its OWN seed frame and propagated backward a bounded span;
 # recovered masks are merged into `results` (never overwriting a frame an
-# earlier/original object already occupies). DEFAULT OFF pending A/B.
+# earlier/original object already occupies). The pipeline knob
+# (late_seed_backfill in job_config.py) defaults ON since 2026-07-18 (qm11
+# validated); this module env default stays OFF for direct/library callers.
 LATE_SEED_BACKFILL = os.environ.get(
     "SAM2_LATE_SEED_BACKFILL", "0") not in ("0", "false", "False")
 # Max frames to propagate backward from an object's seed frame.
@@ -1280,7 +1282,9 @@ class Sam2FieldTracker:
                 (see :data:`BACKFILL_OVERLAP_IOS`) rather than double-counting
                 the same robot under two ids. Backward propagation for one
                 object stops early after :data:`BACKFILL_DARK_STOP` consecutive
-                frames with no recovered mask. DEFAULT OFF pending A/B.
+                frames with no recovered mask. The pipeline knob defaults ON
+                since 2026-07-18 (qm11 validated); the module env default
+                (SAM2_LATE_SEED_BACKFILL) stays off for library callers.
             backfill_max_frames: Max frames to propagate backward from an
                 object's seed frame. ``None``-like knobs resolve to
                 :data:`BACKFILL_MAX_FRAMES`.

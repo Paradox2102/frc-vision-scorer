@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import web.database as database
+from web.embedder import ACTIVE_MODEL
 
 
 @pytest.fixture()
@@ -25,11 +26,15 @@ def _emb_bytes(*vals):
 
 
 def test_insert_gallery_exemplars_batch(db):
+    # embed_model stamped like the finalize-time writes these batch functions
+    # mirror (gallery reads are scoped to the active model).
     rows = [
         {"event_key": "2026hop", "team": "4174", "alliance_color": "blue",
-         "embedding": _emb_bytes(1, 0), "legibility": 0.9, "job_id": "j1"},
+         "embedding": _emb_bytes(1, 0), "legibility": 0.9, "job_id": "j1",
+         "embed_model": ACTIVE_MODEL},
         {"event_key": "2026hop", "team": "401", "alliance_color": "red",
-         "embedding": _emb_bytes(0, 1), "legibility": 0.8, "job_id": "j1"},
+         "embedding": _emb_bytes(0, 1), "legibility": 0.8, "job_id": "j1",
+         "embed_model": ACTIVE_MODEL},
     ]
     asyncio.run(db.insert_gallery_exemplars(rows))
     got = asyncio.run(db.get_gallery_exemplars("2026hop"))

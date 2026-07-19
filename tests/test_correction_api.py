@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web.database as database
+from web.embedder import ACTIVE_MODEL
 
 
 @pytest.fixture()
@@ -34,9 +35,12 @@ def _seed(rid="job-1", event_key="2026x", alliance="blue",
         "confidence": 0.9,
     }))
     emb = np.array([1, 0, 0], np.float32).tobytes() if with_embedding else None
+    # Crops are stamped with the live embedder's model in production; the
+    # correction mint carries the tag onto the exemplar, and gallery reads
+    # are scoped to the active model.
     asyncio.run(database.insert_match_robot_crop({
         "job_id": rid, "slot": 0, "legibility": 0.8,
-        "embedding": emb, "image": b"img",
+        "embedding": emb, "image": b"img", "embed_model": ACTIVE_MODEL,
     }))
 
 

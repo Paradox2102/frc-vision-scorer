@@ -7,14 +7,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-from web.embedder import ACTIVE_MODEL, DEFAULT_MODEL
+from web.embedder import ACTIVE_MODEL
 
 DB_PATH = Path(__file__).parent.parent / "frc_scorer.db"
 
-# Every row written before this feature shipped was embedded with dinov2-small;
-# NULL embed_model (pre-migration rows, or a row some other path forgot to
-# stamp) is treated as that model rather than as "unknown".
-_LEGACY_EMBED_MODEL = DEFAULT_MODEL
+# Every row written before the embed_model column shipped was embedded with
+# dinov2-small; NULL embed_model (pre-migration rows, or a row some other path
+# forgot to stamp) is treated as that model rather than as "unknown". The
+# LITERAL is intentional and must NOT track embedder.DEFAULT_MODEL: when the
+# default flipped to DINOv3 (2026-07-18), an alias would have silently
+# re-attributed every legacy dinov2 row to the new model — exactly the
+# cross-embedding-space contamination this tag exists to prevent.
+_LEGACY_EMBED_MODEL = "facebook/dinov2-small"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (

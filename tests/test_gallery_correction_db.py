@@ -2,6 +2,7 @@ import asyncio
 import numpy as np
 import pytest
 import web.database as database
+from web.embedder import ACTIVE_MODEL
 
 
 @pytest.fixture()
@@ -37,9 +38,12 @@ def test_identity_upsert_replaces(db):
 
 
 def test_gallery_has_image_and_verified_columns_and_crud(db):
+    # embed_model stamped like every production write (reads are scoped to
+    # the active model; NULL means the pre-migration dinov2-small legacy).
     asyncio.run(db.insert_gallery_exemplar({
         "event_key": "2026x", "team": "1787", "alliance_color": "blue",
-        "embedding": _b(1, 0, 0), "legibility": 0.9, "image": b"img", "verified": 1}))
+        "embedding": _b(1, 0, 0), "legibility": 0.9, "image": b"img", "verified": 1,
+        "embed_model": ACTIVE_MODEL}))
     rows = asyncio.run(db.get_gallery_exemplars("2026x"))
     assert rows[0]["verified"] == 1 and rows[0]["image"] == b"img" and "id" in rows[0]
     gid = rows[0]["id"]
@@ -64,7 +68,8 @@ def test_gallery_migration_adds_columns_to_old_table(tmp_path, monkeypatch):
     asyncio.run(database.init_db())  # must ALTER-add image + verified without error
     asyncio.run(database.insert_gallery_exemplar({
         "event_key": "e", "team": "9", "alliance_color": "red",
-        "embedding": _b(0, 1, 0), "legibility": 0.5, "image": b"i", "verified": 1}))
+        "embedding": _b(0, 1, 0), "legibility": 0.5, "image": b"i", "verified": 1,
+        "embed_model": ACTIVE_MODEL}))
     assert asyncio.run(database.get_gallery_exemplars("e"))[0]["verified"] == 1
 
 

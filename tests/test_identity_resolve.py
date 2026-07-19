@@ -123,34 +123,60 @@ def test_alliance_separation():
 
 
 def test_tie_break_prefers_more_assignments_then_lex():
-    # Two candidates tie on total score: {0: "1111"} alone (score 3.0) vs
-    # {0: "1111", 1: "2222"} (score 3.0 + 0.0 -> but 2222 must clear min_score).
-    # Construct so that assigning slot 1 costs nothing (adds a qualifying,
-    # score-equal pair) so total score ties but assigned-count differs.
+    # --- Clause 1: prefer MORE assigned slots on a genuine total-score tie. ---
+    #
+    # Slot scores (reads only, w_gallery contributes nothing):
+    #   slot0: 1111->1.0, 2222->0.5   slot1: 1111->0.5   slot2: (none)
+    # Valid (>= min_score=0.5) pairs: (0,1111)=1.0, (0,2222)=0.5, (1,1111)=0.5.
+    #
+    # The two maximal candidates tie at total 1.0 but differ in assigned count:
+    #   A = {0: 1111}            -> 1.0, 1 slot
+    #   B = {0: 2222, 1: 1111}   -> 0.5 + 0.5 = 1.0, 2 slots
+    # No candidate exceeds 1.0: 1111 (the only >0.5 slot1 team) cannot occupy
+    # both slot0 and slot1, so the best 2-slot total is exactly 2222+1111=1.0.
+    # The assigned-count clause MUST pick B. A count-blind solver would pick A
+    # (its lex key (0,"1111") sorts before B's, so lex alone favors A) and
+    # leave slot 1 None -- which is exactly the bug this test guards against.
     evidence = {
-        0: _ev(0, "blue", read_scores={"1111": 3.0}),
-        1: _ev(1, "blue", read_scores={"2222": 3.0}),
+        0: _ev(0, "blue", read_scores={"1111": 1.0, "2222": 0.5}),
+        1: _ev(1, "blue", read_scores={"1111": 0.5}),
     }
-    roster = ["1111", "2222"]
+    roster = ["1111", "2222", "3333"]
     result = assign_teams_global(evidence, blue_roster=roster, red_roster=[], min_score=0.5)
-    # Assigning both slots (total 6.0) strictly beats assigning only one (3.0),
-    # so this exercises the "more assigned slots" path via the score ordering
-    # already, but also confirms the deterministic single optimum:
-    assert result[0] == "1111"
-    assert result[1] == "2222"
+    assert result == {0: "2222", 1: "1111", 2: None, 3: None, 4: None, 5: None}
 
-    # Now force an actual tie in total score with a genuine choice: two ways
-    # to reach the same max total, prefer more assigned slots, then lex order.
+    # --- Clause 2: on an EQUAL-count tie, lexicographically smallest wins. ---
+    # Only slot 0 has evidence; both teams tie at 5.0. Both candidates are
+    # 1-slot, so the count clause can't break it -> lex: (0,"1111") < (0,"2222").
     evidence2 = {
         0: _ev(0, "blue", read_scores={"1111": 5.0, "2222": 5.0}),
     }
-    # Only slot 0 has evidence; both candidate teams tie at 5.0. Assigning
-    # either is a 1-slot candidate with equal score -> lexicographically
-    # smallest (slot_id, team) tuple wins: (0, "1111") < (0, "2222").
     result2 = assign_teams_global(
         evidence2, blue_roster=["1111", "2222"], red_roster=[], min_score=0.5
     )
     assert result2[0] == "1111"
+
+
+def test_weights_thread_through_solver():
+    # Reads favor "1111", gallery favors "2222". At the default w_gallery=0.4
+    # the read weight dominates and "1111" wins; crank w_gallery up and the
+    # blend flips the winner to "2222" -- proving both weights actually thread
+    # through assign_teams_global (not just combine_scores in isolation).
+    ev = _ev(
+        0, "blue",
+        read_scores={"1111": 2.0},
+        gallery_scores={"2222": 3.0},
+    )
+    # Default weights: 1111 -> 2.0, 2222 -> 0.4 * 3.0 = 1.2 -> 1111 wins.
+    default = assign_teams_global(
+        {0: ev}, blue_roster=["1111", "2222"], red_roster=[], min_score=0.5
+    )
+    assert default[0] == "1111"
+    # High gallery weight: 1111 -> 2.0, 2222 -> 1.0 * 3.0 = 3.0 -> 2222 wins.
+    weighted = assign_teams_global(
+        {0: ev}, blue_roster=["1111", "2222"], red_roster=[], w_gallery=1.0, min_score=0.5
+    )
+    assert weighted[0] == "2222"
 
 
 # ---------------------------------------------------------------------------

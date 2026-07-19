@@ -460,6 +460,8 @@ class ExitMachine:
         self.cfg = cfg
         self.history = history
         self.frame_hw = frame_hw
+        # Stored but not read here: carried for interface compatibility with
+        # Task 4's call site (the orchestrator prompts SAM with these boxes).
         self.seed_boxes = seed_boxes
         self._wins = [_WinState(s) for s in group]
         self._pair_streak: dict[tuple[int, int], int] = {}
@@ -601,27 +603,39 @@ class ExitMachine:
 
 # -- merge into the sam2_raw schema ------------------------------------------
 def _apply_renames(results, events):
-    """Relabel oids in-place per the SWAP rename events. For each frame the
-    single latest event group (max ``frame`` <= f) applies; each transposition
-    is applied sequentially so the frame dict is a clean relabel."""
+    """Relabel oids in-place per the SWAP rename events.
+
+    For frame f, ALL events with ``event.frame <= f`` compose in ascending
+    frame order: each event is a transposition (a<->b) applied to the running
+    label permutation. Composition keeps every earlier correction in effect
+    when a later, independent swap lands (1<->2 at f=3 and 3<->4 at f=7 both
+    apply from f=7 on) and makes a same-pair re-swap cancel out (swap twice =
+    identity from the second event onward -- SAM detected a swap back).
+    """
     if not events:
         return
+    # Chronological order; pair order breaks ties deterministically when two
+    # distinct transpositions share a frame.
+    ordered = sorted(events, key=lambda e: (e.frame, min(e.a, e.b), max(e.a, e.b)))
+    perm: dict[int, int] = {}          # composed relabel: original -> current
+    ei = 0
     for f in sorted(results):
-        applicable = [e for e in events if e.frame <= f]
-        if not applicable:
+        while ei < len(ordered) and ordered[ei].frame <= f:
+            ev = ordered[ei]
+            ei += 1
+            # Compose the transposition on the OUTPUT side of the running
+            # mapping: labels currently equal to a/b trade places.
+            swap = {ev.a: ev.b, ev.b: ev.a}
+            new = {}
+            for x in set(perm) | {ev.a, ev.b}:
+                y = perm.get(x, x)
+                new[x] = swap.get(y, y)
+            perm = {k: v for k, v in new.items() if k != v}
+        if not perm:
             continue
-        max_frame = max(e.frame for e in applicable)
-        pairs = sorted({(min(e.a, e.b), max(e.a, e.b))
-                        for e in applicable if e.frame == max_frame})
-        frame = dict(results[f])
-        for a, b in pairs:
-            ea = frame.pop(a, None)
-            eb = frame.pop(b, None)
-            if eb is not None:
-                frame[a] = eb
-            if ea is not None:
-                frame[b] = ea
-        results[f] = frame
+        relabeled = {perm.get(oid, oid): entry
+                     for oid, entry in results[f].items()}
+        results[f] = {oid: relabeled[oid] for oid in sorted(relabeled)}
 
 
 def merge_selective_results(history, outcomes, cfg: SelectiveConfig):

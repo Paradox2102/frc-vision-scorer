@@ -375,6 +375,58 @@ def test_degraded_abort_leaves_tbd_unchanged():
     assert ren_a == [] and ren_b == []
 
 
+def test_merge_two_disjoint_swap_windows_compose():
+    # Two independent SWAP windows: 1<->2 effective frame 3, 3<->4 effective
+    # frame 7. Frames >= 7 must carry BOTH corrections (renames compose; the
+    # later event must not drop the earlier one).
+    cfg = SelectiveConfig()
+    b1 = (10, 10, 30, 30)
+    b2 = (50, 10, 70, 30)
+    b3 = (110, 10, 130, 30)
+    b4 = (150, 10, 170, 30)
+    history = {f: {1: _obs(b1), 2: _obs(b2), 3: _obs(b3), 4: _obs(b4)}
+               for f in range(10)}
+    o12 = WindowOutcome(
+        spec=WindowSpec(oid=1, seed_frame=0, entry_frame=3, trigger="margin"),
+        state="swap", swap_to=2, close_frame=5, masks={}, probs={})
+    o34 = WindowOutcome(
+        spec=WindowSpec(oid=3, seed_frame=4, entry_frame=7, trigger="margin"),
+        state="swap", swap_to=4, close_frame=9, masks={}, probs={})
+    results, renames = merge_selective_results(history, [o12, o34], cfg)
+    assert [(e.frame, {e.a, e.b}) for e in renames] == [(3, {1, 2}), (7, {3, 4})]
+    # before any event: original labels
+    assert results[2][1]["box"] == b1 and results[2][3]["box"] == b3
+    # frames 3-6: only 1<->2 applied
+    assert results[4][1]["box"] == b2 and results[4][2]["box"] == b1
+    assert results[4][3]["box"] == b3 and results[4][4]["box"] == b4
+    # frames >= 7: BOTH corrections in effect
+    for f in (7, 8, 9):
+        assert results[f][1]["box"] == b2 and results[f][2]["box"] == b1
+        assert results[f][3]["box"] == b4 and results[f][4]["box"] == b3
+
+
+def test_merge_same_pair_reswap_is_identity():
+    # 1<->2 at frame 3, then 1<->2 again at frame 9 (SAM detected a swap back):
+    # frames 3-8 swapped, frames >= 9 back to the original labels.
+    cfg = SelectiveConfig()
+    b1 = (10, 10, 30, 30)
+    b2 = (50, 10, 70, 30)
+    history = {f: {1: _obs(b1), 2: _obs(b2)} for f in range(12)}
+    first = WindowOutcome(
+        spec=WindowSpec(oid=1, seed_frame=0, entry_frame=3, trigger="margin"),
+        state="swap", swap_to=2, close_frame=5, masks={}, probs={})
+    back = WindowOutcome(
+        spec=WindowSpec(oid=1, seed_frame=6, entry_frame=9, trigger="margin"),
+        state="swap", swap_to=2, close_frame=11, masks={}, probs={})
+    results, renames = merge_selective_results(history, [first, back], cfg)
+    assert len(renames) == 2                       # distinct frames: no dedup
+    assert results[2][1]["box"] == b1              # pre-event
+    for f in range(3, 9):                          # swapped span
+        assert results[f][1]["box"] == b2 and results[f][2]["box"] == b1
+    for f in range(9, 12):                         # composed back to identity
+        assert results[f][1]["box"] == b1 and results[f][2]["box"] == b2
+
+
 def test_merge_rename_dedup_identical_pairs():
     cfg = SelectiveConfig()
     box = (10, 10, 30, 30)

@@ -2719,3 +2719,244 @@ class Sam2FieldTracker:
                 predictor.reset_state(state)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Selective mask propagation (arXiv 2606.13033 re-implementation)
+    # ------------------------------------------------------------------
+    def track_selective(
+        self,
+        frames_dir: str,
+        detect_frame_fn,
+        cfg,
+        progress_cb=None,
+        should_stop=None,
+    ) -> dict:
+        """Per-frame tracking-by-detection everywhere, SAM only in ambiguity.
+
+        Orchestrates the pure Task 2/3 logic against the real predictor
+        protocol: run cheap TBD over every exported frame, find the few
+        ambiguous windows, and pay for SAM mask propagation *only* inside those
+        windows. Completely independent of :meth:`track` -- when the selective
+        feature is off this method is simply never called, so it is a pure
+        addition with zero behaviour change to the existing pipeline.
+
+        Args:
+            frames_dir: Directory of zero-padded JPEG frames (``00000.jpg`` …);
+                the local frame index equals the numeric filename.
+            detect_frame_fn: ``fn(local_idx, frame_path) -> list[(box_xyxy_export,
+                color)]`` -- the per-frame detections fed to the TBD tracker.
+            cfg: A :class:`~web.field.selective_prop.SelectiveConfig`.
+            progress_cb: Optional ``fn(done, total)`` called once per enumerated
+                frame during the TBD phase (caller handles any throttling).
+            should_stop: Optional ``fn() -> bool`` polled once per enumerated
+                frame; when it trips, the TBD-only partial is merged and returned
+                immediately without touching the predictor.
+
+        Returns:
+            A ``sam2_raw``-schema dict ``{frame: {oid: {"box", "mask",
+            "evidence"}}}`` (see :func:`merge_selective_results`).
+
+        Side effects:
+            Sets ``self.selective_stats`` = ``{"frames": int, "windows": int,
+            "sam_frames": int, "outcomes": {state: count}, "renames": int,
+            "skipped": int}`` where ``sam_frames`` is the total number of frames
+            actually fed to :class:`ExitMachine` across all groups (the cost
+            metric vs uniform propagation) and ``skipped`` counts specs defensively
+            dropped for lacking a seed-frame box. Also sets
+            ``self.selective_obj_colors`` = ``{oid: first_seen_color_or_None}``
+            (first non-None color per oid in frame order) -- an addition to the
+            plan's stats contract, consumed by the app's obj-color side channel.
+        """
+        import glob as _glob
+
+        from web.field.selective_prop import (  # local import: keep module load light
+            ExitMachine,
+            TbdTracker,
+            find_windows,
+            merge_selective_results,
+        )
+
+        predictor = self._predictor
+
+        # -- Phase A: per-frame TBD over every exported frame --------------
+        frame_paths = sorted(_glob.glob(os.path.join(frames_dir, "*.jpg")))
+        n_frames = len(frame_paths)
+        tbd = TbdTracker(cfg)
+        stopped = False
+        for i, path in enumerate(frame_paths):
+            try:
+                dets = detect_frame_fn(i, path) or []
+            except Exception:
+                dets = []
+            tbd.step(i, dets)
+            if progress_cb is not None:
+                try:
+                    progress_cb(i + 1, n_frames)
+                except Exception:
+                    pass
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
+
+        history = tbd.history
+
+        # Obj-color side channel: first non-None color per oid, in frame order.
+        obj_colors: dict = {}
+        for f in sorted(history):
+            for oid in sorted(history[f]):
+                c = history[f][oid].color
+                if oid not in obj_colors:
+                    obj_colors[oid] = c
+                elif obj_colors[oid] is None and c is not None:
+                    obj_colors[oid] = c
+        self.selective_obj_colors = obj_colors
+
+        # Cooperative stop: emit the pure-TBD partial, no SAM.
+        if stopped:
+            results, renames = merge_selective_results(history, [], cfg)
+            self.selective_stats = {
+                "frames": len(history), "windows": 0, "sam_frames": 0,
+                "outcomes": {}, "renames": len(renames), "skipped": 0,
+            }
+            return results
+
+        # -- Phase B: offline window construction --------------------------
+        specs = find_windows(history, tbd.gap_reappearances, n_frames, cfg)
+
+        # -- Phase C: run each seed-frame group against the predictor ------
+        frame_hw = self._selective_frame_hw(frame_paths)
+        groups: dict = {}
+        for spec in specs:
+            groups.setdefault(spec.seed_frame, []).append(spec)
+
+        all_outcomes: list = []
+        sam_frames = 0
+        skipped = 0
+        for seed_frame in sorted(groups):
+            group = groups[seed_frame]
+            seed_obs = history.get(seed_frame, {})
+            seed_boxes: dict = {}
+            kept: list = []
+            for spec in group:
+                # The seed walk requires the oid present at seed_frame, so this
+                # should never miss; guard defensively rather than KeyError.
+                if spec.oid not in seed_obs:
+                    skipped += 1
+                    continue
+                seed_boxes[spec.oid] = seed_obs[spec.oid].box
+                kept.append(spec)
+            if not kept:
+                continue
+
+            # Fresh init_state per seed-frame group (windows are expected few).
+            state = predictor.init_state(
+                video_path=frames_dir,
+                offload_video_to_cpu=self.offload_video_to_cpu,
+                offload_state_to_cpu=self.offload_state_to_cpu,
+            )
+            try:
+                # SAM3 solo-roster: confine the pass to this group's oids so the
+                # adapter's carried roster doesn't drag other objects along.
+                # Harmless for plain SAM2 states (guarded on dict support).
+                if isinstance(state, dict):
+                    state["solo_ids"] = set(seed_boxes)
+                for oid, box in seed_boxes.items():
+                    predictor.add_new_points_or_box(
+                        state, frame_idx=seed_frame, obj_id=oid,
+                        box=np.asarray(box, dtype=np.float32),
+                    )
+                machine = ExitMachine(kept, seed_boxes, frame_hw, history, cfg)
+                # Never propagate past the video end or the window budget.
+                span = min(cfg.window_max_frames,
+                           max(0, n_frames - 1 - seed_frame))
+                gen = self._selective_propagate(state, seed_frame, span)
+                try:
+                    for out in gen:
+                        # 3-tuples from SAM2 / stubs; 4-tuples (+tracker_probs)
+                        # from the SAM3 adapter.
+                        f_idx, obj_ids, mask_logits, *rest = out
+                        tracker_probs = rest[0] if rest else None
+                        masks_by_oid, probs_by_oid = self._selective_collect(
+                            obj_ids, mask_logits, tracker_probs)
+                        sam_frames += 1
+                        if machine.step(int(f_idx), masks_by_oid, probs_by_oid):
+                            break                    # all windows closed early
+                finally:
+                    # Unwind the propagate context managers and the SAM3
+                    # adapter's streaming session cleanly on early break / error.
+                    gen.close()
+                all_outcomes.extend(machine.outcomes())
+            finally:
+                if isinstance(state, dict):
+                    state["solo_ids"] = None
+                if hasattr(predictor, "reset_state"):
+                    predictor.reset_state(state)
+
+        # -- Phase D: merge + stats ----------------------------------------
+        results, renames = merge_selective_results(history, all_outcomes, cfg)
+        outcome_counts: dict = {}
+        for oc in all_outcomes:
+            outcome_counts[oc.state] = outcome_counts.get(oc.state, 0) + 1
+        self.selective_stats = {
+            "frames": len(history), "windows": len(specs),
+            "sam_frames": sam_frames, "outcomes": outcome_counts,
+            "renames": len(renames), "skipped": skipped,
+        }
+        return results
+
+    def _selective_frame_hw(self, frame_paths):
+        """``(H, W)`` of the exported frames for the ExitMachine border check."""
+        if not frame_paths:
+            return (0, 0)
+        import cv2
+        img = cv2.imread(frame_paths[0])
+        if img is None:
+            return (0, 0)
+        return (int(img.shape[0]), int(img.shape[1]))
+
+    def _selective_propagate(self, state, start_frame_idx,
+                             max_frame_num_to_track):
+        """``propagate_in_video`` wrapped exactly like :meth:`track`'s
+        ``_propagate`` helper: ``torch.inference_mode()`` + autocast on the real
+        backend, a bare generator on the stub path. Closing this generator early
+        (the caller breaks once the ExitMachine closes) throws ``GeneratorExit``
+        through the wrapper, unwinding the context managers and the SAM3
+        adapter's streaming session cleanly."""
+        predictor = self._predictor
+        kwargs = {"start_frame_idx": start_frame_idx,
+                  "max_frame_num_to_track": max_frame_num_to_track}
+        if self._real_torch:
+            import torch
+            with torch.inference_mode(), _maybe_autocast(self._device):
+                yield from predictor.propagate_in_video(state, **kwargs)
+        else:
+            yield from predictor.propagate_in_video(state, **kwargs)
+
+    def _selective_collect(self, obj_ids, mask_logits, tracker_probs):
+        """Logits -> per-oid 2-D bool masks (+ per-oid probs), mirroring
+        :meth:`track`'s collection at the ``_record_chunk`` site. Empty masks are
+        dropped so the ExitMachine reads a missing oid as dark. Real torch
+        tensors go through ``.cpu().numpy()``; plain-numpy stubs skip it."""
+        bool_arr = (mask_logits > 0)
+        if hasattr(bool_arr, "cpu"):            # torch tensor / SAM3 adapter
+            bool_arr = bool_arr.cpu().numpy()
+        bool_arr = np.asarray(bool_arr)
+        masks_by_oid: dict = {}
+        probs_by_oid: dict = {}
+        for i, obj_id in enumerate(obj_ids):
+            oid = int(obj_id)
+            if bool_arr.ndim == 4:
+                mask2d = bool_arr[i, 0]
+            elif bool_arr.ndim == 3:
+                mask2d = bool_arr[i]
+            else:
+                mask2d = bool_arr
+            mask2d = np.asarray(mask2d, dtype=bool)
+            if not mask2d.any():
+                continue                        # empty mask -> absent (dark)
+            masks_by_oid[oid] = mask2d
+            if tracker_probs is not None and i < len(tracker_probs):
+                probs_by_oid[oid] = float(tracker_probs[i])
+            else:
+                probs_by_oid[oid] = None
+        return masks_by_oid, probs_by_oid

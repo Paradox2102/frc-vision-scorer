@@ -356,6 +356,34 @@ def test_sam3_multiplex_knob_env_and_override(monkeypatch):
     assert cfg2.sam3_multiplex is False
 
 
+def test_selective_mask_prop_knob_default_off(monkeypatch):
+    monkeypatch.delenv("SELECTIVE_MASK_PROP", raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_mask_prop is False
+    assert cfg.selective_margin_entry == 0.05
+    assert cfg.selective_margin_exit == 0.10
+    assert cfg.selective_gap_trigger == 7
+    assert cfg.selective_min_streak == 5
+    assert cfg.selective_window_max_frames == 120
+
+
+def test_selective_mask_prop_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_MASK_PROP", "1")
+    assert JobConfig().selective_mask_prop is True
+    assert JobConfig({"selective_mask_prop": "false"}).selective_mask_prop is False
+    cfg = JobConfig({"selective_margin_entry": "0.2", "selective_window_max_frames": 60})
+    assert cfg.selective_margin_entry == 0.2
+    assert cfg.selective_window_max_frames == 60
+
+
+def test_selective_knob_bounds():
+    import pytest
+    with pytest.raises(ValueError):
+        JobConfig({"selective_margin_entry": 1.5})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_window_max_frames": 2})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

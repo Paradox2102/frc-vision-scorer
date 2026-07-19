@@ -145,6 +145,28 @@ KNOBS = [
     # occlusion behavior shifts. DEFAULT OFF pending qm8-qm12 A/B.
     Knob("sam3_multiplex", "SAM3_MULTIPLEX", bool, False,
          section="Tracking backend"),
+    # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
+    # skip full-frame mask propagation for a tracked object while its match is
+    # comfortably inside selective_margin_entry (in 1 - expanded-IoU cost
+    # units, the paper's cost metric) and only resume full propagation once
+    # the margin degrades past selective_margin_exit, a propagation-free gap
+    # reaches selective_gap_trigger frames, or the skipped window would exceed
+    # selective_window_max_frames. Margin/gap/streak values are the paper's
+    # defaults and are A/B-tunable. selective_margin_exit doubles as the seed
+    # margin and selective_min_streak doubles as SEED/EXIT_CONSECUTIVE.
+    # DEFAULT OFF pending qm8-qm12 A/B.
+    Knob("selective_mask_prop", "SELECTIVE_MASK_PROP", bool, False,
+         section="Tracking backend"),
+    Knob("selective_margin_entry", "SELECTIVE_MARGIN_ENTRY", float, 0.05,
+         min=0.0, max=1.0, section="Tracking backend"),
+    Knob("selective_margin_exit", "SELECTIVE_MARGIN_EXIT", float, 0.10,
+         min=0.0, max=1.0, section="Tracking backend"),
+    Knob("selective_gap_trigger", "SELECTIVE_GAP_TRIGGER", int, 7,
+         min=1, section="Tracking backend"),
+    Knob("selective_min_streak", "SELECTIVE_MIN_STREAK", int, 5,
+         min=1, section="Tracking backend"),
+    Knob("selective_window_max_frames", "SELECTIVE_WINDOW_MAX_FRAMES", int, 120,
+         min=8, section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

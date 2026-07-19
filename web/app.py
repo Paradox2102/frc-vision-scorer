@@ -1182,7 +1182,13 @@ class InferenceJob:
         )
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
         self._slot_crops: dict = {}   # slot_id -> list of {quality, crop_b64, embedding} (top-3)
-        self._slot_source: dict = {}  # slot_id -> "ocr" | "gallery" (last confirm source)
+        self._slot_source: dict = {}  # identity_id -> "ocr" | "gallery" | "global_resolve" (last confirm source)
+        # Global-resolve per-slot overrides (identity_id-keyed, same key space as
+        # _slot_source): the whole-match exact assignment writes the resolved team
+        # + confirmed here so the match_robot_identity DB row matches the replay
+        # overlay on changed slots. Empty unless global_identity_resolve is on.
+        self._resolved_team_by_slot: dict[int, str] = {}
+        self._resolved_confirmed_by_slot: dict[int, bool] = {}
         self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
@@ -5138,6 +5144,12 @@ class InferenceJob:
                     iid = assignments.get(ch["slot_id"])
                     if iid is not None:
                         self._slot_source[iid] = "global_resolve"
+                        # Propagate the resolved team + confirmed to the DB write
+                        # (7745) so match_robot_identity matches the replay overlay;
+                        # the live robot.team_number is deliberately left untouched.
+                        self._resolved_team_by_slot[iid] = ch["new_team"]
+                        self._resolved_confirmed_by_slot[iid] = bool(
+                            new_meta[ch["slot_id"]]["confirmed"])
                     print(f"  [global-resolve] {self._slot_label(ch['slot_id'])} "
                           f"{ch['old_team']}->{ch['new_team']} score={ch['score']:.2f} "
                           f"margin={ch['margin']:.2f}")
@@ -7742,8 +7754,13 @@ class InferenceJob:
                     identity_rows.append({
                         "job_id": self.job_id, "identity_id": identity_id, "slot": slot_id,
                         "slot_label": self._slot_label(slot_id),
-                        "alliance": robot.alliance, "team_number": robot.team_number,
-                        "confirmed": int(bool(robot.team_number_confirmed)),
+                        "alliance": robot.alliance,
+                        # Global-resolve override (empty when knob off -> falls back
+                        # to the live value, byte-identical to legacy behavior).
+                        "team_number": getattr(self, "_resolved_team_by_slot", {}).get(
+                            identity_id, robot.team_number),
+                        "confirmed": int(bool(getattr(self, "_resolved_confirmed_by_slot", {}).get(
+                            identity_id, robot.team_number_confirmed))),
                         "source": self._slot_source.get(identity_id, "ocr"),
                         "confidence": (crops[0]["quality"] if crops else None),
                     })

@@ -67,6 +67,63 @@ def test_reresolve_drops_phantom_prefix_from_frames_and_auto_paths():
     assert min(path_frames) == 120 and len(path_frames) == 12            # prefix pruned
 
 
+def _global_resolve_job(knob_on):
+    """A reresolve stub with the global_identity_resolve wiring in scope. Slot 0
+    (B1) has greedy team '9999' but its team_ocr_votes point at '1111' — with the
+    knob on, the exact assignment overrides it (no diag file -> votes fallback)."""
+    job = _job()
+    job.config = SimpleNamespace(global_identity_resolve=knob_on)
+    job.job_id = "test_gir_override_nonexistent"   # diag file absent -> votes fallback
+    job.gallery = None
+    job._slot_source = {}
+    job._resolved_team_by_slot = {}
+    job._resolved_confirmed_by_slot = {}
+    job.match_blue_teams = ["1111", "2222", "3333"]
+    job.match_red_teams = ["4444", "5555", "6666"]
+    for f in range(3):
+        job._identity_log.append({"frame_num": f, "identity_id": 1, "slot_id": 0,
+                                  "alliance": "blue", "pos": [1.0, 4.0],
+                                  "person_overlap": False, "confirmed": True})
+    job._replay.frames = [{"frame_num": f, "scores": {}, "robots": []} for f in range(3)]
+    job.robot_tracks = {1: SimpleNamespace(
+        team_number="9999", team_number_confirmed=False,
+        team_ocr_votes={"1111": 5.0}, appearance_embedding=None, alliance="blue")}
+    job._canonical_identity_slots = lambda: {0: 1}
+    job._get_display_team_number = lambda r: r.team_number if r else None
+    job._slot_alliance = InferenceJob._slot_alliance
+    job._slot_label = InferenceJob._slot_label
+    return job
+
+
+def test_global_resolve_populates_override_dicts_on_change():
+    """Knob ON: a slot whose exact-assignment team differs from the greedy live
+    value records the resolved team + confirmed in the DB-write override dicts
+    (identity_id-keyed), leaving the live robot.team_number untouched."""
+    job = _global_resolve_job(knob_on=True)
+    job._reresolve_replay_frames()
+    assert job._resolved_team_by_slot == {1: "1111"}       # override recorded
+    assert job._resolved_confirmed_by_slot == {1: True}    # margin 5.0 >= 2.0
+    assert job._slot_source == {1: "global_resolve"}
+    assert job.robot_tracks[1].team_number == "9999"       # live value NOT mutated
+    # DB-write consultation semantics: override wins for the changed identity,
+    # falls back to the live value for any identity without an override.
+    r = job.robot_tracks[1]
+    assert job._resolved_team_by_slot.get(1, r.team_number) == "1111"
+    assert job._resolved_team_by_slot.get(99, r.team_number) == "9999"
+
+
+def test_global_resolve_off_leaves_override_dicts_empty():
+    """Knob OFF: the whole block is skipped, so both override dicts stay empty and
+    the DB write falls back to the live team_number (byte-identical to legacy)."""
+    job = _global_resolve_job(knob_on=False)
+    job._reresolve_replay_frames()
+    assert job._resolved_team_by_slot == {}
+    assert job._resolved_confirmed_by_slot == {}
+    assert job._slot_source == {}
+    r = job.robot_tracks[1]
+    assert job._resolved_team_by_slot.get(1, r.team_number) == "9999"  # live fallback
+
+
 def test_reresolve_falls_back_on_catastrophic_drop():
     """Identity-churn can make the rebuild retain almost no rows; the guard must
     fall back to the slice-2 prune rather than ship a gutted replay."""

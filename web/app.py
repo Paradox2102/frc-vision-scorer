@@ -5081,6 +5081,72 @@ class InferenceJob:
                 "confirmed": bool(robot and robot.team_number_confirmed),
                 "alliance": self._slot_alliance(slot_id),
             }
+        if getattr(getattr(self, "config", None), "global_identity_resolve", False):
+            # Whole-match exact slot->team assignment: rewrite slot_meta before
+            # the per-slot rebuild consumes it. A resolve failure must never kill
+            # finalize — fall back to the greedy slot_meta built above.
+            try:
+                from web.field.identity_resolve import (
+                    build_slot_evidence, assign_teams_global, combine_scores,
+                    merge_global_assignment)
+                # 1. Raw VLM reads from this job's diagnostics JSONL. Skip
+                #    unparseable lines AND rows missing frame/robot_id (the builder
+                #    direct-indexes those). None if absent/empty -> builder falls back.
+                rows = []
+                diag_path = UPLOAD_DIR / f"diagnostic_{self.job_id}.jsonl"
+                if diag_path.exists():
+                    for line in diag_path.read_text().splitlines():
+                        try:
+                            r = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if r.get("type") == "vlm_read" and "frame" in r and "robot_id" in r:
+                            rows.append(r)
+                vlm_rows = rows or None
+                # 2. team_ocr_votes fallback source, keyed by slot via the same
+                #    assignments used to build slot_meta.
+                votes_by_slot = {
+                    sid: {str(k): float(v) for k, v in
+                          (self.robot_tracks[iid].team_ocr_votes or {}).items()}
+                    for sid, iid in assignments.items() if self.robot_tracks.get(iid)}
+                # 3. Gallery affinity per slot (skip if gallery disabled/absent).
+                gallery_by_slot = {}
+                if self.gallery is not None:
+                    for sid, iid in assignments.items():
+                        robot = self.robot_tracks.get(iid)
+                        emb = getattr(robot, "appearance_embedding", None) if robot else None
+                        if emb is None:
+                            continue
+                        ranked = self.gallery.query(emb, self._slot_alliance(sid))
+                        gallery_by_slot[sid] = {str(team): float(sim) for team, sim, *_ in ranked}
+                # 4. Rosters (already str in match_blue_teams/match_red_teams).
+                blue = [str(t) for t in (self.match_blue_teams or [])]
+                red = [str(t) for t in (self.match_red_teams or [])]
+                evidence, gstats = build_slot_evidence(
+                    vlm_rows, self._identity_log, votes_by_slot,
+                    gallery_by_slot, self._slot_alliance)
+                assignment = assign_teams_global(evidence, blue, red)
+                scores = {sid: combine_scores(ev) for sid, ev in evidence.items()}
+                # Normalize existing slot_meta team_number to str for a correct
+                # same-team compare (does not mutate the original entries).
+                norm_meta = {sid: {**m, "team_number": (str(m["team_number"])
+                             if m.get("team_number") is not None else None)}
+                             for sid, m in slot_meta.items()}
+                new_meta, changes = merge_global_assignment(norm_meta, assignment, scores)
+                slot_meta = new_meta
+                for ch in changes:
+                    iid = assignments.get(ch["slot_id"])
+                    if iid is not None:
+                        self._slot_source[iid] = "global_resolve"
+                    print(f"  [global-resolve] {self._slot_label(ch['slot_id'])} "
+                          f"{ch['old_team']}->{ch['new_team']} score={ch['score']:.2f} "
+                          f"margin={ch['margin']:.2f}")
+                print(f"  [global-resolve] {len(changes)} slot(s) changed; "
+                      f"reads_used={gstats['reads_used']} "
+                      f"dropped_misattr={gstats['reads_dropped_misattributed']} "
+                      f"fallback={gstats['fallback_used']}")
+            except Exception as e:
+                print(f"  [global-resolve] failed, keeping greedy slot_meta: {e}")
         frame_nums = [f["frame_num"] for f in rec.frames]
         orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
         rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts, frame_nums)

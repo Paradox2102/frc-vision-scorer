@@ -426,6 +426,14 @@ KNOBS = [
     # can't tell same-alliance robots apart to catch it.
     Knob("gallery_verified_only", "GALLERY_VERIFIED_ONLY", bool, True,
          section="Identity & votes"),
+    # Global exact slot->team assignment (identity layer): replaces the greedy
+    # final per-slot team arbitration with a whole-match exact assignment
+    # (collision-free, deterministic — eliminates the Hungarian-pairing-flip
+    # nondeterminism class); live mid-match voting is untouched. DEFAULT OFF
+    # pending qm8-qm12 A/B (metrics: confirmed-team accuracy, compare_manta
+    # --assign MISLABEL count, rerun stability).
+    Knob("global_identity_resolve", "GLOBAL_IDENTITY_RESOLVE", bool, False,
+         section="Identity & votes"),
     # --- cross-camera fusion ---
     # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,
     # so their range estimate is nearly meaningless (measured 1.1-3.8 m off on

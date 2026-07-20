@@ -2759,10 +2759,13 @@ class Sam2FieldTracker:
         Side effects:
             Sets ``self.selective_stats`` = ``{"frames": int, "windows": int,
             "sam_frames": int, "outcomes": {state: count}, "renames": int,
-            "skipped": int}`` where ``sam_frames`` is the total number of frames
-            actually fed to :class:`ExitMachine` across all groups (the cost
-            metric vs uniform propagation) and ``skipped`` counts specs defensively
-            dropped for lacking a seed-frame box. Also sets
+            "skipped": int, "episodes": int, "dropped_windows": int}`` where
+            ``sam_frames`` is the total number of frames actually fed to
+            :class:`ExitMachine` across all episodes (the cost metric vs uniform
+            propagation), ``skipped`` counts specs defensively dropped for lacking
+            a seed-frame box, ``episodes`` is the number of episodes actually run
+            (not budget-skipped), and ``dropped_windows`` is the total number of
+            specs whose episodes were dropped by the SAM-frame budget. Also sets
             ``self.selective_obj_colors`` = ``{oid: first_seen_color_or_None}``
             (first non-None color per oid in frame order) -- an addition to the
             plan's stats contract, consumed by the app's obj-color side channel.
@@ -2772,6 +2775,7 @@ class Sam2FieldTracker:
         from web.field.selective_prop import (  # local import: keep module load light
             ExitMachine,
             TbdTracker,
+            cluster_windows,
             find_windows,
             merge_selective_results,
         )
@@ -2817,59 +2821,91 @@ class Sam2FieldTracker:
             self.selective_stats = {
                 "frames": len(history), "windows": 0, "sam_frames": 0,
                 "outcomes": {}, "renames": len(renames), "skipped": 0,
+                "episodes": 0, "dropped_windows": 0,
             }
             return results
 
         # -- Phase B: offline window construction --------------------------
         specs = find_windows(history, tbd.gap_reappearances, n_frames, cfg)
 
-        # -- Phase C: run each seed-frame group against the predictor ------
+        # -- Phase C: run each episode against the predictor ---------------
+        # Interval-merged episodes (Design 1): one SAM session hosts a cluster
+        # of windows whose padded intervals overlap, even when their seed frames
+        # differ. cluster_windows returns them chronologically (by episode start
+        # = min seed), specs within an episode in (seed, entry, oid) order.
         frame_hw = self._selective_frame_hw(frame_paths)
-        groups: dict = {}
-        for spec in specs:
-            groups.setdefault(spec.seed_frame, []).append(spec)
+        episodes = cluster_windows(specs, cfg)
+
+        # Per-view SAM frame budget (Design 4): total frames fed to any machine,
+        # accumulated ACROSS episodes. ``sam_used`` is exactly the ``sam_frames``
+        # cost stat. Episodes run chronologically; a pre-check skips an
+        # over-budget episode (a smaller later one may still fit) and, once the
+        # budget is exhausted mid-episode, every remaining episode is dropped.
+        budget_frames = int(round(cfg.sam_budget_frac * n_frames))
 
         all_outcomes: list = []
-        sam_frames = 0
+        sam_used = 0
         skipped = 0
-        for seed_frame in sorted(groups):
-            group = groups[seed_frame]
-            seed_obs = history.get(seed_frame, {})
+        dropped_windows = 0
+        episodes_run = 0
+        budget_exhausted = False
+        for episode in episodes:
+            episode_start = episode[0].seed_frame          # min seed (sorted)
+            max_seed = max(spec.seed_frame for spec in episode)
+            max_entry = max(spec.entry_frame for spec in episode)
+
+            # Budget pre-check: conservative minimum cost to reach the last
+            # entry plus one settle streak. Skip the whole episode if it cannot
+            # fit; once the budget is exhausted, drop every remaining episode.
+            min_cost = (max_entry - episode_start) + cfg.min_streak
+            if budget_exhausted or sam_used + min_cost > budget_frames:
+                dropped_windows += len(episode)
+                continue
+
+            # Each oid is prompted at ITS OWN earliest seed frame (Design 2);
+            # dedupe oids that appear in more than one of the episode's specs.
+            oid_seed: dict = {}
+            for spec in episode:
+                cur = oid_seed.get(spec.oid)
+                if cur is None or spec.seed_frame < cur:
+                    oid_seed[spec.oid] = spec.seed_frame
+            # Resolve each oid's TBD seed box; defensively drop (count skipped)
+            # any oid missing from history at its seed frame -- the seed walk
+            # guarantees presence, so this should never actually fire.
             seed_boxes: dict = {}
-            kept: list = []
-            for spec in group:
-                # The seed walk requires the oid present at seed_frame, so this
-                # should never miss; guard defensively rather than KeyError.
-                if spec.oid not in seed_obs:
-                    skipped += 1
-                    continue
-                seed_boxes[spec.oid] = seed_obs[spec.oid].box
-                kept.append(spec)
+            for oid in sorted(oid_seed):
+                obs = history.get(oid_seed[oid], {})
+                if oid in obs:
+                    seed_boxes[oid] = obs[oid].box
+            kept = [spec for spec in episode if spec.oid in seed_boxes]
+            skipped += len(episode) - len(kept)
             if not kept:
                 continue
 
-            # Fresh init_state per seed-frame group (windows are expected few).
+            # Fresh init_state per episode (episodes are expected few).
             state = predictor.init_state(
                 video_path=frames_dir,
                 offload_video_to_cpu=self.offload_video_to_cpu,
                 offload_state_to_cpu=self.offload_state_to_cpu,
             )
             try:
-                # SAM3 solo-roster: confine the pass to this group's oids so the
-                # adapter's carried roster doesn't drag other objects along.
+                # SAM3 solo-roster: confine the pass to this episode's oids so
+                # the adapter's carried roster doesn't drag other objects along.
                 # Harmless for plain SAM2 states (guarded on dict support).
                 if isinstance(state, dict):
                     state["solo_ids"] = set(seed_boxes)
-                for oid, box in seed_boxes.items():
+                for oid in sorted(seed_boxes):
                     predictor.add_new_points_or_box(
-                        state, frame_idx=seed_frame, obj_id=oid,
-                        box=np.asarray(box, dtype=np.float32),
+                        state, frame_idx=oid_seed[oid], obj_id=oid,
+                        box=np.asarray(seed_boxes[oid], dtype=np.float32),
                     )
                 machine = ExitMachine(kept, seed_boxes, frame_hw, history, cfg)
-                # Never propagate past the video end or the window budget.
-                span = min(cfg.window_max_frames,
-                           max(0, n_frames - 1 - seed_frame))
-                gen = self._selective_propagate(state, seed_frame, span)
+                # Propagate from the episode start; the bound reaches the latest
+                # window's full span (the machine breaks earlier, and the
+                # generator is also naturally capped by the sequence end).
+                max_track = (max_seed + cfg.window_max_frames) - episode_start
+                max_track = min(max_track, max(0, n_frames - 1 - episode_start))
+                gen = self._selective_propagate(state, episode_start, max_track)
                 try:
                     for out in gen:
                         # 3-tuples from SAM2 / stubs; 4-tuples (+tracker_probs)
@@ -2878,14 +2914,24 @@ class Sam2FieldTracker:
                         tracker_probs = rest[0] if rest else None
                         masks_by_oid, probs_by_oid = self._selective_collect(
                             obj_ids, mask_logits, tracker_probs)
-                        sam_frames += 1
-                        if machine.step(int(f_idx), masks_by_oid, probs_by_oid):
+                        sam_used += 1
+                        closed = machine.step(
+                            int(f_idx), masks_by_oid, probs_by_oid)
+                        if sam_used >= budget_frames:
+                            # Budget hit mid-episode: stop the generator and let
+                            # outcomes() force-close every still-open window as
+                            # healthy END (masks so far are kept), then drop all
+                            # later episodes.
+                            budget_exhausted = True
+                            break
+                        if closed:
                             break                    # all windows closed early
                 finally:
                     # Unwind the propagate context managers and the SAM3
                     # adapter's streaming session cleanly on early break / error.
                     gen.close()
                 all_outcomes.extend(machine.outcomes())
+                episodes_run += 1
             finally:
                 if isinstance(state, dict):
                     state["solo_ids"] = None
@@ -2899,8 +2945,9 @@ class Sam2FieldTracker:
             outcome_counts[oc.state] = outcome_counts.get(oc.state, 0) + 1
         self.selective_stats = {
             "frames": len(history), "windows": len(specs),
-            "sam_frames": sam_frames, "outcomes": outcome_counts,
+            "sam_frames": sam_used, "outcomes": outcome_counts,
             "renames": len(renames), "skipped": skipped,
+            "episodes": episodes_run, "dropped_windows": dropped_windows,
         }
         return results
 

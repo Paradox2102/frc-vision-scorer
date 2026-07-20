@@ -291,3 +291,166 @@ def test_track_selective_no_windows_pure_tbd(tmp_path):
     assert pred.init_calls == 0
     for f in range(4):
         assert results[f][1]["evidence"]["type"] == "tbd"
+
+
+# ==========================================================================
+# Task B: episode execution (interval-merged windows) + per-view SAM budget.
+# ==========================================================================
+def _cfg_budget(frac):
+    """``_cfg()`` with a SAM-frame budget fraction (Design 4)."""
+    c = _cfg()
+    c.sam_budget_frac = frac
+    return c
+
+
+# Two robots that each gap out at slightly offset times: their padded
+# [seed-min_streak, entry+min_streak] intervals overlap so the two windows land
+# on DIFFERENT seed frames yet cluster into one episode. L->oid1 (present 0-4,
+# gap 5-7, back 8-11) yields (seed=2, entry=4); R->oid2 (present 0-3, gap 4-6,
+# back 7-11) yields (seed=1, entry=3). Disjoint boxes -> no witness, no margin.
+_L_PRESENT = set(range(0, 5)) | set(range(8, 12))
+_R_PRESENT = set(range(0, 4)) | set(range(7, 12))
+_TWO_WIN_DETS = {
+    f: ([(L, None)] if f in _L_PRESENT else [])
+    + ([(R, None)] if f in _R_PRESENT else [])
+    for f in range(12)
+}
+
+# One robot with TWO gaps far enough apart to stay TWO episodes: present 0-3,
+# gap 4-6, back 7-12, gap 13-15, back 16-18 -> windows (seed1, entry3) and
+# (seed10, entry12), padded intervals [-1,5] and [8,14] (disjoint).
+_TWO_GAP_PRESENT = set(range(0, 4)) | set(range(7, 13)) | set(range(16, 19))
+_TWO_GAP_DETS = {
+    f: ([(L, None)] if f in _TWO_GAP_PRESENT else []) for f in range(19)
+}
+
+# One robot with a single gap and a long tail: present 0-3, gap 4-6, back 7-15
+# -> one window (seed1, entry3) that would naturally settle CLEAN at frame 8.
+_ONE_GAP_PRESENT = set(range(0, 4)) | set(range(7, 16))
+_ONE_GAP_DETS = {
+    f: ([(L, None)] if f in _ONE_GAP_PRESENT else []) for f in range(16)
+}
+
+
+# --------------------------------------------------------------------------
+# (a) two overlapping windows -> ONE init_state, correct merged results.
+# --------------------------------------------------------------------------
+def test_track_selective_two_windows_one_episode(tmp_path):
+    _write_frames(tmp_path, 12)
+    # Each object's mask sits on its own home box the whole pass -> both settle
+    # clean on their own oid (no swap).
+    pred = StubSelectivePredictor(lambda f, oid: L if oid == 1 else R,
+                                  emit_probs=True, prob=0.8)
+    tracker = Sam2FieldTracker(predictor=pred)
+
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(_TWO_WIN_DETS), _cfg())
+
+    stats = tracker.selective_stats
+    # The whole point: two windows on two different seed frames run under ONE
+    # SAM session, not two.
+    assert pred.init_calls == 1
+    assert pred.reset_calls == 1
+    assert stats["windows"] == 2
+    assert stats["episodes"] == 1
+    assert stats["dropped_windows"] == 0
+    assert stats["outcomes"] == {"clean": 2}
+    assert stats["renames"] == 0
+
+    # solo roster spans the episode's oids at every prompt (one per oid).
+    assert pred.solo_at_prompt == [{1, 2}, {1, 2}]
+    assert pred.solo_at_reset is None
+
+    # Outside every window the stream is pure TBD.
+    assert results[0][1]["box"] == L
+    assert results[0][1]["evidence"]["type"] == "tbd"
+    assert results[0][2]["box"] == R
+    assert results[0][2]["evidence"]["type"] == "tbd"
+
+    # The episode fills each oid's TBD gap with SAM masks -- including frame 6,
+    # where BOTH robots had gapped out and TBD saw nothing at all.
+    assert results[6][1]["evidence"]["type"] == "selective_sam"
+    assert results[6][1]["mask"] is not None
+    assert results[6][2]["evidence"]["type"] == "selective_sam"
+    assert results[6][2]["mask"] is not None
+
+
+# --------------------------------------------------------------------------
+# (b) budget pre-check drops a far-apart second episode.
+# --------------------------------------------------------------------------
+def test_track_selective_budget_precheck_drops_episode(tmp_path):
+    _write_frames(tmp_path, 19)
+    pred = StubSelectivePredictor(lambda f, oid: L)
+    tracker = Sam2FieldTracker(predictor=pred)
+
+    # budget = round(0.55 * 19) = 10. Episode 1 (windows (1,3)) settles clean at
+    # frame 8 -> sam_used=8. Episode 2's conservative min cost (12-10)+2=4 makes
+    # 8+4=12 > 10, so the pre-check drops it whole.
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(_TWO_GAP_DETS), _cfg_budget(0.55))
+
+    stats = tracker.selective_stats
+    assert stats["windows"] == 2
+    assert stats["episodes"] == 1
+    assert stats["dropped_windows"] == 1
+    assert stats["outcomes"] == {"clean": 1}
+    assert pred.init_calls == 1        # only the first episode ever inited
+
+    # Episode 1 ran: its close frame carries a SAM mask.
+    assert results[8][1]["evidence"]["type"] == "selective_sam"
+    # The dropped episode's span is left as pure TBD (no masks overlaid).
+    assert results[12][1]["evidence"]["type"] == "tbd"
+    assert results[17][1]["evidence"]["type"] == "tbd"
+
+
+# --------------------------------------------------------------------------
+# (c) mid-episode budget stop -> window closes END, masks so far retained.
+# --------------------------------------------------------------------------
+def test_track_selective_budget_stops_mid_episode(tmp_path):
+    _write_frames(tmp_path, 16)
+    pred = StubSelectivePredictor(lambda f, oid: L)
+    tracker = Sam2FieldTracker(predictor=pred)
+
+    # budget = round(0.3125 * 16) = 5. The lone window (seed1, entry3) would
+    # settle clean at frame 8, but the budget is hit after feeding frame 5, so
+    # the still-open window is force-closed as healthy END at frame 5.
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(_ONE_GAP_DETS), _cfg_budget(0.3125))
+
+    stats = tracker.selective_stats
+    assert stats["outcomes"] == {"end": 1}
+    assert stats["episodes"] == 1
+    assert stats["dropped_windows"] == 0
+    assert stats["sam_frames"] == 5
+
+    # Generator stopped early: only frames 1..5 were ever produced (a natural
+    # clean settle would have needed 8).
+    assert pred.yielded == [1, 2, 3, 4, 5]
+
+    # Masks up to the stop are retained (END is healthy).
+    assert results[3][1]["evidence"]["type"] == "selective_sam"
+    assert results[5][1]["evidence"]["type"] == "selective_sam"
+    assert results[5][1]["mask"] is not None
+    # Past the stop the stream falls back to pure TBD (SAM never reached it).
+    assert results[8][1]["evidence"]["type"] == "tbd"
+
+
+# --------------------------------------------------------------------------
+# (d) episodes stat counts only episodes actually run.
+# --------------------------------------------------------------------------
+def test_track_selective_episodes_stat_counts_runs(tmp_path):
+    _write_frames(tmp_path, 19)
+    pred = StubSelectivePredictor(lambda f, oid: L)
+    tracker = Sam2FieldTracker(predictor=pred)
+
+    # Default budget (frac 1.0 -> 19 frames) fits both episodes: both settle
+    # clean, so episodes counts 2 and nothing is dropped.
+    tracker.track_selective(str(tmp_path), _detect_fn(_TWO_GAP_DETS), _cfg())
+
+    stats = tracker.selective_stats
+    assert stats["windows"] == 2
+    assert stats["episodes"] == 2
+    assert stats["dropped_windows"] == 0
+    assert stats["outcomes"] == {"clean": 2}
+    assert pred.init_calls == 2
+    assert pred.reset_calls == 2

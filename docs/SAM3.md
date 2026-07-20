@@ -130,8 +130,9 @@ defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
 | `selective_gap_trigger` | `SELECTIVE_GAP_TRIGGER` | `7` | consecutive missed frames before a reappearing track opens a window |
 | `selective_min_streak` | `SELECTIVE_MIN_STREAK` | `5` | consecutive clean frames required for both the backward seed walk and the exit machine's settle |
 | `selective_window_max_frames` | `SELECTIVE_WINDOW_MAX_FRAMES` | `120` | hard cap on a window's SAM-propagated span before it force-closes healthy (`end`) |
+| `selective_sam_budget_frac` | `SELECTIVE_SAM_BUDGET_FRAC` | `1.0` | cross-episode SAM-frame budget, as a fraction of the view's frame count |
 
-Only these six are job_config knobs / env vars. The other exit/seed
+Only these seven are job_config knobs / env vars. The other exit/seed
 thresholds referenced in the algorithm below (`area_degradation`,
 `mask_overlap_exit`, `ioma_exit`, `seed_clean_iou`, `border_margin_px`,
 `iou_expand`, `max_missed`) are **internal `SelectiveConfig` constants** in
@@ -166,10 +167,11 @@ value -- see the `selective` / `selective-sweep` profiles in
    any other object) -- that run's earliest frame is where SAM gets seeded.
    Candidates with no clean seed run are dropped.
 3. **SAM3 forward through the window** (`Sam2FieldTracker.track_selective`,
-   Task 4/5 orchestration): windows sharing a seed frame are grouped into one
-   predictor session, seeded with *only* that group's objects
-   (`solo_ids`) -- other tracked objects never enter the SAM session for a
-   window that doesn't need them. Propagation runs frame-by-frame through
+   Task 4/5 orchestration): windows sharing an *episode* (the interval-merged
+   cluster described below) are grouped into one predictor session, seeded
+   with *only* that group's objects (`solo_ids`) -- other tracked objects
+   never enter the SAM session for a window that doesn't need them.
+   Propagation runs frame-by-frame through
    `min(selective_window_max_frames, remaining video)`.
 4. **Exit state machine** (`ExitMachine`): watches the propagated masks from
    the entry frame onward and closes each window as soon as it has an
@@ -197,6 +199,40 @@ value -- see the `selective` / `selective-sweep` profiles in
    window's SAM masks overlay their oid's entries across `[entry, close]`
    with the real mask, `mask_to_box(mask)`, and evidence `"selective_sam"`
    carrying the frame's `tracker_prob`.
+
+### Episode merging and the SAM budget
+
+Two windows opened independently by Phase B can still need the same stretch
+of video -- e.g. a witness pulled into one window's entry frame is also the
+trigger object for a second window a few frames later. `cluster_windows`
+merges any windows whose padded `[seed_frame - min_streak, entry_frame +
+min_streak]` intervals overlap (standard sort-and-sweep interval merge) into
+one *episode*, and `track_selective` runs exactly one SAM predictor session
+per episode rather than one per window. This is not just a cost win: an
+episode's single `ExitMachine` sees every concurrent mask in the group each
+step, so the `killed` (mutual mask convergence) and border/edge checks can
+actually compare windows against each other -- two windows split across
+separate sessions would never observe one another's masks at all.
+
+`selective_sam_budget_frac` puts a hard ceiling on that cost: total SAM
+frames fed to any `ExitMachine`, summed across a view's episodes, are capped
+at `sam_budget_frac * view_frame_count`. The default, `1.0`, means selective
+mode can never cost more SAM propagation than the uniform `track()` path
+would have for the same view -- the motivating case was a qm11 main view
+with 17 overlapping windows that, before episode merging existed, drove
+`sam_frames` to 213% of uniform (`web/logs/20260719_222247_ec06450f*.log`).
+Episodes run in chronological order; one that cannot fit the remaining
+budget (a conservative estimate of its minimum cost) is skipped whole
+(`dropped_windows` in the stats/log line) so a smaller, later episode still
+gets a chance, and those frames' TBD-only output stands unchanged. If the
+budget instead runs out in the middle of an episode, propagation stops and
+every window still open in that episode force-closes healthy as `end` --
+the masks collected up to that point are kept, nothing is discarded.
+
+Note that `selective_window_max_frames` (`120`) is a per-window cap, not a
+per-view one -- a single auto-only qm11 view is 181 frames, so one window
+can already span most of it. The per-view SAM budget is what actually bounds
+aggregate cost; the per-window cap only bounds a single window's worst case.
 
 ### Evidence types and the `mask=None` contract
 

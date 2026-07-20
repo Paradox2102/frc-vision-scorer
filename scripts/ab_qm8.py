@@ -338,6 +338,7 @@ PROFILES = {
         ("m02", {"selective_mask_prop": True, "selective_margin_entry": 0.02}),
         ("m05", {"selective_mask_prop": True, "selective_margin_entry": 0.05}),
         ("m10", {"selective_mask_prop": True, "selective_margin_entry": 0.10}),
+        ("budget08", {"selective_mask_prop": True, "selective_sam_budget_frac": 0.8}),
     ],
 }
 CONFIGS = PROFILES["full"]

@@ -167,6 +167,16 @@ KNOBS = [
          min=1, section="Tracking backend"),
     Knob("selective_window_max_frames", "SELECTIVE_WINDOW_MAX_FRAMES", int, 120,
          min=8, section="Tracking backend"),
+    # Cross-episode SAM-frame budget for selective mode: caps total SAM
+    # propagation frames across a view's episodes at sam_budget_frac * n_frames.
+    # Motivated by the qm11 A/B (web/logs/20260719_222247_ec06450f*.log): the
+    # main view's 17 overlapping windows drove sam_frames to 213% of uniform
+    # propagation cost before episode merging existed. Default 1.0 means
+    # "never more SAM work than uniform" -- episodes that don't fit the
+    # remaining budget are skipped (dropped_windows stats, TBD stands for
+    # those frames); a later, smaller episode may still fit.
+    Knob("selective_sam_budget_frac", "SELECTIVE_SAM_BUDGET_FRAC", float, 1.0,
+         min=0.1, max=10.0, section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

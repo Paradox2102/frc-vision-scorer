@@ -1887,6 +1887,7 @@ class InferenceJob:
                     gap_trigger=self.config.selective_gap_trigger,
                     min_streak=self.config.selective_min_streak,
                     window_max_frames=self.config.selective_window_max_frames,
+                    sam_budget_frac=self.config.selective_sam_budget_frac,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,
@@ -1919,7 +1920,9 @@ class InferenceJob:
                       f"sam_frames={sam_frames} ({pct:.0f}% of uniform) "
                       f"outcomes={stats.get('outcomes', {})} "
                       f"renames={stats.get('renames', 0)} "
-                      f"skipped={stats.get('skipped', 0)}")
+                      f"skipped={stats.get('skipped', 0)} "
+                      f"episodes={stats.get('episodes', 0)} "
+                      f"dropped={stats.get('dropped_windows', 0)}")
                 # Selective mode never uses the prompt-seed identity space, so
                 # REPLACE (not merge) the per-view color dict that was pre-seeded
                 # with prompt-order {i+1: color} at ~app.py:6124. Merging only

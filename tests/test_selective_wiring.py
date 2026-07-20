@@ -213,3 +213,55 @@ def test_gate_on_success_logs_stats_and_registers_colors(capsys):
     assert ("[selective] view=main: frames=100 windows=3 sam_frames=25 "
             "(25% of uniform)") in out
     assert "outcomes={'clean': 2, 'swap': 1} renames=1 skipped=0" in out
+
+
+def test_gate_on_passes_sam_budget_frac_override_to_selective_config():
+    """selective_sam_budget_frac (Task C knob) must reach the SelectiveConfig
+    built for track_selective, not just sit unused on JobConfig."""
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.config.selective_sam_budget_frac = 0.8   # non-default override
+    job.timings = {}
+    tracker = _tracker_stub({"unused": True})
+    tracker.track_selective.side_effect = RuntimeError("boom")  # short-circuit to fallback
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    asyncio.run(run())
+    tracker.track_selective.assert_called_once()
+    cfg = tracker.track_selective.call_args.kwargs["cfg"]
+    assert cfg.sam_budget_frac == 0.8
+
+
+def test_gate_on_success_log_includes_episodes_and_dropped(capsys):
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.timings = {}
+    job.sam2_obj_color = {}
+    tracks = {0: {1: {}}, 1: {1: {}}}
+    tracker = _tracker_stub({"unused": True})
+    tracker.track_selective.return_value = tracks
+    tracker.selective_stats = {
+        "frames": 100, "windows": 3, "sam_frames": 25,
+        "outcomes": {"clean": 2, "swap": 1}, "renames": 1, "skipped": 0,
+        "episodes": 2, "dropped_windows": 1}
+    tracker.selective_obj_colors = {1: "red"}
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    asyncio.run(run())
+    out = capsys.readouterr().out
+    assert " episodes=2" in out
+    assert " dropped=1" in out

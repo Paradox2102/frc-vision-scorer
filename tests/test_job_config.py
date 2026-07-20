@@ -384,6 +384,27 @@ def test_selective_knob_bounds():
         JobConfig({"selective_window_max_frames": 2})
 
 
+def test_selective_sam_budget_frac_knob_default(monkeypatch):
+    monkeypatch.delenv("SELECTIVE_SAM_BUDGET_FRAC", raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_sam_budget_frac == 1.0
+
+
+def test_selective_sam_budget_frac_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_SAM_BUDGET_FRAC", "0.8")
+    assert JobConfig().selective_sam_budget_frac == 0.8
+    cfg = JobConfig({"selective_sam_budget_frac": "1.5"})
+    assert cfg.selective_sam_budget_frac == 1.5
+
+
+def test_selective_sam_budget_frac_knob_bounds():
+    import pytest
+    with pytest.raises(ValueError):
+        JobConfig({"selective_sam_budget_frac": 0.05})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_sam_budget_frac": 11})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

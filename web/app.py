@@ -201,16 +201,23 @@ def _on_field(xy, dims, margin=1.0):
 
 
 def _restore_sam2_mask_to_view(
-    mask2d: np.ndarray,
+    mask2d: Optional[np.ndarray],
     view_shape,
     top_offset_px: int = 0,
-) -> np.ndarray:
-    """Map a SAM2 mask from its top-cropped frame back into full-view pixels."""
+) -> Optional[np.ndarray]:
+    """Map a SAM2 mask from its top-cropped frame back into full-view pixels.
+
+    Returns None when ``mask2d`` is None (selective mode's TBD-only sam2_raw
+    entries carry no mask) so callers can distinguish "no mask" from "an
+    empty mask" instead of silently getting an all-False array.
+    """
+    if mask2d is None:
+        return None
     full_h, full_w = int(view_shape[0]), int(view_shape[1])
     top_offset_px = max(0, min(int(top_offset_px), full_h))
     tracked_h = full_h - top_offset_px
     restored = np.zeros((full_h, full_w), dtype=bool)
-    if tracked_h <= 0 or mask2d is None or np.asarray(mask2d).size == 0:
+    if tracked_h <= 0 or np.asarray(mask2d).size == 0:
         return restored
     resized = cv2.resize(
         np.asarray(mask2d, dtype=np.uint8),
@@ -219,6 +226,27 @@ def _restore_sam2_mask_to_view(
     ).astype(bool)
     restored[top_offset_px:, :] = resized
     return restored
+
+
+def ground_uv(box, mask: Optional[np.ndarray], use_footprint: bool):
+    """Pick the ground-contact ``(u, v)`` image point for a box/mask pair.
+
+    Returns the box bottom-center when ``mask`` is None, ``use_footprint`` is
+    False, or the mask is empty (no footprint to find). Returns the mask's
+    carpet-contact footprint (:func:`web.field.sam2_tracker.mask_bottom_center`)
+    only when a mask exists AND ``use_footprint`` is True.
+
+    ``box`` and ``mask`` must share the same coordinate space -- the caller is
+    responsible for scaling the returned point into whatever space it needs
+    (e.g. from SAM2's 0.5x top-cropped export space to full-frame pixels).
+    """
+    x1, _y1, x2, y2 = box
+    if mask is not None and use_footprint:
+        from web.field.sam2_tracker import mask_bottom_center
+        mp = mask_bottom_center(mask)
+        if mp is not None:
+            return mp
+    return ((x1 + x2) / 2.0, float(y2))
 
 
 
@@ -6967,24 +6995,24 @@ class InferenceJob:
                                     frac_backstop=self.config.det_frac_backstop,
                                 ):
                                     continue
-                                uv = ((fx1 + fx2) / 2.0, fy2)
-                                if self.config.mask_footprint_pos:
-                                    # Use the mask's carpet-contact footprint as
-                                    # the ray origin instead of the box bottom-
-                                    # center: an extended intake/arm stretches
-                                    # the box and shifts its bottom-center off
-                                    # the robot's actual contact. The mask is in
-                                    # 0.5x top-cropped coords (same space as the
-                                    # box), so transform mask->full-res exactly
-                                    # as the box is transformed above.
-                                    from web.field.sam2_tracker import mask_bottom_center
-                                    fmask = info.get("mask")
-                                    if fmask is not None:
-                                        mp = mask_bottom_center(fmask)
-                                        if mp is not None:
-                                            mx, my = mp
-                                            uv = (mx / SAM2_SCALE,
-                                                  my / SAM2_SCALE + sam2_y_offset)
+                                # ground_uv picks the mask's carpet-contact
+                                # footprint as the ray origin instead of the
+                                # box bottom-center when config.mask_footprint_pos
+                                # is on: an extended intake/arm stretches the box
+                                # and shifts its bottom-center off the robot's
+                                # actual contact. It falls back to the box
+                                # bottom-center when there's no mask (selective
+                                # mode's TBD-only entries, mask=None) or the
+                                # config knob is off. The mask is in 0.5x
+                                # top-cropped coords (same space as the box), so
+                                # transform the returned point -> full-res
+                                # exactly as the box is transformed above.
+                                mu, mv = ground_uv(
+                                    (x1, y1, x2, y2), info.get("mask"),
+                                    self.config.mask_footprint_pos,
+                                )
+                                uv = (mu / SAM2_SCALE,
+                                      mv / SAM2_SCALE + sam2_y_offset)
                                 xy = cal.image_to_field(uv)
                                 corner_weight = corner_detection_weight(
                                     view.name, xy, self.field_dims

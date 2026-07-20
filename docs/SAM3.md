@@ -89,12 +89,12 @@ default.
 
 ## Selective mask propagation (`selective_mask_prop`, default OFF)
 
-Re-implementation of arXiv 2606.13033 (Holmberg 2026); reference code
+Re-implementation of arXiv 2606.13033 (Holmberg 2026). The reference project
 [holma91/selective-mask-propagation](https://github.com/holma91/selective-mask-propagation)
-(MIT) was read for the algorithm, not vendored -- this repo's version is a
-from-scratch implementation over our own predictor protocol, cost units, and
-evidence schema, so none of the reference project's GPL-3.0 vendored parts
-apply here.
+is MIT in its own code but vendors third-party components under other licenses
+including GPL-3.0, so rather than vendor it we re-implemented its ~4-file
+algorithm surface clean-room over our own predictor protocol, cost units, and
+evidence schema.
 
 ### The inversion
 
@@ -130,6 +130,13 @@ defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
 | `selective_gap_trigger` | `SELECTIVE_GAP_TRIGGER` | `7` | consecutive missed frames before a reappearing track opens a window |
 | `selective_min_streak` | `SELECTIVE_MIN_STREAK` | `5` | consecutive clean frames required for both the backward seed walk and the exit machine's settle |
 | `selective_window_max_frames` | `SELECTIVE_WINDOW_MAX_FRAMES` | `120` | hard cap on a window's SAM-propagated span before it force-closes healthy (`end`) |
+
+Only these six are job_config knobs / env vars. The other exit/seed
+thresholds referenced in the algorithm below (`area_degradation`,
+`mask_overlap_exit`, `ioma_exit`, `seed_clean_iou`, `border_margin_px`,
+`iou_expand`, `max_missed`) are **internal `SelectiveConfig` constants** in
+`web/field/selective_prop.py`, not exposed through job_config or env -- change
+them in source if an A/B warrants.
 
 **Caveat:** the margin knobs are in **1 - expanded-IoU cost units** (this
 repo's Deep-EIoU-style cost, `web/field/selective_prop.py`), **not** the

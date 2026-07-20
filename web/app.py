@@ -246,6 +246,11 @@ def ground_uv(box, mask: Optional[np.ndarray], use_footprint: bool):
         mp = mask_bottom_center(mask)
         if mp is not None:
             return mp
+    # Box bottom-center in export space; the caller scales it into full-frame
+    # pixels (avg-then-divide). Byte-identical to the pre-refactor scale-then-
+    # average uv at a power-of-two sam2_export_scale (default 0.5); at a
+    # non-power-of-two scale the two orders differ by <=1 ULP, negligible into
+    # the homography.
     return ((x1 + x2) / 2.0, float(y2))
 
 
@@ -1891,6 +1896,20 @@ class InferenceJob:
                     progress_cb=progress_cb,
                     should_stop=lambda: self._stopped,
                 )
+            except TrackStopped:
+                # A user stop is NOT a selective failure: propagate it to the
+                # per-view stop handler rather than falling back to a full
+                # uniform propagation the user asked to abort.
+                raise
+            except Exception as e:
+                print(f"  [selective] FALLBACK view={view.name}: {e}")
+                view_tracks = None
+            else:
+                # Post-success bookkeeping runs OUTSIDE the try: track_selective
+                # has already done the expensive SAM work, so a raise in the
+                # stats print / color assignment must surface as a real error
+                # rather than trip a spurious [selective] FALLBACK plus a wasted
+                # full-uniform re-run of the whole view.
                 stats = getattr(sam2_tracker, "selective_stats", None) or {}
                 frames = stats.get("frames", 0)
                 sam_frames = stats.get("sam_frames", 0)
@@ -1901,23 +1920,21 @@ class InferenceJob:
                       f"outcomes={stats.get('outcomes', {})} "
                       f"renames={stats.get('renames', 0)} "
                       f"skipped={stats.get('skipped', 0)}")
-                # Register TBD-spawned obj colors (first-seen non-None wins),
-                # keyed by TBD oid — the same {oid: color} side channel the
-                # uniform seed path populates for evidence_build.
+                # Selective mode never uses the prompt-seed identity space, so
+                # REPLACE (not merge) the per-view color dict that was pre-seeded
+                # with prompt-order {i+1: color} at ~app.py:6124. Merging only
+                # non-None colors would leave a TBD oid whose color is None
+                # sitting on a DIFFERENT physical robot's prompt-seed color at
+                # the colliding integer key, and evidence_build (~app.py:7024,
+                # ``.get(obj_id) or "unknown"``) would then read a confident-but-
+                # wrong red/blue instead of "unknown". Keeping the tracker's None
+                # values makes those oids read back as "unknown". A fresh dict is
+                # assigned — NOT the object_metadata reference captured into
+                # track_kwargs at ~app.py:6538 — so the uniform fallback path
+                # stays byte-identical.
                 obj_colors = getattr(
                     sam2_tracker, "selective_obj_colors", None) or {}
-                view_colors = self.sam2_obj_color.setdefault(view.name, {})
-                for oid, color in obj_colors.items():
-                    if color is not None:
-                        view_colors[oid] = color
-            except TrackStopped:
-                # A user stop is NOT a selective failure: propagate it to the
-                # per-view stop handler rather than falling back to a full
-                # uniform propagation the user asked to abort.
-                raise
-            except Exception as e:
-                print(f"  [selective] FALLBACK view={view.name}: {e}")
-                view_tracks = None
+                self.sam2_obj_color[view.name] = dict(obj_colors)
         if view_tracks is None:
             view_tracks = await asyncio.to_thread(
                 sam2_tracker.track, **track_kwargs)

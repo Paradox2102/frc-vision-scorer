@@ -203,8 +203,11 @@ def test_gate_on_success_logs_stats_and_registers_colors(capsys):
     result = asyncio.run(run())
     assert result is tracks
     tracker.track.assert_not_called()             # selective path stood on its own
-    # Only non-None colors registered, under the view, keyed by TBD oid.
-    assert job.sam2_obj_color["main"] == {1: "red", 3: "blue"}
+    # Selective mode REPLACES the per-view dict with the tracker's colors, keyed
+    # by TBD oid and INCLUDING None values (so a colorless oid reads back as
+    # "unknown" via evidence_build's ``.get(oid) or "unknown"`` rather than a
+    # stale prompt-seed color left at a colliding integer key).
+    assert job.sam2_obj_color["main"] == {1: "red", 2: None, 3: "blue"}
 
     out = capsys.readouterr().out
     assert ("[selective] view=main: frames=100 windows=3 sam_frames=25 "

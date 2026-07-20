@@ -479,3 +479,76 @@ def test_merge_rename_dedup_identical_pairs():
     _, renames = merge_selective_results(history, [o1, o2], cfg)
     assert len(renames) == 1
     assert isinstance(renames[0], RenameEvent)
+
+
+def test_merge_swap_with_clean_witness_same_group():
+    # Same seed-frame group: physical robots A, B cross so the margin trigger
+    # (oid1) settles SWAP -> oid2, while robot C rides along as a WITNESS (its
+    # box overlapped the crossing at the entry frame) and settles CLEAN under
+    # its own oid3. The two corrections must not corrupt each other: the 1<->2
+    # relabel applies to the whole stream from the entry frame, AND both healthy
+    # SAM masks overlay under their RAW spec.oid in the SAME [entry, close]
+    # frames -- oid1 the swap-follow mask, oid3 the witness's own mask, with
+    # oid3 never relabeled. (merge applies renames BEFORE mask overlay, so a
+    # mask keyed by raw spec.oid lands on the post-rename slot; this exercises
+    # that ordering for a swap + healthy-witness pair, which the swap-only and
+    # mask-less-swap tests above never combine.)
+    cfg = SelectiveConfig()
+    hw = (60, 200)
+    bA = (10, 10, 30, 30)     # raw stream 1 (physical A)
+    bB = (50, 10, 70, 30)     # raw stream 2 (physical B)
+    bC = (110, 10, 130, 30)   # raw stream 3 (physical C, the witness)
+    history = {f: {1: _obs(bA), 2: _obs(bB), 3: _obs(bC)} for f in range(9)}
+
+    # oid1 -> oid2 at entry frame 3; SAM followed physical A onto B's spatial
+    # slot (bB) across [entry, close] = [3, 5].
+    swap_masks = {f: _rect_mask(hw, bB) for f in (3, 4, 5)}
+    o_swap = WindowOutcome(
+        spec=WindowSpec(oid=1, seed_frame=0, entry_frame=3, trigger="margin"),
+        state="swap", swap_to=2, close_frame=5,
+        masks=swap_masks, probs={3: 0.8, 4: 0.8, 5: 0.8})
+
+    # oid3 witness in the SAME group (shared seed/entry frame); SAM held C on bC
+    # and it settles clean over the same [3, 5] frames.
+    witness_masks = {f: _rect_mask(hw, bC) for f in (3, 4, 5)}
+    o_witness = WindowOutcome(
+        spec=WindowSpec(oid=3, seed_frame=0, entry_frame=3, trigger="witness"),
+        state="clean", swap_to=None, close_frame=5,
+        masks=witness_masks, probs={3: 0.7, 4: 0.7, 5: 0.7})
+
+    results, renames = merge_selective_results(
+        history, [o_swap, o_witness], cfg)
+
+    # Exactly one rename -- the clean witness contributes none.
+    assert [(e.frame, {e.a, e.b}) for e in renames] == [(3, {1, 2})]
+
+    # Pre-entry: identity, all pure TBD.
+    assert results[2][1]["box"] == bA
+    assert results[2][1]["evidence"]["type"] == "tbd"
+    assert results[2][2]["box"] == bB
+    assert results[2][3]["box"] == bC and results[2][3]["mask"] is None
+
+    # In-window [3, 5]: 1<->2 relabel in force AND both healthy masks landed.
+    for f in (3, 4, 5):
+        # Swapped oid1 now carries A's SAM mask on bB (the relabel already put
+        # raw-oid2's box there; the SAM overlay agrees and adds the mask/prob).
+        assert results[f][1]["box"] == bB
+        assert results[f][1]["evidence"]["type"] == "selective_sam"
+        assert results[f][1]["evidence"]["tracker_prob"] == 0.8
+        assert np.array_equal(results[f][1]["mask"], swap_masks[f])
+        # oid2 is the relabeled raw-oid1 box (bA), still pure TBD (no overlay).
+        assert results[f][2]["box"] == bA
+        assert results[f][2]["evidence"]["type"] == "tbd"
+        assert results[f][2]["mask"] is None
+        # Witness landed correctly: oid3 never relabeled, carries its own mask.
+        assert results[f][3]["box"] == bC
+        assert results[f][3]["evidence"]["type"] == "selective_sam"
+        assert results[f][3]["evidence"]["tracker_prob"] == 0.7
+        assert np.array_equal(results[f][3]["mask"], witness_masks[f])
+
+    # Post-close: 1<->2 relabel persists; masks only inside the window.
+    for f in (6, 7, 8):
+        assert results[f][1]["box"] == bB
+        assert results[f][1]["evidence"]["type"] == "tbd"
+        assert results[f][2]["box"] == bA
+        assert results[f][3]["box"] == bC and results[f][3]["mask"] is None

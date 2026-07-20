@@ -218,7 +218,10 @@ separate sessions would never observe one another's masks at all.
 frames fed to any `ExitMachine`, summed across a view's episodes, are capped
 at `sam_budget_frac * view_frame_count`. The default, `1.0`, means selective
 mode can never cost more SAM propagation than the uniform `track()` path
-would have for the same view -- the motivating case was a qm11 main view
+would have for the same view (the budget bounds propagation frames only;
+per-episode `init_state`/prompt cost is separate, and episode merging
+strictly reduces it versus the old one-session-per-seed-frame grouping)
+-- the motivating case was a qm11 main view
 with 17 overlapping windows that, before episode merging existed, drove
 `sam_frames` to 213% of uniform (`web/logs/20260719_222247_ec06450f*.log`).
 Episodes run in chronological order; one that cannot fit the remaining

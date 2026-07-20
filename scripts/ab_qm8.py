@@ -322,6 +322,23 @@ PROFILES = {
         ("sprint-b", SPRINT),
         ("sprint+backfill-b", {**SPRINT, "late_seed_backfill": True}),
     ],
+    # Selective mask propagation (arXiv 2606.13033 re-implementation): cheap
+    # per-frame TBD everywhere, SAM3 mask propagation only inside ambiguous
+    # windows. Attacks the ~77%-of-wall-clock propagation cost; expect Manta
+    # scores to hold vs baseline (TBD-only frames still emit boxes, just no
+    # mask) while sam_frames/frames in the [selective] log line drops hard.
+    "selective": [
+        ("baseline", {}),
+        ("selective", {"selective_mask_prop": True}),
+    ],
+    # Margin-entry sweep: selective_margin_entry is in 1 - expanded-IoU cost
+    # units (not the paper's Eq. 1 units), so the paper's default is only a
+    # start-point. Sweep around it to find this codebase's cost scale.
+    "selective-sweep": [
+        ("m02", {"selective_mask_prop": True, "selective_margin_entry": 0.02}),
+        ("m05", {"selective_mask_prop": True, "selective_margin_entry": 0.05}),
+        ("m10", {"selective_mask_prop": True, "selective_margin_entry": 0.10}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

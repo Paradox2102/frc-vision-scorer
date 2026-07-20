@@ -86,3 +86,157 @@ installed on this host. Bucket capacity (`max_num_objects` /
 `multiplex_count`, builder default 16) is left untouched -- plenty for our
 ~6-robot rosters, and an untested larger capacity is a bigger risk than the
 default.
+
+## Selective mask propagation (`selective_mask_prop`, default OFF)
+
+Re-implementation of arXiv 2606.13033 (Holmberg 2026); reference code
+[holma91/selective-mask-propagation](https://github.com/holma91/selective-mask-propagation)
+(MIT) was read for the algorithm, not vendored -- this repo's version is a
+from-scratch implementation over our own predictor protocol, cost units, and
+evidence schema, so none of the reference project's GPL-3.0 vendored parts
+apply here.
+
+### The inversion
+
+Every other tracking path in this doc runs SAM propagation on **every**
+frame for **every** tracked object: full-frame mask decode, encode, and
+memory-bank update, whether or not the object's identity is actually in
+doubt. Profiling attributes about 77% of a job's wall clock to that
+propagation stage (see the memory notes on job perf), so it is the only
+lever left with real headroom.
+
+`selective_mask_prop` inverts the architecture: a cheap per-frame
+tracking-by-detection (TBD) pass runs on *every* frame for *every* object
+(Hungarian assignment on expanded-IoU cost, no GPU), and the expensive SAM3
+predictor is invoked **only** inside short windows where the TBD assignment
+is actually ambiguous -- a close second-best competitor, or a tracked object
+reappearing after a real gap. Outside those windows the TBD box **is** the
+tracked output; no mask, no propagation cost. This targets the plan's P2
+(propagation is the dominant cost), P3 (most frames are unambiguous -- SAM's
+precision is wasted on them), and P4 (paying for precision only where it
+resolves an actual ambiguity) findings from the July 2026 tech-upgrade
+review.
+
+`selective_mask_prop` is a per-job/env knob (`SELECTIVE_MASK_PROP`) and
+defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
+
+### Knobs
+
+| knob | env var | default | meaning |
+|------|---------|---------|---------|
+| `selective_mask_prop` | `SELECTIVE_MASK_PROP` | `False` | master switch for the whole selective path |
+| `selective_margin_entry` | `SELECTIVE_MARGIN_ENTRY` | `0.05` | TBD assignment margin below which a frame opens an ambiguity window |
+| `selective_margin_exit` | `SELECTIVE_MARGIN_EXIT` | `0.10` | margin an assignment must clear to count as a "clean" seed/settle frame |
+| `selective_gap_trigger` | `SELECTIVE_GAP_TRIGGER` | `7` | consecutive missed frames before a reappearing track opens a window |
+| `selective_min_streak` | `SELECTIVE_MIN_STREAK` | `5` | consecutive clean frames required for both the backward seed walk and the exit machine's settle |
+| `selective_window_max_frames` | `SELECTIVE_WINDOW_MAX_FRAMES` | `120` | hard cap on a window's SAM-propagated span before it force-closes healthy (`end`) |
+
+**Caveat:** the margin knobs are in **1 - expanded-IoU cost units** (this
+repo's Deep-EIoU-style cost, `web/field/selective_prop.py`), **not** the
+units used in the paper's Eq. 1. The defaults above are the paper's
+start-points carried over verbatim; they have not yet been re-tuned to this
+codebase's cost scale. Treat them as an A/B starting point, not a validated
+value -- see the `selective` / `selective-sweep` profiles in
+`scripts/ab_qm8.py` below.
+
+### Algorithm, in brief
+
+1. **Per-frame TBD** (`TbdTracker.step`, image-space, no GPU): each frame,
+   Hungarian-match live track predictions (constant-velocity) against raw
+   per-frame detections on expanded-IoU cost. Each assignment's *margin* is
+   the cheapest competing (finite-cost) track's cost minus the winner's cost
+   for that detection -- large margin means unambiguous, small margin means
+   another track could plausibly have matched instead (paper Eq. 1).
+2. **Window construction** (`find_windows`, offline over the completed TBD
+   history): a window opens when an assignment's margin drops below
+   `selective_margin_entry`, or when a track reappears after
+   `selective_gap_trigger`+ missed frames. Any other object whose box
+   overlaps a trigger object's box at the entry frame is pulled in too as a
+   witness (SAM needs the neighbor prompted or it will bleed onto it).
+   Each candidate then runs a **backward seed walk**: walk back from the
+   entry frame to find the nearest run of `selective_min_streak` consecutive
+   *clean* frames (margin >= `selective_margin_exit`, box not overlapping
+   any other object) -- that run's earliest frame is where SAM gets seeded.
+   Candidates with no clean seed run are dropped.
+3. **SAM3 forward through the window** (`Sam2FieldTracker.track_selective`,
+   Task 4/5 orchestration): windows sharing a seed frame are grouped into one
+   predictor session, seeded with *only* that group's objects
+   (`solo_ids`) -- other tracked objects never enter the SAM session for a
+   window that doesn't need them. Propagation runs frame-by-frame through
+   `min(selective_window_max_frames, remaining video)`.
+4. **Exit state machine** (`ExitMachine`): watches the propagated masks from
+   the entry frame onward and closes each window as soon as it has an
+   answer. Healthy closes (`clean`, `swap`, `end`) contribute their masks to
+   the merged output; everything else is an abort and the TBD-only output
+   stands unchanged for that window's frames. States: `stale` (seeded mask
+   never covers the TBD box at entry -- SAM never latched on), `degraded`
+   (mask goes dark, or its area collapses below `area_degradation` x seed
+   area, for `selective_min_streak` frames), `edge` (mask goes dark right
+   after sitting near the frame border -- likely exited-frame, not lost),
+   `killed` (two windows' masks converge onto the same object, pixel-IoU >=
+   `mask_overlap_exit`, for `selective_min_streak` frames -- both die),
+   `clean` (mask settles back onto its own TBD box for `selective_min_streak`
+   frames -- no identity change, matches the paper's "accept only on
+   confident contradiction": SAM ran, agreed with TBD, contributes masks but
+   no rename), `swap` (mask instead settles onto a *different* object's box
+   -- SAM found an identity swap TBD couldn't see; this is the paper's
+   confident-contradiction case and the only one that renames), `end`
+   (window hits `selective_window_max_frames` or end-of-video still
+   unresolved -- closes healthy since nothing contradicted TBD).
+5. **Merge** (`merge_selective_results`): the base stream is pure TBD
+   everywhere (`mask=None`, evidence `"tbd"`). `swap` outcomes apply pairwise
+   relabeling transpositions (composed chronologically, raw-label side) to
+   the whole downstream stream from their entry frame. Then every healthy
+   window's SAM masks overlay their oid's entries across `[entry, close]`
+   with the real mask, `mask_to_box(mask)`, and evidence `"selective_sam"`
+   carrying the frame's `tracker_prob`.
+
+### Evidence types and the `mask=None` contract
+
+Two evidence `type`s appear in `sam2_raw` under selective mode:
+
+- `"tbd"` -- `mask=None`, `tracker_prob=None`. The box is the TBD tracker's
+  matched/predicted detection; no SAM ever touched this frame/object.
+- `"selective_sam"` -- a real mask, carrying the propagated `tracker_prob`.
+  Only present inside a healthy window's `[entry_frame, close_frame]` span.
+
+Every downstream consumer of `info["mask"]` was audited (Task 6) to treat
+`mask=None` as a first-class case, not a bug:
+
+- `ground_uv` (`web/app.py`) falls back to the box bottom-center when
+  `mask` is None (or `mask_footprint_pos` is off, or the mask is empty).
+- `RobotEmbedder`/`_apply_mask` (`web/embedder.py`) return the crop
+  unmodified (unmasked) when the mask argument is None -- the DINOv2/DINOv3
+  embedding is computed on the plain box crop.
+- `_restore_sam2_mask_to_view` (`web/app.py`) returns `None` (not an
+  all-False array) when its input mask is `None`, so callers can tell "no
+  mask" from "empty mask".
+- The HUD mask overlay (`web/app.py`, `HUD_DRAW_ROBOT_MASK`) only draws when
+  `mask is not None`; TBD-only frames simply show no silhouette.
+
+### Fallback behavior
+
+`Sam2FieldTracker._run_view_tracking` (`web/app.py`) calls `track_selective`
+only when `selective_mask_prop` is on. **Any** exception it raises (other
+than a user-initiated stop) is caught, logged as
+`[selective] FALLBACK view=<name>: <error>`, and the view falls through to
+the identical uniform `track()` call used when the knob is off -- a bad
+selective run can never lose a view's tracks outright.
+
+### Interaction with other knobs
+
+- `mask_footprint_pos` degrades to box-bottom-center for every frame
+  **outside** a selective window, because there is no mask there to derive a
+  footprint from (see the `ground_uv` contract above). Inside a healthy
+  window it works exactly as it does under uniform tracking.
+- `late_seed_backfill` and `propagate_backward` are **no-ops** in selective
+  mode. Both are parameters/logic that live entirely inside `track()`'s
+  forward-propagation loop; `track_selective` is a separate method that
+  never calls into that code path. This is not a gap needing a fix: selective
+  mode's per-frame TBD detection already covers every frame from the start,
+  so there is no "late-seeded" history left to backfill and no bootstrap
+  frame whose earlier history needs a backward pass.
+- DEFAULT OFF pending a qm8-qm12 A/B (`scripts/ab_qm8.py` profiles
+  `selective` and `selective-sweep`), same posture as `sam3_multiplex`: no
+  known regression, just not yet validated on the identity-heavy qm11/qm12
+  matches.

@@ -5,6 +5,8 @@ Pure numpy / synthetic boxes and masks; no GPU, no torch. Masks are small
 ``np.zeros((H, W), bool)`` rectangles built to match / mismatch the TBD boxes
 that live in a hand-constructed ``history`` dict.
 """
+import random
+
 import numpy as np
 
 from web.field.selective_prop import (
@@ -14,6 +16,7 @@ from web.field.selective_prop import (
     SelectiveConfig,
     WindowOutcome,
     WindowSpec,
+    cluster_windows,
     find_windows,
     merge_selective_results,
 )
@@ -552,3 +555,149 @@ def test_merge_swap_with_clean_witness_same_group():
         assert results[f][1]["evidence"]["type"] == "tbd"
         assert results[f][2]["box"] == bA
         assert results[f][3]["box"] == bC and results[f][3]["mask"] is None
+
+
+# --------------------------------------------------------------------------
+# Task A: cluster_windows (episode merging) + SelectiveConfig.sam_budget_frac
+# --------------------------------------------------------------------------
+def _spec(oid, seed, entry, trigger="margin"):
+    return WindowSpec(oid=oid, seed_frame=seed, entry_frame=entry,
+                      trigger=trigger)
+
+
+def test_selective_config_sam_budget_frac_default():
+    # New field consumed by Task B's budget accounting; default is a no-op cap.
+    assert SelectiveConfig().sam_budget_frac == 1.0
+    assert SelectiveConfig(sam_budget_frac=0.5).sam_budget_frac == 0.5
+
+
+def test_cluster_overlapping_intervals_one_episode():
+    # Design 1 (a): padded intervals overlap -> a single episode.
+    cfg = SelectiveConfig(min_streak=5)
+    # A padded = [0-5, 10+5] = [-5, 15]; B padded = [8-5, 12+5] = [3, 17].
+    eps = cluster_windows([_spec(1, 0, 10), _spec(2, 8, 12)], cfg)
+    assert len(eps) == 1
+    assert [w.oid for w in eps[0]] == [1, 2]
+
+
+def test_cluster_far_apart_two_episodes():
+    # Design 1 (b): non-overlapping padded intervals -> two episodes, sorted
+    # by episode start (min seed).
+    cfg = SelectiveConfig(min_streak=5)
+    a = _spec(1, 0, 5)       # padded [-5, 10]
+    b = _spec(2, 100, 105)   # padded [95, 110]
+    eps = cluster_windows([a, b], cfg)
+    assert len(eps) == 2
+    assert [w.oid for w in eps[0]] == [1]
+    assert [w.oid for w in eps[1]] == [2]
+
+
+def test_cluster_padding_boundary():
+    # Design 1 (c): pin the exact merge boundary and assert BOTH sides.
+    # Point windows (seed == entry) at positions p and p + gap. Padded
+    # intervals touch when gap == 2*min_streak (merge) and separate when
+    # gap == 2*min_streak + 1.
+    cfg = SelectiveConfig(min_streak=5)
+    k = cfg.min_streak
+    base = 20
+    a = _spec(1, base, base)
+    # gap == 2k: A padded hi = base + k; B padded lo = base + 2k - k = base + k
+    #            -> lo == hi -> touch -> merged.
+    merged = cluster_windows([a, _spec(2, base + 2 * k, base + 2 * k)], cfg)
+    assert len(merged) == 1
+    assert [w.oid for w in merged[0]] == [1, 2]
+    # gap == 2k + 1: B padded lo = base + k + 1 > hi -> separate.
+    split = cluster_windows(
+        [a, _spec(2, base + 2 * k + 1, base + 2 * k + 1)], cfg)
+    assert len(split) == 2
+
+
+def test_cluster_witness_seed_before_trigger_same_episode():
+    # Design 1 (d): a witness whose seed lands 2 frames before the trigger's
+    # seed still shares the episode; episode start is the min seed.
+    cfg = SelectiveConfig(min_streak=5)
+    trigger = _spec(1, 10, 14, "margin")
+    witness = _spec(2, 8, 14, "witness")     # seed 2 frames earlier
+    eps = cluster_windows([trigger, witness], cfg)
+    assert len(eps) == 1
+    # sorted within episode by (seed, entry, oid): witness(seed 8) first.
+    assert [w.oid for w in eps[0]] == [2, 1]
+    assert min(w.seed_frame for w in eps[0]) == 8
+
+
+def test_cluster_determinism_shuffled_input():
+    # Design 1 (e): the function sorts internally, so a shuffled input yields
+    # a byte-identical episode partition.
+    cfg = SelectiveConfig(min_streak=5)
+    specs = [
+        _spec(3, 100, 104),
+        _spec(1, 0, 4),
+        _spec(2, 6, 9),        # padded [1, 14] touches spec1's [-5, 9]
+        _spec(4, 200, 205),
+    ]
+    ref = [[w.oid for w in ep] for ep in cluster_windows(list(specs), cfg)]
+    assert ref == [[1, 2], [3], [4]]
+    for s in range(6):
+        shuffled = list(specs)
+        random.Random(s).shuffle(shuffled)
+        got = [[w.oid for w in ep] for ep in cluster_windows(shuffled, cfg)]
+        assert got == ref
+
+
+def test_cluster_empty_input():
+    assert cluster_windows([], SelectiveConfig(min_streak=5)) == []
+
+
+# --------------------------------------------------------------------------
+# Task A: ExitMachine per-window seed gating (Design 3)
+# --------------------------------------------------------------------------
+def test_exitmachine_pre_seed_frames_inert():
+    # Design 3: a window is COMPLETELY inert for any frame before its seed.
+    # Here entry_frame (3) is deliberately placed inside the pre-seed span so
+    # the gate is observable: WITHOUT it the machine reaches the STALE check at
+    # frame 3 (no mask seeded yet -> dark) and aborts; WITH it frames 0-4 are
+    # skipped entirely and the window settles clean once the real seed mask
+    # arrives at frame 5.
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, ioma_exit=0.80,
+                          area_degradation=0.25, border_margin_px=5)
+    hw = (100, 100)
+    box = (10, 40, 30, 60)
+    history = {f: {2: _obs(box, margin=float("inf"))} for f in range(10)}
+    spec = WindowSpec(oid=2, seed_frame=5, entry_frame=3, trigger="witness")
+    em = ExitMachine([spec], {2: box}, hw, history, cfg)
+    mask = _rect_mask(hw, box)
+    for f in range(9):
+        # oid2 has no SAM object until it is prompted at its own seed (frame 5).
+        em.step(f, {2: (mask if f >= 5 else None)}, {2: 0.9})
+    o = em.outcomes()[0]
+    assert o.state == "clean"
+    assert min(o.masks) >= spec.seed_frame       # nothing collected pre-seed
+
+
+def test_exitmachine_episode_earlier_start_later_window_clean():
+    # Design 2 + 3: one episode session hosting two windows whose seeds are 5
+    # frames apart, fed from the earlier seed (episode start). The later window
+    # must stay inert until its own seed and then settle clean; the pre-seed
+    # frames add no dark / degraded pressure and trigger no kill against it.
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, ioma_exit=0.80,
+                          area_degradation=0.25, border_margin_px=5,
+                          mask_overlap_exit=0.90, window_max_frames=120)
+    hw = (100, 200)
+    boxA = (10, 40, 30, 60)
+    boxB = (150, 40, 170, 60)        # disjoint from A -> never kills it
+    history = {f: {1: _obs(boxA, margin=float("inf")),
+                   2: _obs(boxB, margin=float("inf"))} for f in range(14)}
+    a = WindowSpec(oid=1, seed_frame=0, entry_frame=2, trigger="margin")
+    b = WindowSpec(oid=2, seed_frame=5, entry_frame=7, trigger="margin")
+    em = ExitMachine([a, b], {1: boxA, 2: boxB}, hw, history, cfg)
+    maskA = _rect_mask(hw, boxA)
+    maskB = _rect_mask(hw, boxB)
+    for f in range(14):
+        masks = {1: maskA}
+        if f >= 5:                    # oid2 seeded only from its own seed frame
+            masks[2] = maskB
+        em.step(f, masks, {1: 0.9, 2: 0.9})
+    outs = {o.spec.oid: o for o in em.outcomes()}
+    assert outs[1].state == "clean"
+    assert outs[2].state == "clean"
+    assert min(outs[2].masks) >= b.entry_frame

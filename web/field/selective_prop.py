@@ -47,6 +47,7 @@ class SelectiveConfig:
     border_margin_px: int = 20
     max_missed: int = 30           # TBD track death (die when missed > this)
     iou_expand: float = 0.25       # expanded-IoU box inflation factor
+    sam_budget_frac: float = 1.0   # SAM-frame budget as a fraction of n_frames
 
 
 @dataclass
@@ -422,6 +423,41 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
     return specs
 
 
+def cluster_windows(specs: list["WindowSpec"],
+                    cfg: SelectiveConfig) -> list[list["WindowSpec"]]:
+    """Merge windows into episodes by padded-interval overlap (Design 1).
+
+    Each spec covers a padded interval ``[seed_frame - min_streak,
+    entry_frame + min_streak]``; specs whose padded intervals overlap OR merely
+    touch (``lo <= running_hi``) share one episode, so a single SAM session can
+    host them. Standard sort-and-sweep interval merge.
+
+    The boundary is pinned by the touch rule: two point windows (seed == entry)
+    ``min_streak`` apart on each side -- i.e. ``gap == 2*min_streak`` -- touch
+    and merge, while ``gap == 2*min_streak + 1`` stays separate.
+
+    Deterministic: specs are sorted internally by ``(seed_frame, entry_frame,
+    oid)`` before sweeping, so a shuffled input yields an identical partition.
+    Returns episodes ordered by episode start (min seed); within an episode the
+    specs keep that same ``(seed_frame, entry_frame, oid)`` order.
+    """
+    if not specs:
+        return []
+    k = cfg.min_streak
+    ordered = sorted(specs, key=lambda w: (w.seed_frame, w.entry_frame, w.oid))
+    episodes: list[list[WindowSpec]] = [[ordered[0]]]
+    cur_hi = ordered[0].entry_frame + k          # running max padded high
+    for spec in ordered[1:]:
+        lo = spec.seed_frame - k
+        if lo <= cur_hi:                         # overlap or touch -> same episode
+            episodes[-1].append(spec)
+            cur_hi = max(cur_hi, spec.entry_frame + k)
+        else:
+            episodes.append([spec])
+            cur_hi = spec.entry_frame + k
+    return episodes
+
+
 # -- exit state machine ------------------------------------------------------
 class _WinState:
     """Mutable per-window bookkeeping used inside :class:`ExitMachine`."""
@@ -500,6 +536,12 @@ class ExitMachine:
         if w.state is not None:
             return
         spec = w.spec
+        # Seed gate (Design 3): a window is COMPLETELY inert for any frame
+        # before its own seed, so one episode session can host windows with
+        # different seed frames. No seed-area capture, no dark counting, no
+        # settle -- the window simply does not exist yet this frame.
+        if frame_idx < spec.seed_frame:
+            return
         dark = mask is None or not bool(mask.any())
         if frame_idx == spec.seed_frame:
             w.seed_area = 0 if dark else int(mask.sum())
@@ -556,8 +598,13 @@ class ExitMachine:
         """Two windows whose masks overlap (pixel-IoU >= mask_overlap_exit) for
         ``min_streak`` consecutive frames have collapsed onto one object -> both
         die as ``killed``."""
+        # Seed gate (Design 3): a pre-seed window is excluded from the kill set
+        # on BOTH sides -- it can neither kill nor be killed nor perturb another
+        # window's pairwise isolation streak until its own seed frame arrives.
         active = [w for w in self._wins
-                  if w.state is None and frame_idx >= w.spec.entry_frame]
+                  if w.state is None
+                  and frame_idx >= w.spec.seed_frame
+                  and frame_idx >= w.spec.entry_frame]
         active.sort(key=lambda w: w.spec.oid)
         for i, wa in enumerate(active):
             for wb in active[i + 1:]:

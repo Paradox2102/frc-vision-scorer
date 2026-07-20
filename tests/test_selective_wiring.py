@@ -1,0 +1,212 @@
+"""app.py wiring for selective mask propagation (Task 5).
+
+Covers the two new seams:
+
+* :meth:`InferenceJob.make_frame_detect_fn` -- the per-frame detector fed to
+  ``track_selective``. It reads the exported view JPEG, runs the SAME cascade /
+  field-filter / roster-cap logic as ``make_detect_fn`` but returns firm boxes
+  in EXPORT coords, and mirrors the ``detection_archive`` telemetry with the
+  full-res boxes.
+* :meth:`InferenceJob._run_view_tracking` -- the ``selective_mask_prop`` gate.
+  Knob OFF must run the historical ``track`` call untouched and never reference
+  ``track_selective``; knob ON runs ``track_selective`` and, on ANY failure,
+  logs ``[selective] FALLBACK`` and falls through to the identical ``track``
+  call so a bad selective run can never lose a view.
+"""
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import cv2
+import numpy as np
+
+from web.app import InferenceJob
+
+
+def _make_job():
+    with patch("web.app.YOLO"):
+        job = InferenceJob("test_job", "/mock/video.mp4")
+    return job
+
+
+# ---------------------------------------------------------------------------
+# make_frame_detect_fn
+# ---------------------------------------------------------------------------
+def test_make_frame_detect_fn_returns_export_boxes_and_records(tmp_path):
+    job = _make_job()
+    job.field_dims = (16.54, 8.21)
+    job.field_model = None                       # -> half is None, no roster cap
+    job.detection_archive = MagicMock()
+    # The cascade already runs on the export-scale JPEG, so its box is in
+    # EXPORT coords. One firm (strong=True) candidate.
+    job._sam2_robot_candidates = MagicMock(
+        return_value=[((10.0, 20.0, 30.0, 40.0), "red", True)])
+
+    view = SimpleNamespace(name="main", calibration=MagicMock())
+    view_plan = SimpleNamespace(source_frames=[7, 14, 21])
+
+    jpg = tmp_path / "00000.jpg"
+    cv2.imwrite(str(jpg), np.zeros((100, 200, 3), dtype=np.uint8))
+
+    with patch("web.app.filter_field_robot_boxes", return_value=[0]):
+        detect = job.make_frame_detect_fn(view, view_plan, 0.5, 0)
+        out = detect(0, str(jpg))
+
+    # EXPORT box passed straight through to the TBD tracker, paired with color.
+    assert out == [((10.0, 20.0, 30.0, 40.0), "red")]
+
+    # Archive mirrors make_detect_fn: FULL-RES box (export / 0.5 == *2),
+    # corrob_only False, under this view + its source frame.
+    job.detection_archive.record.assert_called_once()
+    args = job.detection_archive.record.call_args.args
+    assert args[0] == "main"          # view name
+    assert args[1] == 0               # local_idx
+    assert args[2] == 7               # source_frame from view_plan map
+    assert args[3] == [((20.0, 40.0, 60.0, 80.0), "red", False)]
+
+
+def test_make_frame_detect_fn_applies_top_crop_y_offset(tmp_path):
+    """y_off is added to the full-res y-coords (the inverse of the export
+    top-crop), and the export box is still returned unscaled."""
+    job = _make_job()
+    job.field_dims = (16.54, 8.21)
+    job.field_model = None
+    job.detection_archive = MagicMock()
+    job._sam2_robot_candidates = MagicMock(
+        return_value=[((10.0, 20.0, 30.0, 40.0), "blue", True)])
+
+    view = SimpleNamespace(name="corner", calibration=MagicMock())
+    view_plan = SimpleNamespace(source_frames=[3])
+
+    jpg = tmp_path / "00000.jpg"
+    cv2.imwrite(str(jpg), np.zeros((100, 200, 3), dtype=np.uint8))
+
+    with patch("web.app.filter_field_robot_boxes", return_value=[0]):
+        detect = job.make_frame_detect_fn(view, view_plan, 0.5, 12)
+        out = detect(0, str(jpg))
+
+    assert out == [((10.0, 20.0, 30.0, 40.0), "blue")]   # export box unchanged
+    recorded = job.detection_archive.record.call_args.args[3]
+    # full-res: x/0.5, y/0.5 + 12
+    assert recorded == [((20.0, 52.0, 60.0, 92.0), "blue", False)]
+
+
+def test_make_frame_detect_fn_swallows_errors_with_first_only_warning(capsys):
+    job = _make_job()
+    job.field_dims = (16.54, 8.21)
+    job.field_model = None
+    job.detection_archive = MagicMock()
+    # imread returns None for a missing path -> the cascade never runs.
+    job._sam2_robot_candidates = MagicMock(side_effect=RuntimeError("cascade boom"))
+
+    view = SimpleNamespace(name="main", calibration=MagicMock())
+    view_plan = SimpleNamespace(source_frames=[1, 2])
+
+    with patch("web.app.cv2.imread", return_value=np.zeros((10, 20, 3), np.uint8)):
+        detect = job.make_frame_detect_fn(view, view_plan, 0.5, 0)
+        assert detect(0, "x.jpg") == []      # never raises into Phase A
+        assert detect(1, "y.jpg") == []
+
+    out = capsys.readouterr().out
+    # First-error-only: the warning is printed once, not per frame.
+    assert out.count("[selective] detect_fn error") == 1
+
+
+def test_make_frame_detect_fn_out_of_range_local_idx_returns_empty():
+    job = _make_job()
+    view = SimpleNamespace(name="main", calibration=MagicMock())
+    view_plan = SimpleNamespace(source_frames=[0, 1])
+    detect = job.make_frame_detect_fn(view, view_plan, 0.5, 0)
+    assert detect(5, "whatever.jpg") == []
+    assert detect(None, "whatever.jpg") == []
+
+
+# ---------------------------------------------------------------------------
+# _run_view_tracking gate
+# ---------------------------------------------------------------------------
+def _tracker_stub(track_return):
+    tracker = MagicMock()
+    tracker.track.return_value = track_return
+    return tracker
+
+
+def test_gate_off_never_references_track_selective():
+    job = _make_job()
+    job.config.selective_mask_prop = False
+    job.timings = {}
+    sentinel = {0: {}}
+    tracker = _tracker_stub(sentinel)
+    tracker.track_selective.side_effect = AssertionError("track_selective ran")
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames", "prompt_idx": 3}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    result = asyncio.run(run())
+    assert result is sentinel
+    tracker.track_selective.assert_not_called()
+    tracker.track.assert_called_once_with(**track_kwargs)
+    # Timing still accrues to the uniform path.
+    assert "sam2_tracking" in job.timings
+
+
+def test_gate_on_fallback_runs_track_and_logs(capsys):
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.timings = {}
+    job.sam2_obj_color = {}
+    sentinel = {0: {}, 1: {}}
+    tracker = _tracker_stub(sentinel)
+    tracker.track_selective.side_effect = RuntimeError("boom")
+
+    view = SimpleNamespace(name="corner")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    result = asyncio.run(run())
+    assert result is sentinel                     # fell back to uniform track
+    tracker.track_selective.assert_called_once()
+    tracker.track.assert_called_once_with(**track_kwargs)
+    out = capsys.readouterr().out
+    assert "[selective] FALLBACK view=corner: boom" in out
+
+
+def test_gate_on_success_logs_stats_and_registers_colors(capsys):
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.timings = {}
+    job.sam2_obj_color = {}
+    tracks = {0: {1: {}}, 1: {1: {}}}
+    tracker = _tracker_stub({"unused": True})
+    tracker.track_selective.return_value = tracks
+    tracker.selective_stats = {
+        "frames": 100, "windows": 3, "sam_frames": 25,
+        "outcomes": {"clean": 2, "swap": 1}, "renames": 1, "skipped": 0}
+    tracker.selective_obj_colors = {1: "red", 2: None, 3: "blue"}
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    result = asyncio.run(run())
+    assert result is tracks
+    tracker.track.assert_not_called()             # selective path stood on its own
+    # Only non-None colors registered, under the view, keyed by TBD oid.
+    assert job.sam2_obj_color["main"] == {1: "red", 3: "blue"}
+
+    out = capsys.readouterr().out
+    assert ("[selective] view=main: frames=100 windows=3 sam_frames=25 "
+            "(25% of uniform)") in out
+    assert "outcomes={'clean': 2, 'swap': 1} renames=1 skipped=0" in out

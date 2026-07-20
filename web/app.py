@@ -105,6 +105,7 @@ from web.field.detect_schema import (
     reject_person_candidates,
     select_gap_fills,
 )
+from web.field.selective_prop import SelectiveConfig
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.detection_archive import DetectionArchive
 from web.field.hardneg_miner import mine_hard_negatives
@@ -1721,6 +1722,183 @@ class InferenceJob:
             xy = view.calibration.image_to_field(uv)
             return xy is not None and point_in_zones(xy, zones)
         return _probe
+
+    def make_frame_detect_fn(self, view, view_plan, sam2_scale, y_off):
+        """Per-frame detector for the selective-mask-propagation path (Task 5).
+
+        Sibling of ``make_detect_fn`` for ``track_selective``: instead of
+        seeking/decoding the source video, it reads the ALREADY-EXPORTED view
+        JPEG and runs the SAME detection cascade / field-filter / per-half
+        roster cap, returning firm robot boxes in EXPORT coords — exactly the
+        ``fn(local_idx, frame_path) -> [(box_xyxy_export, color), ...]`` contract
+        the image-space TBD tracker consumes.
+
+        The cascade runs directly on the export-scale JPEG, so its boxes are
+        already in export coords. They are unscaled to full-res view coords
+        (``x / scale``, ``y / scale + y_off`` — the exact inverse of the export
+        transform, matching evidence_build) ONLY to drive
+        ``filter_field_robot_boxes`` and ``select_gap_fills``, which gate on
+        full-res geometry/calibration; the ORIGINAL export boxes of the
+        survivors are returned (index pairing preserved). The corroborate-only
+        tier is dropped — TBD wants firm boxes, not presence hints — and the
+        motion/zone subordinate tiers are off (the export JPEG carries no motion
+        pair, and those probes are full-res-calibrated), so ``select_gap_fills``
+        is structurally preserved but inert here.
+
+        ``track_selective``'s Phase A swallows per-call exceptions silently
+        (``dets = []``), so this closure carries its own first-error-only
+        warning for observability.
+        """
+        err_state = {"warned": False}
+
+        def detect_frame_fn(local_idx, frame_path):
+            try:
+                if local_idx is None or local_idx >= len(view_plan.source_frames):
+                    return []
+                source_frame = view_plan.source_frames[local_idx]
+                img = cv2.imread(frame_path)
+                if img is None:
+                    return []
+                # Firm boxes only: default cascade (no motion pair, no zone
+                # probe, no corrob band) on the export-scale frame.
+                merged = self._sam2_robot_candidates(img)
+                export_h, export_w = img.shape[:2]
+                # Reconstruct the full-res (non-top-cropped) view frame shape the
+                # field filter expects for its box-fraction backstop: export ->
+                # top-cropped full-res is /scale, then the excluded top-crop rows
+                # (y_off) are added back.
+                cropped_full_h = int(round(export_h / sam2_scale))
+                full_w = int(round(export_w / sam2_scale))
+                full_h = cropped_full_h + y_off
+                full_boxes = [
+                    (b[0] / sam2_scale, b[1] / sam2_scale + y_off,
+                     b[2] / sam2_scale, b[3] / sam2_scale + y_off)
+                    for b, _c, _strong in merged
+                ]
+                keep = filter_field_robot_boxes(
+                    full_boxes,
+                    view.calibration,
+                    self.field_dims,
+                    frame_shape=(full_h, full_w, 3),
+                    frac_backstop=self.config.det_frac_backstop,
+                )
+                # Per-half roster cap, identical to make_detect_fn: strong
+                # candidates always ride; the subordinate (motion) tier — empty
+                # here — would share the per-alliance quota AFTER strongs.
+                strong_halves = []
+                motion_entries = []   # (candidate_idx, half)
+                for idx in keep:
+                    _box, _color, strong = merged[idx]
+                    fb = full_boxes[idx]
+                    uv = ((fb[0] + fb[2]) / 2.0, fb[3])
+                    xy = view.calibration.image_to_field(uv)
+                    half = None
+                    if xy is not None and self.field_model is not None:
+                        half = self.field_model.alliance_side(xy)
+                    if strong:
+                        if half is not None:
+                            strong_halves.append(half)
+                    else:
+                        motion_entries.append((idx, half))
+                kept_motion = set(
+                    motion_entries[i][0]
+                    for i in select_gap_fills(
+                        strong_halves,
+                        [h for _i, h in motion_entries],
+                        max_per_half=3))
+                survivors = [idx for idx in keep
+                             if merged[idx][2] or idx in kept_motion]
+                # EXPORT-coord boxes straight through to the TBD tracker.
+                out = [(tuple(merged[idx][0]), merged[idx][1])
+                       for idx in survivors]
+                # Telemetry archive mirrors make_detect_fn: full-res boxes,
+                # corrob_only False (no corrob band here).
+                try:
+                    self.detection_archive.record(
+                        view.name, local_idx, source_frame,
+                        [(full_boxes[idx], merged[idx][1], False)
+                         for idx in survivors])
+                except Exception:
+                    pass  # telemetry must never break detection
+                return out
+            except Exception as e:
+                # Phase A silences per-call errors; surface the first once.
+                if not err_state["warned"]:
+                    err_state["warned"] = True
+                    print(f"  [selective] detect_fn error view={view.name} "
+                          f"idx={local_idx}: {e}")
+                return []
+
+        return detect_frame_fn
+
+    async def _run_view_tracking(self, sam2_tracker, view, track_kwargs,
+                                 frame_detect_fn, progress_cb):
+        """Run one view's SAM propagation, honoring ``selective_mask_prop``.
+
+        With the knob OFF this is byte-for-byte the historical
+        ``await asyncio.to_thread(sam2_tracker.track, **track_kwargs)`` call.
+        With it ON, ``track_selective`` (per-frame TBD, SAM only inside
+        ambiguous windows) runs in its place; ANY failure logs
+        ``[selective] FALLBACK`` and falls through to the identical uniform
+        ``track`` call, so a bad selective run can never lose a view. Timing
+        accrues to ``timings['sam2_tracking']`` for whichever path produced the
+        tracks, and the per-view ms/frame line is printed here.
+        """
+        t0 = time.perf_counter()
+        view_tracks = None
+        if self.config.selective_mask_prop:
+            try:
+                cfg = SelectiveConfig(
+                    margin_entry=self.config.selective_margin_entry,
+                    margin_exit=self.config.selective_margin_exit,
+                    gap_trigger=self.config.selective_gap_trigger,
+                    min_streak=self.config.selective_min_streak,
+                    window_max_frames=self.config.selective_window_max_frames,
+                )
+                view_tracks = await asyncio.to_thread(
+                    sam2_tracker.track_selective,
+                    frames_dir=track_kwargs["frames_dir"],
+                    detect_frame_fn=frame_detect_fn,
+                    cfg=cfg,
+                    progress_cb=progress_cb,
+                    should_stop=lambda: self._stopped,
+                )
+                stats = getattr(sam2_tracker, "selective_stats", None) or {}
+                frames = stats.get("frames", 0)
+                sam_frames = stats.get("sam_frames", 0)
+                pct = 100.0 * sam_frames / max(frames, 1)
+                print(f"  [selective] view={view.name}: frames={frames} "
+                      f"windows={stats.get('windows', 0)} "
+                      f"sam_frames={sam_frames} ({pct:.0f}% of uniform) "
+                      f"outcomes={stats.get('outcomes', {})} "
+                      f"renames={stats.get('renames', 0)} "
+                      f"skipped={stats.get('skipped', 0)}")
+                # Register TBD-spawned obj colors (first-seen non-None wins),
+                # keyed by TBD oid — the same {oid: color} side channel the
+                # uniform seed path populates for evidence_build.
+                obj_colors = getattr(
+                    sam2_tracker, "selective_obj_colors", None) or {}
+                view_colors = self.sam2_obj_color.setdefault(view.name, {})
+                for oid, color in obj_colors.items():
+                    if color is not None:
+                        view_colors[oid] = color
+            except TrackStopped:
+                # A user stop is NOT a selective failure: propagate it to the
+                # per-view stop handler rather than falling back to a full
+                # uniform propagation the user asked to abort.
+                raise
+            except Exception as e:
+                print(f"  [selective] FALLBACK view={view.name}: {e}")
+                view_tracks = None
+        if view_tracks is None:
+            view_tracks = await asyncio.to_thread(
+                sam2_tracker.track, **track_kwargs)
+        elapsed = time.perf_counter() - t0
+        self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
+        n = len(view_tracks)
+        print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames "
+              f"in {elapsed:.2f}s ({elapsed / max(1, n) * 1000:.1f} ms/frame)")
+        return view_tracks
 
     def _ray_zone_list(self, view):
         """Inflated user zones for the ray-beyond-contact seed gate, or None
@@ -6313,9 +6491,15 @@ class InferenceJob:
                                 self.cull_hijack_enabled, view.name,
                                 self.config.cull_main_view_only)
 
-                            t0 = time.perf_counter()
-                            view_tracks = await asyncio.to_thread(
-                                sam2_tracker.track,
+                            # One progress_cb shared by both tracking paths
+                            # (fn(done, total); track_selective uses the same
+                            # signature). Captured in the kwargs the uniform
+                            # track() call has always received — factored into a
+                            # dict so the call appears once and the selective
+                            # gate can wrap it without touching any value.
+                            progress_cb = make_progress_cb(
+                                base_pct, span_pct, view.name)
+                            track_kwargs = dict(
                                 frames_dir=tmp_dir_obj.name,
                                 prompt_idx=view_plan.prompt_idx,
                                 prompt_boxes=prompt_boxes_scaled,
@@ -6331,16 +6515,11 @@ class InferenceJob:
                                 # old 3x budget; qm24 hit 20 ids by the final frame.
                                 max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
                                 propagate_backward=True,
-                                progress_cb=make_progress_cb(base_pct, span_pct, view.name),
+                                progress_cb=progress_cb,
                                 diagnostics=self.identity_diagnostics,
                                 project_fn=_project_fn,
                                 seed_gate_fn=_seed_gate_fn,
                                 corrob_gate_fn=_corrob_gate_fn,
-                                # None defers to the tracker's env-knob defaults.
-                                **({"cull_enabled": _cull_enabled}
-                                   if _cull_enabled is not None else {}),
-                                **({"reanchor_enabled": self.reanchor_enabled}
-                                   if self.reanchor_enabled is not None else {}),
                                 dark_reanchor_enabled=self.config.dark_reanchor_enabled,
                                 # Frame-denominated wall-clock threshold: rescale
                                 # for decimated views ("dark for ~1s" must not
@@ -6398,11 +6577,23 @@ class InferenceJob:
                                 # SAM3 tracker inherits this track() method).
                                 should_stop=lambda: self._stopped,
                             )
-                            elapsed = time.perf_counter() - t0
-                            self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
-                            n = len(view_tracks)
-                            print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames in {elapsed:.2f}s "
-                                  f"({elapsed / max(1, n) * 1000:.1f} ms/frame)")
+                            # None defers to the tracker's env-knob defaults
+                            # (omitted entirely, exactly as before).
+                            if _cull_enabled is not None:
+                                track_kwargs["cull_enabled"] = _cull_enabled
+                            if self.reanchor_enabled is not None:
+                                track_kwargs["reanchor_enabled"] = self.reanchor_enabled
+
+                            # selective_mask_prop gate: knob OFF runs the uniform
+                            # track() call above unchanged; knob ON swaps in
+                            # track_selective with a per-frame detector, falling
+                            # back to the uniform call on any failure.
+                            view_tracks = await self._run_view_tracking(
+                                sam2_tracker, view, track_kwargs,
+                                self.make_frame_detect_fn(
+                                    view, view_plan, _sam2_scale, _y_off),
+                                progress_cb,
+                            )
                             self.sam2_raw[view.name] = view_tracks
 
                             await safe_send_status(

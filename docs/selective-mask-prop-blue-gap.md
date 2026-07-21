@@ -170,6 +170,49 @@ parameter dtype. Separately, the vLLM engine failing to come up mid-sweep
 traced to the unmerged VRAM ratchet (branch `vram-leak-fix`) — sweeps now run
 `--restart-between`.
 
+## Blue-gap v2 root cause (Jul 21 2026) — detector blind spots, not association
+
+Per-second sample diff of the three full-match replays (baseline f4ee7cd5,
+selective 3d80fc70, sel-app03 dbdb0aea) shows the blue loss is two **hard,
+permanent cliffs**, identical with/without the appearance term:
+
+- **3181 (B2): samples stop at t=37s** and never return (52% coverage).
+- **2992 (B3): samples stop at t=45s** and never return (73% coverage).
+
+The detection archive pins the mechanism: main-view blue detections drop
+2/frame → 1/frame at exactly 37s (and 0/frame during 44–45s); corner views
+see essentially no blue robots the whole time. The HUD frames
+(`docs/assets/hud_{baseline,selective}_t40.png`) show why: **3181 parks
+behind the blue hub with only a bumper sliver visible.** YOLO never fires on
+it again. Baseline's uniform SAM3 keeps a mask latched to the sliver's
+pixels — detector-free persistence — while selective's TBD tracker starves:
+a coasting TBD track emits no observations at all (`TbdTracker.step`,
+unmatched → `missed += 1` only) and dies permanently at `max_missed`.
+2992's cliff is the 2-second full occlusion at 44–45s: reacquisition
+requires expanded-IoU overlap with a constant-velocity coast; a failed
+re-match spawns a fresh identity-less oid.
+
+**Why every prior fix was a no-op for blue:** windows trigger on *ambiguity*
+(margin conflict, gap reappearance, witness). **Disappearance is not a
+trigger class.** A robot that vanishes from the detector never creates
+ambiguity — its stream just ends. The appearance term can't engage either:
+`eiou <= 0` returns FORBIDDEN before appearance is consulted. The selective
+architecture inherited the paper's assumption that the detector is reliable
+and SAM exists to disambiguate; on this footage SAM's real value is
+*persistence through detector blind spots* — an orthogonal capability the
+window system doesn't know to buy.
+
+Candidate fixes (design not yet approved):
+1. **Starvation-triggered windows** — third trigger: track unmatched >= N
+   frames, last box not near frame border → SAM window seeded from the last
+   confident box; existing exit machine + budget cap apply. Mirrors exactly
+   what baseline does right.
+2. **Zero-velocity coast-emit + appearance reacquisition** — emit coasted
+   boxes as `tbd_coast` evidence (accurate for parked robots) + embed-vs-EMA
+   oid merge on respawn. No GPU cost; dishonest for moving robots.
+3. **Detector-side** (hub-sliver hard negatives / occlusion-aware training)
+   — the bigger program (see equipment-hijack memory), out of selective scope.
+
 ## How to evaluate
 
 Server launch: `web/start_all.sh` (vLLM reader, job-managed). qm11 A/B:

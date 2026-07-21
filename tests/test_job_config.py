@@ -426,6 +426,31 @@ def test_selective_mask_overlap_exit_knob_bounds():
         JobConfig({"selective_mask_overlap_exit": 1.1})
 
 
+def test_selective_kill_coast_knob_default(monkeypatch):
+    monkeypatch.delenv("SELECTIVE_KILL_COAST", raising=False)
+    monkeypatch.delenv("SELECTIVE_KILL_COAST_FRAMES", raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_kill_coast is False
+    assert cfg.selective_kill_coast_frames == 24
+
+
+def test_selective_kill_coast_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_KILL_COAST", "true")
+    assert JobConfig().selective_kill_coast is True
+    cfg = JobConfig({"selective_kill_coast": False,
+                     "selective_kill_coast_frames": 48})
+    assert cfg.selective_kill_coast is False
+    assert cfg.selective_kill_coast_frames == 48
+
+
+def test_selective_kill_coast_frames_knob_bounds():
+    import pytest
+    with pytest.raises(ValueError):
+        JobConfig({"selective_kill_coast_frames": 0})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_kill_coast_frames": 241})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

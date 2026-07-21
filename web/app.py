@@ -1889,6 +1889,8 @@ class InferenceJob:
                     window_max_frames=self.config.selective_window_max_frames,
                     mask_overlap_exit=self.config.selective_mask_overlap_exit,
                     sam_budget_frac=self.config.selective_sam_budget_frac,
+                    kill_coast=self.config.selective_kill_coast,
+                    kill_coast_frames=self.config.selective_kill_coast_frames,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,

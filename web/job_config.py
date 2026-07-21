@@ -176,6 +176,19 @@ KNOBS = [
     # "blue-gap" profile) without editing source.
     Knob("selective_mask_overlap_exit", "SELECTIVE_MASK_OVERLAP_EXIT", float, 0.90,
          min=0.5, max=1.0, section="Tracking backend"),
+    # Kill-coast fallback (docs/selective-mask-prop-blue-gap.md fix #2). When a
+    # window pair is killed (masks converged), the two objects normally revert
+    # to the appearance-blind TBD tracker, which mis-links close same-alliance
+    # robots (the qm11 blue regression). ON instead pins each killed object to
+    # its last confident SAM box, coasted at constant velocity for up to
+    # selective_kill_coast_frames frames, until a TBD detection unambiguously
+    # re-claims it (expanded-IoU margin >= selective_margin_exit) or the budget
+    # expires. Default OFF -> byte-identical to today; A/B'd via the "blue-gap"
+    # profile in scripts/ab_qm8.py.
+    Knob("selective_kill_coast", "SELECTIVE_KILL_COAST", bool, False,
+         section="Tracking backend"),
+    Knob("selective_kill_coast_frames", "SELECTIVE_KILL_COAST_FRAMES", int, 24,
+         min=1, max=240, section="Tracking backend"),
     # Cross-episode SAM-frame budget for selective mode: caps total SAM
     # propagation frames across a view's episodes at sam_budget_frac * n_frames.
     # Motivated by the qm11 A/B (web/logs/20260719_222247_ec06450f*.log): the

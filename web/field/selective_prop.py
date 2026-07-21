@@ -48,6 +48,8 @@ class SelectiveConfig:
     max_missed: int = 30           # TBD track death (die when missed > this)
     iou_expand: float = 0.25       # expanded-IoU box inflation factor
     sam_budget_frac: float = 1.0   # SAM-frame budget as a fraction of n_frames
+    kill_coast: bool = False       # coast killed objects instead of raw TBD
+    kill_coast_frames: int = 24    # max frames to coast a killed object
 
 
 @dataclass
@@ -283,6 +285,14 @@ class WindowOutcome:
     close_frame: int
     masks: dict[int, "np.ndarray"] = field(default_factory=dict)
     probs: dict[int, float | None] = field(default_factory=dict)
+    # Kill-coast seed (Task 2, selective_kill_coast): the frame of the last
+    # confident SAM box before the convergence streak, and the short trailing
+    # run of SAM boxes (<=4, ascending) used to coast it at constant velocity.
+    # Only populated for ``killed`` outcomes when ``cfg.kill_coast`` is on;
+    # ``merge_selective_results`` consumes them. Default None/[] leaves every
+    # existing outcome (and the knob-off kill path) byte-identical.
+    coast_seed_frame: int | None = None
+    coast_boxes: list = field(default_factory=list)
 
 
 @dataclass
@@ -464,7 +474,7 @@ class _WinState:
 
     __slots__ = ("spec", "state", "swap_to", "close_frame", "seed_area",
                  "dark_streak", "settle_oid", "settle_streak", "last_near_border",
-                 "masks", "probs")
+                 "masks", "probs", "coast_seed_frame", "coast_boxes")
 
     def __init__(self, spec: WindowSpec):
         self.spec = spec
@@ -478,6 +488,9 @@ class _WinState:
         self.last_near_border = False
         self.masks: dict[int, np.ndarray] = {}
         self.probs: dict[int, float | None] = {}
+        # Kill-coast seed, captured at kill time before _close wipes ``masks``.
+        self.coast_seed_frame: int | None = None
+        self.coast_boxes: list = []
 
 
 class ExitMachine:
@@ -594,6 +607,33 @@ class ExitMachine:
             else:
                 self._close(w, "swap", frame_idx, swap_to=cand)
 
+    def _capture_coast(self, w: _WinState, close_frame: int):
+        """Record ``w``'s last confident SAM boxes before the convergence streak
+        so :func:`merge_selective_results` can coast the killed object instead of
+        dumping it to raw TBD (Task 2, ``selective_kill_coast``).
+
+        The kill fires on ``min_streak`` consecutive mask-overlap frames ending
+        at ``close_frame``, so the last pre-convergence frame is at or before
+        ``close_frame - min_streak``. We take the trailing run (<=4) of stored
+        live-mask frames up to that cutoff and their tight bboxes; the last is
+        the coast seed box, the run gives a constant-velocity estimate. No-op
+        when the knob is off or no such confident frame exists (coast then
+        degrades to today's raw-TBD fallback). Must run before :meth:`_close`
+        wipes ``w.masks``, and captures only once (the first kill pairing wins).
+        """
+        if not self.cfg.kill_coast or w.coast_seed_frame is not None:
+            return
+        cutoff = close_frame - self.cfg.min_streak
+        frames = sorted(f for f in w.masks if f <= cutoff)
+        if not frames:
+            return
+        fb = [(f, _mask_bbox(w.masks[f])) for f in frames[-4:]]
+        fb = [(f, b) for f, b in fb if b is not None]
+        if not fb:
+            return
+        w.coast_seed_frame = fb[-1][0]
+        w.coast_boxes = [b for _, b in fb]
+
     def _check_killed(self, frame_idx: int, masks_by_oid):
         """Two windows whose masks overlap (pixel-IoU >= mask_overlap_exit) for
         ``min_streak`` consecutive frames have collapsed onto one object -> both
@@ -617,6 +657,9 @@ class ExitMachine:
                     continue
                 self._pair_streak[key] = self._pair_streak.get(key, 0) + 1
                 if self._pair_streak[key] >= self.cfg.min_streak:
+                    # Capture coast seeds BEFORE _close wipes each window's masks.
+                    self._capture_coast(wa, frame_idx)
+                    self._capture_coast(wb, frame_idx)
                     self._close(wa, "killed", frame_idx)
                     self._close(wb, "killed", frame_idx)
 
@@ -644,7 +687,9 @@ class ExitMachine:
                             self._last_frame if self._last_frame is not None
                             else w.spec.seed_frame)
         return [WindowOutcome(spec=w.spec, state=w.state, swap_to=w.swap_to,
-                              close_frame=w.close_frame, masks=w.masks, probs=w.probs)
+                              close_frame=w.close_frame, masks=w.masks, probs=w.probs,
+                              coast_seed_frame=w.coast_seed_frame,
+                              coast_boxes=w.coast_boxes)
                 for w in self._wins]
 
 
@@ -688,6 +733,84 @@ def _apply_renames(results, events):
         results[f] = {oid: relabeled[oid] for oid in sorted(relabeled)}
 
 
+def _coast_velocity(boxes):
+    """Constant-velocity ``(dx, dy)`` from the last <=3 center deltas of
+    ``boxes`` (mirrors :meth:`_Track.velocity`; ``(0, 0)`` for a single box)."""
+    if len(boxes) < 2:
+        return (0.0, 0.0)
+    centers = [_center(b) for b in boxes]
+    dxs = [centers[i][0] - centers[i - 1][0] for i in range(1, len(centers))]
+    dys = [centers[i][1] - centers[i - 1][1] for i in range(1, len(centers))]
+    return (sum(dxs) / len(dxs), sum(dys) / len(dys))
+
+
+def _coast_reclaim_margin(coasted_box, frame_obs, cfg: SelectiveConfig):
+    """Assignment margin (paper Eq. 1) of matching ``coasted_box`` against the
+    TBD detections in ``frame_obs`` by expanded-IoU cost.
+
+    Returns the gap between the cheapest and second-cheapest overlapping
+    detection (``inf`` when exactly one overlaps), or None when the coasted box
+    overlaps no detection at all. A large margin means one detection
+    unambiguously owns the coasted box -- the signal that the same-alliance
+    ambiguity has resolved and normal TBD can be trusted again.
+    """
+    costs = []
+    for obs in frame_obs.values():
+        eiou = expanded_iou(coasted_box, obs.box, cfg.iou_expand)
+        if eiou > 0.0:
+            costs.append(1.0 - eiou)
+    if not costs:
+        return None
+    costs.sort()
+    if len(costs) == 1:
+        return float("inf")
+    return costs[1] - costs[0]
+
+
+def _apply_kill_coast(results, history, outcomes, cfg: SelectiveConfig):
+    """Coast each killed object from its last confident SAM box (Task 2).
+
+    For every ``killed`` outcome carrying a coast seed, overwrite that oid's
+    raw-TBD entries from the frame after the seed with a constant-velocity
+    extrapolation of the seed box, for up to ``cfg.kill_coast_frames`` frames.
+    This pins the killed object's identity to a physically-plausible position
+    instead of the appearance-blind TBD association, which mis-links close
+    same-alliance robots (the qm11 blue gap, docs/selective-mask-prop-blue-gap.md).
+
+    The coast ends early the first frame a TBD detection unambiguously re-claims
+    the coasted box (its expanded-IoU assignment margin >= ``cfg.margin_exit``);
+    that frame and every later one keep the raw-TBD stream. Coasted entries
+    carry ``evidence.type == "kill_coast"`` and no mask.
+
+    Mutates ``results`` in place in RAW history-label space, so it must run
+    BEFORE :func:`_apply_renames` -- the coasted entries are then relabeled by
+    any SWAP exactly like the rest of that oid's stream.
+    """
+    for oc in outcomes:
+        if (oc.state != "killed" or oc.coast_seed_frame is None
+                or not oc.coast_boxes):
+            continue
+        oid = oc.spec.oid
+        seed_frame = oc.coast_seed_frame
+        seed_box = oc.coast_boxes[-1]
+        vx, vy = _coast_velocity(oc.coast_boxes)
+        for step in range(1, cfg.kill_coast_frames + 1):
+            f = seed_frame + step
+            if f not in results:
+                break                       # past the tracked range
+            coasted = (seed_box[0] + vx * step, seed_box[1] + vy * step,
+                       seed_box[2] + vx * step, seed_box[3] + vy * step)
+            margin = _coast_reclaim_margin(coasted, history.get(f, {}), cfg)
+            if margin is not None and margin >= cfg.margin_exit:
+                break                       # unambiguous re-claim -> TBD resumes
+            results[f][oid] = {
+                "box": tuple(int(v) for v in coasted),
+                "mask": None,
+                "evidence": {"type": "kill_coast", "gap_len": 0,
+                             "detector_overlap": 1.0, "tracker_prob": None},
+            }
+
+
 def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
     """Build the sam2_raw-schema result stream from the TBD history plus the
     window outcomes.
@@ -699,6 +822,11 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
     healthy outcome overwrites its oid's entry across ``[entry, close]`` with the
     SAM mask, ``mask_to_box(mask)``, and ``selective_sam`` evidence carrying the
     per-frame ``tracker_prob``.
+
+    When ``cfg.kill_coast`` is on, each ``killed`` outcome additionally coasts
+    its object from the last confident SAM box (``kill_coast`` evidence,
+    mask=None) instead of leaving it on raw TBD -- see :func:`_apply_kill_coast`.
+    Off (the default) this is a no-op and the killed path is byte-identical.
     """
     # mask_to_box lives in sam2_tracker; import lazily so this module stays
     # torch-free at import time (sam2_tracker's pure helpers are torch-free, but
@@ -730,6 +858,12 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
             continue
         seen.add(key)
         events.append(RenameEvent(frame=oc.spec.entry_frame, a=a, b=b))
+
+    # Kill-coast fallback (Task 2): pin killed objects to their coasted SAM box
+    # before renames, so coasted entries are relabeled with the rest of the
+    # stream. Knob off -> no-op, leaving the killed path byte-identical.
+    if cfg.kill_coast:
+        _apply_kill_coast(results, history, outcomes, cfg)
 
     _apply_renames(results, events)
 

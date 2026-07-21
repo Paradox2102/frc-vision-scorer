@@ -280,6 +280,84 @@ def test_exit_killed_respects_mask_overlap_exit_knob():
     assert outs_raised[1].state == "end" and outs_raised[2].state == "end"
 
 
+def _kill_coast_scenario():
+    """Two same-alliance objects that track distinctly (oid1 drifts right, oid2
+    left) for two post-entry frames, then their masks collapse onto one patch
+    for ``min_streak`` frames -> both killed. Returns everything an ExitMachine
+    run needs; the last confident (pre-collapse) SAM boxes are frames 1 and 2.
+    """
+    hw = (200, 200)
+    # oid1 masks: distinct+moving right at f1,f2, then merged at f3,f4.
+    m1 = {
+        0: _rect_mask(hw, (10, 80, 30, 100)),
+        1: _rect_mask(hw, (20, 80, 40, 100)),
+        2: _rect_mask(hw, (30, 80, 50, 100)),
+        3: _rect_mask(hw, (60, 80, 80, 100)),
+        4: _rect_mask(hw, (60, 80, 80, 100)),
+    }
+    # oid2 masks: distinct+moving left at f1,f2, then merged onto oid1 at f3,f4.
+    m2 = {
+        0: _rect_mask(hw, (160, 80, 180, 100)),
+        1: _rect_mask(hw, (150, 80, 170, 100)),
+        2: _rect_mask(hw, (140, 80, 160, 100)),
+        3: _rect_mask(hw, (60, 80, 80, 100)),
+        4: _rect_mask(hw, (60, 80, 80, 100)),
+    }
+    # History boxes sit inside each mask (entry STALE check passes); margin 0.0
+    # keeps every frame ambiguous so no CLEAN/SWAP settle pre-empts the kill.
+    history = {
+        0: {1: _obs((12, 82, 28, 98), margin=0.0), 2: _obs((162, 82, 178, 98), margin=0.0)},
+        1: {1: _obs((22, 82, 38, 98), margin=0.0), 2: _obs((152, 82, 168, 98), margin=0.0)},
+        2: {1: _obs((32, 82, 48, 98), margin=0.0), 2: _obs((142, 82, 158, 98), margin=0.0)},
+        3: {1: _obs((62, 82, 78, 98), margin=0.0), 2: _obs((62, 82, 78, 98), margin=0.0)},
+        4: {1: _obs((62, 82, 78, 98), margin=0.0), 2: _obs((62, 82, 78, 98), margin=0.0)},
+    }
+    s1 = WindowSpec(oid=1, seed_frame=0, entry_frame=1, trigger="margin")
+    s2 = WindowSpec(oid=2, seed_frame=0, entry_frame=1, trigger="witness")
+    return hw, history, s1, s2, m1, m2
+
+
+def test_kill_coast_off_captures_no_seed():
+    """Regression guard: knob OFF -> a kill closes exactly as today (masks
+    wiped, no coast metadata on the outcome)."""
+    hw, history, s1, s2, m1, m2 = _kill_coast_scenario()
+    cfg = SelectiveConfig(min_streak=2, mask_overlap_exit=0.90, margin_exit=0.10,
+                          border_margin_px=5)               # kill_coast default OFF
+    em = ExitMachine([s1, s2], {1: history[0][1].box, 2: history[0][2].box},
+                     hw, history, cfg)
+    done = False
+    for f in range(5):
+        done = em.step(f, {1: m1[f], 2: m2[f]}, {1: None, 2: None})
+    assert done
+    outs = {o.spec.oid: o for o in em.outcomes()}
+    assert outs[1].state == "killed" and outs[2].state == "killed"
+    assert outs[1].masks == {} and outs[2].masks == {}
+    assert outs[1].coast_seed_frame is None and outs[1].coast_boxes == []
+    assert outs[2].coast_seed_frame is None and outs[2].coast_boxes == []
+
+
+def test_kill_coast_on_captures_last_confident_boxes():
+    """Knob ON -> each killed window records its last confident (pre-collapse)
+    SAM boxes: cutoff = close_frame - min_streak = 2, so the seed frame is 2 and
+    the coast trajectory is the boxes at frames 1 and 2."""
+    hw, history, s1, s2, m1, m2 = _kill_coast_scenario()
+    cfg = SelectiveConfig(min_streak=2, mask_overlap_exit=0.90, margin_exit=0.10,
+                          border_margin_px=5, kill_coast=True)
+    em = ExitMachine([s1, s2], {1: history[0][1].box, 2: history[0][2].box},
+                     hw, history, cfg)
+    done = False
+    for f in range(5):
+        done = em.step(f, {1: m1[f], 2: m2[f]}, {1: None, 2: None})
+    assert done
+    outs = {o.spec.oid: o for o in em.outcomes()}
+    assert outs[1].state == "killed" and outs[2].state == "killed"
+    assert outs[1].masks == {} and outs[2].masks == {}     # masks still wiped
+    assert outs[1].coast_seed_frame == 2
+    assert outs[1].coast_boxes == [(20, 80, 40, 100), (30, 80, 50, 100)]
+    assert outs[2].coast_seed_frame == 2
+    assert outs[2].coast_boxes == [(150, 80, 170, 100), (140, 80, 160, 100)]
+
+
 def test_exit_end_window_max():
     cfg = SelectiveConfig(min_streak=10, window_max_frames=3, margin_exit=0.10,
                           border_margin_px=5)
@@ -516,6 +594,132 @@ def test_merge_rename_dedup_identical_pairs():
     _, renames = merge_selective_results(history, [o1, o2], cfg)
     assert len(renames) == 1
     assert isinstance(renames[0], RenameEvent)
+
+
+# --------------------------------------------------------------------------
+# merge_selective_results kill-coast fallback (Task 2, selective_kill_coast)
+# --------------------------------------------------------------------------
+def _killed_outcome(oid, seed_frame, coast_boxes, entry_frame=1, close_frame=4):
+    """A killed WindowOutcome carrying the coast seed the ExitMachine would have
+    captured (masks wiped, as a real kill leaves them)."""
+    return WindowOutcome(
+        spec=WindowSpec(oid=oid, seed_frame=0, entry_frame=entry_frame,
+                        trigger="margin"),
+        state="killed", swap_to=None, close_frame=close_frame,
+        masks={}, probs={}, coast_seed_frame=seed_frame, coast_boxes=coast_boxes)
+
+
+def test_kill_coast_off_leaves_tbd_unchanged():
+    """Regression guard (merge level): with the knob OFF a killed outcome is
+    byte-identical to pure TBD, even when coast metadata rides along."""
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10)   # kill_coast default OFF
+    b_flip = (120, 80, 140, 100)
+    history = {f: {1: _obs(b_flip, margin=0.0)} for f in range(6)}
+    killed = _killed_outcome(1, seed_frame=1,
+                             coast_boxes=[(60, 80, 80, 100), (50, 80, 70, 100)])
+    with_kill, ren_a = merge_selective_results(history, [killed], cfg)
+    baseline, ren_b = merge_selective_results(history, [], cfg)
+    assert with_kill == baseline                            # nothing coasted
+    assert ren_a == [] and ren_b == []
+    for f in range(6):
+        assert with_kill[f][1]["evidence"]["type"] == "tbd"
+
+
+def test_kill_coast_on_pins_identity_through_ambiguous_flip():
+    """Knob ON: raw TBD has flipped oid1 onto the other robot's box (far right),
+    but the coast pins oid1 to a constant-velocity extrapolation of its last
+    confident SAM box (drifting left) with ``kill_coast`` evidence, for the
+    whole coast window."""
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, iou_expand=0.25,
+                          kill_coast=True, kill_coast_frames=24)
+    b_flip = (120, 80, 140, 100)                            # TBD's (wrong) box
+    history = {f: {1: _obs(b_flip, margin=0.0)} for f in range(6)}
+    # seed frame 1, box (50,80,70,100), prior box (60,80,80,100) -> velocity (-10,0).
+    killed = _killed_outcome(1, seed_frame=1,
+                             coast_boxes=[(60, 80, 80, 100), (50, 80, 70, 100)])
+    results, renames = merge_selective_results(history, [killed], cfg)
+    assert renames == []
+    # frames <= seed are untouched raw TBD.
+    for f in (0, 1):
+        assert results[f][1]["box"] == b_flip
+        assert results[f][1]["evidence"]["type"] == "tbd"
+    # frames seed+1..end: coasted box (identity pinned), NOT the flipped TBD box.
+    expected = {2: (40, 80, 60, 100), 3: (30, 80, 50, 100),
+                4: (20, 80, 40, 100), 5: (10, 80, 30, 100)}
+    for f, box in expected.items():
+        assert results[f][1]["box"] == box
+        assert results[f][1]["box"] != b_flip
+        assert results[f][1]["mask"] is None
+        assert results[f][1]["evidence"]["type"] == "kill_coast"
+
+
+def test_kill_coast_two_close_boxes_keep_coasting():
+    """The ambiguity gate: two same-alliance detections straddle the coasted box
+    with near-equal expanded-IoU, so the re-claim margin stays below margin_exit
+    and the coast HOLDS -- exactly the two-close-boxes case where raw TBD would
+    flip. The coast does not hand identity to either near-tied detection."""
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, iou_expand=0.25,
+                          kill_coast=True, kill_coast_frames=1)
+    # coasted box at f2 is (40,80,60,100); two detections straddle it equally.
+    history = {
+        0: {1: _obs((60, 80, 80, 100), margin=0.0)},
+        1: {1: _obs((50, 80, 70, 100), margin=0.0)},
+        2: {1: _obs((36, 80, 56, 100), margin=0.0),
+            2: _obs((44, 80, 64, 100), margin=0.0)},
+    }
+    killed = _killed_outcome(1, seed_frame=1,
+                             coast_boxes=[(60, 80, 80, 100), (50, 80, 70, 100)])
+    results, _ = merge_selective_results(history, [killed], cfg)
+    assert results[2][1]["evidence"]["type"] == "kill_coast"    # held (ambiguous)
+    assert results[2][1]["box"] == (40, 80, 60, 100)
+
+
+def test_kill_coast_unambiguous_reclaim_ends_coast():
+    """A frame where the coasted box matches exactly one TBD detection (margin
+    inf >= margin_exit) ends the coast; that frame and all later ones stand as
+    raw TBD."""
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, iou_expand=0.25,
+                          kill_coast=True, kill_coast_frames=24)
+    far = (120, 80, 140, 100)
+    history = {
+        0: {1: _obs(far, margin=0.0)},
+        1: {1: _obs(far, margin=0.0)},
+        2: {1: _obs(far, margin=0.0)},                      # nothing near coast -> hold
+        # f3 coasted box is (30,80,50,100); one detection sits right on it and
+        # no other detection overlaps -> unambiguous re-claim.
+        3: {1: _obs((32, 80, 52, 100), margin=0.5)},
+        4: {1: _obs((20, 80, 40, 100), margin=0.5)},
+        5: {1: _obs((10, 80, 30, 100), margin=0.5)},
+    }
+    killed = _killed_outcome(1, seed_frame=1,
+                             coast_boxes=[(60, 80, 80, 100), (50, 80, 70, 100)])
+    results, _ = merge_selective_results(history, [killed], cfg)
+    assert results[2][1]["evidence"]["type"] == "kill_coast"   # held (no match)
+    assert results[2][1]["box"] == (40, 80, 60, 100)
+    # f3 re-claims -> raw TBD stands from here on.
+    assert results[3][1]["evidence"]["type"] == "tbd"
+    assert results[3][1]["box"] == (32, 80, 52, 100)
+    assert results[4][1]["evidence"]["type"] == "tbd"
+    assert results[5][1]["evidence"]["type"] == "tbd"
+
+
+def test_kill_coast_budget_expiry_reverts_to_tbd():
+    """The coast lasts at most ``kill_coast_frames`` frames; past the budget the
+    raw TBD stream stands even when the geometry would still coast."""
+    cfg = SelectiveConfig(min_streak=2, margin_exit=0.10, iou_expand=0.25,
+                          kill_coast=True, kill_coast_frames=2)
+    far = (120, 80, 140, 100)                               # never near the coast
+    history = {f: {1: _obs(far, margin=0.0)} for f in range(6)}
+    killed = _killed_outcome(1, seed_frame=1,
+                             coast_boxes=[(60, 80, 80, 100), (50, 80, 70, 100)])
+    results, _ = merge_selective_results(history, [killed], cfg)
+    # budget = 2 -> only seed+1, seed+2 coast.
+    assert results[2][1]["evidence"]["type"] == "kill_coast"
+    assert results[3][1]["evidence"]["type"] == "kill_coast"
+    # seed+3 onward: budget spent, back to raw TBD.
+    assert results[4][1]["evidence"]["type"] == "tbd"
+    assert results[4][1]["box"] == far
+    assert results[5][1]["evidence"]["type"] == "tbd"
 
 
 def test_merge_swap_with_clean_witness_same_group():

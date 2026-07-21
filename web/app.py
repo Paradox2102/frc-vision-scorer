@@ -1891,6 +1891,8 @@ class InferenceJob:
                     sam_budget_frac=self.config.selective_sam_budget_frac,
                     kill_coast=self.config.selective_kill_coast,
                     kill_coast_frames=self.config.selective_kill_coast_frames,
+                    app_weight=self.config.selective_app_weight,
+                    app_ema=self.config.selective_app_ema,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,

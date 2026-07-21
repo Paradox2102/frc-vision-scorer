@@ -199,6 +199,17 @@ KNOBS = [
     # those frames); a later, smaller episode may still fit.
     Knob("selective_sam_budget_frac", "SELECTIVE_SAM_BUDGET_FRAC", float, 1.0,
          min=0.1, max=10.0, section="Tracking backend"),
+    # DINOv3 appearance term in the selective TBD tracker's assignment cost
+    # (blue-gap fix #3, docs/selective-mask-prop-blue-gap.md; spec in
+    # docs/superpowers/specs/2026-07-20-selective-appearance-term-design.md).
+    # Same-color pairs gain app_weight * (1 - cosine(track EMA, det emb)) so
+    # same-alliance robots separate by appearance where motion+IoU cannot.
+    # 0.0 = OFF (exact no-op). Track gallery EMA refreshes only on confident
+    # matches (assignment margin >= selective_margin_exit).
+    Knob("selective_app_weight", "SELECTIVE_APP_WEIGHT", float, 0.0,
+         min=0.0, max=5.0, section="Tracking backend"),
+    Knob("selective_app_ema", "SELECTIVE_APP_EMA", float, 0.9,
+         min=0.0, max=1.0, section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

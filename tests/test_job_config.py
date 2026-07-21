@@ -451,6 +451,36 @@ def test_selective_kill_coast_frames_knob_bounds():
         JobConfig({"selective_kill_coast_frames": 241})
 
 
+def test_selective_app_knobs_default(monkeypatch):
+    monkeypatch.delenv("SELECTIVE_APP_WEIGHT", raising=False)
+    monkeypatch.delenv("SELECTIVE_APP_EMA", raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_app_weight == 0.0
+    assert cfg.selective_app_ema == 0.9
+
+
+def test_selective_app_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_APP_WEIGHT", "0.6")
+    monkeypatch.setenv("SELECTIVE_APP_EMA", "0.7")
+    assert JobConfig().selective_app_weight == 0.6
+    assert JobConfig().selective_app_ema == 0.7
+    cfg = JobConfig({"selective_app_weight": 1.2, "selective_app_ema": 0.5})
+    assert cfg.selective_app_weight == 1.2
+    assert cfg.selective_app_ema == 0.5
+
+
+def test_selective_app_knobs_bounds():
+    import pytest
+    with pytest.raises(ValueError):
+        JobConfig({"selective_app_weight": -0.1})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_app_weight": 5.1})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_app_ema": -0.1})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_app_ema": 1.1})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

@@ -167,6 +167,12 @@ def _install_fake_timm(monkeypatch):
         def eval(self):  # torch.nn.Module.eval() (inference mode), not the builtin
             return self
 
+        def parameters(self):
+            # embed_batch reads next(self._model.parameters()).dtype to pin
+            # the input batch's dtype to the model's (here: float32, like
+            # the real timm weights).
+            yield torch.zeros(1)
+
         def forward_features(self, batch):
             self.forward_features_called = True
             n = batch.shape[0]

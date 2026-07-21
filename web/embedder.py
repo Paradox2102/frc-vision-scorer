@@ -167,9 +167,20 @@ class RobotEmbedder:
             crop_bgr = _apply_mask(frame[y1:y2, x1:x2], masks[i])
             crops.append(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
 
+        # Pin the batch dtype to the model's own parameter dtype rather than
+        # whatever torch's ambient default dtype happens to be: a concurrent
+        # transformers model load (e.g. AutoModel.from_pretrained(...,
+        # torch_dtype=torch.float16) in another thread, as the local bumper-
+        # reader fallback does) temporarily flips torch's global default
+        # dtype, and building/stacking the batch inside that window would
+        # otherwise silently produce e.g. a float16 batch against float32
+        # weights -> "Input type (c10::Half) and bias type (float) should be
+        # the same" in the model's first conv/linear layer.
+        model_dtype = next(self._model.parameters()).dtype
         if self.model_name.startswith("timm/"):
             batch = torch.stack(
-                [self._transform(self._image_cls.fromarray(c)) for c in crops]).to(self._device)
+                [self._transform(self._image_cls.fromarray(c)) for c in crops]
+            ).to(self._device, model_dtype)
             with torch.no_grad():
                 # forward_features() returns the raw token sequence (no head
                 # pooling applied). Do NOT call the model directly / use its
@@ -181,7 +192,7 @@ class RobotEmbedder:
                 feats = self._model.forward_features(batch)
             cls = feats[:, 0]
         else:
-            inputs = self._processor(images=crops, return_tensors="pt").to(self._device)
+            inputs = self._processor(images=crops, return_tensors="pt").to(self._device, model_dtype)
             with torch.no_grad():
                 outputs = self._model(**inputs)
             cls = outputs.last_hidden_state[:, 0]  # CLS token, [N, 384]

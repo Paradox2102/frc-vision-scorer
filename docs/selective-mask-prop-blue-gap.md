@@ -109,6 +109,46 @@ Also note baseline blue_cov 4786=1 vs selective 26 — selective *helps* the
 never-seeded robot; the blue regression is entirely 3181 (100→52) and
 2992 (99→73).
 
+## Appearance-term results (Jul 20 2026, fix #3) — works, but the blue diagnosis was WRONG
+
+`selective_app_weight` (DINOv3 term in the TBD cost, spec
+`docs/superpowers/specs/2026-07-20-selective-appearance-term-design.md`,
+merged on this branch) swept 0.3/0.6/1.0 on qm11 auto:
+
+| arm | agg | blue | red | main windows | killed | sam_frames |
+|-----|-----|------|-----|--------------|--------|-----------|
+| baseline | 0.816 | 0.594 | 1.037 | — | — | 100% |
+| selective (w=0) | 0.883 | 1.033 | 0.733 | 17 | 7 | 72% |
+| sel-app03 | 0.837 | 1.034 | **0.639** | **10** | **2** | **56%** |
+| sel-app06 | 0.837 | 1.034 | 0.639 | (byte-identical to 0.3) | | |
+| sel-app10 | 0.834 | 1.034 | 0.635 | (~same) | | |
+
+The term works for what embeddings can separate: red 0.733→0.639 (38% better
+than baseline), windows −41%, kills 7→2, SAM cost 72%→56%, and the effect
+saturates at weight 0.3. **Blue did not move at all** — meanNN 1.033→1.034 and
+coverage byte-identical (4786=26, 3181=52, 2992=73) across all four selective
+variants.
+
+**This falsifies the original causal story.** Kills collapsed 7→2 with zero
+blue movement, so the killed window pairs were evidently RED convergences
+(red is what improved as they resolved), not blue. Blue coverage is
+deterministically pinned across wildly different window/kill/appearance
+structures, which means the blue gap lives OUTSIDE the window mechanism
+entirely: either the pure-TBD stream for the blue robots is qualitatively
+worse than uniform SAM tracking regardless of association correctness, or a
+downstream layer (identity binding / fusion) treats mask-less TBD boxes
+differently. Blue-gap v2 needs a fresh root-cause pass: diff baseline-vs-
+selective per-frame blue behavior (where exactly does 3181 lose its 48%?)
+before proposing any further fix.
+
+Incidental find (fixed, commit 4b5e040e): the analysis-loop relink
+`embed_batch` raced the local reader's in-process VLM load (transformers
+temporarily flips torch's global default dtype during `from_pretrained`) →
+"Half input / float bias" job kill. Input dtype now pinned to the model's
+parameter dtype. Separately, the vLLM engine failing to come up mid-sweep
+traced to the unmerged VRAM ratchet (branch `vram-leak-fix`) — sweeps now run
+`--restart-between`.
+
 ## How to evaluate
 
 Server launch: `web/start_all.sh` (vLLM reader, job-managed). qm11 A/B:

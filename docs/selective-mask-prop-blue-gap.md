@@ -141,6 +141,27 @@ differently. Blue-gap v2 needs a fresh root-cause pass: diff baseline-vs-
 selective per-frame blue behavior (where exactly does 3181 lose its 48%?)
 before proposing any further fix.
 
+**Full-match validation (same day) — the framing flips.** `--full-match
+--restart-between`, 3 arms, auto-window scored:
+
+| arm (full-match processing) | agg | blue | red |
+|-----------------------------|-----|------|-----|
+| baseline | 0.983 | 1.062 | 0.903 |
+| selective | 0.883 | 1.034 | 0.733 |
+| sel-app03 | **0.837** | **1.034** | **0.639** |
+
+On like-for-like full-match processing — the production case — selective+
+appearance **beats baseline by 15% agg, red by 29%, and even blue slightly**.
+The "selective is a net regression" story was an artifact of comparing
+against the auto-only baseline (0.816), a mode full production wouldn't run.
+Two more full-match facts: (1) selective's auto-window output is byte-identical
+between auto-only and full-match runs (per-frame TBD is causal), while uniform
+baseline degrades 0.816→0.983 from whole-match state pollution; (2) the SAM
+cost win shrinks at full scale (56%→88% of uniform; teleop density opens
+230–272 windows, killed 71–73, stale 95–121) — window mechanics get turbulent
+in teleop and are the next cost lever if it matters. Blue-gap v2 remains real
+against full-match baseline coverage too (3181: 52 vs 100).
+
 Incidental find (fixed, commit 4b5e040e): the analysis-loop relink
 `embed_batch` raced the local reader's in-process VLM load (transformers
 temporarily flips torch's global default dtype during `from_pretrained`) →

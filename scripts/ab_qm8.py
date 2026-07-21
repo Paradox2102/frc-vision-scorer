@@ -347,6 +347,12 @@ PROFILES = {
     # fixes: raise the kill threshold (selective_mask_overlap_exit, Task 1) so
     # only near-total collapse kills, and/or coast the last-confident SAM box
     # instead of reverting to raw TBD on a kill (selective_kill_coast, Task 2).
+    # Single-arm probe for the kill-coast diagnostics (coast= in the
+    # [selective] log line): did _apply_kill_coast write entries, and why did
+    # each kill's coast end (no_seed / range / reclaim / budget)?
+    "coast-probe": [
+        ("sel-coast", {"selective_mask_prop": True, "selective_kill_coast": True}),
+    ],
     "blue-gap": [
         ("baseline", {}),
         ("selective", {"selective_mask_prop": True}),

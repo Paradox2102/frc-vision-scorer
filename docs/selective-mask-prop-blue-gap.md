@@ -2,6 +2,8 @@
 
 **Status:** open problem, discovered Jul 19 2026 after the window merge/cap fix landed (`selective_sam_budget_frac`, commit a2f3a846). Selective mask propagation (`selective_mask_prop`, default OFF) is now cost-correct on qm11 but has a quality regression isolated to one mechanism. This doc scopes that mechanism and the candidate fixes so the next session can start from the diagnosis, not the symptom.
 
+**Update Jul 20 2026:** fixes #1 and #2 were implemented (`selective_mask_overlap_exit`, `selective_kill_coast`, both default OFF) and A/B'd — **both are dead on qm11**. See "Blue-gap A/B results" below. The kills are total mask collapses (identical outcomes at 0.90/0.95/0.97), and 5 of 7 killed windows are *born converged* (no pre-convergence SAM state exists to coast from), which reframes the problem: the same-alliance confusion predates the windows. Fix #3 (appearance term in TBD) is the remaining candidate.
+
 ## Where we are
 
 Two qm11 A/Bs against an exactly-reproduced baseline (`agg_meanNN` 0.816, blue 0.594, red 1.037):
@@ -52,6 +54,60 @@ Red improved because reds were more separated on this match — their windows se
 1. **Tune `mask_overlap_exit` (kill threshold).** Currently 0.90, an internal constant. Raising it (e.g. 0.95–0.97) makes the kill fire only on near-total mask collapse, letting partially-overlapping same-alliance masks survive rather than dumping both to TBD. Cheapest probe: promote it to a knob (`selective_mask_overlap_exit`) and A/B 0.90/0.95/0.97 on qm11. Risk: too high and genuine hijack/merge cases stop being culled. Measures whether the kills are premature vs genuinely-collapsed.
 2. **Better fallback than raw TBD on a killed pair.** When a window is killed, instead of reverting to the appearance-blind TBD association, keep the last-confident SAM box per object and coast it (the uniform path's coast-and-decay). Medium effort in `merge_selective_results` / the `killed` branch. Attacks the "TBD is weak exactly here" half rather than the "kills fire" half.
 3. **DINOv3 appearance term in the TBD cost (the plan's deferred v2).** Add a gallery/embedding affinity term to `TbdTracker`'s expanded-IoU Hungarian cost so same-alliance robots are separated by appearance, not just motion. This is the principled fix — it makes the TBD fallback strong enough that kills reverting to it stop hurting — but it's the most work (per-frame embedding cost in the TBD pass, plumbing the embedder into `selective_prop.py`, which is currently torch-free) and overlaps the broader same-alliance re-ID program. Note it partly re-introduces the per-frame embedding cost the selective architecture was trying to avoid — measure the net speed.
+
+## Blue-gap A/B results (Jul 20 2026)
+
+Six-arm `--profile blue-gap` run on qm11. Baseline reproduced exactly
+(0.816/0.594/1.037, third time); every selective arm came back **byte-identical**
+to the selective control (agg 0.883, blue 1.033, red 0.733; blue_cov
+4786=26 3181=52 2992=73). Config receipt verified per arm in the server log;
+no `FALLBACK`, no `Error during propagation` in any job log.
+
+**Fix #1 (kill threshold) is dead.** At 0.90, 0.95, and 0.97 the main view
+produces the identical outcome histogram (`killed: 7`, windows=17,
+sam_frames=130 = 72%). The convergences exceed 0.97 pixel-IoU — total mask
+collapse, not partial overlap. No threshold value rescues these windows.
+
+**Fix #2 (kill-coast) never engages.** A `coast=` diagnostic added to the
+`[selective]` per-view log line (probe: `--profile coast-probe`) shows zero
+coasted entries across all 7 kills:
+
+```
+coast={'kills': 7, 'no_seed': 5, 'entries': 0, 'per_kill': [
+  (6, None, 0, 'no_seed'), (6, None, 0, 'no_seed'), (6, None, 0, 'no_seed'),
+  (1, 95, 0, 'reclaim'), (1, None, 0, 'no_seed'),
+  (16, 155, 0, 'reclaim'), (16, None, 0, 'no_seed')]}
+```
+
+Two distinct defects:
+
+1. **Born-converged windows (5/7 kills, `no_seed`).** `_capture_coast` requires
+   stored mask frames at/before `close_frame - min_streak`; masks are stored
+   from `entry_frame` on. `no_seed` therefore means the overlap streak started
+   at (or before) window entry — the window never had a confident
+   pre-convergence SAM state *at all*. The same-alliance confusion exists at
+   seed time (two windows seeded onto the same robot because TBD had already
+   mis-associated), so there is nothing to coast from. Only 3 distinct oids
+   (1, 6, 16) account for all 7 kills — the same objects re-seed, re-converge,
+   and re-die.
+2. **Instant reclaim (2/7 kills, `reclaim` at step 1, 0 entries written).**
+   `_coast_reclaim_margin` returns `inf` when exactly one TBD detection
+   overlaps the coasted box — and the killed object's *own* TBD track is in
+   `frame_obs`, sitting within a frame of the coast seed, so it always
+   overlaps. `inf >= margin_exit (0.10)` ends the coast before the first entry
+   is written. The test asks "does some TBD box own this position?" when it
+   should ask "has the killed *pair* separated?"
+
+**Implication.** The doc's original causal story ("kills → weak TBD fallback")
+is at best half the picture: for 5 of 7 kills the TBD mis-association
+*precedes* the window, so no post-kill fallback — however good — can recover
+identity that was already lost at seeding. Patching kill-coast (seed from the
+window's seed box, fix the reclaim test) would engage it, but it would coast
+from possibly-already-wrong positions. The remaining principled fix is #3
+(appearance term in the TBD cost), which attacks the mis-association itself.
+Also note baseline blue_cov 4786=1 vs selective 26 — selective *helps* the
+never-seeded robot; the blue regression is entirely 3181 (100→52) and
+2992 (99→73).
 
 ## How to evaluate
 

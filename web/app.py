@@ -1925,7 +1925,9 @@ class InferenceJob:
                       f"renames={stats.get('renames', 0)} "
                       f"skipped={stats.get('skipped', 0)} "
                       f"episodes={stats.get('episodes', 0)} "
-                      f"dropped={stats.get('dropped_windows', 0)}")
+                      f"dropped={stats.get('dropped_windows', 0)}"
+                      + (f" coast={stats['coast']}"
+                         if stats.get("coast") is not None else ""))
                 # Selective mode never uses the prompt-seed identity space, so
                 # REPLACE (not merge) the per-view color dict that was pre-seeded
                 # with prompt-order {i+1: color} at ~app.py:6124. Merging only

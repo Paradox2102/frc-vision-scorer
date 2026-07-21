@@ -767,6 +767,14 @@ def _coast_reclaim_margin(coasted_box, frame_obs, cfg: SelectiveConfig):
     return costs[1] - costs[0]
 
 
+# Diagnostics from the most recent _apply_kill_coast call. Single-view
+# pipeline: sam2_tracker reads this right after merge_selective_results and
+# folds it into selective_stats, so the per-view log line shows whether the
+# coast actually wrote entries (kills, no_seed, entries written, and a
+# per-kill (oid, seed_frame, written, end_reason) breakdown).
+last_coast_stats: dict | None = None
+
+
 def _apply_kill_coast(results, history, outcomes, cfg: SelectiveConfig):
     """Coast each killed object from its last confident SAM box (Task 2).
 
@@ -786,29 +794,42 @@ def _apply_kill_coast(results, history, outcomes, cfg: SelectiveConfig):
     BEFORE :func:`_apply_renames` -- the coasted entries are then relabeled by
     any SWAP exactly like the rest of that oid's stream.
     """
+    global last_coast_stats
+    stats = {"kills": 0, "no_seed": 0, "entries": 0, "per_kill": []}
     for oc in outcomes:
-        if (oc.state != "killed" or oc.coast_seed_frame is None
-                or not oc.coast_boxes):
+        if oc.state != "killed":
+            continue
+        stats["kills"] += 1
+        if oc.coast_seed_frame is None or not oc.coast_boxes:
+            stats["no_seed"] += 1
+            stats["per_kill"].append((oc.spec.oid, None, 0, "no_seed"))
             continue
         oid = oc.spec.oid
         seed_frame = oc.coast_seed_frame
         seed_box = oc.coast_boxes[-1]
         vx, vy = _coast_velocity(oc.coast_boxes)
+        written, end = 0, "budget"
         for step in range(1, cfg.kill_coast_frames + 1):
             f = seed_frame + step
             if f not in results:
-                break                       # past the tracked range
+                end = "range"               # past the tracked range
+                break
             coasted = (seed_box[0] + vx * step, seed_box[1] + vy * step,
                        seed_box[2] + vx * step, seed_box[3] + vy * step)
             margin = _coast_reclaim_margin(coasted, history.get(f, {}), cfg)
             if margin is not None and margin >= cfg.margin_exit:
-                break                       # unambiguous re-claim -> TBD resumes
+                end = "reclaim"             # unambiguous re-claim -> TBD resumes
+                break
             results[f][oid] = {
                 "box": tuple(int(v) for v in coasted),
                 "mask": None,
                 "evidence": {"type": "kill_coast", "gap_len": 0,
                              "detector_overlap": 1.0, "tracker_prob": None},
             }
+            written += 1
+        stats["entries"] += written
+        stats["per_kill"].append((oid, seed_frame, written, end))
+    last_coast_stats = stats
 
 
 def merge_selective_results(history, outcomes, cfg: SelectiveConfig):

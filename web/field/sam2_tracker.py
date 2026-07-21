@@ -2949,6 +2949,9 @@ class Sam2FieldTracker:
             "renames": len(renames), "skipped": skipped,
             "episodes": episodes_run, "dropped_windows": dropped_windows,
         }
+        if cfg.kill_coast:
+            from web.field import selective_prop as _selprop
+            self.selective_stats["coast"] = _selprop.last_coast_stats
         return results
 
     def _selective_frame_hw(self, frame_paths):

@@ -50,6 +50,8 @@ class SelectiveConfig:
     sam_budget_frac: float = 1.0   # SAM-frame budget as a fraction of n_frames
     kill_coast: bool = False       # coast killed objects instead of raw TBD
     kill_coast_frames: int = 24    # max frames to coast a killed object
+    app_weight: float = 0.0        # appearance cost weight; 0 = OFF (exact no-op)
+    app_ema: float = 0.9           # track-embedding EMA retention on confident matches
 
 
 @dataclass
@@ -99,15 +101,16 @@ def _center(box):
 class _Track:
     """Internal per-object state (never leaked across the public interface)."""
 
-    __slots__ = ("oid", "box", "color", "_centers", "missed", "last_seen")
+    __slots__ = ("oid", "box", "color", "_centers", "missed", "last_seen", "emb")
 
-    def __init__(self, oid: int, box, color, frame_idx: int):
+    def __init__(self, oid: int, box, color, frame_idx: int, emb=None):
         self.oid = oid
         self.box = tuple(int(v) for v in box)
         self.color = color            # sticky: first *known* color wins
         self._centers = [_center(box)]
         self.missed = 0
         self.last_seen = frame_idx
+        self.emb = None if emb is None else np.asarray(emb, dtype=np.float32)
 
     def velocity(self):
         """Average of the last <=3 center deltas; (0, 0) for new tracks."""
@@ -131,6 +134,16 @@ class _Track:
             self.color = color        # first known color sticks
         self.missed = 0
         self.last_seen = frame_idx
+
+    def update_emb(self, det_emb, ema: float):
+        """EMA toward ``det_emb`` (re-L2-normalized). Caller gates on margin."""
+        if self.emb is None:
+            self.emb = np.asarray(det_emb, dtype=np.float32)
+            return
+        mixed = ema * self.emb + (1.0 - ema) * np.asarray(det_emb, dtype=np.float32)
+        norm = float(np.linalg.norm(mixed))
+        self.emb = (mixed / norm).astype(np.float32) if norm > 0.0 \
+            else np.asarray(det_emb, dtype=np.float32)
 
 
 class TbdTracker:
@@ -157,7 +170,7 @@ class TbdTracker:
         return self._next_oid
 
     # -- core step ---------------------------------------------------------
-    def _pair_cost(self, track: _Track, det_box, det_color) -> float:
+    def _pair_cost(self, track: _Track, det_box, det_color, det_emb=None) -> float:
         eiou = expanded_iou(track.predicted_box(), det_box, self.cfg.iou_expand)
         if eiou <= 0.0:
             return FORBIDDEN
@@ -165,15 +178,30 @@ class TbdTracker:
         if (det_color is not None and track.color is not None
                 and det_color != track.color):
             cost += COLOR_PENALTY
+        # Appearance (blue-gap fix #3): same-color pairs only -- cross-color
+        # is already penalized above; this term separates same-alliance
+        # robots that motion+IoU cannot. 1 - cosine in [0, 2].
+        if (self.cfg.app_weight > 0.0 and det_emb is not None
+                and track.emb is not None and det_color is not None
+                and det_color == track.color):
+            cost += self.cfg.app_weight * (1.0 - float(np.dot(track.emb, det_emb)))
         return cost
+
+    def emb_of(self, oid: int):
+        """Read-only view of a live track's EMA embedding (None if absent)."""
+        trk = self._tracks.get(oid)
+        return None if trk is None else trk.emb
 
     def step(self, frame_idx: int,
              dets: list[tuple[tuple, str | None]]) -> dict[int, FrameObs]:
         """Advance one frame.
 
-        ``dets = [(box_xyxy, color), ...]``. Returns this frame's matched and
-        newly-spawned observations keyed by oid. Also appends to ``history``.
+        ``dets = [(box_xyxy, color), ...]`` or ``[(box_xyxy, color, emb), ...]``
+        where ``emb`` is an ``np.ndarray|None`` appearance vector. Returns this
+        frame's matched and newly-spawned observations keyed by oid. Also
+        appends to ``history``.
         """
+        dets = [(d[0], d[1], d[2] if len(d) > 2 else None) for d in dets]
         live = sorted(self._tracks.values(), key=lambda t: t.oid)  # rows by oid
         obs: dict[int, FrameObs] = {}
         matched_oids: set[int] = set()
@@ -183,8 +211,8 @@ class TbdTracker:
             n, m = len(live), len(dets)
             cost = np.empty((n, m), dtype=float)
             for i, trk in enumerate(live):
-                for j, (dbox, dcolor) in enumerate(dets):
-                    cost[i, j] = self._pair_cost(trk, dbox, dcolor)
+                for j, (dbox, dcolor, demb) in enumerate(dets):
+                    cost[i, j] = self._pair_cost(trk, dbox, dcolor, demb)
 
             rows, cols = linear_sum_assignment(cost)
             for r, c in zip(rows, cols):
@@ -192,7 +220,7 @@ class TbdTracker:
                 if mcost >= FORBIDDEN:
                     continue                       # discard forbidden matches
                 trk = live[r]
-                dbox, dcolor = dets[c]
+                dbox, dcolor, demb = dets[c]
                 # Margin (paper Eq. 1): cheapest finite competitor in this
                 # detection's column minus the winning cost. No finite
                 # competitor -> unambiguous -> inf.
@@ -205,6 +233,9 @@ class TbdTracker:
                     self._gap_reappearances.append(
                         (trk.oid, trk.last_seen, frame_idx))
                 trk.observe(dbox, dcolor, frame_idx)
+                if (self.cfg.app_weight > 0.0 and demb is not None
+                        and margin >= self.cfg.margin_exit):
+                    trk.update_emb(demb, self.cfg.app_ema)
                 matched_oids.add(trk.oid)
                 matched_dets.add(c)
                 obs[trk.oid] = FrameObs(
@@ -219,12 +250,14 @@ class TbdTracker:
                 trk.missed += 1
 
         # Unmatched detections spawn fresh tracks (input order); margin inf.
-        for j, (dbox, dcolor) in enumerate(dets):
+        for j, (dbox, dcolor, demb) in enumerate(dets):
             if j in matched_dets:
                 continue
             oid = self._next_oid
             self._next_oid += 1
-            self._tracks[oid] = _Track(oid, dbox, dcolor, frame_idx)
+            self._tracks[oid] = _Track(
+                oid, dbox, dcolor, frame_idx,
+                emb=demb if self.cfg.app_weight > 0.0 else None)
             obs[oid] = FrameObs(
                 box=tuple(int(v) for v in dbox),
                 margin=float("inf"),

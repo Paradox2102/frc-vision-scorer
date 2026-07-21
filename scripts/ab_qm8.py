@@ -358,6 +358,16 @@ PROFILES = {
     # blue_meanNN toward the 0.594 baseline without losing the red win
     # (~0.73) or the cost win (main sam_frames <= 100% of uniform). Weight is
     # in combined-cost units (1-cos in [0,2] vs 1-eIoU in [0,1]) -- sweep it.
+    # Full-match validation of the winning appearance weight (0.3 — the sweep
+    # saturates there; 0.6/1.0 byte-identical on qm11 auto). Run with
+    # --full-match --restart-between: Manta position metrics still score the
+    # auto window; read teleop value from mislabel/slot_map, per-team
+    # coverage, killed counts, wall clock, and VRAM stability across arms.
+    "app-full": [
+        ("baseline", {}),
+        ("selective", {"selective_mask_prop": True}),
+        ("sel-app03", {"selective_mask_prop": True, "selective_app_weight": 0.3}),
+    ],
     "app-sweep": [
         ("baseline", {}),
         ("selective", {"selective_mask_prop": True}),

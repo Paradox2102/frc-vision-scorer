@@ -2730,6 +2730,7 @@ class Sam2FieldTracker:
         cfg,
         progress_cb=None,
         should_stop=None,
+        embed_frame_fn=None,
     ) -> dict:
         """Per-frame tracking-by-detection everywhere, SAM only in ambiguity.
 
@@ -2751,6 +2752,12 @@ class Sam2FieldTracker:
             should_stop: Optional ``fn() -> bool`` polled once per enumerated
                 frame; when it trips, the TBD-only partial is merged and returned
                 immediately without touching the predictor.
+            embed_frame_fn: Optional ``fn(local_idx, frame_path, boxes) ->
+                list[np.ndarray|None]`` -- per-frame appearance embeddings for
+                the TBD detections, aligned with ``boxes``. Only consulted when
+                ``cfg.app_weight > 0``; with ``cfg.app_weight`` at its default
+                of 0.0 this parameter is never called regardless of what's
+                passed.
 
         Returns:
             A ``sam2_raw``-schema dict ``{frame: {oid: {"box", "mask",
@@ -2787,11 +2794,23 @@ class Sam2FieldTracker:
         n_frames = len(frame_paths)
         tbd = TbdTracker(cfg)
         stopped = False
+        app_frames = app_dets = 0
         for i, path in enumerate(frame_paths):
             try:
                 dets = detect_frame_fn(i, path) or []
             except Exception:
                 dets = []
+            if (embed_frame_fn is not None and dets
+                    and getattr(cfg, "app_weight", 0.0) > 0.0):
+                boxes = [d[0] for d in dets]
+                try:
+                    embs = embed_frame_fn(i, path, boxes)
+                except Exception:
+                    embs = [None] * len(dets)
+                if embs is not None and len(embs) == len(dets):
+                    dets = [(b, c, e) for (b, c), e in zip(dets, embs)]
+                    app_frames += 1
+                    app_dets += sum(1 for e in embs if e is not None)
             tbd.step(i, dets)
             if progress_cb is not None:
                 try:
@@ -2823,6 +2842,9 @@ class Sam2FieldTracker:
                 "outcomes": {}, "renames": len(renames), "skipped": 0,
                 "episodes": 0, "dropped_windows": 0,
             }
+            if getattr(cfg, "app_weight", 0.0) > 0.0:
+                self.selective_stats["app"] = {
+                    "frames_embedded": app_frames, "dets_embedded": app_dets}
             return results
 
         # -- Phase B: offline window construction --------------------------
@@ -2952,6 +2974,9 @@ class Sam2FieldTracker:
         if cfg.kill_coast:
             from web.field import selective_prop as _selprop
             self.selective_stats["coast"] = _selprop.last_coast_stats
+        if getattr(cfg, "app_weight", 0.0) > 0.0:
+            self.selective_stats["app"] = {
+                "frames_embedded": app_frames, "dets_embedded": app_dets}
         return results
 
     def _selective_frame_hw(self, frame_paths):

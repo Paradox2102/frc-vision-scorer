@@ -1864,6 +1864,36 @@ class InferenceJob:
 
         return detect_frame_fn
 
+    def make_embed_frame_fn(self):
+        """Per-frame crop embedder for the selective TBD appearance term.
+
+        Returns ``fn(local_idx, frame_path, boxes) -> [vec384|None, ...]``.
+        Closes over ``self.robot_embedder`` (loaded with the tracker before
+        Phase 2; released with the job's other GPU models). Every failure
+        degrades to all-None embeddings for that frame -- the TBD cost then
+        falls back to pure expanded-IoU, never aborting the view. First
+        error only is logged (Phase A swallows exceptions silently).
+        """
+        err_state = {"warned": False}
+
+        def embed_frame_fn(local_idx, frame_path, boxes):
+            try:
+                emb = self.robot_embedder
+                if emb is None or not boxes:
+                    return [None] * len(boxes)
+                img = cv2.imread(frame_path)
+                if img is None:
+                    return [None] * len(boxes)
+                return emb.embed_batch(img, boxes)
+            except Exception as e:
+                if not err_state["warned"]:
+                    err_state["warned"] = True
+                    print(f"  [selective] embed_frame_fn error "
+                          f"(further errors suppressed): {e}")
+                return [None] * len(boxes)
+
+        return embed_frame_fn
+
     async def _run_view_tracking(self, sam2_tracker, view, track_kwargs,
                                  frame_detect_fn, progress_cb):
         """Run one view's SAM propagation, honoring ``selective_mask_prop``.
@@ -1901,6 +1931,9 @@ class InferenceJob:
                     cfg=cfg,
                     progress_cb=progress_cb,
                     should_stop=lambda: self._stopped,
+                    embed_frame_fn=(self.make_embed_frame_fn()
+                                    if self.config.selective_app_weight > 0.0
+                                    else None),
                 )
             except TrackStopped:
                 # A user stop is NOT a selective failure: propagate it to the
@@ -1929,7 +1962,9 @@ class InferenceJob:
                       f"episodes={stats.get('episodes', 0)} "
                       f"dropped={stats.get('dropped_windows', 0)}"
                       + (f" coast={stats['coast']}"
-                         if stats.get("coast") is not None else ""))
+                         if stats.get("coast") is not None else "")
+                      + (f" app={stats['app']}"
+                         if stats.get("app") is not None else ""))
                 # Selective mode never uses the prompt-seed identity space, so
                 # REPLACE (not merge) the per-view color dict that was pre-seeded
                 # with prompt-order {i+1: color} at ~app.py:6124. Merging only

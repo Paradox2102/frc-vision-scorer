@@ -122,6 +122,43 @@ def test_make_frame_detect_fn_out_of_range_local_idx_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# make_embed_frame_fn
+# ---------------------------------------------------------------------------
+def test_make_embed_frame_fn_batches_boxes(tmp_path):
+    job = _make_job()
+    vec = np.ones(384, dtype=np.float32)
+    job.robot_embedder = SimpleNamespace(
+        embed_batch=MagicMock(return_value=[vec, None]))
+    jpg = tmp_path / "00000.jpg"
+    cv2.imwrite(str(jpg), np.zeros((50, 50, 3), dtype=np.uint8))
+
+    fn = job.make_embed_frame_fn()
+    out = fn(0, str(jpg), [(0, 0, 10, 10), (20, 20, 40, 40)])
+    assert out[0] is vec and out[1] is None
+    assert job.robot_embedder.embed_batch.call_count == 1
+
+
+def test_make_embed_frame_fn_none_embedder_returns_nones():
+    job = _make_job()
+    job.robot_embedder = None
+    fn = job.make_embed_frame_fn()
+    assert fn(0, "/nonexistent.jpg", [(0, 0, 10, 10)]) == [None]
+
+
+def test_make_embed_frame_fn_swallows_errors_first_warning_only(capsys):
+    job = _make_job()
+    job.robot_embedder = SimpleNamespace(
+        embed_batch=MagicMock(side_effect=RuntimeError("boom")))
+    fn = job.make_embed_frame_fn()
+    # Unreadable path also exercises the imread-None branch harmlessly.
+    boxes = [(0, 0, 10, 10)]
+    assert fn(0, "/nonexistent.jpg", boxes) == [None]
+    assert fn(1, "/nonexistent.jpg", boxes) == [None]
+    err = capsys.readouterr().out
+    assert err.count("embed_frame_fn") <= 1
+
+
+# ---------------------------------------------------------------------------
 # _run_view_tracking gate
 # ---------------------------------------------------------------------------
 def _tracker_stub(track_return):
@@ -315,6 +352,32 @@ def test_gate_on_passes_app_overrides_to_selective_config():
     cfg = tracker.track_selective.call_args.kwargs["cfg"]
     assert cfg.app_weight == 0.6
     assert cfg.app_ema == 0.7
+
+
+def test_gate_on_passes_embed_frame_fn_only_when_weight_positive():
+    """weight 0 -> embed_frame_fn=None; weight >0 -> a callable."""
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    def _run(weight):
+        job = _make_job()
+        job.config.selective_mask_prop = True
+        job.config.selective_app_weight = weight
+        job.timings = {}
+        tracker = _tracker_stub({"unused": True})
+        tracker.track_selective.side_effect = RuntimeError("boom")  # short-circuit to fallback
+
+        async def run():
+            return await job._run_view_tracking(
+                tracker, view, track_kwargs,
+                lambda i, p: [], lambda a, b: None)
+
+        asyncio.run(run())
+        tracker.track_selective.assert_called_once()
+        return tracker.track_selective.call_args.kwargs["embed_frame_fn"]
+
+    assert _run(0.0) is None
+    assert callable(_run(0.6))
 
 
 def test_gate_on_success_log_includes_episodes_and_dropped(capsys):

@@ -1221,7 +1221,7 @@ class InferenceJob:
         # _slot_source): the whole-match exact assignment writes the resolved team
         # + confirmed here so the match_robot_identity DB row matches the replay
         # overlay on changed slots. Empty unless global_identity_resolve is on.
-        self._resolved_team_by_slot: dict[int, str] = {}
+        self._resolved_team_by_slot: dict[int, str | None] = {}  # None = stripped stale label
         self._resolved_confirmed_by_slot: dict[int, bool] = {}
         self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}

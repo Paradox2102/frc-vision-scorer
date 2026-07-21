@@ -254,6 +254,45 @@ def test_merge_does_not_mutate_input():
     assert slot_meta == original_copy
 
 
+def test_merge_strips_kept_label_colliding_with_assignment():
+    # qm11 debut collision (2026-07-20 A/B): the exact assignment moved 1477
+    # onto slot 2, slot 3's assignment came back None (1477 already taken),
+    # and the v1 keep-on-None rule preserved slot 3's stale greedy "1477" —
+    # two 1477s on the overlay. A team assigned to one slot must not survive
+    # as a kept label on any other slot.
+    slot_meta = {
+        2: {"team_number": None, "confirmed": False},
+        3: {"team_number": "1477", "confirmed": False},
+    }
+    assignment = {2: "1477", 3: None}
+    scores = {2: {"1477": 1.1}, 3: {}}
+    new_meta, changes = merge_global_assignment(slot_meta, assignment, scores)
+
+    assert new_meta[2]["team_number"] == "1477"
+    assert new_meta[3]["team_number"] is None       # stripped, not duplicated
+    assert new_meta[3]["confirmed"] is False
+    teams = [m["team_number"] for m in new_meta.values() if m["team_number"]]
+    assert len(teams) == len(set(teams))
+    strip = {c["slot_id"]: c for c in changes}[3]
+    assert strip["old_team"] == "1477" and strip["new_team"] is None
+    # Original still unmutated.
+    assert slot_meta[3]["team_number"] == "1477"
+
+
+def test_merge_strips_collision_when_slot_absent_from_assignment():
+    # Same hazard when the stale slot never entered the solve at all (no
+    # evidence rows -> absent from ``assignment``, not merely None).
+    slot_meta = {
+        2: {"team_number": None, "confirmed": False},
+        3: {"team_number": "1477", "confirmed": True},
+    }
+    new_meta, _ = merge_global_assignment(
+        slot_meta, {2: "1477"}, {2: {"1477": 3.0}})
+    assert new_meta[2]["team_number"] == "1477"
+    assert new_meta[3]["team_number"] is None
+    assert new_meta[3]["confirmed"] is False
+
+
 # ---------------------------------------------------------------------------
 # Extra edge cases
 # ---------------------------------------------------------------------------

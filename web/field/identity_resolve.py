@@ -215,9 +215,13 @@ def merge_global_assignment(
     - assigned team differs and is not ``None`` -> ``team_number`` is
       overridden; ``confirmed`` is set True iff (winner score - best
       other-team score for that slot) >= ``confirm_margin``, else False.
-    - assignment is ``None`` -> existing entry left entirely untouched (v1
-      does not strip an existing label just because this pass found no
-      qualifying replacement).
+    - assignment is ``None`` (or the slot never entered the solve) -> the
+      existing entry is left untouched UNLESS its team was assigned to a
+      different slot by this pass, in which case the stale label is stripped
+      (team ``None``, unconfirmed) and recorded as a change. Keeping it would
+      duplicate the team on the overlay (qm11 2026-07-20: R2 assigned 1477
+      while R3 kept its greedy OCR 1477), voiding the assignment's
+      collision-free guarantee.
 
     Returns ``(new_slot_meta, changes)`` where ``changes`` lists only the
     actual overrides, each as
@@ -254,6 +258,31 @@ def merge_global_assignment(
                 "new_team": new_team,
                 "score": winner_score,
                 "margin": margin,
+            }
+        )
+
+    # Collision sweep: a team this pass assigned to one slot must not survive
+    # as a kept label on another (None-assigned or absent slots skipped the
+    # loop above and were never part of the solve's constraint set).
+    assigned = {t for t in assignment.values() if t is not None}
+    for slot_id, existing in slot_meta.items():
+        team = (existing or {}).get("team_number")
+        if team is None or team not in assigned or assignment.get(slot_id) == team:
+            continue
+        current = new_meta.get(slot_id, existing)
+        if current.get("team_number") != team:
+            continue  # already overridden to a non-colliding team above
+        updated = dict(current)
+        updated["team_number"] = None
+        updated["confirmed"] = False
+        new_meta[slot_id] = updated
+        changes.append(
+            {
+                "slot_id": slot_id,
+                "old_team": team,
+                "new_team": None,
+                "score": 0.0,
+                "margin": 0.0,
             }
         )
 

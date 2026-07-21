@@ -502,6 +502,34 @@ class Sam3FieldTracker(Sam2FieldTracker):
                     compile=compile_model,
                     use_fa3=False,
                 )
+                # Sam3BasePredictor.start_session unconditionally forwards
+                # offload_state_to_cpu into model.init_state(**kwargs), but
+                # the 3.1 multiplex model's init_state doesn't accept it —
+                # every session raised TypeError and all views fell to the
+                # no-SAM3 fallback (qm11 2026-07-20 A/B). Shim the built
+                # model's init_state to accept-and-drop the kwarg,
+                # signature-guarded so a fixed upstream disables it.
+                import functools
+                import inspect
+
+                model = getattr(predictor, "model", None)
+                init_state = getattr(model, "init_state", None)
+                if init_state is not None:
+                    try:
+                        params = inspect.signature(init_state).parameters
+                    except (TypeError, ValueError):
+                        params = {}
+                    accepts = "offload_state_to_cpu" in params or any(
+                        p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    )
+                    if not accepts:
+                        @functools.wraps(init_state)
+                        def _drop_state_offload(*a, offload_state_to_cpu=False,
+                                                _orig=init_state, **kw):
+                            return _orig(*a, **kw)
+
+                        model.init_state = _drop_state_offload
             else:
                 from sam3.model_builder import build_sam3_video_predictor
 

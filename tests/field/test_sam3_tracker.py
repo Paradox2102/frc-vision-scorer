@@ -621,6 +621,64 @@ def test_sam3_multiplex_on_uses_multiplex_builder_with_fa3_forced_off(monkeypatc
     }
 
 
+def test_sam3_multiplex_shims_init_state_without_state_offload(monkeypatch):
+    """Sam3BasePredictor.start_session unconditionally forwards
+    offload_state_to_cpu into model.init_state(**kwargs), but the SAM 3.1
+    multiplex model's init_state doesn't accept it — every live session died
+    with TypeError and all three views fell to the no-SAM3 fallback (qm11
+    2026-07-20 A/B). The multiplex branch must shim the built model's
+    init_state to accept-and-drop the kwarg."""
+    import sam3.model_builder as model_builder
+
+    seen = {}
+
+    class MuxModel:
+        def init_state(self, resource_path, offload_video_to_cpu=False,
+                       async_loading_frames=False):
+            seen["kwargs"] = dict(resource_path=resource_path,
+                                  offload_video_to_cpu=offload_video_to_cpu)
+            return {"ok": True}
+
+    class MuxPredictor:
+        def __init__(self):
+            self.model = MuxModel()
+
+    built = MuxPredictor()
+    monkeypatch.setattr(model_builder, "build_sam3_predictor",
+                        lambda **kw: built)
+
+    Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True)
+
+    # Exactly what base start_session sends; must not raise, kwarg dropped.
+    state = built.model.init_state(resource_path="dir",
+                                   offload_video_to_cpu=True,
+                                   offload_state_to_cpu=True)
+    assert state == {"ok": True}
+    assert seen["kwargs"] == {"resource_path": "dir",
+                              "offload_video_to_cpu": True}
+
+
+def test_sam3_multiplex_leaves_native_init_state_unshimmed(monkeypatch):
+    """When the model's init_state already accepts offload_state_to_cpu (the
+    base SAM3 predictor today, or a fixed upstream 3.1), no shim is applied."""
+    import sam3.model_builder as model_builder
+
+    class Model:
+        def init_state(self, resource_path, offload_video_to_cpu=False,
+                       offload_state_to_cpu=False):
+            return "native"
+
+    class Predictor:
+        def __init__(self):
+            self.model = Model()
+
+    built = Predictor()
+    monkeypatch.setattr(model_builder, "build_sam3_predictor",
+                        lambda **kw: built)
+    Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True)
+    assert built.model.init_state.__func__ is Model.init_state
+
+
 def test_solo_ids_scopes_open_chunk_for_boundary_reseed(tmp_path):
     """Same scoping contract at the chunk-boundary re-seed (_open_chunk_for):
     solo_ids must exclude a carried object even when its last_box is fresh

@@ -167,6 +167,15 @@ KNOBS = [
          min=1, section="Tracking backend"),
     Knob("selective_window_max_frames", "SELECTIVE_WINDOW_MAX_FRAMES", int, 120,
          min=8, section="Tracking backend"),
+    # Pixel-IoU at which two windows' masks count as converged and both are
+    # killed to TBD (ExitMachine._check_killed). 0.90 (the knob default) fires
+    # on partially-overlapping same-alliance robots -- the qm11 blue gap, see
+    # docs/selective-mask-prop-blue-gap.md -- not just genuine mask collapse.
+    # Higher = only near-total collapse kills. Was an internal SelectiveConfig
+    # constant; promoted to a knob so it can be A/B'd (scripts/ab_qm8.py
+    # "blue-gap" profile) without editing source.
+    Knob("selective_mask_overlap_exit", "SELECTIVE_MASK_OVERLAP_EXIT", float, 0.90,
+         min=0.5, max=1.0, section="Tracking backend"),
     # Cross-episode SAM-frame budget for selective mode: caps total SAM
     # propagation frames across a view's episodes at sam_budget_frac * n_frames.
     # Motivated by the qm11 A/B (web/logs/20260719_222247_ec06450f*.log): the

@@ -239,6 +239,30 @@ def test_gate_on_passes_sam_budget_frac_override_to_selective_config():
     assert cfg.sam_budget_frac == 0.8
 
 
+def test_gate_on_passes_mask_overlap_exit_override_to_selective_config():
+    """selective_mask_overlap_exit (Task 1 knob) must reach the SelectiveConfig
+    built for track_selective, not just sit unused on JobConfig."""
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.config.selective_mask_overlap_exit = 0.95   # non-default override
+    job.timings = {}
+    tracker = _tracker_stub({"unused": True})
+    tracker.track_selective.side_effect = RuntimeError("boom")  # short-circuit to fallback
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    asyncio.run(run())
+    tracker.track_selective.assert_called_once()
+    cfg = tracker.track_selective.call_args.kwargs["cfg"]
+    assert cfg.mask_overlap_exit == 0.95
+
+
 def test_gate_on_success_log_includes_episodes_and_dropped(capsys):
     job = _make_job()
     job.config.selective_mask_prop = True

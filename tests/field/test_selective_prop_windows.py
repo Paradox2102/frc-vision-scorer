@@ -246,6 +246,40 @@ def test_exit_killed():
     assert outs[1].masks == {} and outs[2].masks == {}
 
 
+def test_exit_killed_respects_mask_overlap_exit_knob():
+    """selective_mask_overlap_exit (Task 1 knob) drives the kill threshold, not
+    a hardcoded constant: the SAME 0.923 pixel-IoU mask pair kills at the
+    knob's 0.90 default but survives once the knob is raised to 0.95 (the
+    qm11 blue-gap fix candidate, docs/selective-mask-prop-blue-gap.md)."""
+    hw = (200, 200)
+    b1 = (10, 10, 50, 50)
+    b2 = (15, 10, 55, 50)                             # overlaps b1 -> never isolated
+    history = {f: {1: _obs(b1, margin=0.0), 2: _obs(b2, margin=0.0)}
+               for f in range(4)}
+    s1 = WindowSpec(oid=1, seed_frame=0, entry_frame=1, trigger="margin")
+    s2 = WindowSpec(oid=2, seed_frame=0, entry_frame=1, trigger="witness")
+    mA = _rect_mask(hw, (20, 20, 120, 120))
+    mB = _rect_mask(hw, (24, 20, 124, 120))           # pixel-IoU 9600/10400 = 0.9231
+
+    cfg_default = SelectiveConfig(min_streak=2, mask_overlap_exit=0.90, border_margin_px=5)
+    em_default = ExitMachine([s1, s2], {1: b1, 2: b2}, hw, history, cfg_default)
+    done = False
+    for f in range(3):
+        done = em_default.step(f, {1: mA, 2: mB}, {1: None, 2: None})
+    assert done
+    outs = {o.spec.oid: o for o in em_default.outcomes()}
+    assert outs[1].state == "killed" and outs[2].state == "killed"
+
+    cfg_raised = SelectiveConfig(min_streak=2, mask_overlap_exit=0.95, border_margin_px=5)
+    em_raised = ExitMachine([s1, s2], {1: b1, 2: b2}, hw, history, cfg_raised)
+    done = False
+    for f in range(3):
+        done = em_raised.step(f, {1: mA, 2: mB}, {1: None, 2: None})
+    assert not done                                   # never killed -> never both closed
+    outs_raised = {o.spec.oid: o for o in em_raised.outcomes()}
+    assert outs_raised[1].state == "end" and outs_raised[2].state == "end"
+
+
 def test_exit_end_window_max():
     cfg = SelectiveConfig(min_streak=10, window_max_frames=3, margin_exit=0.10,
                           border_margin_px=5)

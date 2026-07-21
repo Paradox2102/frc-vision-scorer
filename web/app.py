@@ -1887,6 +1887,7 @@ class InferenceJob:
                     gap_trigger=self.config.selective_gap_trigger,
                     min_streak=self.config.selective_min_streak,
                     window_max_frames=self.config.selective_window_max_frames,
+                    mask_overlap_exit=self.config.selective_mask_overlap_exit,
                     sam_budget_frac=self.config.selective_sam_budget_frac,
                 )
                 view_tracks = await asyncio.to_thread(

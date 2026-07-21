@@ -340,6 +340,22 @@ PROFILES = {
         ("m10", {"selective_mask_prop": True, "selective_margin_entry": 0.10}),
         ("budget08", {"selective_mask_prop": True, "selective_sam_budget_frac": 0.8}),
     ],
+    # Same-alliance mask-convergence gap (docs/selective-mask-prop-blue-gap.md):
+    # selective mode's qm11 `killed` outcomes fire on partially-overlapping
+    # same-alliance robots, not just genuine mask collapse, and the TBD
+    # fallback has no appearance term to recover blue coverage. Two candidate
+    # fixes: raise the kill threshold (selective_mask_overlap_exit, Task 1) so
+    # only near-total collapse kills, and/or coast the last-confident SAM box
+    # instead of reverting to raw TBD on a kill (selective_kill_coast, Task 2).
+    "blue-gap": [
+        ("baseline", {}),
+        ("selective", {"selective_mask_prop": True}),
+        ("sel-ov95", {"selective_mask_prop": True, "selective_mask_overlap_exit": 0.95}),
+        ("sel-ov97", {"selective_mask_prop": True, "selective_mask_overlap_exit": 0.97}),
+        ("sel-coast", {"selective_mask_prop": True, "selective_kill_coast": True}),
+        ("sel-coast-ov95", {"selective_mask_prop": True, "selective_kill_coast": True,
+                            "selective_mask_overlap_exit": 0.95}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

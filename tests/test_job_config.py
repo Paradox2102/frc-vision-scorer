@@ -405,6 +405,27 @@ def test_selective_sam_budget_frac_knob_bounds():
         JobConfig({"selective_sam_budget_frac": 11})
 
 
+def test_selective_mask_overlap_exit_knob_default(monkeypatch):
+    monkeypatch.delenv("SELECTIVE_MASK_OVERLAP_EXIT", raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_mask_overlap_exit == 0.90
+
+
+def test_selective_mask_overlap_exit_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_MASK_OVERLAP_EXIT", "0.95")
+    assert JobConfig().selective_mask_overlap_exit == 0.95
+    cfg = JobConfig({"selective_mask_overlap_exit": "0.97"})
+    assert cfg.selective_mask_overlap_exit == 0.97
+
+
+def test_selective_mask_overlap_exit_knob_bounds():
+    import pytest
+    with pytest.raises(ValueError):
+        JobConfig({"selective_mask_overlap_exit": 0.4})
+    with pytest.raises(ValueError):
+        JobConfig({"selective_mask_overlap_exit": 1.1})
+
+
 def test_to_dict_round_trip():
     cfg = JobConfig({"sam2_model_size": "large"})
     d = cfg.to_dict()

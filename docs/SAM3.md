@@ -87,6 +87,26 @@ installed on this host. Bucket capacity (`max_num_objects` /
 ~6-robot rosters, and an untested larger capacity is a bigger risk than the
 default.
 
+### init_state offload-kwarg shim (2026-07-20)
+
+"Dispatches through the same request protocol" above turned out to be only
+almost true: upstream `Sam3BasePredictor.start_session` unconditionally
+forwards `offload_state_to_cpu` into `model.init_state(**kwargs)`, and the
+3.1 multiplex model's `init_state` does not accept that parameter (the base
+model's does). Result: with `sam3_multiplex` ON, **every** session start
+raised `TypeError`, every view logged `Error during propagation` +
+`[DEGRADED] sam3: view produced no tracks`, and the job silently ran the
+no-SAM3 detector+fusion fallback. Any multiplex "A/B numbers" recorded before
+2026-07-20 measured that fallback, not multiplex (docs/
+default-on-ab-2026-07-20.md).
+
+The multiplex build branch in `web/field/sam3_tracker.py` now shims the built
+model's `init_state` to accept-and-drop the kwarg. The shim is
+signature-guarded: if a future sam3 release adds `offload_state_to_cpu` (or a
+`**kwargs`) to the multiplex `init_state`, no wrapping happens. Grep any
+multiplex run's job log for `Error during propagation` before trusting its
+numbers.
+
 ## Selective mask propagation (`selective_mask_prop`, default OFF)
 
 Re-implementation of arXiv 2606.13033 (Holmberg 2026). The reference project

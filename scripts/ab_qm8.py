@@ -374,6 +374,50 @@ PROFILES = {
         ("sel-coast-ov95", {"selective_mask_prop": True, "selective_kill_coast": True,
                             "selective_mask_overlap_exit": 0.95}),
     ],
+    # Default-ON candidacy (2026-07-20): the three merged-but-OFF tech-upgrade
+    # features, each isolated vs baseline (the geo4 lesson: stacked-only runs
+    # can't attribute a regressor), plus the stacked arm twice — the stack IS
+    # the proposed new default, and the repeat gauges rerun stability
+    # (global_identity_resolve's determinism claim; qm11 baseline reproduced
+    # 0.816 three times, so any drift is the arm's).
+    # rts_smooth: offline path rewrite + gap fill -> expect meanNN/coverage
+    # gains at ~flat job time. global_identity_resolve: meanNN-blind identity
+    # feature -> read mislabel/slot_map. sam3_multiplex: NOT a pure perf
+    # toggle (different builder heuristics) -> quality parity + wall-clock.
+    "default-on": [
+        ("baseline", {}),
+        ("rts", {"rts_smooth": True}),
+        ("gir", {"global_identity_resolve": True}),
+        ("mux", {"sam3_multiplex": True}),
+        ("all3", {"rts_smooth": True, "global_identity_resolve": True,
+                  "sam3_multiplex": True}),
+        ("all3-b", {"rts_smooth": True, "global_identity_resolve": True,
+                    "sam3_multiplex": True}),
+    ],
+    # Cross-match confirmation (qm11 verdicts: rts regresses the headline
+    # metric via gap-fill insertions, mux trades blue collapse for red gains,
+    # gir needed the collision-sweep fix): per-feature isolation again, no
+    # stack arm — nothing earned a stacked default on qm11.
+    "default-on-cross": [
+        ("baseline", {}),
+        ("rts", {"rts_smooth": True}),
+        ("gir", {"global_identity_resolve": True}),
+        ("mux", {"sam3_multiplex": True}),
+    ],
+    # Single gir arm: live re-validation of the merge collision-sweep fix on
+    # the match that produced the duplicate label (expect R2 assigned AND the
+    # colliding stale label stripped -> 2 changes, no dup teams in replay).
+    "gir-single": [
+        ("gir-fixed", {"global_identity_resolve": True}),
+    ],
+    # Single mux arm: re-validation after the init_state offload-kwarg shim
+    # (before it, EVERY view raised TypeError at session start and the whole
+    # job silently ran the no-SAM3 fallback — the 2026-07-20 "mux" numbers
+    # measured that, not multiplex). Grep the job log for "Error during
+    # propagation" = 0 before reading the metrics.
+    "mux-single": [
+        ("mux-fixed", {"sam3_multiplex": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 
@@ -473,10 +517,21 @@ async def drive(job_id: str) -> str:
                 return "error"
 
 
-def score() -> dict:
+def score(expect_replay: str | None = None) -> dict:
     """Score the newest 2026cur_qm8 replay vs Manta: aggregate mean-NN and
-    per-alliance red coverage/tracked-count."""
+    per-alliance red coverage/tracked-count.
+
+    ``expect_replay``: the arm's job_id. load_our_auto_paths keeps the newest
+    replay PER KEY THAT HAS PATHS, so a job that exports zero autonomous_paths
+    silently inherits the previous replay's score (2026-07-20: the post-shim
+    mux arm scored the prior gir arm's replay bit-for-bit). Refuse that."""
     ours = load_our_auto_paths("2026cur")
+    if expect_replay is not None:
+        rids = {rec["replay_id"] for key, rec in ours.items() if key[0] == MATCH}
+        if expect_replay not in rids:
+            return {"error": f"stale replay scored (job {expect_replay[:8]} "
+                             f"exported no paths; newest with paths: "
+                             f"{sorted(r[:8] for r in rids)})"}
     tbf = {False: load_manta_auto_paths("2026cur", False),
            True: load_manta_auto_paths("2026cur", True)}
     pairs = []
@@ -492,6 +547,13 @@ def score() -> dict:
         "blue_meanNN": round(float(np.mean([p["mean_nn_m"] for p in blue])), 3) if blue else None,
         "red_meanNN": round(float(np.mean([p["mean_nn_m"] for p in red])), 3) if red else None,
         "n_blue": len(blue), "n_red": len(red),
+        # Identity metrics: scoring pairs geometrically, so a label-only
+        # feature (global_identity_resolve) is invisible to meanNN. Count
+        # slot-label vs Manta-DS-position mismatches and keep the mapping
+        # for cross-run stability diffs.
+        "mislabel": sum(1 for p in pairs if p["our_slot"][1:] != str(p["manta_pos"])),
+        "slot_map": {p["our_slot"]: f"{p['manta_pos']}:{p['manta_team']}"
+                     for p in pairs},
         "red_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in red},
         "blue_cov": {str(p["manta_team"]): round(100 * p["coverage_frac"]) for p in blue},
         # Seconds each slot's path starts after the match window opens — a
@@ -516,16 +578,19 @@ def main(args) -> None:
             restart_server()
         t0 = time.time()
         print(f"\n=== [{name}] config={cfg} ===", flush=True)
+        jid, job_s = None, None
         try:
             jid = post_job(cfg)
             print(f"  job_id={jid}; driving...", flush=True)
             status = asyncio.run(drive(jid))
-            print(f"  status={status} in {time.time()-t0:.0f}s", flush=True)
+            job_s = round(time.time() - t0)
+            print(f"  status={status} in {job_s}s", flush=True)
             time.sleep(3)  # let the replay finish writing
-            metrics = score() if status == "completed" else {"error": status}
+            metrics = score(expect_replay=jid) if status == "completed" else {"error": status}
         except Exception as e:
             metrics = {"error": repr(e)}
-        row = {"config": name, "cfg": cfg, "metrics": metrics}
+        row = {"config": name, "cfg": cfg, "job_id": jid, "job_s": job_s,
+               "metrics": metrics}
         results.append(row)
         RESULTS.write_text(json.dumps(results, indent=2))  # stream partial
         print(f"  metrics={metrics}", flush=True)

@@ -142,7 +142,12 @@ KNOBS = [
     # toggle: the multiplex builder bakes in different tracking heuristics
     # (new_det_thresh 0.65 vs 0.7, score_threshold_detection 0.4 vs 0.5,
     # boundary suppression on, masklet confirmation on), so mask/re-seed/
-    # occlusion behavior shifts. DEFAULT OFF pending qm8-qm12 A/B.
+    # occlusion behavior shifts. DEFAULT OFF. Until 2026-07-20 the knob was
+    # broken outright — upstream start_session forwards offload_state_to_cpu
+    # into the multiplex model's init_state, which rejects it, so every view
+    # crashed and jobs ran the no-SAM3 fallback (now shimmed in
+    # sam3_tracker.py; any earlier "multiplex" numbers measured the
+    # fallback). Post-shim A/B: docs/default-on-ab-2026-07-20.md.
     Knob("sam3_multiplex", "SAM3_MULTIPLEX", bool, False,
          section="Tracking backend"),
     # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
@@ -444,8 +449,12 @@ KNOBS = [
     # re-filter each slot's recorded measurements forward (no coast decay)
     # and smooth backward, then rewrite autonomous_paths field_pos and fill
     # in-gap samples (flagged interpolated=true, tracker_prob null). Live
-    # HUD/radar and all tracking decisions stay causal. DEFAULT OFF pending
-    # qm8-qm12 compare_manta A/B.
+    # HUD/radar and all tracking decisions stay causal. DEFAULT OFF —
+    # 2026-07-20 qm11+qm8 A/B (docs/default-on-ab-2026-07-20.md): measured
+    # samples improve on every robot, but insertions into LONG occlusion gaps
+    # regress the compare_manta gate (qm11 agg 0.816->0.890, qm8 0.414->0.477;
+    # qm11 R1 fills avg 2.9 m off). Re-A/B after adding a max-gap cap on
+    # insertion (short-gap fills measured excellent: 0.14-0.32 m).
     Knob("rts_smooth", "RTS_SMOOTH", bool, False,
          section="Track hygiene"),
     # --- identity / VLM ---
@@ -494,9 +503,15 @@ KNOBS = [
     # Global exact slot->team assignment (identity layer): replaces the greedy
     # final per-slot team arbitration with a whole-match exact assignment
     # (collision-free, deterministic — eliminates the Hungarian-pairing-flip
-    # nondeterminism class); live mid-match voting is untouched. DEFAULT OFF
-    # pending qm8-qm12 A/B (metrics: confirmed-team accuracy, compare_manta
-    # --assign MISLABEL count, rerun stability).
+    # nondeterminism class); live mid-match voting is untouched. DEFAULT OFF —
+    # 2026-07-20 qm11+qm8 A/B (docs/default-on-ab-2026-07-20.md): geometry-
+    # neutral both matches; debut run exposed a merge collision (kept greedy
+    # label duplicated an assigned team; fixed via the collision sweep in
+    # identity_resolve.merge_global_assignment) and qm8 showed a clean
+    # confirmed true positive greedy missed (R1=2724, margin 2.0). Flip
+    # candidate after the full-match protocol: confirmed-team accuracy,
+    # compare_manta --assign MISLABEL count, rerun stability on qm8-qm12
+    # with a healthy vLLM reader (auto-only read sets vary run to run).
     Knob("global_identity_resolve", "GLOBAL_IDENTITY_RESOLVE", bool, False,
          section="Identity & votes"),
     # --- cross-camera fusion ---

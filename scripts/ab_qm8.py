@@ -21,6 +21,7 @@ from scripts.compare_manta import (  # noqa: E402
 )
 
 HOST = "localhost:8004"
+AUTO_ONLY = True  # module global; --full-match sets False (per-arm cfg still wins, see post_job)
 # Defaults target qm8; override via CLI for other matches.
 MATCH_KEY = "2026cur_qm8"
 VIDEO = REPO / "web/uploads/ff4be1d9-b8e5-49ff-ac78-4a6a0e77a697.mp4"  # cached qm8
@@ -353,6 +354,17 @@ PROFILES = {
     "coast-probe": [
         ("sel-coast", {"selective_mask_prop": True, "selective_kill_coast": True}),
     ],
+    # Appearance-term sweep (blue-gap fix #3, selective_app_weight): recover
+    # blue_meanNN toward the 0.594 baseline without losing the red win
+    # (~0.73) or the cost win (main sam_frames <= 100% of uniform). Weight is
+    # in combined-cost units (1-cos in [0,2] vs 1-eIoU in [0,1]) -- sweep it.
+    "app-sweep": [
+        ("baseline", {}),
+        ("selective", {"selective_mask_prop": True}),
+        ("sel-app03", {"selective_mask_prop": True, "selective_app_weight": 0.3}),
+        ("sel-app06", {"selective_mask_prop": True, "selective_app_weight": 0.6}),
+        ("sel-app10", {"selective_mask_prop": True, "selective_app_weight": 1.0}),
+    ],
     "blue-gap": [
         ("baseline", {}),
         ("selective", {"selective_mask_prop": True}),
@@ -377,9 +389,31 @@ def load_event() -> None:
         raise RuntimeError(f"event load failed: {out[:200]}")
 
 
+def restart_server() -> None:
+    """Stop/start the app between arms (full-match VRAM hygiene) and reload
+    the event. Mirrors web/stop_all.sh + web/start_all.sh + load_event()."""
+    subprocess.run([str(REPO / "web/stop_all.sh")], check=False, timeout=120)
+    subprocess.run([str(REPO / "web/start_all.sh")], check=True, timeout=120)
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            out = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 f"http://{HOST}/"], capture_output=True, text=True,
+                timeout=10).stdout
+            if out in ("200", "404"):
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError("server did not come back after restart")
+    load_event()
+
+
 def post_job(cfg: dict) -> str:
     """Create a job via /api/infer (curl multipart); return job_id."""
-    config_json = json.dumps({"auto_period_only": True, **cfg})
+    config_json = json.dumps({"auto_period_only": AUTO_ONLY, **cfg})
     out = subprocess.run(
         ["curl", "-s", "-F", f"video_file=@{VIDEO}",
          "-F", f"match_key={MATCH_KEY}", "-F", f"config_json={config_json}",
@@ -470,11 +504,16 @@ def score() -> dict:
     }
 
 
-def main():
+def main(args) -> None:
+    global AUTO_ONLY
+    AUTO_ONLY = not args.full_match
     load_event()
     print("event 2026cur loaded", flush=True)
     results = []
-    for name, cfg in CONFIGS:
+    for idx, (name, cfg) in enumerate(CONFIGS):
+        if args.restart_between and idx > 0:
+            print("  restarting server between arms...", flush=True)
+            restart_server()
         t0 = time.time()
         print(f"\n=== [{name}] config={cfg} ===", flush=True)
         try:
@@ -510,7 +549,11 @@ if __name__ == "__main__":
     ap.add_argument("--video", default=str(VIDEO))
     ap.add_argument("--results", default=str(RESULTS))
     ap.add_argument("--profile", choices=list(PROFILES), default="full")
+    ap.add_argument("--full-match", action="store_true",
+                    help="process whole matches (auto_period_only=False) unless an arm overrides it")
+    ap.add_argument("--restart-between", action="store_true",
+                    help="restart the app server between arms (VRAM hygiene for full-match sweeps)")
     a = ap.parse_args()
     MATCH_KEY, MATCH, VIDEO, RESULTS = a.match_key, a.match, Path(a.video), Path(a.results)
     CONFIGS = PROFILES[a.profile]
-    main()
+    main(a)

@@ -131,8 +131,10 @@ defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
 | `selective_min_streak` | `SELECTIVE_MIN_STREAK` | `5` | consecutive clean frames required for both the backward seed walk and the exit machine's settle |
 | `selective_window_max_frames` | `SELECTIVE_WINDOW_MAX_FRAMES` | `120` | hard cap on a window's SAM-propagated span before it force-closes healthy (`end`) |
 | `selective_sam_budget_frac` | `SELECTIVE_SAM_BUDGET_FRAC` | `1.0` | cross-episode SAM-frame budget, as a fraction of the view's frame count |
+| `selective_app_weight` | `SELECTIVE_APP_WEIGHT` | `0.0` | appearance cost weight in the TBD assignment cost (same-color pairs only); `0.0` = off |
+| `selective_app_ema` | `SELECTIVE_APP_EMA` | `0.9` | track-gallery EMA retention on confident matches |
 
-Only these seven are job_config knobs / env vars. The other exit/seed
+Only these nine are job_config knobs / env vars. The other exit/seed
 thresholds referenced in the algorithm below (`area_degradation`,
 `mask_overlap_exit`, `ioma_exit`, `seed_clean_iou`, `border_margin_px`,
 `iou_expand`, `max_missed`) are **internal `SelectiveConfig` constants** in

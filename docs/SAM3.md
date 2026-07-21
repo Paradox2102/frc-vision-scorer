@@ -130,16 +130,21 @@ defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
 | `selective_gap_trigger` | `SELECTIVE_GAP_TRIGGER` | `7` | consecutive missed frames before a reappearing track opens a window |
 | `selective_min_streak` | `SELECTIVE_MIN_STREAK` | `5` | consecutive clean frames required for both the backward seed walk and the exit machine's settle |
 | `selective_window_max_frames` | `SELECTIVE_WINDOW_MAX_FRAMES` | `120` | hard cap on a window's SAM-propagated span before it force-closes healthy (`end`) |
+| `selective_mask_overlap_exit` | `SELECTIVE_MASK_OVERLAP_EXIT` | `0.90` | pixel-IoU at which two windows' masks count as converged and both are `killed` to TBD; higher = only near-total collapse kills |
+| `selective_kill_coast` | `SELECTIVE_KILL_COAST` | `False` | on a `killed` exit, coast each object from its last confident SAM box at constant velocity instead of reverting to appearance-blind raw TBD |
+| `selective_kill_coast_frames` | `SELECTIVE_KILL_COAST_FRAMES` | `24` | coast budget in frames; ends early when a TBD detection re-claims the box at margin >= `selective_margin_exit` |
 | `selective_sam_budget_frac` | `SELECTIVE_SAM_BUDGET_FRAC` | `1.0` | cross-episode SAM-frame budget, as a fraction of the view's frame count |
 | `selective_app_weight` | `SELECTIVE_APP_WEIGHT` | `0.0` | appearance cost weight in the TBD assignment cost (same-color pairs only); `0.0` = off |
 | `selective_app_ema` | `SELECTIVE_APP_EMA` | `0.9` | track-gallery EMA retention on confident matches |
 
-Only these nine are job_config knobs / env vars. The other exit/seed
+Only these twelve are job_config knobs / env vars. The other exit/seed
 thresholds referenced in the algorithm below (`area_degradation`,
-`mask_overlap_exit`, `ioma_exit`, `seed_clean_iou`, `border_margin_px`,
+`ioma_exit`, `seed_clean_iou`, `border_margin_px`,
 `iou_expand`, `max_missed`) are **internal `SelectiveConfig` constants** in
 `web/field/selective_prop.py`, not exposed through job_config or env -- change
-them in source if an A/B warrants.
+them in source if an A/B warrants. (`mask_overlap_exit` used to be on that
+list; it was promoted to the `selective_mask_overlap_exit` knob so the
+qm11 blue-gap kill threshold can be A/B'd without editing source.)
 
 **Caveat:** the margin knobs are in **1 - expanded-IoU cost units** (this
 repo's Deep-EIoU-style cost, `web/field/selective_prop.py`), **not** the
@@ -185,7 +190,10 @@ value -- see the `selective` / `selective-sweep` profiles in
    area, for `selective_min_streak` frames), `edge` (mask goes dark right
    after sitting near the frame border -- likely exited-frame, not lost),
    `killed` (two windows' masks converge onto the same object, pixel-IoU >=
-   `mask_overlap_exit`, for `selective_min_streak` frames -- both die),
+   `selective_mask_overlap_exit`, for `selective_min_streak` frames -- both
+   die; with `selective_kill_coast` on, each killed object then coasts from
+   its last confident SAM box for up to `selective_kill_coast_frames` frames
+   instead of standing on raw TBD),
    `clean` (mask settles back onto its own TBD box for `selective_min_streak`
    frames -- no identity change, matches the paper's "accept only on
    confident contradiction": SAM ran, agreed with TBD, contributes masks but
@@ -241,12 +249,18 @@ aggregate cost; the per-window cap only bounds a single window's worst case.
 
 ### Evidence types and the `mask=None` contract
 
-Two evidence `type`s appear in `sam2_raw` under selective mode:
+Three evidence `type`s appear in `sam2_raw` under selective mode (the third
+only when `selective_kill_coast` is on):
 
 - `"tbd"` -- `mask=None`, `tracker_prob=None`. The box is the TBD tracker's
   matched/predicted detection; no SAM ever touched this frame/object.
 - `"selective_sam"` -- a real mask, carrying the propagated `tracker_prob`.
   Only present inside a healthy window's `[entry_frame, close_frame]` span.
+- `"kill_coast"` -- `mask=None`, `tracker_prob=None`. Constant-velocity coast
+  of a `killed` object from its last confident SAM box, standing in for the
+  raw-TBD entries until a detection re-claims it or the
+  `selective_kill_coast_frames` budget expires
+  (`_apply_kill_coast`, `web/field/selective_prop.py`).
 
 Every downstream consumer of `info["mask"]` was audited (Task 6) to treat
 `mask=None` as a first-class case, not a bug:

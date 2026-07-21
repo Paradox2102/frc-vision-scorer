@@ -454,3 +454,75 @@ def test_track_selective_episodes_stat_counts_runs(tmp_path):
     assert stats["outcomes"] == {"clean": 2}
     assert pred.init_calls == 2
     assert pred.reset_calls == 2
+
+
+# --------------------------------------------------------------------------
+# Phase A: per-frame appearance embedding integration (embed_frame_fn).
+# --------------------------------------------------------------------------
+def test_track_selective_phase_a_embed_stats(tmp_path):
+    """embed_frame_fn is consulted once per frame (when dets are non-empty and
+    app_weight > 0) and selective_stats["app"] tallies frames touched and how
+    many of the returned per-det embeddings were non-None."""
+    _write_frames(tmp_path, 4)
+    # Two isolated, always-present robots -> unambiguous every frame (margin
+    # inf, per the module comment on L/R), no gap ever opens -> no window,
+    # predictor untouched. Keeps the scenario to the Phase A loop itself
+    # rather than the window machinery.
+    pred = StubSelectivePredictor(lambda f, oid: L if oid == 1 else R)
+    tracker = Sam2FieldTracker(predictor=pred)
+    cfg = _cfg()
+    cfg.app_weight = 1.0
+
+    dets = {i: [(L, None), (R, None)] for i in range(4)}
+    unit_vec = np.zeros(384, dtype=np.float32)
+    unit_vec[0] = 1.0                  # np.float32[384], L2-normalized
+
+    def embed_fn(local_idx, path, boxes):
+        assert len(boxes) == 2
+        return [unit_vec, None]        # matching-length: mix of vector + None
+
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(dets), cfg, embed_frame_fn=embed_fn)
+
+    stats = tracker.selective_stats
+    assert stats["app"] == {"frames_embedded": 4, "dets_embedded": 4}
+    assert stats["windows"] == 0
+    assert pred.init_calls == 0
+
+    # dets still flow through to ordinary TBD output.
+    for f in range(4):
+        assert results[f][1]["box"] == L
+        assert results[f][2]["box"] == R
+
+
+def test_track_selective_phase_a_embed_wrong_length_discarded(tmp_path):
+    """A per-frame embedding list whose length doesn't match dets is discarded
+    outright: dets stay 2-tuples for that frame (no crash) and neither counter
+    in selective_stats["app"] advances."""
+    _write_frames(tmp_path, 4)
+    pred = StubSelectivePredictor(lambda f, oid: L)
+    tracker = Sam2FieldTracker(predictor=pred)
+    cfg = _cfg()
+    cfg.app_weight = 1.0
+
+    dets = {i: [(L, None)] for i in range(4)}
+    calls = []
+
+    def bad_embed_fn(local_idx, path, boxes):
+        calls.append(local_idx)
+        return []                      # wrong length vs. the single det
+
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(dets), cfg, embed_frame_fn=bad_embed_fn)
+
+    assert calls == [0, 1, 2, 3]        # embed_frame_fn was in fact consulted
+    stats = tracker.selective_stats
+    assert stats["app"] == {"frames_embedded": 0, "dets_embedded": 0}
+
+    # Pipeline proceeds normally on the untouched 2-tuple dets -- no crash, no
+    # window (single always-present robot).
+    assert stats["windows"] == 0
+    assert pred.init_calls == 0
+    for f in range(4):
+        assert results[f][1]["box"] == L
+        assert results[f][1]["evidence"]["type"] == "tbd"

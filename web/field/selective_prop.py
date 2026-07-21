@@ -193,7 +193,7 @@ class TbdTracker:
         return None if trk is None else trk.emb
 
     def step(self, frame_idx: int,
-             dets: list[tuple[tuple, str | None]]) -> dict[int, FrameObs]:
+             dets: list[tuple]) -> dict[int, FrameObs]:
         """Advance one frame.
 
         ``dets = [(box_xyxy, color), ...]`` or ``[(box_xyxy, color, emb), ...]``
@@ -786,6 +786,13 @@ def _coast_reclaim_margin(coasted_box, frame_obs, cfg: SelectiveConfig):
     overlaps no detection at all. A large margin means one detection
     unambiguously owns the coasted box -- the signal that the same-alliance
     ambiguity has resolved and normal TBD can be trusted again.
+
+    Note: this margin is deliberately **pure expanded-IoU** and does not
+    include the appearance term (``selective_app_weight``) that
+    ``FrameObs.margin`` carries elsewhere (find_windows, settle, EMA gate)
+    when ``app_weight > 0`` -- kill-coast reclaim asks a geometry question,
+    not an appearance one, so the two features' margin units intentionally
+    diverge when both knobs are on.
     """
     costs = []
     for obs in frame_obs.values():

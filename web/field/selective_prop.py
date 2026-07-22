@@ -307,6 +307,14 @@ class WindowSpec:
     trigger: str                    # "margin" | "gap" | "starve" | "witness"
 
 
+def effective_window_max(spec: "WindowSpec", cfg: SelectiveConfig):
+    """Per-window frame budget: starve windows use ``starve_max_frames``
+    (0 = uncapped -> None); every other trigger uses ``window_max_frames``."""
+    if spec.trigger == "starve":
+        return cfg.starve_max_frames if cfg.starve_max_frames > 0 else None
+    return cfg.window_max_frames
+
+
 @dataclass
 class WindowOutcome:
     """Result of running a window through :class:`ExitMachine`.
@@ -663,7 +671,11 @@ class ExitMachine:
 
         w.dark_streak = 0
         area = int(mask.sum())
-        if w.seed_area > 0 and area < self.cfg.area_degradation * w.seed_area:
+        # Starve windows track a robot sliding behind an occluder: the mask
+        # SHRINKS to a sliver by design, so area degradation is not an abort
+        # signal for them (dark/edge/killed/settle still are).
+        if (w.seed_area > 0 and area < self.cfg.area_degradation * w.seed_area
+                and spec.trigger != "starve"):
             self._close(w, "degraded", frame_idx)
             return
         w.last_near_border = _near_border(mask, self.frame_hw, self.cfg.border_margin_px)
@@ -749,10 +761,13 @@ class ExitMachine:
                               masks_by_oid.get(w.spec.oid),
                               probs_by_oid.get(w.spec.oid))
         self._check_killed(frame_idx, masks_by_oid)
-        # window budget exhausted -> healthy END.
+        # window budget exhausted -> healthy END (starve windows may be
+        # uncapped; the cross-episode SAM budget still bounds them).
         for w in self._wins:
-            if w.state is None and frame_idx >= w.spec.seed_frame + self.cfg.window_max_frames:
-                self._close(w, "end", frame_idx)
+            if w.state is None:
+                wmax = effective_window_max(w.spec, self.cfg)
+                if wmax is not None and frame_idx >= w.spec.seed_frame + wmax:
+                    self._close(w, "end", frame_idx)
         return all(w.state is not None for w in self._wins)
 
     def outcomes(self):

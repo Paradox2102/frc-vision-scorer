@@ -119,3 +119,81 @@ def test_starve_trigger_spawns_no_witnesses():
     history.update({f: {2: _obs(far)} for f in range(5, 10)})
     wins = find_windows(history, [], 10, cfg, frame_hw=HW)
     assert {(w.oid, w.trigger) for w in wins} == {(1, "starve")}
+
+
+# ------------------------------------------------------------ ExitMachine --
+def _run_machine(spec, cfg, history, mask_fn, n_frames, hw=HW):
+    """Drive one window through ExitMachine; ``mask_fn(f) -> mask|None``."""
+    machine = ExitMachine([spec], {spec.oid: history[spec.seed_frame][spec.oid].box},
+                          hw, history, cfg)
+    for f in range(spec.seed_frame, n_frames):
+        m = mask_fn(f)
+        machine.step(f, {} if m is None else {spec.oid: m}, {})
+    return machine.outcomes()[0]
+
+
+def test_starve_window_survives_area_shrink():
+    """A mask shrinking to a sliver aborts a margin window as degraded but
+    must NOT abort a starve window (that sliver is the whole point)."""
+    cfg = _cfg(area_degradation=0.25, window_max_frames=50)
+    history = {f: {1: _obs(MID)} for f in range(5)}    # vanishes after 4
+    big = _rect_mask(HW, MID)                          # 900 px at seed
+    sliver = _rect_mask(HW, (100, 80, 104, 110))       # 120 px < 25% of seed
+
+    def masks(f):
+        return big if f <= 4 else sliver
+
+    starve = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="starve")
+    oc = _run_machine(starve, cfg, history, masks, 20)
+    assert oc.state == "end"                           # ran to sequence end
+    assert set(oc.masks) == set(range(4, 20))          # sliver frames kept
+
+    margin = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="margin")
+    oc = _run_machine(margin, cfg, history, masks, 20)
+    assert oc.state == "degraded"                      # existing behavior
+
+
+def test_starve_window_uncapped_by_default():
+    cfg = _cfg(window_max_frames=8, starve_max_frames=0)
+    history = {f: {1: _obs(MID)} for f in range(5)}
+    mask = _rect_mask(HW, MID)
+    spec = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="starve")
+    oc = _run_machine(spec, cfg, history, lambda f: mask, 30)
+    assert oc.state == "end"
+    assert oc.close_frame == 29                        # past seed+8, to the end
+
+
+def test_starve_max_frames_caps_window():
+    cfg = _cfg(window_max_frames=50, starve_max_frames=6)
+    history = {f: {1: _obs(MID)} for f in range(5)}
+    mask = _rect_mask(HW, MID)
+    spec = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="starve")
+    oc = _run_machine(spec, cfg, history, lambda f: mask, 30)
+    assert oc.state == "end"
+    assert oc.close_frame == 8                         # seed 2 + cap 6
+
+
+def test_starve_window_still_degrades_dark():
+    cfg = _cfg(min_streak=2)
+    history = {f: {1: _obs(MID)} for f in range(5)}
+    mask = _rect_mask(HW, MID)
+    spec = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="starve")
+    oc = _run_machine(spec, cfg, history, lambda f: mask if f <= 6 else None, 20)
+    assert oc.state == "degraded"                      # true mask loss closes
+
+
+def test_fresh_oid_settle_swaps_and_renames():
+    """The vanished robot reappears as a NEW oid; the starve window's mask
+    settles onto it -> swap -> rename merges the streams (the 2992 case)."""
+    cfg = _cfg(min_streak=2, ioma_exit=0.8, margin_exit=0.10)
+    history = {f: {1: _obs(MID)} for f in range(5)}    # oid 1, frames 0-4
+    for f in range(10, 14):                            # fresh oid 7 reappears
+        history[f] = {7: _obs(MID)}
+    mask = _rect_mask(HW, (102, 82, 128, 108))         # inside MID box
+    spec = WindowSpec(oid=1, seed_frame=2, entry_frame=4, trigger="starve")
+    oc = _run_machine(spec, cfg, history, lambda f: mask, 14)
+    assert oc.state == "swap" and oc.swap_to == 7
+    results, renames = merge_selective_results(history, [oc], cfg)
+    assert len(renames) == 1
+    # post-rename, oid 1 owns the reappeared stream at frame 12.
+    assert 1 in results[12] and 7 not in results[12]

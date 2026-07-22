@@ -272,6 +272,52 @@ transient few-frame tracks. That's a design decision (gate form + default),
 not a knob sweep — next cycle. A per-view starve-window count cap is the
 cruder alternative.
 
+## Junk gate + fresh-match validation (Jul 21-22 2026) — gate insufficient, starve OFF stands
+
+The min-obs junk gate landed (`selective_starve_min_obs`, default 30, commit
+c6dea732) and was validated on a match never analyzed before: **qm16**
+(video 2026cur_qm16_EhW3ikP789I.mp4, downloaded from TBA's YouTube link;
+blue 5712/7539/166, red 8280/2724/2053). Three arms, full-match,
+restart-between (/tmp/frc-ab-starve-qm16.json):
+
+| qm16 arm | agg | blue | red | notes |
+|----------|-----|------|-----|-------|
+| baseline | 0.739 | 0.932 | 0.450 | n_red=2 (8280 never paired), mislabel 4 |
+| sel-app03 | **0.415** | **0.463** | 0.344 | mislabel 2; coverage up broadly |
+| sel-app03-starve (gated 30) | 0.983 | 1.418 | 0.331 | mislabel 4; **7539 cov 59→3%**, B2/B3 slots flipped |
+
+Two findings:
+
+1. **The already-merged sel-app03 stack generalizes.** 44% agg win over
+   baseline on a match nothing was tuned on — strong default-flip evidence
+   for `selective_mask_prop` + `selective_app_weight=0.3` (pending the
+   qm8-qm12 protocol).
+2. **Starve windows (even gated) DESTROY a winning config on a dense fresh
+   match.** The gate worked as specified (48 gated starve triggers on main)
+   but the collateral is not junk-count: on a full match every identity
+   fragment (robot lost → respawned as a new oid) ends with a
+   disappeared-forever tail, so fragment terminals pass any obs-count gate.
+   The uncapped windows then **bridged the episode clustering**: control ran
+   18 main episodes at 86% budget; the starve arm merged them into **5
+   mega-episodes**, saturated 100% budget, and **dropped 251 of 301
+   windows** — starving the ambiguity windows that produce the sel-app03
+   win. One surviving starve swap likely mis-renamed 7539's stream
+   (renames 5, B2/B3 flip, 7539 59→3%).
+
+Also: the first qm11 gate arm was VOID — it ran on a server process started
+before the gate commit (`trig={'starve': 56}` unchanged = stale-code
+receipt). Single-arm runs MUST restart the server after a code change; the
+`trig=` line is the receipt to check.
+
+**Where this leaves fix #1:** the 3181 capability is real (cov 52→99,
+0.455) but the v1 shape — uncapped windows, episode-bridging allowed,
+trigger on any gated terminal tail — does not survive dense matches.
+`selective_starve_windows` stays OFF. A v2 needs, at minimum: starve
+windows excluded from episode merging (or hard-capped so they can't bridge),
+a strict per-view starve-window budget share, and respawn-chain awareness
+(a terminal tail whose robot RESPAWNED as a new oid nearby is a re-ID
+problem, not a persistence problem — don't open a window for it).
+
 ## How to evaluate
 
 Server launch: `web/start_all.sh` (vLLM reader, job-managed). qm11 A/B:

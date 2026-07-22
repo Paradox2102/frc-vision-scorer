@@ -1926,6 +1926,7 @@ class InferenceJob:
                     starve_windows=self.config.selective_starve_windows,
                     starve_trigger=self.config.selective_starve_trigger,
                     starve_max_frames=self.config.selective_starve_max_frames,
+                    starve_min_obs=self.config.selective_starve_min_obs,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,

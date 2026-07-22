@@ -414,6 +414,17 @@ PROFILES = {
                                  "selective_starve_windows": True,
                                  "selective_starve_max_frames": 240}),
     ],
+    # Junk-gate probe (starve v1.1): min-obs gate should keep 3181's recovery
+    # (cov 52->99, meanNN 0.455) while restoring 4786 (~2.31 @ 26, lag 0) and
+    # the corner budgets (26%/42% of uniform in control) by refusing starve
+    # windows to transient junk tracks. Single arm; compare against the
+    # existing baseline / sel-app03 / sel-app03-starve rows from
+    # /tmp/frc-ab-starve-qm11.json.
+    "starve-gate": [
+        ("sel-app03-starve-gate", {"selective_mask_prop": True,
+                                   "selective_app_weight": 0.3,
+                                   "selective_starve_windows": True}),
+    ],
     # Default-ON candidacy (2026-07-20): the three merged-but-OFF tech-upgrade
     # features, each isolated vs baseline (the geo4 lesson: stacked-only runs
     # can't attribute a regressor), plus the stacked arm twice — the stack IS

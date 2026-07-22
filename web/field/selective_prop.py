@@ -57,6 +57,7 @@ class SelectiveConfig:
     starve_windows: bool = False   # master; False = exact no-op
     starve_trigger: int = 7        # min dark-tail frames (to sequence end)
     starve_max_frames: int = 0     # starve-window frame cap; 0 = uncapped
+    starve_min_obs: int = 30       # min observed frames to starve-trigger; 0 = gate off
 
 
 @dataclass
@@ -459,7 +460,10 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig,
     Requires ``frame_hw`` (H, W) for the border check; without it (or with the
     knob off) the scan is skipped entirely. Priority: margin > gap > starve >
     witness; starve candidates spawn no witnesses (witnesses co-observe
-    ambiguity; starvation is about persistence).
+    ambiguity; starvation is about persistence). A junk gate additionally
+    requires at least ``starve_min_obs`` OBSERVED frames (count, not lifetime
+    span) before an oid may starve-trigger, so transient detector false-fires
+    that vanish forever don't flood the SAM budget; ``0`` disables the gate.
     """
     # (oid, entry) -> trigger, first insert wins (priority: margin, gap, witness).
     candidates: dict[tuple[int, int], str] = {}
@@ -483,13 +487,21 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig,
     if cfg.starve_windows and frame_hw is not None:
         last_seen: dict[int, int] = {}
         last_box: dict[int, tuple] = {}
+        obs_count: dict[int, int] = {}
         for f in sorted(history):
             for oid in history[f]:
                 last_seen[oid] = f
                 last_box[oid] = history[f][oid].box
+                obs_count[oid] = obs_count.get(oid, 0) + 1
         for oid in sorted(last_seen):
             f = last_seen[oid]
             if (n_frames - 1) - f < cfg.starve_trigger:
+                continue
+            # Junk gate: transient tracks (few observations, regardless of
+            # lifetime span) are detector false-fires, not robots that
+            # disappeared -- without this they flood the SAM budget with
+            # uncapped windows (qm11: corners 26%/42% -> 100% of uniform).
+            if cfg.starve_min_obs > 0 and obs_count[oid] < cfg.starve_min_obs:
                 continue
             if _box_near_border(last_box[oid], frame_hw, cfg.border_margin_px):
                 continue

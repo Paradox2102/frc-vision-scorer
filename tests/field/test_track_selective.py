@@ -546,7 +546,7 @@ def _cfg_starve():
                            area_degradation=0.25, border_margin_px=5,
                            window_max_frames=120, max_missed=30,
                            starve_windows=True, starve_trigger=3,
-                           starve_max_frames=0)
+                           starve_max_frames=0, starve_min_obs=0)
 
 
 def test_track_selective_passes_frame_hw_and_reports_triggers(tmp_path):

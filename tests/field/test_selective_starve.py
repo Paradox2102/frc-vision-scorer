@@ -38,6 +38,7 @@ def _cfg(**kw):
     kw.setdefault("starve_windows", True)
     kw.setdefault("min_streak", 2)
     kw.setdefault("starve_trigger", 3)
+    kw.setdefault("starve_min_obs", 0)
     return SelectiveConfig(**kw)
 
 
@@ -206,3 +207,44 @@ def test_fresh_oid_settle_swaps_and_renames():
     assert results[4][1]["evidence"]["type"] == "selective_sam"
     # post-rename, oid 1 owns the reappeared stream at frame 12.
     assert 1 in results[12] and 7 not in results[12]
+
+
+# ------------------------------------------------------------- min-obs gate --
+def test_min_obs_gate_blocks_short_tracks():
+    """A transient junk track (few observations) must not starve-trigger."""
+    cfg = _cfg(starve_min_obs=10)
+    history = {f: {1: _obs(MID)} for f in range(5)}     # only 5 obs
+    assert find_windows(history, [], 20, cfg, frame_hw=HW) == []
+
+
+def test_min_obs_gate_passes_long_tracks():
+    cfg = _cfg(starve_min_obs=10)
+    history = {f: {1: _obs(MID)} for f in range(12)}    # 12 obs >= 10
+    wins = find_windows(history, [], 25, cfg, frame_hw=HW)
+    assert [(w.oid, w.trigger) for w in wins] == [(1, "starve")]
+
+
+def test_min_obs_counts_observations_not_span():
+    """Flickery junk: long lifetime span but few actual observations."""
+    cfg = _cfg(starve_min_obs=10)
+    # oid 1 observed on 6 scattered frames spanning 0..50 (span 51 >> 10).
+    history = {f: {1: _obs(MID)} for f in (0, 10, 20, 30, 40, 50)}
+    assert find_windows(history, [], 70, cfg, frame_hw=HW) == []
+
+
+def test_min_obs_zero_disables_gate():
+    cfg = _cfg(starve_min_obs=0)
+    history = {f: {1: _obs(MID)} for f in range(5)}     # 5 obs, gate off
+    wins = find_windows(history, [], 20, cfg, frame_hw=HW)
+    assert [(w.oid, w.trigger) for w in wins] == [(1, "starve")]
+
+
+def test_min_obs_gate_does_not_touch_gap_triggers():
+    cfg = _cfg(starve_min_obs=100, gap_trigger=3)
+    history = {f: {1: _obs(MID)} for f in range(3)}
+    history[7] = {1: _obs(MID)}
+    history[8] = {1: _obs(MID)}
+    # 5 obs < 100 -> no starve for the terminal tail, but the mid-video gap
+    # trigger must still fire (the gate applies ONLY to starve candidacy).
+    wins = find_windows(history, [(1, 2, 7)], 20, cfg, frame_hw=HW)
+    assert [(w.oid, w.trigger) for w in wins] == [(1, "gap")]

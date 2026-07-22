@@ -235,6 +235,16 @@ KNOBS = [
          min=1, section="Tracking backend"),
     Knob("selective_starve_max_frames", "SELECTIVE_STARVE_MAX_FRAMES", int, 0,
          min=0, section="Tracking backend"),
+    # Starve-trigger junk gate: a starve candidate must have been OBSERVED in
+    # at least this many frames (count, not lifetime span -- flickery junk
+    # stretches span with few actual observations). Transient YOLO
+    # false-fires otherwise satisfy the starve trigger and flood the SAM
+    # budget with uncapped windows (qm11 Jul 21: corner sam_frames 26%/42% ->
+    # 100% of uniform, main dropped 34 windows, 4786 2.31 -> 3.11). A real
+    # disappearing robot has hundreds of observations first (3181: ~37s
+    # tracked before parking). 0 disables the gate (v1 behavior).
+    Knob("selective_starve_min_obs", "SELECTIVE_STARVE_MIN_OBS", int, 30,
+         min=0, section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

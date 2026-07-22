@@ -152,3 +152,4 @@ data/hard_negatives/boxes/*/
 
 # Blog drafts (not part of the public repo)
 blog-post-*.md
+.worktrees/

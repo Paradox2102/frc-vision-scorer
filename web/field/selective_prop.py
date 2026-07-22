@@ -938,10 +938,17 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
     Returns ``(results, renames)`` where ``results`` is
     ``{frame: {oid: {"box", "mask", "evidence"}}}``. Outside healthy windows
     every entry is a pure-TBD box (``mask=None``, evidence type ``"tbd"``). SWAP
-    outcomes relabel the whole stream pairwise from their entry frame; then each
+    outcomes relabel the whole stream pairwise from their event frame; then each
     healthy outcome overwrites its oid's entry across ``[entry, close]`` with the
     SAM mask, ``mask_to_box(mask)``, and ``selective_sam`` evidence carrying the
     per-frame ``tracker_prob``.
+
+    Margin/gap/witness swaps fire the rename from ``entry_frame`` (both oids
+    co-exist there, so the transposition is balanced). Starve swaps instead fire
+    from the fresh swap-target oid's first observed frame at or after entry:
+    renaming from the vanished track's ``entry_frame`` would relabel its genuine
+    last TBD box to the fresh oid, minting a one-frame phantom track at the
+    disappearance location. The mask overlay bridges the blind gap in between.
 
     When ``cfg.kill_coast`` is on, each ``killed`` outcome additionally coasts
     its object from the last confident SAM box (``kill_coast`` evidence,
@@ -967,17 +974,39 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
         results[f] = frame
 
     # SWAP rename events (dedup identical (frame, {a, b}) pairs).
+    #
+    # Margin/gap/witness swaps settle while both oids co-exist, so their
+    # transposition at entry_frame is balanced -- the event fires from
+    # entry_frame exactly as it always has (byte-parity).
+    #
+    # Starve swaps are different: the window opens at the VANISHED track's last
+    # observation (entry = last_seen) and the swap target ``b`` is a fresh oid
+    # first observed many frames later. Transposing at entry would relabel raw
+    # oid ``a``'s genuine last TBD box to ``b``, minting a one-frame phantom
+    # track for output oid ``b`` at the disappearance location. So for starve
+    # swaps the event fires from the fresh oid's first observed frame at or
+    # after entry (min{f >= entry : b in history[f]}), where the transposition
+    # is balanced; the mask overlay (written post-rename under the seeded raw
+    # oid) carries the identity through the blind gap in between. Falls back to
+    # entry_frame if the target is never seen (defensive -- settle guarantees it
+    # was). Dedup keys on the RESOLVED frame so two outcomes that resolve to the
+    # same (frame, {a, b}) still collapse to one event.
     events: list[RenameEvent] = []
     seen: set[tuple[int, frozenset]] = set()
     for oc in outcomes:
         if oc.state != "swap" or oc.swap_to is None:
             continue
         a, b = oc.spec.oid, oc.swap_to
-        key = (oc.spec.entry_frame, frozenset((a, b)))
+        frame = oc.spec.entry_frame
+        if oc.spec.trigger == "starve":
+            future = [f for f in sorted(history)
+                      if f >= oc.spec.entry_frame and b in history[f]]
+            frame = future[0] if future else oc.spec.entry_frame
+        key = (frame, frozenset((a, b)))
         if key in seen:
             continue
         seen.add(key)
-        events.append(RenameEvent(frame=oc.spec.entry_frame, a=a, b=b))
+        events.append(RenameEvent(frame=frame, a=a, b=b))
 
     # Kill-coast fallback (Task 2): pin killed objects to their coasted SAM box
     # before renames, so coasted entries are relabeled with the rest of the

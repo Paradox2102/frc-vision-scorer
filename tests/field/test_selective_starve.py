@@ -195,5 +195,14 @@ def test_fresh_oid_settle_swaps_and_renames():
     assert oc.state == "swap" and oc.swap_to == 7
     results, renames = merge_selective_results(history, [oc], cfg)
     assert len(renames) == 1
+    # The rename event fires from the fresh oid's FIRST appearance (frame 10),
+    # not the vanished track's last-observation entry frame (4). Renaming from
+    # entry would transpose raw oid 1's genuine last TBD box into a one-frame
+    # phantom output oid 7 at the disappearance location.
+    assert renames[0].frame == 10
+    # No phantom at the entry frame: output oid 7 must NOT exist there, and
+    # oid 1's entry is the mask overlay that carries it through the blind gap.
+    assert 7 not in results[4]
+    assert results[4][1]["evidence"]["type"] == "selective_sam"
     # post-rename, oid 1 owns the reappeared stream at frame 12.
     assert 1 in results[12] and 7 not in results[12]

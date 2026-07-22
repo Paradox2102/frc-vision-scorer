@@ -156,8 +156,11 @@ defaults OFF pending a qm8-qm12 A/B, same posture as `sam3_multiplex` above.
 | `selective_sam_budget_frac` | `SELECTIVE_SAM_BUDGET_FRAC` | `1.0` | cross-episode SAM-frame budget, as a fraction of the view's frame count |
 | `selective_app_weight` | `SELECTIVE_APP_WEIGHT` | `0.0` | appearance cost weight in the TBD assignment cost (same-color pairs only); `0.0` = off |
 | `selective_app_ema` | `SELECTIVE_APP_EMA` | `0.9` | track-gallery EMA retention on confident matches |
+| `selective_starve_windows` | `SELECTIVE_STARVE_WINDOWS` | `False` | master switch for the starvation trigger class; `False` is an exact no-op |
+| `selective_starve_trigger` | `SELECTIVE_STARVE_TRIGGER` | `7` | dark-tail length (consecutive missed frames running to the *end* of the sequence, not just a gap) required before a never-seen-again track opens a starve window |
+| `selective_starve_max_frames` | `SELECTIVE_STARVE_MAX_FRAMES` | `0` | per-window frame cap for starve windows only; `0` = uncapped (the cross-episode `selective_sam_budget_frac` budget is the cost governor instead) |
 
-Only these twelve are job_config knobs / env vars. The other exit/seed
+Only these fifteen are job_config knobs / env vars. The other exit/seed
 thresholds referenced in the algorithm below (`area_degradation`,
 `ioma_exit`, `seed_clean_iou`, `border_margin_px`,
 `iou_expand`, `max_missed`) are **internal `SelectiveConfig` constants** in
@@ -266,6 +269,64 @@ Note that `selective_window_max_frames` (`120`) is a per-window cap, not a
 per-view one -- a single auto-only qm11 view is 181 frames, so one window
 can already span most of it. The per-view SAM budget is what actually bounds
 aggregate cost; the per-window cap only bounds a single window's worst case.
+
+### Starvation-triggered windows (`selective_starve_windows`, blue-gap v2 fix #1)
+
+Margin, gap, and witness all fire on *ambiguity* -- a close second-best
+competitor, or a track reappearing after a real gap. None of them fire on
+*disappearance*: a robot that leaves the detector's coverage (e.g. parks
+behind an obstruction, presenting only a sliver YOLO never re-fires on)
+just has its TBD stream end, permanently, at `max_missed` -- no ambiguity is
+ever created, so no window ever opens, and selective mode loses the robot
+that baseline's uniform SAM3 keeps tracking (detector-free persistence). See
+`docs/selective-mask-prop-blue-gap.md` for the full diagnosis
+(`docs/superpowers/specs/2026-07-21-selective-starvation-windows-design.md`
+is the approved design).
+
+`selective_starve_windows` (default `False`, exact no-op when off) adds a
+third trigger class in `find_windows`, evaluated after margin/gap and
+skipped entirely when the knob is off: an oid never observed again with a
+dark tail of at least `selective_starve_trigger` frames running all the way
+to the *end* of the sequence (not just a same-length mid-stream gap), whose
+last box sits at least `border_margin_px` from every frame edge (an
+off-border last box reads as "occluded", not "walked off-screen" --
+compare the `edge` exit state), opens a starve candidate entered at that
+last-observed frame. The existing backward seed walk, SAM3 propagation, and
+exit machine are otherwise unchanged -- starve windows are prioritized
+after margin and gap, and spawn no witnesses of their own (a starving
+track's neighbors aren't necessarily ambiguous).
+
+Two differences from every other trigger class, both because a starve
+window is tracking a robot sliding out of detector view on purpose:
+
+- **Area-degradation abort is skipped.** The `degraded` exit state normally
+  fires when a mask's area collapses below `area_degradation x seed area`;
+  for a starve window that shrink is the expected signature of a robot
+  disappearing behind an occluder, not a sign SAM lost the object. `dark`,
+  `edge`, `killed`, and `clean`/`swap` settle still apply unchanged -- only
+  the area check is exempted (`ExitMachine._update`,
+  `web/field/selective_prop.py`).
+- **Its own, uncapped-by-default frame budget.** `selective_starve_max_frames`
+  (default `0`) is a per-window cap like `selective_window_max_frames`, but
+  scoped to starve windows only; `0` means no per-window cap at all. The
+  cost governor for starve windows is the same cross-episode
+  `selective_sam_budget_frac` budget every other window draws from -- a
+  starve episode that would blow the remaining budget is skipped whole
+  (`dropped_windows`) exactly like any other episode.
+
+A starve window still runs through the normal exit machine, so it can
+close `swap` instead of `end`/`degraded`: if a fresh, identity-less oid
+reappears where the starving track was last seen and its mask settles onto
+that new oid's box for `selective_min_streak` frames, the window closes
+`swap` and the relabeling transposition re-binds the reappearing stream to
+the original identity -- recovering exactly the case a plain
+detector-side respawn would otherwise hand a brand-new, unrelated oid.
+
+`selective_stats["triggers"]` counts opened window specs per trigger class
+(`"margin"` / `"gap"` / `"starve"` / `"witness"`), and the per-view
+`[selective]` log line gains a ` trig={...}` segment showing those counts
+(`web/app.py`) -- use it to confirm starve windows are actually opening
+before reading outcomes.
 
 ### Evidence types and the `mask=None` contract
 

@@ -202,11 +202,14 @@ and SAM exists to disambiguate; on this footage SAM's real value is
 *persistence through detector blind spots* — an orthogonal capability the
 window system doesn't know to buy.
 
-Candidate fixes (design not yet approved):
+Candidate fixes (fix #1's design approved and built; #2/#3 not yet approved):
 1. **Starvation-triggered windows** — third trigger: track unmatched >= N
    frames, last box not near frame border → SAM window seeded from the last
    confident box; existing exit machine + budget cap apply. Mirrors exactly
-   what baseline does right.
+   what baseline does right. **Implemented** (`selective_starve_windows`,
+   default OFF; `selective_starve_trigger`, `selective_starve_max_frames`) —
+   spec `docs/superpowers/specs/2026-07-21-selective-starvation-windows-design.md`,
+   `--profile starve` in `scripts/ab_qm8.py`. A/B pending.
 2. **Zero-velocity coast-emit + appearance reacquisition** — emit coasted
    boxes as `tbd_coast` evidence (accurate for parked robots) + embed-vs-EMA
    oid merge on respawn. No GPU cost; dishonest for moving robots.

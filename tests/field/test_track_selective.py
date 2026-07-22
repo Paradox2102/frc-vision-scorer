@@ -526,3 +526,48 @@ def test_track_selective_phase_a_embed_wrong_length_discarded(tmp_path):
     for f in range(4):
         assert results[f][1]["box"] == L
         assert results[f][1]["evidence"]["type"] == "tbd"
+
+
+# ==========================================================================
+# Task 3: starvation-triggered windows + per-trigger stats.
+# ==========================================================================
+# One robot at L, detected frames 0-4, then gone for the rest of the sequence
+# (no reappearance -> no gap trigger, no witness). Its last box L is well off-
+# border and the dark tail (frames 5-10) is >= the starve trigger, so with
+# starve_windows ON exactly one "starve" window opens on oid 1.
+_STARVE_DETS = {0: [(L, None)], 1: [(L, None)], 2: [(L, None)],
+                3: [(L, None)], 4: [(L, None)],
+                5: [], 6: [], 7: [], 8: [], 9: [], 10: []}
+
+
+def _cfg_starve():
+    return SelectiveConfig(min_streak=2, gap_trigger=3, margin_entry=0.05,
+                           margin_exit=0.10, seed_clean_iou=0.10, ioma_exit=0.80,
+                           area_degradation=0.25, border_margin_px=5,
+                           window_max_frames=120, max_missed=30,
+                           starve_windows=True, starve_trigger=3,
+                           starve_max_frames=0)
+
+
+def test_track_selective_passes_frame_hw_and_reports_triggers(tmp_path):
+    _write_frames(tmp_path, 11)
+    # SAM keeps the robot latched at L even after the detector loses it. The
+    # starve scan only fires because track_selective passes frame_hw into
+    # find_windows (the off-border check); without it, no window -> no trigger.
+    pred = StubSelectivePredictor(lambda f, oid: L, emit_probs=True, prob=0.8)
+    tracker = Sam2FieldTracker(predictor=pred)
+
+    results = tracker.track_selective(
+        str(tmp_path), _detect_fn(_STARVE_DETS), _cfg_starve())
+
+    stats = tracker.selective_stats
+    # The per-trigger breakdown is reported and counts the starve window.
+    assert stats["triggers"]["starve"] >= 1
+    assert stats["windows"] == 1
+
+    # oid 1's last TBD detection is frame 4; the starve window carries SAM masks
+    # PAST it (frames 5+) -- exactly the detector blind-spot persistence pure
+    # TBD could never do (history is empty for those frames).
+    for f in (5, 6, 7):
+        assert results[f][1]["evidence"]["type"] == "selective_sam"
+        assert results[f][1]["mask"] is not None

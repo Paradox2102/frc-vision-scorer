@@ -1923,6 +1923,9 @@ class InferenceJob:
                     kill_coast_frames=self.config.selective_kill_coast_frames,
                     app_weight=self.config.selective_app_weight,
                     app_ema=self.config.selective_app_ema,
+                    starve_windows=self.config.selective_starve_windows,
+                    starve_trigger=self.config.selective_starve_trigger,
+                    starve_max_frames=self.config.selective_starve_max_frames,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,
@@ -1961,6 +1964,8 @@ class InferenceJob:
                       f"skipped={stats.get('skipped', 0)} "
                       f"episodes={stats.get('episodes', 0)} "
                       f"dropped={stats.get('dropped_windows', 0)}"
+                      + (f" trig={stats['triggers']}"
+                         if stats.get("triggers") else "")
                       + (f" coast={stats['coast']}"
                          if stats.get("coast") is not None else "")
                       + (f" app={stats['app']}"

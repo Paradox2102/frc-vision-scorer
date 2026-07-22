@@ -52,6 +52,11 @@ class SelectiveConfig:
     kill_coast_frames: int = 24    # max frames to coast a killed object
     app_weight: float = 0.0        # appearance cost weight; 0 = OFF (exact no-op)
     app_ema: float = 0.9           # track-embedding EMA retention on confident matches
+    # Starvation-triggered windows (blue-gap v2 fix #1): a track never
+    # observed again opens a SAM window from its last confident box.
+    starve_windows: bool = False   # master; False = exact no-op
+    starve_trigger: int = 7        # min dark-tail frames (to sequence end)
+    starve_max_frames: int = 0     # starve-window frame cap; 0 = uncapped
 
 
 @dataclass
@@ -299,7 +304,15 @@ class WindowSpec:
     oid: int
     seed_frame: int
     entry_frame: int
-    trigger: str                    # "margin" | "gap" | "witness"
+    trigger: str                    # "margin" | "gap" | "starve" | "witness"
+
+
+def effective_window_max(spec: "WindowSpec", cfg: SelectiveConfig):
+    """Per-window frame budget: starve windows use ``starve_max_frames``
+    (0 = uncapped -> None); every other trigger uses ``window_max_frames``."""
+    if spec.trigger == "starve":
+        return cfg.starve_max_frames if cfg.starve_max_frames > 0 else None
+    return cfg.window_max_frames
 
 
 @dataclass
@@ -379,6 +392,13 @@ def _near_border(mask: np.ndarray, frame_hw, margin_px: int) -> bool:
     return x1 < margin_px or y1 < margin_px or (w - x2) < margin_px or (h - y2) < margin_px
 
 
+def _box_near_border(box, frame_hw, margin_px: int) -> bool:
+    """True when ``box`` comes within ``margin_px`` of any frame edge."""
+    h, w = frame_hw
+    x1, y1, x2, y2 = box
+    return x1 < margin_px or y1 < margin_px or (w - x2) < margin_px or (h - y2) < margin_px
+
+
 def _pixel_iou(a: np.ndarray, b: np.ndarray) -> float:
     """IoU of two bool masks; 0.0 when the union is empty."""
     inter = int(np.logical_and(a, b).sum())
@@ -419,7 +439,8 @@ def _seed_walk(history, oid: int, entry_frame: int, cfg: SelectiveConfig):
     return None
 
 
-def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
+def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig,
+                 frame_hw=None):
     """Offline window construction over the completed TBD history.
 
     Margin triggers (any matched oid with ``margin < margin_entry``) and gap
@@ -429,6 +450,16 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
     walk and is dropped if no clean seed exists. Candidates are de-duplicated on
     ``(oid, entry_frame)`` (margin > gap > witness priority) and the surviving
     :class:`WindowSpec`s are sorted by ``(seed_frame, entry_frame, oid)``.
+
+    Starvation triggers (``cfg.starve_windows``, blue-gap v2 fix #1): an oid
+    whose FINAL observation is followed by a dark tail of at least
+    ``starve_trigger`` frames to sequence end, with a last box at least
+    ``border_margin_px`` from every frame edge, opens a "starve" candidate at
+    ``entry = last_seen`` — detector-free SAM persistence through blind spots.
+    Requires ``frame_hw`` (H, W) for the border check; without it (or with the
+    knob off) the scan is skipped entirely. Priority: margin > gap > starve >
+    witness; starve candidates spawn no witnesses (witnesses co-observe
+    ambiguity; starvation is about persistence).
     """
     # (oid, entry) -> trigger, first insert wins (priority: margin, gap, witness).
     candidates: dict[tuple[int, int], str] = {}
@@ -445,8 +476,29 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
     for oid, last_seen, _reappear in sorted(gap_reappearances):
         _add(oid, last_seen, "gap")
 
-    # (3) witness expansion off the primary (margin/gap) triggers only.
+    # (2b) starvation triggers: an oid never observed again, with a dark tail
+    # of >= starve_trigger frames to sequence end and an off-border last box.
+    # Inserted after margin/gap (they win same-(oid, entry) ties) and before
+    # witness expansion, which deliberately skips starve candidates.
+    if cfg.starve_windows and frame_hw is not None:
+        last_seen: dict[int, int] = {}
+        last_box: dict[int, tuple] = {}
+        for f in sorted(history):
+            for oid in history[f]:
+                last_seen[oid] = f
+                last_box[oid] = history[f][oid].box
+        for oid in sorted(last_seen):
+            f = last_seen[oid]
+            if (n_frames - 1) - f < cfg.starve_trigger:
+                continue
+            if _box_near_border(last_box[oid], frame_hw, cfg.border_margin_px):
+                continue
+            _add(oid, f, "starve")
+
+    # (3) witness expansion off the ambiguity (margin/gap) triggers only.
     for (oid, entry), _trig in list(candidates.items()):
+        if _trig not in ("margin", "gap"):
+            continue
         frame_obs = history.get(entry, {})
         if oid not in frame_obs:
             continue
@@ -619,7 +671,11 @@ class ExitMachine:
 
         w.dark_streak = 0
         area = int(mask.sum())
-        if w.seed_area > 0 and area < self.cfg.area_degradation * w.seed_area:
+        # Starve windows track a robot sliding behind an occluder: the mask
+        # SHRINKS to a sliver by design, so area degradation is not an abort
+        # signal for them (dark/edge/killed/settle still are).
+        if (w.seed_area > 0 and area < self.cfg.area_degradation * w.seed_area
+                and spec.trigger != "starve"):
             self._close(w, "degraded", frame_idx)
             return
         w.last_near_border = _near_border(mask, self.frame_hw, self.cfg.border_margin_px)
@@ -705,10 +761,13 @@ class ExitMachine:
                               masks_by_oid.get(w.spec.oid),
                               probs_by_oid.get(w.spec.oid))
         self._check_killed(frame_idx, masks_by_oid)
-        # window budget exhausted -> healthy END.
+        # window budget exhausted -> healthy END (starve windows may be
+        # uncapped; the cross-episode SAM budget still bounds them).
         for w in self._wins:
-            if w.state is None and frame_idx >= w.spec.seed_frame + self.cfg.window_max_frames:
-                self._close(w, "end", frame_idx)
+            if w.state is None:
+                wmax = effective_window_max(w.spec, self.cfg)
+                if wmax is not None and frame_idx >= w.spec.seed_frame + wmax:
+                    self._close(w, "end", frame_idx)
         return all(w.state is not None for w in self._wins)
 
     def outcomes(self):
@@ -879,10 +938,17 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
     Returns ``(results, renames)`` where ``results`` is
     ``{frame: {oid: {"box", "mask", "evidence"}}}``. Outside healthy windows
     every entry is a pure-TBD box (``mask=None``, evidence type ``"tbd"``). SWAP
-    outcomes relabel the whole stream pairwise from their entry frame; then each
+    outcomes relabel the whole stream pairwise from their event frame; then each
     healthy outcome overwrites its oid's entry across ``[entry, close]`` with the
     SAM mask, ``mask_to_box(mask)``, and ``selective_sam`` evidence carrying the
     per-frame ``tracker_prob``.
+
+    Margin/gap/witness swaps fire the rename from ``entry_frame`` (both oids
+    co-exist there, so the transposition is balanced). Starve swaps instead fire
+    from the fresh swap-target oid's first observed frame at or after entry:
+    renaming from the vanished track's ``entry_frame`` would relabel its genuine
+    last TBD box to the fresh oid, minting a one-frame phantom track at the
+    disappearance location. The mask overlay bridges the blind gap in between.
 
     When ``cfg.kill_coast`` is on, each ``killed`` outcome additionally coasts
     its object from the last confident SAM box (``kill_coast`` evidence,
@@ -908,17 +974,39 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
         results[f] = frame
 
     # SWAP rename events (dedup identical (frame, {a, b}) pairs).
+    #
+    # Margin/gap/witness swaps settle while both oids co-exist, so their
+    # transposition at entry_frame is balanced -- the event fires from
+    # entry_frame exactly as it always has (byte-parity).
+    #
+    # Starve swaps are different: the window opens at the VANISHED track's last
+    # observation (entry = last_seen) and the swap target ``b`` is a fresh oid
+    # first observed many frames later. Transposing at entry would relabel raw
+    # oid ``a``'s genuine last TBD box to ``b``, minting a one-frame phantom
+    # track for output oid ``b`` at the disappearance location. So for starve
+    # swaps the event fires from the fresh oid's first observed frame at or
+    # after entry (min{f >= entry : b in history[f]}), where the transposition
+    # is balanced; the mask overlay (written post-rename under the seeded raw
+    # oid) carries the identity through the blind gap in between. Falls back to
+    # entry_frame if the target is never seen (defensive -- settle guarantees it
+    # was). Dedup keys on the RESOLVED frame so two outcomes that resolve to the
+    # same (frame, {a, b}) still collapse to one event.
     events: list[RenameEvent] = []
     seen: set[tuple[int, frozenset]] = set()
     for oc in outcomes:
         if oc.state != "swap" or oc.swap_to is None:
             continue
         a, b = oc.spec.oid, oc.swap_to
-        key = (oc.spec.entry_frame, frozenset((a, b)))
+        frame = oc.spec.entry_frame
+        if oc.spec.trigger == "starve":
+            future = [f for f in sorted(history)
+                      if f >= oc.spec.entry_frame and b in history[f]]
+            frame = future[0] if future else oc.spec.entry_frame
+        key = (frame, frozenset((a, b)))
         if key in seen:
             continue
         seen.add(key)
-        events.append(RenameEvent(frame=oc.spec.entry_frame, a=a, b=b))
+        events.append(RenameEvent(frame=frame, a=a, b=b))
 
     # Kill-coast fallback (Task 2): pin killed objects to their coasted SAM box
     # before renames, so coasted entries are relabeled with the rest of the

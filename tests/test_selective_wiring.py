@@ -327,6 +327,35 @@ def test_gate_on_passes_kill_coast_overrides_to_selective_config():
     assert cfg.kill_coast_frames == 48
 
 
+def test_gate_on_passes_starve_overrides_to_selective_config():
+    """selective_starve_windows / _trigger / _max_frames (Task 3 knobs) must
+    reach the SelectiveConfig built for track_selective, not just sit unused on
+    JobConfig."""
+    job = _make_job()
+    job.config.selective_mask_prop = True
+    job.config.selective_starve_windows = True      # non-default overrides
+    job.config.selective_starve_trigger = 11
+    job.config.selective_starve_max_frames = 200
+    job.timings = {}
+    tracker = _tracker_stub({"unused": True})
+    tracker.track_selective.side_effect = RuntimeError("boom")  # short-circuit to fallback
+
+    view = SimpleNamespace(name="main")
+    track_kwargs = {"frames_dir": "/frames"}
+
+    async def run():
+        return await job._run_view_tracking(
+            tracker, view, track_kwargs,
+            lambda i, p: [], lambda a, b: None)
+
+    asyncio.run(run())
+    tracker.track_selective.assert_called_once()
+    cfg = tracker.track_selective.call_args.kwargs["cfg"]
+    assert cfg.starve_windows is True
+    assert cfg.starve_trigger == 11
+    assert cfg.starve_max_frames == 200
+
+
 def test_gate_on_passes_app_overrides_to_selective_config():
     """selective_app_weight / selective_app_ema (Task 2 knobs) must reach the
     SelectiveConfig built for track_selective, not just sit unused on

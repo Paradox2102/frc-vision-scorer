@@ -384,6 +384,22 @@ PROFILES = {
         ("sel-coast-ov95", {"selective_mask_prop": True, "selective_kill_coast": True,
                             "selective_mask_overlap_exit": 0.95}),
     ],
+    # Starvation-triggered windows (blue-gap v2 fix #1, spec docs/superpowers/
+    # specs/2026-07-21-selective-starvation-windows-design.md): recover the
+    # blue coverage cliffs (3181 parks behind the hub at t=37s -> 52%
+    # coverage; 2992's 2s occlusion respawn -> 73%) without losing the
+    # appearance-term red win (0.639) or the cost bar (main sam_frames <=
+    # 100% of uniform). Run with --full-match --restart-between; watch trig=
+    # and outcomes in the [selective] log line, per-team blue coverage, and
+    # whether 2992's post-occlusion stream inherits its identity via swap.
+    "starve": [
+        ("baseline", {}),
+        ("sel-app03", {"selective_mask_prop": True,
+                       "selective_app_weight": 0.3}),
+        ("sel-app03-starve", {"selective_mask_prop": True,
+                              "selective_app_weight": 0.3,
+                              "selective_starve_windows": True}),
+    ],
     # Default-ON candidacy (2026-07-20): the three merged-but-OFF tech-upgrade
     # features, each isolated vs baseline (the geo4 lesson: stacked-only runs
     # can't attribute a regressor), plus the stacked arm twice — the stack IS

@@ -309,14 +309,25 @@ before the gate commit (`trig={'starve': 56}` unchanged = stale-code
 receipt). Single-arm runs MUST restart the server after a code change; the
 `trig=` line is the receipt to check.
 
-**Where this leaves fix #1:** the 3181 capability is real (cov 52→99,
-0.455) but the v1 shape — uncapped windows, episode-bridging allowed,
-trigger on any gated terminal tail — does not survive dense matches.
-`selective_starve_windows` stays OFF. A v2 needs, at minimum: starve
-windows excluded from episode merging (or hard-capped so they can't bridge),
-a strict per-view starve-window budget share, and respawn-chain awareness
-(a terminal tail whose robot RESPAWNED as a new oid nearby is a re-ID
-problem, not a persistence problem — don't open a window for it).
+**qm11 gate re-run (valid this time — trig receipt: main starve 56→41,
+corners 15→8 / 22→14, corner budgets 100%→50%/93%):** per-team, the gate on
+qm11 is genuinely good — 3181 held exactly (0.455 @ 99%), **2992 improved
+to 0.212 @ 93%** (from 73%; freed budget let its window run), red
+byte-identical to control (0.480/0.527/0.910). The one unfixed qm11 wound
+is 4786 (~3.1 @ 28%, lag 9.7s, unchanged from ungated). qm11 alone would
+say ship it; **qm16 is the disqualifier** — exactly the
+hyper-optimization-on-one-match trap the fresh-match protocol exists to
+catch.
+
+**Where this leaves fix #1:** the 3181/2992 capability is real (52→99 @
+0.455, 73→93 @ 0.212) but the v1 shape — uncapped windows, episode-bridging
+allowed, trigger on any gated terminal tail — does not survive dense
+matches it wasn't tuned on. `selective_starve_windows` stays OFF. A v2
+needs, at minimum: starve windows excluded from episode merging (or
+hard-capped so they can't bridge), a strict per-view starve-window budget
+share, and respawn-chain awareness (a terminal tail whose robot RESPAWNED
+as a new oid nearby is a re-ID problem, not a persistence problem — don't
+open a window for it).
 
 ## How to evaluate
 

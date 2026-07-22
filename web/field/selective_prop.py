@@ -52,6 +52,11 @@ class SelectiveConfig:
     kill_coast_frames: int = 24    # max frames to coast a killed object
     app_weight: float = 0.0        # appearance cost weight; 0 = OFF (exact no-op)
     app_ema: float = 0.9           # track-embedding EMA retention on confident matches
+    # Starvation-triggered windows (blue-gap v2 fix #1): a track never
+    # observed again opens a SAM window from its last confident box.
+    starve_windows: bool = False   # master; False = exact no-op
+    starve_trigger: int = 7        # min dark-tail frames (to sequence end)
+    starve_max_frames: int = 0     # starve-window frame cap; 0 = uncapped
 
 
 @dataclass
@@ -299,7 +304,7 @@ class WindowSpec:
     oid: int
     seed_frame: int
     entry_frame: int
-    trigger: str                    # "margin" | "gap" | "witness"
+    trigger: str                    # "margin" | "gap" | "starve" | "witness"
 
 
 @dataclass
@@ -379,6 +384,13 @@ def _near_border(mask: np.ndarray, frame_hw, margin_px: int) -> bool:
     return x1 < margin_px or y1 < margin_px or (w - x2) < margin_px or (h - y2) < margin_px
 
 
+def _box_near_border(box, frame_hw, margin_px: int) -> bool:
+    """True when ``box`` comes within ``margin_px`` of any frame edge."""
+    h, w = frame_hw
+    x1, y1, x2, y2 = box
+    return x1 < margin_px or y1 < margin_px or (w - x2) < margin_px or (h - y2) < margin_px
+
+
 def _pixel_iou(a: np.ndarray, b: np.ndarray) -> float:
     """IoU of two bool masks; 0.0 when the union is empty."""
     inter = int(np.logical_and(a, b).sum())
@@ -419,7 +431,8 @@ def _seed_walk(history, oid: int, entry_frame: int, cfg: SelectiveConfig):
     return None
 
 
-def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
+def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig,
+                 frame_hw=None):
     """Offline window construction over the completed TBD history.
 
     Margin triggers (any matched oid with ``margin < margin_entry``) and gap
@@ -429,6 +442,16 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
     walk and is dropped if no clean seed exists. Candidates are de-duplicated on
     ``(oid, entry_frame)`` (margin > gap > witness priority) and the surviving
     :class:`WindowSpec`s are sorted by ``(seed_frame, entry_frame, oid)``.
+
+    Starvation triggers (``cfg.starve_windows``, blue-gap v2 fix #1): an oid
+    whose FINAL observation is followed by a dark tail of at least
+    ``starve_trigger`` frames to sequence end, with a last box at least
+    ``border_margin_px`` from every frame edge, opens a "starve" candidate at
+    ``entry = last_seen`` — detector-free SAM persistence through blind spots.
+    Requires ``frame_hw`` (H, W) for the border check; without it (or with the
+    knob off) the scan is skipped entirely. Priority: margin > gap > starve >
+    witness; starve candidates spawn no witnesses (witnesses co-observe
+    ambiguity; starvation is about persistence).
     """
     # (oid, entry) -> trigger, first insert wins (priority: margin, gap, witness).
     candidates: dict[tuple[int, int], str] = {}
@@ -445,8 +468,29 @@ def find_windows(history, gap_reappearances, n_frames, cfg: SelectiveConfig):
     for oid, last_seen, _reappear in sorted(gap_reappearances):
         _add(oid, last_seen, "gap")
 
-    # (3) witness expansion off the primary (margin/gap) triggers only.
+    # (2b) starvation triggers: an oid never observed again, with a dark tail
+    # of >= starve_trigger frames to sequence end and an off-border last box.
+    # Inserted after margin/gap (they win same-(oid, entry) ties) and before
+    # witness expansion, which deliberately skips starve candidates.
+    if cfg.starve_windows and frame_hw is not None:
+        last_seen: dict[int, int] = {}
+        last_box: dict[int, tuple] = {}
+        for f in sorted(history):
+            for oid in history[f]:
+                last_seen[oid] = f
+                last_box[oid] = history[f][oid].box
+        for oid in sorted(last_seen):
+            f = last_seen[oid]
+            if (n_frames - 1) - f < cfg.starve_trigger:
+                continue
+            if _box_near_border(last_box[oid], frame_hw, cfg.border_margin_px):
+                continue
+            _add(oid, f, "starve")
+
+    # (3) witness expansion off the ambiguity (margin/gap) triggers only.
     for (oid, entry), _trig in list(candidates.items()):
+        if _trig not in ("margin", "gap"):
+            continue
         frame_obs = history.get(entry, {})
         if oid not in frame_obs:
             continue

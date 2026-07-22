@@ -209,12 +209,58 @@ Candidate fixes (fix #1's design approved and built; #2/#3 not yet approved):
    what baseline does right. **Implemented** (`selective_starve_windows`,
    default OFF; `selective_starve_trigger`, `selective_starve_max_frames`) —
    spec `docs/superpowers/specs/2026-07-21-selective-starvation-windows-design.md`,
-   `--profile starve` in `scripts/ab_qm8.py`. A/B pending.
+   `--profile starve` in `scripts/ab_qm8.py`. A/B'd Jul 21 — see
+   "Starvation-window A/B results" below.
 2. **Zero-velocity coast-emit + appearance reacquisition** — emit coasted
    boxes as `tbd_coast` evidence (accurate for parked robots) + embed-vs-EMA
    oid merge on respawn. No GPU cost; dishonest for moving robots.
 3. **Detector-side** (hub-sliver hard negatives / occlusion-aware training)
    — the bigger program (see equipment-hijack memory), out of selective scope.
+
+## Starvation-window A/B results (Jul 21 2026, fix #1)
+
+Three-arm `--profile starve --full-match --restart-between` on qm11
+(/tmp/frc-ab-starve-qm11.json; jobs c40f277f / b89bc7b1 / ddf07026). Both
+controls reproduced exactly (baseline 0.983/1.062/0.903 with blue cov
+100/100/26; sel-app03 0.837/1.034/0.639 with the 52/73/26 cliffs). No
+`FALLBACK`, no propagation errors.
+
+Aggregates hide the result — read it per team (per-slot `mean_nn_m`):
+
+| team (blue) | baseline | sel-app03 | sel-app03-starve |
+|-------------|----------|-----------|------------------|
+| 3181 (hub sliver) | 0.614 @ 100% | 0.575 @ 52% | **0.455 @ 99%** |
+| 2992 (occlusion)  | 0.259 @ 100% | 0.214 @ 73% | 0.225 @ 73% |
+| 4786 (never-seeded) | ~2.31 @ 26% | ~2.31 @ 26% | **3.11 @ 28%, lag 9.7s** |
+| red meanNN | 0.903 | 0.639 | 0.642 (cov identical) |
+
+**The thesis is proven on its target.** 3181's starve window carried the
+hub-sliver blind spot detector-free: coverage 52→99 with positions *better*
+than baseline's uniform SAM (0.455 vs 0.614) — selective's clean seed +
+sliver mask beats baseline's whole-match-polluted track. Red held.
+
+**Three problems, all mechanical:**
+
+1. **Uncapped starve windows blew the corner budgets.** Corner junk tracks
+   (transient detections that vanish forever — starve trig 15 and 22 on the
+   corners) open windows that run to sequence end: corner sam_frames went
+   26%→100% and 42%→100% of uniform, wall clock +51% (1232s→1864s), and
+   main dropped 34 windows on budget (control dropped 0). Main itself stayed
+   at 92%.
+2. **4786 regressed (2.31→3.11, start-lag 9.7s).** Likely budget
+   cannibalization (the dropped-34 windows) and/or a junk starve window
+   swapping onto 4786's stream (main renames 7→17). Not yet attributed
+   per-frame.
+3. **2992 untouched (73%).** Its cliff is a ~2s FULL occlusion; a starve
+   window's mask goes dark ≥ `min_streak` (5) frames → closes `degraded`
+   before the robot reappears, so the swap re-binding never happens. Fixing
+   this needs a starve-specific dark tolerance (design question, not a knob).
+
+**Probe in flight:** `--profile starve-cap` — `selective_starve_max_frames`
+240 (~28s at full-match fps), single arm. Should keep 3181's recovery (the
+scored window ends well within 240 frames of the park) while stopping corner
+junk windows from eating the budget; watch whether 4786 and the corner
+percentages recover toward control.
 
 ## How to evaluate
 

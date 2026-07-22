@@ -400,6 +400,20 @@ PROFILES = {
                               "selective_app_weight": 0.3,
                               "selective_starve_windows": True}),
     ],
+    # Jul 21 starve A/B verdict: 3181 FIXED (cov 52->99, meanNN 0.455 beats
+    # baseline 0.614) but UNCAPPED starve windows blew the corner budgets to
+    # 100% of uniform (26%/42% in control), main dropped 34 windows on
+    # budget, and 4786 regressed 2.31->3.11 with a 9.7s start lag (budget
+    # cannibalization and/or junk-track starve swaps; renames 7->17). Probe:
+    # cap starve windows at 240 frames (~28s at full-match fps) -- long
+    # enough to carry 3181 through the scored window, short enough to stop
+    # corner junk tracks from eating the whole budget.
+    "starve-cap": [
+        ("sel-app03-starve240", {"selective_mask_prop": True,
+                                 "selective_app_weight": 0.3,
+                                 "selective_starve_windows": True,
+                                 "selective_starve_max_frames": 240}),
+    ],
     # Default-ON candidacy (2026-07-20): the three merged-but-OFF tech-upgrade
     # features, each isolated vs baseline (the geo4 lesson: stacked-only runs
     # can't attribute a regressor), plus the stacked arm twice — the stack IS

@@ -256,11 +256,21 @@ sliver mask beats baseline's whole-match-polluted track. Red held.
    before the robot reappears, so the swap re-binding never happens. Fixing
    this needs a starve-specific dark tolerance (design question, not a knob).
 
-**Probe in flight:** `--profile starve-cap` — `selective_starve_max_frames`
-240 (~28s at full-match fps), single arm. Should keep 3181's recovery (the
-scored window ends well within 240 frames of the park) while stopping corner
-junk windows from eating the budget; watch whether 4786 and the corner
-percentages recover toward control.
+**Cap probe (`--profile starve-cap`, `selective_starve_max_frames=240`, job
+f6176320): the cap is NOT the fix.** Scored metrics byte-identical to the
+uncapped arm (0.953/1.263/0.642, same coverage/lag). The knob demonstrably
+applied — corner_left's episode structure changed completely (15 episodes
+run vs 3, dropped 4 vs 29, outcome histogram reshuffled) — but shorter
+windows just admitted MORE junk windows until the corner budgets saturated
+at 100% again, and main was byte-identical because its budget exhaustion
+(dropped 34) comes from the COUNT of its 56 starve triggers, not their
+length. **The collateral is window count from junk tracks, not window
+length.** The fix is a trigger gate: require a minimum track lifetime (or
+minimum clean-frame count) before a disappearance qualifies as starvation —
+3181 was tracked for ~37s before parking; the corner junk triggers are
+transient few-frame tracks. That's a design decision (gate form + default),
+not a knob sweep — next cycle. A per-view starve-window count cap is the
+cruder alternative.
 
 ## How to evaluate
 

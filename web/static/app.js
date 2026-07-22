@@ -102,6 +102,7 @@ class VisionScorer {
         // Upload form
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
         this.populateSam2Models();
+        this.populateVlmModels();
         this.rejoinActiveJob();
         this.startInferenceBtn.addEventListener('click', () => this.startInference());
         this.pauseInferenceBtn.addEventListener('click', () => this.pauseInference());
@@ -1137,6 +1138,34 @@ class VisionScorer {
         }
     }
 
+    async populateVlmModels() {
+        const select = document.getElementById('vlmModel');
+        if (!select) return;
+        try {
+            const resp = await fetch('/api/vlm_models');
+            const data = await resp.json();
+            select.replaceChildren();
+            for (const m of data.models || []) {
+                const opt = document.createElement('option');
+                opt.value = m.key;
+                // needs_download models stay selectable (vLLM fetches on first
+                // serve); annotate the size hint when we have one.
+                let tag = '';
+                if (m.status === 'needs_download') {
+                    const gb = m.approx_gb ? ` (~${m.approx_gb} GB)` : '';
+                    tag = ` — needs download${gb}`;
+                }
+                opt.textContent = `${m.label}${tag}`;
+                if (m.notes) opt.title = m.notes;
+                if (m.key === data.default) opt.selected = true;
+                select.appendChild(opt);
+            }
+            this._defaultVlmModel = data.default;
+        } catch (err) {
+            console.error('Failed to load VLM model list:', err);
+        }
+    }
+
     async handleSubmit(e) {
         e.preventDefault();
 
@@ -1180,6 +1209,12 @@ class VisionScorer {
         }
         if (document.getElementById('fieldWireframeOverlay')?.checked) {
             config.field_wireframe_overlay = true;
+        }
+        // Bumper reader model: only send the override when it differs from the
+        // server default (mirrors how tracking_backend / model_size are sent).
+        const vlmModel = document.getElementById('vlmModel')?.value;
+        if (vlmModel && vlmModel !== this._defaultVlmModel) {
+            config.vlm_model = vlmModel;
         }
         if (Object.keys(config).length > 0) {
             formData.append('config_json', JSON.stringify(config));

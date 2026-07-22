@@ -8,6 +8,11 @@
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
+# MODEL and UTIL come from the environment so web/vllm_lifecycle.py can serve a
+# per-job model (the vlm_model knob) by exporting VLM_MODEL_NAME /
+# VLM_SERVER_GPU_UTIL; the defaults reproduce today's incumbent behavior. Any
+# extra positional args ("$@") are appended to `vllm serve` (per-model flags,
+# e.g. GLM's --reasoning-parser glm45).
 MODEL="${VLM_MODEL_NAME:-Qwen/Qwen3-VL-4B-Instruct}"
 PORT="${VLM_SERVER_PORT:-8006}"
 # 0.45 of the 3090's 24GB ≈ 11GB: ~8GB fp16 weights plus KV-cache/encoder
@@ -23,6 +28,17 @@ echo "Logs: /tmp/frc-vllm.log"
 # The system nvcc (CUDA 12.0) is too old to JIT flashinfer's sampling
 # kernels; vLLM's native torch sampler is fine for 64-token reads.
 export VLLM_USE_FLASHINFER_SAMPLER=0
+
+# vLLM 0.25.x fixes (both verified 2026-07-22, harmless for non-FP8 models):
+# 1. Its "humming" JIT loads NVRTC directly (not through torch), which then
+#    can't find libnvrtc-builtins.so — put the venv's bundled CUDA libs on the
+#    loader path.
+# 2. The humming FP8 GEMM kernels themselves crash on the 3090 (SM86:
+#    cuFuncSetAttribute CUDA_ERROR_INVALID_VALUE at engine init) — disable
+#    them so kernel selection falls back to Marlin W8A16, which is how the
+#    FP8 repos (GLM-4.6V-Flash, Qwen3-VL-8B-FP8) ran on vLLM 0.22.1 too.
+export LD_LIBRARY_PATH="$PROJECT_ROOT/.venv-vllm/lib/python3.12/site-packages/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export VLLM_DISABLED_KERNELS=HummingFP8ScaledMMLinearKernel,HummingInt8ScaledMMLinearKernel,HummingLinearKernel
 
 # Mount the dev sleep routes (/sleep, /wake_up, /is_sleeping) that
 # web/vllm_lifecycle.py uses to offload the GPU pool between phases instead
@@ -48,6 +64,7 @@ export VLLM_SERVER_DEV_MODE=1
   --max-num-seqs 8 \
   --limit-mm-per-prompt '{"image": 1}' \
   --mm-processor-kwargs '{"min_pixels": 200704, "max_pixels": 1003520}' \
+  "$@" \
   > /tmp/frc-vllm.log 2>&1 &
 echo $! > /tmp/frc-vllm.pid
 

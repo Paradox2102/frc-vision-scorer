@@ -27,6 +27,48 @@ def test_logprobs_flag():
     assert p["logprobs"] is True
 
 
+def test_payload_model_defaults_to_incumbent():
+    # With no per-job override the payload model is the HF default — unchanged.
+    import web.app as app
+    p = _vlm_chat_payload("d", "p", max_tokens=8)
+    assert p["model"] == app.VLM_MODEL_NAME
+
+
+def test_payload_model_follows_active_model(monkeypatch):
+    import web.app as app
+    monkeypatch.setattr(app, "_active_vlm_payload_model", "some/Other-VLM")
+    p = _vlm_chat_payload("d", "p", max_tokens=8)
+    assert p["model"] == "some/Other-VLM"
+
+
+def test_apply_vlm_model_sets_payload_and_lifecycle():
+    import web.app as app
+    from web import vllm_lifecycle, vlm_models
+    try:
+        app._apply_vlm_model("qwen3-vl-8b")
+        assert vllm_lifecycle.active_model() == "qwen3-vl-8b"
+        assert app._active_vlm_payload_model == vlm_models.get("qwen3-vl-8b").hf_repo
+    finally:
+        app._apply_vlm_model(vlm_models.DEFAULT_KEY)
+
+
+def test_payload_merges_active_extra_body():
+    """GLM's extra_body (disable thinking) is merged top-level into the payload;
+    the default model adds nothing."""
+    import web.app as app
+    from web import vlm_models
+    try:
+        app._apply_vlm_model("glm-4.6v-flash")
+        p = _vlm_chat_payload("d", "p", max_tokens=8)
+        assert p["chat_template_kwargs"] == {"enable_thinking": False}
+        # Default model: no extra keys beyond the standard payload.
+        app._apply_vlm_model("qwen3-vl-4b")
+        p2 = _vlm_chat_payload("d", "p", max_tokens=8)
+        assert "chat_template_kwargs" not in p2
+    finally:
+        app._apply_vlm_model(vlm_models.DEFAULT_KEY)
+
+
 def test_guided_schema_attached():
     p = _vlm_chat_payload("d", "p", max_tokens=8, schema_name="bumper_read",
                           schema=_BUMPER_READ_SCHEMA, guided=True)

@@ -22,6 +22,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from web import vlm_models
+
 # Matches the truthiness rule used by the app.py env constants.
 _FALSY = ("0", "false", "False")
 
@@ -521,6 +523,17 @@ KNOBS = [
     # anyway), start it for the analysis loop's reads, stop it after the job.
     Knob("vllm_phase_exclusive", "VLLM_PHASE_EXCLUSIVE", bool, True,
          section="VLM reader"),
+    # Which model serves bumper reads. Default "qwen3-vl-4b" is byte-for-byte
+    # today's behavior: vLLM serving Qwen3-VL-4B fp16 at gpu-util 0.45
+    # (web/start_vllm.sh). The other keys are alternative vision models served by
+    # the SAME vLLM server in HF format (a different VLM_MODEL_NAME /
+    # VLM_SERVER_GPU_UTIL at launch) — see web/vlm_models.py for the registry.
+    # The lifecycle (web/vllm_lifecycle.py) verifies the right model is serving
+    # and cold-restarts with the requested model on a mismatch. vLLM fetches an
+    # uncached model from the HF hub on first serve, so "needs download" models
+    # are selectable (the first run just pays the download).
+    Knob("vlm_model", "VLM_MODEL", str, vlm_models.DEFAULT_KEY,
+         choices=vlm_models.model_keys(), section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only

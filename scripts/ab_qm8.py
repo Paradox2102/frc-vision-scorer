@@ -68,6 +68,18 @@ PROFILES = {
     # side.
     # One plain-defaults job (for validating default-on fixes on any match).
     "single": [("baseline", {})],
+    # Bumper-reader model A/B/C/D (vlm_model knob, web/vlm_models.py): the
+    # incumbent Qwen3-VL-4B vs the three 2026-07-22 candidates, geometry knobs
+    # all default so only the reader differs. Read quality shows up in the
+    # identity columns (mislabel / slot_map / coverage); read speed comes from
+    # the replay's timings JSON (vlm.pass_async) keyed by each arm's job_id.
+    # Huihui Mistral 24B was dropped: no vision-intact non-GGUF quant exists.
+    "vlm-models": [
+        ("qwen3-vl-4b", {}),
+        ("glm-4.6v-flash", {"vlm_model": "glm-4.6v-flash"}),
+        ("qwen3-vl-8b", {"vlm_model": "qwen3-vl-8b"}),
+        ("lfm2.5-vl", {"vlm_model": "lfm2.5-vl"}),
+    ],
     "relink": [
         ("baseline", {}),
         ("relink-gate", {"relink_max_dist_m": 3.0}),

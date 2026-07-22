@@ -756,6 +756,32 @@ VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 # weights live in the vLLM process, so job pruning here never reloads them.
 VLM_SERVER_URL = os.environ.get("VLM_SERVER_URL", "http://127.0.0.1:8006/v1")
 
+# Active served model for the analysis-phase read path's chat payload. Default
+# keeps today's exact behavior (Qwen3-VL-4B on vLLM, no extra payload keys). A
+# per-job `vlm_model` knob repoints both at job start via _apply_vlm_model:
+# `_active_vlm_payload_model` is the served HF id for the payload's `model`
+# field, and `_active_vlm_extra_body` is any per-model keys merged top-level into
+# the chat payload (e.g. GLM's enable_thinking=false).
+_active_vlm_payload_model = VLM_MODEL_NAME
+_active_vlm_extra_body: dict = {}
+
+
+def _apply_vlm_model(key: str) -> None:
+    """Point the read path + lifecycle at a job's selected VLM model.
+
+    Records the requested model with the phase-exclusive lifecycle (so
+    ensure_started serves/verifies the right model) and sets the payload model
+    name + extra body used by _vlm_chat_payload. The default key (qwen3-vl-4b) is
+    a no-op that leaves behavior byte-identical to the incumbent.
+    """
+    global _active_vlm_payload_model, _active_vlm_extra_body
+    from web import vlm_models, vllm_lifecycle
+    if key is None:
+        key = vlm_models.DEFAULT_KEY
+    vllm_lifecycle.set_active_model(key)
+    _active_vlm_payload_model = vlm_models.payload_model(key, default=VLM_MODEL_NAME)
+    _active_vlm_extra_body = vlm_models.extra_body(key)
+
 # Match-start calibration drift check: sample a few in-match frames from the main
 # view, auto-detect AprilTags, and verify the selected calibration epoch still
 # reprojects them accurately. If the camera moved/zoomed since calibration the job
@@ -5575,6 +5601,10 @@ class InferenceJob:
         # A/B provenance: knobs differing from code defaults (env or per-job).
         _nd = self.config.non_defaults()
         print(f"  [config] {_nd if _nd else 'all defaults'}")
+        # Point the read path + phase-exclusive lifecycle at this job's selected
+        # bumper-reader model (default qwen3-vl-4b = today's behavior). getattr
+        # keeps legacy/stub configs without the knob on the incumbent.
+        _apply_vlm_model(getattr(self.config, "vlm_model", None))
         # Gate on calibration / loaded event (decision 7). No fallback to the old
         # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
         if not self._init_field_tracking():
@@ -9248,6 +9278,11 @@ def _get_qwen_vl():
 
     Uses AutoModelForImageTextToText so the model is swappable via VLM_MODEL_NAME
     (Qwen3-VL today; InternVL3 / Nemotron later) with no code change here.
+
+    This in-process fallback reader always uses the VLM_MODEL_NAME default
+    regardless of the per-job vlm_model knob: that knob selects which model the
+    vLLM SERVER serves, and this transformers path is the fallback for when the
+    server is unreachable.
     """
     global _qwen_vl_model, _qwen_vl_processor
     if _qwen_vl_model is None:
@@ -9730,7 +9765,9 @@ def _vlm_chat_payload(data_uri: str, prompt: str, *, max_tokens: int,
     if guided is None:
         guided = VLM_GUIDED_JSON
     payload = {
-        "model": VLM_MODEL_NAME,
+        # The active served model (set per-job by _apply_vlm_model from the
+        # vlm_model knob); defaults to VLM_MODEL_NAME for byte-identical behavior.
+        "model": _active_vlm_payload_model,
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": data_uri}},
             {"type": "text", "text": prompt},
@@ -9745,6 +9782,11 @@ def _vlm_chat_payload(data_uri: str, prompt: str, *, max_tokens: int,
             "type": "json_schema",
             "json_schema": {"name": schema_name or "reply", "schema": schema},
         }
+    # Per-model extra payload keys (set by _apply_vlm_model), e.g. GLM's
+    # chat_template_kwargs to disable thinking so 64-token reads aren't empty.
+    # Empty for the default model, so the payload is byte-identical to today.
+    if _active_vlm_extra_body:
+        payload.update(_active_vlm_extra_body)
     return payload
 
 
@@ -10552,6 +10594,20 @@ async def sam2_models():
     }
 
 
+@app.get("/api/vlm_models")
+async def vlm_models_endpoint():
+    """List selectable bumper-reader models and whether each is cached locally.
+
+    All models are served by the same vLLM server in HF format; `status` is
+    `ready` (in the HF cache) or `needs_download` (vLLM fetches it on first
+    serve). The UI annotates `needs_download` but keeps it selectable.
+    """
+    from web import vlm_models
+    # scan_cache_dir touches disk; keep the event loop free.
+    rows = await asyncio.to_thread(vlm_models.describe)
+    return {"default": vlm_models.DEFAULT_KEY, "models": rows}
+
+
 async def _load_db_roster(match_key: Optional[str]) -> Optional[tuple[list, list, list]]:
     """Server-authoritative roster from the DB: ``(match_teams, blue, red)``.
 
@@ -10634,6 +10690,16 @@ async def infer(
         overrides.update(extra)
     try:
         job_config = JobConfig(overrides)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    # Submit-time VLM model check: reject an unresolvable model up front rather
+    # than failing minutes into inference. All models are vLLM-served in HF
+    # format, so a `needs_download` model is allowed (vLLM fetches it on first
+    # serve) — only an unknown key is rejected here (JobConfig's choices already
+    # guard this; this is the defensive second gate the brief called for).
+    try:
+        from web import vlm_models
+        vlm_models.get(job_config.vlm_model)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     if not _sam2_checkpoint_present(job_config.sam2_model_size):

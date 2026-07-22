@@ -34,9 +34,19 @@ so we derive the root URL by stripping that trailing ``/v1``. They only exist
 because web/start_vllm.sh launches with ``--enable-sleep-mode`` and
 ``VLLM_SERVER_DEV_MODE=1``.
 
-All effectful inputs (readiness check, HTTP transport, script runner, sleep,
-clock) are injectable for tests; the defaults shell out to the scripts and
-poll over HTTP.
+Model selection (web/vlm_models.py): the served bumper reader is per-job, but
+every model is served by this same vLLM server in HF format. A job calls
+``set_active_model(key)`` at start; ``ensure_started`` then verifies the RIGHT
+model is serving (GET ``{VLM_SERVER_URL}/models`` reports vLLM's launched HF id)
+and, on a confirmed mismatch, stops the running server and cold-starts it with
+the requested model's ``VLM_MODEL_NAME`` / ``VLM_SERVER_GPU_UTIL``. When the
+right model is already serving, the sleep/wake fast path applies unchanged. The
+default active model is Qwen3-VL-4B at gpu-util 0.45, so with no
+``set_active_model`` call the behavior is byte-for-byte the incumbent.
+
+All effectful inputs (readiness check, served-model probe, HTTP transport,
+script runner, sleep, clock) are injectable for tests; the defaults shell out to
+the scripts and poll over HTTP.
 """
 from __future__ import annotations
 
@@ -47,7 +57,28 @@ import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from web import vlm_models
+
 _PROJECT_ROOT = Path(__file__).parent.parent
+
+#: The bumper-reader model a job wants served. Set per-job by set_active_model;
+#: defaults to the incumbent so untouched callers/tests keep vLLM behavior.
+_active_model_key: str = vlm_models.DEFAULT_KEY
+
+
+def set_active_model(key: str) -> None:
+    """Record the model the next ensure_started should serve/verify.
+
+    Validates against the registry (raises ValueError on an unknown key) so a
+    bad key surfaces at job start, not mid-lifecycle.
+    """
+    global _active_model_key
+    vlm_models.get(key)  # validate
+    _active_model_key = key
+
+
+def active_model() -> str:
+    return _active_model_key
 
 #: How long to wait for the vLLM server to serve /v1/models after launch.
 #: Model load is ~90s on the 3090; double it for cold page cache.
@@ -89,6 +120,38 @@ def _default_http(method: str, path: str) -> "tuple[int, str]":
     req = urllib.request.Request(f"{_root_url()}{path}", method=method)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return resp.status, resp.read().decode()
+
+
+#: Served-model probe seam: () -> served model id (or None if undeterminable).
+ServedModelFn = Callable[[], "str | None"]
+
+
+def _default_served_model() -> "str | None":
+    """The id of the model currently served at ``{VLM_SERVER_URL}/models``.
+
+    vLLM reports the HF id it was launched with (e.g.
+    ``Qwen/Qwen3-VL-4B-Instruct``). Returns None on any error (no server,
+    malformed body) — callers treat None as "cannot confirm a mismatch", so an
+    unidentifiable-but-up server is left running rather than needlessly cycled.
+    """
+    from web.app import VLM_SERVER_URL  # late import: avoid cycle at module load
+    try:
+        req = urllib.request.Request(f"{VLM_SERVER_URL}/models", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode())
+        data = body.get("data") or []
+        return str(data[0].get("id")) if data else None
+    except Exception:
+        return None
+
+
+def _served_matches(served_model_fn: ServedModelFn) -> "bool | None":
+    """Tri-state: True if the served model is the active model, False on a
+    confirmed mismatch, None if it can't be determined (probe returned None)."""
+    served = served_model_fn()
+    if served is None:
+        return None
+    return vlm_models.served_matches(_active_model_key, served)
 
 
 def _is_sleeping(http_fn: HttpFn) -> bool | None:
@@ -162,11 +225,31 @@ async def _try_wake(
 
 
 async def _default_run_script(name: str) -> None:
-    script = _PROJECT_ROOT / "web" / f"{'start_vllm.sh' if name == 'start' else 'stop_vllm.sh'}"
+    """Start/stop the vLLM server for the active model.
+
+    "start" launches start_vllm.sh with the active model's ``VLM_MODEL_NAME`` and
+    ``VLM_SERVER_GPU_UTIL`` exported into the child env (the script reads both,
+    defaulting to the incumbent) plus any per-model extra ``vllm serve`` args
+    (e.g. GLM's ``--reasoning-parser glm45``) as trailing script arguments the
+    script forwards to ``vllm serve``; "stop" runs stop_vllm.sh (pid-based).
+    """
+    web_dir = _PROJECT_ROOT / "web"
+    if name == "start":
+        model = vlm_models.get(_active_model_key)
+        env = {
+            **os.environ,
+            "VLM_MODEL_NAME": model.hf_repo,
+            "VLM_SERVER_GPU_UTIL": str(model.gpu_util),
+        }
+        args = [str(web_dir / "start_vllm.sh"), *model.extra_serve_args]
+    else:
+        env = None
+        args = [str(web_dir / "stop_vllm.sh")]
     proc = await asyncio.create_subprocess_exec(
-        str(script),
+        *args,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
+        env=env,
     )
     await proc.wait()
 
@@ -180,30 +263,40 @@ async def ensure_started(
     now: Callable[[], float] | None = None,
     http_fn: HttpFn = _default_http,
     should_stop: Callable[[], bool] | None = None,
+    served_model_fn: ServedModelFn = _default_served_model,
 ) -> bool:
-    """Bring the vLLM server up; True when it is serving, False on timeout.
+    """Bring the requested reader model up; True when serving, False on timeout.
 
-    Fast path: if the server answers the readiness check but is sleeping, wake
-    it (no process launch). If it is up and awake, we are done. If nothing is
-    running, cold-start via the launch script. If a sleeper refuses to wake,
-    tear it down and cold-start so a wedged sleeper never strands the job.
+    Model-aware: if a server is up but serving the WRONG model (confirmed via
+    the served-model probe), stop it and cold-start with the requested model's
+    env. When the right model is up, the sleep/wake fast path applies (a sleeper
+    is woken, no process launch). If nothing is running, cold-start via the
+    launch script. A wedged sleeper that refuses to wake is torn down and
+    cold-started.
 
     ``should_stop`` (optional) is polled inside the wait loops so a user STOP
     aborts the ~90s startup wait within a poll interval instead of blocking
     until the readiness timeout; it returns False (server not up) in that case.
     """
     if check_fn():
-        # Server answers /v1/models — but it might be a sleeper (readiness
-        # alone can't tell). Only wake if /is_sleeping explicitly says True.
-        if _is_sleeping(http_fn) is not True:
-            return True
-        if await _try_wake(http_fn, check_fn, sleep, ready_timeout, now,
-                           should_stop):
-            return True
-        if should_stop is not None and should_stop():
-            return False
-        # Wedged sleeper: kill it, then fall through to a clean cold start.
-        await run_script("stop")
+        # A server answers /v1/models. If it is definitively serving the WRONG
+        # model, take it down and cold-start the requested model below. None
+        # (undeterminable) is NOT a confirmed mismatch — leave it running.
+        if _served_matches(served_model_fn) is False:
+            await run_script("stop")
+        else:
+            # Right model (or undeterminable) — apply the sleep/wake fast path.
+            # It might be a sleeper (readiness alone can't tell); only wake if
+            # /is_sleeping explicitly says True.
+            if _is_sleeping(http_fn) is not True:
+                return True
+            if await _try_wake(http_fn, check_fn, sleep, ready_timeout, now,
+                               should_stop):
+                return True
+            if should_stop is not None and should_stop():
+                return False
+            # Wedged sleeper: kill it, then fall through to a clean cold start.
+            await run_script("stop")
 
     await run_script("start")
     clock = now or asyncio.get_event_loop().time

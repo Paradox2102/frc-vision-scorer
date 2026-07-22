@@ -215,6 +215,26 @@ KNOBS = [
          min=0.0, max=5.0, section="Tracking backend"),
     Knob("selective_app_ema", "SELECTIVE_APP_EMA", float, 0.9,
          min=0.0, max=1.0, section="Tracking backend"),
+    # Starvation-triggered windows (blue-gap v2 fix #1,
+    # docs/selective-mask-prop-blue-gap.md; spec docs/superpowers/specs/
+    # 2026-07-21-selective-starvation-windows-design.md). Margin/gap/witness
+    # all fire on AMBIGUITY; disappearance is not a trigger class, so a robot
+    # that vanishes from the detector (3181 parks behind the hub at t=37s,
+    # sliver only -- YOLO never re-fires) just ends its TBD stream and
+    # selective loses it while baseline's uniform SAM stays latched to the
+    # sliver. ON: a track never observed again (dark tail >=
+    # selective_starve_trigger frames to sequence end) whose last box is off-
+    # border opens a SAM window from its last confident box. Starve windows
+    # skip the area-degradation abort (slivers shrink by design) and run
+    # uncapped by default (selective_starve_max_frames 0; the cross-episode
+    # selective_sam_budget_frac budget is the cost governor). DEFAULT OFF ->
+    # byte-identical no-op.
+    Knob("selective_starve_windows", "SELECTIVE_STARVE_WINDOWS", bool, False,
+         section="Tracking backend"),
+    Knob("selective_starve_trigger", "SELECTIVE_STARVE_TRIGGER", int, 7,
+         min=1, section="Tracking backend"),
+    Knob("selective_starve_max_frames", "SELECTIVE_STARVE_MAX_FRAMES", int, 0,
+         min=0, section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

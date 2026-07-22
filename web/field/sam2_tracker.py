@@ -2783,6 +2783,7 @@ class Sam2FieldTracker:
             ExitMachine,
             TbdTracker,
             cluster_windows,
+            effective_window_max,
             find_windows,
             merge_selective_results,
         )
@@ -2840,7 +2841,7 @@ class Sam2FieldTracker:
             self.selective_stats = {
                 "frames": len(history), "windows": 0, "sam_frames": 0,
                 "outcomes": {}, "renames": len(renames), "skipped": 0,
-                "episodes": 0, "dropped_windows": 0,
+                "episodes": 0, "dropped_windows": 0, "triggers": {},
             }
             if getattr(cfg, "app_weight", 0.0) > 0.0:
                 self.selective_stats["app"] = {
@@ -2848,14 +2849,18 @@ class Sam2FieldTracker:
             return results
 
         # -- Phase B: offline window construction --------------------------
-        specs = find_windows(history, tbd.gap_reappearances, n_frames, cfg)
+        frame_hw = self._selective_frame_hw(frame_paths)
+        specs = find_windows(history, tbd.gap_reappearances, n_frames, cfg,
+                             frame_hw=frame_hw)
+        trig_counts: dict = {}
+        for spec in specs:
+            trig_counts[spec.trigger] = trig_counts.get(spec.trigger, 0) + 1
 
         # -- Phase C: run each episode against the predictor ---------------
         # Interval-merged episodes (Design 1): one SAM session hosts a cluster
         # of windows whose padded intervals overlap, even when their seed frames
         # differ. cluster_windows returns them chronologically (by episode start
         # = min seed), specs within an episode in (seed, entry, oid) order.
-        frame_hw = self._selective_frame_hw(frame_paths)
         episodes = cluster_windows(specs, cfg)
 
         # Per-view SAM frame budget (Design 4): total frames fed to any machine,
@@ -2873,7 +2878,6 @@ class Sam2FieldTracker:
         budget_exhausted = False
         for episode in episodes:
             episode_start = episode[0].seed_frame          # min seed (sorted)
-            max_seed = max(spec.seed_frame for spec in episode)
             max_entry = max(spec.entry_frame for spec in episode)
 
             # Budget pre-check: conservative minimum cost to reach the last
@@ -2922,10 +2926,16 @@ class Sam2FieldTracker:
                         box=np.asarray(seed_boxes[oid], dtype=np.float32),
                     )
                 machine = ExitMachine(kept, seed_boxes, frame_hw, history, cfg)
-                # Propagate from the episode start; the bound reaches the latest
-                # window's full span (the machine breaks earlier, and the
-                # generator is also naturally capped by the sequence end).
-                max_track = (max_seed + cfg.window_max_frames) - episode_start
+                # Propagate from the episode start; the bound reaches the
+                # latest window's full span (uncapped starve windows reach the
+                # sequence end; the machine breaks earlier, and the generator
+                # is also naturally capped by the sequence end).
+                spans = []
+                for spec in episode:
+                    wmax = effective_window_max(spec, cfg)
+                    spans.append(n_frames - 1 - episode_start if wmax is None
+                                 else (spec.seed_frame + wmax) - episode_start)
+                max_track = max(spans)
                 max_track = min(max_track, max(0, n_frames - 1 - episode_start))
                 gen = self._selective_propagate(state, episode_start, max_track)
                 try:
@@ -2970,6 +2980,7 @@ class Sam2FieldTracker:
             "sam_frames": sam_used, "outcomes": outcome_counts,
             "renames": len(renames), "skipped": skipped,
             "episodes": episodes_run, "dropped_windows": dropped_windows,
+            "triggers": trig_counts,
         }
         if cfg.kill_coast:
             from web.field import selective_prop as _selprop

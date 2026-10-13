@@ -583,6 +583,17 @@ KNOBS = [
          min=0.5, max=30.0, section="VLM reader"),
     Knob("read_census_honor_backoff", "READ_CENSUS_HONOR_BACKOFF", bool, False,
          section="VLM reader"),
+    # Keep reads whose identity was evicted (registry caps) while the read was
+    # in flight: the paid read still writes its vlm_read row (crop frame +
+    # the identity that held the crop's slot at that frame, flagged
+    # "evicted": true) so the finalize slot resolvers (global_identity_resolve
+    # / identity_swap_resolve), which credit rows to slots via the identity
+    # log at the crop frame, can use it. No live vote / identity / backoff /
+    # census state changes: live behaviour is identical to OFF. qm11 full
+    # match lost 84 of 328 paid reads (26%) to in-flight eviction with
+    # read_census on (reads.dropped_evicted; reads.kept_evicted counts the
+    # rows kept). DEFAULT OFF pending a full-match A/B.
+    Knob("read_keep_evicted", "READ_KEEP_EVICTED", bool, False, section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only

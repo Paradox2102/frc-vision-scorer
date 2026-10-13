@@ -24,6 +24,13 @@ reads only come from active identities — only ``frames_seen``, which the
 solver does not use. ``--identity-log`` takes an exact dump instead
 (scripts/rerun_reresolve.py format).
 
+Evicted rows (read_keep_evicted): a read whose identity was evicted while
+in flight writes a row flagged ``"evicted": true`` naming the identity that
+held the crop's slot at the crop frame; it attributes exactly like any other
+row (the reconstruction covers the evicted identity's binding).
+``--exclude-evicted`` drops those rows first, so one knob-ON job compares
+the resolve with and without the recovered evidence.
+
 Baseline ("today"): the job's ``match_robot_identity`` labels, i.e. what the
 run itself wrote (last-identity labels when the knob was OFF). They are also
 the ``slot_meta`` the resolve merges into, as in the live path.
@@ -151,14 +158,19 @@ def run_check(bindings, frame_nums, reads, truth: dict, slot_meta=None,
         "identities": len({r["identity_id"] for r in ilog}),
         "identities_per_slot": {LABELS[s]: len(v) for s, v in sorted(per_slot_ids.items())},
         "team_reads": sum(1 for r in (reads or []) if r.get("matched_team")),
+        "evicted_team_reads": sum(1 for r in (reads or [])
+                                  if r.get("matched_team") and r.get("evicted")),
     }
 
 
 def format_report(res: dict) -> str:
     st = res["stats"]
+    ev = res.get("evicted_team_reads")
     lines = [
         f"identities={res['identities']} per slot {res['identities_per_slot']}; "
-        f"team-naming reads={res['team_reads']} used={st['reads_used']} "
+        f"team-naming reads={res['team_reads']}"
+        + (f" ({ev} evicted-in-flight)" if ev else "")
+        + f" used={st['reads_used']} "
         f"dropped_misattr={st['reads_dropped_misattributed']} "
         f"fallback={st['fallback_used']} contested={[LABELS[s] for s in st['contested']]}",
         f"{'slot':<5}{'truth':<7}{'resolved':<10}{'today':<8}{'status':<7}scores",
@@ -362,6 +374,9 @@ def main(argv=None) -> int:
     ap.add_argument("--identity-log", help="exact identity_log JSON dump to use "
                                            "instead of the binding reconstruction")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
+    ap.add_argument("--exclude-evicted", action="store_true",
+                    help="drop read_keep_evicted rows (\"evicted\": true) before "
+                         "resolving: the knob-OFF evidence of a knob-ON job")
     ap.add_argument("--swap", action="store_true",
                     help="also run the swap-aware time-varying resolve "
                          "(identity_swap_resolve) and compare it with gir")
@@ -385,6 +400,8 @@ def main(argv=None) -> int:
         truth[lab.strip().upper()] = team.strip()
 
     data = load_job(Path(args.data_root), args.job)
+    if args.exclude_evicted:
+        data["reads"] = [r for r in data["reads"] if not r.get("evicted")]
     ilog = json.loads(Path(args.identity_log).read_text()) if args.identity_log else None
     res = run_check(data["bindings"], data["frame_nums"], data["reads"], truth,
                     slot_meta=data["slot_meta"], votes_by_slot=data["votes_by_slot"],

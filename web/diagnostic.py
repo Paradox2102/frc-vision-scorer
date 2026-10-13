@@ -135,7 +135,8 @@ class DiagnosticRecorder:
                        clef_probs: dict | None = None,
                        clef_frames: list | None = None,
                        clef_same_robot: float | None = None,
-                       trigger: str | None = None) -> None:
+                       trigger: str | None = None,
+                       evicted: bool = False) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -168,6 +169,13 @@ class DiagnosticRecorder:
         # the caller passes none, so other callers' rows are unchanged.
         if trigger is not None:
             record["trigger"] = str(trigger)
+        # read_keep_evicted only: the read's identity was evicted (registry
+        # caps) while the read was in flight. The row is evidence for the
+        # finalize slot resolvers only (no live vote was cast); robot_id is
+        # still the identity that held the crop's slot at `frame`. Omitted
+        # otherwise, so every other row is unchanged.
+        if evicted:
+            record["evicted"] = True
         self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

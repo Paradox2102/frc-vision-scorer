@@ -34,10 +34,17 @@ which therefore leave no row), passes, Clef cost and trigger counts.
 Absolute counts run ~2x the real job's (no occlusion gate / crop failures
 modelled); compare arms, not the real column.
 
+--keep-evicted runs every arm with read_keep_evicted ON: the evicted-in-
+flight reads then write ``evicted`` rows (no vote; live scheduling is
+unchanged, so the table above is identical) and each arm line adds how many
+rows the knob recovers, how many of them the slot resolvers can attribute
+(their identity held a slot at the crop frame) and how many name a team.
+
 Usage:
   .venv/bin/python scripts/sim_read_census.py               # 3-arm table
   .venv/bin/python scripts/sim_read_census.py --interval 3 --seed 1
   .venv/bin/python scripts/sim_read_census.py --visibility replay
+  .venv/bin/python scripts/sim_read_census.py --keep-evicted     # + rows recovered
   .venv/bin/python scripts/sim_read_census.py --build-fixture   # rebuild
 """
 from __future__ import annotations
@@ -227,16 +234,18 @@ class SimResult:
     honor_backoff: bool
     reader_items: int                 # reads sent to the reader (paid)
     rows: list                        # vlm_read rows: frame, robot_id, trigger, matched_team
-    reads: list                       # (frame, slot, identity, trigger, team)
+    reads: list                       # (frame, slot, identity, trigger, team), live rows
     bound: dict                       # slot -> list[(start_s, end_s)] bound spans
     span_s: float
     passes: int
     scheduled: dict = field(default_factory=dict)
     timings: dict = field(default_factory=dict)
+    keep_evicted: bool = False
+    kept: list = field(default_factory=list)   # same tuples, read_keep_evicted rows
 
 
 def _make_job(fx, census: bool, interval: float, reader_name: str,
-              honor_backoff: bool = False):
+              honor_backoff: bool = False, keep_evicted: bool = False):
     import web.app as app_module
     from web.app import InferenceJob
     from web.field.identity import IdentityRegistry
@@ -247,6 +256,7 @@ def _make_job(fx, census: bool, interval: float, reader_name: str,
     job = InferenceJob.__new__(InferenceJob)
     job.config = JobConfig({"read_census": census, "read_census_interval_s": interval,
                             "read_census_honor_backoff": honor_backoff,
+                            "read_keep_evicted": keep_evicted,
                             "team_reader": reader_name})
     job.team_reader = reader_name
     job._camera_centers_xy = {}
@@ -432,12 +442,13 @@ async def _run(fx, job, app_module, reader, *, base_latency_s, per_read_latency_
 def simulate(fx: dict, *, census: bool, interval: float = 2.0, seed: int = 0,
              honor_backoff: bool = False, reader_name: str = "clef",
              base_latency_s: float = 0.8, per_read_latency_s: float = 0.08,
-             visibility: str = "bound") -> SimResult:
+             visibility: str = "bound", keep_evicted: bool = False) -> SimResult:
     real = fx["real_stats"]
     p_named = {_slot_of_label(lab): (st["named"] / st["attempts"] if st["attempts"] else 0.0)
                for lab, st in real.items()}
     team_of = {_slot_of_label(lab): st["top_team"] for lab, st in real.items()}
-    app_module, job = _make_job(fx, census, interval, reader_name, honor_backoff)
+    app_module, job = _make_job(fx, census, interval, reader_name, honor_backoff,
+                                keep_evicted)
     reader = _GatedReader(p_named, team_of, seed)
     saved = app_module._vision_read_bumpers
     app_module._vision_read_bumpers = reader
@@ -452,17 +463,19 @@ def simulate(fx: dict, *, census: bool, interval: float = 2.0, seed: int = 0,
         app_module._vision_read_bumpers = saved
     fps = fx["fps"]
     # Credit each row to the slot its identity held at the crop frame (the
-    # sim's own binding state at that processed frame).
-    reads = []
+    # sim's own binding state at that processed frame — the identity log's
+    # stand-in; a row whose identity held no slot then stays unattributed).
+    reads, kept = [], []
     for r in job.diagnostic.rows:
         slot = (frame_slot_of.get(r["frame"]) or {}).get(r["robot_id"])
-        reads.append((r["frame"], slot, r["robot_id"], r.get("trigger"), r.get("matched_team")))
+        (kept if r.get("evicted") else reads).append(
+            (r["frame"], slot, r["robot_id"], r.get("trigger"), r.get("matched_team")))
     span = (fx["frames"][-1] - fx["frames"][0]) / fps
     return SimResult(census=census, interval=interval, honor_backoff=honor_backoff,
                      reader_items=reader.items_total, rows=job.diagnostic.rows,
                      reads=reads, bound=bound, span_s=span, passes=passes,
                      scheduled=dict(job.identity_diagnostics.counts),
-                     timings=dict(job.timings))
+                     timings=dict(job.timings), keep_evicted=keep_evicted, kept=kept)
 
 
 # --------------------------------------------------------------------------- #
@@ -497,11 +510,19 @@ def summarize(res: SimResult, fps: float) -> dict:
     for _f, _s, _i, t, _team in res.reads:
         trig[t] = trig.get(t, 0) + 1
     total = len(res.reads)
-    return {"per_slot": per, "total": total,
-            "named": sum(1 for r in res.reads if r[4]),
-            "per_s": total / res.span_s if res.span_s else 0.0,
-            "paid": res.reader_items, "passes": res.passes, "triggers": trig,
-            "usd": res.reader_items * CLEF_USD_PER_READ}
+    out = {"per_slot": per, "total": total,
+           "named": sum(1 for r in res.reads if r[4]),
+           "per_s": total / res.span_s if res.span_s else 0.0,
+           "paid": res.reader_items, "passes": res.passes, "triggers": trig,
+           "usd": res.reader_items * CLEF_USD_PER_READ}
+    if res.keep_evicted:
+        attr = [r for r in res.kept if r[1] is not None]
+        out["kept"] = {
+            "rows": len(res.kept), "attributed": len(attr),
+            "named": sum(1 for r in attr if r[4]),
+            "named_per_slot": {LABELS[s]: sum(1 for r in attr if r[1] == s and r[4])
+                               for s in range(6)}}
+    return out
 
 
 def format_report(fx, arms: list, interval: float) -> str:
@@ -530,6 +551,13 @@ def format_report(fx, arms: list, interval: float) -> str:
         out.append(f"{n}: {a['paid']} reads paid ({a['paid'] - a['total']} dropped: identity "
                    f"evicted in flight), {a['passes']} passes, Clef ~${a['usd']:.4f}; "
                    f"triggers {trig}")
+        k = a.get("kept")
+        if k is not None:
+            per = ", ".join(f"{lab} +{v}" for lab, v in k["named_per_slot"].items())
+            out.append(f"  read_keep_evicted: {k['rows']} of {a['paid'] - a['total']} "
+                       f"evicted reads kept as rows, {k['attributed']} attributable at "
+                       f"the crop frame, {k['named']} name a team (+{k['named']} on "
+                       f"{a['named']} live named: {per})")
     return "\n".join(out)
 
 
@@ -552,6 +580,9 @@ def main(argv=None) -> int:
     ap.add_argument("--visibility", choices=("bound", "replay"), default="bound",
                     help="bound: every bound slot has a crop every frame (upper "
                          "bound); replay: only slots the replay drew (lower bound)")
+    ap.add_argument("--keep-evicted", action="store_true",
+                    help="run every arm with read_keep_evicted ON and report the "
+                         "evicted-in-flight rows it recovers")
     ap.add_argument("--build-fixture", action="store_true")
     ap.add_argument("--db", type=Path, default=Path("/home/nick/AI/frc-vision-scorer/frc_scorer.db"))
     ap.add_argument("--diagnostic", type=Path, default=Path(
@@ -568,7 +599,7 @@ def main(argv=None) -> int:
     arms = run_arms(fx, interval=args.interval, seed=args.seed, reader_name=args.reader,
                     base_latency_s=args.base_latency,
                     per_read_latency_s=args.per_read_latency,
-                    visibility=args.visibility)
+                    visibility=args.visibility, keep_evicted=args.keep_evicted)
     print(format_report(fx, arms, args.interval))
     return 0
 

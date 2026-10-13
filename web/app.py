@@ -1560,6 +1560,9 @@ class InferenceJob:
         # scheduler pass's {identity_id: trigger} (snapshotted per read pass).
         self._read_trigger_counts: dict[str, int] = {}
         self._read_dropped_counts: dict[str, int] = {}
+        # read_keep_evicted: per-trigger rows written for reads whose identity
+        # was evicted in flight (a subset of _read_dropped_counts).
+        self._read_kept_evicted_counts: dict[str, int] = {}
         self._immediate_reasons: dict[int, str] = {}
         self._due_triggers: dict[int, str] = {}
         # read_census: per-slot clock of the last read attempt on the slot and
@@ -2497,7 +2500,9 @@ class InferenceJob:
                             dropped: bool = False) -> None:
         """One recorded vlm_read row, by trigger (+ the read-clock span the
         rows cover, for the census rate in the finalize line). ``dropped``:
-        a read that returned for an identity evicted mid-flight (no row)."""
+        a read that returned for an identity evicted mid-flight (no row
+        unless read_keep_evicted, which tallies the rows it keeps in
+        _read_kept_evicted_counts; reads.total stays the live rows)."""
         attr = "_read_dropped_counts" if dropped else "_read_trigger_counts"
         counts = getattr(self, attr, None)
         if counts is None:
@@ -2527,6 +2532,9 @@ class InferenceJob:
                     f"{span[1] - span[0]:.0f}s)")
         if dropped:
             out += f"; {dropped} dropped (identity evicted in flight)"
+            kept = sum((getattr(self, "_read_kept_evicted_counts", None) or {}).values())
+            if kept:
+                out += f", {kept} kept as evidence rows (read_keep_evicted)"
         return out
 
     def _finalize_read_triggers(self) -> None:
@@ -2549,6 +2557,9 @@ class InferenceJob:
             dropped = getattr(self, "_read_dropped_counts", None) or {}
             if dropped:
                 timings["reads.dropped_evicted"] = sum(dropped.values())
+            kept = getattr(self, "_read_kept_evicted_counts", None) or {}
+            if kept:
+                timings["reads.kept_evicted"] = sum(kept.values())
             span = getattr(self, "_read_clock_span", None)
             if counts.get("census") and span is not None and span[1] > span[0]:
                 timings["reads.census_per_s"] = counts["census"] / (span[1] - span[0])
@@ -2559,6 +2570,9 @@ class InferenceJob:
                 dropped = getattr(self, "_read_dropped_counts", None)
                 if dropped:
                     diags.gauge("read_dropped_evicted", dict(dropped))
+                kept = getattr(self, "_read_kept_evicted_counts", None)
+                if kept:
+                    diags.gauge("read_kept_evicted", dict(kept))
             except Exception:
                 pass
         if getattr(self, "_clef_session", None) is None:
@@ -3158,6 +3172,66 @@ class InferenceJob:
                 crop_frame=crop_frame, slot_identity=slot_identity,
                 read_triggers=read_triggers)
 
+    def _record_evicted_read(self, robot, identity_id, slot_id, crop_b64,
+                             source_weight, res, crop_frame, slot_identity,
+                             trigger) -> bool:
+        """read_keep_evicted: write the vlm_read row of a read whose identity
+        was evicted (registry caps) while the read was in flight — the row
+        the read would have written (crop frame, the crop slot's owner at
+        that frame, team, alliance, confidence, vote_weight, surface,
+        clef_probs, trigger), flagged ``evicted``. Evidence for the finalize
+        slot resolvers only (identity_resolve.attribute_reads credits it to
+        the slot that (crop_frame, robot_id) holds in _identity_log, which is
+        append-only, so the identity need not be alive). Nothing live
+        changes: no vote, no identity / backoff / immediate-request / census
+        state, no crop capture, no gallery deposit, no UI read list.
+
+        robot_id is the identity bound to the crop's slot when the pass was
+        scheduled (``slot_identity``: the same registry state _identity_log
+        logged for crop_frame); a direct caller (``slot_identity`` None) cut
+        the crop at the live frame with ``identity_id`` on the slot. A
+        scheduled crop whose slot had NO owner at crop_frame is not written:
+        no identity held it at that frame, so any robot_id would be a guess
+        (the read stays counted in reads.dropped_evicted only).
+
+        vote_weight is the live path's: confidence tier x camera weight x the
+        slot track's tracker-prob multiplier (``robot`` is the slot's current
+        track, as in the live path; last_tracker_prob is per slot).
+        Returns True when the row was written."""
+        if slot_identity is not None:
+            diag_robot_id = slot_identity.get(slot_id)
+            if diag_robot_id is None:
+                return False
+        else:
+            diag_robot_id = identity_id
+        conf = float(res.get("confidence", 0.0))
+        vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
+        vote_weight *= prob_vote_multiplier(
+            getattr(robot, "last_tracker_prob", None),
+            getattr(getattr(self, "config", None), "vote_prob_weight", False))
+        _mf_diag = {k: res[k] for k in ("clef_frames", "clef_same_robot")
+                    if res.get(k) is not None}
+        self.diagnostic.record_vlm_read(
+            frame=crop_frame, robot_id=diag_robot_id,
+            crop_b64=crop_b64,
+            legibility=0.0,
+            raw_read=res.get("raw_read"),
+            matched_team=res.get("team_number"),
+            alliance_read=res.get("alliance", "unknown"),
+            confidence=conf,
+            vote_weight=vote_weight,
+            surface=res.get("surface", "unknown"),
+            clef_probs=res.get("clef_probs"),
+            trigger=trigger,
+            evicted=True,
+            **_mf_diag,
+        )
+        kept = getattr(self, "_read_kept_evicted_counts", None)
+        if kept is None:
+            kept = self._read_kept_evicted_counts = {}
+        kept[trigger] = kept.get(trigger, 0) + 1
+        return True
+
     def _read_clock_sec(self, source_frame, processed_frame_num) -> float:
         """The main loop's read-scheduling clock for the frame being processed
         (see read_clock_sec; VLM_READ_CLOCK_FIX picks real vs legacy)."""
@@ -3424,6 +3498,10 @@ class InferenceJob:
         # read_census: per-slot attempt clock + named-read tally (knob only).
         census = self._read_census_enabled()
         read_triggers = read_triggers or {}
+        # read_keep_evicted: a read whose identity is evicted in flight still
+        # writes its vlm_read row (no vote) — see _record_evicted_read.
+        keep_evicted = bool(getattr(getattr(self, "config", None),
+                                    "read_keep_evicted", False))
 
         # Map slot_id -> obs. det_to_slot is the frame-indexed detection->slot
         # mapping; when the pass runs as a background task it MUST be the
@@ -3656,10 +3734,18 @@ class InferenceJob:
             ident = self.identity_registry.identities.get(identity_id)
             if not robot or not ident:
                 # The identity was evicted (registry caps) while its read was
-                # in flight: the paid read leaves no vlm_read row and no vote.
-                # Counted (telemetry only) so read supply lost to churn shows.
+                # in flight: the paid read casts no vote and (unless
+                # read_keep_evicted) leaves no vlm_read row. Counted either
+                # way (telemetry only) so read supply lost to churn shows.
                 self._count_read_trigger(
                     read_triggers.get(identity_id, TRIGGER_UNSPECIFIED), dropped=True)
+                if ident is None and keep_evicted:
+                    # read_keep_evicted: keep the row (still no vote) as
+                    # evidence for the finalize slot resolvers.
+                    self._record_evicted_read(
+                        robot, identity_id, slot_id, crop_b64, source_weight, res,
+                        crop_frame, slot_identity,
+                        read_triggers.get(identity_id, TRIGGER_UNSPECIFIED))
                 continue
 
             # Update VLM attempt time + position (novelty-gate reference)

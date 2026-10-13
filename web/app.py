@@ -463,8 +463,15 @@ def _find_clock_period(
     samples: List[Tuple[int, Optional[int]]],
     target_start: int,
     after_frame: int = -1,
+    fps: Optional[float] = None,
 ) -> Optional[dict]:
-    """Find one decreasing countdown, tolerating a single bad OCR sample."""
+    """Find one decreasing countdown, tolerating a single bad OCR sample.
+
+    With ``fps``, a read that falls faster than real time (more than the
+    seconds elapsed since the last good read, plus slack) is a bad sample
+    too: a single digit misread low mid-teleop (69->60) otherwise became the
+    running minimum, every true read after it looked like a high outlier, and
+    the match fell back to full-video processing. None = legacy behaviour."""
     candidates = [
         i for i, (frame, value) in enumerate(samples)
         if frame > after_frame
@@ -491,7 +498,14 @@ def _find_clock_period(
             }
 
         for frame, value in samples[start_idx + 1:]:
-            if value is None or value > last_value + 2:
+            if (
+                value is None
+                or value > last_value + 2
+                or (
+                    fps is not None and fps > 0
+                    and value < last_value - ((frame - previous_frame) / fps + 2)
+                )
+            ):
                 bad_samples += 1
                 if bad_samples > 1:
                     if reached_near_zero:
@@ -575,7 +589,7 @@ def compute_active_windows(
     if not samples or fps <= 0 or total_frames <= 0:
         return full_range, [], True, "missing clock samples or video metadata"
 
-    auto = _find_clock_period(samples, 20)
+    auto = _find_clock_period(samples, 20, fps=fps)
     if auto is None:
         return full_range, [], True, "autonomous countdown was not found"
 
@@ -591,7 +605,9 @@ def compute_active_windows(
             None,
         )
 
-    teleop = _find_clock_period(samples, 140, after_frame=auto["end_frame"])
+    teleop = _find_clock_period(
+        samples, 140, after_frame=auto["end_frame"], fps=fps
+    )
     if teleop is None:
         return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
 

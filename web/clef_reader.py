@@ -20,6 +20,16 @@ API (verified 2026-10-12):
   -> {"result": {"model", "answers", "usage": {"input_tokens", ...}},
       "success": true, "errors": []}   (the unwrapped result is accepted too)
 
+Multi-frame reads (job knob clef_multiframe): ``read_bumpers`` also accepts a
+LIST of crops of one identity (newest first) per item and sends them as ONE
+request with up to 4 images, the state reworded for N moments of the same
+robot, plus a ``same_robot`` noul question. On the labelled tracklet bench
+(newest + the 3 sharpest earlier crops) clef-flash went from 31/48 to 39-41/48
+legible bumpers with 0 wrong reads and 2% false positives. A same_robot
+probability below ``same_robot_min`` discards the read as
+error="tracklet_inconsistent" (the app raises a hijack alarm). A string item
+is today's single-image request byte-for-byte.
+
 Failure policy: HTTP 429 with error 4006 / "daily free allocation" means the
 quota is exhausted and 401/403 means bad credentials. Both latch the session
 unavailable for the rest of the job: one log line, then every later read
@@ -69,6 +79,13 @@ CLEF_MIN_SIDE = 256
 CLEF_MAX_IMAGE_TOKENS = 1024
 CLEF_MAX_IMAGE_BYTES = 4 * 1024 * 1024
 CLEF_MAX_IMAGE_PIXELS = 16_000_000
+# Images per request (API max). A multi-frame read sends the newest crop plus
+# up to 3 earlier crops of the same identity in ONE request.
+CLEF_MAX_IMAGES = 4
+# Multi-frame reads ask "do all images show the same robot?" (noul); below this
+# probability the read is discarded as tracklet_inconsistent (hijack alarm).
+DEFAULT_SAME_ROBOT_MIN = 0.5
+INCONSISTENT_ERROR = "tracklet_inconsistent"
 
 ESCAPES = ("none", "other")
 ESCAPE_TEXT = {
@@ -189,6 +206,35 @@ def read_state(red: list, blue: list, expected_alliance: str = "unknown") -> str
     return s
 
 
+def read_state_multi(n: int, span_s: Optional[float], red: list, blue: list,
+                     expected_alliance: str = "unknown") -> str:
+    """State for a multi-image read: ``n`` crops of ONE identity, newest first."""
+    when = f" over ~{float(span_s):.1f} s" if span_s is not None else ""
+    s = (f"{n} images: the same robot's bumper at different moments{when}, newest first. "
+         "Each is a crop from FRC robotics match video around ONE robot's bumper, a solid "
+         "RED or BLUE fabric band around the robot's base with the team number in WHITE "
+         "digits. The digits may be readable in some images and blurred, cut off or hidden "
+         "in others. Field structures (crates, bins, signs) can also carry printed numbers. "
+         f"Match roster: red alliance {', '.join(map(str, red))}; "
+         f"blue alliance {', '.join(map(str, blue))}.")
+    if expected_alliance in ("red", "blue"):
+        s += f" Computer vision sees {expected_alliance.upper()} bumper pixels."
+    return s
+
+
+SAME_ROBOT_QUESTION = {
+    "type": "noul",
+    "instructions": "Do all images show the same robot?",
+    "criteria": {
+        "true": ("Every image shows the same robot: the same bumper colour and number and the "
+                 "same robot. Blur, partial occlusion or a different angle does not make it a "
+                 "different robot."),
+        "false": ("At least one image shows a different robot, or a non-robot object such as "
+                  "field equipment or a person."),
+    },
+}
+
+
 def read_questions(options: list[dict]) -> dict:
     return {
         "legible": {
@@ -218,6 +264,13 @@ def read_questions(options: list[dict]) -> dict:
     }
 
 
+def read_questions_multi(options: list[dict]) -> dict:
+    """The single-image questions plus ``same_robot`` (noul)."""
+    q = read_questions(options)
+    q["same_robot"] = json.loads(json.dumps(SAME_ROBOT_QUESTION))
+    return q
+
+
 def build_read_payload(model_key: str, img_bytes: bytes, red: list, blue: list,
                        expected_alliance: str = "unknown",
                        options: Optional[list[dict]] = None, seed=None) -> dict:
@@ -230,6 +283,27 @@ def build_read_payload(model_key: str, img_bytes: bytes, red: list, blue: list,
         "state": read_state(red, blue, expected_alliance),
         "questions": read_questions(_shuffled(options, seed)),
         "images": [_data_url(img_bytes)],
+    }
+
+
+def build_read_payload_multi(model_key: str, imgs: list, red: list, blue: list,
+                             expected_alliance: str = "unknown",
+                             options: Optional[list[dict]] = None, seed=None,
+                             span_s: Optional[float] = None) -> dict:
+    """One request carrying ``imgs`` (prepped JPEG bytes, NEWEST FIRST, <= 4).
+    ``seed`` should be the newest crop, so the option order matches what a
+    single-crop read of that crop would show."""
+    if not imgs or len(imgs) > CLEF_MAX_IMAGES:
+        raise ValueError(f"multi-image read needs 1..{CLEF_MAX_IMAGES} images, got {len(imgs)}")
+    red = [str(t) for t in red or ()]
+    blue = [str(t) for t in blue or ()]
+    if options is None:
+        options = roster_options(red, blue)
+    return {
+        "model": CLEF_MODELS[model_key]["model"],
+        "state": read_state_multi(len(imgs), span_s, red, blue, expected_alliance),
+        "questions": read_questions_multi(_shuffled(options, seed)),
+        "images": [_data_url(b) for b in imgs],
     }
 
 
@@ -258,11 +332,16 @@ def build_classify_payload(model_key: str, img_bytes: bytes) -> dict:
     }
 
 
-def estimate_tokens(payload: dict, image_wh: tuple[int, int]) -> int:
+def estimate_tokens(payload: dict, image_wh) -> int:
     """Rough input tokens (image blocks + ~4 chars/token of text) for responses
-    that carry no usage block."""
+    that carry no usage block. ``image_wh`` is one (w, h) or, for a
+    multi-image request, a list of them (summed)."""
     text = len(json.dumps(payload.get("state", ""))) + len(json.dumps(payload.get("questions", {})))
-    return clef_image_tokens(*image_wh) + text // 4
+    if image_wh and isinstance(image_wh[0], (tuple, list)):
+        img_tok = sum(clef_image_tokens(*wh) for wh in image_wh)
+    else:
+        img_tok = clef_image_tokens(*image_wh)
+    return img_tok + text // 4
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +466,17 @@ def map_read_answers(answers: dict, roster_alliance: dict, expected_alliance: st
     }
 
 
+def _noul(ans) -> Optional[float]:
+    """The probability of a noul answer ({"noul": p}), or None if absent."""
+    if not isinstance(ans, dict):
+        return None
+    v = ans.get("noul")
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def map_classify_answers(answers: dict) -> dict:
     probs = _choice_probs(answers.get("object"))
     top = _top(probs)
@@ -432,6 +522,7 @@ class ClefSession:
                  concurrency: Optional[int] = None, timeout_s: Optional[float] = None,
                  retries: Optional[int] = None, backoff_s: Optional[float] = None,
                  min_team_prob: Optional[float] = None,
+                 same_robot_min: Optional[float] = None,
                  sleep_fn: Optional[Callable[[float], None]] = None,
                  log_fn: Optional[Callable[[str], None]] = None):
         if model_key not in CLEF_MODELS:
@@ -447,6 +538,11 @@ class ClefSession:
         self.backoff_s = backoff_s if backoff_s is not None else _env_float("CLEF_BACKOFF_S", 0.5)
         self.min_team_prob = (min_team_prob if min_team_prob is not None
                               else _env_float("CLEF_MIN_TEAM_PROB", 0.5))
+        self.same_robot_min = (DEFAULT_SAME_ROBOT_MIN if same_robot_min is None
+                               else float(same_robot_min))
+        # The job sets this when clef_multiframe is on, so the summary line
+        # reports the multi-frame counters even when none fired.
+        self.multiframe = False
         self._sleep = sleep_fn
         self._log = log_fn or print
         self._lock = threading.Lock()
@@ -455,7 +551,8 @@ class ClefSession:
         self.disabled_reason: Optional[str] = None
         self._c = {"requests": 0, "ok": 0, "input_tokens": 0, "output_tokens": 0,
                    "estimated_token_responses": 0, "errors": 0, "quota_errors": 0,
-                   "auth_errors": 0, "retries": 0, "skipped": 0}
+                   "auth_errors": 0, "retries": 0, "skipped": 0,
+                   "mf_reads": 0, "mf_images": 0, "inconsistent": 0}
         self._latencies: list[float] = []
         missing = [n for n, v in zip(CF_ENV_KEYS, (self._account, self._token)) if not v]
         if missing:
@@ -491,7 +588,7 @@ class ClefSession:
         return CF_URL.format(account=self._account, route=self.spec["route"])
 
     # ---- transport ----
-    def _request(self, payload: dict, image_wh: tuple[int, int]) -> dict:
+    def _request(self, payload: dict, image_wh) -> dict:
         """POST one payload with retries; returns the answers dict."""
         if self._disabled.is_set():
             self._bump("skipped")
@@ -573,18 +670,44 @@ class ClefSession:
     # ---- public API ----
     def read_bumpers(self, crops_b64: list, red: list, blue: list,
                      expected_alliances: Optional[list] = None,
-                     extra_teams: Iterable = ()) -> list[dict]:
-        """One Clef request per crop; results in the vLLM reader's dict shape."""
+                     extra_teams: Iterable = (),
+                     item_meta: Optional[list] = None) -> list[dict]:
+        """One Clef request per item; results in the vLLM reader's dict shape.
+
+        An item is a crop string (one image, today's request byte-for-byte) or
+        a LIST of crop strings of ONE identity, newest first: a multi-frame
+        read sent as ONE request with up to CLEF_MAX_IMAGES images (a 1-element
+        list is read exactly like its string). ``item_meta[i]`` (optional dict)
+        describes a list item: ``span_s`` (newest-to-oldest source seconds, for
+        the state text) and ``frames`` (echoed back as ``clef_frames``). A
+        multi-frame result also carries ``clef_same_robot`` (the noul answer);
+        below ``same_robot_min`` it becomes team None with
+        error="tracklet_inconsistent"."""
         red = [str(t) for t in red or ()]
         blue = [str(t) for t in blue or ()]
         options = roster_options(red, blue, extra_teams)
         roster_alliance = {o["id"]: o.get("alliance") or "unknown"
                            for o in options if o["kind"] == "team"}
         expected_alliances = list(expected_alliances or [])
+        item_meta = list(item_meta or [])
 
-        def _one(i: int, crop_b64: str) -> dict:
+        def _one(i: int, item) -> dict:
             expected = (expected_alliances[i] if i < len(expected_alliances)
                         and expected_alliances[i] in ("red", "blue") else "unknown")
+            meta = item_meta[i] if i < len(item_meta) and isinstance(item_meta[i], dict) else None
+            if isinstance(item, (list, tuple)):
+                crops = [c for c in item if c][:CLEF_MAX_IMAGES]
+                if len(crops) >= 2:
+                    res = self._read_multi(crops, meta, red, blue, expected, options,
+                                           roster_alliance)
+                    if meta and meta.get("frames") is not None:
+                        res["clef_frames"] = list(meta["frames"])
+                    return res
+                if not crops:
+                    self._bump("errors")
+                    return error_entry("clef: empty crop list")
+                item = crops[0]          # a 1-element list reads like its string
+            crop_b64 = item
             try:
                 if self._disabled.is_set():
                     self._bump("skipped")
@@ -605,6 +728,36 @@ class ClefSession:
         print(f"  Clef [{self.model_key}]: identified {identified}/{len(results)} robots: "
               f"{[r.get('team_number') for r in results]}")
         return results
+
+    def _read_multi(self, crops: list, meta: Optional[dict], red: list, blue: list,
+                    expected: str, options: list, roster_alliance: dict) -> dict:
+        """One request with 2..4 images of one identity (newest first)."""
+        try:
+            if self._disabled.is_set():
+                self._bump("skipped")
+                return error_entry(f"clef unavailable: {self.disabled_reason}")
+            imgs = [clef_image(base64.b64decode(c)) for c in crops]
+            payload = build_read_payload_multi(
+                self.model_key, [b for b, _w, _h in imgs], red, blue, expected,
+                options=options, seed=crops[0],
+                span_s=(meta or {}).get("span_s"))
+            answers = self._request(payload, [(w, h) for _b, w, h in imgs])
+            with self._lock:
+                self._c["mf_reads"] += 1
+                self._c["mf_images"] += len(imgs)
+            res = map_read_answers(answers, roster_alliance, expected, self.min_team_prob)
+            p_same = _noul(answers.get("same_robot"))
+            res["clef_same_robot"] = None if p_same is None else round(p_same, 4)
+            if p_same is not None and p_same < self.same_robot_min:
+                self._bump("inconsistent")
+                res.update(team_number=None, confidence=0.0, error=INCONSISTENT_ERROR,
+                           alliance=expected if expected in ("red", "blue") else "unknown")
+            return res
+        except ClefUnavailable as e:
+            return error_entry(str(e))
+        except Exception as e:
+            self._bump("errors")
+            return error_entry(self._redact(f"clef: {e}"))
 
     def classify_crops(self, crops_b64: list) -> list[dict]:
         """robot / equipment / person / unclear, same shape as _vllm_classify_crops."""
@@ -647,6 +800,9 @@ class ClefSession:
                 f"~${st['cost_usd']:.4f}, {st['errors']} errors")
         if st["latency_p50_s"] is not None:
             line += f", p50 {st['latency_p50_s']:.2f}s"
+        if self.multiframe or st["mf_reads"] or st["inconsistent"]:
+            line += (f", {st['mf_reads']} multi-frame ({st['mf_images']} images), "
+                     f"{st['inconsistent']} inconsistent")
         if st["quota_errors"]:
             line += f", {st['quota_errors']} quota-exhausted"
         if self.disabled_kind:

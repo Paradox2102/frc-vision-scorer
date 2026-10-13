@@ -804,3 +804,557 @@ def test_diagnostic_row_carries_clef_probs_only_when_present(tmp_path):
     rows = [json.loads(l) for l in path.read_text().splitlines()]
     assert "clef_probs" not in rows[0]
     assert rows[1]["clef_probs"] == {"4786": 0.9, "none": 0.1}
+
+
+# =========================================================================== #
+# clef_multiframe: multi-image requests (newest crop + buffered earlier crops)
+# =========================================================================== #
+
+def _mf_answers(team_probs=None, same=0.93, **kw):
+    a = _answers(team_probs, **kw)
+    if same is not None:
+        a["same_robot"] = {"type": "noul", "noul": same}
+    return a
+
+
+def _crops(n):
+    return [_jpeg_b64(80 + 8 * i, 40, (200, 30 + 20 * i, 30)) for i in range(n)]
+
+
+def _prep(b64):
+    return clef_reader.clef_image(base64.b64decode(b64))
+
+
+def test_multi_payload_images_state_and_same_robot_question():
+    imgs = [_prep(c)[0] for c in _crops(3)]
+    p = clef_reader.build_read_payload_multi("clef-flash", imgs, RED, BLUE, "blue",
+                                             seed="newest", span_s=1.37)
+    assert p["model"] == "clef-flash"
+    assert len(p["images"]) == 3
+    assert all(u.startswith("data:image/jpeg;base64,") for u in p["images"])
+    assert p["images"][0] == clef_reader._data_url(imgs[0])           # newest first
+    assert p["state"].startswith(
+        "3 images: the same robot's bumper at different moments over ~1.4 s, newest first.")
+    assert "red alliance 2992, 4256, 1477" in p["state"]
+    assert "BLUE bumper pixels" in p["state"]
+    q = p["questions"]
+    assert q["same_robot"]["type"] == "noul"
+    assert q["same_robot"]["instructions"] == "Do all images show the same robot?"
+    assert set(q["same_robot"]["criteria"]) == {"true", "false"}
+    # The other questions (and the option order for the same seed) match a
+    # single-crop read of the newest crop.
+    single = clef_reader.build_read_payload("clef-flash", imgs[0], RED, BLUE, "blue",
+                                            seed="newest")
+    assert {k: v for k, v in q.items() if k != "same_robot"} == single["questions"]
+    assert list(_team_criteria(p)) == list(_team_criteria(single))
+
+
+def test_multi_payload_rejects_more_than_api_max_images():
+    imgs = [_prep(c)[0] for c in _crops(5)]
+    with pytest.raises(ValueError):
+        clef_reader.build_read_payload_multi("clef-flash", imgs, RED, BLUE)
+
+
+def test_list_item_is_one_request_with_n_images(monkeypatch):
+    fake = _install(monkeypatch, FakeCF(_ok(_mf_answers({"4786": 0.97, "none": 0.03}))))
+    s = _session()
+    crops = _crops(3)
+    frames = [{"frame": 180, "cam": "main"}, {"frame": 150, "cam": "corner_left"},
+              {"frame": 90, "cam": "main"}]
+    out = s.read_bumpers([crops], RED, BLUE, ["blue"],
+                         item_meta=[{"span_s": 1.5, "frames": frames}])
+    assert len(fake.calls) == 1
+    p = fake.calls[0]["payload"]
+    assert len(p["images"]) == 3
+    assert p["images"] == [clef_reader._data_url(_prep(c)[0]) for c in crops]
+    assert p["state"].startswith("3 images: the same robot's bumper at different moments "
+                                 "over ~1.5 s, newest first.")
+    assert "same_robot" in p["questions"]
+    r = out[0]
+    assert r["team_number"] == "4786" and r["error"] is None
+    assert r["clef_same_robot"] == pytest.approx(0.93)
+    assert r["clef_frames"] == frames
+    # Result shape: the single-read keys plus the two multi-frame keys.
+    single_keys = set(clef_reader.map_read_answers(
+        _answers(), _ALLIANCE, "blue", 0.5))
+    assert set(r) == single_keys | {"clef_same_robot", "clef_frames"}
+    st = s.stats()
+    assert st["mf_reads"] == 1 and st["mf_images"] == 3 and st["ok"] == 1
+    assert st["inconsistent"] == 0
+
+
+def test_list_item_capped_at_four_images(monkeypatch):
+    fake = _install(monkeypatch, FakeCF(_ok(_mf_answers())))
+    s = _session()
+    s.read_bumpers([_crops(6)], RED, BLUE, ["blue"])
+    assert len(fake.calls[0]["payload"]["images"]) == clef_reader.CLEF_MAX_IMAGES == 4
+    assert s.stats()["mf_images"] == 4
+
+
+def test_single_element_list_reads_exactly_like_its_string(monkeypatch):
+    c = _jpeg_b64()
+    fake = _install(monkeypatch, FakeCF(_ok(_answers())))
+    a = _session().read_bumpers([c], RED, BLUE, ["blue"])
+    b = _session().read_bumpers([[c]], RED, BLUE, ["blue"])
+    assert fake.calls[0]["payload"] == fake.calls[1]["payload"]
+    assert a == b and "clef_same_robot" not in b[0]
+
+
+def test_string_items_unchanged_next_to_list_items(monkeypatch):
+    c1, rest = _jpeg_b64(), _crops(2)
+    fake = _install(monkeypatch, FakeCF(lambda p: _ok(
+        _mf_answers() if len(p["images"]) > 1 else _answers())))
+    s = _session(concurrency=1)
+    s.read_bumpers([c1], RED, BLUE, ["blue"])
+    base = fake.calls[0]["payload"]
+    out = s.read_bumpers([c1, rest], RED, BLUE, ["blue", "blue"],
+                         item_meta=[None, {"span_s": 0.5, "frames": None}])
+    single = [c["payload"] for c in fake.calls[1:] if len(c["payload"]["images"]) == 1]
+    multi = [c["payload"] for c in fake.calls[1:] if len(c["payload"]["images"]) == 2]
+    assert single == [base] and len(multi) == 1
+    assert "clef_same_robot" not in out[0] and "clef_same_robot" in out[1]
+    assert "clef_frames" not in out[1]          # no frames in its meta
+
+
+def test_multi_token_estimate_sums_every_image(monkeypatch):
+    result = {"model": "clef-flash", "answers": _mf_answers()}   # no usage block
+    fake = _install(monkeypatch, FakeCF((200, json.dumps({"result": result, "success": True}))))
+    s = _session()
+    crops = _crops(3)
+    s.read_bumpers([crops], RED, BLUE, ["blue"], item_meta=[{"span_s": 1.0}])
+    p = fake.calls[0]["payload"]
+    whs = [_prep(c)[1:] for c in crops]
+    text = len(json.dumps(p["state"])) + len(json.dumps(p["questions"]))
+    expected = sum(clef_reader.clef_image_tokens(w, h) for w, h in whs) + text // 4
+    st = s.stats()
+    assert st["input_tokens"] == expected and st["estimated_token_responses"] == 1
+    assert clef_reader.estimate_tokens(p, whs) == expected
+    # The single-image form is unchanged.
+    assert clef_reader.estimate_tokens(p, whs[0]) == (
+        clef_reader.clef_image_tokens(*whs[0]) + text // 4)
+
+
+def test_same_robot_gate_marks_read_inconsistent(monkeypatch):
+    _install(monkeypatch, FakeCF(_ok(_mf_answers({"4786": 0.97, "none": 0.03}, same=0.2))))
+    s = _session()
+    s.multiframe = True
+    r = s.read_bumpers([_crops(4)], RED, BLUE, ["blue"])[0]
+    assert r["team_number"] is None and r["confidence"] == 0.0
+    assert r["error"] == clef_reader.INCONSISTENT_ERROR == "tracklet_inconsistent"
+    assert r["clef_same_robot"] == pytest.approx(0.2)
+    assert r["raw_read"] == "4786"              # what it read is kept for diagnostics
+    assert r["alliance"] == "blue"
+    st = s.stats()
+    assert st["inconsistent"] == 1 and st["mf_reads"] == 1 and st["errors"] == 0
+    line = s.summary_line()
+    assert "1 multi-frame (4 images), 1 inconsistent" in line
+
+
+def test_same_robot_threshold_is_configurable(monkeypatch):
+    _install(monkeypatch, FakeCF(_ok(_mf_answers(same=0.2))))
+    r = _session(same_robot_min=0.1).read_bumpers([_crops(2)], RED, BLUE, ["blue"])[0]
+    assert r["team_number"] == "4786" and r["error"] is None
+
+
+def test_missing_same_robot_answer_does_not_gate(monkeypatch):
+    _install(monkeypatch, FakeCF(_ok(_mf_answers(same=None))))
+    r = _session().read_bumpers([_crops(2)], RED, BLUE, ["blue"])[0]
+    assert r["team_number"] == "4786" and r["clef_same_robot"] is None
+
+
+def test_multi_read_when_latched_makes_no_http(monkeypatch, no_network):
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN")
+    s = _session()
+    frames = [{"frame": 2, "cam": "main"}, {"frame": 1, "cam": "main"}]
+    r = s.read_bumpers([_crops(2)], RED, BLUE, ["blue"], item_meta=[{"frames": frames}])[0]
+    assert r["team_number"] is None and r["error"] and r["clef_frames"] == frames
+    assert s.stats()["skipped"] == 1 and s.stats()["mf_reads"] == 0
+
+
+def test_summary_line_unchanged_without_multiframe(monkeypatch):
+    _install(monkeypatch, FakeCF(_ok(_answers())))
+    s = _session()
+    s.read_bumpers([_jpeg_b64()], RED, BLUE, ["blue"])
+    assert "multi-frame" not in s.summary_line()
+
+
+def test_job_config_multiframe_knobs():
+    cfg = JobConfig({"team_reader": "clef", "clef_multiframe": True})
+    assert cfg.clef_multiframe is True
+    assert cfg.clef_mf_frames == 4 and cfg.clef_mf_window_s == 3.0
+    assert cfg.clef_mf_same_robot_min == 0.5
+    d = JobConfig()
+    assert d.clef_multiframe is False
+    for k in ("clef_multiframe", "clef_mf_frames", "clef_mf_window_s", "clef_mf_same_robot_min"):
+        assert k not in d.non_defaults()
+    for bad in ({"clef_mf_frames": 5}, {"clef_mf_frames": 1},
+                {"clef_mf_same_robot_min": 1.5}, {"clef_mf_window_s": 0.0}):
+        with pytest.raises(ValueError):
+            JobConfig(bad)
+
+
+def test_job_clef_session_takes_multiframe_knobs():
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    job.team_reader = "clef"
+    job.config = JobConfig({"team_reader": "clef", "clef_multiframe": True,
+                            "clef_mf_same_robot_min": 0.7})
+    s = job._get_clef_session()
+    assert s.multiframe is True and s.same_robot_min == 0.7
+    job2 = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    job2.team_reader = "clef"
+    job2.config = JobConfig({"team_reader": "clef"})
+    assert job2._get_clef_session().multiframe is False
+
+
+# --------------------------------------------------------------------------- #
+# Read-pass wiring (InferenceJob._read_fused_bumper_numbers_impl)
+# --------------------------------------------------------------------------- #
+
+import numpy as np                                        # noqa: E402
+from unittest.mock import MagicMock                       # noqa: E402
+from web.diagnostic import DiagnosticRecorder             # noqa: E402
+from web.field.identity import IdentityRegistry, RobotIdentity   # noqa: E402
+from web.field.identity_diagnostics import DiagnosticEvents      # noqa: E402
+from web.field.identity_confidence import ConfidenceConfig       # noqa: E402
+
+_BOX = (200, 100, 340, 220)
+
+
+def _view(f):
+    """A distinct synthetic 'view frame' per source frame: red band + white
+    blocks (some legibility), varying with f so crops differ."""
+    rng = np.random.default_rng(f)
+    img = rng.integers(0, 60, (400, 600, 3), dtype=np.uint8)
+    img[160:220, 200:340] = (30, 30, 200)                  # BGR red band
+    img[175:205, 220 + (f % 7) * 4:240 + (f % 7) * 4] = 255
+    return img
+
+
+def _mf_read_job(tmp_path, multiframe=True):
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    cfg = {"team_reader": "clef"}
+    if multiframe:
+        cfg["clef_multiframe"] = True
+    job.config = JobConfig(cfg)
+    job.team_reader = "clef"
+    job._camera_centers_xy = {}
+    job.match_teams = ALL6
+    job.match_blue_teams = BLUE
+    job.match_red_teams = RED
+    job.vlm_status = {}
+    job._vlm_task = None
+    job._claude_vision_calls = 0
+    job._current_frame = 0
+    job._evidence_frame = 0
+    job.video_fps = 60.0
+    job.field_tracker = types.SimpleNamespace(last_det_to_slot={0: 1}, binding_events=[],
+                                              _id_to_slot={})
+    reg = IdentityRegistry()
+    reg.identities[7] = RobotIdentity(identity_id=7, alliance="blue", active_slot=1)
+    reg._next_id = 8
+    job.identity_registry = reg
+    job.robot_tracks = {}
+    job._last_bindings = {}
+    job._slot_source = {}
+    job._slot_crops = {}
+    job.scoring_events = []
+    job.user_seed_zones_raw = []
+    job._occ = {}
+    job._occ_by_cam = {}
+    job.confidence_config = ConfidenceConfig()
+    job.co_occlusion_tracker = types.SimpleNamespace(get_active_events=lambda: [])
+    job.apply_gallery_matches = lambda crops: None
+    job.identity_diagnostics = MagicMock()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    job.diagnostic = DiagnosticRecorder(tmp_path / "diag.jsonl", ws_send=None)
+    job._clef_session = _session()
+    return job
+
+
+def _mf_fused(job, f):
+    frame = _view(f)
+
+    def _enc(_f=frame):
+        return job._bumper_crop_b64(_f, _BOX, enforce_floor=False)[0]
+    lazy = app_module._LazyCrop(
+        _enc, src=(frame, _BOX, False) if job._clef_mf_enabled() else None)
+    return [types.SimpleNamespace(
+        evidence=[("main", lazy, 1.0, (4.0, 3.0))], track_id=5,
+        detection=types.SimpleNamespace(pos=(4.0, 3.0)),
+        relink_evidence=types.SimpleNamespace(type="continued"))], frame
+
+
+def _run_frames(job, frames):
+    fused = frame = None
+    for f in frames:
+        fused, frame = _mf_fused(job, f)
+        job._clef_mf_push(fused, f)
+    return fused, frame
+
+
+def _read(job, fused, crop_frame):
+    asyncio.run(job.read_fused_bumper_numbers(
+        fused, {7: 1.0}, det_to_slot={0: 1}, crop_frame=crop_frame,
+        slot_identity={1: 7}))
+
+
+def _diag_rows(job, tmp_path):
+    job.diagnostic.flush()
+    return [json.loads(l) for l in (tmp_path / "diag.jsonl").read_text().splitlines()
+            if json.loads(l)["type"] == "vlm_read"]
+
+
+def test_knob_off_clef_payload_is_byte_identical(monkeypatch, tmp_path):
+    """Knob off (and knob on with nothing usable buffered) sends today's
+    single-crop request byte-for-byte, through today's call signature."""
+    fake = _install(monkeypatch, FakeCF(_ok(_answers())))
+    seen = []
+    real = app_module._vision_read_bumpers
+
+    def _spy(*a, **k):
+        seen.append(sorted(k))
+        return real(*a, **k)
+    monkeypatch.setattr(app_module, "_vision_read_bumpers", _spy)
+
+    off = _mf_read_job(tmp_path, multiframe=False)
+    fused, frame = _mf_fused(off, 180)
+    assert fused[0].evidence[0][1].src is None          # no frame pinned when off
+    _read(off, fused, 180)
+    newest = off._bumper_crop_b64(frame, _BOX, enforce_floor=False)[0]
+    img, _w, _h = _prep(newest)
+    expected = clef_reader.build_read_payload(
+        "clef-flash", img, RED, BLUE, "blue",
+        options=clef_reader.roster_options(RED, BLUE), seed=newest)
+    assert fake.calls[0]["payload"] == expected
+    assert seen[0] == ["clef_session", "expected_alliances", "full_roster", "provider"]
+
+    # Knob on, but only the newest frame buffered -> single-crop fallback.
+    on = _mf_read_job(tmp_path / "x", multiframe=True)
+    fused_on, _ = _run_frames(on, [180])
+    _read(on, fused_on, 180)
+    assert fake.calls[1]["payload"] == expected
+    assert seen[1] == seen[0]
+    # Knob on, buffer never built (no push at all) -> same.
+    on2 = _mf_read_job(tmp_path / "y", multiframe=True)
+    fused2, _ = _mf_fused(on2, 180)
+    _read(on2, fused2, 180)
+    assert fake.calls[2]["payload"] == expected
+    assert on._mf_counts["single"] == 1 and on._mf_counts["multi"] == 0
+
+
+def test_multiframe_read_sends_newest_plus_buffered_frames(monkeypatch, tmp_path):
+    fake = _install(monkeypatch, FakeCF(_ok(_mf_answers({"4786": 0.97, "none": 0.03}))))
+    job = _mf_read_job(tmp_path)
+    fused, frame = _run_frames(job, range(0, 181, 6))
+    newest = job._bumper_crop_b64(frame, _BOX, enforce_floor=False)[0]
+    _read(job, fused, 180)
+
+    assert len(fake.calls) == 1
+    p = fake.calls[0]["payload"]
+    assert len(p["images"]) == 4
+    assert p["images"][0] == clef_reader._data_url(_prep(newest)[0])
+    assert p["state"].startswith("4 images: the same robot's bumper at different moments over ~")
+    assert "newest first" in p["state"] and "same_robot" in p["questions"]
+    single = clef_reader.build_read_payload("clef-flash", _prep(newest)[0], RED, BLUE,
+                                            "blue", seed=newest)
+    assert list(_team_criteria(p)) == list(_team_criteria(single))
+
+    # Every single-crop consumer got the NEWEST crop; the row is stamped with
+    # the newest crop's frame and records which frames/cams were sent.
+    rows = _diag_rows(job, tmp_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["frame"] == 180 and row["robot_id"] == 7 and row["crop_b64"] == newest
+    assert row["matched_team"] == "4786"
+    assert row["clef_same_robot"] == pytest.approx(0.93)
+    fr = row["clef_frames"]
+    assert len(fr) == 4 and fr[0] == {"frame": 180, "cam": "main"}
+    assert [f["frame"] for f in fr] == sorted((f["frame"] for f in fr), reverse=True)
+    assert job.last_ocr_crops[0]["crop"] == newest
+    slot_crops = next(iter(job._slot_crops.values()))
+    assert slot_crops[0]["crop_b64"] == newest
+
+    # ONE vote for the whole multi-image read.
+    robot = next(iter(job.robot_tracks.values()))
+    assert robot.team_ocr_votes == {"4786": 1.0}
+    st = job._clef_session.stats()
+    assert st["mf_reads"] == 1 and st["mf_images"] == 4 and st["requests"] == 1
+
+    # The frames used are marked sent: the next read uses fresh ones.
+    used = {f["frame"] for f in fr}
+    assert job._crop_buffer.sent_frames(7) >= used
+    fused2, _ = _run_frames(job, [186])
+    job.identity_registry.identities[7].backoff_until = -999.0
+    _read(job, fused2, 186)
+    fr2 = _diag_rows(job, tmp_path)[-1]["clef_frames"]
+    assert fr2[0]["frame"] == 186 and not ({f["frame"] for f in fr2} & used)
+
+
+def test_tracklet_inconsistent_read_casts_no_vote_and_raises_alarm(monkeypatch, tmp_path):
+    _install(monkeypatch, FakeCF(_ok(_mf_answers({"4786": 0.97, "none": 0.03}, same=0.1))))
+    job = _mf_read_job(tmp_path)
+    fused, _ = _run_frames(job, range(0, 181, 6))
+    _read(job, fused, 180)
+    robot = next(iter(job.robot_tracks.values()))
+    assert not robot.team_ocr_votes
+    ident = job.identity_registry.identities[7]
+    assert ident.vlm_fail_count == 1                       # a failed read -> backoff
+    calls = [c for c in job.identity_diagnostics.record.call_args_list
+             if c.args and c.args[0] == DiagnosticEvents.VLM_TRACKLET_INCONSISTENT]
+    assert len(calls) == 1
+    kw = calls[0].kwargs
+    assert kw["identity_id"] == 7 and kw["p_same_robot"] == pytest.approx(0.1)
+    assert len(kw["frames"]) == 4 and kw["frames"][0]["frame"] == 180
+    job.identity_diagnostics.increment.assert_any_call("vlm.tracklet_inconsistent")
+    assert job._crop_buffer.entries(7) == []               # buffer flushed
+    assert job._crop_buffer.stats()["flushes"]["inconsistent"] == 1
+    row = _diag_rows(job, tmp_path)[0]
+    assert row["matched_team"] is None and row["clef_same_robot"] == pytest.approx(0.1)
+    assert job._clef_session.stats()["inconsistent"] == 1
+
+
+def test_read_falls_back_to_single_crop_when_identity_moved_slots(monkeypatch, tmp_path):
+    """The background pass may start after a re-bind: if the buffer does not
+    hold this identity on the crop's slot at the crop frame, read single."""
+    fake = _install(monkeypatch, FakeCF(_ok(_answers())))
+    job = _mf_read_job(tmp_path)
+    fused, _ = _run_frames(job, range(0, 181, 6))
+    job.identity_registry.identities[7].active_slot = 2      # re-bound before the pass ran
+    asyncio.run(job.read_fused_bumper_numbers(
+        fused, {7: 1.0}, det_to_slot={0: 2}, crop_frame=180, slot_identity={2: 7}))
+    assert len(fake.calls[0]["payload"]["images"]) == 1
+    assert "clef_frames" not in _diag_rows(job, tmp_path)[0]
+
+
+def test_contradiction_and_roster_clear_flush_the_buffer(tmp_path):
+    job = _mf_read_job(tmp_path)
+    _run_frames(job, range(0, 31, 6))
+    assert job._crop_buffer.entries(7)
+    job._mf_flush(7, "contradiction")
+    assert job._crop_buffer.entries(7) == []
+    assert job._crop_buffer.stats()["flushes"] == {"contradiction": 1}
+    # The real call sites route through _mf_flush.
+    import inspect
+    src = inspect.getsource(app_module.InferenceJob)
+    for reason in ("contradiction", "roster_clear", "co_occlusion", "inconsistent"):
+        assert f'"{reason}")' in src
+
+
+def test_co_occlusion_resolution_flushes_both_identities(monkeypatch, tmp_path):
+    job = _mf_read_job(tmp_path)
+    reg = job.identity_registry
+    reg.identities[8] = RobotIdentity(identity_id=8, alliance="blue", active_slot=2,
+                                      team_number="6800", is_ambiguous=True)
+    reg.identities[7].team_number = "4786"
+    reg.identities[7].is_ambiguous = True
+    for f in range(0, 31, 6):
+        fa, _ = _mf_fused(job, f)
+        fb, _ = _mf_fused(job, f + 1000)
+        fb[0].track_id = 6
+        job.field_tracker.last_det_to_slot = {0: 1, 1: 2}
+        job._clef_mf_push(fa + fb, f)
+    assert job._crop_buffer.entries(7) and job._crop_buffer.entries(8)
+    event = types.SimpleNamespace(event_id=1, status="pending_vlm", identity_ids={7, 8},
+                                  alliance="blue")
+    resolved = []
+    job.co_occlusion_tracker = types.SimpleNamespace(
+        get_active_events=lambda: [event],
+        resolve_event=lambda eid, mapping: resolved.append(mapping))
+    job.deferred_attributions = []
+    # Reads come back swapped: slot 1 shows 6800, slot 2 shows 4786.
+    monkeypatch.setattr(app_module, "_vision_read_bumpers", lambda crops, *a, **k: [
+        {"team_number": "6800", "confidence": 0.95, "raw_read": "6800"},
+        {"team_number": "4786", "confidence": 0.95, "raw_read": "4786"}][:len(crops)])
+    fa, _ = _mf_fused(job, 36)
+    fb, _ = _mf_fused(job, 1036)
+    fb[0].track_id = 6
+    asyncio.run(job.read_fused_bumper_numbers(
+        fa + fb, {7: 1.0, 8: 1.0}, det_to_slot={0: 1, 1: 2}, crop_frame=36,
+        slot_identity={1: 7, 2: 8}))
+    assert resolved == [{8: 1, 7: 2}]
+    assert job._crop_buffer.entries(7) == [] and job._crop_buffer.entries(8) == []
+    assert job._crop_buffer.stats()["flushes"]["co_occlusion"] == 2
+
+
+def test_encode_plan_drops_failed_older_crop_and_collapses():
+    good = np.full((30, 80, 3), 120, np.uint8)
+    empty = np.zeros((0, 0, 3), np.uint8)
+    items = ["NEWEST", ["NEWEST2", good, empty]]
+    metas = [None, {"span_s": 9.9, "frames": [{"frame": 100, "cam": "main"},
+                                              {"frame": 70, "cam": "main"},
+                                              {"frame": 40, "cam": "main"}]}]
+    out, m = app_module._clef_mf_encode_plan(items, metas, 60.0)
+    assert out[0] == "NEWEST" and m[0] is None
+    assert out[1][0] == "NEWEST2" and len(out[1]) == 2
+    assert out[1][1] == app_module._encode_band_crop_b64(good)
+    assert m[1]["frames"] == metas[1]["frames"][:2] and m[1]["span_s"] == 0.5
+    out2, m2 = app_module._clef_mf_encode_plan([["ONLY", empty]],
+                                               [{"frames": [{"frame": 1, "cam": "main"},
+                                                            {"frame": 0, "cam": "main"}]}], 60.0)
+    assert out2 == ["ONLY"] and m2 == [None]
+
+
+def test_buffered_crop_encodes_like_the_lazy_newest_crop():
+    frame = _view(42)
+    band, leg = app_module._band_crop_for_buffer((frame, _BOX, False))
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    b64, score = job._bumper_crop_b64(frame, _BOX, enforce_floor=False)
+    assert app_module._encode_band_crop_b64(band) == b64
+    assert leg == pytest.approx(score)
+
+
+def test_finalize_reports_multiframe_counters(monkeypatch, capsys):
+    _install(monkeypatch, FakeCF(_ok(_mf_answers(same=0.1), input_tokens=900)))
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    job.team_reader = "clef"
+    job.config = JobConfig({"team_reader": "clef", "clef_multiframe": True})
+    job.timings = {}
+    gauges = {}
+    job.identity_diagnostics = types.SimpleNamespace(
+        gauge=lambda k, v: gauges.__setitem__(k, v))
+    job._clef_session = _session()
+    job._clef_session.multiframe = True
+    job._clef_session.read_bumpers([_crops(3)], RED, BLUE, ["blue"])
+    job._mf_counts = {"multi": 1, "single": 2}
+    job._crop_buffer = app_module.CropBuffer(fps=60.0)
+    job._finalize_clef_usage()
+    t = job.timings
+    assert t["clef.mf_reads"] == 1 and t["clef.mf_images"] == 3
+    assert t["clef.inconsistent"] == 1 and t["clef.mf_single_fallbacks"] == 2
+    assert all(isinstance(v, (int, float)) for v in t.values())
+    assert gauges["clef_mf_buffer"]["multi"] == 1
+    printed = [l for l in capsys.readouterr().out.splitlines() if "[clef]" in l]
+    assert "1 multi-frame (3 images), 1 inconsistent" in printed[0]
+
+
+def test_finalize_omits_multiframe_timings_when_knob_off(monkeypatch):
+    _install(monkeypatch, FakeCF(_ok(_answers())))
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    job.team_reader = "clef"
+    job.config = JobConfig({"team_reader": "clef"})
+    job.timings = {}
+    job._clef_session = _session()
+    job._clef_session.read_bumpers([_jpeg_b64()], RED, BLUE, ["blue"])
+    job._finalize_clef_usage()
+    assert not any(k.startswith("clef.mf_") or k == "clef.inconsistent" for k in job.timings)
+
+
+def test_diagnostic_row_carries_multiframe_fields_only_when_present(tmp_path):
+    from web.diagnostic import DiagnosticRecorder
+    path = tmp_path / "d.jsonl"
+    rec = DiagnosticRecorder(path)
+    common = dict(frame=180, robot_id=2, crop_b64="x", legibility=0.0, raw_read="4786",
+                  matched_team="4786", alliance_read="blue", confidence=0.9,
+                  vote_weight=1.0, surface="bumper")
+    rec.record_vlm_read(**common)
+    rec.record_vlm_read(**common, clef_probs={"4786": 0.9},
+                        clef_frames=[{"frame": 180, "cam": "main"},
+                                     {"frame": 150, "cam": "corner_left"}],
+                        clef_same_robot=0.88)
+    rec.close()
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    assert "clef_frames" not in rows[0] and "clef_same_robot" not in rows[0]
+    assert rows[1]["clef_frames"] == [{"frame": 180, "cam": "main"},
+                                      {"frame": 150, "cam": "corner_left"}]
+    assert rows[1]["clef_same_robot"] == 0.88
+    assert rows[1]["frame"] == 180 and rows[1]["crop_b64"] == "x"

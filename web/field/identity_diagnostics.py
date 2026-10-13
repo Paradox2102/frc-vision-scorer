@@ -63,6 +63,9 @@ class DiagnosticEvents:
     VLM_RESULT = "vlm.result"
     VLM_AUDIT_OVERDUE = "vlm.audit_overdue"
     VLM_CONTRADICTION = "vlm.contradiction"
+    # clef_multiframe: a multi-image read answered "not the same robot"
+    # (same_robot < clef_mf_same_robot_min) — a hijack alarm.
+    VLM_TRACKLET_INCONSISTENT = "vlm.tracklet_inconsistent"
 
     # Scoring
     SCORING_ATTRIBUTED = "scoring.attributed"

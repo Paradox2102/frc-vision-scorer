@@ -37,7 +37,11 @@ static, whole-match, per-slot case. The time-varying case that did land
 (``identity_swap_resolve``, web/field/identity_swap.py) avoids the ILP: per
 alliance only the 3! slot->team permutations are states, a Viterbi over
 time finds where slots swapped robots, and THIS module's
-``resolve_slot_labels`` then labels the resulting virtual tracks.
+``resolve_slot_labels`` then labels the resulting virtual tracks. When the
+permutation assumption fails (slots hold duplicates/junk and change robot at
+every expiry/reseed), ``identity_segment_resolve``
+(web/field/identity_segments.py) labels discontinuity-bounded segments by
+their own reads and stitches the rest along feasible links instead.
 """
 from __future__ import annotations
 
@@ -53,6 +57,7 @@ __all__ = [
     "attribute_reads",
     "build_slot_evidence",
     "vlm_read_rows_from_jsonl",
+    "apply_evidence_floor",
     "resolve_slot_labels",
 ]
 
@@ -479,6 +484,45 @@ def build_slot_evidence(
         "fallback_used": fallback_used,
     }
     return evidence, stats
+
+
+def apply_evidence_floor(
+    vlm_read_rows: list[dict] | None,
+    min_conf: float = 0.0,
+    min_margin: float = 0.0,
+) -> tuple[list[dict] | None, int]:
+    """Clef evidence floor (knob ``clef_min_evidence_conf``): drop team-naming
+    Clef reads too weak to be slot evidence for the finalize resolvers.
+
+    A row is dropped when it names a team (``matched_team``), carries
+    ``clef_probs`` (a Clef decision-model read; other readers' confidences are
+    on a different scale and pass through untouched) and either its
+    ``confidence`` (= p(team), the closed-set probability) is below
+    ``min_conf`` or ``p(team) - p(none)`` is below ``min_margin``. A floor of
+    0 disables that rule. Rows naming no team carry no vote and are kept.
+
+    qm8 0f632e0a: all 3 wrong red reads were blurry-bumper "6497" at conf
+    0.58/0.59/0.64 (margins 0.28-0.38); below 0.65 3/4 red reads were wrong,
+    at >= 0.65 32/32 right. Returns ``(rows, n_dropped)``; ``None`` in ->
+    ``None`` out (the evidence builder's fallback signal is preserved).
+    """
+    if vlm_read_rows is None or (min_conf <= 0.0 and min_margin <= 0.0):
+        return vlm_read_rows, 0
+    kept: list[dict] = []
+    dropped = 0
+    for row in vlm_read_rows:
+        team = row.get("matched_team")
+        probs = row.get("clef_probs")
+        if team is not None and isinstance(probs, dict):
+            p_team = float(probs.get(str(team), row.get("confidence") or 0.0))
+            conf = float(row.get("confidence") or p_team)
+            margin = p_team - float(probs.get("none", 0.0))
+            if (min_conf > 0.0 and conf < min_conf - SCORE_EPS) or (
+                    min_margin > 0.0 and margin < min_margin - SCORE_EPS):
+                dropped += 1
+                continue
+        kept.append(row)
+    return kept, dropped
 
 
 def vlm_read_rows_from_jsonl(lines) -> list[dict]:

@@ -184,3 +184,93 @@ def test_main_swap_flag_end_to_end(tmp_path, capsys):
     assert rc == 0
     assert "[swap-resolve] lambda=3 prox=1.5m | blue: none | red: R1<->R3 @f" in out
     assert "auto window: gir 4/6 slots" in out and "swap 6/6 slots" in out
+
+
+# --------------------------------------------------------------------------- #
+# --segments: segment-level labels (identity_segment_resolve) + Clef floor
+# --------------------------------------------------------------------------- #
+def _segment_data(exact=False):
+    """The swap job with the robot exchange logged as a discontinuity on R1
+    and R3 at f800 (identity births on disrupted slots)."""
+    binds, frames, reads, positions = _swap_job()
+    rejects = [{"type": "identity_reject", "frame": 800, "slot_id": s,
+                "slot_disrupted": True, "distance_m": 0.3} for s in (3, 5)]
+    data = {"job": "seg", "bindings": binds, "frame_nums": frames, "reads": reads,
+            "positions": positions, "votes_by_slot": {}, "reject_rows": rejects,
+            "boundary_rows": []}
+    if exact:
+        data["boundary_rows"] = [{"type": "slot_boundary", "frame": 800, "slot_id": s,
+                                  "kinds": ["birth"], "birth_disrupted": True}
+                                 for s in (3, 5)]
+    return data
+
+
+def test_run_segment_check_labels_both_halves_and_beats_gir():
+    res = ioc.run_segment_check(_segment_data(), TRUTH, auto_end=600, holdout_runs=10,
+                                min_conf=0.65)
+    assert res["boundary_source"] == "reconstructed" and res["boundary_rows"] == 2
+    assert "R1=6800[0-792]>4256[800-1592]" in res["seg_summary"]
+    assert "R3=4256[0-792]>6800[800-1592]" in res["seg_summary"]
+    assert res["auto"]["seg"]["slots_ok"] == 6 and res["auto"]["gir"]["slots_ok"] == 4
+    assert res["coverage"]["seg"] == 1.0
+    assert res["exclusivity"]["seg"] == {"violations": 0, "duplicates": 0}
+    ho = res["holdout"]
+    assert ho["seg"]["agree"] > ho["gir"]["agree"]
+    assert set(ho) >= {"gir", "swap", "seg", "gir+floor", "seg+floor"}
+    assert res["floor"]["dropped"] == 0                  # no clef_probs rows
+    text = ioc.format_segment_report(res)
+    assert "boundaries: reconstructed" in text and "seg+floor" in text
+
+
+def test_run_segment_check_prefers_exact_boundary_rows():
+    res = ioc.run_segment_check(_segment_data(exact=True), TRUTH, holdout_runs=0)
+    assert res["boundary_source"] == "exact" and "holdout" not in res
+    assert "R1=6800[0-792]>4256[800-1592]" in res["seg_summary"]
+
+
+def test_holdout_multi_matches_holdout_agreement_for_gir():
+    binds, frames, reads, positions = _swap_job()
+    ilog = ioc.attach_positions(ioc.reconstruct_identity_log(binds, frames), positions)
+    blue, red = ["4786", "3181", "2992"], ["6800", "1477", "4256"]
+    old = ioc.holdout_agreement(reads, ilog, {}, blue, red, ioc.SwapParams(), runs=7)
+
+    def gir(train):
+        gl = ioc._gir_labels(train, ilog, {}, blue, red, ioc._blank_meta())
+        return lambda s, f: gl.get(s)
+    new = ioc.holdout_multi(reads, ilog, blue, red, {"gir": gir}, runs=7)
+    assert new["n"] == old["n"] and new["gir"]["agree"] == old["gir"]
+
+
+def test_main_segments_flag_end_to_end(tmp_path, capsys):
+    job = "segs1234-0000"
+    binds, frames, reads, positions = _swap_job()
+    con = sqlite3.connect(tmp_path / "frc_scorer.db")
+    con.execute("CREATE TABLE match_robot_binding (id INTEGER PRIMARY KEY, job_id TEXT,"
+                " identity_id INTEGER, slot INTEGER, start_frame INTEGER, end_frame INTEGER)")
+    con.execute("CREATE TABLE match_robot_identity (job_id TEXT, identity_id INTEGER,"
+                " slot INTEGER, slot_label TEXT, alliance TEXT, team_number TEXT,"
+                " confirmed INTEGER, source TEXT, confidence REAL)")
+    for iid, s, start, _end in binds:
+        con.execute("INSERT INTO match_robot_binding (job_id, identity_id, slot, start_frame)"
+                    " VALUES (?,?,?,?)", (job, iid, s, start))
+    con.commit()
+    con.close()
+    (tmp_path / "web" / "uploads").mkdir(parents=True)
+    (tmp_path / "web" / "replays" / job).mkdir(parents=True)
+    labels = ["B1", "B2", "B3", "R1", "R2", "R3"]
+    (tmp_path / "web" / "replays" / job / "meta.json").write_text(json.dumps(
+        {"frames": [{"frame_num": f, "robots": [
+            {"slot": labels[s], "field_pos": positions[(f, s)]} for s in range(6)]}
+            for f in frames]}))
+    rows = reads + [{"type": "identity_reject", "frame": 800, "slot_id": s,
+                     "slot_disrupted": True, "distance_m": 0.3} for s in (3, 5)]
+    (tmp_path / "web" / "uploads" / f"diagnostic_{job}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n")
+    rc = ioc.main([job[:6], "--data-root", str(tmp_path), "--segments", "--fps", "60",
+                   "--holdout-runs", "5", "--auto-end", "600", "--min-conf", "0.65",
+                   "--truth", ",".join(f"{k}={v}" for k, v in TRUTH.items())])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[segment-resolve] segments=8 read=8" in out
+    assert "boundaries: reconstructed (2 rows)" in out
+    assert "seg+floor" in out and "held-out: 5 x 30%" in out

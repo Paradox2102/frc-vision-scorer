@@ -146,10 +146,12 @@ CREATE TABLE IF NOT EXISTS match_robot_binding (
     end_frame INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
 );
--- identity_swap_resolve: per-slot team segments (slots swap robots
--- mid-match). Frames are source-video frame numbers, both ends inclusive;
--- team_number NULL = unassigned/contested; score = summed read weight inside
--- the segment naming its team. Written only when the knob is on.
+-- identity_swap_resolve / identity_segment_resolve: per-slot team segments
+-- (slots change robots mid-match). Frames are source-video frame numbers,
+-- both ends inclusive; team_number NULL = unassigned/contested; score =
+-- summed read weight inside the segment naming its team (swap) or the read
+-- support behind its label (segments); source = read | stitched | none
+-- (segment resolve only, NULL for swap). Written only when a knob is on.
 CREATE TABLE IF NOT EXISTS match_robot_identity_segment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -160,6 +162,7 @@ CREATE TABLE IF NOT EXISTS match_robot_identity_segment (
     team_number TEXT,
     confirmed INTEGER DEFAULT 0,
     score REAL,
+    source TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_identity_segment_job
@@ -268,6 +271,11 @@ async def init_db():
                 await db.execute(f"ALTER TABLE match_robot_crop ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
+        # identity_segment_resolve: per-segment label source on a table that
+        # predates it.
+        if "source" not in await _table_columns(db, "match_robot_identity_segment"):
+            await db.execute(
+                "ALTER TABLE match_robot_identity_segment ADD COLUMN source TEXT")
         # Every embedding written before this column existed came from dinov2-small
         # (the only backend that ever ran) — pin that fact so a future default-model
         # change can't reinterpret old rows as "unknown model".
@@ -1010,12 +1018,12 @@ async def replace_match_identity_segments(job_id: str, rows: List[Dict[str, Any]
     """Replace a job's swap-aware identity segments (one transaction).
 
     ``rows``: ``{slot, slot_label, start_frame, end_frame, team_number,
-    confirmed, score}``. Any previous segments for the job are deleted first,
-    so a re-run never accumulates duplicates."""
+    confirmed, score[, source]}``. Any previous segments for the job are
+    deleted first, so a re-run never accumulates duplicates."""
     params = [
         (job_id, int(r["slot"]), r.get("slot_label"), int(r["start_frame"]),
          int(r["end_frame"]), r.get("team_number"), int(bool(r.get("confirmed"))),
-         r.get("score"))
+         r.get("score"), r.get("source"))
         for r in rows
     ]
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1023,19 +1031,20 @@ async def replace_match_identity_segments(job_id: str, rows: List[Dict[str, Any]
         if params:
             await db.executemany(
                 "INSERT INTO match_robot_identity_segment "
-                "(job_id, slot, slot_label, start_frame, end_frame, team_number, confirmed, score) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", params)
+                "(job_id, slot, slot_label, start_frame, end_frame, team_number, confirmed, "
+                "score, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
         await db.commit()
 
 
 async def get_match_identity_segments(job_id) -> List[Dict]:
     """A job's identity segments ordered by slot then start frame (empty
-    unless the job ran with identity_swap_resolve)."""
+    unless the job ran with identity_swap_resolve / identity_segment_resolve)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT slot, slot_label, start_frame, end_frame, team_number, confirmed, score "
-            "FROM match_robot_identity_segment WHERE job_id = ? ORDER BY slot, start_frame",
+            "SELECT slot, slot_label, start_frame, end_frame, team_number, confirmed, score, "
+            "source FROM match_robot_identity_segment WHERE job_id = ? "
+            "ORDER BY slot, start_frame",
             (job_id,))
         return [dict(r) for r in await cur.fetchall()]
 

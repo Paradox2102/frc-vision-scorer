@@ -1487,10 +1487,15 @@ class InferenceJob:
         # None unless global_identity_resolve ran. Feeds the replay row's
         # blue_teams/red_teams.
         self._final_slot_meta: Optional[dict] = None
-        # Swap-aware per-slot team segments (slot_id -> [segment dict]); None
-        # unless identity_swap_resolve ran. Feeds the replay per-frame labels,
-        # the replay events and match_robot_identity_segment.
+        # Time-varying per-slot team segments (slot_id -> [segment dict]); None
+        # unless identity_swap_resolve or identity_segment_resolve ran. Feeds
+        # the replay per-frame labels, the replay events and
+        # match_robot_identity_segment.
         self._slot_segments: Optional[dict] = None
+        # Exact per-(frame, slot) discontinuity rows (web/field/slot_boundaries.py);
+        # collected only with slot_boundary_log / identity_segment_resolve.
+        self._slot_boundaries: list[dict] = []
+        self._boundary_prev_corner: Dict[int, bool] = {}
         self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
@@ -5923,12 +5928,14 @@ class InferenceJob:
         for e in self.field_tracker.binding_events:
             if e.get("event") == "slot_expired":
                 feed.pop(e.get("slot_id"), None)
+        feed_changes = {}   # slot -> (prev feeder, new feeder); slot_boundary rows only
         for t in track_outs:
             tid = getattr(slot_to_fused.get(t.slot_id), "track_id", None)
             if tid is None:
                 continue   # coasting / track-less: keep the last known feeder
             if feed.get(t.slot_id) not in (None, tid):
                 disrupted_slots.add(t.slot_id)
+                feed_changes[t.slot_id] = (feed.get(t.slot_id), tid)
             feed[t.slot_id] = tid
 
         # Construct IdentityObservation
@@ -6167,6 +6174,40 @@ class InferenceJob:
                     })
             except Exception:
                 pass
+            if self._slot_boundary_logging():
+                self._record_slot_boundaries(log_frame_num, track_outs, feed_changes)
+
+    def _slot_boundary_logging(self) -> bool:
+        """slot_boundary_log, or implied by identity_segment_resolve."""
+        cfg = getattr(self, "config", None)
+        return bool(getattr(cfg, "slot_boundary_log", False)
+                    or getattr(cfg, "identity_segment_resolve", False))
+
+    def _record_slot_boundaries(self, frame: int, track_outs: list, feed_changes: dict) -> None:
+        """Exact per-(frame, slot) discontinuity rows (web/field/slot_boundaries.py)
+        from this frame's tracker slot_events, feeder changes, identity births
+        and corner-only transitions. Observation-only: reads state after the
+        frame's decisions; any failure is swallowed."""
+        try:
+            from web.field.slot_boundaries import frame_boundary_rows
+            corner = {t.slot_id: bool(getattr(t, "corner_only", False)) for t in track_outs}
+            rows = frame_boundary_rows(
+                frame, getattr(self.field_tracker, "slot_events", None), feed_changes,
+                getattr(self.identity_registry, "frame_rejections", None),
+                corner, getattr(self, "_boundary_prev_corner", None) or {},
+                positions={t.slot_id: t.pos for t in track_outs})
+            self._boundary_prev_corner = corner
+            if not rows:
+                return
+            if getattr(self, "_slot_boundaries", None) is None:
+                self._slot_boundaries = []
+            self._slot_boundaries.extend(rows)
+            diag = getattr(self, "diagnostic", None)
+            if diag is not None:
+                for row in rows:
+                    diag.record_slot_boundary(row)
+        except Exception:
+            pass
 
     def _get_display_team_number(self, robot) -> Optional[str]:
         ident = self.identity_registry.identities.get(robot.robot_id)
@@ -6553,11 +6594,12 @@ class InferenceJob:
 
     @staticmethod
     def _relabel_replay_events(rec, slot_segments: dict) -> int:
-        """identity_swap_resolve: re-stamp each recorded replay event's team
-        with its slot's segment label at the event's frame (the same label the
-        rebuilt replay rows carry there; None when the segment is unassigned).
-        Events were mirrored with the live label of the moment. Returns the
-        number of events whose team changed.
+        """identity_swap_resolve / identity_segment_resolve: re-stamp each
+        recorded replay event's team with its slot's segment label at the
+        event's frame (the same label the rebuilt replay rows carry there;
+        None when the segment is unassigned). Events were mirrored with the
+        live label of the moment. Returns the number of events whose team
+        changed.
 
         A ScoringEvent's ``frame_num`` is the PROCESSED-frame index
         (attribute_score is called with processed_frame_num), while segments
@@ -6631,8 +6673,11 @@ class InferenceJob:
             }
         cfg = getattr(self, "config", None)
         swap_on = bool(getattr(cfg, "identity_swap_resolve", False))
+        seg_on = bool(getattr(cfg, "identity_segment_resolve", False))
         if swap_on and not getattr(cfg, "global_identity_resolve", False):
             print("  [swap-resolve] skipped: requires global_identity_resolve")
+        if seg_on and not getattr(cfg, "global_identity_resolve", False):
+            print("  [segment-resolve] skipped: requires global_identity_resolve")
         if getattr(getattr(self, "config", None), "global_identity_resolve", False):
             # Whole-match per-slot labels (default ON): every identity that ever
             # held a slot contributes its reads at the read's own frame, so the
@@ -6649,6 +6694,14 @@ class InferenceJob:
                 diag_path = UPLOAD_DIR / f"diagnostic_{self.job_id}.jsonl"
                 rows = (vlm_read_rows_from_jsonl(diag_path.read_text().splitlines())
                         if diag_path.exists() else [])
+                floor = float(getattr(cfg, "clef_min_evidence_conf", 0.0) or 0.0)
+                if floor > 0.0 and rows:
+                    # Clef evidence floor (default OFF): weak team reads stop
+                    # being slot evidence for every finalize resolver below.
+                    from web.field.identity_resolve import apply_evidence_floor
+                    rows, n_floor = apply_evidence_floor(rows, min_conf=floor)
+                    print(f"  [clef-floor] ignoring {n_floor} team read(s) with "
+                          f"p(team) < {floor:g} as slot evidence")
                 vlm_rows = rows or None
                 # 2. team_ocr_votes fallback source, keyed by slot via the same
                 #    assignments used to build slot_meta.
@@ -6700,7 +6753,9 @@ class InferenceJob:
                       f"dropped_misattr={gstats['reads_dropped_misattributed']} "
                       f"fallback={gstats['fallback_used']} "
                       f"contested=[{contested}] final: {final}")
-                if swap_on:
+                if swap_on and seg_on:
+                    print("  [swap-resolve] skipped: identity_segment_resolve wins")
+                if swap_on and not seg_on:
                     # Swap-aware time-varying labels (default OFF): same inputs
                     # and the same pre-resolve slot_meta as the whole-match
                     # resolve, so with no swap found every slot is ONE segment
@@ -6722,6 +6777,27 @@ class InferenceJob:
                     except Exception as e:
                         self._slot_segments = None
                         print(f"  [swap-resolve] failed, keeping whole-match labels: {e}")
+                if seg_on:
+                    # Segment-level labels (default OFF; wins over swap):
+                    # each slot cut at its exact live discontinuities (+ presence
+                    # gaps/steps), segments labelled by their own reads, unread
+                    # ones stitched along feasible links with team exclusivity.
+                    # Own guard: a failure keeps the whole-match labels.
+                    try:
+                        from web.field.identity_segments import (
+                            DEFAULT_FPS as SEG_FPS, SegmentParams,
+                            format_segment_summary, resolve_segment_labels)
+                        gres = resolve_segment_labels(
+                            vlm_rows, self._identity_log, blue, red,
+                            boundary_rows=getattr(self, "_slot_boundaries", None) or [],
+                            params=SegmentParams(
+                                fps=float(getattr(self, "video_fps", 0) or SEG_FPS)),
+                            grid=[f["frame_num"] for f in rec.frames])
+                        self._slot_segments = gres["segments"]
+                        print(f"  {format_segment_summary(gres, self._slot_label)}")
+                    except Exception as e:
+                        self._slot_segments = None
+                        print(f"  [segment-resolve] failed, keeping whole-match labels: {e}")
             except Exception as e:
                 print(f"  [global-resolve] failed, keeping greedy slot_meta: {e}")
         frame_nums = [f["frame_num"] for f in rec.frames]
@@ -9388,17 +9464,19 @@ class InferenceJob:
                 print(f"  Match-identity capture failed ({e})")
             segs = getattr(self, "_slot_segments", None)
             if segs:
-                # identity_swap_resolve: per-slot team segments (the
-                # whole-match match_robot_identity rows above are unchanged).
+                # identity_swap_resolve / identity_segment_resolve: per-slot
+                # team segments (the whole-match match_robot_identity rows
+                # above are unchanged). ``source`` (read / stitched / none) is
+                # only set by the segment resolve.
                 try:
                     await database.replace_match_identity_segments(self.job_id, [
                         {"slot": sid, "slot_label": self._slot_label(sid),
                          "start_frame": sg["start_frame"], "end_frame": sg["end_frame"],
                          "team_number": sg["team_number"], "confirmed": sg["confirmed"],
-                         "score": sg["score"]}
+                         "score": sg["score"], "source": sg.get("source")}
                         for sid, rows in sorted(segs.items()) for sg in rows])
                 except Exception as e:
-                    print(f"  [swap-resolve] segment persist failed ({e})")
+                    print(f"  [identity-segments] segment persist failed ({e})")
 
 
 @app.on_event("startup")
@@ -12412,8 +12490,9 @@ async def get_replay_identities(job_id: str):
     except Exception:
         segments = []
     if segments:
-        # identity_swap_resolve runs only: per-slot team segments over time
-        # (each robot row above keeps its whole-match label).
+        # identity_swap_resolve / identity_segment_resolve runs only: per-slot
+        # team segments over time (each robot row above keeps its whole-match
+        # label).
         resp["segments"] = segments
     return resp
 

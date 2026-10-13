@@ -291,6 +291,15 @@ class DiagnosticRecorder:
             "outcome": str(outcome),
         })
 
+    def record_slot_boundary(self, row: dict) -> None:
+        """One exact slot discontinuity row (web/field/slot_boundaries.py:
+        ``{"frame", "slot_id", "kinds": [...], ...geometry}``), written only
+        when slot_boundary_log / identity_segment_resolve is on."""
+        if not row or row.get("frame") is None or row.get("slot_id") is None:
+            return
+        self._emit({**row, "frame": int(row["frame"]), "t_ms": self._t_ms(),
+                    "type": "slot_boundary", "slot_id": int(row["slot_id"])})
+
     def record_snapshot(self, frame: int | None, robots_state: list[dict],
                        roster: dict, identified: dict) -> None:
         """`robots_state` is a list of dicts pre-shaped per the snapshot schema

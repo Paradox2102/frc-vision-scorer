@@ -594,6 +594,21 @@ KNOBS = [
     # read_census on (reads.dropped_evicted; reads.kept_evicted counts the
     # rows kept). DEFAULT OFF pending a full-match A/B.
     Knob("read_keep_evicted", "READ_KEEP_EVICTED", bool, False, section="VLM reader"),
+    # Clef evidence floor (finalize only): team-naming Clef reads whose
+    # p(team) is below this are ignored as slot evidence by the finalize
+    # resolvers (global_identity_resolve, identity_swap_resolve,
+    # identity_segment_resolve). Live voting is untouched. Non-Clef reads
+    # (vLLM freeread confidences are on another scale) pass through. qm8
+    # 0f632e0a: all 3 wrong red reads were blurry-bumper "6497" at p 0.58/
+    # 0.59/0.64; below 0.65 3/4 red reads were wrong, >= 0.65 32/32 right.
+    # 200-crop bench (clef-flash decoy, single frame): 0.65 keeps 61/67
+    # right team reads and drops 1 of 2 wrong (precision 97.1% -> 98.4%).
+    # A p(team) - p(none) margin rule (0.4) separates no better (scripts/
+    # identity_offline_check.py --min-margin). Held-out agreement with the
+    # floor on the training reads: qm8 +0.9 pts, qm11 -0.2 (neutral: 0-3
+    # low-p reads per job). 0 = off. DEFAULT OFF pending a live A/B.
+    Knob("clef_min_evidence_conf", "CLEF_MIN_EVIDENCE_CONF", float, 0.0,
+         min=0.0, max=1.0, section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only
@@ -637,6 +652,34 @@ KNOBS = [
          min=0.5, max=100.0, section="Identity & votes"),
     Knob("identity_swap_prox_m", "IDENTITY_SWAP_PROX_M", float, 1.5,
          min=0.3, max=5.0, section="Identity & votes"),
+    # Segment-level slot labels (web/field/identity_segments.py; requires
+    # global_identity_resolve): a slot changes physical robot ~17x per
+    # alliance per match, only at tracker discontinuities (expiry+reseed,
+    # wide-gate coasting re-acquisition, disrupted identity births), and
+    # holds duplicates/junk -- the swap HMM's 3-slot permutation state does
+    # not hold. Each slot is cut at its discontinuities, every segment is
+    # labelled by its OWN reads, unread segments inherit labels along
+    # physically feasible end->start links (Hungarian, <= 5 m/s + 1.5 m,
+    # <= 2 s) with team exclusivity at each instant; unreachable segments
+    # stay unlabelled. Replay per-frame labels, replay events and
+    # match_robot_identity_segment use the segments; the whole-match
+    # match_robot_identity label stays gir's. Wins over identity_swap_resolve
+    # when both are on. Collects slot_boundary rows (slot_boundary_log).
+    # Offline (scripts/identity_offline_check.py --segments, 50 x 30% held-
+    # out reads, unlabelled = miss): qm11 7 jobs pooled gir 55.2% / swap
+    # 76.2% / segments 78.3% (labels 96.6% precise, 81% of reads labelled);
+    # qm8 2 jobs gir 48.4% / swap 51.1% / segments 61.8% (92.9% precise).
+    # Slot-time coverage 31-69%. DEFAULT OFF pending a live full-match A/B.
+    Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, False,
+         section="Identity & votes"),
+    # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
+    # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
+    # expiry / coasting re-acquisition / feed change / identity birth /
+    # corner-only transition, with its geometry. Observation-only; lets
+    # scripts/identity_offline_check.py --segments cut on exact boundaries
+    # instead of reconstructing them. Implied by identity_segment_resolve.
+    Knob("slot_boundary_log", "SLOT_BOUNDARY_LOG", bool, False,
+         section="Identity & votes"),
     # Identity continuity (identity layer, web/field/identity.py): an
     # observation on the SAME slot its identity held last frame, with no
     # tracker binding disruption (seeded/expired/kinematic_reject/

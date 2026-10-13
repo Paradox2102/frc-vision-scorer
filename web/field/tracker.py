@@ -99,6 +99,11 @@ class _Track:
     # Went into coast while hub-occluded; stays set until re-acquired. Gates the
     # occlusion re-acquisition guard (suspect-zone detections need motion proof).
     occ_coasting: bool = False
+    # Observation-only (slot_events): the position of the last detection that
+    # measured this slot, and the slot's position when it last expired. Never
+    # read by any tracking decision.
+    last_meas_pos: Optional[tuple] = None
+    expired_pos: Optional[tuple] = None
 
 
 class FieldTracker:
@@ -166,6 +171,12 @@ class FieldTracker:
         # Maps stable track_id -> slot_id for sticky binding.
         self._id_to_slot: dict[int, int] = {}
         self.binding_events: list[dict] = []
+        # Observation-only per-update log of the events that can change a slot's
+        # physical robot (seed / expire / coasting re-acquisition), with the
+        # geometry behind each (web/field/slot_boundaries.py). Unlike
+        # binding_events it also covers track_id-less detections. Never read by
+        # any tracking decision.
+        self.slot_events: list[dict] = []
         self.assignment_evidence: dict[int, dict] = {}
 
     def _slots(self, alliance):
@@ -226,6 +237,7 @@ class FieldTracker:
 
     def update(self, detections, occlusion, dt, portals=None, frame_num=None):
         self.binding_events = []
+        self.slot_events = []
         self.assignment_evidence = {}
         self._pending_meas: dict[int, tuple] = {}   # slot_id -> (z, r_scale)
         self._pending_seed: set[int] = set()
@@ -278,6 +290,10 @@ class FieldTracker:
                     t.kf.decay_velocity(self.coast_vel_decay)
             if t.missed > budget:
                 # Expire the track
+                t.expired_pos = t.kf.pos if t.kf is not None else None
+                self.slot_events.append({
+                    "event": "expire", "slot_id": t.slot_id,
+                    "pos": t.expired_pos, "missed": int(t.missed)})
                 t.active = False
                 t.kf = None
                 t.box = None
@@ -385,6 +401,7 @@ class FieldTracker:
                             "alliance": slot.alliance,
                         })
                         continue
+                    self._note_reacquire(slot, d, dt, "sticky", None)
                     self._measured_update(slot, d, dt)
                     slot.box = d.box
                     slot.missed = 0
@@ -426,6 +443,7 @@ class FieldTracker:
         dets = [d for (_, d) in dets_with_idx]
 
         guard_blocked = set()  # det indices barred from seeding this call
+        portal_pairs = set()   # (slot row, det col) admitted via a portal (slot_events only)
         if active_slots and dets:
             # Build cost matrix: rows=active_slots, cols=dets
             n = len(active_slots)
@@ -450,6 +468,7 @@ class FieldTracker:
                         if d_portal <= pr:
                             in_gate = True
                             dist = d_portal + 0.5   # small penalty vs direct matches
+                            portal_pairs.add((i, j))
                     if in_gate:
                         if self._kin_violates(t, d, dt):
                             # Implied speed exceeds the physical cap: leave
@@ -493,6 +512,9 @@ class FieldTracker:
                 if np.isfinite(cost[r, c]):
                     # Update matched slot
                     t = active_slots[r]
+                    self._note_reacquire(
+                        t, dets[c], dt, "portal" if (r, c) in portal_pairs else "distance",
+                        self.gate * min(4.0, 1.0 + 0.5 * t.missed))
                     self._measured_update(t, dets[c], dt)
                     t.box = dets[c].box
                     t.missed = 0
@@ -534,6 +556,7 @@ class FieldTracker:
                 if j in guard_blocked or point_in_zones(d.pos, self.zones):
                     continue
                 slot = free_slots.pop(0)
+                self._note_seed(slot, d)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
                 slot.corner_only = d.box is None
@@ -570,6 +593,7 @@ class FieldTracker:
                 if point_in_zones(d.pos, self.zones):
                     continue
                 slot = free_slots.pop(0)
+                self._note_seed(slot, d)
                 slot.kf = _KF(d.pos)
                 slot.box = d.box
                 slot.corner_only = d.box is None
@@ -592,6 +616,37 @@ class FieldTracker:
                         "alliance": slot.alliance,
                     })
 
+    def _note_seed(self, slot, d):
+        """slot_events: a free slot (re)seeded from detection ``d``. Records the
+        distance from where the slot last expired (None on its first seed)."""
+        pos = (float(d.pos[0]), float(d.pos[1]))
+        prev = slot.expired_pos
+        self.slot_events.append({
+            "event": "seed", "slot_id": slot.slot_id, "pos": pos,
+            "track_id": d.track_id, "prev_pos": prev,
+            "seed_dist_m": (float(np.hypot(pos[0] - prev[0], pos[1] - prev[1]))
+                            if prev is not None else None),
+            "corner_only": d.box is None})
+        slot.last_meas_pos = pos
+
+    def _note_reacquire(self, t, d, dt, via, gate_m):
+        """slot_events: a COASTING slot (missed > 0) matched detection ``d``.
+        ``jump_m`` is measured from the slot's last measurement, ``pred_jump_m``
+        from its coasted prediction; ``speed_mps`` is jump_m over the coast."""
+        if t.missed <= 0 or t.kf is None:
+            return
+        dp = np.asarray(d.pos, float)
+        last = t.last_meas_pos
+        jump = float(np.linalg.norm(dp - np.asarray(last, float))) if last is not None else None
+        span = (dt or 0.0) * (t.missed + 1)
+        self.slot_events.append({
+            "event": "reacquire", "slot_id": t.slot_id, "missed": int(t.missed),
+            "jump_m": jump,
+            "pred_jump_m": float(np.linalg.norm(dp - np.asarray(t.kf.pos, float))),
+            "speed_mps": (jump / span) if (jump is not None and span > 0) else None,
+            "gate_m": gate_m, "via": via, "track_id": d.track_id,
+            "corner_only": d.box is None})
+
     def _measured_update(self, t, d, dt):
         """KF update with measurement noise scaled by source quality.
 
@@ -609,6 +664,7 @@ class FieldTracker:
                 scale *= (speed / self.max_speed) ** 2
         t.kf.update(d.pos, r_scale=scale)
         t.corner_only = d.box is None
+        t.last_meas_pos = (float(d.pos[0]), float(d.pos[1]))   # slot_events only
         # Payload: record the measuring detection's SAM confidence on the slot.
         # After the KF update so it can never feed back into the state estimate.
         t.tracker_prob = d.tracker_prob

@@ -55,6 +55,25 @@ Per-slot positions for the swap gate come from the replay's per-frame
 ``field_pos`` rows (the live path reads the identity log's ``pos``). The
 replay drops rows of non-robot slots and per-segment-dropped ranges, which
 the gate sees as "slot lost" (open) -- slightly more permissive than live.
+
+``--segments`` (identity_segment_resolve) runs the segment-level resolve
+(web.field.identity_segments): slot presence + positions from the replay,
+cut at presence gaps / > 2.5 m steps plus the job's exact ``slot_boundary``
+diagnostic rows when it logged them (slot_boundary_log), else its
+``identity_reject`` births (disrupted or > 2 m) -- the reconstruction. It
+reports, per arm (gir, swap, seg, seg|gir = gir's label where seg has none
+-- a reference arm for the prototype's protocol, never used live -- and with
+``--min-conf`` / ``--min-margin``
+the Clef evidence floor applied to the TRAINING reads: gir+floor,
+seg+floor): auto-window slots/frames right and precision (labelled frames
+only), held-out read agreement on the same seeded splits as ``--swap``
+(an unlabelled slot counts as a miss) plus the labelled fraction and
+precision, slot-time coverage, and exclusivity (instants where two slots
+carry one team > 1 m apart / co-located duplicates). Caveat: the auto
+truth is one team per slot for the whole auto window, but slots DO change
+robots in auto (qm11: 16 of 57 in-alliance auto reads, mostly p >= 0.9,
+disagree with it), so segment labels can be right where the auto score
+calls them wrong; held-out agreement is the primary metric.
 """
 from __future__ import annotations
 
@@ -71,9 +90,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from web.field.identity_resolve import (  # noqa: E402
+    apply_evidence_floor,
     attribute_reads,
     resolve_slot_labels,
     vlm_read_rows_from_jsonl,
+)
+from web.field.identity_segments import (  # noqa: E402
+    SegmentParams,
+    boundary_rows_from_rejects,
+    exclusivity_violations,
+    format_segment_summary,
+    labels_at,
+    resolve_segment_labels,
 )
 from web.field.identity_swap import (  # noqa: E402
     SwapParams,
@@ -211,7 +239,7 @@ def _swap_res(reads, ilog, votes_by_slot, blue, red, meta, params):
 def auto_window_score(label_at, truth: dict, auto_frames: list[int]) -> dict:
     """``label_at(slot_id, frame) -> team``; per-slot majority auto label and
     the frame-weighted fraction of (slot, auto frame) pairs labelled right."""
-    slots, ok_pairs, n_pairs, ok_slots = {}, 0, 0, 0
+    slots, ok_pairs, n_pairs, ok_slots, lab_pairs = {}, 0, 0, 0, 0
     for sid, lab in enumerate(LABELS):
         want = truth.get(lab)
         counts: dict = defaultdict(int)
@@ -221,12 +249,15 @@ def auto_window_score(label_at, truth: dict, auto_frames: list[int]) -> dict:
         ok = counts.get(want, 0) if want is not None else 0
         ok_pairs += ok
         n_pairs += n
+        lab_pairs += n - counts.get(None, 0)
         major = max(counts.items(), key=lambda kv: (kv[1], str(kv[0])))[0] if counts else None
         ok_slots += major is not None and major == want
         slots[lab] = {"truth": want, "majority": major, "frac": (ok / n) if n else 0.0,
                       "labels": dict(counts)}
     return {"slots": slots, "slots_ok": ok_slots,
-            "frame_frac": (ok_pairs / n_pairs) if n_pairs else 0.0}
+            "frame_frac": (ok_pairs / n_pairs) if n_pairs else 0.0,
+            "labelled_frac": (lab_pairs / n_pairs) if n_pairs else 0.0,
+            "precision": (ok_pairs / lab_pairs) if lab_pairs else 0.0}
 
 
 def holdout_agreement(reads, ilog, votes_by_slot, blue, red, params,
@@ -308,6 +339,164 @@ def format_swap_report(res: dict) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- #
+# --segments: segment-level labels (identity_segment_resolve) + Clef floor
+# --------------------------------------------------------------------------- #
+def job_boundary_rows(data: dict) -> tuple[list[dict], str]:
+    """The job's exact ``slot_boundary`` rows when it logged them
+    (slot_boundary_log / identity_segment_resolve), else its
+    ``identity_reject`` births as boundary rows (the reconstruction)."""
+    if data.get("boundary_rows"):
+        return data["boundary_rows"], "exact"
+    return boundary_rows_from_rejects(data.get("reject_rows") or []), "reconstructed"
+
+
+def _floored(reads, min_conf: float, min_margin: float):
+    return apply_evidence_floor(reads, min_conf, min_margin)[0]
+
+
+def holdout_multi(reads, ilog, blue, red, arms: dict, runs: int = 50,
+                  frac: float = 0.3, seed: int = 0) -> dict:
+    """The ``holdout_agreement`` protocol (same seeded splits) over any arms:
+    ``arms`` maps name -> ``make(train_reads) -> label_at(slot, frame)``.
+    Per arm: ``agree`` (held-out reads whose team equals the arm's label at
+    their slot+frame; an unlabelled slot counts as a miss), ``labelled``
+    (fraction of held-out reads the arm labels at all) and ``precision``
+    (agreement among the labelled ones)."""
+    team_reads = [r for r in reads if r.get("matched_team") is not None]
+    roster = {**{t: "blue" for t in blue}, **{t: "red" for t in red}}
+    rng = random.Random(seed)
+    hit = {k: 0 for k in arms}
+    lab = {k: 0 for k in arms}
+    n = 0
+    for _ in range(runs):
+        held = set(rng.sample(range(len(team_reads)), round(frac * len(team_reads))))
+        train = [r for i, r in enumerate(team_reads) if i not in held]
+        test = [r for i, r in enumerate(team_reads) if i in held]
+        fns = {k: make(train) for k, make in arms.items()}
+        for frame, sid, team, _w in attribute_reads(test, ilog)[0]:
+            if roster.get(str(team)) != slot_alliance(sid):
+                continue
+            n += 1
+            for k, fn in fns.items():
+                got = fn(sid, frame)
+                lab[k] += got is not None
+                hit[k] += got == str(team)
+    out = {"n": n, "runs": runs, "frac": frac}
+    for k in arms:
+        out[k] = {"agree": hit[k] / n if n else 0.0,
+                  "labelled": lab[k] / n if n else 0.0,
+                  "precision": hit[k] / lab[k] if lab[k] else 0.0}
+    return out
+
+
+def run_segment_check(data: dict, truth: dict, seg_params: SegmentParams | None = None,
+                      swap_params: SwapParams | None = None, auto_end: int = 1860,
+                      holdout_runs: int = 50, holdout_frac: float = 0.3,
+                      min_conf: float = 0.0, min_margin: float = 0.0,
+                      identity_log=None) -> dict:
+    """gir / swap / segments / segments+floor on one loaded job
+    (``load_job`` dict). Blank slot_meta for gir and swap, as in --swap."""
+    sp = seg_params or SegmentParams()
+    swp = swap_params or SwapParams(fps=sp.fps)
+    ilog = identity_log if identity_log is not None else reconstruct_identity_log(
+        data["bindings"], data["frame_nums"])
+    ilog = attach_positions(ilog, data.get("positions"))
+    reads, votes = data["reads"], data.get("votes_by_slot") or {}
+    blue = [truth[lab] for lab in LABELS[:3] if lab in truth]
+    red = [truth[lab] for lab in LABELS[3:] if lab in truth]
+    brows, bsrc = job_boundary_rows(data)
+    grid = list(data.get("frame_nums") or [])
+    floor_on = min_conf > 0.0 or min_margin > 0.0
+
+    def seg(train, floor=False):
+        rows = _floored(train, min_conf, min_margin) if floor else train
+        return resolve_segment_labels(rows or None, ilog, blue, red, boundary_rows=brows,
+                                      params=sp, grid=grid)
+
+    def gir_fn(train, floor=False):
+        rows = _floored(train, min_conf, min_margin) if floor else train
+        gl = _gir_labels(rows, ilog, votes, blue, red, _blank_meta())
+        return lambda s, f: gl.get(s)
+
+    def swap_fn(train):
+        sres = _swap_res(train, ilog, votes, blue, red, _blank_meta(), swp)
+        return lambda s, f: (segment_at(sres["segments"].get(s), f) or {}).get("team_number")
+
+    def seg_fn(train, floor=False):
+        segs = seg(train, floor)["segments"]
+        return lambda s, f: labels_at(segs, s, f)
+
+    def seg_gir_fn(train):
+        # Reference only (the prototype's protocol): gir's whole-match label
+        # wherever the segment resolve leaves a segment unlabelled. The live
+        # resolve never does this -- it does not invent labels.
+        segs, gl = seg_fn(train), gir_fn(train)
+        return lambda s, f: segs(s, f) if segs(s, f) is not None else gl(s, f)
+
+    arms = {"gir": gir_fn, "swap": swap_fn, "seg": seg_fn, "seg|gir": seg_gir_fn}
+    if floor_on:
+        arms["gir+floor"] = lambda tr: gir_fn(tr, True)
+        arms["seg+floor"] = lambda tr: seg_fn(tr, True)
+    auto_frames = sorted({r["frame_num"] for r in ilog if r["frame_num"] < auto_end})
+    full = {k: make(reads) for k, make in arms.items()}
+    sres_full = seg(reads)
+    out = {
+        "boundary_source": bsrc,
+        "boundary_rows": len(brows),
+        "seg": sres_full,
+        "seg_summary": format_segment_summary(sres_full),
+        "auto": {k: auto_window_score(fn, truth, auto_frames) for k, fn in full.items()},
+        "coverage": {"seg": sres_full["stats"]["coverage"]},
+        "exclusivity": {"seg": exclusivity_violations(sres_full["segments"], ilog,
+                                                      sp.dup_dist_m)},
+        "floor": {"min_conf": min_conf, "min_margin": min_margin,
+                  "dropped": apply_evidence_floor(reads, min_conf, min_margin)[1]},
+    }
+    if floor_on:
+        sres_floor = seg(reads, True)
+        out["seg_floor"] = sres_floor
+        out["coverage"]["seg+floor"] = sres_floor["stats"]["coverage"]
+        out["exclusivity"]["seg+floor"] = exclusivity_violations(
+            sres_floor["segments"], ilog, sp.dup_dist_m)
+    if holdout_runs > 0:
+        out["holdout"] = holdout_multi(reads, ilog, blue, red, arms,
+                                       runs=holdout_runs, frac=holdout_frac)
+    return out
+
+
+def format_segment_report(res: dict) -> str:
+    st = res["seg"]["stats"]
+    lines = [res["seg_summary"],
+             f"boundaries: {res['boundary_source']} ({res['boundary_rows']} rows) "
+             f"cuts={st['cuts']} segments={st['segments']} read={st['read']} "
+             f"stitched={st['stitched']} none={st['unlabelled']} contested={st['contested']} "
+             f"demoted={st['demoted']} links={st['links']} "
+             f"refused(reads={st['refused_reads']}, exclusive={st['refused_exclusive']})"]
+    fl = res["floor"]
+    if fl["min_conf"] > 0 or fl["min_margin"] > 0:
+        lines.append(f"clef floor: conf>={fl['min_conf']:g} margin>={fl['min_margin']:g} "
+                     f"drops {fl['dropped']} team read(s)")
+    ho = res.get("holdout")
+    lines.append(f"{'arm':<10}{'auto slots':>11}{'auto frames':>12}{'auto prec':>10}"
+                 + (f"{'held-out':>10}{'labelled':>9}{'prec':>7}" if ho else "")
+                 + f"{'coverage':>9}{'excl/dup':>10}")
+    for k, a in res["auto"].items():
+        cov = res["coverage"].get(k)
+        ex = res["exclusivity"].get(k)
+        row = f"{k:<10}{a['slots_ok']:>9}/6{a['frame_frac']:>12.0%}{a['precision']:>10.0%}"
+        if ho:
+            h = ho[k]
+            row += f"{h['agree']:>10.1%}{h['labelled']:>9.0%}{h['precision']:>7.1%}"
+        cov_txt = f"{cov:.0%}" if cov is not None else "-"
+        ex_txt = f"{ex['violations']}/{ex['duplicates']}" if ex else "-"
+        lines.append(f"{row}{cov_txt:>9}{ex_txt:>10}")
+    if ho:
+        lines.append(f"held-out: {ho['runs']} x {ho['frac']:.0%}, n={ho['n']} "
+                     f"(unlabelled = miss; floors apply to the training reads only)")
+    return "\n".join(lines)
+
+
 def _resolve_job_id(con, prefix: str) -> str:
     ids = [r[0] for r in con.execute(
         "SELECT DISTINCT job_id FROM match_robot_binding WHERE job_id LIKE ?",
@@ -350,6 +539,18 @@ def load_job(data_root: Path, prefix: str) -> dict:
                 last_snap = r
     votes_by_id = {r["robot_id"]: r.get("votes") or {}
                    for r in (last_snap or {}).get("robots", [])}
+    reject_rows, boundary_rows = [], []
+    for line in lines:
+        if '"identity_reject"' not in line and '"slot_boundary"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("type") == "identity_reject":
+            reject_rows.append(r)
+        elif r.get("type") == "slot_boundary":
+            boundary_rows.append(r)
     slot_meta, votes_by_slot = {}, {}
     for slot, iid, team, confirmed in ident_rows:
         if slot is None:
@@ -360,7 +561,8 @@ def load_job(data_root: Path, prefix: str) -> dict:
                                     for k, v in votes_by_id.get(iid, {}).items()}
     return {"job": job, "bindings": bindings, "frame_nums": frame_nums,
             "reads": reads, "slot_meta": slot_meta, "votes_by_slot": votes_by_slot,
-            "positions": positions}
+            "positions": positions, "reject_rows": reject_rows,
+            "boundary_rows": boundary_rows}
 
 
 def main(argv=None) -> int:
@@ -390,6 +592,26 @@ def main(argv=None) -> int:
                     help="first teleop source frame (default %(default)s)")
     ap.add_argument("--holdout-runs", type=int, default=50)
     ap.add_argument("--holdout-frac", type=float, default=0.3)
+    ap.add_argument("--segments", action="store_true",
+                    help="also run the segment-level resolve (identity_segment_resolve) "
+                         "and compare gir / swap / segments (+floor) on held-out reads, "
+                         "the auto window, coverage and exclusivity")
+    ap.add_argument("--min-conf", type=float, default=0.0,
+                    help="Clef evidence floor (clef_min_evidence_conf) for the +floor "
+                         "arms: ignore team reads with p(team) below this (0 = off)")
+    ap.add_argument("--min-margin", type=float, default=0.0,
+                    help="alternative floor for the +floor arms: ignore team reads with "
+                         "p(team) - p(none) below this (0 = off)")
+    ap.add_argument("--seg-slack", type=float, default=SegmentParams.link_slack_m,
+                    help="segment link slack, metres (default %(default)s)")
+    ap.add_argument("--seg-max-gap", type=float, default=SegmentParams.link_max_gap_s,
+                    help="segment link max gap, seconds (default %(default)s)")
+    ap.add_argument("--seg-speed", type=float, default=SegmentParams.max_speed_mps,
+                    help="segment link max robot speed, m/s (default %(default)s)")
+    ap.add_argument("--seg-dup-m", type=float, default=SegmentParams.dup_dist_m,
+                    help="duplicate / exclusivity distance, metres (default %(default)s)")
+    ap.add_argument("--seg-min-support", type=float, default=SegmentParams.min_support,
+                    help="read weight a segment needs to label itself (default %(default)s)")
     args = ap.parse_args(argv)
 
     truth = {}
@@ -414,14 +636,31 @@ def main(argv=None) -> int:
                               votes_by_slot=data["votes_by_slot"], params=params,
                               auto_end=args.auto_end, holdout_runs=args.holdout_runs,
                               holdout_frac=args.holdout_frac, identity_log=ilog)
+    gres = None
+    if args.segments:
+        sp = SegmentParams(fps=args.fps, link_slack_m=args.seg_slack,
+                           link_max_gap_s=args.seg_max_gap, max_speed_mps=args.seg_speed,
+                           dup_dist_m=args.seg_dup_m, min_support=args.seg_min_support)
+        gres = run_segment_check(
+            data, truth, seg_params=sp,
+            swap_params=SwapParams(swap_lambda=args.swap_lambda, prox_m=args.prox_m,
+                                   fps=args.fps),
+            auto_end=args.auto_end, holdout_runs=args.holdout_runs,
+            holdout_frac=args.holdout_frac, min_conf=args.min_conf,
+            min_margin=args.min_margin, identity_log=ilog)
     if args.json:
         print(json.dumps({"job": data["job"], **res,
-                          **({"swap": sres} if sres else {})}, default=str, indent=2))
+                          **({"swap": sres} if sres else {}),
+                          **({"segments": {k: v for k, v in gres.items()
+                                           if k not in ("seg", "seg_floor")}}
+                             if gres else {})}, default=str, indent=2))
     else:
         print(f"== {data['job']}")
         print(format_report(res))
         if sres:
             print(format_swap_report(sres))
+        if gres:
+            print(format_segment_report(gres))
     return 0
 
 

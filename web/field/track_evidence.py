@@ -195,10 +195,18 @@ def reresolve_frames(identity_log, slot_team_map, verdicts, frame_nums):
     return [{"frame_num": fn, "robots": by_frame[fn]} for fn in frame_nums]
 
 
-def reresolve_frames_by_slot(identity_log, slot_meta, slot_verdicts, frame_nums):
+def reresolve_frames_by_slot(identity_log, slot_meta, slot_verdicts, frame_nums,
+                             slot_segments=None):
     """Rebuild rows keyed by stable slot_id. Emit each snapshot at its own slot when
     that slot's whole-match verdict is 'robot'; team/alliance from slot_meta (final
-    canonical, keyed by slot_id), position from the snapshot. Non-robot slots excluded."""
+    canonical, keyed by slot_id), position from the snapshot. Non-robot slots excluded.
+
+    ``slot_segments`` (identity_swap_resolve; slot_id -> time-ordered segment
+    dicts with start_frame/team_number/confirmed): team + confirmed come from
+    the slot's segment covering the row's frame instead of the whole-match
+    slot_meta. A slot without segments keeps its slot_meta label."""
+    if slot_segments:
+        from web.field.identity_swap import segment_at
     by_frame: dict = {fn: [] for fn in frame_nums}
     for s in identity_log:
         sid = s["slot_id"]
@@ -208,11 +216,15 @@ def reresolve_frames_by_slot(identity_log, slot_meta, slot_verdicts, frame_nums)
         if fn not in by_frame:
             continue
         meta = slot_meta.get(sid, {})
+        team, confirmed = meta.get("team_number"), bool(meta.get("confirmed"))
+        seg = segment_at(slot_segments.get(sid), fn) if slot_segments else None
+        if seg is not None:
+            team, confirmed = seg["team_number"], bool(seg["confirmed"])
         by_frame[fn].append({
             "slot": _ID_TO_SLOT_LABEL.get(sid),
             "alliance": meta.get("alliance") or s.get("alliance"),
-            "team_number": meta.get("team_number"),
-            "confirmed": bool(meta.get("confirmed")),
+            "team_number": team,
+            "confirmed": confirmed,
             "field_pos": s.get("pos"),
         })
     return [{"frame_num": fn, "robots": by_frame[fn]} for fn in frame_nums]

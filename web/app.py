@@ -1475,6 +1475,10 @@ class InferenceJob:
         # None unless global_identity_resolve ran. Feeds the replay row's
         # blue_teams/red_teams.
         self._final_slot_meta: Optional[dict] = None
+        # Swap-aware per-slot team segments (slot_id -> [segment dict]); None
+        # unless identity_swap_resolve ran. Feeds the replay per-frame labels,
+        # the replay events and match_robot_identity_segment.
+        self._slot_segments: Optional[dict] = None
         self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
@@ -6233,6 +6237,39 @@ class InferenceJob:
         except Exception:
             pass
 
+    @staticmethod
+    def _relabel_replay_events(rec, slot_segments: dict) -> int:
+        """identity_swap_resolve: re-stamp each recorded replay event's team
+        with its slot's segment label at the event's frame (the same label the
+        rebuilt replay rows carry there; None when the segment is unassigned).
+        Events were mirrored with the live label of the moment. Returns the
+        number of events whose team changed.
+
+        A ScoringEvent's ``frame_num`` is the PROCESSED-frame index
+        (attribute_score is called with processed_frame_num), while segments
+        are in source frames; the recorder appends exactly one replay frame
+        per processed frame, so ``rec.frames[index]["frame_num"]`` is the
+        event's source frame. An index outside the recording is left alone."""
+        from web.field.identity_swap import segment_at
+        from web.field.track_evidence import slot_label_to_id
+        frames = getattr(rec, "frames", None) or []
+        changed = 0
+        for ev in getattr(rec, "events", None) or []:
+            sid = slot_label_to_id(ev.get("slot"))
+            idx = ev.get("frame_num")
+            if sid is None or not isinstance(idx, int) or not 0 <= idx < len(frames):
+                continue
+            src = frames[idx].get("frame_num")
+            seg = segment_at(slot_segments.get(sid), src) if src is not None else None
+            if seg is None:
+                continue
+            team = seg["team_number"]
+            if ev.get("team_number") != team:
+                changed += 1
+            ev["team_number"] = team
+            ev["robot_label"] = team or ev.get("slot")
+        return changed
+
     def _apply_track_verdicts(self) -> None:
         """Slice 2: after the whole match is processed, classify each track from the
         accumulated evidence and retroactively drop human/static-track rows from the
@@ -6278,6 +6315,10 @@ class InferenceJob:
                 "confirmed": bool(robot and robot.team_number_confirmed),
                 "alliance": self._slot_alliance(slot_id),
             }
+        cfg = getattr(self, "config", None)
+        swap_on = bool(getattr(cfg, "identity_swap_resolve", False))
+        if swap_on and not getattr(cfg, "global_identity_resolve", False):
+            print("  [swap-resolve] skipped: requires global_identity_resolve")
         if getattr(getattr(self, "config", None), "global_identity_resolve", False):
             # Whole-match per-slot labels (default ON): every identity that ever
             # held a slot contributes its reads at the read's own frame, so the
@@ -6314,6 +6355,7 @@ class InferenceJob:
                 # 4. Rosters (already str in match_blue_teams/match_red_teams).
                 blue = [str(t) for t in (self.match_blue_teams or [])]
                 red = [str(t) for t in (self.match_red_teams or [])]
+                greedy_meta = slot_meta
                 res = resolve_slot_labels(
                     vlm_rows, self._identity_log, votes_by_slot, gallery_by_slot,
                     self._slot_alliance, blue, red, slot_meta)
@@ -6344,11 +6386,40 @@ class InferenceJob:
                       f"dropped_misattr={gstats['reads_dropped_misattributed']} "
                       f"fallback={gstats['fallback_used']} "
                       f"contested=[{contested}] final: {final}")
+                if swap_on:
+                    # Swap-aware time-varying labels (default OFF): same inputs
+                    # and the same pre-resolve slot_meta as the whole-match
+                    # resolve, so with no swap found every slot is ONE segment
+                    # carrying exactly the label above. Own guard: a failure
+                    # keeps the whole-match labels.
+                    try:
+                        from web.field.identity_swap import (
+                            DEFAULT_FPS, SwapParams, format_swap_summary,
+                            resolve_slot_segments)
+                        params = SwapParams(
+                            swap_lambda=float(getattr(cfg, "identity_swap_lambda", 3.0)),
+                            prox_m=float(getattr(cfg, "identity_swap_prox_m", 1.5)),
+                            fps=float(getattr(self, "video_fps", 0) or DEFAULT_FPS))
+                        sres = resolve_slot_segments(
+                            vlm_rows, self._identity_log, votes_by_slot, gallery_by_slot,
+                            self._slot_alliance, blue, red, greedy_meta, params=params)
+                        self._slot_segments = sres["segments"]
+                        print(f"  {format_swap_summary(sres, self._slot_label)}")
+                    except Exception as e:
+                        self._slot_segments = None
+                        print(f"  [swap-resolve] failed, keeping whole-match labels: {e}")
             except Exception as e:
                 print(f"  [global-resolve] failed, keeping greedy slot_meta: {e}")
         frame_nums = [f["frame_num"] for f in rec.frames]
         orig_rows = sum(len(f.get("robots", [])) for f in rec.frames)
-        rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts, frame_nums)
+        slot_segments = getattr(self, "_slot_segments", None)
+        if slot_segments:
+            rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts,
+                                               frame_nums, slot_segments=slot_segments)
+            self._relabel_replay_events(rec, slot_segments)
+        else:
+            rebuilt = reresolve_frames_by_slot(self._identity_log, slot_meta, slot_verdicts,
+                                               frame_nums)
         if dropped:
             # Drop phantom / wrong-robot segments (per-segment resolution) from the
             # per-slot rebuild. Rows are keyed by slot label; map back to slot_id.
@@ -9001,6 +9072,19 @@ class InferenceJob:
                 await database.insert_match_robot_crops(crop_rows)
             except Exception as e:
                 print(f"  Match-identity capture failed ({e})")
+            segs = getattr(self, "_slot_segments", None)
+            if segs:
+                # identity_swap_resolve: per-slot team segments (the
+                # whole-match match_robot_identity rows above are unchanged).
+                try:
+                    await database.replace_match_identity_segments(self.job_id, [
+                        {"slot": sid, "slot_label": self._slot_label(sid),
+                         "start_frame": sg["start_frame"], "end_frame": sg["end_frame"],
+                         "team_number": sg["team_number"], "confirmed": sg["confirmed"],
+                         "score": sg["score"]}
+                        for sid, rows in sorted(segs.items()) for sg in rows])
+                except Exception as e:
+                    print(f"  [swap-resolve] segment persist failed ({e})")
 
 
 @app.on_event("startup")
@@ -12008,7 +12092,16 @@ async def get_replay_identities(job_id: str):
                 for c in crops if c["image"] is not None
             ],
         })
-    return {"job_id": job_id, "robots": out}
+    resp = {"job_id": job_id, "robots": out}
+    try:
+        segments = await database.get_match_identity_segments(job_id)
+    except Exception:
+        segments = []
+    if segments:
+        # identity_swap_resolve runs only: per-slot team segments over time
+        # (each robot row above keeps its whole-match label).
+        resp["segments"] = segments
+    return resp
 
 
 @app.post("/api/replays/{job_id}/correct")

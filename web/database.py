@@ -146,6 +146,24 @@ CREATE TABLE IF NOT EXISTS match_robot_binding (
     end_frame INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
 );
+-- identity_swap_resolve: per-slot team segments (slots swap robots
+-- mid-match). Frames are source-video frame numbers, both ends inclusive;
+-- team_number NULL = unassigned/contested; score = summed read weight inside
+-- the segment naming its team. Written only when the knob is on.
+CREATE TABLE IF NOT EXISTS match_robot_identity_segment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    slot_label TEXT,
+    start_frame INTEGER NOT NULL,
+    end_frame INTEGER NOT NULL,
+    team_number TEXT,
+    confirmed INTEGER DEFAULT 0,
+    score REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_identity_segment_job
+    ON match_robot_identity_segment(job_id, slot, start_frame);
 CREATE TABLE IF NOT EXISTS match_robot_crop (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -985,6 +1003,40 @@ async def get_match_crops(job_id, identity_id) -> List[Dict]:
         cur = await db.execute(
             "SELECT * FROM match_robot_crop WHERE job_id = ? AND identity_id = ? ORDER BY legibility DESC",
             (job_id, identity_id))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def replace_match_identity_segments(job_id: str, rows: List[Dict[str, Any]]) -> None:
+    """Replace a job's swap-aware identity segments (one transaction).
+
+    ``rows``: ``{slot, slot_label, start_frame, end_frame, team_number,
+    confirmed, score}``. Any previous segments for the job are deleted first,
+    so a re-run never accumulates duplicates."""
+    params = [
+        (job_id, int(r["slot"]), r.get("slot_label"), int(r["start_frame"]),
+         int(r["end_frame"]), r.get("team_number"), int(bool(r.get("confirmed"))),
+         r.get("score"))
+        for r in rows
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM match_robot_identity_segment WHERE job_id = ?", (job_id,))
+        if params:
+            await db.executemany(
+                "INSERT INTO match_robot_identity_segment "
+                "(job_id, slot, slot_label, start_frame, end_frame, team_number, confirmed, score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", params)
+        await db.commit()
+
+
+async def get_match_identity_segments(job_id) -> List[Dict]:
+    """A job's identity segments ordered by slot then start frame (empty
+    unless the job ran with identity_swap_resolve)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT slot, slot_label, start_frame, end_frame, team_number, confirmed, score "
+            "FROM match_robot_identity_segment WHERE job_id = ? ORDER BY slot, start_frame",
+            (job_id,))
         return [dict(r) for r in await cur.fetchall()]
 
 

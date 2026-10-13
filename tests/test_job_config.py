@@ -554,3 +554,15 @@ def test_identity_registry_built_from_knobs(monkeypatch):
     assert isinstance(reg, IdentityRegistry)
     assert reg.continuity is True and reg.continuity_max_m == 0.8
     assert reg.warmup_frames == 3
+
+
+def test_identity_swap_resolve_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.identity_swap_resolve is False
+    assert cfg.identity_swap_lambda == 3.0
+    assert cfg.identity_swap_prox_m == 1.5
+    assert "identity_swap_resolve" not in cfg.non_defaults()
+    on = JobConfig({"identity_swap_resolve": "true", "identity_swap_lambda": "4"})
+    assert on.identity_swap_resolve is True and on.identity_swap_lambda == 4.0

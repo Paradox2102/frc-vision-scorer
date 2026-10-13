@@ -33,7 +33,11 @@ space stops being small enough to enumerate and this should become an ILP
 solved with ``scipy.optimize.milp`` (binary assignment variables x[segment,
 team] with one-team-per-segment and one-segment-window-per-team-at-a-time
 constraints). That is out of scope here; this module only handles the
-static, whole-match, per-slot case.
+static, whole-match, per-slot case. The time-varying case that did land
+(``identity_swap_resolve``, web/field/identity_swap.py) avoids the ILP: per
+alliance only the 3! slot->team permutations are states, a Viterbi over
+time finds where slots swapped robots, and THIS module's
+``resolve_slot_labels`` then labels the resulting virtual tracks.
 """
 from __future__ import annotations
 
@@ -46,6 +50,7 @@ __all__ = [
     "combine_scores",
     "assign_teams_global",
     "merge_global_assignment",
+    "attribute_reads",
     "build_slot_evidence",
     "vlm_read_rows_from_jsonl",
     "resolve_slot_labels",
@@ -358,6 +363,36 @@ def merge_global_assignment(
     return new_meta, changes
 
 
+def attribute_reads(
+    vlm_read_rows: list[dict] | None, identity_log: list[dict]
+) -> tuple[list[tuple[int, int, str, float]], int]:
+    """Credit each team-naming read to the slot its identity held at the
+    read's OWN frame (the misattribution guard described in
+    :func:`build_slot_evidence`, which is built on this helper).
+
+    Returns ``(attributed, dropped)``: ``attributed`` lists
+    ``(frame, slot_id, matched_team, vote_weight)`` in input order (rows
+    without a ``matched_team`` are skipped silently); ``dropped`` counts
+    team-naming rows whose ``(frame, robot_id)`` has no binding.
+    """
+    frame_identity_to_slot: dict[tuple[int, int], int] = {
+        (row["frame_num"], row["identity_id"]): row["slot_id"] for row in identity_log
+    }
+    attributed: list[tuple[int, int, str, float]] = []
+    dropped = 0
+    for row in vlm_read_rows or ():
+        matched_team = row.get("matched_team")
+        if matched_team is None:
+            continue  # no team vote carried by this row
+        slot_id = frame_identity_to_slot.get((row["frame"], row["robot_id"]))
+        if slot_id is None:
+            dropped += 1
+            continue
+        attributed.append(
+            (row["frame"], slot_id, matched_team, row.get("vote_weight", 0.0)))
+    return attributed, dropped
+
+
 def build_slot_evidence(
     vlm_read_rows: list[dict] | None,
     identity_log: list[dict],
@@ -401,27 +436,16 @@ def build_slot_evidence(
     ``stats = {"reads_used": int, "reads_dropped_misattributed": int,
     "fallback_used": bool}``.
     """
-    frame_identity_to_slot: dict[tuple[int, int], int] = {
-        (row["frame_num"], row["identity_id"]): row["slot_id"] for row in identity_log
-    }
-
     read_scores_by_slot: dict[int, dict[str, float]] = {}
     reads_used = 0
     reads_dropped_misattributed = 0
 
     if vlm_read_rows:
-        for row in vlm_read_rows:
-            matched_team = row.get("matched_team")
-            if matched_team is None:
-                continue  # no team vote carried by this row
-            slot_id = frame_identity_to_slot.get((row["frame"], row["robot_id"]))
-            if slot_id is None:
-                reads_dropped_misattributed += 1
-                continue
+        attributed, reads_dropped_misattributed = attribute_reads(
+            vlm_read_rows, identity_log)
+        for _frame, slot_id, matched_team, weight in attributed:
             slot_scores = read_scores_by_slot.setdefault(slot_id, {})
-            slot_scores[matched_team] = slot_scores.get(matched_team, 0.0) + row.get(
-                "vote_weight", 0.0
-            )
+            slot_scores[matched_team] = slot_scores.get(matched_team, 0.0) + weight
             reads_used += 1
 
     fallback_used = vlm_read_rows is None or len(vlm_read_rows) == 0 or reads_used == 0

@@ -27,12 +27,34 @@ solver does not use. ``--identity-log`` takes an exact dump instead
 Baseline ("today"): the job's ``match_robot_identity`` labels, i.e. what the
 run itself wrote (last-identity labels when the knob was OFF). They are also
 the ``slot_meta`` the resolve merges into, as in the live path.
+
+``--swap`` (identity_swap_resolve) additionally runs the swap-aware,
+time-varying resolve (web.field.identity_swap.resolve_slot_segments) and
+prints its per-slot segments, then compares it with whole-match gir on:
+
+- auto-window correctness: labels over frames < ``--auto-end`` (default
+  1860, teleop start) vs ``--truth`` (Manta auto paths; teleop truth is not
+  available), as slots whose majority auto label is right and as the
+  frame-weighted fraction of (slot, auto frame) pairs;
+- held-out read agreement: ``--holdout-runs`` seeded splits hold out
+  ``--holdout-frac`` of the team-naming reads, resolve on the rest, and
+  score the fraction of held-out reads (attributed to a slot, naming a team
+  of that slot's alliance) whose team equals the resolved label of their
+  slot at their frame. Both arms merge into a BLANK slot_meta here: the
+  job's stored labels were computed from all reads and would leak the
+  held-out ones.
+
+Per-slot positions for the swap gate come from the replay's per-frame
+``field_pos`` rows (the live path reads the identity log's ``pos``). The
+replay drops rows of non-robot slots and per-segment-dropped ranges, which
+the gate sees as "slot lost" (open) -- slightly more permissive than live.
 """
 from __future__ import annotations
 
 import argparse
 import bisect
 import json
+import random
 import sqlite3
 import sys
 from collections import defaultdict
@@ -42,8 +64,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from web.field.identity_resolve import (  # noqa: E402
+    attribute_reads,
     resolve_slot_labels,
     vlm_read_rows_from_jsonl,
+)
+from web.field.identity_swap import (  # noqa: E402
+    SwapParams,
+    format_swap_summary,
+    resolve_slot_segments,
+    segment_at,
 )
 
 LABELS = ["B1", "B2", "B3", "R1", "R2", "R3"]
@@ -144,6 +173,129 @@ def format_report(res: dict) -> str:
     return "\n".join(lines)
 
 
+def attach_positions(ilog: list[dict], positions: dict | None) -> list[dict]:
+    """identity_log rows with ``pos`` filled from ``{(frame, slot): [x, y]}``."""
+    if not positions:
+        return ilog
+    return [{**r, "pos": positions.get((r["frame_num"], r["slot_id"]))} for r in ilog]
+
+
+def _blank_meta() -> dict:
+    return {sid: {"team_number": None, "confirmed": False, "alliance": slot_alliance(sid)}
+            for sid in range(6)}
+
+
+def _gir_labels(reads, ilog, votes_by_slot, blue, red, meta) -> dict[int, str | None]:
+    res = resolve_slot_labels(reads or None, ilog, votes_by_slot or {}, {},
+                              slot_alliance, blue, red, meta)
+    return {sid: res["slot_meta"].get(sid, {}).get("team_number") for sid in range(6)}
+
+
+def _swap_res(reads, ilog, votes_by_slot, blue, red, meta, params):
+    return resolve_slot_segments(reads or None, ilog, votes_by_slot or {}, {},
+                                 slot_alliance, blue, red, meta, params=params)
+
+
+def auto_window_score(label_at, truth: dict, auto_frames: list[int]) -> dict:
+    """``label_at(slot_id, frame) -> team``; per-slot majority auto label and
+    the frame-weighted fraction of (slot, auto frame) pairs labelled right."""
+    slots, ok_pairs, n_pairs, ok_slots = {}, 0, 0, 0
+    for sid, lab in enumerate(LABELS):
+        want = truth.get(lab)
+        counts: dict = defaultdict(int)
+        for f in auto_frames:
+            counts[label_at(sid, f)] += 1
+        n = sum(counts.values())
+        ok = counts.get(want, 0) if want is not None else 0
+        ok_pairs += ok
+        n_pairs += n
+        major = max(counts.items(), key=lambda kv: (kv[1], str(kv[0])))[0] if counts else None
+        ok_slots += major is not None and major == want
+        slots[lab] = {"truth": want, "majority": major, "frac": (ok / n) if n else 0.0,
+                      "labels": dict(counts)}
+    return {"slots": slots, "slots_ok": ok_slots,
+            "frame_frac": (ok_pairs / n_pairs) if n_pairs else 0.0}
+
+
+def holdout_agreement(reads, ilog, votes_by_slot, blue, red, params,
+                      runs: int = 50, frac: float = 0.3, seed: int = 0) -> dict:
+    """Seeded hold-out of team-naming reads: resolve gir and swap-aware on the
+    rest, score held-out reads against each arm's label at (slot, frame)."""
+    team_reads = [r for r in reads if r.get("matched_team") is not None]
+    roster = {**{t: "blue" for t in blue}, **{t: "red" for t in red}}
+    rng = random.Random(seed)
+    tot = {"gir": 0, "swap": 0, "n": 0}
+    for _ in range(runs):
+        held = set(rng.sample(range(len(team_reads)), round(frac * len(team_reads))))
+        train = [r for i, r in enumerate(team_reads) if i not in held]
+        test = [r for i, r in enumerate(team_reads) if i in held]
+        gl = _gir_labels(train, ilog, votes_by_slot, blue, red, _blank_meta())
+        sres = _swap_res(train, ilog, votes_by_slot, blue, red, _blank_meta(), params)
+        for frame, sid, team, _w in attribute_reads(test, ilog)[0]:
+            if roster.get(str(team)) != slot_alliance(sid):
+                continue        # cross-alliance / off-roster read: no arm can agree
+            seg = segment_at(sres["segments"].get(sid), frame)
+            tot["n"] += 1
+            tot["gir"] += gl.get(sid) == str(team)
+            tot["swap"] += seg is not None and seg["team_number"] == str(team)
+    n = tot["n"] or 1
+    return {"n": tot["n"], "runs": runs, "frac": frac,
+            "gir": tot["gir"] / n, "swap": tot["swap"] / n}
+
+
+def run_swap_check(bindings, frame_nums, reads, truth: dict, positions=None,
+                   votes_by_slot=None, params: SwapParams | None = None,
+                   auto_end: int = 1860, holdout_runs: int = 50,
+                   holdout_frac: float = 0.3, identity_log=None) -> dict:
+    """Swap-aware vs whole-match gir on one job (blank slot_meta for both)."""
+    params = params or SwapParams()
+    ilog = identity_log if identity_log is not None else reconstruct_identity_log(
+        bindings, frame_nums)
+    ilog = attach_positions(ilog, positions)
+    blue = [truth[lab] for lab in LABELS[:3] if lab in truth]
+    red = [truth[lab] for lab in LABELS[3:] if lab in truth]
+    gl = _gir_labels(reads, ilog, votes_by_slot, blue, red, _blank_meta())
+    sres = _swap_res(reads, ilog, votes_by_slot, blue, red, _blank_meta(), params)
+    auto_frames = sorted({r["frame_num"] for r in ilog if r["frame_num"] < auto_end})
+
+    def swap_at(sid, f):
+        seg = segment_at(sres["segments"].get(sid), f)
+        return seg["team_number"] if seg else None
+
+    out = {
+        "gir_labels": {LABELS[s]: t for s, t in gl.items()},
+        "segments": {LABELS[s]: [(g["start_frame"], g["end_frame"], g["team_number"],
+                                  g["score"]) for g in segs]
+                     for s, segs in sres["segments"].items()},
+        "swaps": [{**sw, "slots": [LABELS[a] for a in sw["slots"]]} for sw in sres["swaps"]],
+        "summary": format_swap_summary(sres),
+        "gate_open_frac": sres["stats"]["gate_open_frac"],
+        "auto_gir": auto_window_score(lambda s, f: gl.get(s), truth, auto_frames),
+        "auto_swap": auto_window_score(swap_at, truth, auto_frames),
+    }
+    if holdout_runs > 0:
+        out["holdout"] = holdout_agreement(reads, ilog, votes_by_slot, blue, red, params,
+                                           runs=holdout_runs, frac=holdout_frac)
+    return out
+
+
+def format_swap_report(res: dict) -> str:
+    lines = [res["summary"], f"gate open fraction: {res['gate_open_frac']}",
+             f"{'slot':<5}{'truth':<7}{'gir':<7}segments (start-end team score)"]
+    for lab in LABELS:
+        segs = " | ".join(f"{a}-{b} {t} {sc:g}" for a, b, t, sc in res["segments"].get(lab, []))
+        lines.append(f"{lab:<5}{str(res['auto_swap']['slots'][lab]['truth']):<7}"
+                     f"{str(res['gir_labels'][lab]):<7}{segs}")
+    ag, asw = res["auto_gir"], res["auto_swap"]
+    lines.append(f"auto window: gir {ag['slots_ok']}/6 slots ({ag['frame_frac']:.0%} slot-frames)"
+                 f" | swap {asw['slots_ok']}/6 slots ({asw['frame_frac']:.0%} slot-frames)")
+    ho = res.get("holdout")
+    if ho:
+        lines.append(f"held-out read agreement ({ho['runs']} x {ho['frac']:.0%}, "
+                     f"n={ho['n']}): gir {ho['gir']:.1%} | swap {ho['swap']:.1%}")
+    return "\n".join(lines)
+
+
 def _resolve_job_id(con, prefix: str) -> str:
     ids = [r[0] for r in con.execute(
         "SELECT DISTINCT job_id FROM match_robot_binding WHERE job_id LIKE ?",
@@ -165,6 +317,12 @@ def load_job(data_root: Path, prefix: str) -> dict:
     con.close()
     meta = json.loads((data_root / "web" / "replays" / job / "meta.json").read_text())
     frame_nums = [f["frame_num"] for f in meta["frames"]]
+    positions = {}          # (frame, slot_id) -> [x, y] from the replay rows
+    for fr in meta["frames"]:
+        for r in fr.get("robots", []):
+            if r.get("field_pos") is not None and r.get("slot") in LABEL_TO_SLOT:
+                positions.setdefault((fr["frame_num"], LABEL_TO_SLOT[r["slot"]]),
+                                     list(r["field_pos"]))
     diag = data_root / "web" / "uploads" / f"diagnostic_{job}.jsonl"
     lines = diag.read_text().splitlines() if diag.exists() else []
     reads = vlm_read_rows_from_jsonl(lines)
@@ -189,7 +347,8 @@ def load_job(data_root: Path, prefix: str) -> dict:
         votes_by_slot[int(slot)] = {str(k): float(v)
                                     for k, v in votes_by_id.get(iid, {}).items()}
     return {"job": job, "bindings": bindings, "frame_nums": frame_nums,
-            "reads": reads, "slot_meta": slot_meta, "votes_by_slot": votes_by_slot}
+            "reads": reads, "slot_meta": slot_meta, "votes_by_slot": votes_by_slot,
+            "positions": positions}
 
 
 def main(argv=None) -> int:
@@ -203,6 +362,19 @@ def main(argv=None) -> int:
     ap.add_argument("--identity-log", help="exact identity_log JSON dump to use "
                                            "instead of the binding reconstruction")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
+    ap.add_argument("--swap", action="store_true",
+                    help="also run the swap-aware time-varying resolve "
+                         "(identity_swap_resolve) and compare it with gir")
+    ap.add_argument("--swap-lambda", type=float, default=SwapParams.swap_lambda,
+                    help="swap cost in vote-weight units (default %(default)s)")
+    ap.add_argument("--prox-m", type=float, default=SwapParams.prox_m,
+                    help="swap-gate proximity threshold, metres (default %(default)s)")
+    ap.add_argument("--fps", type=float, default=SwapParams.fps,
+                    help="source video fps (default %(default)s)")
+    ap.add_argument("--auto-end", type=int, default=1860,
+                    help="first teleop source frame (default %(default)s)")
+    ap.add_argument("--holdout-runs", type=int, default=50)
+    ap.add_argument("--holdout-frac", type=float, default=0.3)
     args = ap.parse_args(argv)
 
     truth = {}
@@ -217,11 +389,22 @@ def main(argv=None) -> int:
     res = run_check(data["bindings"], data["frame_nums"], data["reads"], truth,
                     slot_meta=data["slot_meta"], votes_by_slot=data["votes_by_slot"],
                     identity_log=ilog)
+    sres = None
+    if args.swap:
+        params = SwapParams(swap_lambda=args.swap_lambda, prox_m=args.prox_m, fps=args.fps)
+        sres = run_swap_check(data["bindings"], data["frame_nums"], data["reads"], truth,
+                              positions=data.get("positions"),
+                              votes_by_slot=data["votes_by_slot"], params=params,
+                              auto_end=args.auto_end, holdout_runs=args.holdout_runs,
+                              holdout_frac=args.holdout_frac, identity_log=ilog)
     if args.json:
-        print(json.dumps({"job": data["job"], **res}, default=str, indent=2))
+        print(json.dumps({"job": data["job"], **res,
+                          **({"swap": sres} if sres else {})}, default=str, indent=2))
     else:
         print(f"== {data['job']}")
         print(format_report(res))
+        if sres:
+            print(format_swap_report(sres))
     return 0
 
 

@@ -196,6 +196,102 @@ def decide_vlm_read(
             return ReadDecision(due=False, reason="unconfirmed_not_due", priority=0.0, is_audit=False)
 
 
+# ---- read-trigger telemetry -------------------------------------------------
+# Why a bumper read was attempted: the ``trigger`` field of every vlm_read
+# diagnostic row and the per-trigger finalize counters. Scheduled reads carry
+# the decide_vlm_read / census reason; an immediate read carries the specific
+# escalation that queued it (IMMEDIATE_* below), not the generic
+# "immediate_read_requested".
+TRIGGER_UNCONFIRMED_RETRY = "unconfirmed_retry"
+TRIGGER_AUDIT = "audit_due"
+TRIGGER_CENSUS = "census"
+TRIGGER_EARLY_OCR = "early_ocr"          # one-shot pass at the auto start
+TRIGGER_IMMEDIATE = "immediate"          # request raised with no recorded reason
+TRIGGER_UNSPECIFIED = "unspecified"      # direct read-pass callers (tests)
+
+IMMEDIATE_RE_ATTACHMENT = "re_attachment"
+IMMEDIATE_LOW_MARGIN = "low_margin"
+IMMEDIATE_APPEARANCE_DIVERGENT = "appearance_divergent"
+IMMEDIATE_ROSTER_CONFLICT = "roster_conflict"
+IMMEDIATE_AMBIGUOUS = "co_occlusion_ambiguous"
+IMMEDIATE_CONTRADICTION = "contradiction"    # confirmed lock contradicted
+IMMEDIATE_ROSTER_CLEAR = "roster_clear"      # team cleared by another's lock
+
+
+def read_trigger(decision_reason: str, immediate_reason: Optional[str] = None) -> str:
+    """The trigger name for a read scheduled with ``decision_reason`` (a
+    ReadDecision.reason). An immediate read reports the escalation that
+    queued it (``immediate_reason``), falling back to TRIGGER_IMMEDIATE."""
+    if decision_reason == "immediate_read_requested":
+        return immediate_reason or TRIGGER_IMMEDIATE
+    return decision_reason
+
+
+# ---- per-slot read census (job knob read_census, default OFF) ----------------
+# Census priorities sit between the unconfirmed-retry band (3-5) and the
+# priority-10 immediate escalations, so an escalation always wins a contested
+# pass and, among census reads, the slot with the weakest evidence wins.
+CENSUS_BASE_PRIORITY = 6.0
+CENSUS_STARVE_SPAN = 2.0       # added in full at evidence margin 0
+CENSUS_OVERDUE_RATE = 0.1      # per second past the interval ...
+CENSUS_OVERDUE_MAX = 1.0       # ... capped, so census never reaches 10
+
+
+def slot_evidence_margin(votes) -> float:
+    """Top accumulated team vote minus the runner-up for one slot (0.0 when
+    the slot has no named read). ``votes`` is ``{team: accumulated vote}``.
+    Same evidence the whole-match per-slot resolve sums (every named read's
+    vote_weight credited to the crop's slot), so a small margin is a slot the
+    resolve would leave tied or contested."""
+    vals = sorted((float(v) for v in (votes or {}).values()), reverse=True)
+    if not vals:
+        return 0.0
+    return vals[0] - (vals[1] if len(vals) > 1 else 0.0)
+
+
+def census_read_decision(
+    current_match_time: float,
+    last_attempt_time: float,
+    backoff_until: float,
+    interval_sec: float,
+    evidence_margin: float,
+    honor_backoff: bool = True,
+) -> ReadDecision:
+    """Census: a bound slot's identity is read-due once its last read ATTEMPT
+    (on this slot or by this identity) is ``interval_sec`` old, regardless of
+    confirmation state, identity births or audits — read supply per slot
+    stops depending on identity churn.
+
+    Failure backoff: with ``honor_backoff`` a census read also waits out
+    ``backoff_until`` (3 s after one failed read, then the 4 s cap). The job
+    knob read_census_honor_backoff defaults OFF: ~65% of qm11 reads name no
+    team, so an honoured backoff holds most slots — the blue ones census
+    exists for — to one read per ~4.5 s (offline qm11 sim, blue slots vs
+    census OFF: -2..+26% reads honoured, +49..+83% with the census interval
+    as the per-slot limit; scripts/sim_read_census.py). The
+    interval already bounds a failing slot's cost (one read per interval;
+    no-crop attempts call no reader at all), so the backoff adds no
+    protection census needs.
+
+    The novelty gate does NOT apply: it is position-only, so a robot
+    rotating in place to shoot presents a new bumper face it cannot see, and
+    its 8 s escape would cut census to one read per 8 s on exactly the
+    parked, hard-to-read robots census exists for.
+
+    Priority: CENSUS_BASE_PRIORITY + CENSUS_STARVE_SPAN / (1 + margin) + a
+    capped overdue term — the weakest-evidence slot reads first whenever the
+    pass budget (VLM_TOP_K, single-flight) is contested; always < 10."""
+    if honor_backoff and current_match_time < backoff_until:
+        return ReadDecision(due=False, reason="backed_off", priority=0.0, is_audit=False)
+    elapsed = current_match_time - last_attempt_time
+    if elapsed < interval_sec:
+        return ReadDecision(due=False, reason="census_not_due", priority=0.0, is_audit=False)
+    margin = max(0.0, float(evidence_margin or 0.0))
+    overdue = min(CENSUS_OVERDUE_MAX, (elapsed - interval_sec) * CENSUS_OVERDUE_RATE)
+    priority = CENSUS_BASE_PRIORITY + CENSUS_STARVE_SPAN / (1.0 + margin) + overdue
+    return ReadDecision(due=True, reason=TRIGGER_CENSUS, priority=priority, is_audit=False)
+
+
 def should_queue_immediate_read(
     current_match_time: float,
     last_vlm_time: float,

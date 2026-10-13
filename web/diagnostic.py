@@ -134,7 +134,8 @@ class DiagnosticRecorder:
                        surface: str = "unknown",
                        clef_probs: dict | None = None,
                        clef_frames: list | None = None,
-                       clef_same_robot: float | None = None) -> None:
+                       clef_same_robot: float | None = None,
+                       trigger: str | None = None) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -159,6 +160,14 @@ class DiagnosticRecorder:
                 {"frame": int(f["frame"]), "cam": str(f["cam"])} for f in clef_frames]
         if clef_same_robot is not None:
             record["clef_same_robot"] = float(clef_same_robot)
+        # Why the read was attempted (every reader): the scheduler reason
+        # (unconfirmed_retry, audit_due, census, early_ocr) or, for an
+        # immediate read, the escalation that queued it (re_attachment,
+        # low_margin, appearance_divergent, roster_conflict,
+        # co_occlusion_ambiguous, contradiction, roster_clear). Omitted when
+        # the caller passes none, so other callers' rows are unchanged.
+        if trigger is not None:
+            record["trigger"] = str(trigger)
         self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

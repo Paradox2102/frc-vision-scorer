@@ -561,6 +561,28 @@ KNOBS = [
          section="VLM reader"),
     Knob("clef_mf_same_robot_min", "CLEF_MF_SAME_ROBOT_MIN", float,
          clef_reader.DEFAULT_SAME_ROBOT_MIN, min=0.0, max=1.0, section="VLM reader"),
+    # Per-slot read census: every live, bound slot's current identity becomes
+    # read-due once its last read ATTEMPT (on that slot or by that identity)
+    # is read_census_interval_s old — regardless of confirmation, identity
+    # births or audits — weakest-evidence slot first (per-slot top-minus-
+    # runner-up vote margin). Decouples read supply from identity churn: qm11
+    # full match read 107-170 times with blue slots attempted every 7-10 s
+    # (median) and 4786 named <=1x, and identity_continuity cut births
+    # 575->326, reads 170->145 and binding 4/6->1/6.
+    # ~3 reads/s target (6 slots / 2 s, ~500/match, ~$0.02 on clef-flash).
+    # Works with any team_reader (local vLLM: GPU time, warned once).
+    # Census reads honour the single-flight pass and the all-camera occlusion
+    # gate, and skip the (position-only) novelty gate. The failure backoff
+    # (3-4 s after a failed read) applies only with read_census_honor_backoff:
+    # ~65% of reads name no team, so honouring it caps the illegible (mostly
+    # blue) slots at ~1 read / 4.5 s — scripts/sim_read_census.py on the qm11
+    # timeline: OFF 265 reads, ON 455 (2.7/s, p90 gap <= 3.5 s), ON+honour
+    # 330 (p90 4.5-6 s). DEFAULT OFF pending a full-match A/B.
+    Knob("read_census", "READ_CENSUS", bool, False, section="VLM reader"),
+    Knob("read_census_interval_s", "READ_CENSUS_INTERVAL_S", float, 2.0,
+         min=0.5, max=30.0, section="VLM reader"),
+    Knob("read_census_honor_backoff", "READ_CENSUS_HONOR_BACKOFF", bool, False,
+         section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only

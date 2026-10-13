@@ -141,11 +141,23 @@ from web.field.identity import (
     live_robot_tracks,
 )
 from web.field.identity_confidence import (
+    IMMEDIATE_AMBIGUOUS,
+    IMMEDIATE_APPEARANCE_DIVERGENT,
+    IMMEDIATE_CONTRADICTION,
+    IMMEDIATE_LOW_MARGIN,
+    IMMEDIATE_RE_ATTACHMENT,
+    IMMEDIATE_ROSTER_CLEAR,
+    IMMEDIATE_ROSTER_CONFLICT,
+    TRIGGER_EARLY_OCR,
+    TRIGGER_UNSPECIFIED,
     ConfidenceConfig,
     best_owned_team,
     blend_read_confidence,
+    census_read_decision,
     decide_vlm_read,
     read_backoff_sec,
+    read_trigger,
+    slot_evidence_margin,
     dedupe_batch_team_reads,
     digit_token_conf,
     normalize_surface,
@@ -1538,6 +1550,20 @@ class InferenceJob:
         self._crop_buffer = None
         self._mf_state = None
         self._mf_counts = {"multi": 0, "single": 0}
+        # Read-trigger telemetry (always on, diagnostics only): per-trigger
+        # counts of recorded vlm_read rows, the escalation behind each pending
+        # immediate-read request ({identity_id: reason}), and the latest
+        # scheduler pass's {identity_id: trigger} (snapshotted per read pass).
+        self._read_trigger_counts: dict[str, int] = {}
+        self._read_dropped_counts: dict[str, int] = {}
+        self._immediate_reasons: dict[int, str] = {}
+        self._due_triggers: dict[int, str] = {}
+        # read_census: per-slot clock of the last read attempt on the slot and
+        # per-slot {team: accumulated vote_weight} of named reads (the
+        # weakest-evidence-first margin). Only maintained with the knob on.
+        self._slot_last_read_attempt: dict[int, float] = {}
+        self._census_slot_votes: dict[int, dict[str, float]] = {}
+        self._census_warned = False
         # Single-flight background handle + per-identity position history for
         # the observe-only equipment-adjudication pass (equipment_adjudicate).
         self._adjudicate_task = None
@@ -2446,9 +2472,142 @@ class InferenceJob:
             "reads are skipped — no local-model fallback.",
         )
 
+    # ---- read-trigger telemetry (always on) + per-slot read census ----
+
+    def _request_immediate_read(self, ident, reason: str, renew: bool = False) -> None:
+        """Raise an immediate-read request on ``ident`` and remember the
+        escalation that queued it (the served read's ``trigger``). An
+        unstamped re-raise (ambiguity re-arm, roster clear, contradiction)
+        of a still-pending request keeps the original reason; ``renew`` (an
+        escalation that stamps a new last_immediate_queue_time — a new
+        request the in-flight read will not consume) replaces it."""
+        reasons = getattr(self, "_immediate_reasons", None)
+        if reasons is None:
+            reasons = self._immediate_reasons = {}
+        iid = getattr(ident, "identity_id", None)
+        if renew or not getattr(ident, "needs_immediate_read", False) or iid not in reasons:
+            reasons[iid] = reason
+        ident.needs_immediate_read = True
+
+    def _count_read_trigger(self, trigger: str, crop_time: Optional[float] = None,
+                            dropped: bool = False) -> None:
+        """One recorded vlm_read row, by trigger (+ the read-clock span the
+        rows cover, for the census rate in the finalize line). ``dropped``:
+        a read that returned for an identity evicted mid-flight (no row)."""
+        attr = "_read_dropped_counts" if dropped else "_read_trigger_counts"
+        counts = getattr(self, attr, None)
+        if counts is None:
+            counts = {}
+            setattr(self, attr, counts)
+        counts[trigger] = counts.get(trigger, 0) + 1
+        if dropped:
+            return
+        if crop_time is not None:
+            span = getattr(self, "_read_clock_span", None)
+            self._read_clock_span = ((crop_time, crop_time) if span is None
+                                     else (min(span[0], crop_time), max(span[1], crop_time)))
+
+    def _read_trigger_suffix(self) -> str:
+        """'; triggers: re_attachment=120, census=300, ...' (most frequent
+        first) + the census rate when census reads were made; '' if none."""
+        counts = getattr(self, "_read_trigger_counts", None) or {}
+        dropped = sum((getattr(self, "_read_dropped_counts", None) or {}).values())
+        if not counts and not dropped:
+            return ""
+        out = "; triggers: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        span = getattr(self, "_read_clock_span", None)
+        n_census = counts.get("census", 0)
+        if n_census and span is not None and span[1] > span[0]:
+            out += (f" (census {n_census / (span[1] - span[0]):.2f}/s over "
+                    f"{span[1] - span[0]:.0f}s)")
+        if dropped:
+            out += f"; {dropped} dropped (identity evicted in flight)"
+        return out
+
+    def _finalize_read_triggers(self) -> None:
+        """Fold per-trigger vlm_read counts into timings (numeric
+        ``reads.trigger.<name>`` + ``reads.total``) and a diagnostics gauge;
+        print a ``[reads]`` line for non-clef readers (a clef job appends the
+        same counts to its ``[clef]`` line). Idempotent; adds nothing when no
+        read row was recorded."""
+        if getattr(self, "_read_triggers_done", False):
+            return
+        self._read_triggers_done = True
+        counts = dict(getattr(self, "_read_trigger_counts", None) or {})
+        if not counts and not getattr(self, "_read_dropped_counts", None):
+            return
+        timings = getattr(self, "timings", None)
+        if isinstance(timings, dict):
+            for k, v in counts.items():
+                timings[f"reads.trigger.{k}"] = v
+            timings["reads.total"] = sum(counts.values())
+            dropped = getattr(self, "_read_dropped_counts", None) or {}
+            if dropped:
+                timings["reads.dropped_evicted"] = sum(dropped.values())
+            span = getattr(self, "_read_clock_span", None)
+            if counts.get("census") and span is not None and span[1] > span[0]:
+                timings["reads.census_per_s"] = counts["census"] / (span[1] - span[0])
+        diags = getattr(self, "identity_diagnostics", None)
+        if diags is not None:
+            try:
+                diags.gauge("read_triggers", counts)
+                dropped = getattr(self, "_read_dropped_counts", None)
+                if dropped:
+                    diags.gauge("read_dropped_evicted", dict(dropped))
+            except Exception:
+                pass
+        if getattr(self, "_clef_session", None) is None:
+            print(f"  [reads] {getattr(self, 'team_reader', 'local')}: "
+                  f"{sum(counts.values())} reads{self._read_trigger_suffix()}")
+
+    def _read_census_enabled(self) -> bool:
+        """read_census knob (any team_reader). The first call with it on
+        prints one line — a GPU-cost warning for the local/vLLM readers."""
+        cfg = getattr(self, "config", None)
+        on = bool(getattr(cfg, "read_census", False))
+        if on and not getattr(self, "_census_warned", False):
+            self._census_warned = True
+            interval = float(getattr(cfg, "read_census_interval_s", 2.0))
+            reader = getattr(self, "team_reader", "local")
+            rate = f"~{6.0 / interval:.1f} bumper reads/s (6 slots / {interval:g} s)"
+            if reader == "clef":
+                print(f"  [census] read_census ON: {rate} on Clef")
+            else:
+                print(f"  [census] WARNING read_census ON with team_reader={reader}: "
+                      f"{rate} of local GPU VLM time")
+        return on
+
+    def _census_due(self, ident, current_match_time: float):
+        """census_read_decision for a bound identity: its last attempt is the
+        newer of its own and its slot's (a birth or rebind does not reset the
+        slot's census clock); margin from the slot's named-read tally; the
+        failure backoff only with read_census_honor_backoff."""
+        slot = ident.active_slot
+        last_slot = (getattr(self, "_slot_last_read_attempt", None) or {}).get(slot, -999.0)
+        votes = (getattr(self, "_census_slot_votes", None) or {}).get(slot)
+        return census_read_decision(
+            current_match_time=current_match_time,
+            last_attempt_time=max(ident.last_vlm_time, last_slot),
+            backoff_until=ident.backoff_until,
+            interval_sec=float(getattr(self.config, "read_census_interval_s", 2.0)),
+            evidence_margin=slot_evidence_margin(votes),
+            honor_backoff=bool(getattr(self.config, "read_census_honor_backoff", False)),
+        )
+
+    def _note_slot_read_attempt(self, slot_id, crop_time: float) -> None:
+        if slot_id is None:
+            return
+        att = getattr(self, "_slot_last_read_attempt", None)
+        if att is None:
+            att = self._slot_last_read_attempt = {}
+        att[slot_id] = max(att.get(slot_id, -999.0), crop_time)
+
     def _finalize_clef_usage(self) -> None:
         """Fold Clef request/token/cost counters into timings + diagnostics and
-        print one summary line. Idempotent; a no-op for non-clef jobs."""
+        print one summary line (with the per-trigger read counts). Idempotent.
+        For non-clef jobs only the read-trigger fold runs (its own line)."""
+        self._finalize_read_triggers()
         session = getattr(self, "_clef_session", None)
         if session is None or getattr(self, "_clef_usage_done", False):
             return
@@ -2480,7 +2639,7 @@ class InferenceJob:
                         **buf.stats(), **(getattr(self, "_mf_counts", None) or {})})
             except Exception:
                 pass
-        print(f"  {session.summary_line()}")
+        print(f"  {session.summary_line()}{self._read_trigger_suffix()}")
 
     # ---- clef_multiframe: per-identity crop buffer + multi-image reads ----
 
@@ -2807,7 +2966,7 @@ class InferenceJob:
             ident.team_number = None
             ident.is_confirmed = False
             ident.confidence = 0.4
-            ident.needs_immediate_read = True
+            self._request_immediate_read(ident, IMMEDIATE_CONTRADICTION)
             self._mf_flush(ident.identity_id, "contradiction")
 
     def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding, robot_crop_b64=None):
@@ -2954,7 +3113,7 @@ class InferenceJob:
 
     async def read_fused_bumper_numbers(
         self, fused, requested_priorities: dict[int, float], det_to_slot=None,
-        crop_frame=None, slot_identity=None,
+        crop_frame=None, slot_identity=None, read_triggers=None,
     ) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
@@ -2980,6 +3139,11 @@ class InferenceJob:
         crop_frame falls back to self._current_frame at call time and rows
         name the live slot owner (today's behaviour for direct callers).
 
+        read_triggers ({identity_id: trigger}, snapshotted at scheduling)
+        names why each read was attempted: the ``trigger`` field of its
+        vlm_read row. Identities missing from it (direct callers) are
+        recorded as "unspecified".
+
         The whole body is wrapped in the vlm.pass_async stage so the true
         read-pass wall cost stays visible in the profile without implying it
         blocks the loop.
@@ -2987,7 +3151,8 @@ class InferenceJob:
         with self._stage("vlm.pass_async"):
             await self._read_fused_bumper_numbers_impl(
                 fused, requested_priorities, det_to_slot,
-                crop_frame=crop_frame, slot_identity=slot_identity)
+                crop_frame=crop_frame, slot_identity=slot_identity,
+                read_triggers=read_triggers)
 
     def _read_clock_sec(self, source_frame, processed_frame_num) -> float:
         """The main loop's read-scheduling clock for the frame being processed
@@ -3013,12 +3178,25 @@ class InferenceJob:
     def _collect_due_vlm_reads(self, current_match_time: float) -> dict:
         """{identity_id: priority} for every identity due a bumper read at
         `current_match_time` (the loop's read clock). Records the
-        vlm_scheduled diagnostics and vlm_status counts as a side effect."""
+        vlm_scheduled diagnostics and vlm_status counts as a side effect,
+        and each due identity's read trigger in ``self._due_triggers``
+        (snapshotted into the read pass by _schedule_vlm_pass).
+
+        read_census (knob, default OFF): a bound identity not otherwise due
+        becomes due with reason "census" once its slot's last read attempt is
+        read_census_interval_s old (census_read_decision: skips the novelty
+        gate, waits out the failure backoff only with
+        read_census_honor_backoff; the occlusion gate above still applies). One
+        that is due anyway keeps its own trigger and takes the higher of the
+        two priorities, so the weakest-evidence slots win a contested pass."""
         unconfirmed_count = sum(
             1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
         )
+        census = self._read_census_enabled()
+        immediate_reasons = getattr(self, "_immediate_reasons", None) or {}
 
         due_priorities = {}
+        due_triggers = {}
         for ident in self.identity_registry.identities.values():
             if ident.active_slot is None:
                 continue
@@ -3057,8 +3235,19 @@ class InferenceJob:
                 last_read_failed=last_failed,
                 moved_since_read=moved,
             )
+            priority = decision.priority
+            if census:
+                census_decision = self._census_due(ident, current_match_time)
+                if census_decision.due:
+                    if decision.due:
+                        priority = max(priority, census_decision.priority)
+                    else:
+                        decision = census_decision
+                        priority = decision.priority
             if decision.due:
-                due_priorities[ident.identity_id] = decision.priority
+                due_priorities[ident.identity_id] = priority
+                due_triggers[ident.identity_id] = read_trigger(
+                    decision.reason, immediate_reasons.get(ident.identity_id))
                 self.identity_diagnostics.increment(
                     f"vlm_scheduled.{decision.reason}"
                 )
@@ -3066,10 +3255,11 @@ class InferenceJob:
                     DiagnosticEvents.VLM_SCHEDULED,
                     identity_id=ident.identity_id,
                     reason_type=decision.reason,
-                    priority=decision.priority,
+                    priority=priority,
                     is_audit=decision.is_audit,
                 )
 
+        self._due_triggers = due_triggers
         self.vlm_status.update({
             "unconfirmed": unconfirmed_count,
             "due_count": len(due_priorities),
@@ -3107,10 +3297,16 @@ class InferenceJob:
             for iid, ident in self.identity_registry.identities.items()
             if getattr(ident, "active_slot", None) is not None
         }
+        # ...and each due identity's read trigger (the next frame's scheduler
+        # pass overwrites _due_triggers while this pass is in flight).
+        _due_triggers = getattr(self, "_due_triggers", None) or {}
+        _read_triggers = {iid: _due_triggers[iid] for iid in due_priorities
+                          if iid in _due_triggers}
         self._vlm_task = asyncio.create_task(
             self.read_fused_bumper_numbers(
                 fused, due_priorities, det_to_slot=_det_to_slot,
-                crop_frame=crop_frame, slot_identity=_slot_identity))
+                crop_frame=crop_frame, slot_identity=_slot_identity,
+                read_triggers=_read_triggers))
 
     async def _drain_vlm_task(self) -> None:
         """Await any in-flight background VLM read so its votes land before
@@ -3194,7 +3390,7 @@ class InferenceJob:
 
     async def _read_fused_bumper_numbers_impl(
         self, fused, requested_priorities: dict[int, float], det_to_slot=None,
-        crop_frame=None, slot_identity=None,
+        crop_frame=None, slot_identity=None, read_triggers=None,
     ) -> None:
         # Direct/synchronous callers run up to the first await immediately, so
         # the live frame here IS the crop frame (today's behaviour).
@@ -3221,6 +3417,9 @@ class InferenceJob:
         current_match_time = (
             crop_frame if VLM_READ_CLOCK_FIX else self._current_frame
         ) / (self.video_fps or 10.0)
+        # read_census: per-slot attempt clock + named-read tally (knob only).
+        census = self._read_census_enabled()
+        read_triggers = read_triggers or {}
 
         # Map slot_id -> obs. det_to_slot is the frame-indexed detection->slot
         # mapping; when the pass runs as a background task it MUST be the
@@ -3286,6 +3485,8 @@ class InferenceJob:
             else:
                 # No crops found: backoff
                 ident.last_vlm_time = current_match_time
+                if census:
+                    self._note_slot_read_attempt(slot_id, current_match_time)
                 ident.vlm_fail_count += 1
                 ident.backoff_until = current_match_time + read_backoff_sec(
                     self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
@@ -3297,6 +3498,8 @@ class InferenceJob:
                 ident = self.identity_registry.identities.get(identity_id)
                 if ident and ident.identity_id not in identities_with_crops:
                     ident.last_vlm_time = current_match_time
+                    if census:
+                        self._note_slot_read_attempt(ident.active_slot, current_match_time)
                     ident.vlm_fail_count += 1
                     ident.backoff_until = current_match_time + read_backoff_sec(
                         self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
@@ -3448,11 +3651,18 @@ class InferenceJob:
             robot = self._get_or_create_slot_track(slot_id)
             ident = self.identity_registry.identities.get(identity_id)
             if not robot or not ident:
+                # The identity was evicted (registry caps) while its read was
+                # in flight: the paid read leaves no vlm_read row and no vote.
+                # Counted (telemetry only) so read supply lost to churn shows.
+                self._count_read_trigger(
+                    read_triggers.get(identity_id, TRIGGER_UNSPECIFIED), dropped=True)
                 continue
 
             # Update VLM attempt time + position (novelty-gate reference)
             ident.last_vlm_time = current_match_time
             ident.last_vlm_pos = getattr(robot, "field_position", None)
+            if census:
+                self._note_slot_read_attempt(slot_id, current_match_time)
 
             team = res.get("team_number")
             conf = float(res.get("confidence", 0.0))
@@ -3497,6 +3707,8 @@ class InferenceJob:
             # the same_robot probability. Absent otherwise (rows unchanged).
             _mf_diag = {k: res[k] for k in ("clef_frames", "clef_same_robot")
                         if res.get(k) is not None}
+            # Why this read was attempted (scheduler snapshot; always on).
+            _trigger = read_triggers.get(identity_id, TRIGGER_UNSPECIFIED)
             self.diagnostic.record_vlm_read(
                 frame=crop_frame, robot_id=diag_robot_id,
                 crop_b64=crop_b64,
@@ -3508,8 +3720,18 @@ class InferenceJob:
                 vote_weight=vote_weight,
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
+                trigger=_trigger,
                 **_mf_diag,
             )
+            self._count_read_trigger(_trigger, current_match_time)
+            if census and team:
+                # Same evidence the whole-match per-slot resolve sums: every
+                # named row's vote_weight on the crop's slot.
+                _cv = getattr(self, "_census_slot_votes", None)
+                if _cv is None:
+                    _cv = self._census_slot_votes = {}
+                _sv = _cv.setdefault(slot_id, {})
+                _sv[team] = _sv.get(team, 0.0) + vote_weight
             if res.get("error") == clef_reader.INCONSISTENT_ERROR:
                 self._on_tracklet_inconsistent(identity_id, slot_id, res, crop_frame)
 
@@ -3787,13 +4009,16 @@ class InferenceJob:
         tracked_robots,
         boxes_are_bumpers: bool = False,
         crop_frame=None,
+        trigger: str = TRIGGER_EARLY_OCR,
     ) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
         identity can be overturned by the audit (assign_teams_from_votes +
         audit_overturn_confirmations). tracked_robots: list of (canonical_id, box).
         crop_frame is the frame `frame` was cut from (det-gate lookup and
-        diagnostics); defaults to self._current_frame."""
+        diagnostics); defaults to self._current_frame. ``trigger`` names the
+        reads in their vlm_read rows (the only caller is the early-OCR pass
+        at the auto start)."""
         if crop_frame is None:
             crop_frame = self._current_frame
         if not self.match_teams:
@@ -3898,7 +4123,10 @@ class InferenceJob:
                 vote_weight=1.0 if float(res.get("confidence", 0.0)) >= 0.85 else 0.5,
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
+                trigger=trigger,
             )
+            self._count_read_trigger(
+                trigger, crop_frame / (getattr(self, "video_fps", None) or 10.0))
         self.last_ocr_crops = ocr_crops
         self._ocr_crops_dirty = True
 
@@ -4471,7 +4699,7 @@ class InferenceJob:
                 ident.team_number = None
                 ident.is_confirmed = False
                 ident.confidence = min(ident.confidence, 0.4)
-                ident.needs_immediate_read = True
+                self._request_immediate_read(ident, IMMEDIATE_ROSTER_CLEAR)
                 self._mf_flush(ident.identity_id, "roster_clear")
 
     def ocr_score(self, overhead_frame: np.ndarray, alliance: str) -> Optional[int]:
@@ -5723,7 +5951,7 @@ class InferenceJob:
             ambiguous_ids = self.co_occlusion_tracker.ambiguous_identity_ids()
             ident.is_ambiguous = ident.identity_id in ambiguous_ids
             if ident.is_ambiguous:
-                ident.needs_immediate_read = True
+                self._request_immediate_read(ident, IMMEDIATE_AMBIGUOUS)
 
             # Check for appearance divergence
             appearance_divergent = False
@@ -5784,29 +6012,29 @@ class InferenceJob:
                     ident.last_immediate_queue_time,
                     self.confidence_config.immediate_read_cooldown_sec,
                 )
-                queued = False
+                # Escalations that fired this frame, in check order; the first
+                # names the queued read's trigger (read-trigger telemetry).
+                fired = []
                 prev_slot = self._last_bindings.get(ident.identity_id)
                 # re-attachment
                 if prev_slot is None and allow_immediate:
-                    ident.needs_immediate_read = True
-                    queued = True
+                    fired.append(IMMEDIATE_RE_ATTACHMENT)
                     print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
                 # low margins
                 if relink_margin < 0.1 and allow_immediate:
-                    ident.needs_immediate_read = True
-                    queued = True
+                    fired.append(IMMEDIATE_LOW_MARGIN)
                     print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
                 # appearance divergence
                 if appearance_divergent and allow_immediate:
-                    ident.needs_immediate_read = True
-                    queued = True
+                    fired.append(IMMEDIATE_APPEARANCE_DIVERGENT)
                     print(f"  Immediate read queued for identity {ident.identity_id}: appearance divergent")
                 # roster conflict
                 if not roster_uniqueness_ok and allow_immediate:
-                    ident.needs_immediate_read = True
-                    queued = True
+                    fired.append(IMMEDIATE_ROSTER_CONFLICT)
                     print(f"  Immediate read queued for identity {ident.identity_id}: roster conflict")
-                if queued:
+                if fired:
+                    # A new queue stamp is a new request: it renews the reason.
+                    self._request_immediate_read(ident, fired[0], renew=True)
                     ident.last_immediate_queue_time = current_match_time
 
         # 4. Bind new slots to identities

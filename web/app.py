@@ -3314,6 +3314,10 @@ class InferenceJob:
     def _emit_diagnostic_snapshot(self, frame: int) -> None:
         """Build a snapshot dict from current state and hand to the recorder.
 
+        `frame` is a SOURCE video frame number (not a processed-frame index),
+        matching last_seen_frame / last_embedding_frame and every other
+        diagnostic row.
+
         Reads embedding-freshness fields defensively via getattr — those fields
         are populated by the re-ID instrumentation in Task 6; before that lands,
         the snapshot still works with sensible defaults.
@@ -3327,10 +3331,12 @@ class InferenceJob:
                 "last_match_similarity": getattr(r, "last_reid_similarity", None),
                 "last_match_gap": getattr(r, "last_reid_gap", None),
             }
-            # Use `is None` not `or` — frame 0 is a real frame number.
+            # Use `is None` not `or` — frame 0 is a real frame number. Fall back
+            # to `frame`, not positions_history[-1][0]: that is a processed
+            # index and there is no reliable processed->source mapping.
             last_seen = getattr(r, "last_seen_frame", None)
             if last_seen is None:
-                last_seen = r.positions_history[-1][0] if r.positions_history else frame
+                last_seen = frame
             robots_state.append({
                 "robot_id": r.robot_id,
                 "alliance": r.alliance,
@@ -7503,7 +7509,10 @@ class InferenceJob:
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
                     self.audit_overturn_confirmations()
-                    self._emit_diagnostic_snapshot(processed_frame_num)
+                    # Cadence is by processed index, but the row is stamped with
+                    # the SOURCE frame like every other diagnostic row and
+                    # _identity_log (last_seen/last_embedding are source frames).
+                    self._emit_diagnostic_snapshot(frame_num)
 
                 # Ball trajectory tracking — link ball detections across frames
                 # and detect when balls enter hubs (with trajectory-based shooter ID)

@@ -138,11 +138,13 @@ from web.field.identity_confidence import (
     best_owned_team,
     blend_read_confidence,
     decide_vlm_read,
+    read_backoff_sec,
     dedupe_batch_team_reads,
     digit_token_conf,
     normalize_surface,
     occlusion_blocks_read,
     prob_vote_multiplier,
+    read_clock_sec,
     surface_vote_multiplier,
     tentative_claim_winners,
     vote_ray_cross_m,
@@ -433,6 +435,17 @@ WS_SEND_TIMEOUT = float(os.environ.get("WS_SEND_TIMEOUT", "30"))
 WS_STOP_GRACE = float(os.environ.get("WS_STOP_GRACE", "5"))
 # Never schedule a read for a slot whose bumper is occluded in EVERY camera.
 VLM_OCCLUSION_GATE = os.environ.get("VLM_OCCLUSION_GATE", "1") not in ("0", "false", "False")
+# Bumper-read cadence on ONE real-time clock. ON: the scheduler runs on the
+# source-video seconds of the frame being processed and read stamps use the
+# crop frame, so unconfirmed retries / backoff / audits elapse in real match
+# seconds; and a completed read attempt without a usable team consumes its
+# immediate-read request (fall back to backoff cadence until a NEW trigger).
+# OFF (legacy, for A/B): processed_frame_num/fps scheduler (frame_skip x slow)
+# vs real-time stamps -> only immediate reads ever fire, and an illegible
+# robot stays "immediate" on every processed frame. Also moves the loop's
+# other current_match_time consumers (calibration drift monitor, equipment
+# adjudication cooldown/static window) onto real seconds.
+VLM_READ_CLOCK_FIX = os.environ.get("VLM_READ_CLOCK_FIX", "1") not in ("0", "false", "False")
 AUDIT_FLOOR_SECONDS = 30.0     # min match seconds between audits for a confirmed identity
 VLM_UNCONFIRMED_FAST_INTERVAL_SEC = 0.75
 VLM_UNCONFIRMED_MED_INTERVAL_SEC = 1.25
@@ -2631,6 +2644,93 @@ class InferenceJob:
                 fused, requested_priorities, det_to_slot,
                 crop_frame=crop_frame, slot_identity=slot_identity)
 
+    def _read_clock_sec(self, source_frame, processed_frame_num) -> float:
+        """The main loop's read-scheduling clock for the frame being processed
+        (see read_clock_sec; VLM_READ_CLOCK_FIX picks real vs legacy)."""
+        return read_clock_sec(source_frame, processed_frame_num, self.video_fps,
+                              fixed=VLM_READ_CLOCK_FIX)
+
+    def _consume_immediate_request(self, ident, crop_time: float) -> None:
+        """A read attempt for `ident` (crop cut at `crop_time`) has served its
+        immediate-read request. Under VLM_READ_CLOCK_FIX only a request queued
+        at or before the crop is consumed: an escalation stamped later (it
+        fired while the pass was in flight) asked about a newer view and
+        survives. Requests raised without a queue stamp (ambiguity re-arm,
+        roster clear, contradiction) are consumed: the ambiguity trigger
+        re-arms every frame anyway, and the others are raised by votes AFTER
+        the consume step (see the read pass)."""
+        if not VLM_READ_CLOCK_FIX:
+            ident.needs_immediate_read = False
+            return
+        if getattr(ident, "last_immediate_queue_time", -999.0) <= crop_time + 1e-9:
+            ident.needs_immediate_read = False
+
+    def _collect_due_vlm_reads(self, current_match_time: float) -> dict:
+        """{identity_id: priority} for every identity due a bumper read at
+        `current_match_time` (the loop's read clock). Records the
+        vlm_scheduled diagnostics and vlm_status counts as a side effect."""
+        unconfirmed_count = sum(
+            1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
+        )
+
+        due_priorities = {}
+        for ident in self.identity_registry.identities.values():
+            if ident.active_slot is None:
+                continue
+            # Occlusion gate: a bumper hidden in EVERY camera cannot
+            # be read — at best a wasted call, at worst a garbage-crop
+            # contradiction against a correct lock. The
+            # needs_immediate_read flag is NOT cleared, so the read
+            # fires on the first visible frame.
+            if VLM_OCCLUSION_GATE and occlusion_blocks_read(
+                    (self._occ or {}).get(ident.active_slot)):
+                self.identity_diagnostics.increment(
+                    "vlm_scheduled.occluded_skip")
+                continue
+            # Novelty inputs: a failed read of an unmoved robot is
+            # the same unreadable view again (decide_vlm_read gates
+            # it, bounded by novelty_skip_max_sec).
+            last_failed = (ident.last_vlm_time > ident.last_success_time)
+            moved = True
+            slot_track = self._get_slot_track_if_exists(ident.active_slot)
+            cur_pos = getattr(slot_track, "field_position", None)
+            if ident.last_vlm_pos is not None and cur_pos is not None:
+                moved = (
+                    (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
+                    + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
+                ) ** 0.5 >= self.confidence_config.novelty_min_move_m
+            decision = decide_vlm_read(
+                is_confirmed=ident.is_confirmed,
+                confidence=ident.confidence,
+                last_vlm_time=ident.last_vlm_time,
+                last_success_time=ident.last_success_time,
+                backoff_until=ident.backoff_until,
+                needs_immediate_read=ident.needs_immediate_read,
+                current_match_time=current_match_time,
+                unconfirmed_count=unconfirmed_count,
+                config=self.confidence_config,
+                last_read_failed=last_failed,
+                moved_since_read=moved,
+            )
+            if decision.due:
+                due_priorities[ident.identity_id] = decision.priority
+                self.identity_diagnostics.increment(
+                    f"vlm_scheduled.{decision.reason}"
+                )
+                self.identity_diagnostics.record(
+                    DiagnosticEvents.VLM_SCHEDULED,
+                    identity_id=ident.identity_id,
+                    reason_type=decision.reason,
+                    priority=decision.priority,
+                    is_audit=decision.is_audit,
+                )
+
+        self.vlm_status.update({
+            "unconfirmed": unconfirmed_count,
+            "due_count": len(due_priorities),
+        })
+        return due_priorities
+
     def _schedule_vlm_pass(self, fused, due_priorities, crop_frame=None) -> None:
         """Single-flight schedule of the background bumper-read pass.
 
@@ -2767,7 +2867,15 @@ class InferenceJob:
             self._ocr_crops_dirty = True
             return
 
-        current_match_time = self._current_frame / (self.video_fps or 10.0)
+        # Read stamps (last_vlm_time / last_success_time / backoff_until) are
+        # on the scheduler's clock: the CROP frame's source seconds — the
+        # frame the scheduler judged this identity due at. The live
+        # _current_frame has moved on by the time this background body runs
+        # (next loop yield), so stamping it made intervals depend on task
+        # start latency. VLM_READ_CLOCK_FIX=0 restores the live-frame stamp.
+        current_match_time = (
+            crop_frame if VLM_READ_CLOCK_FIX else self._current_frame
+        ) / (self.video_fps or 10.0)
 
         # Map slot_id -> obs. det_to_slot is the frame-indexed detection->slot
         # mapping; when the pass runs as a background task it MUST be the
@@ -2834,7 +2942,8 @@ class InferenceJob:
                 # No crops found: backoff
                 ident.last_vlm_time = current_match_time
                 ident.vlm_fail_count += 1
-                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                ident.backoff_until = current_match_time + read_backoff_sec(
+                    self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
                 print(f"  VLM backoff: Identity {identity_id} (slot {slot_id}) has no crops. Backoff until {ident.backoff_until:.2f}")
 
         # For any requested identity that didn't even have an active slot or obs
@@ -2844,7 +2953,14 @@ class InferenceJob:
                 if ident and ident.identity_id not in identities_with_crops:
                     ident.last_vlm_time = current_match_time
                     ident.vlm_fail_count += 1
-                    ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                    ident.backoff_until = current_match_time + read_backoff_sec(
+                        self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
+                    if VLM_READ_CLOCK_FIX:
+                        # A no-crop attempt is a completed attempt (stamped and
+                        # backed off above): left set, the priority-10 request
+                        # would bypass that backoff and re-fire every frame,
+                        # ratcheting vlm_fail_count once per frame.
+                        self._consume_immediate_request(ident, current_match_time)
                     print(f"  VLM backoff: Identity {identity_id} not visible/active. Backoff until {ident.backoff_until:.2f}")
 
         if not candidates:
@@ -2937,6 +3053,24 @@ class InferenceJob:
             (r.get("team_number"), float(r.get("confidence", 0.0)), c[1])
             for c, r in zip(chosen, results)
         ])
+        if VLM_READ_CLOCK_FIX:
+            # The attempt has completed: consume each read identity's
+            # immediate request BEFORE any vote is applied, so requests the
+            # votes themselves raise on other identities in this batch
+            # (_clear_team_from_other_robots, a confirmed-lock contradiction)
+            # are new and survive. A read without a usable team now falls
+            # back to backoff + unconfirmed cadence instead of re-firing at
+            # priority 10 on every frame. Unchanged: an ambiguous identity
+            # keeps its request after a successful read until its
+            # co-occlusion group resolves.
+            for (_p, _w, identity_id, *_rest), res in zip(chosen, results):
+                ident = self.identity_registry.identities.get(identity_id)
+                if ident is None:
+                    continue
+                usable = bool(res.get("team_number")) and not res.get("error")
+                if usable and getattr(ident, "is_ambiguous", False):
+                    continue
+                self._consume_immediate_request(ident, current_match_time)
         for _read_idx, ((_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res) in enumerate(zip(chosen, results)):
             robot = self._get_or_create_slot_track(slot_id)
             ident = self.identity_registry.identities.get(identity_id)
@@ -3001,7 +3135,8 @@ class InferenceJob:
             # Update success/backoff based on whether read succeeded
             if res.get("error") or not team:
                 ident.vlm_fail_count += 1
-                ident.backoff_until = current_match_time + self.confidence_config.backoff_base_sec * (1.5 ** ident.vlm_fail_count)
+                ident.backoff_until = current_match_time + read_backoff_sec(
+                    self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
             else:
                 previous_team = ident.team_number
                 ident.last_success_time = current_match_time
@@ -3014,7 +3149,8 @@ class InferenceJob:
                     and previous_team is not None
                     and team != previous_team
                 )
-                if not ident.is_ambiguous:
+                if not ident.is_ambiguous and not VLM_READ_CLOCK_FIX:
+                    # Legacy clear (fix ON: consumed before the vote loop).
                     ident.needs_immediate_read = False
 
             if (robot.team_number_confirmed and team == robot.team_number
@@ -5168,7 +5304,14 @@ class InferenceJob:
             # the escalation cooldown so a just-read identity isn't pinned at
             # priority 10 every frame its condition persists.
             if is_observed:
-                current_match_time = self._current_frame / (self.video_fps or 10.0)
+                # Same clock as the scheduler and the read stamps: the source
+                # frame being processed (log_frame_num). _current_frame is
+                # assigned at loop END, so in the main loop it is one stride
+                # stale here. VLM_READ_CLOCK_FIX=0 restores _current_frame.
+                _clock_frame = (log_frame_num
+                                if (VLM_READ_CLOCK_FIX and log_frame_num is not None)
+                                else self._current_frame)
+                current_match_time = _clock_frame / (self.video_fps or 10.0)
                 allow_immediate = should_queue_immediate_read(
                     current_match_time,
                     ident.last_vlm_time,
@@ -7696,67 +7839,13 @@ class InferenceJob:
                     # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
                     # free, so there's no per-match call cap (the old 20-call budget was a
                     # paid-API leftover). We schedule VLM reads per-identity based on match seconds.
-                    current_match_time = processed_frame_num / (self.video_fps or 10.0)
-                    unconfirmed_count = sum(
-                        1 for ident in self.identity_registry.identities.values() if not ident.is_confirmed
-                    )
-                
-                    due_priorities = {}
-                    for ident in self.identity_registry.identities.values():
-                        if ident.active_slot is None:
-                            continue
-                        # Occlusion gate: a bumper hidden in EVERY camera cannot
-                        # be read — at best a wasted call, at worst a garbage-crop
-                        # contradiction against a correct lock. The
-                        # needs_immediate_read flag is NOT cleared, so the read
-                        # fires on the first visible frame.
-                        if VLM_OCCLUSION_GATE and occlusion_blocks_read(
-                                (self._occ or {}).get(ident.active_slot)):
-                            self.identity_diagnostics.increment(
-                                "vlm_scheduled.occluded_skip")
-                            continue
-                        # Novelty inputs: a failed read of an unmoved robot is
-                        # the same unreadable view again (decide_vlm_read gates
-                        # it, bounded by novelty_skip_max_sec).
-                        last_failed = (ident.last_vlm_time > ident.last_success_time)
-                        moved = True
-                        slot_track = self._get_slot_track_if_exists(ident.active_slot)
-                        cur_pos = getattr(slot_track, "field_position", None)
-                        if ident.last_vlm_pos is not None and cur_pos is not None:
-                            moved = (
-                                (cur_pos[0] - ident.last_vlm_pos[0]) ** 2
-                                + (cur_pos[1] - ident.last_vlm_pos[1]) ** 2
-                            ) ** 0.5 >= self.confidence_config.novelty_min_move_m
-                        decision = decide_vlm_read(
-                            is_confirmed=ident.is_confirmed,
-                            confidence=ident.confidence,
-                            last_vlm_time=ident.last_vlm_time,
-                            last_success_time=ident.last_success_time,
-                            backoff_until=ident.backoff_until,
-                            needs_immediate_read=ident.needs_immediate_read,
-                            current_match_time=current_match_time,
-                            unconfirmed_count=unconfirmed_count,
-                            config=self.confidence_config,
-                            last_read_failed=last_failed,
-                            moved_since_read=moved,
-                        )
-                        if decision.due:
-                            due_priorities[ident.identity_id] = decision.priority
-                            self.identity_diagnostics.increment(
-                                f"vlm_scheduled.{decision.reason}"
-                            )
-                            self.identity_diagnostics.record(
-                                DiagnosticEvents.VLM_SCHEDULED,
-                                identity_id=ident.identity_id,
-                                reason_type=decision.reason,
-                                priority=decision.priority,
-                                is_audit=decision.is_audit,
-                            )
-
-                    self.vlm_status.update({
-                        "unconfirmed": unconfirmed_count,
-                        "due_count": len(due_priorities),
-                    })
+                    # The clock is the source-video seconds of THIS frame (frame_num):
+                    # the read pass stamps its crop frame (= this frame_num) in the
+                    # same units, and _current_frame still holds the previous
+                    # processed frame here (assigned at loop END), one stride stale.
+                    # VLM_READ_CLOCK_FIX=0 restores processed_frame_num/fps.
+                    current_match_time = self._read_clock_sec(frame_num, processed_frame_num)
+                    due_priorities = self._collect_due_vlm_reads(current_match_time)
                     if bool(fused) and len(due_priorities) > 0:
                         # Single-flight background schedule (see the method): the
                         # read pass no longer blocks frame processing — it runs

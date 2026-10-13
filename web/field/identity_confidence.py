@@ -18,6 +18,11 @@ class ConfidenceConfig:
     unconfirmed_med_interval_sec: float = 1.25
     unconfirmed_slow_interval_sec: float = 2.0
     backoff_base_sec: float = 2.0
+    # Ceiling on the 1.5^n failure backoff (read clock fix on). Uncapped, a
+    # robot unreadable for a stretch waits 34s+ between tries and misses the
+    # moment its bumper turns legible; capped, it's retried every few seconds.
+    backoff_max_sec: float = field(default_factory=lambda: float(
+        os.environ.get("VLM_READ_BACKOFF_MAX_S", "4.0")))
     # Novelty gate: skip an unconfirmed retry when the last read FAILED and
     # the robot hasn't moved since — same pose, same unreadable view, same
     # outcome. Bounded by novelty_skip_max_sec so a parked robot still gets
@@ -107,6 +112,30 @@ def calculate_confidence_update(
         conf = max(conf, config.confirmed_floor)
         
     return ConfidenceUpdate(new_confidence=float(conf), reasons=reasons)
+
+def read_backoff_sec(config: "ConfidenceConfig", fail_count: int, capped: bool = True) -> float:
+    """Retry delay after `fail_count` consecutive failed reads: base * 1.5^n,
+    clamped to config.backoff_max_sec when `capped` (the read clock fix)."""
+    delay = config.backoff_base_sec * (1.5 ** fail_count)
+    return min(delay, config.backoff_max_sec) if capped else delay
+
+
+def read_clock_sec(source_frame, processed_frame_num, fps, fixed: bool = True) -> float:
+    """Seconds on the bumper-read scheduling clock.
+
+    fixed: source-video seconds of the frame being processed — the same
+    units every read stamp (last_vlm_time, last_success_time, backoff_until,
+    last_immediate_queue_time) is written in, so ConfidenceConfig intervals
+    elapse in real match seconds.
+
+    legacy (fixed=False): processed-frame index / fps. The loop processes
+    every frame_skip-th source frame, so this runs frame_skip x slow and
+    starts at 0 at the first processing frame; compared against real-time
+    stamps, retries and audits never came due. Kept only for A/B
+    (VLM_READ_CLOCK_FIX=0).
+    """
+    return (source_frame if fixed else processed_frame_num) / (fps or 10.0)
+
 
 def decide_vlm_read(
     is_confirmed: bool,

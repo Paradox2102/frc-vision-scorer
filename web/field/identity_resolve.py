@@ -38,6 +38,7 @@ static, whole-match, per-slot case.
 from __future__ import annotations
 
 import itertools
+import json
 from dataclasses import dataclass, field
 
 __all__ = [
@@ -46,7 +47,14 @@ __all__ = [
     "assign_teams_global",
     "merge_global_assignment",
     "build_slot_evidence",
+    "vlm_read_rows_from_jsonl",
+    "resolve_slot_labels",
 ]
+
+# Absolute tolerance for score comparisons: vote weights are sums of products
+# of small decimals (0.5, 0.55, 1.25 ...), so "exactly min_score" and "exact
+# tie" must survive float noise.
+SCORE_EPS = 1e-9
 
 # Fixed slot-id -> alliance convention used throughout the pipeline.
 BLUE_SLOTS = (0, 1, 2)
@@ -130,44 +138,58 @@ def _best_alliance_assignment(
     roster: list[str],
     slot_scores: dict[int, dict[str, float]],
     min_score: float,
-) -> dict[int, str]:
+) -> tuple[dict[int, str], set[int]]:
     """Exhaustively search partial assignments of ``roster`` to ``slots``.
 
-    Returns a dict of only the assigned slot_id -> team pairs (unassigned
-    slots are simply absent). Enumerates every subset of slots of size
-    0..min(3, len(roster)) paired with every permutation of roster teams of
-    that size; a candidate is valid only if every pair in it clears
-    ``min_score`` (a sub-threshold pair may not be assigned at all, per
-    spec — its "cleaned" version is already covered by a smaller candidate
-    enumerated separately, so simply discarding invalid candidates is
-    exact, not an approximation).
+    Returns ``(assignment, contested)``: ``assignment`` holds only the
+    assigned slot_id -> team pairs (unassigned slots are absent). Enumerates
+    every subset of slots of size 0..min(3, len(roster)) paired with every
+    permutation of roster teams of that size; a candidate is valid only if
+    every pair in it clears ``min_score`` (a sub-threshold pair may not be
+    assigned at all, per spec — its "cleaned" version is already covered by
+    a smaller candidate enumerated separately, so simply discarding invalid
+    candidates is exact, not an approximation).
+
+    Optimum: maximize total score, then the number of assigned slots. Ties
+    are handled conservatively instead of arbitrarily: when several
+    candidates share that optimum (totals within SCORE_EPS, same count),
+    only the pairs ALL of them agree on are returned, and every slot they
+    disagree on is reported in ``contested`` and left unassigned. A
+    per-slot tie that the rest of the alliance breaks (qm11 R3: 4256/6800
+    tied at 3.5 but R1 can only take 6800) is not a tie of the joint
+    optimum, so it is resolved, not contested.
     """
     max_k = min(len(slots), len(roster))
-    best_key = None
-    best_assignment: dict[int, str] = {}
+    best_total: float | None = None
+    best_count = -1
+    optima: list[dict[int, str]] = []
 
     for k in range(0, max_k + 1):
         for slot_subset in itertools.combinations(slots, k):
             for team_perm in itertools.permutations(roster, k):
                 candidate = dict(zip(slot_subset, team_perm))
-                pair_scores = [
-                    (slot_id, team, slot_scores[slot_id][team])
-                    for slot_id, team in candidate.items()
-                ]
-                if any(score < min_score for _, _, score in pair_scores):
+                pair_scores = [slot_scores[slot_id][team]
+                               for slot_id, team in candidate.items()]
+                if any(score < min_score - SCORE_EPS for score in pair_scores):
                     continue  # a sub-threshold pair may not be assigned
-                total_score = sum(score for _, _, score in pair_scores)
+                total_score = sum(pair_scores)
                 assigned_count = len(candidate)
-                lex_key = tuple(sorted((s, t) for s, t, _ in pair_scores))
-                # Maximize total_score, then assigned_count, then prefer the
-                # lexicographically smallest pair tuple -> encode as a single
-                # min() key by negating the two "higher is better" fields.
-                key = (-total_score, -assigned_count, lex_key)
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best_assignment = candidate
+                if (best_total is None
+                        or total_score > best_total + SCORE_EPS
+                        or (abs(total_score - best_total) <= SCORE_EPS
+                            and assigned_count > best_count)):
+                    best_total, best_count = total_score, assigned_count
+                    optima = [candidate]
+                elif (abs(total_score - best_total) <= SCORE_EPS
+                        and assigned_count == best_count):
+                    optima.append(candidate)
 
-    return best_assignment
+    if not optima:
+        return {}, set()
+    agreed = {slot_id: team for slot_id, team in optima[0].items()
+              if all(o.get(slot_id) == team for o in optima[1:])}
+    touched = {slot_id for o in optima for slot_id in o}
+    return agreed, touched - set(agreed)
 
 
 def assign_teams_global(
@@ -177,12 +199,22 @@ def assign_teams_global(
     w_reads: float = 1.0,
     w_gallery: float = 0.4,
     min_score: float = 0.5,
+    contested_out: set | None = None,
 ) -> dict[int, str | None]:
     """Exact max-total-score slot->team assignment, solved per alliance.
 
     Returns all six slot ids (0-5); a slot with no qualifying assignment
-    (no evidence, or every candidate pair below ``min_score``) maps to
-    ``None``.
+    (no evidence, every candidate pair below ``min_score``, or contested by
+    a tie of the optimum) maps to ``None``.
+
+    ``min_score`` is inclusive: a (slot, team) pair is eligible iff its
+    combined score >= min_score (within SCORE_EPS). With the default 0.5 a
+    single half-weight read (vote_weight 0.5: confidence < 0.85) is enough
+    to make a team eligible for a slot; it is then assigned only if the
+    whole-alliance optimum puts it there. ``contested_out``, when given, is
+    filled with the slots left unassigned by a tie (see
+    ``_best_alliance_assignment``). Confirmation margins are not decided
+    here — see ``merge_global_assignment``'s ``confirm_margin``.
     """
     _validate_evidence(evidence)
 
@@ -192,9 +224,12 @@ def assign_teams_global(
         if not roster:
             continue
         slot_scores = _slot_team_scores(slots, roster, evidence, w_reads, w_gallery)
-        assignment = _best_alliance_assignment(slots, roster, slot_scores, min_score)
+        assignment, contested = _best_alliance_assignment(
+            slots, roster, slot_scores, min_score)
         for slot_id, team in assignment.items():
             result[slot_id] = team
+        if contested_out is not None:
+            contested_out.update(contested)
 
     return result
 
@@ -204,6 +239,7 @@ def merge_global_assignment(
     assignment: dict[int, str | None],
     scores: dict[int, dict[str, float]],
     confirm_margin: float = 2.0,
+    strip_slots: set | None = None,
 ) -> tuple[dict, list[dict]]:
     """Merge a solved assignment into existing per-slot metadata.
 
@@ -222,6 +258,17 @@ def merge_global_assignment(
       duplicate the team on the overlay (qm11 2026-07-20: R2 assigned 1477
       while R3 kept its greedy OCR 1477), voiding the assignment's
       collision-free guarantee.
+    - ``strip_slots`` (the solver's contested slots): an existing label on
+      a slot the solve left ``None`` because of a tie is stripped (team
+      ``None``, unconfirmed) — a tie leaves the slot unassigned rather than
+      keeping whichever label the last identity happened to carry. Recorded
+      as a change with ``"reason": "tie"``.
+
+    The confirm margin is the winner's combined score minus the best OTHER
+    team's score on the same slot (including teams the solve gave to other
+    slots), so an assignment the alliance optimum forced onto a slot whose
+    own evidence prefers another team gets a negative margin and stays
+    unconfirmed (qm11 R1: 6800 at 0.5 vs 1477 at 1.8).
 
     Returns ``(new_slot_meta, changes)`` where ``changes`` lists only the
     actual overrides, each as
@@ -258,6 +305,28 @@ def merge_global_assignment(
                 "new_team": new_team,
                 "score": winner_score,
                 "margin": margin,
+            }
+        )
+
+    # Contested (tied) slots: strip whatever label the slot still carries.
+    for slot_id in sorted(strip_slots or ()):
+        if assignment.get(slot_id) is not None:
+            continue
+        current = new_meta.get(slot_id)
+        if not current or current.get("team_number") is None:
+            continue
+        updated = dict(current)
+        updated["team_number"] = None
+        updated["confirmed"] = False
+        new_meta[slot_id] = updated
+        changes.append(
+            {
+                "slot_id": slot_id,
+                "old_team": current.get("team_number"),
+                "new_team": None,
+                "score": 0.0,
+                "margin": 0.0,
+                "reason": "tie",
             }
         )
 
@@ -386,3 +455,72 @@ def build_slot_evidence(
         "fallback_used": fallback_used,
     }
     return evidence, stats
+
+
+def vlm_read_rows_from_jsonl(lines) -> list[dict]:
+    """``vlm_read`` rows from diagnostic JSONL lines (an iterable of str).
+
+    Skips unparseable lines and rows missing ``frame``/``robot_id`` (the
+    evidence builder direct-indexes those); drops the bulky ``crop_b64``.
+    Shared by the live finalize path and scripts/identity_offline_check.py.
+    """
+    rows: list[dict] = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if (isinstance(r, dict) and r.get("type") == "vlm_read"
+                and "frame" in r and "robot_id" in r):
+            r.pop("crop_b64", None)
+            rows.append(r)
+    return rows
+
+
+def resolve_slot_labels(
+    vlm_read_rows: list[dict] | None,
+    identity_log: list[dict],
+    votes_by_slot: dict[int, dict[str, float]],
+    gallery_by_slot: dict[int, dict[str, float]],
+    slot_alliance,
+    blue_roster: list[str],
+    red_roster: list[str],
+    slot_meta: dict,
+    min_score: float = 0.5,
+    confirm_margin: float = 2.0,
+) -> dict:
+    """Whole-match per-slot final labels: evidence -> exact assignment ->
+    merge into ``slot_meta``. The single code path behind the
+    ``global_identity_resolve`` finalize step and the offline checker.
+
+    Reads are credited to the slot their identity held at the read's own
+    frame (``build_slot_evidence``), so every identity that ever sat on a
+    slot contributes — the slot's final identity may have no votes at all
+    (qm11 80a1cd4c: 5 of 6 final identities were born in the last ~10 s).
+
+    Returns ``{"slot_meta", "changes", "assignment", "contested", "scores",
+    "evidence", "stats"}``; ``slot_meta`` is a new dict (input unmutated).
+    """
+    evidence, stats = build_slot_evidence(
+        vlm_read_rows, identity_log, votes_by_slot, gallery_by_slot, slot_alliance)
+    contested: set[int] = set()
+    assignment = assign_teams_global(
+        evidence, list(blue_roster), list(red_roster), min_score=min_score,
+        contested_out=contested)
+    scores = {sid: combine_scores(ev) for sid, ev in evidence.items()}
+    norm_meta = {sid: {**m, "team_number": (str(m["team_number"])
+                 if m.get("team_number") is not None else None)}
+                 for sid, m in slot_meta.items()}
+    new_meta, changes = merge_global_assignment(
+        norm_meta, assignment, scores, confirm_margin=confirm_margin,
+        strip_slots=contested)
+    stats = {**stats, "contested": sorted(contested)}
+    return {
+        "slot_meta": new_meta,
+        "changes": changes,
+        "assignment": assignment,
+        "contested": contested,
+        "scores": scores,
+        "evidence": evidence,
+        "stats": stats,
+    }

@@ -554,20 +554,38 @@ KNOBS = [
     # can't tell same-alliance robots apart to catch it.
     Knob("gallery_verified_only", "GALLERY_VERIFIED_ONLY", bool, True,
          section="Identity & votes"),
-    # Global exact slot->team assignment (identity layer): replaces the greedy
-    # final per-slot team arbitration with a whole-match exact assignment
-    # (collision-free, deterministic — eliminates the Hungarian-pairing-flip
-    # nondeterminism class); live mid-match voting is untouched. DEFAULT OFF —
-    # 2026-07-20 qm11+qm8 A/B (docs/default-on-ab-2026-07-20.md): geometry-
-    # neutral both matches; debut run exposed a merge collision (kept greedy
-    # label duplicated an assigned team; fixed via the collision sweep in
-    # identity_resolve.merge_global_assignment) and qm8 showed a clean
-    # confirmed true positive greedy missed (R1=2724, margin 2.0). Flip
-    # candidate after the full-match protocol: confirmed-team accuracy,
-    # compare_manta --assign MISLABEL count, rerun stability on qm8-qm12
-    # with a healthy vLLM reader (auto-only read sets vary run to run).
-    Knob("global_identity_resolve", "GLOBAL_IDENTITY_RESOLVE", bool, False,
+    # Global exact slot->team assignment (identity layer): the end-of-job
+    # labels (replay overlay, match_robot_identity, replay team lists) come
+    # from whole-match PER-SLOT evidence — every read credited to the slot
+    # its identity held at the read's frame — via an exact, collision-free,
+    # deterministic assignment; ties leave the slot unassigned. Live
+    # mid-match voting is untouched. DEFAULT ON since identity-binding-fix
+    # (2026-10-13): on qm11 full match (80a1cd4c) the last-identity labels
+    # were 0/6 (5 of 6 final identities born in the last ~10 s with no
+    # votes -> NULL everywhere); the per-slot resolve replayed offline gives
+    # 4/6 correct. GLOBAL_IDENTITY_RESOLVE=0 restores the last-identity
+    # labels. History: 2026-07-20 qm11+qm8 A/B (docs/default-on-ab-2026-07-
+    # 20.md) geometry-neutral, collision sweep fix, qm8 R1=2724 true positive.
+    Knob("global_identity_resolve", "GLOBAL_IDENTITY_RESOLVE", bool, True,
          section="Identity & votes"),
+    # Identity continuity (identity layer, web/field/identity.py): an
+    # observation on the SAME slot its identity held last frame, with no
+    # tracker binding disruption (seeded/expired/kinematic_reject/
+    # occlusion_rebind_held or a feeder-track change), moved < max_m and no
+    # team conflict, is not split by the appearance veto (soft 0.1 instead
+    # of +0.5); young identities update appearance for their first
+    # identity_warmup_frames observations. qm11 full match: 575 identities /
+    # 168 s, 88% of teleop births with the slot moved < 1 m, veto-driven.
+    # DEFAULT OFF pending A/B — the always-on [identity] summary line reports
+    # how many veto births were continuity-eligible. max_m is capped at 1.5:
+    # with the 0.1 soft penalty the association cost 0.6 + 0.1*d crosses the
+    # 0.75 threshold at d = 1.5 m anyway.
+    Knob("identity_continuity", "IDENTITY_CONTINUITY", bool, False,
+         section="Identity & votes"),
+    Knob("identity_continuity_max_m", "IDENTITY_CONTINUITY_MAX_M", float, 1.0,
+         min=0.1, max=1.5, section="Identity & votes"),
+    Knob("identity_warmup_frames", "IDENTITY_WARMUP_FRAMES", int, 5,
+         min=0, max=30, section="Identity & votes"),
     # --- cross-camera fusion ---
     # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,
     # so their range estimate is nearly meaningless (measured 1.1-3.8 m off on

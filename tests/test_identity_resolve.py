@@ -13,6 +13,7 @@ from web.field.identity_resolve import (
     build_slot_evidence,
     combine_scores,
     merge_global_assignment,
+    resolve_slot_labels,
 )
 
 
@@ -146,16 +147,20 @@ def test_tie_break_prefers_more_assignments_then_lex():
     result = assign_teams_global(evidence, blue_roster=roster, red_roster=[], min_score=0.5)
     assert result == {0: "2222", 1: "1111", 2: None, 3: None, 4: None, 5: None}
 
-    # --- Clause 2: on an EQUAL-count tie, lexicographically smallest wins. ---
+    # --- Clause 2: an EQUAL-count tie is contested -> slot left unassigned. ---
     # Only slot 0 has evidence; both teams tie at 5.0. Both candidates are
-    # 1-slot, so the count clause can't break it -> lex: (0,"1111") < (0,"2222").
+    # 1-slot, so the count clause can't break it. Picking one (the old lex
+    # rule chose "1111") would be arbitrary; the conservative answer is None.
     evidence2 = {
         0: _ev(0, "blue", read_scores={"1111": 5.0, "2222": 5.0}),
     }
+    contested = set()
     result2 = assign_teams_global(
-        evidence2, blue_roster=["1111", "2222"], red_roster=[], min_score=0.5
+        evidence2, blue_roster=["1111", "2222"], red_roster=[], min_score=0.5,
+        contested_out=contested,
     )
-    assert result2[0] == "1111"
+    assert result2[0] is None
+    assert contested == {0}
 
 
 def test_weights_thread_through_solver():
@@ -510,3 +515,122 @@ def test_build_slot_evidence_does_not_mutate_inputs():
     evidence[0].read_scores["8888"] = 456.0
     assert "9999" not in gallery_scores_by_slot[0]
     assert "8888" not in team_ocr_votes_by_slot.get(0, {})
+
+
+# ---------------------------------------------------------------------------
+# Ties, min_score boundary, contested-slot stripping (identity-binding-fix)
+# ---------------------------------------------------------------------------
+
+
+def test_slot_tie_broken_by_joint_optimum_is_not_contested():
+    """qm11 80a1cd4c R3: 4256 and 6800 tie at 3.5 on R3, but R1 can only take
+    6800 (0.5), so the joint optimum is unique: R3=4256, R1=6800."""
+    evidence = {
+        3: _ev(3, "red", read_scores={"6800": 0.5, "1477": 1.8}),
+        4: _ev(4, "red", read_scores={"1477": 7.05}),
+        5: _ev(5, "red", read_scores={"4256": 3.5, "6800": 3.5, "1477": 2.0}),
+    }
+    contested = set()
+    out = assign_teams_global(evidence, [], ["6800", "1477", "4256"],
+                              contested_out=contested)
+    assert (out[3], out[4], out[5]) == ("6800", "1477", "4256")
+    assert contested == set()
+
+
+def test_unresolvable_tie_leaves_only_the_tied_slot_unassigned():
+    """Without R1's 6800 read, R3's tie can't be broken: R3 None, R2 kept."""
+    evidence = {
+        4: _ev(4, "red", read_scores={"1477": 7.05}),
+        5: _ev(5, "red", read_scores={"4256": 3.5, "6800": 3.5}),
+    }
+    contested = set()
+    out = assign_teams_global(evidence, [], ["6800", "1477", "4256"],
+                              contested_out=contested)
+    assert out[4] == "1477" and out[5] is None
+    assert contested == {5}
+
+
+def test_symmetric_two_slot_tie_leaves_both_unassigned():
+    """Two slots with identical evidence for the same two teams: both
+    pairings score 3.0 -> both slots contested; the uncontested slot keeps
+    its team."""
+    evidence = {
+        0: _ev(0, "blue", read_scores={"1111": 2.0, "2222": 1.0}),
+        1: _ev(1, "blue", read_scores={"1111": 2.0, "2222": 1.0}),
+        2: _ev(2, "blue", read_scores={"3333": 4.0}),
+    }
+    contested = set()
+    out = assign_teams_global(evidence, BLUE_ROSTER, [], contested_out=contested)
+    assert out[0] is None and out[1] is None and out[2] == "3333"
+    assert contested == {0, 1}
+    # Break the symmetry and the optimum is unique again.
+    evidence[1] = _ev(1, "blue", read_scores={"1111": 1.0, "2222": 2.0})
+    contested = set()
+    out = assign_teams_global(evidence, BLUE_ROSTER, [], contested_out=contested)
+    assert (out[0], out[1], out[2]) == ("1111", "2222", "3333")
+    assert contested == set()
+
+
+def test_min_score_is_inclusive_with_float_tolerance():
+    """A single half-weight read (0.5) clears min_score=0.5 (80a1cd4c R1
+    sat exactly there); float noise just below the floor still counts."""
+    ev = {0: _ev(0, "blue", read_scores={"1111": 0.5})}
+    assert assign_teams_global(ev, BLUE_ROSTER, [])[0] == "1111"
+    ev = {0: _ev(0, "blue", read_scores={"1111": 0.1 + 0.2 + 0.2 - 1e-12})}
+    assert assign_teams_global(ev, BLUE_ROSTER, [])[0] == "1111"
+    ev = {0: _ev(0, "blue", read_scores={"1111": 0.49})}
+    assert assign_teams_global(ev, BLUE_ROSTER, [])[0] is None
+
+
+def test_merge_strips_existing_label_on_contested_slot():
+    slot_meta = {5: {"team_number": "6800", "confirmed": False}}
+    new_meta, changes = merge_global_assignment(
+        slot_meta, {5: None}, {5: {"4256": 3.5, "6800": 3.5}}, strip_slots={5})
+    assert new_meta[5]["team_number"] is None and new_meta[5]["confirmed"] is False
+    assert changes == [{"slot_id": 5, "old_team": "6800", "new_team": None,
+                        "score": 0.0, "margin": 0.0, "reason": "tie"}]
+    # Without strip_slots: legacy keep-on-None.
+    kept, _ = merge_global_assignment(slot_meta, {5: None}, {5: {}})
+    assert kept[5]["team_number"] == "6800"
+
+
+def test_merge_contested_slot_without_label_records_nothing():
+    new_meta, changes = merge_global_assignment(
+        {5: {"team_number": None, "confirmed": False}}, {5: None}, {},
+        strip_slots={5})
+    assert changes == [] and new_meta[5]["team_number"] is None
+
+
+def test_resolve_slot_labels_canonical_identity_without_votes():
+    """The slot's final (canonical) identity has no votes — every read was on
+    earlier, now-dead identities. The label must come from the slot's
+    whole-match evidence."""
+    ilog = []
+    for f, iid in ((10, 1), (20, 2), (30, 3), (40, 9)):     # 9 = canonical
+        ilog.append({"frame_num": f, "identity_id": iid, "slot_id": 0, "alliance": "blue"})
+    rows = [{"type": "vlm_read", "frame": f, "robot_id": iid,
+             "matched_team": "2222", "vote_weight": 1.0}
+            for f, iid in ((10, 1), (20, 2), (30, 3))]
+    res = resolve_slot_labels(
+        rows, ilog, votes_by_slot={0: {}}, gallery_by_slot={},
+        slot_alliance=lambda s: "blue" if s < 3 else "red",
+        blue_roster=BLUE_ROSTER, red_roster=RED_ROSTER,
+        slot_meta={0: {"team_number": None, "confirmed": False, "alliance": "blue"}})
+    assert res["slot_meta"][0]["team_number"] == "2222"
+    assert res["slot_meta"][0]["confirmed"] is True        # margin 3.0 >= 2.0
+    assert res["slot_meta"][0]["alliance"] == "blue"       # other keys kept
+    assert res["stats"]["reads_used"] == 3
+    assert [c["new_team"] for c in res["changes"]] == ["2222"]
+
+
+def test_resolve_slot_labels_strips_tie_and_collision():
+    ilog = [{"frame_num": 1, "identity_id": 1, "slot_id": 0, "alliance": "blue"},
+            {"frame_num": 1, "identity_id": 2, "slot_id": 1, "alliance": "blue"}]
+    rows = [{"frame": 1, "robot_id": 1, "matched_team": "1111", "vote_weight": 1.0},
+            {"frame": 1, "robot_id": 1, "matched_team": "2222", "vote_weight": 1.0}]
+    meta = {0: {"team_number": "2222", "confirmed": False},
+            1: {"team_number": None, "confirmed": False}}
+    res = resolve_slot_labels(rows, ilog, {}, {}, lambda s: "blue",
+                              BLUE_ROSTER, RED_ROSTER, meta)
+    assert res["contested"] == {0}
+    assert res["slot_meta"][0]["team_number"] is None

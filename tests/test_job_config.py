@@ -505,3 +505,52 @@ def test_describe_knobs_carries_section():
         knob = by_name[entry["name"]]
         assert entry["section"] == knob.section
         assert entry["section"].strip()
+
+
+def test_global_identity_resolve_default_on_env_off(monkeypatch):
+    # identity-binding-fix: whole-match per-slot final labels are the default;
+    # GLOBAL_IDENTITY_RESOLVE=0 (or a per-job override) restores the
+    # last-identity labels.
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    assert JobConfig().global_identity_resolve is True
+    monkeypatch.setenv("GLOBAL_IDENTITY_RESOLVE", "0")
+    assert JobConfig().global_identity_resolve is False
+    assert JobConfig({"global_identity_resolve": "true"}).global_identity_resolve is True
+
+
+def test_identity_continuity_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.identity_continuity is False
+    assert cfg.identity_continuity_max_m == 1.0
+    assert cfg.identity_warmup_frames == 5
+
+
+def test_identity_continuity_knobs_env_override_and_bounds(monkeypatch):
+    monkeypatch.setenv("IDENTITY_CONTINUITY", "1")
+    monkeypatch.setenv("IDENTITY_CONTINUITY_MAX_M", "0.75")
+    cfg = JobConfig()
+    assert cfg.identity_continuity is True and cfg.identity_continuity_max_m == 0.75
+    assert JobConfig({"identity_warmup_frames": "0"}).identity_warmup_frames == 0
+    with pytest.raises(ValueError):
+        JobConfig({"identity_continuity_max_m": 0.0})
+    with pytest.raises(ValueError):
+        JobConfig({"identity_continuity_max_m": 2.0})
+    with pytest.raises(ValueError):
+        JobConfig({"identity_warmup_frames": 99})
+
+
+def test_identity_registry_built_from_knobs(monkeypatch):
+    from web.app import InferenceJob
+    job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig({"identity_continuity": True,
+                            "identity_continuity_max_m": 0.8,
+                            "identity_warmup_frames": 3})
+    from web.field.identity import IdentityRegistry
+    # Mirrors the constructor wiring in InferenceJob.__init__.
+    reg = InferenceJob._build_identity_registry(job)
+    assert isinstance(reg, IdentityRegistry)
+    assert reg.continuity is True and reg.continuity_max_m == 0.8
+    assert reg.warmup_frames == 3

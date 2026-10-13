@@ -237,6 +237,33 @@ class DiagnosticRecorder:
             "similarity": float(similarity) if similarity is not None else None,
         })
 
+    def record_identity_reject(self, frame: int | None, slot_id: int | None,
+                               candidate_id: int | None, max_sim: float | None,
+                               distance_m: float | None, cost: float, reason: str,
+                               continuity_eligible: bool, slot_disrupted: bool,
+                               outcome: str) -> None:
+        """One observation->identity match the registry rejected (cost over
+        the association threshold) — i.e. an identity birth (outcome "born")
+        or a creation blocked by the roster cap ("cap_rejected"). ``reason``
+        names the decisive cost term (identity.BIRTH_REASONS);
+        ``continuity_eligible`` says whether the identity_continuity gate
+        would have held the identity (same slot as last frame's holder, no
+        tracker disruption, small move, no team conflict)."""
+        if frame is None or slot_id is None:
+            return
+        self._emit({
+            "frame": int(frame), "t_ms": self._t_ms(), "type": "identity_reject",
+            "slot_id": int(slot_id),
+            "candidate_id": int(candidate_id) if candidate_id is not None else None,
+            "max_sim": round(float(max_sim), 4) if max_sim is not None else None,
+            "distance_m": round(float(distance_m), 3) if distance_m is not None else None,
+            "cost": round(float(cost), 4),
+            "reason": str(reason),
+            "continuity_eligible": bool(continuity_eligible),
+            "slot_disrupted": bool(slot_disrupted),
+            "outcome": str(outcome),
+        })
+
     def record_snapshot(self, frame: int | None, robots_state: list[dict],
                        roster: dict, identified: dict) -> None:
         """`robots_state` is a list of dicts pre-shaped per the snapshot schema

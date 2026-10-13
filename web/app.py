@@ -132,7 +132,13 @@ from web.field.zones import (
 )
 from web.replay_recorder import ReplayRecorder
 from web import database
-from web.field.identity import IdentityRegistry, RobotIdentity, IdentityObservation
+from web.field.identity import (
+    DISRUPTING_BINDING_EVENTS,
+    IdentityObservation,
+    IdentityRegistry,
+    RobotIdentity,
+    live_robot_tracks,
+)
 from web.field.identity_confidence import (
     ConfidenceConfig,
     best_owned_team,
@@ -1356,7 +1362,12 @@ class InferenceJob:
 
         # Detection state
         self.hubs: List[DetectedHub] = []
-        self.identity_registry = IdentityRegistry()
+        # identity_continuity (default OFF): don't let the appearance veto split
+        # an identity on an undisturbed slot; young identities warm up their
+        # appearance samples. See IdentityRegistry.
+        self.identity_registry = self._build_identity_registry()
+        # slot_id -> fused track id that last fed it (binding-disruption check).
+        self._slot_feed_track: Dict[int, Any] = {}
         self.confidence_config = ConfidenceConfig()
         self.co_occlusion_tracker = CoOcclusionTracker()
         # max_events raised well above a full multi-view match's event volume so
@@ -1382,6 +1393,10 @@ class InferenceJob:
         # overlay on changed slots. Empty unless global_identity_resolve is on.
         self._resolved_team_by_slot: dict[int, str | None] = {}  # None = stripped stale label
         self._resolved_confirmed_by_slot: dict[int, bool] = {}
+        # Final per-slot labels from the whole-match resolve (slot_id -> meta);
+        # None unless global_identity_resolve ran. Feeds the replay row's
+        # blue_teams/red_teams.
+        self._final_slot_meta: Optional[dict] = None
         self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
@@ -3657,9 +3672,16 @@ class InferenceJob:
         if not self.match_teams:
             return
 
-        locked_teams = {r.team_number for r in self.robot_tracks.values()
+        # Only identities still alive in the registry take part: robot_tracks
+        # is never pruned, and a dead identity's stale votes / confirmed team
+        # stole teams from the robot actually on the field (qm11 80a1cd4c:
+        # all 395 assignment rows named 8 identities, none alive at the end).
+        live = live_robot_tracks(self.robot_tracks,
+                                 getattr(self, "identity_registry", None))
+
+        locked_teams = {r.team_number for r in live.values()
                         if r.team_number_confirmed and r.team_number}
-        locked_robots = {r.robot_id for r in self.robot_tracks.values()
+        locked_robots = {r.robot_id for r in live.values()
                          if r.team_number_confirmed}
 
         # Per-robot alliance for the constraint is the field-tracker SLOT alliance
@@ -3667,11 +3689,11 @@ class InferenceJob:
         # Team assignment is masked to the slot's alliance; it never flips it.
         alliance_of_robot = {
             r.robot_id: (r.alliance if r.alliance in ("red", "blue") else "unknown")
-            for r in self.robot_tracks.values()
+            for r in live.values()
         }
 
         votes = {r.robot_id: dict(r.team_ocr_votes or {})
-                 for r in self.robot_tracks.values()}
+                 for r in live.values()}
 
         assignment = reid.assign_teams_alliance_masked(
             votes, alliance_of_robot,
@@ -3703,8 +3725,7 @@ class InferenceJob:
 
         # Process-of-elimination: last roster team + last unidentified bumper-colored
         # robot → assign and auto-confirm. Subject to overturn by the audit (Task 6).
-        team_of_robot = {rid: self.robot_tracks[rid].team_number
-                         for rid in self.robot_tracks}
+        team_of_robot = {rid: r.team_number for rid, r in live.items()}
         eliminated = reid.eliminate_last_team(
             alliance_of_robot, team_of_robot,
             self.match_blue_teams, self.match_red_teams,
@@ -4259,7 +4280,9 @@ class InferenceJob:
             # two slots at once (qm11: B1 and B3 both showed "2992?").
             winners = tentative_claim_winners({
                 rid: getattr(r, "team_ocr_votes", None) or {}
-                for rid, r in self.robot_tracks.items()
+                for rid, r in live_robot_tracks(
+                    self.robot_tracks,
+                    getattr(self, "identity_registry", None)).items()
             })
             owned_team, owned_vote = best_owned_team(
                 robot.team_ocr_votes, robot.robot_id, winners)
@@ -4956,7 +4979,7 @@ class InferenceJob:
     def _identity_for_slot(self, slot_id: int) -> Optional[RobotIdentity]:
         """Find the active identity currently bound to a slot."""
         if not hasattr(self, "identity_registry") or self.identity_registry is None:
-            self.identity_registry = IdentityRegistry()
+            self.identity_registry = self._build_identity_registry()
             self.robot_identities = self.identity_registry.identities
             self._last_bindings = {}
         for ident in self.identity_registry.identities.values():
@@ -5011,6 +5034,49 @@ class InferenceJob:
             if slot_id >= self.identity_registry._next_id:
                 self.identity_registry._next_id = slot_id + 1
         return self._get_or_create_identity_track(ident.identity_id, alliance)
+
+    def _build_identity_registry(self) -> IdentityRegistry:
+        """The job's IdentityRegistry, wired to the identity_continuity knobs."""
+        cfg = getattr(self, "config", None)
+        return IdentityRegistry(
+            continuity=bool(getattr(cfg, "identity_continuity", False)),
+            continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
+            warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
+        )
+
+    def _retire_evicted_tracks(self, evicted_ids) -> None:
+        """Identities evicted from the registry this frame are dead: drop the
+        team (and confirmed flag) from their RobotTrack; votes stay as
+        evidence history. A dead confirmed team would otherwise stay "taken"
+        for the rest of the match — removed from the read roster
+        (_remaining_rosters), blocking consecutive-lock confirmation and the
+        Hungarian's locked teams on the live robot that really carries it —
+        and, with live-only assignment, a dead track's tentative team would
+        freeze and duplicate the live holder's label in all-track lists."""
+        for rid in evicted_ids or ():
+            track = self.robot_tracks.get(rid)
+            if track is not None:
+                track.team_number = None
+                track.team_number_confirmed = False
+
+    def _identity_churn_summary(self) -> tuple[str, dict]:
+        """End-of-job identity churn telemetry: births by reason, evictions,
+        continuity holds, and the age (born -> last seen) of each slot's
+        final identity. One re-run line confirms the churn mechanism."""
+        from web.field.identity import churn_summary
+        reg = self.identity_registry
+        fps = float(getattr(self, "video_fps", None) or 0.0) or None
+        ages = {}
+        if fps:
+            for sid, iid in sorted(self._canonical_identity_slots().items()):
+                ident = reg.identities.get(iid)
+                if ident is not None:
+                    ages[self._slot_label(sid)] = round(
+                        max(0.0, (ident.last_seen_frame - ident.born_frame) / fps), 2)
+        log = getattr(self, "_identity_log", None) or []
+        span = ((log[-1]["frame_num"] - log[0]["frame_num"]) / fps
+                if (log and fps) else None)
+        return churn_summary(reg.stats, ages, span, reg.continuity)
 
     def _canonical_identity_slots(self) -> dict[int, int]:
         """Map at most three current identities per alliance onto the six slots.
@@ -5155,6 +5221,28 @@ class InferenceJob:
                                 slot_to_ev[slot_id] = ev_list[idx]
                             break
 
+        # Tracker binding disruptions per slot: a disrupted slot never gets the
+        # identity_continuity pass (genuine swaps must still split). slot_rebound
+        # is NOT in the set — it fires every frame a known track id re-binds to
+        # its own slot (the steady state); a rebound/distance match that feeds
+        # the slot from a DIFFERENT track id than last frame is caught below.
+        disrupted_slots = {
+            e.get("slot_id") for e in self.field_tracker.binding_events
+            if e.get("event") in DISRUPTING_BINDING_EVENTS}
+        feed = getattr(self, "_slot_feed_track", None)
+        if feed is None:
+            feed = self._slot_feed_track = {}
+        for e in self.field_tracker.binding_events:
+            if e.get("event") == "slot_expired":
+                feed.pop(e.get("slot_id"), None)
+        for t in track_outs:
+            tid = getattr(slot_to_fused.get(t.slot_id), "track_id", None)
+            if tid is None:
+                continue   # coasting / track-less: keep the last known feeder
+            if feed.get(t.slot_id) not in (None, tid):
+                disrupted_slots.add(t.slot_id)
+            feed[t.slot_id] = tid
+
         # Construct IdentityObservation
         for t in track_outs:
             slot_id = t.slot_id
@@ -5174,7 +5262,8 @@ class InferenceJob:
                 alliance=alliance,
                 embedding=emb,
                 relink_margin=margin,
-                continuity_evidence=ev_type
+                continuity_evidence=ev_type,
+                slot_disrupted=slot_id in disrupted_slots,
             )
             observations.append(obs)
 
@@ -5207,6 +5296,13 @@ class InferenceJob:
             observations=observations,
             alliance_side_fn=alliance_side
         )
+        # Churn telemetry + dead-track retirement (always on, cheap).
+        self._retire_evicted_tracks(self.identity_registry.frame_evictions)
+        _diag = getattr(self, "diagnostic", None)
+        if _diag is not None and self.identity_registry.frame_rejections:
+            _row_frame = log_frame_num if log_frame_num is not None else self._current_frame
+            for _row in self.identity_registry.frame_rejections:
+                _diag.record_identity_reject(frame=_row_frame, **_row)
 
         # 3.5 Update live confidence signals
         from web.field.identity_confidence import (
@@ -5813,26 +5909,21 @@ class InferenceJob:
                 "alliance": self._slot_alliance(slot_id),
             }
         if getattr(getattr(self, "config", None), "global_identity_resolve", False):
-            # Whole-match exact slot->team assignment: rewrite slot_meta before
-            # the per-slot rebuild consumes it. A resolve failure must never kill
-            # finalize — fall back to the greedy slot_meta built above.
+            # Whole-match per-slot labels (default ON): every identity that ever
+            # held a slot contributes its reads at the read's own frame, so the
+            # final label no longer depends on the slot's LAST identity (qm11
+            # 80a1cd4c: 5/6 final identities had no votes -> NULL stamped into
+            # every frame). Rewrites slot_meta before the per-slot rebuild
+            # consumes it. A resolve failure must never kill finalize — fall
+            # back to the greedy slot_meta built above.
             try:
                 from web.field.identity_resolve import (
-                    build_slot_evidence, assign_teams_global, combine_scores,
-                    merge_global_assignment)
-                # 1. Raw VLM reads from this job's diagnostics JSONL. Skip
-                #    unparseable lines AND rows missing frame/robot_id (the builder
-                #    direct-indexes those). None if absent/empty -> builder falls back.
-                rows = []
+                    resolve_slot_labels, vlm_read_rows_from_jsonl)
+                # 1. Raw VLM reads from this job's diagnostics JSONL. None if
+                #    absent/empty -> the evidence builder falls back to votes.
                 diag_path = UPLOAD_DIR / f"diagnostic_{self.job_id}.jsonl"
-                if diag_path.exists():
-                    for line in diag_path.read_text().splitlines():
-                        try:
-                            r = json.loads(line)
-                        except (ValueError, TypeError):
-                            continue
-                        if r.get("type") == "vlm_read" and "frame" in r and "robot_id" in r:
-                            rows.append(r)
+                rows = (vlm_read_rows_from_jsonl(diag_path.read_text().splitlines())
+                        if diag_path.exists() else [])
                 vlm_rows = rows or None
                 # 2. team_ocr_votes fallback source, keyed by slot via the same
                 #    assignments used to build slot_meta.
@@ -5853,35 +5944,36 @@ class InferenceJob:
                 # 4. Rosters (already str in match_blue_teams/match_red_teams).
                 blue = [str(t) for t in (self.match_blue_teams or [])]
                 red = [str(t) for t in (self.match_red_teams or [])]
-                evidence, gstats = build_slot_evidence(
-                    vlm_rows, self._identity_log, votes_by_slot,
-                    gallery_by_slot, self._slot_alliance)
-                assignment = assign_teams_global(evidence, blue, red)
-                scores = {sid: combine_scores(ev) for sid, ev in evidence.items()}
-                # Normalize existing slot_meta team_number to str for a correct
-                # same-team compare (does not mutate the original entries).
-                norm_meta = {sid: {**m, "team_number": (str(m["team_number"])
-                             if m.get("team_number") is not None else None)}
-                             for sid, m in slot_meta.items()}
-                new_meta, changes = merge_global_assignment(norm_meta, assignment, scores)
+                res = resolve_slot_labels(
+                    vlm_rows, self._identity_log, votes_by_slot, gallery_by_slot,
+                    self._slot_alliance, blue, red, slot_meta)
+                new_meta, changes, gstats = res["slot_meta"], res["changes"], res["stats"]
                 slot_meta = new_meta
+                self._final_slot_meta = {sid: dict(m) for sid, m in new_meta.items()}
                 for ch in changes:
                     iid = assignments.get(ch["slot_id"])
                     if iid is not None:
                         self._slot_source[iid] = "global_resolve"
                         # Propagate the resolved team + confirmed to the DB write
-                        # (7745) so match_robot_identity matches the replay overlay;
-                        # the live robot.team_number is deliberately left untouched.
+                        # (match_robot_identity) so it matches the replay
+                        # overlay; the live robot.team_number is deliberately
+                        # left untouched.
                         self._resolved_team_by_slot[iid] = ch["new_team"]
                         self._resolved_confirmed_by_slot[iid] = bool(
                             new_meta[ch["slot_id"]]["confirmed"])
                     print(f"  [global-resolve] {self._slot_label(ch['slot_id'])} "
                           f"{ch['old_team']}->{ch['new_team']} score={ch['score']:.2f} "
-                          f"margin={ch['margin']:.2f}")
+                          f"margin={ch['margin']:.2f}"
+                          + (f" ({ch['reason']})" if ch.get("reason") else ""))
+                final = " ".join(
+                    f"{self._slot_label(sid)}={new_meta.get(sid, {}).get('team_number')}"
+                    for sid in range(6))
+                contested = ",".join(self._slot_label(sid) for sid in gstats["contested"])
                 print(f"  [global-resolve] {len(changes)} slot(s) changed; "
                       f"reads_used={gstats['reads_used']} "
                       f"dropped_misattr={gstats['reads_dropped_misattributed']} "
-                      f"fallback={gstats['fallback_used']}")
+                      f"fallback={gstats['fallback_used']} "
+                      f"contested=[{contested}] final: {final}")
             except Exception as e:
                 print(f"  [global-resolve] failed, keeping greedy slot_meta: {e}")
         frame_nums = [f["frame_num"] for f in rec.frames]
@@ -8385,6 +8477,12 @@ class InferenceJob:
             timings = {k: round(v, 2) for k, v in timings.items()}
             self.timings = timings
             try:
+                _churn_line, _churn = self._identity_churn_summary()
+                print(f"  {_churn_line}")
+                self.identity_diagnostics.gauge("identity_churn", _churn)
+            except Exception as e:
+                print(f"  [identity] churn summary failed: {e}")
+            try:
                 rec = getattr(self, "_replay", None)
                 if rec is not None and rec.is_open:
                     status = "complete" if self.status == "completed" else "partial"
@@ -8421,6 +8519,12 @@ class InferenceJob:
                             # Re-resolution may have dropped phantom/alien path
                             # segments; refresh the snapshot built before it ran.
                             summary["autonomous_paths"] = dict(self.autonomous_paths)
+                            # Whole-match per-slot labels (global resolve) replace
+                            # the every-track-ever team lists (qm11: 575 entries).
+                            _fsm = getattr(self, "_final_slot_meta", None)
+                            if _fsm:
+                                blue_teams = [_fsm.get(s, {}).get("team_number") for s in range(3)]
+                                red_teams = [_fsm.get(s, {}).get("team_number") for s in range(3, 6)]
                         except Exception as e:
                             print(f"[backward-confirm] re-resolution skipped: {e}")
                     if TRACKER_TRACE and getattr(self, "_tracker_trace", None):

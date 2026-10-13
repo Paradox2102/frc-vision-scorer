@@ -119,6 +119,7 @@ from web.field.camera_view import load_views
 from web.field.view_stride import build_view_frame_plan, scale_frame_knob
 from web.field.fusion import fuse_detections, merge_same_id_observations
 from web.field.fused_track_id import FusedTrackRegistry
+from web.field.crop_buffer import CropBuffer
 from web.hud_util import select_coasting_ghosts, draw_dashed_box
 from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import (
@@ -1172,13 +1173,19 @@ class _LazyCrop:
     eager base64 string; the VLM dispatcher resolves it only for the top-K
     candidates it actually sends (most processed frames dispatch no read at
     all, and each pass sends at most VLM_TOP_K of the ~6-18 per-frame crops).
-    Memoized so status payloads / crop capture reuse the first encode."""
-    __slots__ = ("_fn", "_done", "_val")
+    Memoized so status payloads / crop capture reuse the first encode.
 
-    def __init__(self, fn):
+    ``src`` (clef_multiframe only, else None) is ``(view_frame, box,
+    box_is_bumper)``: the multi-frame crop buffer cuts the RAW band crop from
+    it on the frame it was built (_band_crop_for_buffer) and then clears it, so
+    a buffered entry never holds this thunk or its view frame."""
+    __slots__ = ("_fn", "_done", "_val", "src")
+
+    def __init__(self, fn, src=None):
         self._fn = fn
         self._done = False
         self._val = None
+        self.src = src
 
     def __call__(self):
         if not self._done:
@@ -1192,6 +1199,77 @@ def _resolve_crop(crop):
     """Evidence crops are either eager base64 strings (tests, corner sweep) or
     _LazyCrop thunks (per-frame detections). Returns str or None."""
     return crop() if callable(crop) else crop
+
+
+def _band_crop_for_buffer(src):
+    """(raw band crop, legibility) from a _LazyCrop ``src`` — the same pixels
+    _bumper_crop_b64 would encode, BEFORE its upscale/JPEG — or None for a
+    degenerate box. The crop is a view into the frame; CropBuffer.push copies
+    it. legibility_score is computed here (pre-upscale), like the read path."""
+    if not src:
+        return None
+    frame, box, box_is_bumper = src
+    x1, y1, x2, y2 = map(int, box)
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(fw, x2), min(fh, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = (frame[y1:y2, x1:x2] if box_is_bumper
+            else bumper_crop(frame, (x1, y1, x2, y2)))
+    if crop is None or crop.size == 0:
+        crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    return crop, legibility_score(crop)
+
+
+def _encode_band_crop_b64(crop) -> Optional[str]:
+    """Upscale + JPEG/base64 a raw band crop exactly as _bumper_crop_b64 does
+    after cropping, so a buffered earlier frame is prepared like the newest
+    (lazily encoded) one."""
+    if crop is None or crop.size == 0:
+        return None
+    if crop.shape[0] < 384:
+        scale = max(2, int(np.ceil(384 / max(1, crop.shape[0]))))
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        return None
+    return base64.b64encode(buf).decode('utf-8')
+
+
+def _clef_mf_encode_plan(items: list, metas: list, fps: float):
+    """Worker-thread step of a multi-frame read (InferenceJob.
+    _plan_clef_multiframe): each planned item is the newest crop string
+    (single read, untouched) or [newest_b64, raw_crop, ...]. Encodes the raw
+    buffered crops like the newest one; an older crop that fails to encode is
+    dropped with its frame, and a list left with one image collapses back to
+    its string (a plain single-crop read). Returns (items, metas)."""
+    out_items, out_metas = [], []
+    for item, meta in zip(items, metas):
+        if isinstance(item, str):
+            out_items.append(item)
+            out_metas.append(meta)
+            continue
+        frames = list((meta or {}).get("frames") or [])
+        keep_b64, keep_frames = [item[0]], frames[:1]
+        for k, raw in enumerate(item[1:], start=1):
+            b64 = _encode_band_crop_b64(raw)
+            if b64:
+                keep_b64.append(b64)
+                if k < len(frames):
+                    keep_frames.append(frames[k])
+        if len(keep_b64) < 2:
+            out_items.append(item[0])
+            out_metas.append(None)
+            continue
+        span = (meta or {}).get("span_s")
+        if len(keep_frames) >= 2 and len(keep_frames) != len(frames):
+            span = round((keep_frames[0]["frame"] - keep_frames[-1]["frame"]) / (fps or 30.0), 2)
+        out_items.append(keep_b64)
+        out_metas.append({**(meta or {}), "frames": keep_frames, "span_s": span})
+    return out_items, out_metas
 
 
 class JobStopped(Exception):
@@ -1440,6 +1518,11 @@ class InferenceJob:
         self._clef_session = None
         self._clef_warned = False
         self._clef_usage_done = False
+        # clef_multiframe: per-identity rolling crop buffer (built on the first
+        # push) + the push hook's previous-frame snapshot for flush triggers.
+        self._crop_buffer = None
+        self._mf_state = None
+        self._mf_counts = {"multi": 0, "single": 0}
         # Single-flight background handle + per-identity position history for
         # the observe-only equipment-adjudication pass (equipment_adjudicate).
         self._adjudicate_task = None
@@ -2269,6 +2352,7 @@ class InferenceJob:
                 view_name=view.name, frame_num=frame_num,
             )
         paired = []
+        _mf_src = self._clef_mf_enabled()
         for d in field_dets:
             # Defer the JPEG encode: only the top-K candidates the VLM actually
             # dispatches get resolved (see read_fused_bumper_numbers). Bind loop
@@ -2276,7 +2360,9 @@ class InferenceJob:
             def _enc(_f=frame, _b=d.box, _bm=self.bumper_model is not None):
                 cb = self._bumper_crop_b64(_f, _b, enforce_floor=False, box_is_bumper=_bm)
                 return cb[0] if cb is not None else None
-            paired.append((d, _LazyCrop(_enc)))
+            paired.append((d, _LazyCrop(
+                _enc, src=(frame, d.box, self.bumper_model is not None)
+                if _mf_src else None)))
         person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
         return paired, person_boxes, person_boxes_all
 
@@ -2298,8 +2384,12 @@ class InferenceJob:
         getattr defaults keep __new__-built test jobs and legacy configs working."""
         session = getattr(self, "_clef_session", None)
         if session is None:
-            model = getattr(getattr(self, "config", None), "clef_model", None)
-            session = clef_reader.ClefSession(model or clef_reader.DEFAULT_MODEL)
+            cfg = getattr(self, "config", None)
+            model = getattr(cfg, "clef_model", None)
+            session = clef_reader.ClefSession(
+                model or clef_reader.DEFAULT_MODEL,
+                same_robot_min=getattr(cfg, "clef_mf_same_robot_min", None))
+            session.multiframe = self._clef_mf_enabled()
             self._clef_session = session
         return session
 
@@ -2359,13 +2449,252 @@ class InferenceJob:
             timings["clef.errors"] = st["errors"]
             timings["clef.quota_errors"] = st["quota_errors"]
             timings["clef.latency_p50_s"] = st["latency_p50_s"] or 0.0
+            if self._clef_mf_enabled():
+                timings["clef.mf_reads"] = st["mf_reads"]
+                timings["clef.mf_images"] = st["mf_images"]
+                timings["clef.inconsistent"] = st["inconsistent"]
+                timings["clef.mf_single_fallbacks"] = (
+                    getattr(self, "_mf_counts", None) or {}).get("single", 0)
         diags = getattr(self, "identity_diagnostics", None)
         if diags is not None:
             try:
                 diags.gauge("clef_usage", st)
+                buf = getattr(self, "_crop_buffer", None)
+                if buf is not None:
+                    diags.gauge("clef_mf_buffer", {
+                        **buf.stats(), **(getattr(self, "_mf_counts", None) or {})})
             except Exception:
                 pass
         print(f"  {session.summary_line()}")
+
+    # ---- clef_multiframe: per-identity crop buffer + multi-image reads ----
+
+    def _clef_mf_enabled(self) -> bool:
+        """Multi-frame reads are on only for team_reader="clef" with the
+        clef_multiframe knob; getattr defaults keep __new__-built test jobs off."""
+        return (getattr(self, "team_reader", "local") == "clef"
+                and bool(getattr(getattr(self, "config", None), "clef_multiframe", False)))
+
+    def _get_crop_buffer(self) -> CropBuffer:
+        buf = getattr(self, "_crop_buffer", None)
+        if buf is None:
+            cfg = self.config
+            fps = getattr(self, "video_fps", 0) or 30.0
+            # Hard per-identity cap: one window of processed frames x views,
+            # +25% slack (a memory bound, not a selection rule).
+            proc_fps = fps / max(1, int(getattr(self, "frame_skip", 1) or 1))
+            n_views = max(1, len(getattr(self, "views", None) or ()) or 3)
+            buf = CropBuffer(
+                fps=fps,
+                window_s=cfg.clef_mf_window_s,
+                max_frames=cfg.clef_mf_frames,
+                max_entries=max(32, int(math.ceil(
+                    cfg.clef_mf_window_s * proc_fps * n_views * 1.25))),
+                max_jump_m=cfg.vote_stale_max_m,
+            )
+            self._crop_buffer = buf
+        return buf
+
+    def _mf_flush(self, identity_id, reason: str) -> None:
+        """Forget an identity's buffered crops (its physical object may have
+        changed). No-op when the buffer was never built (knob off)."""
+        buf = getattr(self, "_crop_buffer", None)
+        if buf is not None and identity_id is not None:
+            buf.flush(identity_id, reason)
+
+    def _clef_mf_push(self, fused, frame_num, det_to_slot=None, binding_events=None) -> None:
+        """Per processed frame (clef_multiframe): flush identities whose object
+        may have changed, then buffer each bound identity's raw band crops.
+
+        Runs after the identity registry, tracker and occlusion flags are
+        settled for this frame and before the read is scheduled. Mirrors the
+        read pass's slot_to_obs build (det_to_slot -> fused obs -> evidence)
+        and its crop filters (all-camera bumper occlusion without a corner
+        crop, vote_ray_gate), and additionally skips a main-camera crop whose
+        main-view bumper is occluded.
+
+        Flush triggers handled here (the snapshot is the previous push):
+          * identity eviction (IdentityRegistry caps)            -> "evicted"
+          * identity<->slot rebinding, incl. re-attachment         -> "rebind"
+          * tracker binding events on the slot (slot_seeded, slot_expired,
+            kinematic_reject, occlusion_rebind_held)               -> event name
+          * fused-id evidence type != "continued" (merged,
+            appearance_relinked, newly_created)                    -> "fused_<type>"
+          * the slot measured by a different fused track id than last time
+            (tracker.py's silent _id_to_slot rewire, or a slot_rebound of a
+            different id)                                          -> "slot_track_change"
+        "slot_rebound" itself is NOT a trigger: FieldTracker emits it on EVERY
+        frame a known fused id sticky-rebinds to its own slot (the normal
+        continuation), so flushing on it would empty the buffer every frame.
+        A slot_rebound that changes the slot's id is caught by the id check.
+          * an immediate-read trigger: needs_immediate_read rising, or a new
+            last_immediate_queue_time stamp                        -> "immediate_read"
+          * a field-position jump > vote_stale_max_m (inside CropBuffer.push) -> "jump"
+        Elsewhere: co-occlusion resolution, a confirmed-lock contradiction,
+        a roster clear, and a tracklet_inconsistent read flush explicitly.
+        KNOWN GAP: SAM pre-pass re-anchor / cull events are not plumbed into
+        the loop; a re-anchored mask that keeps its object id looks
+        "continued" here. The in-request same_robot question is the backstop.
+        """
+        if not self._clef_mf_enabled():
+            return
+        buf = self._get_crop_buffer()
+        ft = getattr(self, "field_tracker", None)
+        if det_to_slot is None:
+            det_to_slot = getattr(ft, "last_det_to_slot", None) or {}
+        if binding_events is None:
+            binding_events = getattr(ft, "binding_events", None) or []
+        identities = self.identity_registry.identities
+        st = getattr(self, "_mf_state", None)
+        if st is None:
+            st = self._mf_state = {"bind": {}, "slot_tid": {}, "flags": {}}
+        prev_bind = st["bind"]
+        cur_bind = {iid: ident.active_slot for iid, ident in identities.items()
+                    if getattr(ident, "active_slot", None) is not None}
+
+        buf.retain(identities.keys(), "evicted")
+
+        def _owners(slot):
+            return ({i for i, s_ in prev_bind.items() if s_ == slot}
+                    | {i for i, s_ in cur_bind.items() if s_ == slot})
+
+        for iid, slot in cur_bind.items():
+            if prev_bind.get(iid) != slot:
+                buf.flush(iid, "rebind")
+        for ev in binding_events:
+            kind = str(ev.get("event") or "binding_event")
+            if kind == "slot_rebound":
+                continue          # per-frame sticky continuation (see docstring)
+            for iid in _owners(ev.get("slot_id")):
+                buf.flush(iid, kind)
+        slot_to_obs = {}
+        for i, obs in enumerate(fused):
+            slot = det_to_slot.get(i)
+            if slot is None:
+                continue
+            slot_to_obs[slot] = obs
+            ev_type = getattr(getattr(obs, "relink_evidence", None), "type", None)
+            if ev_type is not None and ev_type != "continued":
+                for iid in _owners(slot):
+                    buf.flush(iid, f"fused_{ev_type}")
+            tid = getattr(obs, "track_id", None)
+            if tid is not None:
+                last = st["slot_tid"].get(slot)
+                if last is not None and last != tid:
+                    for iid in _owners(slot):
+                        buf.flush(iid, "slot_track_change")
+                st["slot_tid"][slot] = tid
+        flags = {}
+        for iid, ident in identities.items():
+            cur = (bool(getattr(ident, "needs_immediate_read", False)),
+                   getattr(ident, "last_immediate_queue_time", None))
+            prev = st["flags"].get(iid)
+            if prev is not None and ((cur[0] and not prev[0]) or cur[1] != prev[1]):
+                buf.flush(iid, "immediate_read")
+            flags[iid] = cur
+        st["flags"] = flags
+
+        occ = getattr(self, "_occ", None) or {}
+        main_occ = (getattr(self, "_occ_by_cam", None) or {}).get("main") or {}
+        cfg = self.config
+        ray_gate = bool(getattr(cfg, "vote_ray_gate", False))
+        centers = getattr(self, "_camera_centers_xy", None) or {}
+        for iid, slot in cur_bind.items():
+            obs = slot_to_obs.get(slot)
+            if obs is None:
+                continue
+            evidence = obs.evidence
+            if (occ.get(slot) or {}).get("bumper_occluded") and not any(
+                    cam != "main" and crop for cam, crop, _w, _p in evidence):
+                continue
+            main_blocked = bool((main_occ.get(slot) or {}).get("bumper_occluded"))
+            crops = []
+            for cam, crop, _w, cam_pos in evidence:
+                src = getattr(crop, "src", None)
+                if not src or (cam == "main" and main_blocked):
+                    continue
+                if ray_gate and cam_pos is not None:
+                    center = centers.get(cam)
+                    if center is not None:
+                        miss = vote_ray_cross_m(center, cam_pos, obs.detection.pos)
+                        if miss is not None and miss > cfg.vote_ray_cross_m:
+                            continue
+                cut = _band_crop_for_buffer(src)
+                if cut is not None:
+                    crops.append((cam, cut[0], cut[1]))
+            if crops:
+                buf.push(iid, frame_num, crops, pos=obs.detection.pos, slot=slot)
+        # The buffer holds copies: stop the thunks pinning this frame's views
+        # (the read pass keeps `fused` alive while a request is in flight).
+        for obs in fused:
+            for _cam, crop, _w, _p in obs.evidence:
+                if isinstance(crop, _LazyCrop):
+                    crop.src = None
+        st["bind"] = cur_bind
+
+    def _plan_clef_multiframe(self, chosen, crop_frame):
+        """Per chosen read candidate, the multi-frame item (or None for a
+        single-crop read). Returns (items, metas) or None when no candidate
+        gets more than one image (the call then stays the single-crop call).
+
+        items[i] is the candidate's own crop string, or [crop_b64, raw_crop,
+        ...] (newest first; raw crops are encoded on the worker thread by
+        _clef_mf_encode_plan). metas[i] is None or {"span_s", "frames":
+        [{"frame", "cam"}...]}. The newest image is ALWAYS the candidate's own
+        crop (so every single-crop consumer keeps getting exactly today's
+        crop); the buffer must hold an entry of that identity at crop_frame on
+        the same slot, else the read stays single-crop. Selected frames are
+        marked sent so the next read of the identity uses fresh frames."""
+        buf = getattr(self, "_crop_buffer", None)
+        counts = getattr(self, "_mf_counts", None)
+        if counts is None:
+            counts = self._mf_counts = {"multi": 0, "single": 0}
+        if buf is None:
+            counts["single"] += len(chosen)
+            return None
+        fps = getattr(self, "video_fps", 0) or 30.0
+        n = getattr(self.config, "clef_mf_frames", 4)
+        items, metas, any_multi = [], [], False
+        for cand in chosen:
+            _p, _w, identity_id, slot_id, cam, crop_b64 = cand[:6]
+            sel = buf.select(identity_id, crop_frame, newest_cam=cam, slot=slot_id, n=n)
+            if len(sel) < 2:
+                counts["single"] += 1
+                items.append(crop_b64)
+                metas.append(None)
+                continue
+            older = sel[1:]
+            frames = ([{"frame": int(crop_frame), "cam": cam}]
+                      + [{"frame": int(e.frame), "cam": e.cam} for e in older])
+            items.append([crop_b64] + [e.crop for e in older])
+            metas.append({"span_s": round((int(crop_frame) - older[-1].frame) / fps, 2),
+                          "frames": frames})
+            buf.mark_sent(identity_id, [f["frame"] for f in frames])
+            counts["multi"] += 1
+            any_multi = True
+        return (items, metas) if any_multi else None
+
+    def _on_tracklet_inconsistent(self, identity_id, slot_id, res, crop_frame) -> None:
+        """A multi-frame read whose same_robot probability fell below
+        clef_mf_same_robot_min: the read already counts as failed (team None,
+        error set -> normal backoff). Raise the hijack alarm (diagnostic event
+        + counter + log line) and drop the identity's buffered crops, which
+        evidently mix objects."""
+        frames = res.get("clef_frames")
+        p_same = res.get("clef_same_robot")
+        diags = getattr(self, "identity_diagnostics", None)
+        if diags is not None:
+            try:
+                diags.increment("vlm.tracklet_inconsistent")
+                diags.record(DiagnosticEvents.VLM_TRACKLET_INCONSISTENT,
+                             identity_id=identity_id, slot_id=slot_id,
+                             crop_frame=crop_frame, frames=frames, p_same_robot=p_same)
+            except Exception:
+                pass
+        self._mf_flush(identity_id, "inconsistent")
+        print(f"  Clef tracklet INCONSISTENT: identity {identity_id} "
+              f"({self._slot_label(slot_id)}) "
+              f"same_robot={p_same} frames={[f.get('frame') for f in frames or []]}")
 
     def _apply_bumper_read(self, slot_id, crop_b64, remaining, remaining_blue,
                            remaining_red, source_weight):
@@ -2464,6 +2793,7 @@ class InferenceJob:
             ident.is_confirmed = False
             ident.confidence = 0.4
             ident.needs_immediate_read = True
+            self._mf_flush(ident.identity_id, "contradiction")
 
     def _capture_slot_crop(self, slot_id, crop_b64, quality, embedding, robot_crop_b64=None):
         """Keep the top-3 (by quality) crops per slot for post-match review.
@@ -3019,6 +3349,17 @@ class InferenceJob:
             expected.append(alliance if alliance in ("blue", "red") else "unknown")
 
         provider = getattr(self, "team_reader", "local")
+        # clef_multiframe: per chosen identity, the newest crop (this crop,
+        # unchanged) plus fresh earlier crops of the same identity from the
+        # crop buffer, as ONE request. None = every read stays single-crop
+        # (and the call below is today's call byte-for-byte).
+        mf_plan = None
+        if provider == "clef" and self._clef_mf_enabled():
+            try:
+                mf_plan = self._plan_clef_multiframe(chosen, crop_frame)
+            except Exception as e:
+                print(f"  [clef-mf] multi-frame plan failed ({e!r}); single-crop reads")
+                mf_plan = None
         self.vlm_status.update({
             "provider": provider,
             "calls": int(self.vlm_status.get("calls", 0)) + 1,
@@ -3029,13 +3370,30 @@ class InferenceJob:
             "last_error": None,
         })
         try:
-            results = await asyncio.to_thread(
-                _vision_read_bumpers,
-                crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
-                expected_alliances=expected,
-                provider=provider,
-                **self._clef_read_kwargs(provider),
-            )
+            if mf_plan is None:
+                results = await asyncio.to_thread(
+                    _vision_read_bumpers,
+                    crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
+                    expected_alliances=expected,
+                    provider=provider,
+                    **self._clef_read_kwargs(provider),
+                )
+            else:
+                _mf_items, _mf_metas = mf_plan
+                _mf_kw = self._clef_read_kwargs(provider)
+                _mf_fps = getattr(self, "video_fps", 0) or 30.0
+
+                def _mf_read():
+                    # Encode the buffered earlier crops off the event loop.
+                    items, metas = _clef_mf_encode_plan(_mf_items, _mf_metas, _mf_fps)
+                    return _vision_read_bumpers(
+                        items, self.match_teams, self.match_blue_teams, self.match_red_teams,
+                        expected_alliances=expected,
+                        provider=provider,
+                        clef_item_meta=metas,
+                        **_mf_kw,
+                    )
+                results = await asyncio.to_thread(_mf_read)
         except Exception as e:
             print(f"  VLM failed [{provider}]: {e}")
             self.vlm_status["last_error"] = str(e)
@@ -3119,6 +3477,11 @@ class InferenceJob:
             # slot while the read was in flight.
             diag_robot_id = (slot_identity.get(slot_id, robot.robot_id)
                              if slot_identity is not None else robot.robot_id)
+            # Multi-frame clef reads only: which frames/cams went into the
+            # request (newest first; the row's frame/crop are the newest) and
+            # the same_robot probability. Absent otherwise (rows unchanged).
+            _mf_diag = {k: res[k] for k in ("clef_frames", "clef_same_robot")
+                        if res.get(k) is not None}
             self.diagnostic.record_vlm_read(
                 frame=crop_frame, robot_id=diag_robot_id,
                 crop_b64=crop_b64,
@@ -3130,7 +3493,10 @@ class InferenceJob:
                 vote_weight=vote_weight,
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
+                **_mf_diag,
             )
+            if res.get("error") == clef_reader.INCONSISTENT_ERROR:
+                self._on_tracklet_inconsistent(identity_id, slot_id, res, crop_frame)
 
             # Update success/backoff based on whether read succeeded
             if res.get("error") or not team:
@@ -3307,6 +3673,9 @@ class InferenceJob:
 
             for identity_id, slot_id in resolved_slots.items():
                 ident_obj = self.identity_registry.identities[identity_id]
+                # The occlusion may have swapped which robot each identity's
+                # buffered crops show: start the multi-frame buffer over.
+                self._mf_flush(identity_id, "co_occlusion")
                 ident_obj.active_slot = slot_id
                 ident_obj.is_ambiguous = False
                 ident_obj.needs_immediate_read = False
@@ -4082,6 +4451,7 @@ class InferenceJob:
                 ident.is_confirmed = False
                 ident.confidence = min(ident.confidence, 0.4)
                 ident.needs_immediate_read = True
+                self._mf_flush(ident.identity_id, "roster_clear")
 
     def ocr_score(self, overhead_frame: np.ndarray, alliance: str) -> Optional[int]:
         """OCR a single alliance score from the overhead crop of the scoreboard.
@@ -7460,6 +7830,9 @@ class InferenceJob:
                 person_evidence_boxes_by_cam = {}
                 
                 with self._stage("loop.evidence_build"):
+                    # clef_multiframe: lazy crops also carry their source so
+                    # the crop buffer can cut the raw band crop (see _LazyCrop).
+                    _mf_src = self._clef_mf_enabled()
                     if self.use_sam2:
                         SAM2_SCALE = self.sam2_export_scale
                         for view in self.views:
@@ -7613,7 +7986,9 @@ class InferenceJob:
                                 def _enc(_f=view_frame, _b=det.box):
                                     cb = self._bumper_crop_b64(_f, _b, enforce_floor=False)
                                     return cb[0] if cb is not None else None
-                                paired.append((det, _LazyCrop(_enc)))
+                                paired.append((det, _LazyCrop(
+                                    _enc, src=(view_frame, det.box, False)
+                                    if _mf_src else None)))
 
 
                             person_boxes = field_adjacent_persons(person_boxes_all, cal, self.field_dims)
@@ -7834,6 +8209,26 @@ class InferenceJob:
                                                  if _tp is not None else None),
                             })
                     # Coasting tracks keep their stale last_position untouched.
+
+                if self._clef_mf_enabled():
+                    # Multi-frame Clef reads: buffer this frame's raw band
+                    # crops per identity, AFTER the identity<->slot mapping
+                    # and occlusion flags for this frame are settled and
+                    # BEFORE the read is scheduled (the newest buffered frame
+                    # is then the read's own crop frame).
+                    with self._stage("loop.crop_buffer"):
+                        try:
+                            self._clef_mf_push(fused, frame_num)
+                        except Exception as e:
+                            # Optional feature: never kill the job. Start the
+                            # buffer over (no stale continuity assumptions).
+                            if not getattr(self, "_mf_push_warned", False):
+                                self._mf_push_warned = True
+                                print(f"  [clef-mf] crop-buffer push failed ({e!r}); "
+                                      "buffer reset, reads fall back to single crops "
+                                      "until it refills")
+                            self._crop_buffer = None
+                            self._mf_state = None
 
                 with self._stage("loop.vlm"):
                     # VLM — read bumper numbers on a time interval. Qwen3-VL is LOCAL and
@@ -9504,24 +9899,29 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
                           expected_alliances: Optional[list] = None,
                           provider: str = "local",
                           full_roster: Optional[dict] = None,
-                          clef_session=None) -> list:
+                          clef_session=None,
+                          clef_item_meta: Optional[list] = None) -> list:
     """Read bumper numbers using best available method.
     provider="local" uses Qwen VL on the local GPU. provider="deepseek" uses
     local OCR digits plus DeepSeek V4 text/chat roster normalization.
     provider="clef" asks a Cloudflare Workers AI decision model to choose among
     the full match roster (``full_roster`` = {"red": [...], "blue": [...]})
-    plus none/other escapes; ``full_roster`` and ``clef_session`` are only
-    consumed by that branch."""
+    plus none/other escapes; ``full_roster``, ``clef_session`` and
+    ``clef_item_meta`` are only consumed by that branch. For clef, an item of
+    ``robot_crops_b64`` may be a LIST of crops of one identity (newest first,
+    clef_multiframe): one multi-image request, described by
+    ``clef_item_meta[i]`` (see ClefSession.read_bumpers)."""
     print(f"  Team reader [{provider}]: sending {len(robot_crops_b64)} bumper crops")
     if provider == "clef":
         # Cloud reader: returns here on every path. It must never fall through
         # to the in-process Qwen reader below, which would load ~8GB onto the
         # GPU mid-job (e.g. after the Workers AI quota runs out).
         try:
+            _mf = {} if clef_item_meta is None else {"item_meta": clef_item_meta}
             return _clef_read_bumpers(
                 robot_crops_b64, match_teams, blue_teams, red_teams,
                 expected_alliances=expected_alliances,
-                full_roster=full_roster, session=clef_session,
+                full_roster=full_roster, session=clef_session, **_mf,
             )
         except Exception as e:
             print(f"  Clef reader failed ({e!r}); reads skipped (no local fallback)")
@@ -9562,8 +9962,10 @@ def _clef_read_bumpers(robot_crops_b64: list, match_teams: list,
                        blue_teams: list, red_teams: list,
                        expected_alliances: Optional[list] = None,
                        full_roster: Optional[dict] = None,
-                       session=None) -> list:
-    """team_reader="clef": one Workers AI decision-model request per crop.
+                       session=None,
+                       item_meta: Optional[list] = None) -> list:
+    """team_reader="clef": one Workers AI decision-model request per crop
+    (or per multi-frame crop list; ``item_meta`` describes those items).
 
     Offers the FULL match roster (``full_roster`` when given, else the passed
     alliance lists), each team labelled with its alliance, plus the none/other
@@ -9580,9 +9982,10 @@ def _clef_read_bumpers(robot_crops_b64: list, match_teams: list,
         blue = [str(t) for t in blue_teams or []]
     extra = [str(t) for t in match_teams or [] if str(t) not in red and str(t) not in blue]
     session = session or clef_reader.default_session()
+    _mf = {} if item_meta is None else {"item_meta": item_meta}
     return session.read_bumpers(robot_crops_b64, red, blue,
                                 expected_alliances=expected_alliances,
-                                extra_teams=extra)
+                                extra_teams=extra, **_mf)
 
 
 def _clef_classify_crops(crops_b64: list, session=None) -> list:

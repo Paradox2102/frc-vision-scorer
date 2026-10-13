@@ -132,7 +132,9 @@ class DiagnosticRecorder:
                        raw_read: str | None, matched_team: str | None,
                        alliance_read: str, confidence: float, vote_weight: float,
                        surface: str = "unknown",
-                       clef_probs: dict | None = None) -> None:
+                       clef_probs: dict | None = None,
+                       clef_frames: list | None = None,
+                       clef_same_robot: float | None = None) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -149,6 +151,14 @@ class DiagnosticRecorder:
         # rows from the other readers are unchanged.
         if clef_probs:
             record["clef_probs"] = {str(k): float(v) for k, v in clef_probs.items()}
+        # clef_multiframe reads only: the frames/cams sent in the ONE request
+        # (newest first; `frame` and `crop_b64` above are the newest) and the
+        # model's "do all images show the same robot?" probability.
+        if clef_frames:
+            record["clef_frames"] = [
+                {"frame": int(f["frame"]), "cam": str(f["cam"])} for f in clef_frames]
+        if clef_same_robot is not None:
+            record["clef_same_robot"] = float(clef_same_robot)
         self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

@@ -545,6 +545,22 @@ KNOBS = [
     # readers.
     Knob("clef_model", "CLEF_MODEL", str, clef_reader.DEFAULT_MODEL,
          choices=tuple(clef_reader.CLEF_MODELS), section="VLM reader"),
+    # Multi-frame Clef reads (team_reader="clef" only; ignored otherwise): send
+    # the newest bumper crop plus the sharpest earlier crops of the SAME
+    # identity (a per-identity rolling buffer of the last clef_mf_window_s
+    # source seconds, flushed whenever the object behind the identity may
+    # have changed) in ONE request, up to clef_mf_frames images (the API max
+    # is 4). Tracklet bench: clef-flash 31/48 -> 39-41/48 legible, 0 wrong,
+    # 2% FP. A "same_robot" question rides along; below
+    # clef_mf_same_robot_min the read is discarded as tracklet_inconsistent
+    # (a hijack alarm). DEFAULT OFF pending a full-match A/B.
+    Knob("clef_multiframe", "CLEF_MULTIFRAME", bool, False, section="VLM reader"),
+    Knob("clef_mf_frames", "CLEF_MF_FRAMES", int, 4,
+         min=2, max=clef_reader.CLEF_MAX_IMAGES, section="VLM reader"),
+    Knob("clef_mf_window_s", "CLEF_MF_WINDOW_S", float, 3.0, min=0.5, max=10.0,
+         section="VLM reader"),
+    Knob("clef_mf_same_robot_min", "CLEF_MF_SAME_ROBOT_MIN", float,
+         clef_reader.DEFAULT_SAME_ROBOT_MIN, min=0.0, max=1.0, section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only

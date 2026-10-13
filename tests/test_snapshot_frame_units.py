@@ -15,6 +15,9 @@ import ast
 import inspect
 import json
 from collections import deque
+from types import SimpleNamespace
+
+import numpy as np
 
 import web.app as app_module
 from web.app import InferenceJob, RobotTrack
@@ -115,3 +118,109 @@ def test_snapshot_ages_and_last_seen_are_source_frame_differences(tmp_path):
     # rather than treating it as "never seen".
     assert by_id[3]["last_seen_frame"] == 0
     assert by_id[3]["embedding"]["age_frames"] == 1000
+
+
+def _obs(track_id, detection):
+    return SimpleNamespace(track_id=track_id, detection=detection)
+
+
+def test_fresh_embedding_slots_only_counts_this_frames_embeddings():
+    # FusedTrackRegistry.get_embedding is the persistent running EMA, so it is
+    # non-None every frame once a track was ever embedded -- it cannot signal
+    # freshness. Only an observation carrying detection.embedding THIS frame
+    # refreshes the slot's appearance embedding.
+    job = InferenceJob.__new__(InferenceJob)
+    job.field_tracker = SimpleNamespace(_id_to_slot={10: 1, 11: 2, 12: 3})
+    emb = np.ones(4)
+    fused = [
+        _obs(10, SimpleNamespace(embedding=emb)),   # fresh, mapped -> slot 1
+        _obs(11, SimpleNamespace(embedding=None)),  # coasting: EMA not updated
+        _obs(12, None),                             # no detection
+        _obs(None, SimpleNamespace(embedding=emb)), # unassigned fused id
+        _obs(99, SimpleNamespace(embedding=emb)),   # fused id not bound to a slot
+    ]
+
+    assert job._fresh_embedding_slots(fused) == {1}
+
+    job.field_tracker = None
+    assert job._fresh_embedding_slots(fused) == set()
+
+
+def _is_name(node, name):
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _is_stamp_assign(node):
+    """True for `robot.last_embedding_frame = frame_num`."""
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        return False
+    target = node.targets[0]
+    return (
+        isinstance(target, ast.Attribute)
+        and target.attr == "last_embedding_frame"
+        and _is_name(target.value, "robot")
+        and _is_name(node.value, "frame_num")
+    )
+
+
+def _is_fresh_slot_membership(test):
+    """True for a `<expr> in fresh_emb_slots` comparison."""
+    return (
+        isinstance(test, ast.Compare)
+        and any(isinstance(op, ast.In) for op in test.ops)
+        and any(_is_name(c, "fresh_emb_slots") for c in test.comparators)
+    )
+
+
+def test_main_loop_stamps_last_embedding_frame_only_for_fresh_slots():
+    source_path = inspect.getsourcefile(app_module)
+    with open(source_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=source_path)
+
+    # The helper must be fed this frame's `fused` list.
+    helper_calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_fresh_embedding_slots"
+        and _is_name(n.func.value, "self")
+        and len(n.args) == 1 and _is_name(n.args[0], "fused")
+    ]
+    assert helper_calls, (
+        "web/app.py must call self._fresh_embedding_slots(fused) in the main "
+        "loop to learn which slots got a fresh embedding this frame.")
+
+    # The stamp must sit under `if <slot> in fresh_emb_slots:` -- NOT merely
+    # under `if _emb is not None:` (the persistent EMA is non-None even while
+    # coasting, which would pin age_frames at ~0).
+    stamps = [n for n in ast.walk(tree) if _is_stamp_assign(n)]
+    assert stamps, (
+        "Could not find `robot.last_embedding_frame = frame_num` in "
+        "web/app.py: the live field path must stamp the SOURCE frame.")
+
+    guarded = []
+    for if_node in (n for n in ast.walk(tree) if isinstance(n, ast.If)):
+        if not _is_fresh_slot_membership(if_node.test):
+            continue
+        guarded.extend(
+            n for stmt in if_node.body for n in ast.walk(stmt)
+            if _is_stamp_assign(n))
+    assert guarded, (
+        "`robot.last_embedding_frame = frame_num` must be guarded by an "
+        "`if ... in fresh_emb_slots:` check so only slots whose embedding was "
+        "refreshed THIS frame are stamped.")
+
+
+def test_snapshot_age_frames_from_live_stamp(tmp_path):
+    # Characterization (expected to pass before the fix too): once the live
+    # path stamps last_embedding_frame with a source frame, the snapshot's
+    # embedding.age_frames is the source-frame distance to the snapshot.
+    robot = _robot(1, last_embedding_frame=984, last_seen_frame=1000)
+    job = _make_job(tmp_path, [robot])
+
+    job._emit_diagnostic_snapshot(1000)
+
+    (snap,) = _read_snapshot_rows(job, tmp_path)
+    (row,) = snap["robots"]
+    assert row["embedding"]["age_frames"] == 16

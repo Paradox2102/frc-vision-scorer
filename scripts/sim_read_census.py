@@ -277,6 +277,11 @@ def _make_job(fx, census: bool, interval: float, reader_name: str,
     job.identity_diagnostics = _Quiet()
     job.diagnostic = _RowSink()
     job.timings = {}
+    # Hermetic: the reader is faked, but the clef path still builds a real
+    # ClefSession from the environment; without .env credentials it latches
+    # unavailable and the once-per-job UI warning needs a websocket.
+    job.websocket = None
+    job._clef_warned = True
     return app_module, job
 
 

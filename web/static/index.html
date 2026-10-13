@@ -116,6 +116,27 @@
                                     SAM 2.1 remains as the legacy fallback.
                                 </small>
                             </div>
+                            <div class="input-group debug-only" id="teamReaderGroup">
+                                <label for="teamReader">Bumper reader backend:</label>
+                                <select id="teamReader">
+                                    <option value="" selected>Server default (vLLM)</option>
+                                    <option value="clef">Clef (Cloudflare Workers AI, no GPU)</option>
+                                </select>
+                                <small style="color:#889;display:block;margin-top:4px;">
+                                    Clef picks the team from the full match roster in the cloud
+                                    (~0.5 s, ~$0.00004 per read) and never starts vLLM. Needs
+                                    CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN in .env; if the
+                                    quota runs out, reads stop for that job (no local fallback).
+                                </small>
+                            </div>
+                            <div class="input-group debug-only" id="clefModelGroup" style="display:none;">
+                                <label for="clefModel">Clef model:</label>
+                                <select id="clefModel">
+                                    <option value="clef-flash" selected>clef-flash ($0.038/M tokens)</option>
+                                    <option value="clef">clef ($0.24/M tokens)</option>
+                                    <option value="clef-omni">clef-omni ($0.15/M tokens)</option>
+                                </select>
+                            </div>
                             <div class="input-group debug-only" id="vlmModelGroup">
                                 <label for="vlmModel">Bumper reader model:</label>
                                 <select id="vlmModel">

@@ -384,7 +384,7 @@ documentation lives in `web/job_config.py`. Frequently used:
 |----------|---------|
 | `TRACKING_BACKEND` | `sam3` (default) or `sam2` |
 | `SAM2_TRACK_FPS` / `SAM2_MODEL_SIZE` | tracking speed-vs-quality tradeoffs |
-| `TEAM_READER` | `vllm` (what `start_all.sh` sets) or `local` (in-process) |
+| `TEAM_READER` | `vllm` (what `start_all.sh` sets), `local` (in-process), or `clef` (Cloudflare Workers AI; needs `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`, model via `CLEF_MODEL`) |
 | `VLM_MODEL_NAME` | reader model (default `Qwen/Qwen3-VL-4B-Instruct`) |
 | `GALLERY_ENABLED` | appearance-gallery identity assists |
 

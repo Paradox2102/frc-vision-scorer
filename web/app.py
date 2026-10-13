@@ -52,6 +52,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
 from web.job_config import JobConfig
+from web import clef_reader
 from web import job_config as job_config_registry
 from web.legibility import legibility_score
 from web import reid
@@ -869,6 +870,9 @@ VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 # (web/start_vllm.sh). Continuous batching replaces VLM_BATCH_READS, and the
 # weights live in the vLLM process, so job pruning here never reloads them.
 VLM_SERVER_URL = os.environ.get("VLM_SERVER_URL", "http://127.0.0.1:8006/v1")
+# Valid per-job bumper readers. "clef" = Cloudflare Workers AI decision models
+# (web/clef_reader.py): no GPU, vLLM never started, no in-process fallback.
+_TEAM_READERS = ("local", "deepseek", "vllm", "clef")
 
 # Active served model for the analysis-phase read path's chat payload. Default
 # keeps today's exact behavior (Qwen3-VL-4B on vLLM, no extra payload keys). A
@@ -1203,7 +1207,7 @@ class InferenceJob:
         if config is not None:
             self.team_reader = self.config.team_reader
         else:
-            self.team_reader = team_reader if team_reader in ("local", "deepseek", "vllm") else "local"
+            self.team_reader = team_reader if team_reader in _TEAM_READERS else "local"
         self.status = "initializing"
         self.error: Optional[str] = None
         # Match this job processes; drives calibration-epoch selection. The
@@ -1418,6 +1422,11 @@ class InferenceJob:
         # runs as an event-loop task (create_task) so frame processing never
         # blocks on the 0.6-1.5s generate; only one pass is in flight at a time.
         self._vlm_task = None
+        # team_reader="clef": per-job Workers AI session (credentials, the
+        # quota/auth latch, cost counters). Built lazily by _get_clef_session.
+        self._clef_session = None
+        self._clef_warned = False
+        self._clef_usage_done = False
         # Single-flight background handle + per-identity position history for
         # the observe-only equipment-adjudication pass (equipment_adjudicate).
         self._adjudicate_task = None
@@ -2269,6 +2278,82 @@ class InferenceJob:
             [t for t in self.match_red_teams if t not in confirmed],
         )
 
+    # ---- team_reader="clef" (Cloudflare Workers AI decision models) ----
+
+    def _get_clef_session(self):
+        """This job's Clef session, built on first use from the clef_model knob.
+        getattr defaults keep __new__-built test jobs and legacy configs working."""
+        session = getattr(self, "_clef_session", None)
+        if session is None:
+            model = getattr(getattr(self, "config", None), "clef_model", None)
+            session = clef_reader.ClefSession(model or clef_reader.DEFAULT_MODEL)
+            self._clef_session = session
+        return session
+
+    def _clef_read_kwargs(self, provider: str) -> dict:
+        """Extra _vision_read_bumpers kwargs for a clef read: the FULL match
+        roster (both alliances) and the job's session. Clef offers all six teams
+        plus none/other escapes even when a caller passes roster-minus-confirmed
+        lists, so a missing true team can't force a wrong roster pick. Empty for
+        every other provider, so vllm/local/deepseek calls are byte-identical."""
+        if provider != "clef":
+            return {}
+        return {
+            "full_roster": {"red": list(getattr(self, "match_red_teams", None) or []),
+                            "blue": list(getattr(self, "match_blue_teams", None) or [])},
+            "clef_session": self._get_clef_session(),
+        }
+
+    def _needs_vllm_server(self) -> bool:
+        """Start the vLLM server for the analysis phase only for vllm jobs; a
+        clef job (or local/deepseek) never starts it."""
+        return bool(getattr(getattr(self, "config", None), "vllm_phase_exclusive", False)
+                    and getattr(self, "team_reader", "local") == "vllm")
+
+    async def _maybe_warn_clef_unavailable(self) -> None:
+        """Surface a latched Clef session (quota exhausted / bad credentials) to
+        the UI once, like the vLLM-startup-failure path. Reads keep returning
+        error entries with no HTTP; nothing falls back to a GPU model."""
+        session = getattr(self, "_clef_session", None)
+        if session is None or session.available or getattr(self, "_clef_warned", False):
+            return
+        self._clef_warned = True
+        reason = session.disabled_reason or "unavailable"
+        status = getattr(self, "vlm_status", None)
+        if isinstance(status, dict):
+            status["last_error"] = f"clef: {reason}"
+        await self._warn_degraded(
+            "clef",
+            f"Clef bumper reader disabled for this job ({reason}); team-number "
+            "reads are skipped — no local-model fallback.",
+        )
+
+    def _finalize_clef_usage(self) -> None:
+        """Fold Clef request/token/cost counters into timings + diagnostics and
+        print one summary line. Idempotent; a no-op for non-clef jobs."""
+        session = getattr(self, "_clef_session", None)
+        if session is None or getattr(self, "_clef_usage_done", False):
+            return
+        self._clef_usage_done = True
+        st = session.stats()
+        timings = getattr(self, "timings", None)
+        if isinstance(timings, dict):
+            # Numeric only: the end-of-job pass rounds every timings value to
+            # 2 dp, so cost is kept in cents (full precision in the gauge).
+            timings["clef.requests"] = st["requests"]
+            timings["clef.input_tokens"] = st["input_tokens"]
+            timings["clef.cost_cents"] = st["cost_usd"] * 100.0
+            timings["clef.errors"] = st["errors"]
+            timings["clef.quota_errors"] = st["quota_errors"]
+            timings["clef.latency_p50_s"] = st["latency_p50_s"] or 0.0
+        diags = getattr(self, "identity_diagnostics", None)
+        if diags is not None:
+            try:
+                diags.gauge("clef_usage", st)
+            except Exception:
+                pass
+        print(f"  {session.summary_line()}")
+
     def _apply_bumper_read(self, slot_id, crop_b64, remaining, remaining_blue,
                            remaining_red, source_weight):
         """Read one bumper crop with the VLM and add a (confidence x source_weight)
@@ -2278,11 +2363,13 @@ class InferenceJob:
             return
         alliance = getattr(robot, "alliance", "unknown")
         expected = alliance if alliance in ("blue", "red") else "unknown"
+        provider = getattr(self, "team_reader", "local")
         try:
             res = _vision_read_bumpers(
                 [crop_b64], getattr(self, "match_teams", None) or remaining, remaining_blue, remaining_red,
                 expected_alliances=[expected],
-                provider=getattr(self, "team_reader", "local"),
+                provider=provider,
+                **self._clef_read_kwargs(provider),
             )[0]
         except TypeError:
             # Older tests monkeypatch the previous 4-arg helper shape.
@@ -2636,8 +2723,15 @@ class InferenceJob:
         self._adjudicate_task = asyncio.create_task(self._run_adjudication(batch))
 
     async def _run_adjudication(self, batch) -> None:
-        results = await asyncio.to_thread(
-            _vllm_classify_crops, [crop for (_i, _s, crop) in batch])
+        crops = [crop for (_i, _s, crop) in batch]
+        if getattr(self, "team_reader", "local") == "clef":
+            # Clef job: no vLLM server exists, so ask the same decision model
+            # (robot / equipment / person / unclear choice question).
+            results = await asyncio.to_thread(
+                _clef_classify_crops, crops, session=self._get_clef_session())
+            await self._maybe_warn_clef_unavailable()
+        else:
+            results = await asyncio.to_thread(_vllm_classify_crops, crops)
         for (identity_id, slot_id, _crop), res in zip(batch, results):
             ident = self.identity_registry.identities.get(identity_id)
             if ident is None or res.get("error"):
@@ -2824,11 +2918,14 @@ class InferenceJob:
                 crops, self.match_teams, self.match_blue_teams, self.match_red_teams,
                 expected_alliances=expected,
                 provider=provider,
+                **self._clef_read_kwargs(provider),
             )
         except Exception as e:
             print(f"  VLM failed [{provider}]: {e}")
             self.vlm_status["last_error"] = str(e)
             return
+        if provider == "clef":
+            await self._maybe_warn_clef_unavailable()
 
         ocr_crops = []
         status_results = []
@@ -2898,6 +2995,7 @@ class InferenceJob:
                 confidence=conf,
                 vote_weight=vote_weight,
                 surface=res.get("surface", "unknown"),
+                clef_probs=res.get("clef_probs"),
             )
 
             # Update success/backoff based on whether read succeeded
@@ -3248,10 +3346,12 @@ class InferenceJob:
             robot = self._get_or_create_slot_track(canonical_id)
             if robot and robot.alliance in ("blue", "red"):
                 expected = robot.alliance
+            _provider = getattr(self, "team_reader", "local")
             res = _vision_read_bumpers(
                 [crop_b64], self.match_teams, self.match_blue_teams, self.match_red_teams,
                 expected_alliances=[expected],
-                provider=getattr(self, "team_reader", "local"),
+                provider=_provider,
+                **self._clef_read_kwargs(_provider),
             )[0]
             results.append((canonical_id, box, res))
             ocr_crops.append({
@@ -3277,6 +3377,7 @@ class InferenceJob:
                 confidence=float(res.get("confidence", 0.0)),
                 vote_weight=1.0 if float(res.get("confidence", 0.0)) >= 0.85 else 0.5,
                 surface=res.get("surface", "unknown"),
+                clef_probs=res.get("clef_probs"),
             )
         self.last_ocr_crops = ocr_crops
         self._ocr_crops_dirty = True
@@ -5786,6 +5887,15 @@ class InferenceJob:
         # bumper-reader model (default qwen3-vl-4b = today's behavior). getattr
         # keeps legacy/stub configs without the knob on the incumbent.
         _apply_vlm_model(getattr(self.config, "vlm_model", None))
+        # team_reader="clef": build this job's Workers AI session up front so
+        # missing credentials surface at job start (one log line + UI warning),
+        # not at the first read. vLLM is never started for a clef job.
+        if getattr(self, "team_reader", "local") == "clef":
+            _cs = self._get_clef_session()
+            print(f"  [clef] bumper reader: {_cs.model_key} via Cloudflare Workers AI "
+                  f"(concurrency {_cs.concurrency}, min team p {_cs.min_team_prob}); "
+                  "vLLM not used")
+            await self._maybe_warn_clef_unavailable()
         # Gate on calibration / loaded event (decision 7). No fallback to the old
         # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
         if not self._init_field_tracking():
@@ -6970,8 +7080,7 @@ class InferenceJob:
             # server back now. On failure the read path falls back to the
             # in-process Qwen reader — degraded speed, not a dead job.
             self._raise_if_stopped()  # phase boundary: before vLLM startup
-            if (self.config.vllm_phase_exclusive
-                    and getattr(self, "team_reader", "local") == "vllm"):
+            if self._needs_vllm_server():
                 from web import vllm_lifecycle
                 # Tracking leaves the CUDA caching allocator holding a large
                 # RESERVED pool (observed 14.5GiB cached over ~4GiB live);
@@ -7139,6 +7248,7 @@ class InferenceJob:
                         boxes_are_bumpers=self.bumper_model is not None,
                         crop_frame=early_ocr_source_frame,
                     )
+                    await self._maybe_warn_clef_unavailable()
 
             first_processing_frame = self.processing_ranges[0][0]
             last_processing_frame = self.processing_ranges[-1][1]
@@ -8024,6 +8134,10 @@ class InferenceJob:
                 finally:
                     self._adjudicate_task = None
 
+            # Clef reads/tokens/cost into timings (+ one summary line) before
+            # the complete payload is built. No-op for other readers.
+            self._finalize_clef_usage()
+
             # Fold the per-stage accumulators into timings as flat "loop.<stage>"
             # keys (survive the end-of-job round pass) and print one hot-path line.
             for _k, _v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]):
@@ -8168,6 +8282,12 @@ class InferenceJob:
                 except Exception:
                     pass
             self._view_export_dirs = None
+            # Clef usage for errored/stopped runs that never reached the
+            # success-path call (idempotent; no-op for other readers).
+            try:
+                self._finalize_clef_usage()
+            except Exception as e:
+                print(f"  [clef] usage summary failed: {e}")
             # Finalize processing timings (covers partial/errored runs the success
             # path never reached) and round to 2 decimals for display/storage.
             timings = getattr(self, "timings", {}) or {}
@@ -9293,11 +9413,30 @@ async def calibration_tag_map(season: str = "2026-rebuilt-welded"):
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
                           blue_teams: list, red_teams: list,
                           expected_alliances: Optional[list] = None,
-                          provider: str = "local") -> list:
+                          provider: str = "local",
+                          full_roster: Optional[dict] = None,
+                          clef_session=None) -> list:
     """Read bumper numbers using best available method.
     provider="local" uses Qwen VL on the local GPU. provider="deepseek" uses
-    local OCR digits plus DeepSeek V4 text/chat roster normalization."""
+    local OCR digits plus DeepSeek V4 text/chat roster normalization.
+    provider="clef" asks a Cloudflare Workers AI decision model to choose among
+    the full match roster (``full_roster`` = {"red": [...], "blue": [...]})
+    plus none/other escapes; ``full_roster`` and ``clef_session`` are only
+    consumed by that branch."""
     print(f"  Team reader [{provider}]: sending {len(robot_crops_b64)} bumper crops")
+    if provider == "clef":
+        # Cloud reader: returns here on every path. It must never fall through
+        # to the in-process Qwen reader below, which would load ~8GB onto the
+        # GPU mid-job (e.g. after the Workers AI quota runs out).
+        try:
+            return _clef_read_bumpers(
+                robot_crops_b64, match_teams, blue_teams, red_teams,
+                expected_alliances=expected_alliances,
+                full_roster=full_roster, session=clef_session,
+            )
+        except Exception as e:
+            print(f"  Clef reader failed ({e!r}); reads skipped (no local fallback)")
+            return [clef_reader.error_entry(f"clef: {e}") for _ in robot_crops_b64]
     if provider == "deepseek":
         return _deepseek_read_bumpers(
             robot_crops_b64, match_teams, blue_teams, red_teams,
@@ -9328,6 +9467,44 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
 
     # Claude Vision fallback (disabled for now)
     # return _claude_vision_read_bumpers(robot_crops_b64, match_teams, blue_teams, red_teams)
+
+
+def _clef_read_bumpers(robot_crops_b64: list, match_teams: list,
+                       blue_teams: list, red_teams: list,
+                       expected_alliances: Optional[list] = None,
+                       full_roster: Optional[dict] = None,
+                       session=None) -> list:
+    """team_reader="clef": one Workers AI decision-model request per crop.
+
+    Offers the FULL match roster (``full_roster`` when given, else the passed
+    alliance lists), each team labelled with its alliance, plus the none/other
+    escapes; the expected bumper colour goes in the state text only. Returns
+    the same per-crop dicts as _vllm_read_bumpers (team_number, alliance,
+    confidence, raw_read, digit_prob, surface, error) plus ``clef_probs``.
+    ``session`` is the job's ClefSession (quota latch + cost counters); None
+    uses a process-wide default session.
+    """
+    red = [str(t) for t in ((full_roster or {}).get("red") or [])]
+    blue = [str(t) for t in ((full_roster or {}).get("blue") or [])]
+    if not red and not blue:
+        red = [str(t) for t in red_teams or []]
+        blue = [str(t) for t in blue_teams or []]
+    extra = [str(t) for t in match_teams or [] if str(t) not in red and str(t) not in blue]
+    session = session or clef_reader.default_session()
+    return session.read_bumpers(robot_crops_b64, red, blue,
+                                expected_alliances=expected_alliances,
+                                extra_teams=extra)
+
+
+def _clef_classify_crops(crops_b64: list, session=None) -> list:
+    """Clef counterpart of _vllm_classify_crops (equipment adjudication):
+    {"object": robot|equipment|person|unclear, "error": ...} per crop.
+    Best-effort; never raises into the loop."""
+    try:
+        session = session or clef_reader.default_session()
+        return session.classify_crops(crops_b64)
+    except Exception as e:
+        return [{"object": "unclear", "error": f"clef: {e}"} for _ in crops_b64]
 
 
 def _claude_vision_read_bumpers(robot_crops_b64: list, match_teams: list,

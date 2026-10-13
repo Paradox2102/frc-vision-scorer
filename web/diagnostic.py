@@ -131,18 +131,25 @@ class DiagnosticRecorder:
                        crop_b64: str | None, legibility: float,
                        raw_read: str | None, matched_team: str | None,
                        alliance_read: str, confidence: float, vote_weight: float,
-                       surface: str = "unknown") -> None:
+                       surface: str = "unknown",
+                       clef_probs: dict | None = None) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
-        self._emit({
+        record = {
             "frame": int(frame), "t_ms": self._t_ms(), "type": "vlm_read",
             "robot_id": int(robot_id), "crop_b64": crop_b64,
             "legibility": float(legibility), "raw_read": raw_read,
             "matched_team": matched_team, "alliance_read": alliance_read,
             "confidence": float(confidence), "vote_weight": float(vote_weight),
             "surface": surface,
-        })
+        }
+        # team_reader="clef" only: the per-option probabilities (roster teams +
+        # none/other), kept for later soft-evidence use. Omitted otherwise so
+        # rows from the other readers are unchanged.
+        if clef_probs:
+            record["clef_probs"] = {str(k): float(v) for k, v in clef_probs.items()}
+        self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,
                            crop_b64: str | None, legibility: float, reason: str) -> None:

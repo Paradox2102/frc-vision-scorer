@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from web import vlm_models
+from web import clef_reader, vlm_models
 
 # Matches the truthiness rule used by the app.py env constants.
 _FALSY = ("0", "false", "False")
@@ -490,8 +490,12 @@ KNOBS = [
     Knob("rts_smooth", "RTS_SMOOTH", bool, False,
          section="Track hygiene"),
     # --- identity / VLM ---
+    # "clef": Cloudflare Workers AI decision models (web/clef_reader.py) —
+    # a closed-set choice over the full 6-team roster + none/other escapes.
+    # No GPU: vLLM is never started for a clef job and there is no mid-job
+    # fallback to the in-process model (quota/auth failure disables reads).
     Knob("team_reader", "TEAM_READER", str, "local",
-         choices=("local", "deepseek", "vllm"), section="Identity & votes"),
+         choices=("local", "deepseek", "vllm", "clef"), section="Identity & votes"),
     # Surface-aware vote gate: the bumper readers also report whether the
     # digits sit on a robot bumper band ("bumper") or are PRINTED on
     # equipment ("printed") — qm11's OVERFLOW crate base read "1477" at
@@ -534,6 +538,13 @@ KNOBS = [
     # are selectable (the first run just pays the download).
     Knob("vlm_model", "VLM_MODEL", str, vlm_models.DEFAULT_KEY,
          choices=vlm_models.model_keys(), section="VLM reader"),
+    # Which Workers AI decision model serves team_reader="clef" reads.
+    # clef-flash ($0.038/M input tokens) tied local Qwen3-VL-8B on the
+    # 200-crop bench (68 vs 69/90 legible, 0 wrong); clef ($0.24/M) and
+    # clef-omni ($0.15/M) are the larger alternatives. Ignored by the other
+    # readers.
+    Knob("clef_model", "CLEF_MODEL", str, clef_reader.DEFAULT_MODEL,
+         choices=tuple(clef_reader.CLEF_MODELS), section="VLM reader"),
     Knob("gallery_enabled", "GALLERY_ENABLED", bool, True,
          section="Identity & votes"),
     # Trust model: deposits are saved as unverified CANDIDATES; only

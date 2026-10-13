@@ -103,6 +103,7 @@ class VisionScorer {
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
         this.populateSam2Models();
         this.populateVlmModels();
+        this.initTeamReaderControls();
         this.rejoinActiveJob();
         this.startInferenceBtn.addEventListener('click', () => this.startInference());
         this.pauseInferenceBtn.addEventListener('click', () => this.pauseInference());
@@ -1166,6 +1167,22 @@ class VisionScorer {
         }
     }
 
+    initTeamReaderControls() {
+        // Debug-only reader backend picker. Clef runs in the cloud, so the
+        // vLLM model picker doesn't apply to it; show the Clef model instead.
+        const reader = document.getElementById('teamReader');
+        if (!reader) return;
+        const sync = () => {
+            const isClef = reader.value === 'clef';
+            const clefGroup = document.getElementById('clefModelGroup');
+            const vlmGroup = document.getElementById('vlmModelGroup');
+            if (clefGroup) clefGroup.style.display = isClef ? '' : 'none';
+            if (vlmGroup) vlmGroup.style.display = isClef ? 'none' : '';
+        };
+        reader.addEventListener('change', sync);
+        sync();
+    }
+
     async handleSubmit(e) {
         e.preventDefault();
 
@@ -1183,7 +1200,8 @@ class VisionScorer {
         } else if (youtubeUrl) {
             formData.append('youtube_url', youtubeUrl);
         }
-        // team_reader intentionally not sent: the server default (vllm via
+        // team_reader is only sent (via config_json below) when the debug
+        // picker selects Clef; otherwise the server default (vllm via
         // start_all.sh) applies, with automatic in-process fallback.
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
@@ -1210,11 +1228,20 @@ class VisionScorer {
         if (document.getElementById('fieldWireframeOverlay')?.checked) {
             config.field_wireframe_overlay = true;
         }
-        // Bumper reader model: only send the override when it differs from the
-        // server default (mirrors how tracking_backend / model_size are sent).
-        const vlmModel = document.getElementById('vlmModel')?.value;
-        if (vlmModel && vlmModel !== this._defaultVlmModel) {
-            config.vlm_model = vlmModel;
+        const teamReader = document.getElementById('teamReader')?.value;
+        if (teamReader === 'clef') {
+            config.team_reader = 'clef';
+            const clefModel = document.getElementById('clefModel')?.value;
+            if (clefModel && clefModel !== 'clef-flash') {
+                config.clef_model = clefModel;
+            }
+        } else {
+            // Bumper reader model: only send the override when it differs from the
+            // server default (mirrors how tracking_backend / model_size are sent).
+            const vlmModel = document.getElementById('vlmModel')?.value;
+            if (vlmModel && vlmModel !== this._defaultVlmModel) {
+                config.vlm_model = vlmModel;
+            }
         }
         if (Object.keys(config).length > 0) {
             formData.append('config_json', JSON.stringify(config));

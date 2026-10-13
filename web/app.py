@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -374,6 +375,16 @@ MATCH_CLOCK_OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:"
 MATCH_CLOCK_SAMPLE_SECONDS = 0.5
 MATCH_CLOCK_LEAD_SECONDS = 0.5
 MATCH_CLOCK_TAIL_SECONDS = 3.0
+# Clock scan decode: grab() every frame and retrieve() only the sampled ones
+# instead of seeking per sample (each CAP_PROP_POS_FRAMES seek re-decodes from
+# the previous keyframe, ~5x the cost). Exact frames by construction; the seek
+# path stays as the kill-switch for A/B.
+CLOCK_SCAN_SEQUENTIAL = os.environ.get("CLOCK_SCAN_SEQUENTIAL", "1") not in ("0", "false", "False")
+# pytesseract spawns a subprocess per read, so a thread pool parallelises the
+# clock OCR almost linearly. Applies to the sequential path only.
+CLOCK_SCAN_OCR_WORKERS = max(1, int(
+    os.environ.get("CLOCK_SCAN_OCR_WORKERS", "") or min(8, os.cpu_count() or 1)
+))
 TITLE_SCREEN_FRAMES = 180
 EARLY_OCR_FRAME = 200
 OCR_FRAME_INTERVAL = 5  # OCR every 5th processed frame
@@ -452,8 +463,15 @@ def _find_clock_period(
     samples: List[Tuple[int, Optional[int]]],
     target_start: int,
     after_frame: int = -1,
+    fps: Optional[float] = None,
 ) -> Optional[dict]:
-    """Find one decreasing countdown, tolerating a single bad OCR sample."""
+    """Find one decreasing countdown, tolerating a single bad OCR sample.
+
+    With ``fps``, a read that falls faster than real time (more than the
+    seconds elapsed since the last good read, plus slack) is a bad sample
+    too: a single digit misread low mid-teleop (69->60) otherwise became the
+    running minimum, every true read after it looked like a high outlier, and
+    the match fell back to full-video processing. None = legacy behaviour."""
     candidates = [
         i for i, (frame, value) in enumerate(samples)
         if frame > after_frame
@@ -480,7 +498,14 @@ def _find_clock_period(
             }
 
         for frame, value in samples[start_idx + 1:]:
-            if value is None or value > last_value + 2:
+            if (
+                value is None
+                or value > last_value + 2
+                or (
+                    fps is not None and fps > 0
+                    and value < last_value - ((frame - previous_frame) / fps + 2)
+                )
+            ):
                 bad_samples += 1
                 if bad_samples > 1:
                     if reached_near_zero:
@@ -564,7 +589,7 @@ def compute_active_windows(
     if not samples or fps <= 0 or total_frames <= 0:
         return full_range, [], True, "missing clock samples or video metadata"
 
-    auto = _find_clock_period(samples, 20)
+    auto = _find_clock_period(samples, 20, fps=fps)
     if auto is None:
         return full_range, [], True, "autonomous countdown was not found"
 
@@ -580,7 +605,9 @@ def compute_active_windows(
             None,
         )
 
-    teleop = _find_clock_period(samples, 140, after_frame=auto["end_frame"])
+    teleop = _find_clock_period(
+        samples, 140, after_frame=auto["end_frame"], fps=fps
+    )
     if teleop is None:
         return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
 
@@ -595,6 +622,93 @@ def compute_active_windows(
 
 def frame_in_ranges(frame: int, ranges: List[Tuple[int, int]]) -> bool:
     return any(start <= frame <= end for start, end in ranges)
+
+
+def _scan_clock_samples_seek(video_path, total_frames, sample_step,
+                             overhead_height, read_fn):
+    """Legacy scan: seek to each sampled frame, OCR it inline."""
+    samples = []
+    scan_cap = cv2.VideoCapture(str(video_path))
+    try:
+        for frame_idx in range(0, total_frames, sample_step):
+            scan_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = scan_cap.read()
+            if not ok:
+                continue
+            overhead = frame[:overhead_height, :]
+            samples.append((frame_idx, read_fn(overhead)))
+    finally:
+        scan_cap.release()
+    return samples
+
+
+def _scan_clock_samples_sequential(video_path, total_frames, sample_step,
+                                   overhead_height, read_fn, workers):
+    """Decode once front-to-back; OCR sampled strips on a thread pool.
+
+    Every frame is decoded exactly once (a seek re-decodes from the previous
+    keyframe per sample); unsampled frames are only grab()bed, skipping
+    retrieve()'s colour conversion and copy-out. In-flight OCR is capped at
+    2x workers so a slow reader back-pressures the decoder instead of
+    buffering the whole video."""
+    samples = []
+    pending = deque()
+    max_in_flight = 2 * workers
+    scan_cap = cv2.VideoCapture(str(video_path))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="clock-ocr")
+    try:
+        # total_frames (CAP_PROP_FRAME_COUNT) can overshoot: stop at the
+        # first failed grab, which is end of stream.
+        for frame_idx in range(total_frames):
+            if not scan_cap.grab():
+                break
+            if frame_idx % sample_step:
+                continue
+            ok, frame = scan_cap.retrieve()
+            if not ok:
+                continue
+            # Copy: the strip outlives this iteration on a worker thread.
+            overhead = frame[:overhead_height, :].copy()
+            pending.append((frame_idx, pool.submit(read_fn, overhead)))
+            if len(pending) >= max_in_flight:
+                idx, fut = pending.popleft()
+                samples.append((idx, fut.result()))
+        # FIFO drain keeps the output in frame order.
+        while pending:
+            idx, fut = pending.popleft()
+            samples.append((idx, fut.result()))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        scan_cap.release()
+    return samples
+
+
+def scan_clock_samples(
+    video_path,
+    total_frames: int,
+    sample_step: int,
+    overhead_height: int,
+    read_fn,
+    *,
+    workers: Optional[int] = None,
+    sequential: Optional[bool] = None,
+) -> List[Tuple[int, Optional[int]]]:
+    """OCR the match clock at frames ``range(0, total_frames, sample_step)``.
+
+    Returns ``(frame_idx, seconds_or_None)`` in frame order for every sampled
+    frame that decoded. ``read_fn`` gets the overhead strip
+    (``frame[:overhead_height]``) and must be thread-safe on the sequential
+    path. ``workers``/``sequential`` default to the CLOCK_SCAN_* knobs."""
+    if sequential is None:
+        sequential = CLOCK_SCAN_SEQUENTIAL
+    if not sequential:
+        return _scan_clock_samples_seek(
+            video_path, total_frames, sample_step, overhead_height, read_fn
+        )
+    return _scan_clock_samples_sequential(
+        video_path, total_frames, sample_step, overhead_height, read_fn,
+        max(1, int(workers or CLOCK_SCAN_OCR_WORKERS)),
+    )
 
 # Appearance gallery (per-event re-ID exemplar memory)
 GALLERY_ENABLED = os.environ.get("GALLERY_ENABLED", "1") not in ("0", "false", "False")
@@ -3766,7 +3880,11 @@ class InferenceJob:
         return None
 
     def read_match_clock(self, overhead_frame: np.ndarray) -> Optional[int]:
-        """Read the configured match-clock ROI from an overhead-crop frame."""
+        """Read the configured match-clock ROI from an overhead-crop frame.
+
+        Called from the clock-scan OCR thread pool: it only reads
+        ``self.ocr_regions`` (fixed before the scan starts) and each
+        pytesseract call runs in its own subprocess on its own temp file."""
         if overhead_frame is None or overhead_frame.size == 0:
             return None
         region = self.ocr_regions.get("match_clock")
@@ -3809,18 +3927,10 @@ class InferenceJob:
             return [(int(i), None if v is None else int(v)) for i, v in cached]
         except (OSError, ValueError):
             pass
-        samples = []
-        scan_cap = cv2.VideoCapture(str(self.video_path))
-        try:
-            for frame_idx in range(0, self.total_frames, sample_step):
-                scan_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ok, frame = scan_cap.read()
-                if not ok:
-                    continue
-                overhead = frame[:self.overhead_height, :]
-                samples.append((frame_idx, self.read_match_clock(overhead)))
-        finally:
-            scan_cap.release()
+        samples = scan_clock_samples(
+            self.video_path, self.total_frames, sample_step,
+            self.overhead_height, self.read_match_clock,
+        )
         try:
             cache_path.write_text(json.dumps(samples))
         except OSError:

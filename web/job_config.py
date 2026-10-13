@@ -771,6 +771,46 @@ KNOBS = [
     # are logged only. DEFAULT OFF pending A/B. See web/field/occlusion_portal.py.
     Knob("occlusion_portal", "OCCLUSION_PORTAL_ENABLED", bool, False,
          section="Fusion & field position"),
+    # --- field-tracker re-acquisition (slot robot changes; all DEFAULT OFF) ---
+    # Replay-A/B'd with scripts/replay_field_tracker.py on TRACKER_TRACE dumps.
+    # assign_partial_fix: the slot<->detection search summed raw costs, so when
+    # every full pairing held one gated-out (inf) pair (an extra out-of-gate
+    # det or slot — ~7% of qm8 calls) all sums tied at inf and the first
+    # permutation's in-gate pairs were applied, however poor. Fixed: gated-out
+    # pairs cost a large constant, so in-gate matches are maximised then
+    # cost-minimised. qm8 replay: slot robot switches 60->29.
+    Knob("assign_partial_fix", "ASSIGN_PARTIAL_FIX", bool, False,
+         section="Fusion & field position"),
+    # coast_gate_phys: soften the coasting gate's widening (up to 4x gate_m)
+    # with physics — the distance a detection lies beyond the robot's reach
+    # (phys_reach_mps x time since the slot's last measurement + slack) is
+    # added to its cost, and the pair is rejected once that leaves the
+    # widened gate. Never tighter than the base gate; visible slots unchanged.
+    Knob("coast_gate_phys", "COAST_GATE_PHYS", bool, False,
+         section="Fusion & field position"),
+    # reseed_identity: leftover detections seed the free slot whose last
+    # measurement explains them (min-cost) instead of the lowest-numbered one,
+    # and a slot that expired < reseed_hold_s ago is not reseeded by a
+    # detection beyond its physical reach (the 12 m expire->reseed teleports).
+    Knob("reseed_identity", "RESEED_IDENTITY", bool, False,
+         section="Fusion & field position"),
+    # corner_dup_suppress: a corner-only detection within corner_dup_radius_m
+    # of a main-backed same-alliance detection whose fused cluster lacks that
+    # corner camera is that robot's unfused corner view (e.g. corner_right's
+    # ~1.2 m lateral offset vs main and corner_left defeats the 1.0 m ray
+    # gate); it is dropped before tracking, so it can't seed a duplicate slot.
+    Knob("corner_dup_suppress", "CORNER_DUP_SUPPRESS", bool, False,
+         section="Fusion & field position"),
+    Knob("phys_reach_mps", "PHYS_REACH_MPS", float, 5.0, min=1.0, max=12.0,
+         section="Fusion & field position"),
+    Knob("phys_reach_slack_m", "PHYS_REACH_SLACK_M", float, 1.0, min=0.0, max=5.0,
+         section="Fusion & field position"),
+    Knob("phys_corner_slack_m", "PHYS_CORNER_SLACK_M", float, 2.0, min=0.0,
+         max=6.0, section="Fusion & field position"),
+    Knob("reseed_hold_s", "RESEED_HOLD_S", float, 1.5, min=0.0, max=10.0,
+         section="Fusion & field position"),
+    Knob("corner_dup_radius_m", "CORNER_DUP_RADIUS_M", float, 2.0, min=0.5,
+         max=4.0, section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

@@ -283,7 +283,8 @@ def _merge_fused_group(group, ref_local: int) -> FusedObservation:
     det = FieldDetection(pos=rd.pos, color=rd.color, box=rd.box,
                          score=rd.score, track_id=rd.track_id, embedding=emb,
                          robot_crop_b64=rd.robot_crop_b64,
-                         tracker_prob=rd.tracker_prob)
+                         tracker_prob=rd.tracker_prob,
+                         cams=tuple(sorted({m[0] for m in members})))
     # Carry the registry's per-detection relink annotations forward if present.
     for attr in ("relink_margin", "relink_evidence"):
         if hasattr(rd, attr):
@@ -363,7 +364,9 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
         merged_embedding = None
 
     return FusedObservation(
-        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box, embedding=merged_embedding, tracker_prob=tracker_prob),
+        detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box,
+                                 embedding=merged_embedding, tracker_prob=tracker_prob,
+                                 cams=tuple(sorted(member_cameras))),
         evidence=evidence,
         members=members,
     )

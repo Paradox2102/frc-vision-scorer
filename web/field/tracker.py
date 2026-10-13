@@ -14,6 +14,9 @@ import numpy as np
 from web.field.zones import point_in_zones
 
 ALLIANCES = ("blue", "red")
+# Stand-in cost of a gated-out pair under assign_partial_fix: larger than any
+# sum of in-gate costs, so fewer matches can never beat more.
+_GATED_OUT_COST = 1e6
 
 
 @dataclass
@@ -31,6 +34,11 @@ class FieldDetection:
     # quality metadata; it never enters cost, gating, fusion weights, or any
     # tracking decision.
     tracker_prob: Optional[float] = None
+    # Cameras whose detections fused into this one (fusion payload; empty when
+    # unknown). Only corner_dup_suppress reads it: a corner-only detection is
+    # a duplicate of a nearby main-backed one only if that one's cluster lacks
+    # this corner camera (else the corner saw two robots there).
+    cams: tuple = ()
 
 
 @dataclass
@@ -99,11 +107,17 @@ class _Track:
     # Went into coast while hub-occluded; stays set until re-acquired. Gates the
     # occlusion re-acquisition guard (suspect-zone detections need motion proof).
     occ_coasting: bool = False
-    # Observation-only (slot_events): the position of the last detection that
-    # measured this slot, and the slot's position when it last expired. Never
-    # read by any tracking decision.
+    # The position of the last detection that measured this slot, and the
+    # slot's position when it last expired. Observation-only (slot_events)
+    # unless coast_gate_phys / reseed_identity reason from last_meas_pos.
     last_meas_pos: Optional[tuple] = None
     expired_pos: Optional[tuple] = None
+    # Physical-reach bookkeeping (coast_gate_phys / reseed_identity): update
+    # index of the last measurement, whether it was corner-only, and the update
+    # index at which the slot last expired.
+    last_meas_k: Optional[int] = None
+    last_meas_corner: bool = False
+    expired_k: Optional[int] = None
 
 
 class FieldTracker:
@@ -114,7 +128,13 @@ class FieldTracker:
                  suspect_zones=None, occlusion_rebind_guard=False,
                  guard_motion_m=0.3, guard_motion_window=5,
                  kin_gate_enabled=False, kin_max_speed_mps=6.5,
-                 record_history=False):
+                 record_history=False,
+                 coast_gate_phys=False, reseed_identity=False,
+                 corner_dup_suppress=False, phys_reach_mps=5.0,
+                 phys_reach_slack_m=1.0, phys_corner_slack_m=2.0,
+                 reseed_hold_s=1.5, reseed_fresh_cost_m=3.0,
+                 corner_dup_radius_m=2.0, assign_partial_fix=False,
+                 phys_excess_weight=2.0):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -154,6 +174,45 @@ class FieldTracker:
         # slot) instead of dragging the existing slot along. Default off.
         self.kin_gate_enabled = bool(kin_gate_enabled)
         self.kin_max_speed = float(kin_max_speed_mps)
+        # Physical reach (all default OFF; see _reach_excess). A robot last
+        # measured at P, gap seconds ago, is within phys_reach_mps * gap of P,
+        # plus measurement slack (phys_reach_slack_m; + phys_corner_slack_m
+        # when either end is a corner-only position, whose range is poor).
+        # - coast_gate_phys: a COASTING slot's widened gate (up to 4x gate_m)
+        #   is softened by the physics: the excess beyond reach is added to the
+        #   association cost, and a pair whose penalised cost leaves the
+        #   widened gate is rejected. Visible slots and the base gate_m are
+        #   untouched, so steady tracking is unchanged.
+        # - reseed_identity: leftover detections seed the FREE slot whose last
+        #   measurement best explains them (min-cost assignment) instead of the
+        #   lowest-numbered one; a slot that expired < reseed_hold_s ago is
+        #   held (not reseeded) by a detection beyond its physical reach.
+        #   A never-seeded slot costs reseed_fresh_cost_m.
+        # - corner_dup_suppress: a corner-only detection within
+        #   corner_dup_radius_m of a main-backed detection of the same alliance
+        #   whose fused cluster lacks that corner camera is that robot's
+        #   unfused corner view (fusion missed the merge). It is dropped
+        #   before matching: it can't seed a second slot onto the robot, and a
+        #   slot riding it falls back to the main view (see _corner_dups).
+        # - phys_excess_weight: cost per meter of reach excess (coast gate).
+        # assign_partial_fix: _best_assignment sums raw costs, so when EVERY
+        # full pairing contains a gated-out (inf) pair — e.g. one extra
+        # out-of-gate detection or slot — all sums tie at inf and the FIRST
+        # permutation's finite pairs are applied, however poor (a coasting slot
+        # takes the det a visible slot sits on). With the fix a gated-out pair
+        # costs a large finite constant instead, so the search maximises the
+        # number of in-gate matches, then minimises their cost. Default OFF.
+        self.assign_partial_fix = bool(assign_partial_fix)
+        self.coast_gate_phys = bool(coast_gate_phys)
+        self.reseed_identity = bool(reseed_identity)
+        self.corner_dup_suppress = bool(corner_dup_suppress)
+        self.phys_reach_mps = float(phys_reach_mps)
+        self.phys_excess_weight = float(phys_excess_weight)
+        self.phys_reach_slack_m = float(phys_reach_slack_m)
+        self.phys_corner_slack_m = float(phys_corner_slack_m)
+        self.reseed_hold_s = float(reseed_hold_s)
+        self.reseed_fresh_cost_m = float(reseed_fresh_cost_m)
+        self.corner_dup_radius_m = float(corner_dup_radius_m)
         self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
         self._frame_idx = 0
         # Opt-in measurement history for the offline RTS smoothing pass
@@ -178,6 +237,77 @@ class FieldTracker:
         # any tracking decision.
         self.slot_events: list[dict] = []
         self.assignment_evidence: dict[int, dict] = {}
+
+    def config_dict(self) -> dict:
+        """Constructor kwargs reproducing this tracker (TRACKER_TRACE header,
+        consumed by scripts/replay_field_tracker.py). JSON-serialisable."""
+        def _z(zs):
+            return [[float(v) for v in z] for z in zs]
+        return {
+            "field_length": float(self.field_length), "gate_m": float(self.gate),
+            "max_coast_open": int(self.max_open), "max_coast_occluded": int(self.max_occ),
+            "color_penalty": float(self.color_penalty), "zones": _z(self.zones),
+            "corner_only_r_scale": self.corner_only_r_scale,
+            "coast_vel_decay": self.coast_vel_decay, "max_speed_m_s": self.max_speed,
+            "sticky_max_dist_m": self.sticky_max_dist_m,
+            "suspect_zones": _z(self.suspect_zones),
+            "occlusion_rebind_guard": self.occlusion_rebind_guard,
+            "guard_motion_m": self.guard_motion_m,
+            "guard_motion_window": self.guard_motion_window,
+            "kin_gate_enabled": self.kin_gate_enabled,
+            "kin_max_speed_mps": self.kin_max_speed,
+            "coast_gate_phys": self.coast_gate_phys,
+            "reseed_identity": self.reseed_identity,
+            "corner_dup_suppress": self.corner_dup_suppress,
+            "phys_reach_mps": self.phys_reach_mps,
+            "phys_excess_weight": self.phys_excess_weight,
+            "phys_reach_slack_m": self.phys_reach_slack_m,
+            "phys_corner_slack_m": self.phys_corner_slack_m,
+            "reseed_hold_s": self.reseed_hold_s,
+            "reseed_fresh_cost_m": self.reseed_fresh_cost_m,
+            "corner_dup_radius_m": self.corner_dup_radius_m,
+            "assign_partial_fix": self.assign_partial_fix,
+        }
+
+    def _reach_excess(self, t, pos, det_corner, dt) -> float:
+        """Meters by which ``pos`` lies beyond where slot ``t``'s robot can
+        physically be: phys_reach_mps x the time since its last measurement,
+        plus measurement slack (more when the detection or that measurement is
+        corner-only — corner ground projections have poor range). 0 = within
+        reach; also 0 when the slot has no measurement to reason from."""
+        if t.last_meas_pos is None or t.last_meas_k is None or not dt or dt <= 0:
+            return 0.0
+        gap_s = (self._frame_idx - t.last_meas_k) * dt
+        reach = self.phys_reach_mps * gap_s + self.phys_reach_slack_m
+        if det_corner or t.last_meas_corner:
+            reach += self.phys_corner_slack_m
+        dist = float(np.hypot(pos[0] - t.last_meas_pos[0], pos[1] - t.last_meas_pos[1]))
+        return max(0.0, dist - reach)
+
+    def _corner_dups(self, dets_with_idx) -> set:
+        """Original indices of corner-only detections that are an unfused
+        corner view of a main-backed detection of the same alliance pool this
+        frame: within corner_dup_radius_m of it, and (when camera membership
+        is known) from a corner camera that main-backed cluster lacks — if
+        the cluster already holds that camera's view, the corner camera saw a
+        second robot there (e.g. one hidden from main), not a duplicate."""
+        if not self.corner_dup_suppress:
+            return set()
+        mains = [d for _i, d in dets_with_idx if d.box is not None]
+        r = self.corner_dup_radius_m
+        out = set()
+        for i, d in dets_with_idx:
+            if d.box is not None:
+                continue
+            own = set(d.cams or ())
+            for m in mains:
+                if float(np.hypot(d.pos[0] - m.pos[0], d.pos[1] - m.pos[1])) > r:
+                    continue
+                if own and m.cams and own & set(m.cams):
+                    continue
+                out.add(i)
+                break
+        return out
 
     def _slots(self, alliance):
         return [t for t in self.tracks if t.alliance == alliance]
@@ -291,6 +421,7 @@ class FieldTracker:
             if t.missed > budget:
                 # Expire the track
                 t.expired_pos = t.kf.pos if t.kf is not None else None
+                t.expired_k = self._frame_idx
                 self.slot_events.append({
                     "event": "expire", "slot_id": t.slot_id,
                     "pos": t.expired_pos, "missed": int(t.missed)})
@@ -334,6 +465,17 @@ class FieldTracker:
         """Match active tracks to dets, update matched, coast unmatched, seed free slots."""
         active_slots = [t for t in slots if t.active]
         free_slots = [t for t in slots if not t.active]
+
+        # corner_dup_suppress: an unfused corner view of a main-backed robot is
+        # that robot measured twice (worse geometry); it is dropped from the
+        # pool before any matching or seeding, so it can neither seed a second
+        # slot nor keep a slot riding it (that slot re-acquires the main view).
+        dup_idx = self._corner_dups(dets_with_idx)
+        if dup_idx:
+            self.slot_events.append({"event": "corner_dup", "slot_id": None,
+                                     "det_idx": sorted(int(i) for i in dup_idx),
+                                     "alliance": alliance})
+            dets_with_idx = [(i, d) for i, d in dets_with_idx if i not in dup_idx]
 
         # A track_id carried by 2+ detections in this frame is AMBIGUOUS: the
         # registry mis-assigned one id to distinct robots (merge_main_guard
@@ -498,6 +640,22 @@ class FieldTracker:
                             })
                             continue
                         c = dist
+                        if (self.coast_gate_phys and t.missed > 0
+                                and (i, j) not in portal_pairs):
+                            # Soft physical gate: penalise the distance beyond
+                            # the robot's reach since its last measurement;
+                            # reject once the penalised cost leaves the
+                            # (widened) gate.
+                            excess = self._reach_excess(t, d.pos, d.box is None, dt)
+                            if excess > 0:
+                                c += self.phys_excess_weight * excess
+                                if c > effective_gate:
+                                    self.slot_events.append({
+                                        "event": "coast_gate_reject",
+                                        "slot_id": t.slot_id, "missed": int(t.missed),
+                                        "det_idx": int(idxs[j]),
+                                        "excess_m": round(excess, 2)})
+                                    continue
                         if d.color == "unknown":
                             c += self.color_penalty
                         cost[i, j] = c
@@ -549,35 +707,11 @@ class FieldTracker:
             # Seed leftover detections into free slots — but never seed a new
             # slot from a detection inside a static-structure zone (a real robot
             # is never born there; it drives in as an already-active track).
-            leftover_pairs = [(j, dets[j]) for j in range(len(dets)) if j not in matched_det_indices]
-            for j, d in leftover_pairs:
-                if not free_slots:
-                    break
-                if j in guard_blocked or point_in_zones(d.pos, self.zones):
-                    continue
-                slot = free_slots.pop(0)
-                self._note_seed(slot, d)
-                slot.kf = _KF(d.pos)
-                slot.box = d.box
-                slot.corner_only = d.box is None
-                slot.tracker_prob = d.tracker_prob  # payload only
-                slot.missed = 0
-                slot.hits = 1
-                slot.coasting = False
-                slot.active = True
-                if self.record_history:
-                    self._pending_seed.add(slot.slot_id)
-                    self._pending_meas[slot.slot_id] = (
-                        (float(d.pos[0]), float(d.pos[1])), 1.0)
-                self.last_det_to_slot[idxs[j]] = slot.slot_id
-                if d.track_id is not None and d.track_id not in ambiguous_tids:
-                    self._id_to_slot[d.track_id] = slot.slot_id
-                    self.binding_events.append({
-                        "event": "slot_seeded",
-                        "slot_id": slot.slot_id,
-                        "track_id": d.track_id,
-                        "alliance": slot.alliance,
-                    })
+            cands = [(idxs[j], dets[j]) for j in range(len(dets))
+                     if j not in matched_det_indices and j not in guard_blocked
+                     and not point_in_zones(dets[j].pos, self.zones)]
+            for slot, (orig_idx, d) in self._seed_pairs(free_slots, cands, dt):
+                self._seed_slot(slot, d, orig_idx, ambiguous_tids)
 
         elif active_slots and not dets:
             # No detections: all active slots missed
@@ -587,34 +721,76 @@ class FieldTracker:
         else:
             # No active slots: seed as many dets as we have free slots, skipping
             # any detection sitting inside a static-structure zone.
-            for j, d in enumerate(dets):
-                if not free_slots:
-                    break
-                if point_in_zones(d.pos, self.zones):
+            cands = [(idxs[j], d) for j, d in enumerate(dets)
+                     if not point_in_zones(d.pos, self.zones)]
+            for slot, (orig_idx, d) in self._seed_pairs(free_slots, cands, dt):
+                self._seed_slot(slot, d, orig_idx, ambiguous_tids)
+
+    def _seed_pairs(self, free_slots, cands, dt):
+        """Which free slot each seedable detection ``(orig_idx, det)`` seeds.
+
+        Default: the lowest-numbered free slots, in detection order.
+        reseed_identity: a min-cost assignment where a never-seeded slot costs
+        reseed_fresh_cost_m and an expired slot costs its physical-reach excess
+        (plus a 0.1 x distance tie-break) from its last measurement; a slot
+        that expired less than reseed_hold_s ago is HELD — never reseeded by a
+        detection beyond its reach (a recently lost robot is likelier to
+        reappear than to teleport across the field)."""
+        if not free_slots or not cands:
+            return []
+        if not self.reseed_identity:
+            return list(zip(free_slots, cands))
+        big = 1e6
+        cost = np.zeros((len(free_slots), len(cands)))
+        for a, t in enumerate(free_slots):
+            for b, (_i, d) in enumerate(cands):
+                if t.last_meas_pos is None:
+                    cost[a, b] = self.reseed_fresh_cost_m
                     continue
-                slot = free_slots.pop(0)
-                self._note_seed(slot, d)
-                slot.kf = _KF(d.pos)
-                slot.box = d.box
-                slot.corner_only = d.box is None
-                slot.tracker_prob = d.tracker_prob  # payload only
-                slot.missed = 0
-                slot.hits = 1
-                slot.coasting = False
-                slot.active = True
-                if self.record_history:
-                    self._pending_seed.add(slot.slot_id)
-                    self._pending_meas[slot.slot_id] = (
-                        (float(d.pos[0]), float(d.pos[1])), 1.0)
-                self.last_det_to_slot[idxs[j]] = slot.slot_id
-                if d.track_id is not None and d.track_id not in ambiguous_tids:
-                    self._id_to_slot[d.track_id] = slot.slot_id
-                    self.binding_events.append({
-                        "event": "slot_seeded",
-                        "slot_id": slot.slot_id,
-                        "track_id": d.track_id,
-                        "alliance": slot.alliance,
-                    })
+                excess = self._reach_excess(t, d.pos, d.box is None, dt)
+                since = ((self._frame_idx - t.expired_k) * dt
+                         if t.expired_k is not None and dt else float("inf"))
+                if excess > 0 and since < self.reseed_hold_s:
+                    cost[a, b] = big
+                    continue
+                dist = float(np.hypot(d.pos[0] - t.last_meas_pos[0],
+                                      d.pos[1] - t.last_meas_pos[1]))
+                cost[a, b] = excess + 0.1 * dist
+        rows, cols = self._best_assignment(cost)
+        pairs = []
+        for r, c in zip(rows, cols):
+            if cost[r, c] >= big:
+                self.slot_events.append({
+                    "event": "reseed_hold", "slot_id": free_slots[r].slot_id,
+                    "det_idx": int(cands[c][0])})
+                continue
+            pairs.append((free_slots[r], cands[c]))
+        return pairs
+
+    def _seed_slot(self, slot, d, orig_idx, ambiguous_tids):
+        """Seed free ``slot`` from detection ``d`` (fused index ``orig_idx``)."""
+        self._note_seed(slot, d)
+        slot.kf = _KF(d.pos)
+        slot.box = d.box
+        slot.corner_only = d.box is None
+        slot.tracker_prob = d.tracker_prob  # payload only
+        slot.missed = 0
+        slot.hits = 1
+        slot.coasting = False
+        slot.active = True
+        if self.record_history:
+            self._pending_seed.add(slot.slot_id)
+            self._pending_meas[slot.slot_id] = (
+                (float(d.pos[0]), float(d.pos[1])), 1.0)
+        self.last_det_to_slot[orig_idx] = slot.slot_id
+        if d.track_id is not None and d.track_id not in ambiguous_tids:
+            self._id_to_slot[d.track_id] = slot.slot_id
+            self.binding_events.append({
+                "event": "slot_seeded",
+                "slot_id": slot.slot_id,
+                "track_id": d.track_id,
+                "alliance": slot.alliance,
+            })
 
     def _note_seed(self, slot, d):
         """slot_events: a free slot (re)seeded from detection ``d``. Records the
@@ -628,6 +804,8 @@ class FieldTracker:
                             if prev is not None else None),
             "corner_only": d.box is None})
         slot.last_meas_pos = pos
+        slot.last_meas_k = self._frame_idx
+        slot.last_meas_corner = d.box is None
 
     def _note_reacquire(self, t, d, dt, via, gate_m):
         """slot_events: a COASTING slot (missed > 0) matched detection ``d``.
@@ -664,7 +842,9 @@ class FieldTracker:
                 scale *= (speed / self.max_speed) ** 2
         t.kf.update(d.pos, r_scale=scale)
         t.corner_only = d.box is None
-        t.last_meas_pos = (float(d.pos[0]), float(d.pos[1]))   # slot_events only
+        t.last_meas_pos = (float(d.pos[0]), float(d.pos[1]))
+        t.last_meas_k = self._frame_idx
+        t.last_meas_corner = d.box is None
         # Payload: record the measuring detection's SAM confidence on the slot.
         # After the KF update so it can never feed back into the state estimate.
         t.tracker_prob = d.tracker_prob
@@ -681,6 +861,10 @@ class FieldTracker:
         Returns (track_rows, det_cols) for the best finite-cost pairs found.
         """
         n, m = cost.shape
+        if self.assign_partial_fix:
+            # Gated-out pairs (inf) become a large finite cost so partial
+            # matchings stay comparable; callers drop non-finite pairs.
+            cost = np.where(np.isfinite(cost), cost, _GATED_OUT_COST)
         best, best_cost = None, None
         for track_rows in permutations(range(n), min(n, m)):
             for det_cols in permutations(range(m), min(n, m)):

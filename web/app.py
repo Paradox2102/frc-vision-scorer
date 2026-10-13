@@ -6525,7 +6525,16 @@ class InferenceJob:
                 occlusion_rebind_guard=self.config.occlusion_rebind_guard,
                 kin_gate_enabled=self.config.kin_gate,
                 kin_max_speed_mps=self.config.kin_max_speed_mps,
-                record_history=self.config.rts_smooth)
+                record_history=self.config.rts_smooth,
+                assign_partial_fix=self.config.assign_partial_fix,
+                coast_gate_phys=self.config.coast_gate_phys,
+                reseed_identity=self.config.reseed_identity,
+                corner_dup_suppress=self.config.corner_dup_suppress,
+                phys_reach_mps=self.config.phys_reach_mps,
+                phys_reach_slack_m=self.config.phys_reach_slack_m,
+                phys_corner_slack_m=self.config.phys_corner_slack_m,
+                reseed_hold_s=self.config.reseed_hold_s,
+                corner_dup_radius_m=self.config.corner_dup_radius_m)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -8292,6 +8301,16 @@ class InferenceJob:
                     )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt, frame_num=early_ocr_source_frame)
+                if TRACKER_TRACE:
+                    # Replay input (scripts/replay_field_tracker.py): this
+                    # update seeds slots before the first traced loop frame.
+                    self._tracker_trace_early = {
+                        "frame": early_ocr_source_frame, "dt": float(early_dt),
+                        "dets": [{
+                            "pos": [round(float(d.pos[0]), 4), round(float(d.pos[1]), 4)],
+                            "has_main_box": d.box is not None,
+                            "color": d.color, "tid": d.track_id,
+                        } for d in early_field_dets]}
                 from web.field.fusion import FusedObservation
                 early_fused = [FusedObservation(detection=d, evidence=[]) for d in early_field_dets]
                 await self._sync_identity_registry_frame(
@@ -8616,17 +8635,28 @@ class InferenceJob:
                     dt = self.frame_skip / (self.video_fps or 30.0)
                     portals = (self._portal_state
                                if self.config.occlusion_portal else None)
+                    if TRACKER_TRACE:
+                        # Exact replay inputs (scripts/replay_field_tracker.py):
+                        # the occlusion flags this update consumes, dt, portals.
+                        _trace_occ = {int(sid): bool((v or {}).get("view_occluded"))
+                                      for sid, v in (self._view_flags or {}).items()}
+                        _trace_portals = ({int(sid): [float(x) for x in p]
+                                           for sid, p in portals.items()}
+                                          if portals else None)
                     track_outs = self.field_tracker.update(
                         field_dets, self._view_flags, dt, portals=portals,
                         frame_num=frame_num)
                     if TRACKER_TRACE:
                         ft = self.field_tracker
                         self._tracker_trace = getattr(self, "_tracker_trace", [])
-                        self._tracker_trace.append({
+                        _trace_rec = {
                             "frame": frame_num,
+                            "dt": float(dt),
+                            "occ": _trace_occ,
+                            "portals": _trace_portals,
                             "fused": [{
-                                "pos": [round(float(o.detection.pos[0]), 2),
-                                        round(float(o.detection.pos[1]), 2)],
+                                "pos": [round(float(o.detection.pos[0]), 4),
+                                        round(float(o.detection.pos[1]), 4)],
                                 "cams": sorted({m[0] for m in o.members}),
                                 "has_main_box": o.detection.box is not None,
                                 "color": o.detection.color,
@@ -8634,7 +8664,7 @@ class InferenceJob:
                             } for o in fused],
                             "tracks": [{
                                 "slot": t.slot_id, "label": self._slot_label(t.slot_id),
-                                "pos": [round(float(t.pos[0]), 2), round(float(t.pos[1]), 2)],
+                                "pos": [round(float(t.pos[0]), 4), round(float(t.pos[1]), 4)],
                                 "state": t.state, "corner_only": t.corner_only,
                             } for t in track_outs],
                             "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
@@ -8643,11 +8673,19 @@ class InferenceJob:
                             # robot vanished from detection itself (SAM3 gave up / occluded /
                             # left frame) vs was detected but lost in fusion/tracking.
                             "raw": {cam: [{
-                                "pos": [round(float(d.pos[0]), 2), round(float(d.pos[1]), 2)],
+                                "pos": [round(float(d.pos[0]), 4), round(float(d.pos[1]), 4)],
                                 "color": d.color, "has_box": d.box is not None,
                                 "tid": d.track_id, "score": round(float(d.score or 1.0), 2),
                             } for (d, _crop) in dets] for cam, dets in per_camera.items()},
-                        })
+                        }
+                        if not self._tracker_trace:
+                            # First record: tracker construction + the untraced
+                            # early-OCR update, so a replay starts from the
+                            # same state (scripts/replay_field_tracker.py).
+                            _trace_rec["tracker_cfg"] = ft.config_dict()
+                            _trace_rec["early"] = getattr(
+                                self, "_tracker_trace_early", None)
+                        self._tracker_trace.append(_trace_rec)
                     try:
                         self._record_frame_evidence(
                             fused,

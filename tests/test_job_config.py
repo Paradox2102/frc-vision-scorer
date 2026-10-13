@@ -566,3 +566,32 @@ def test_identity_swap_resolve_knobs_default_off(monkeypatch):
     assert "identity_swap_resolve" not in cfg.non_defaults()
     on = JobConfig({"identity_swap_resolve": "true", "identity_swap_lambda": "4"})
     assert on.identity_swap_resolve is True and on.identity_swap_lambda == 4.0
+
+
+def test_tracker_reacquire_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.assign_partial_fix is False
+    assert cfg.coast_gate_phys is False
+    assert cfg.reseed_identity is False
+    assert cfg.corner_dup_suppress is False
+    assert cfg.phys_reach_mps == 5.0
+    assert cfg.phys_reach_slack_m == 1.0
+    assert cfg.phys_corner_slack_m == 2.0
+    assert cfg.reseed_hold_s == 1.5
+    assert cfg.corner_dup_radius_m == 2.0
+
+
+def test_tracker_reacquire_knobs_env_override_and_range(monkeypatch):
+    monkeypatch.setenv("ASSIGN_PARTIAL_FIX", "1")
+    monkeypatch.setenv("COAST_GATE_PHYS", "1")
+    cfg = JobConfig({"reseed_identity": "true", "corner_dup_suppress": "1",
+                     "reseed_hold_s": "2.5"})
+    assert cfg.assign_partial_fix and cfg.coast_gate_phys
+    assert cfg.reseed_identity and cfg.corner_dup_suppress
+    assert cfg.reseed_hold_s == 2.5
+    with pytest.raises(ValueError):
+        JobConfig({"corner_dup_radius_m": 0.1})
+    with pytest.raises(ValueError):
+        JobConfig({"phys_reach_mps": 0.5})

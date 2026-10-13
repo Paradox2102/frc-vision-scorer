@@ -960,9 +960,11 @@ class RobotTrack:
     # appearance signature, shown in the gallery / replay-review UI.
     appearance_crop_b64: Optional[str] = None
     # Diagnostic / embedding-freshness state. Set when a re-ID match resolves
-    # to this canonical; read by _emit_diagnostic_snapshot. None sentinels are
-    # load-bearing — frame 0 is a real, valid frame number, so we cannot use 0
-    # to mean "never set" without colliding with legitimate frame-0 values.
+    # to this canonical, and on the field path when the slot's fused track
+    # receives a fresh embedding (source frame); read by
+    # _emit_diagnostic_snapshot. None sentinels are load-bearing — frame 0 is
+    # a real, valid frame number, so we cannot use 0 to mean "never set"
+    # without colliding with legitimate frame-0 values.
     last_embedding_frame: Optional[int] = None
     last_reid_similarity: Optional[float] = None
     last_reid_gap: Optional[float] = None
@@ -2339,6 +2341,24 @@ class InferenceJob:
         return next((tid for tid, s in self.field_tracker._id_to_slot.items()
                      if s == slot_id), None)
 
+    def _fresh_embedding_slots(self, fused) -> set:
+        """Slot ids whose fused observation carried a fresh appearance embedding
+        THIS frame. FusedTrackRegistry.get_embedding is the persistent running
+        EMA (non-None every frame once a track was ever embedded, even while
+        coasting), so it cannot signal freshness; the registry only updates the
+        EMA when the frame's detection has an embedding, and so do we."""
+        if self.field_tracker is None:
+            return set()
+        slots = set()
+        for obs in fused:
+            if obs.track_id is None:
+                continue
+            slot = self.field_tracker._id_to_slot.get(obs.track_id)
+            if (slot is not None and obs.detection is not None
+                    and getattr(obs.detection, "embedding", None) is not None):
+                slots.add(slot)
+        return slots
+
     def apply_gallery_matches(self, ocr_crops: list) -> None:
         """Query the gallery for unconfirmed tracks, cast votes, and annotate any
         matching ocr_crops cards so the UI distinguishes appearance recovery."""
@@ -3359,6 +3379,10 @@ class InferenceJob:
     def _emit_diagnostic_snapshot(self, frame: int) -> None:
         """Build a snapshot dict from current state and hand to the recorder.
 
+        `frame` is a SOURCE video frame number (not a processed-frame index),
+        matching last_seen_frame / last_embedding_frame and every other
+        diagnostic row.
+
         Reads embedding-freshness fields defensively via getattr — those fields
         are populated by the re-ID instrumentation in Task 6; before that lands,
         the snapshot still works with sensible defaults.
@@ -3372,10 +3396,12 @@ class InferenceJob:
                 "last_match_similarity": getattr(r, "last_reid_similarity", None),
                 "last_match_gap": getattr(r, "last_reid_gap", None),
             }
-            # Use `is None` not `or` — frame 0 is a real frame number.
+            # Use `is None` not `or` — frame 0 is a real frame number. Fall back
+            # to `frame`, not positions_history[-1][0]: that is a processed
+            # index and there is no reliable processed->source mapping.
             last_seen = getattr(r, "last_seen_frame", None)
             if last_seen is None:
-                last_seen = r.positions_history[-1][0] if r.positions_history else frame
+                last_seen = frame
             robots_state.append({
                 "robot_id": r.robot_id,
                 "alliance": r.alliance,
@@ -7373,11 +7399,13 @@ class InferenceJob:
                     # so the appearance gallery never deposits or queries anything.
                     slot_to_embedding = {}
                     slot_to_robot_crop = {}  # slot -> latest masked whole-robot crop (main cam)
+                    fresh_emb_slots = set()  # slots whose embedding was refreshed THIS frame
                     if self.use_sam2 and self.field_tracker is not None:
                         for tid, slot in self.field_tracker._id_to_slot.items():
                             emb = self.fused_registry.get_embedding(tid)
                             if emb is not None:
                                 slot_to_embedding[slot] = emb
+                        fresh_emb_slots = self._fresh_embedding_slots(fused)
                         # Mirror the main-camera robot crop behind that embedding so the
                         # gallery / replay-review UI can show the whole robot.
                         for obs in fused:
@@ -7404,6 +7432,8 @@ class InferenceJob:
                     _emb = slot_to_embedding.get(t.slot_id)
                     if _emb is not None:
                         robot.appearance_embedding = _emb
+                        if t.slot_id in fresh_emb_slots:
+                            robot.last_embedding_frame = frame_num
                     _crop = slot_to_robot_crop.get(t.slot_id)
                     if _crop:
                         robot.appearance_crop_b64 = _crop
@@ -7554,7 +7584,10 @@ class InferenceJob:
                 if processed_frame_num % IDENTITY_INTERVAL == 0:
                     self.assign_teams_from_votes()
                     self.audit_overturn_confirmations()
-                    self._emit_diagnostic_snapshot(processed_frame_num)
+                    # Cadence is by processed index, but the row is stamped with
+                    # the SOURCE frame like every other diagnostic row and
+                    # _identity_log (last_seen/last_embedding are source frames).
+                    self._emit_diagnostic_snapshot(frame_num)
 
                 # Ball trajectory tracking — link ball detections across frames
                 # and detect when balls enter hubs (with trajectory-based shooter ID)

@@ -58,7 +58,12 @@ Metrics (``evaluate``):
 
 Usage:
   .venv/bin/python scripts/replay_field_tracker.py TRACE.json --job 91411eb8 \\
-      [--fidelity] [--variants all] [--json out.json]
+      --rosters 3128,6773,9066/6497,2724,2637 [--fidelity] [--variants all] \\
+      [--set phys_reach_slack_m=0.5] [--jitter 0.005 --seeds 8] [--json out.json]
+
+``--jitter/--seeds`` replays each arm on N position-jittered copies and prints
+mean +- sd of the key metrics: the tracker is chaotic (one tie flip re-routes
+the rest of the match), so compare arm differences against that noise floor.
 """
 from __future__ import annotations
 
@@ -102,12 +107,18 @@ def load_trace(path) -> list[dict]:
     return data
 
 
-def trace_detections(rec: dict) -> list[FieldDetection]:
-    """The fused observations of one traced frame, as the tracker saw them."""
+def trace_detections(rec: dict, rng=None, jitter_m: float = 0.0) -> list[FieldDetection]:
+    """The fused observations of one traced frame, as the tracker saw them
+    (optionally with uniform +-jitter_m position noise — the noise-floor runs:
+    the tracker is chaotic, so one rounding-level tie flip re-routes the rest
+    of a match; jittered seeds show which arm differences exceed that)."""
     out = []
     for o in rec["fused"]:
+        jx = jy = 0.0
+        if rng is not None and jitter_m > 0:
+            jx, jy = rng.uniform(-jitter_m, jitter_m), rng.uniform(-jitter_m, jitter_m)
         out.append(FieldDetection(
-            pos=(float(o["pos"][0]), float(o["pos"][1])),
+            pos=(float(o["pos"][0]) + jx, float(o["pos"][1]) + jy),
             color=o.get("color") or "unknown",
             box=PLACEHOLDER_BOX if o.get("has_main_box") else None,
             track_id=o.get("tid"),
@@ -224,7 +235,10 @@ def make_tracker(field_length: float = 16.541, zones=None, **kw) -> FieldTracker
 
 
 def replay(trace: list[dict], tracker: FieldTracker, occ_fn: Callable,
-           dt: float = DEFAULT_DT, early: bool = True) -> list[ReplayFrame]:
+           dt: float = DEFAULT_DT, early: bool = True, jitter_m: float = 0.0,
+           seed: int = 0) -> list[ReplayFrame]:
+    import random
+    rng = random.Random(seed) if jitter_m > 0 else None
     out = []
     prev = []
     if early and trace:
@@ -236,7 +250,7 @@ def replay(trace: list[dict], tracker: FieldTracker, occ_fn: Callable,
                                     track_id=o.get("tid")) for o in e["dets"]]
             tracker.update(edets, {}, float(e.get("dt", dt)), frame_num=e.get("frame"))
     for k, rec in enumerate(trace):
-        dets = trace_detections(rec)
+        dets = trace_detections(rec, rng, jitter_m)
         step_dt = float(rec.get("dt", dt))
         portals = ({int(sid): tuple(v) for sid, v in rec["portals"].items()}
                    if rec.get("portals") else None)
@@ -527,6 +541,28 @@ def register_variants():
     })
 
 
+NOISE_KEYS = ("oid_steals", "implausible_reacq", "corner_shadow_frames", "far_seeds",
+              "dup_pair_frames", "pair_agree_frac", "within_agree_frac",
+              "slot_majority_share", "reads_lost", "mean_visible", "mean_active")
+
+
+def noise_summary(runs: list[dict]) -> dict:
+    """Mean and sample sd of the key metrics over jittered replays."""
+    import statistics
+    out = {}
+    for k in NOISE_KEYS:
+        vals = []
+        for m in runs:
+            if k == "pair_agree_frac":
+                a, n = m["pair_agree"]; vals.append(a / n if n else 0.0)
+            elif k == "within_agree_frac":
+                a, n = m["within_agree"]; vals.append(a / n if n else 0.0)
+            else:
+                vals.append(float(m[k]))
+        out[k] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0.0)
+    return out
+
+
 def fmt_row(name: str, m: dict) -> str:
     pa = m["pair_agree"]; wa = m["within_agree"]; xa = m["across_agree"]
     return (f"{name:<14} seeds {m['seeds']:>3} far {m['far_seeds']:>3} | reacq {m['reacquires']:>4} "
@@ -553,6 +589,11 @@ def main(argv=None) -> int:
                     help="extra tracker kwarg for every non-baseline arm, k=v")
     ap.add_argument("--rosters", default="",
                     help="blue teams/red teams, e.g. 3128,6773,9066/6497,2724,2637")
+    ap.add_argument("--jitter", type=float, default=0.0,
+                    help="uniform +- position noise (m) for noise-floor seeds")
+    ap.add_argument("--seeds", type=int, default=0,
+                    help="with --jitter: also run N jittered seeds per arm and "
+                         "print mean/sd of the key metrics")
     ap.add_argument("--json")
     args = ap.parse_args(argv)
     register_variants()
@@ -611,6 +652,15 @@ def main(argv=None) -> int:
         mm = evaluate(trace, rep, reads, dt=args.dt, rosters=rosters or None)
         result["arms"][name] = mm
         print(fmt_row(name, mm))
+        if args.seeds and args.jitter > 0:
+            runs = []
+            for sd in range(args.seeds):
+                rj = replay(trace, make_tracker(field_length, zones=zones, **kw),
+                            occ_fn(args.occ), args.dt, jitter_m=args.jitter, seed=sd + 1)
+                runs.append(evaluate(trace, rj, reads, dt=args.dt, rosters=rosters or None))
+            summ = noise_summary(runs)
+            result.setdefault("noise", {})[name] = summ
+            print("   " + "  ".join(f"{k} {v[0]:.3g}+-{v[1]:.2g}" for k, v in summ.items()))
     if args.json:
         Path(args.json).write_text(json.dumps(result, indent=1, default=str))
     return 0

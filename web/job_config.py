@@ -778,7 +778,9 @@ KNOBS = [
     # det or slot — ~7% of qm8 calls) all sums tied at inf and the first
     # permutation's in-gate pairs were applied, however poor. Fixed: gated-out
     # pairs cost a large constant, so in-gate matches are maximised then
-    # cost-minimised. qm8 replay: slot robot switches 60->29.
+    # cost-minimised. Replays: slot robot steals qm8 55->25, qm11 113->48.
+    # Recommended live A/B arm: assign_partial_fix + coast_gate_phys +
+    # corner_dup_suppress (reseed_identity neutral/negative on replays).
     Knob("assign_partial_fix", "ASSIGN_PARTIAL_FIX", bool, False,
          section="Fusion & field position"),
     # coast_gate_phys: soften the coasting gate's widening (up to 4x gate_m)

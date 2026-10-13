@@ -119,3 +119,19 @@ def test_evaluate_counts_far_reseed_as_discontinuity():
     assert m["across_agree"] == (0, 1)
     assert m["within_agree"] == (0, 0)
     assert m["segments_multi_team"] == 0
+
+
+def test_jittered_noise_floor_is_seeded_and_summarised():
+    trace = _trace_from_run(_frames(), sticky_max_dist_m=2.5)
+    cfg = R.trace_tracker_cfg(trace)
+    runs = []
+    for seed in (1, 2):
+        a = R.replay(trace, FieldTracker(**cfg), R.occlusion_traced(trace),
+                     jitter_m=0.005, seed=seed)
+        b = R.replay(trace, FieldTracker(**cfg), R.occlusion_traced(trace),
+                     jitter_m=0.005, seed=seed)
+        assert [t.pos for t in a[-1].tracks] == [t.pos for t in b[-1].tracks]
+        runs.append(R.evaluate(trace, a, []))
+    summ = R.noise_summary(runs)
+    assert set(summ) == set(R.NOISE_KEYS)
+    assert summ["far_seeds"] == (0.0, 0.0)

@@ -1487,6 +1487,7 @@ class InferenceJob:
         robot_id=None,
         enforce_floor: bool = True,
         box_is_bumper: bool = False,
+        crop_frame=None,
     ):
         """Crop the bumper band (lower part of the robot box), upscale, and JPEG/base64
         encode it for the VLM. Returns (crop_b64, legibility_score) for usable crops, or
@@ -1494,7 +1495,8 @@ class InferenceJob:
 
         When a non-None robot_id is supplied and the crop is below the legibility floor,
         the rejected crop is recorded as a vlm_filtered diagnostic (preserving the prior
-        behavior of vision_identify_robots).
+        behavior of vision_identify_robots), stamped with crop_frame (the frame `frame`
+        was cut from; defaults to self._current_frame).
         """
         with self._stage("loop.crop_encode"):
             x1, y1, x2, y2 = map(int, box)
@@ -1526,7 +1528,8 @@ class InferenceJob:
                         print(f"  vlm_filtered: imencode failed for robot {robot_id}: {e}")
                         rejected_b64 = ""
                     self.diagnostic.record_vlm_filtered(
-                        frame=self._current_frame, robot_id=robot_id,
+                        frame=self._current_frame if crop_frame is None else crop_frame,
+                        robot_id=robot_id,
                         crop_b64=rejected_b64, legibility=score,
                         reason="below_legibility_floor",
                     )
@@ -2371,7 +2374,8 @@ class InferenceJob:
                       f"(appearance {sim:.2f})")
 
     async def read_fused_bumper_numbers(
-        self, fused, requested_priorities: dict[int, float], det_to_slot=None
+        self, fused, requested_priorities: dict[int, float], det_to_slot=None,
+        crop_frame=None, slot_identity=None,
     ) -> None:
         """Read team numbers from the per-camera bumper crops attached to fusion.
 
@@ -2388,15 +2392,25 @@ class InferenceJob:
         field_tracker.last_det_to_slot). When None (direct/synchronous callers,
         incl. tests) it falls back to the live tracker attr.
 
+        crop_frame / slot_identity pin the vlm_read diagnostic rows the same
+        way: crop_frame is the frame `fused`'s crops were cut from and
+        slot_identity the {slot_id: identity_id} binding at that frame, so
+        identity_resolve.build_slot_evidence's exact (frame, robot_id) join
+        against _identity_log credits the read to the crop's slot even when
+        the slot was re-bound while the read was in flight. When None,
+        crop_frame falls back to self._current_frame at call time and rows
+        name the live slot owner (today's behaviour for direct callers).
+
         The whole body is wrapped in the vlm.pass_async stage so the true
         read-pass wall cost stays visible in the profile without implying it
         blocks the loop.
         """
         with self._stage("vlm.pass_async"):
             await self._read_fused_bumper_numbers_impl(
-                fused, requested_priorities, det_to_slot)
+                fused, requested_priorities, det_to_slot,
+                crop_frame=crop_frame, slot_identity=slot_identity)
 
-    def _schedule_vlm_pass(self, fused, due_priorities) -> None:
+    def _schedule_vlm_pass(self, fused, due_priorities, crop_frame=None) -> None:
         """Single-flight schedule of the background bumper-read pass.
 
         Only one pass runs at a time. If a pass is already in flight this is a
@@ -2417,9 +2431,20 @@ class InferenceJob:
         # the next loop yield, by which point last_det_to_slot may describe a
         # newer frame whose indices don't line up with this `fused` snapshot.
         _det_to_slot = dict(self.field_tracker.last_det_to_slot)
+        # Pin the diagnostic frame + slot->identity binding to THIS frame too:
+        # the pass completes several identity re-bindings later, but its
+        # vlm_read rows are joined on (frame, identity) against _identity_log
+        # and must name the crop's frame and the identity that held the slot.
+        crop_frame = self._current_frame if crop_frame is None else crop_frame
+        _slot_identity = {
+            ident.active_slot: iid
+            for iid, ident in self.identity_registry.identities.items()
+            if getattr(ident, "active_slot", None) is not None
+        }
         self._vlm_task = asyncio.create_task(
             self.read_fused_bumper_numbers(
-                fused, due_priorities, det_to_slot=_det_to_slot))
+                fused, due_priorities, det_to_slot=_det_to_slot,
+                crop_frame=crop_frame, slot_identity=_slot_identity))
 
     async def _drain_vlm_task(self) -> None:
         """Await any in-flight background VLM read so its votes land before
@@ -2495,8 +2520,13 @@ class InferenceJob:
                   f"(streak={ident.equipment_streak})")
 
     async def _read_fused_bumper_numbers_impl(
-        self, fused, requested_priorities: dict[int, float], det_to_slot=None
+        self, fused, requested_priorities: dict[int, float], det_to_slot=None,
+        crop_frame=None, slot_identity=None,
     ) -> None:
+        # Direct/synchronous callers run up to the first await immediately, so
+        # the live frame here IS the crop frame (today's behaviour).
+        if crop_frame is None:
+            crop_frame = self._current_frame
         if not self.match_teams:
             self.vlm_status.update({
                 "provider": getattr(self, "team_reader", "local"),
@@ -2717,8 +2747,15 @@ class InferenceJob:
                 "via": "ocr",
                 "surface": res.get("surface", "unknown"),
             })
+            # The diagnostic row must name the frame the crop was cut from and
+            # the identity bound to the crop's slot AT that frame:
+            # build_slot_evidence joins (frame, robot_id) against _identity_log.
+            # The live `robot` may belong to an identity re-bound onto this
+            # slot while the read was in flight.
+            diag_robot_id = (slot_identity.get(slot_id, robot.robot_id)
+                             if slot_identity is not None else robot.robot_id)
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=robot.robot_id,
+                frame=crop_frame, robot_id=diag_robot_id,
                 crop_b64=crop_b64,
                 legibility=0.0,
                 raw_read=res.get("raw_read"),
@@ -2974,7 +3011,8 @@ class InferenceJob:
             self.vlm_status["last_error"] = errors[0]
 
     def vision_identify_robots(
-        self, frame: np.ndarray, tracked_robots, boxes_are_bumpers: bool = False
+        self, frame: np.ndarray, tracked_robots, boxes_are_bumpers: bool = False,
+        crop_frame=None,
     ) -> None:
         """Time-tracking wrapper around the bumper-VLM read (accumulates into
         timings['bumper_vlm'], a sub-component of the analysis loop)."""
@@ -2984,6 +3022,7 @@ class InferenceJob:
                 frame,
                 tracked_robots,
                 boxes_are_bumpers=boxes_are_bumpers,
+                crop_frame=crop_frame,
             )
         finally:
             t = getattr(self, "timings", None)
@@ -2995,11 +3034,16 @@ class InferenceJob:
         frame: np.ndarray,
         tracked_robots,
         boxes_are_bumpers: bool = False,
+        crop_frame=None,
     ) -> None:
         """Use Qwen-VL to read bumper numbers on a legibility-ranked subset of
         the field. Confirmed robots are included at a reduced cadence so a wrong
         identity can be overturned by the audit (assign_teams_from_votes +
-        audit_overturn_confirmations). tracked_robots: list of (canonical_id, box)."""
+        audit_overturn_confirmations). tracked_robots: list of (canonical_id, box).
+        crop_frame is the frame `frame` was cut from (det-gate lookup and
+        diagnostics); defaults to self._current_frame."""
+        if crop_frame is None:
+            crop_frame = self._current_frame
         if not self.match_teams:
             return
 
@@ -3030,7 +3074,7 @@ class InferenceJob:
                            * (self.video_fps or 10.0))
                 try:
                     _ok = self.detection_archive.corroborates(
-                        "main", self._current_frame, box, max_gap_frames=_gap)
+                        "main", crop_frame, box, max_gap_frames=_gap)
                 except Exception:
                     # Mirror detection_archive.record()'s "telemetry must
                     # never break detection" contract: a gate failure must
@@ -3049,6 +3093,7 @@ class InferenceJob:
                 box,
                 robot_id=canonical_id,
                 box_is_bumper=boxes_are_bumpers,
+                crop_frame=crop_frame,
             )
             if cb is None:
                 continue  # empty crop or below legibility floor (diagnostic recorded)
@@ -3089,7 +3134,7 @@ class InferenceJob:
                 "surface": res.get("surface", "unknown"),
             })
             self.diagnostic.record_vlm_read(
-                frame=self._current_frame, robot_id=robot.robot_id,
+                frame=crop_frame, robot_id=robot.robot_id,
                 crop_b64=crop_b64,
                 legibility=float(score),
                 raw_read=res.get("raw_read"),
@@ -6956,6 +7001,7 @@ class InferenceJob:
                         early_overhead,
                         early_robots,
                         boxes_are_bumpers=self.bumper_model is not None,
+                        crop_frame=early_ocr_source_frame,
                     )
 
             first_processing_frame = self.processing_ranges[0][0]
@@ -7465,7 +7511,12 @@ class InferenceJob:
                         # Single-flight background schedule (see the method): the
                         # read pass no longer blocks frame processing — it runs
                         # as an event-loop task while the loop keeps decoding.
-                        self._schedule_vlm_pass(fused, due_priorities)
+                        # _current_frame is assigned at loop END, so here it
+                        # still holds the previous processed frame; frame_num is
+                        # the frame `fused`'s crops were cut from and the key
+                        # _identity_log uses.
+                        self._schedule_vlm_pass(
+                            fused, due_priorities, crop_frame=frame_num)
 
                     if getattr(self.config, "equipment_adjudicate", False):
                         # Position history feeds track_is_static; only paid

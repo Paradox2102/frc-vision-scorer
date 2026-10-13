@@ -18,4 +18,5 @@ def test_vision_identify_threads_bumper_box_mode_to_impl():
         frame,
         tracked,
         boxes_are_bumpers=True,
+        crop_frame=None,
     )

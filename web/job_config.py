@@ -606,6 +606,26 @@ KNOBS = [
     # 20.md) geometry-neutral, collision sweep fix, qm8 R1=2724 true positive.
     Knob("global_identity_resolve", "GLOBAL_IDENTITY_RESOLVE", bool, True,
          section="Identity & votes"),
+    # Swap-aware, time-varying slot labels (web/field/identity_swap.py;
+    # requires global_identity_resolve): slots swap robots mid-match, so one
+    # whole-match label per slot is wrong for part of the match. A Viterbi
+    # over the 6 per-alliance slot->team permutations (reads = emissions, a
+    # transposition costs identity_swap_lambda vote-weight units and is only
+    # possible where the two slots came within identity_swap_prox_m or both
+    # lost their robot) splits each slot into team segments; labels keep gir
+    # semantics. Replay per-frame labels + replay events use the segment at
+    # their frame; segments persist to match_robot_identity_segment; the
+    # whole-match match_robot_identity label is unchanged. qm11 18a8fd23
+    # offline: R1 6800->4256 / R3 4256->6800 @f6128, auto window 4/6 -> 6/6,
+    # held-out read agreement 66% -> 86%; never worse on 3 other jobs.
+    # lambda 3.0 > the heaviest single read (2.5): one stray read never
+    # flips a segment. DEFAULT OFF pending a live full-match run.
+    Knob("identity_swap_resolve", "IDENTITY_SWAP_RESOLVE", bool, False,
+         section="Identity & votes"),
+    Knob("identity_swap_lambda", "IDENTITY_SWAP_LAMBDA", float, 3.0,
+         min=0.5, max=100.0, section="Identity & votes"),
+    Knob("identity_swap_prox_m", "IDENTITY_SWAP_PROX_M", float, 1.5,
+         min=0.3, max=5.0, section="Identity & votes"),
     # Identity continuity (identity layer, web/field/identity.py): an
     # observation on the SAME slot its identity held last frame, with no
     # tracker binding disruption (seeded/expired/kinematic_reject/

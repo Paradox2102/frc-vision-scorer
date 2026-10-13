@@ -85,3 +85,102 @@ def test_main_end_to_end_on_tmp_data(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "R2" in out and "1/6 correct" in out and "today 0/6" in out
+
+
+# --------------------------------------------------------------------------- #
+# --swap: swap-aware time-varying resolve vs whole-match gir
+# --------------------------------------------------------------------------- #
+TRUTH = {"B1": "4786", "B2": "3181", "B3": "2992",
+         "R1": "6800", "R2": "1477", "R3": "4256"}
+
+
+def _swap_job():
+    """R1/R3 exchange robots around f800 (positions touch there): R1 reads
+    6800 early and 4256 late, R3 the opposite; others steady. One identity
+    per slot; the replay positions feed the swap gate."""
+    frames = list(range(0, 1600, 8))
+    binds = [(10 + s, s, -8, None) for s in range(6)]
+
+    def pos(s, f):
+        y = 1.0 + 3.0 * s
+        if s in (3, 5):
+            t = min(abs(f - 800) / 360.0, 1.0)
+            y = 13.0 + (y - 13.0) * t
+        return [2.0 + 0.01 * f + (6.0 if s == 4 else 0.0), y]
+    positions = {(f, s): pos(s, f) for f in frames for s in range(6)}
+    reads = []
+    for s, team in enumerate(TRUTH.values()):
+        if s in (3, 5):
+            continue
+        reads += [{"type": "vlm_read", "frame": f, "robot_id": 10 + s,
+                   "matched_team": team, "vote_weight": 1.0} for f in (160, 1200)]
+    for i in range(5):
+        for s, early, late in ((3, "6800", "4256"), (5, "4256", "6800")):
+            reads.append({"type": "vlm_read", "frame": 160 + 40 * i, "robot_id": 10 + s,
+                          "matched_team": early, "vote_weight": 1.0})
+            reads.append({"type": "vlm_read", "frame": 1200 + 40 * i, "robot_id": 10 + s,
+                          "matched_team": late, "vote_weight": 1.0})
+    return binds, frames, reads, positions
+
+
+def test_attach_positions_fills_pos():
+    log = [{"frame_num": 8, "identity_id": 1, "slot_id": 0}]
+    assert ioc.attach_positions(log, {(8, 0): [1, 2]})[0]["pos"] == [1, 2]
+    assert ioc.attach_positions(log, None) is log
+
+
+def test_run_swap_check_finds_the_swap_and_beats_gir():
+    binds, frames, reads, positions = _swap_job()
+    res = ioc.run_swap_check(binds, frames, reads, TRUTH, positions=positions,
+                             auto_end=600, holdout_runs=10)
+    assert [(s["alliance"], s["slots"]) for s in res["swaps"]] == [("red", ["R1", "R3"])]
+    assert [seg[2] for seg in res["segments"]["R1"]] == ["6800", "4256"]
+    assert [seg[2] for seg in res["segments"]["R3"]] == ["4256", "6800"]
+    # gir ties R1/R3 (5 reads each way) -> both blank all match long.
+    assert res["gir_labels"]["R1"] is None and res["gir_labels"]["R3"] is None
+    assert res["auto_swap"]["slots_ok"] == 6 and res["auto_gir"]["slots_ok"] == 4
+    assert res["auto_swap"]["frame_frac"] == 1.0
+    ho = res["holdout"]
+    assert ho["n"] > 0 and ho["swap"] > ho["gir"]
+    text = ioc.format_swap_report(res)
+    assert "R1<->R3" in text and "auto window: gir 4/6" in text and "held-out" in text
+
+
+def test_run_swap_check_without_positions_has_open_gate():
+    binds, frames, reads, _ = _swap_job()
+    res = ioc.run_swap_check(binds, frames, reads, TRUTH, positions=None, holdout_runs=0)
+    assert "holdout" not in res
+    assert res["gate_open_frac"]["R1-R3"] == 1.0
+    assert [(s["slots"]) for s in res["swaps"]] == [["R1", "R3"]]
+
+
+def test_main_swap_flag_end_to_end(tmp_path, capsys):
+    job = "swap1234-0000"
+    binds, frames, reads, positions = _swap_job()
+    con = sqlite3.connect(tmp_path / "frc_scorer.db")
+    con.execute("CREATE TABLE match_robot_binding (id INTEGER PRIMARY KEY, job_id TEXT,"
+                " identity_id INTEGER, slot INTEGER, start_frame INTEGER, end_frame INTEGER)")
+    con.execute("CREATE TABLE match_robot_identity (job_id TEXT, identity_id INTEGER,"
+                " slot INTEGER, slot_label TEXT, alliance TEXT, team_number TEXT,"
+                " confirmed INTEGER, source TEXT, confidence REAL)")
+    for iid, s, start, end in binds:
+        con.execute("INSERT INTO match_robot_binding (job_id, identity_id, slot, start_frame)"
+                    " VALUES (?,?,?,?)", (job, iid, s, start))
+    con.commit()
+    con.close()
+    (tmp_path / "web" / "uploads").mkdir(parents=True)
+    (tmp_path / "web" / "replays" / job).mkdir(parents=True)
+    labels = ["B1", "B2", "B3", "R1", "R2", "R3"]
+    (tmp_path / "web" / "replays" / job / "meta.json").write_text(json.dumps(
+        {"frames": [{"frame_num": f, "robots": [
+            {"slot": labels[s], "field_pos": positions[(f, s)]} for s in range(6)]}
+            for f in frames]}))
+    (tmp_path / "web" / "uploads" / f"diagnostic_{job}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in reads) + "\n")
+    rc = ioc.main([job[:6], "--data-root", str(tmp_path), "--swap", "--fps", "60",
+                   "--holdout-runs", "5", "--auto-end", "600",
+                   "--truth", ",".join(f"{k}={v}" for k, v in TRUTH.items())])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[swap-resolve] lambda=3 prox=1.5m | blue: none | red: R1<->R3 @f" in out
+    assert "auto window: gir 4/6 slots" in out and "swap 6/6 slots" in out

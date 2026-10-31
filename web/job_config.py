@@ -253,21 +253,24 @@ KNOBS = [
     Knob("sam3_compile", "SAM3_COMPILE", bool, False, section="Tracking backend"),
     # Corner-cam decimation: track corner views at track_fps/stride. SAM
     # propagation cost scales with frames/view (export resolution is NOT a
-    # lever — the model resizes everything to a fixed square). Stride 2 cut
-    # corner propagation ~39% on the qm24 smoke, BUT cost confirmed locks
-    # (5/6 at stride 1 vs 3/6 and 1/6 across two stride-2 runs) — corner
-    # reads carry 2.5x vote weight and halved crop opportunities starve
-    # confirmation. Default OFF; opt in per job when speed outweighs
-    # identity. Wall-clock-denominated tracker knobs (reprompt_seconds,
-    # evict_dark_frames) are rescaled per view automatically.
-    Knob("corner_track_stride", "CORNER_TRACK_STRIDE", int, 1, min=1, max=8,
+    # lever — the model resizes everything to a fixed square). The June qm24
+    # 45 s smoke saw stride 2 cost confirmed locks (5/6 -> 3/6, 1/6), but the
+    # Oct 31 2026 full-match A/B (qm8 + qm11, Clef reader, census) overturned
+    # it: corner propagation -45..-53%, job wall -27..-35%, identical per-slot
+    # identity results (gir/swap/segment) and equal-or-better held-out read
+    # agreement; per-slot measured frames and longest unmeasured gap
+    # unchanged (a corner frame every 0.27 s is well inside the ~1 s coast
+    # budget). Default 2. Wall-clock-denominated tracker knobs
+    # (reprompt_seconds, evict_dark_frames) are rescaled per view
+    # automatically.
+    Knob("corner_track_stride", "CORNER_TRACK_STRIDE", int, 2, min=1, max=8,
          section="Tracking backend"),
     # Dense head for corner decimation: corners run full-rate for the first
     # N seconds of tracked footage (the lock-formation window), then pay the
     # stride. Only meaningful when corner_track_stride > 1. Smoke A/B
     # (qm24 45s, June 12 2026): stride 2 + 20s head got 2/6 locks vs 3/6
-    # same-day baseline — softer than pure stride 2 (1/6) but still never
-    # matched baseline, so decimation stays opt-in.
+    # same-day baseline — softer than pure stride 2 (1/6). 25 s is the
+    # head used in the Oct 31 full-match A/B that made stride 2 the default.
     Knob("corner_dense_seconds", "CORNER_DENSE_SECONDS", float, 25.0, min=0.0,
          section="Tracking backend"),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False,

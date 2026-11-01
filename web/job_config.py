@@ -774,7 +774,7 @@ KNOBS = [
     # are logged only. DEFAULT OFF pending A/B. See web/field/occlusion_portal.py.
     Knob("occlusion_portal", "OCCLUSION_PORTAL_ENABLED", bool, False,
          section="Fusion & field position"),
-    # --- field-tracker re-acquisition (slot robot changes; all DEFAULT OFF) ---
+    # --- field-tracker re-acquisition (slot robot changes) ---
     # Replay-A/B'd with scripts/replay_field_tracker.py on TRACKER_TRACE dumps.
     # assign_partial_fix: the slot<->detection search summed raw costs, so when
     # every full pairing held one gated-out (inf) pair (an extra out-of-gate
@@ -782,16 +782,19 @@ KNOBS = [
     # permutation's in-gate pairs were applied, however poor. Fixed: gated-out
     # pairs cost a large constant, so in-gate matches are maximised then
     # cost-minimised. Replays: slot robot steals qm8 55->25, qm11 113->48.
-    # Recommended live A/B arm: assign_partial_fix + coast_gate_phys +
-    # corner_dup_suppress (reseed_identity neutral/negative on replays).
-    Knob("assign_partial_fix", "ASSIGN_PARTIAL_FIX", bool, False,
+    # assign_partial_fix + coast_gate_phys + corner_dup_suppress ("combo") are
+    # DEFAULT ON since the Oct 31 2026 live full-match A/B (stride 2, Clef +
+    # census, identity_offline_check): correct auto slots qm8 2->5/6, qm11
+    # 1->4/6; held-out read agreement qm8 38->61%, qm11 66->87%; coverage
+    # flat. reseed_identity stays OFF (neutral/negative on replays).
+    Knob("assign_partial_fix", "ASSIGN_PARTIAL_FIX", bool, True,
          section="Fusion & field position"),
     # coast_gate_phys: soften the coasting gate's widening (up to 4x gate_m)
     # with physics — the distance a detection lies beyond the robot's reach
     # (phys_reach_mps x time since the slot's last measurement + slack) is
     # added to its cost, and the pair is rejected once that leaves the
     # widened gate. Never tighter than the base gate; visible slots unchanged.
-    Knob("coast_gate_phys", "COAST_GATE_PHYS", bool, False,
+    Knob("coast_gate_phys", "COAST_GATE_PHYS", bool, True,
          section="Fusion & field position"),
     # reseed_identity: leftover detections seed the free slot whose last
     # measurement explains them (min-cost) instead of the lowest-numbered one,
@@ -804,7 +807,7 @@ KNOBS = [
     # corner camera is that robot's unfused corner view (e.g. corner_right's
     # ~1.2 m lateral offset vs main and corner_left defeats the 1.0 m ray
     # gate); it is dropped before tracking, so it can't seed a duplicate slot.
-    Knob("corner_dup_suppress", "CORNER_DUP_SUPPRESS", bool, False,
+    Knob("corner_dup_suppress", "CORNER_DUP_SUPPRESS", bool, True,
          section="Fusion & field position"),
     Knob("phys_reach_mps", "PHYS_REACH_MPS", float, 5.0, min=1.0, max=12.0,
          section="Fusion & field position"),

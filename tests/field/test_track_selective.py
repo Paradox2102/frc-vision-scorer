@@ -571,3 +571,241 @@ def test_track_selective_passes_frame_hw_and_reports_triggers(tmp_path):
     for f in (5, 6, 7):
         assert results[f][1]["evidence"]["type"] == "selective_sam"
         assert results[f][1]["mask"] is not None
+
+
+# ==========================================================================
+# Segmented episode propagation: selective_retire_closed / selective_lazy_seed.
+# ==========================================================================
+# Two robots, one episode: R(->oid2) present 0-3, gap 4-6, back 7-20 ->
+# window (seed 1, entry 3) settles CLEAN at frame 8; L(->oid1) present 0-4,
+# gap 5-12, back 13-20 -> window (seed 2, entry 4) settles CLEAN at frame 14.
+# Disjoint boxes -> no witness / margin triggers. oid2's only window closes six
+# frames before the episode ends (retire), and oid1 seeds one frame after the
+# episode start (lazy).
+_SEG_L = set(range(0, 5)) | set(range(13, 21))
+_SEG_R = set(range(0, 4)) | set(range(7, 21))
+_SEG_DETS = {
+    f: ([(L, None)] if f in _SEG_L else []) + ([(R, None)] if f in _SEG_R else [])
+    for f in range(21)
+}
+
+
+def _home_box(f, oid):
+    return L if oid == 1 else R
+
+
+class EventStubPredictor(StubSelectivePredictor):
+    """StubSelectivePredictor that logs every protocol call in order (prompt,
+    propagate request, per-frame yield with its oids, reset). Like a SAM3
+    session, each propagate request snapshots the prompted object set when it
+    starts; masks never depend on that set (outcome parity checks)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.events = []
+
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box):
+        self.events.append(("prompt", int(frame_idx), int(obj_id)))
+        super().add_new_points_or_box(state, frame_idx, obj_id, box)
+
+    def reset_state(self, state):
+        self.events.append(("reset",))
+        super().reset_state(state)
+
+    def propagate_in_video(self, state, start_frame_idx, max_frame_num_to_track):
+        self.events.append(("propagate", int(start_frame_idx),
+                            int(max_frame_num_to_track),
+                            bool(state.get("resume_refine"))))
+        for out in super().propagate_in_video(
+                state, start_frame_idx, max_frame_num_to_track):
+            self.events.append(("yield", int(out[0]),
+                                tuple(int(o) for o in out[1])))
+            yield out
+
+
+class RemovableStubPredictor(EventStubPredictor):
+    """EventStubPredictor + the SAM3 adapter's ``remove_object`` (the
+    capability that enables segmented propagation)."""
+
+    def remove_object(self, state, obj_id):
+        oid = int(obj_id)
+        self.events.append(("remove", oid))
+        self._prompted.discard(oid)
+        solo = state.get("solo_ids")
+        if isinstance(solo, set):
+            solo.discard(oid)
+
+
+def _cfg_seg(retire=False, lazy=False):
+    c = _cfg()
+    c.retire_closed = retire
+    c.lazy_seed = lazy
+    return c
+
+
+def _run_seg(tmp_path, pred, cfg, monkeypatch=None):
+    """Run the two-window episode; returns (tracker, results, machine frames)."""
+    from web.field import selective_prop as sp
+    fed = []
+    if monkeypatch is not None:
+        orig = sp.ExitMachine.step
+
+        def step(self, frame_idx, masks_by_oid, probs_by_oid):
+            fed.append(int(frame_idx))
+            return orig(self, frame_idx, masks_by_oid, probs_by_oid)
+        monkeypatch.setattr(sp.ExitMachine, "step", step)
+    tracker = Sam2FieldTracker(predictor=pred)
+    results = tracker.track_selective(str(tmp_path), _detect_fn(_SEG_DETS), cfg)
+    return tracker, results, fed
+
+
+def _same_results(a, b):
+    assert set(a) == set(b)
+    for f in a:
+        assert set(a[f]) == set(b[f]), f
+        for oid in a[f]:
+            ea, eb = a[f][oid], b[f][oid]
+            assert ea["box"] == eb["box"], (f, oid)
+            assert ea["evidence"] == eb["evidence"], (f, oid)
+            if ea["mask"] is None:
+                assert eb["mask"] is None, (f, oid)
+            else:
+                assert np.array_equal(ea["mask"], eb["mask"]), (f, oid)
+
+
+def test_segmented_knobs_default_off():
+    cfg = SelectiveConfig()
+    assert cfg.retire_closed is False
+    assert cfg.lazy_seed is False
+
+
+def test_segmented_scenario_baseline(tmp_path):
+    """Pin the scenario the segmented tests rely on (knobs off)."""
+    _write_frames(tmp_path, 21)
+    pred = EventStubPredictor(_home_box, emit_probs=True)
+    tracker, _, _ = _run_seg(tmp_path, pred, _cfg_seg())
+    stats = tracker.selective_stats
+    assert stats["episodes"] == 1 and stats["windows"] == 2
+    assert stats["outcomes"] == {"clean": 2}
+    assert pred.events[:2] == [("prompt", 2, 1), ("prompt", 1, 2)]
+    assert pred.events[2] == ("propagate", 1, 19, False)
+    assert [e[1] for e in pred.events if e[0] == "yield"] == list(range(1, 15))
+    assert pred.events[-1] == ("reset",)
+    assert stats["sam_frames"] == 14
+    assert "segmented" not in stats
+
+
+def test_segmented_off_call_sequence_identical_to_today(tmp_path):
+    """Knobs off: a remove_object-capable predictor sees exactly the call
+    sequence of one without it (today's single-pass episode)."""
+    _write_frames(tmp_path, 21)
+    plain = EventStubPredictor(_home_box, emit_probs=True)
+    t1, r1, _ = _run_seg(tmp_path, plain, _cfg_seg())
+    capable = RemovableStubPredictor(_home_box, emit_probs=True)
+    t2, r2, _ = _run_seg(tmp_path, capable, _cfg_seg())
+    assert capable.events == plain.events
+    assert capable.solo_at_prompt == plain.solo_at_prompt == [{1, 2}, {1, 2}]
+    assert t2.selective_stats == t1.selective_stats
+    _same_results(r1, r2)
+
+
+def test_segmented_without_remove_object_keeps_single_pass(tmp_path):
+    """Knobs ON but the predictor can't drop/add objects mid-session (SAM2,
+    stubs): today's behaviour, no segmentation."""
+    _write_frames(tmp_path, 21)
+    base = EventStubPredictor(_home_box, emit_probs=True)
+    t1, r1, _ = _run_seg(tmp_path, base, _cfg_seg())
+    on = EventStubPredictor(_home_box, emit_probs=True)
+    t2, r2, _ = _run_seg(tmp_path, on, _cfg_seg(retire=True, lazy=True))
+    assert on.events == base.events
+    assert t2.selective_stats == t1.selective_stats
+    _same_results(r1, r2)
+
+
+def test_retire_closed_removes_after_last_window_and_preserves_outcomes(
+        tmp_path, monkeypatch):
+    _write_frames(tmp_path, 21)
+    base = RemovableStubPredictor(_home_box, emit_probs=True)
+    t0, r0, fed0 = _run_seg(tmp_path, base, _cfg_seg(), monkeypatch)
+    monkeypatch.undo()
+
+    pred = RemovableStubPredictor(_home_box, emit_probs=True)
+    t1, r1, fed1 = _run_seg(tmp_path, pred, _cfg_seg(retire=True), monkeypatch)
+
+    ev = pred.events
+    removes = [e for e in ev if e[0] == "remove"]
+    assert removes == [("remove", 2)]           # exactly once, oid2 only
+    i = ev.index(("remove", 2))
+    # right after oid2's window closed (frame 8), before frame 9 is produced
+    assert ev[i - 1] == ("yield", 8, (1, 2))
+    assert ev[i + 1] == ("propagate", 9, 11, True)   # same end frame (20)
+    assert [e for e in ev if e[0] == "propagate"] == [
+        ("propagate", 1, 19, False), ("propagate", 9, 11, True)]
+    # survivor keeps propagating alone; oid2 never produced again
+    after = [e for e in ev[i:] if e[0] == "yield"]
+    assert [e[1] for e in after] == list(range(9, 15))
+    assert all(e[2] == (1,) for e in after)
+    # every frame reaches the machine once, in order — same as no-retire
+    assert fed1 == fed0 == list(range(1, 15))
+    s0, s1 = t0.selective_stats, t1.selective_stats
+    assert s1["sam_frames"] == s0["sam_frames"] == 14
+    assert s1["outcomes"] == s0["outcomes"] == {"clean": 2}
+    _same_results(r0, r1)
+    seg = s1["segmented"]
+    assert seg["segments"] == 2
+    assert seg["retired"] == 1
+    assert seg["lazy_seeded"] == 0
+    assert seg["retire_obj_frames_saved"] == 6        # frames 9..14 for oid2
+    # solo roster tracks retirement; reset in the finally
+    assert pred.solo_at_reset is None
+
+
+def test_lazy_seed_prompts_only_when_seed_frame_reached(tmp_path, monkeypatch):
+    _write_frames(tmp_path, 21)
+    pred = RemovableStubPredictor(_home_box, emit_probs=True)
+    t1, _, fed = _run_seg(tmp_path, pred, _cfg_seg(lazy=True), monkeypatch)
+    ev = pred.events
+    # oid2 (seed 1 = episode start) up front; oid1 (seed 2) held back
+    assert ev[0] == ("prompt", 1, 2)
+    assert ev[1] == ("propagate", 1, 19, False)
+    assert ev[2] == ("yield", 1, (2,))
+    assert ev[3] == ("prompt", 2, 1)            # added when frame 2 is next
+    assert ev[4] == ("propagate", 2, 18, True)
+    assert ev[5] == ("yield", 2, (1, 2))
+    assert pred.solo_at_prompt == [{2}, {1, 2}]
+    assert [e for e in ev if e[0] == "remove"] == []
+    assert fed == list(range(1, 15))
+    seg = t1.selective_stats["segmented"]
+    assert seg == {"segments": 2, "retired": 0, "lazy_seeded": 1,
+                   "retire_obj_frames_saved": 0, "lazy_obj_frames_saved": 1}
+    assert t1.selective_stats["outcomes"] == {"clean": 2}
+
+
+def test_retire_and_lazy_together(tmp_path, monkeypatch):
+    _write_frames(tmp_path, 21)
+    pred = RemovableStubPredictor(_home_box, emit_probs=True)
+    t1, _, fed = _run_seg(tmp_path, pred, _cfg_seg(retire=True, lazy=True),
+                          monkeypatch)
+    props = [e for e in pred.events if e[0] == "propagate"]
+    assert props == [("propagate", 1, 19, False), ("propagate", 2, 18, True),
+                     ("propagate", 9, 11, True)]
+    assert [e for e in pred.events if e[0] == "remove"] == [("remove", 2)]
+    assert fed == list(range(1, 15))
+    assert t1.selective_stats["sam_frames"] == 14
+    assert t1.selective_stats["outcomes"] == {"clean": 2}
+    assert t1.selective_stats["segmented"]["segments"] == 3
+
+
+def test_segmented_respects_budget(tmp_path):
+    """A mid-episode budget stop still wins over segmentation: no resume past
+    the budget, sam_frames == budget."""
+    _write_frames(tmp_path, 21)
+    pred = RemovableStubPredictor(_home_box, emit_probs=True)
+    cfg = _cfg_seg(retire=True, lazy=True)
+    cfg.sam_budget_frac = 10 / 21               # budget = 10 frames
+    tracker = Sam2FieldTracker(predictor=pred)
+    tracker.track_selective(str(tmp_path), _detect_fn(_SEG_DETS), cfg)
+    stats = tracker.selective_stats
+    assert stats["sam_frames"] == 10
+    assert [e[1] for e in pred.events if e[0] == "yield"] == list(range(1, 11))
+    assert stats["outcomes"] == {"clean": 1, "end": 1}

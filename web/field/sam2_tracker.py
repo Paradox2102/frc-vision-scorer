@@ -2889,6 +2889,21 @@ class Sam2FieldTracker:
         dropped_windows = 0
         episodes_run = 0
         budget_exhausted = False
+
+        # Segmented episode propagation (selective_retire_closed /
+        # selective_lazy_seed, docs/sam3-per-frame-profile-2026-11-06.md).
+        # Needs a predictor that can drop / add objects mid-session and resume
+        # (the SAM3 adapter: remove_object + incremental adds). SAM2 and stub
+        # predictors without remove_object, and the multiplex adapter
+        # (session_remove False: retire is bookkeeping-only there), keep
+        # today's single-pass episode.
+        seg_capable = (hasattr(predictor, "remove_object")
+                       and bool(getattr(predictor, "session_remove", True)))
+        retire_on = bool(getattr(cfg, "retire_closed", False)) and seg_capable
+        lazy_on = bool(getattr(cfg, "lazy_seed", False)) and seg_capable
+        seg_stats = {"segments": 0, "retired": 0, "lazy_seeded": 0,
+                     "retire_obj_frames_saved": 0,
+                     "lazy_obj_frames_saved": 0}
         for episode in episodes:
             episode_start = episode[0].seed_frame          # min seed (sorted)
             max_entry = max(spec.entry_frame for spec in episode)
@@ -2928,12 +2943,24 @@ class Sam2FieldTracker:
                 offload_state_to_cpu=self.offload_state_to_cpu,
             )
             try:
+                # Lazy seeding: prompt up front only the oids seeded at the
+                # earliest kept seed frame; hold every later seed back until
+                # propagation reaches it (``lazy`` = ascending (seed, oid)).
+                if lazy_on:
+                    first_seed = min(oid_seed[o] for o in seed_boxes)
+                    lazy = sorted((oid_seed[o], o) for o in seed_boxes
+                                  if oid_seed[o] > first_seed)
+                else:
+                    lazy = []
+                lazy_ids = {o for _, o in lazy}
+                eager = sorted(o for o in seed_boxes if o not in lazy_ids)
                 # SAM3 solo-roster: confine the pass to this episode's oids so
-                # the adapter's carried roster doesn't drag other objects along.
+                # the adapter's carried roster doesn't drag other objects along
+                # (with segmentation: the currently seeded, unretired oids).
                 # Harmless for plain SAM2 states (guarded on dict support).
                 if isinstance(state, dict):
-                    state["solo_ids"] = set(seed_boxes)
-                for oid in sorted(seed_boxes):
+                    state["solo_ids"] = set(eager)
+                for oid in eager:
                     predictor.add_new_points_or_box(
                         state, frame_idx=oid_seed[oid], obj_id=oid,
                         box=np.asarray(seed_boxes[oid], dtype=np.float32),
@@ -2950,31 +2977,102 @@ class Sam2FieldTracker:
                                  else (spec.seed_frame + wmax) - episode_start)
                 max_track = max(spans)
                 max_track = min(max_track, max(0, n_frames - 1 - episode_start))
-                gen = self._selective_propagate(state, episode_start, max_track)
-                try:
-                    for out in gen:
-                        # 3-tuples from SAM2 / stubs; 4-tuples (+tracker_probs)
-                        # from the SAM3 adapter.
-                        f_idx, obj_ids, mask_logits, *rest = out
-                        tracker_probs = rest[0] if rest else None
-                        masks_by_oid, probs_by_oid = self._selective_collect(
-                            obj_ids, mask_logits, tracker_probs)
-                        sam_used += 1
-                        closed = machine.step(
-                            int(f_idx), masks_by_oid, probs_by_oid)
-                        if sam_used >= budget_frames:
-                            # Budget hit mid-episode: stop the generator and let
-                            # outcomes() force-close every still-open window as
-                            # healthy END (masks so far are kept), then drop all
-                            # later episodes.
-                            budget_exhausted = True
-                            break
-                        if closed:
-                            break                    # all windows closed early
-                finally:
-                    # Unwind the propagate context managers and the SAM3
-                    # adapter's streaming session cleanly on early break / error.
-                    gen.close()
+                # Segmented propagation: a SAM3 propagate request snapshots
+                # its object set, so changing it (retire / lazy seed) means
+                # closing the stream after frame f, applying the change, and
+                # resuming at f + 1 with the remaining span to the SAME end
+                # frame. Every frame still reaches the machine exactly once,
+                # in ascending order; sam_used / budget are unchanged. With
+                # both knobs off this loop runs exactly one segment (today).
+                end_frame = episode_start + max_track
+                seg_start = episode_start
+                live = set(eager)
+                retired_at: dict = {}            # oid -> frame it was retired after
+                last_fed = None
+                while True:
+                    seg_stats["segments"] += 1
+                    resume_at = None
+                    retire_now: set = set()
+                    gen = self._selective_propagate(
+                        state, seg_start, end_frame - seg_start)
+                    try:
+                        for out in gen:
+                            # 3-tuples from SAM2 / stubs; 4-tuples
+                            # (+tracker_probs) from the SAM3 adapter.
+                            f_idx, obj_ids, mask_logits, *rest = out
+                            f = int(f_idx)
+                            if last_fed is not None and f <= last_fed:
+                                continue             # never re-feed a frame
+                            tracker_probs = rest[0] if rest else None
+                            masks_by_oid, probs_by_oid = self._selective_collect(
+                                obj_ids, mask_logits, tracker_probs)
+                            sam_used += 1
+                            last_fed = f
+                            closed = machine.step(f, masks_by_oid, probs_by_oid)
+                            if sam_used >= budget_frames:
+                                # Budget hit mid-episode: stop the generator and
+                                # let outcomes() force-close every still-open
+                                # window as healthy END (masks so far are kept),
+                                # then drop all later episodes.
+                                budget_exhausted = True
+                                break
+                            if closed:
+                                break                # all windows closed early
+                            if (retire_on or lazy) and f < end_frame:
+                                retire_now = ((machine.closed_oids() & live)
+                                              if retire_on else set())
+                                if retire_now or (lazy and lazy[0][0] <= f + 1):
+                                    resume_at = f + 1
+                                    break
+                    finally:
+                        # Unwind the propagate context managers and the SAM3
+                        # adapter's streaming session cleanly on early break /
+                        # error.
+                        gen.close()
+                    if resume_at is None:
+                        break
+                    # Apply the object-set change, then resume at f + 1.
+                    for oid in sorted(retire_now):
+                        try:
+                            predictor.remove_object(state, oid)
+                        except Exception as exc:  # never kill the view
+                            print(f"  [selective] retire of oid {oid} "
+                                  f"failed: {exc!r}")
+                        live.discard(oid)
+                        retired_at[oid] = resume_at - 1
+                        if isinstance(state, dict) and isinstance(
+                                state.get("solo_ids"), set):
+                            state["solo_ids"].discard(oid)
+                    while lazy and lazy[0][0] <= resume_at:
+                        seed_f, oid = lazy.pop(0)
+                        if isinstance(state, dict) and isinstance(
+                                state.get("solo_ids"), set):
+                            state["solo_ids"].add(oid)
+                        predictor.add_new_points_or_box(
+                            state, frame_idx=seed_f, obj_id=oid,
+                            box=np.asarray(seed_boxes[oid], dtype=np.float32),
+                        )
+                        live.add(oid)
+                        seg_stats["lazy_seeded"] += 1
+                        seg_stats["lazy_obj_frames_saved"] += \
+                            seed_f - episode_start
+                    if isinstance(state, dict):
+                        # One-shot: survivors continue on a bare refine (no
+                        # new conditioning prompt) — see Sam3PredictorAdapter.
+                        state["resume_refine"] = True
+                    seg_start = resume_at
+                # Rough savings counters (object-frames SAM did not propagate
+                # vs the single-pass episode, up to the last frame fed).
+                if last_fed is not None:
+                    for oid, f_ret in retired_at.items():
+                        seg_stats["retire_obj_frames_saved"] += \
+                            max(0, last_fed - f_ret)
+                    for _seed_f, _oid in lazy:   # never reached: never paid
+                        seg_stats["lazy_obj_frames_saved"] += \
+                            last_fed - episode_start + 1
+                seg_stats["retired"] += len(retired_at)
+                if isinstance(state, dict):
+                    state.pop("resume_refine", None)
                 all_outcomes.extend(machine.outcomes())
                 episodes_run += 1
             finally:
@@ -2995,6 +3093,8 @@ class Sam2FieldTracker:
             "episodes": episodes_run, "dropped_windows": dropped_windows,
             "triggers": trig_counts,
         }
+        if retire_on or lazy_on:
+            self.selective_stats["segmented"] = seg_stats
         if cfg.kill_coast:
             from web.field import selective_prop as _selprop
             self.selective_stats["coast"] = _selprop.last_coast_stats

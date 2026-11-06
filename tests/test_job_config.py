@@ -776,3 +776,23 @@ def test_sam3_retire_culled_knob_env_and_override(monkeypatch):
     assert cfg.sam3_retire_culled is True
     cfg2 = JobConfig({"sam3_retire_culled": "false"})
     assert cfg2.sam3_retire_culled is False
+
+
+def test_selective_segmented_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.selective_retire_closed is False
+    assert cfg.selective_lazy_seed is False
+
+
+def test_selective_segmented_knobs_env_and_override(monkeypatch):
+    monkeypatch.setenv("SELECTIVE_RETIRE_CLOSED", "1")
+    monkeypatch.setenv("SELECTIVE_LAZY_SEED", "true")
+    cfg = JobConfig()
+    assert cfg.selective_retire_closed is True
+    assert cfg.selective_lazy_seed is True
+    cfg2 = JobConfig({"selective_retire_closed": "false",
+                      "selective_lazy_seed": False})
+    assert cfg2.selective_retire_closed is False
+    assert cfg2.selective_lazy_seed is False

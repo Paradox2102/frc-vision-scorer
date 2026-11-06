@@ -447,6 +447,12 @@ class Sam3PredictorAdapter:
         # remove_objects._slice_state can KeyError on the memory the
         # _shim_bound_tracker_memory trim leaves behind.
         self.session_remove = True
+        # state["resume_refine"] (selective_retire_closed / selective_lazy_seed
+        # segment resumes): allowed to keep already-tracked ids on
+        # propagation_partial with a bare ``refine`` action instead of a new
+        # box prompt. Sam3FieldTracker sets False for multiplex (its objects
+        # share bucketed states; the bare-refine path is unverified there).
+        self.refine_resume = True
 
     # ── SAM2-protocol surface ────────────────────────────────────────
 
@@ -597,6 +603,15 @@ class Sam3PredictorAdapter:
         """Whether the chunk session tracks ``obj_id`` (upstream
         ``remove_object`` asserts it does). None when the predictor exposes
         no session introspection (stubs) — the caller then just tries."""
+        ids = self._session_object_ids(session_id)
+        if ids is None:
+            return None
+        return int(obj_id) in ids
+
+    def _session_object_ids(self, session_id: str) -> set | None:
+        """All obj_ids the chunk session currently tracks (empty before the
+        first add). None when the predictor exposes no session introspection
+        (stubs) or the lookup fails."""
         get_session = getattr(self._predictor, "_get_session", None)
         if get_session is None:
             return None
@@ -605,11 +620,50 @@ class Sam3PredictorAdapter:
             per_gpu = (sess_state.get("tracker_metadata") or {}).get(
                 "obj_ids_per_gpu")
             if per_gpu is None:
-                return False  # metadata uninitialized: nothing added yet
-            return any(int(obj_id) in {int(x) for x in np.asarray(ids).reshape(-1)}
-                       for ids in per_gpu)
+                return set()  # metadata uninitialized: nothing added yet
+            return {int(x) for ids in per_gpu
+                    for x in np.asarray(ids).reshape(-1)}
         except Exception:
             return None
+
+    def _resume_refiner(self, chunk: dict):
+        """For a ``resume_refine`` propagate: ``(session_ids, carry, refine)``
+        or None when the bare-refine path is unavailable (multiplex, or a
+        predictor/model without ``_get_session`` / ``add_action_history``) —
+        the caller then re-anchors with real prompts as usual.
+
+        ``carry`` is the obj_id list of the session's last propagation action
+        (what the interrupted request was propagating); ``refine(oid, local)``
+        records a bare upstream ``refine`` action, which
+        ``parse_action_history_for_propagation`` folds into the next
+        ``propagation_partial`` WITHOUT ``add_tracker_new_points`` — no new
+        conditioning frame, no score reset, so the object's masks continue
+        exactly as in an uninterrupted propagate."""
+        if not self.refine_resume:
+            return None
+        get_session = getattr(self._predictor, "_get_session", None)
+        model = getattr(self._predictor, "model", None)
+        add_action = getattr(model, "add_action_history", None)
+        if get_session is None or add_action is None:
+            return None
+        try:
+            sess_state = get_session(chunk["session_id"])["state"]
+        except Exception:
+            return None
+        ids = self._session_object_ids(chunk["session_id"])
+        if ids is None:
+            return None
+        carry: list = []
+        for action in reversed(sess_state.get("action_history") or []):
+            if "propagation" in str(action.get("type", "")):
+                carry = [int(o) for o in (action.get("obj_ids") or [])]
+                break
+
+        def refine(obj_id: int, local_idx: int) -> None:
+            add_action(sess_state, action_type="refine",
+                       frame_idx=int(local_idx), obj_ids=[int(obj_id)])
+
+        return ids, carry, refine
 
     def reset_state(self, state: dict) -> None:
         if state.get("closed"):
@@ -766,6 +820,30 @@ class Sam3PredictorAdapter:
 
         chunk = state["chunk"]
 
+        # One-shot segment resume (track_selective's selective_retire_closed /
+        # selective_lazy_seed): the caller broke a propagate mid-stream to
+        # change the object set and is resuming at the next frame. Ids the
+        # session already tracks get a bare ``refine`` action instead of a box
+        # prompt (which would add a conditioning frame and change their
+        # masks); see _resume_refiner. Unset (default) = unchanged behaviour.
+        refiner = (self._resume_refiner(chunk)
+                   if state.pop("resume_refine", False) else None)
+        refined: set = set()
+        solo = state.get("solo_ids")
+        local_start = start_global - chunk["lo"]
+        if refiner is not None:
+            session_ids, carry, refine = refiner
+            # Everything the interrupted request was propagating (minus
+            # retired ids, which upstream remove_object dropped from the
+            # session) continues — stale or not, as it would have uninterrupted.
+            for obj_id in sorted(set(carry)):
+                if obj_id in chunk["prompted"] or obj_id not in session_ids:
+                    continue
+                if solo is not None and obj_id not in solo:
+                    continue
+                refine(obj_id, local_start)
+                refined.add(obj_id)
+
         # SAM3 sessions route each propagate request through their action
         # history: objects WITHOUT an add/refine since the previous propagate
         # are not tracked at all (fetch/partial-only semantics, see
@@ -773,9 +851,8 @@ class Sam3PredictorAdapter:
         # latest observed box before each window so the whole roster rides
         # ``propagation_partial``; stale objects stay with the detector
         # re-prompt recovery path, same rule as the chunk-boundary re-seed.
-        solo = state.get("solo_ids")
         for obj_id, (seen_idx, box) in sorted(state["last_box"].items()):
-            if obj_id in chunk["prompted"]:
+            if obj_id in chunk["prompted"] or obj_id in refined:
                 continue
             if solo is not None and obj_id not in solo:
                 continue  # backfill scoping — see _open_chunk_for
@@ -783,10 +860,12 @@ class Sam3PredictorAdapter:
                 continue
             if abs(start_global - seen_idx) > SAM3_RESEED_MAX_AGE:
                 continue
+            if refiner is not None and obj_id in refiner[0]:
+                refiner[2](obj_id, local_start)
+                continue
             self._send_prompt(state, seen_idx, obj_id, box)
         chunk["prompted"] = set()
 
-        local_start = start_global - chunk["lo"]
         # frames of this chunk that fall inside the caller's range
         chunk_lo = max(lo, chunk["lo"])
         chunk_hi = min(hi, chunk["hi"])
@@ -957,6 +1036,7 @@ class Sam3FieldTracker(Sam2FieldTracker):
         # Multiplex remove_objects can KeyError on trimmed memory: retire by
         # adapter bookkeeping only there.
         adapter.session_remove = not multiplex
+        adapter.refine_resume = not multiplex
         self.retire_culled = bool(retire_culled)
 
         super().__init__(

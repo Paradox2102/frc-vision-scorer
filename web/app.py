@@ -2557,6 +2557,8 @@ class InferenceJob:
                     starve_trigger=self.config.selective_starve_trigger,
                     starve_max_frames=self.config.selective_starve_max_frames,
                     starve_min_obs=self.config.selective_starve_min_obs,
+                    retire_closed=self.config.selective_retire_closed,
+                    lazy_seed=self.config.selective_lazy_seed,
                 )
                 view_tracks = await asyncio.to_thread(
                     sam2_tracker.track_selective,
@@ -2600,7 +2602,9 @@ class InferenceJob:
                       + (f" coast={stats['coast']}"
                          if stats.get("coast") is not None else "")
                       + (f" app={stats['app']}"
-                         if stats.get("app") is not None else ""))
+                         if stats.get("app") is not None else "")
+                      + (f" seg={stats['segmented']}"
+                         if stats.get("segmented") is not None else ""))
                 # Selective mode never uses the prompt-seed identity space, so
                 # REPLACE (not merge) the per-view color dict that was pre-seeded
                 # with prompt-order {i+1: color} at ~app.py:6124. Merging only

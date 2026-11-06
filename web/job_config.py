@@ -276,6 +276,31 @@ KNOBS = [
     # tracked before parking). 0 disables the gate (v1 behavior).
     Knob("selective_starve_min_obs", "SELECTIVE_STARVE_MIN_OBS", int, 30,
          min=0, section="Tracking backend"),
+    # Segmented episode propagation (docs/sam3-per-frame-profile-2026-11-06.md
+    # lever 1, selective half). A selective episode is ONE SAM session that
+    # propagates every window's oid until ALL its windows close; on main that
+    # is 4-8 episodes covering 95-99% of frames, so a finished oid keeps
+    # costing ~42 ms/frame to the episode end and selective saves nothing vs
+    # uniform (main 425-596 vs 417-550 ms/frame). ON: as soon as every window
+    # of an oid has closed, break the propagate, remove_object it from the
+    # SAM3 session and resume at the next frame (survivors resume with a bare
+    # `refine` action, no new prompt). Outcome-preserving: the ExitMachine
+    # never reads a fully-closed oid's masks (kill pairs and settles only
+    # involve open windows). SAM3 base model only (SAM2 / multiplex keep the
+    # single-pass episode). DEFAULT OFF pending live A/B.
+    Knob("selective_retire_closed", "SELECTIVE_RETIRE_CLOSED", bool, False,
+         section="Tracking backend"),
+    # Lazy seeding for selective episodes. Today every oid is prompted up
+    # front at its own seed frame and propagated from the EPISODE start, so a
+    # late-seeded oid is paid for (and conditioned on its future prompt) on
+    # frames before its window even exists. ON: hold the seed prompt back
+    # until propagation reaches the seed frame, then add it and resume.
+    # Changes the late oid's masks somewhat (no future-conditioned warm-up;
+    # windows never read pre-seed frames, so what they see is otherwise the
+    # same), hence its own knob. SAM3 base model only. DEFAULT OFF pending
+    # live A/B.
+    Knob("selective_lazy_seed", "SELECTIVE_LAZY_SEED", bool, False,
+         section="Tracking backend"),
     # torch.compile for SAM3 mask propagation. First run pays inductor
     # compile warm-up (cached on disk thereafter); A/B knob for the
     # propagation stage that dominates tracking wall time.

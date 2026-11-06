@@ -58,6 +58,10 @@ class SelectiveConfig:
     starve_trigger: int = 7        # min dark-tail frames (to sequence end)
     starve_max_frames: int = 0     # starve-window frame cap; 0 = uncapped
     starve_min_obs: int = 30       # min observed frames to starve-trigger; 0 = gate off
+    # Segmented episode propagation (Sam2FieldTracker.track_selective, SAM3
+    # adapter only; both False = today's single-pass episode, exact no-op).
+    retire_closed: bool = False    # remove an oid from SAM once all its windows close
+    lazy_seed: bool = False        # prompt an oid only when propagation reaches its seed
 
 
 @dataclass
@@ -781,6 +785,18 @@ class ExitMachine:
                 if wmax is not None and frame_idx >= w.spec.seed_frame + wmax:
                     self._close(w, "end", frame_idx)
         return all(w.state is not None for w in self._wins)
+
+    def closed_oids(self) -> set:
+        """Oids whose every window in this machine has closed. Such an oid's
+        masks are never read again: ``_eval_window`` returns early on a closed
+        window and ``_check_killed`` pairs only open windows (settle
+        candidates come from the TBD history, not other oids' masks). Used by
+        ``selective_retire_closed`` to drop the oid from the SAM session."""
+        open_by_oid: dict[int, bool] = {}
+        for w in self._wins:
+            oid = w.spec.oid
+            open_by_oid[oid] = open_by_oid.get(oid, False) or w.state is None
+        return {oid for oid, is_open in open_by_oid.items() if not is_open}
 
     def outcomes(self):
         """Finalize any still-open windows (sequence ended) as healthy END, then

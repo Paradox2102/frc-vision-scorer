@@ -1453,3 +1453,214 @@ def test_sam2_retire_hook_is_noop():
 
     tracker = Sam2FieldTracker(predictor=object())
     assert tracker._retire_object({}, 3) is None
+
+
+# ---------------------------------------------------------------------------
+# selective segment resumes: state["resume_refine"] (bare refine for known ids)
+# ---------------------------------------------------------------------------
+
+class _RefineModel:
+    """Upstream ``model.add_action_history`` surface: appends to the session
+    state's action history (the stub stream then treats refine like add)."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def add_action_history(self, inference_state, action_type, frame_idx=None,
+                           obj_ids=None):
+        inference_state["action_history"].append(
+            {"type": action_type, "frame_idx": frame_idx, "obj_ids": obj_ids})
+        self._raw.actions.append((action_type, frame_idx, list(obj_ids or [])))
+
+
+class RefineStubPredictor(RemoveStubPredictor):
+    """RemoveStubPredictor with a persistent per-session ``state`` that carries
+    an upstream-like ``action_history``: add_prompt records ``add``/``refine``,
+    each propagate records ``propagation_partial`` over the ids it runs (or
+    ``propagation_fetch`` with none), and a bare ``refine`` action (via
+    ``model.add_action_history``) keeps an id on the next partial propagate
+    exactly like a prompt would, minus the conditioning frame."""
+
+    def __init__(self, with_model=True):
+        super().__init__()
+        self.actions = []
+        if with_model:
+            self.model = _RefineModel(self)
+
+    def _sess_state(self, sid):
+        sess = self._sessions[sid]
+        st = sess.setdefault("state", {"action_history": []})
+        st["tracker_metadata"] = {"obj_ids_per_gpu": [
+            np.array(sorted(sess.get("known", set())), dtype=np.int64)]}
+        return st
+
+    def _get_session(self, sid):
+        return {"state": self._sess_state(sid)}
+
+    def handle_request(self, request):
+        if request["type"] == "add_prompt":
+            sid = request["session_id"]
+            known = self._sessions[sid].get("known", set())
+            kind = "refine" if request["obj_id"] in known else "add"
+            self._sess_state(sid)["action_history"].append(
+                {"type": kind, "frame_idx": request["frame_index"],
+                 "obj_ids": [request["obj_id"]]})
+        return super().handle_request(request)
+
+    def handle_stream_request(self, request):
+        sid = request["session_id"]
+        st = self._sess_state(sid)
+        ids = []
+        for a in reversed(st["action_history"]):
+            if "propagation" in a["type"]:
+                break
+            if a["type"] in ("add", "refine"):
+                ids.extend(a["obj_ids"])
+        ids = sorted(set(ids) & self._sessions[sid].get("known", set()))
+        st["action_history"].append(
+            {"type": "propagation_partial" if ids else "propagation_fetch",
+             "frame_idx": request["start_frame_index"],
+             "obj_ids": ids or None})
+        self._sessions[sid]["prompted_since"] = set(ids)
+        yield from ActionHistoryStubPredictor.handle_stream_request(self, request)
+
+
+def _break_after(adapter, state, start, span, stop_at):
+    """Propagate and close the stream right after frame ``stop_at`` (what
+    track_selective does at a segment break)."""
+    gen = adapter.propagate_in_video(state, start_frame_idx=start,
+                                     max_frame_num_to_track=span)
+    out = []
+    try:
+        for item in gen:
+            out.append(item)
+            if item[0] == stop_at:
+                break
+    finally:
+        gen.close()
+    return out
+
+
+def _resume_setup(tmp_path, raw, n=24, chunk=64):
+    _write_frames(tmp_path, n)
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=chunk)
+    state = adapter.init_state(video_path=str(tmp_path))
+    for oid, box in ((1, [1, 1, 5, 5]), (2, [4, 2, 9, 6])):
+        adapter.add_new_points_or_box(
+            state, frame_idx=0, obj_id=oid, box=np.array(box, np.float32))
+    w1 = _break_after(adapter, state, 0, 15, stop_at=5)
+    assert [f for f, *_ in w1] == list(range(0, 6))
+    return adapter, state
+
+
+def test_resume_refine_uses_bare_refine_for_known_ids(tmp_path):
+    raw = RefineStubPredictor()
+    adapter, state = _resume_setup(tmp_path, raw)
+    adapter.remove_object(state, 2)
+    raw.requests.clear()
+    raw.actions.clear()
+    state["resume_refine"] = True
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                         max_frame_num_to_track=9))
+    # no box prompt for the survivor, a bare refine at the resume frame
+    assert [r for r in raw.requests if r["type"] == "add_prompt"] == []
+    assert raw.actions == [("refine", 6, [1])]
+    assert [f for f, *_ in w2] == list(range(6, 16))
+    assert all(ids.tolist() == [1] for _, ids, *_ in w2)
+    assert "resume_refine" not in state            # one-shot
+    adapter.reset_state(state)
+
+
+def test_resume_refine_lazy_seed_prompt_plus_refine(tmp_path):
+    """A lazily-seeded new id gets its real prompt; known survivors get a
+    bare refine; both ride the resumed partial propagate."""
+    raw = RefineStubPredictor()
+    adapter, state = _resume_setup(tmp_path, raw)
+    adapter.add_new_points_or_box(
+        state, frame_idx=6, obj_id=3, box=np.array([2, 2, 6, 6], np.float32))
+    raw.actions.clear()
+    state["resume_refine"] = True
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                         max_frame_num_to_track=9))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert [p["obj_id"] for p in prompts][-1] == 3
+    assert sorted(a[2][0] for a in raw.actions) == [1, 2]
+    assert all(a[0] == "refine" and a[1] == 6 for a in raw.actions)
+    assert all(ids.tolist() == [1, 2, 3] for _, ids, *_ in w2)
+    adapter.reset_state(state)
+
+
+def test_resume_without_flag_reanchors_with_prompts(tmp_path):
+    """Default (flag unset): today's per-request re-anchor box prompts."""
+    raw = RefineStubPredictor()
+    adapter, state = _resume_setup(tmp_path, raw)
+    raw.requests.clear()
+    raw.actions.clear()
+    list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                    max_frame_num_to_track=9))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert {p["obj_id"] for p in prompts} == {1, 2}
+    assert raw.actions == []
+    adapter.reset_state(state)
+
+
+@pytest.mark.parametrize("variant", ["no_model", "multiplex", "no_session"])
+def test_resume_refine_falls_back_to_prompts(tmp_path, variant):
+    if variant == "no_session":
+        raw = ActionHistoryStubPredictor()
+        raw.model = _RefineModel(raw)
+        raw.actions = []
+    else:
+        raw = RefineStubPredictor(with_model=(variant != "no_model"))
+    adapter, state = _resume_setup(tmp_path, raw)
+    if variant == "multiplex":
+        adapter.refine_resume = False
+    raw.requests.clear()
+    state["resume_refine"] = True
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                         max_frame_num_to_track=9))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert {p["obj_id"] for p in prompts} == {1, 2}
+    assert getattr(raw, "actions", []) == []
+    assert all(set(ids.tolist()) == {1, 2} for _, ids, *_ in w2)
+    assert "resume_refine" not in state
+    adapter.reset_state(state)
+
+
+def test_resume_refine_prompts_ids_not_in_session(tmp_path):
+    """A fresh last_box id the session doesn't track still gets a real
+    prompt on a resume (refine is only for known ids)."""
+    raw = RefineStubPredictor()
+    adapter, state = _resume_setup(tmp_path, raw)
+    state["last_box"][9] = (5, (1.0, 1.0, 4.0, 4.0))
+    raw.requests.clear()
+    raw.actions.clear()
+    state["resume_refine"] = True
+    list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                    max_frame_num_to_track=3))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert [p["obj_id"] for p in prompts] == [9]
+    assert sorted(a[2][0] for a in raw.actions) == [1, 2]
+    adapter.reset_state(state)
+
+
+def test_resume_across_chunk_boundary_skips_retired_and_unseeded(tmp_path):
+    """Resume that crosses the 16-frame chunk boundary: the new chunk re-seeds
+    only the survivor — never the retired id, never a held-back lazy id."""
+    raw = RefineStubPredictor()
+    adapter, state = _resume_setup(tmp_path, raw, n=24, chunk=16)
+    state["solo_ids"] = {1, 2}
+    adapter.remove_object(state, 2)
+    assert state["solo_ids"] == {1}
+    raw.requests.clear()
+    state["resume_refine"] = True
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=6,
+                                         max_frame_num_to_track=17))
+    assert [f for f, *_ in w2] == list(range(6, 24))
+    starts = [r for r in raw.requests if r["type"] == "start_session"]
+    assert len(starts) == 1                          # chunk [16, 24)
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert [p["obj_id"] for p in prompts] == [1]     # boundary re-seed only
+    assert all(ids.tolist() == [1] for _, ids, *_ in w2)
+    state["solo_ids"] = None
+    adapter.reset_state(state)

@@ -2886,6 +2886,39 @@ class VisionScorer {
         this.renderReplayFrame(idx);
     }
 
+    // Whole-match label confidence: a slot whose label holds less than this
+    // share of the slot's team evidence is flagged "low confidence — check".
+    static get LOW_LABEL_SHARE() { return 0.6; }
+
+    // "3128 · 62%  (alt 6773 · 21%)" line + low-confidence badge + a
+    // "Use <runner-up>" button for one review row. Empty when the job ran
+    // without the whole-match resolve (no share stored).
+    reviewConfidenceHtml(r) {
+        const pct = (v) => `${Math.round(Number(v) * 100)}%`;
+        const share = r.label_share;
+        const alt = r.runner_up_team;
+        if (share == null && alt == null) return '';
+        const team = this.escapeHtml(r.team_number || '—');
+        // No share: an unlabelled slot, or a label corrected by hand to a
+        // team other than the runner-up (its evidence share is unknown).
+        const main = share != null ? `${team} · ${pct(share)}` : `${team} · —`;
+        const altTxt = alt != null
+            ? ` <span class="review-alt">(alt ${this.escapeHtml(alt)}`
+              + `${r.runner_up_share != null ? ' · ' + pct(r.runner_up_share) : ''})</span>`
+            : '';
+        const low = share != null && Number(share) < VisionScorer.LOW_LABEL_SHARE;
+        const badge = low && r.team_number
+            ? '<span class="low-conf-badge" title="The label holds a small share of this slot\'s read evidence">low confidence — check</span>'
+            : '';
+        const useBtn = alt != null
+            ? `<button class="review-use-alt" data-slot="${r.slot}" data-team="${this.escapeHtml(alt)}"
+                       title="Correct this slot to the runner-up team">Use ${this.escapeHtml(alt)}</button>`
+            : '';
+        return `<div class="review-conf${low ? ' low' : ''}">
+                    <span class="review-share">${main}</span>${altTxt}${badge}${useBtn}
+                </div>`;
+    }
+
     async loadReplayIdentities(id) {
         this._replayId = id;
         const replayId = id;
@@ -2913,10 +2946,22 @@ class VisionScorer {
                         <button class="review-save" data-slot="${r.slot}">Save</button>
                         <span class="review-status"></span>
                     </div>
+                    ${this.reviewConfidenceHtml(r)}
                 </div>`;
             }).join('');
             grid.querySelectorAll('.review-save').forEach(btn => {
                 btn.addEventListener('click', () => this.saveIdentityCorrection(btn, replayId));
+            });
+            grid.querySelectorAll('.review-use-alt').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    // Same correct endpoint as Save, with the runner-up team;
+                    // reload so the swapped share/runner-up line re-renders.
+                    const wrap = btn.closest('.review-robot');
+                    wrap.querySelector('.review-team').value = btn.dataset.team;
+                    const ok = await this.saveIdentityCorrection(
+                        wrap.querySelector('.review-save'), replayId);
+                    if (ok) this.loadReplayIdentities(replayId);
+                });
             });
             card.style.display = 'block';
         } catch (e) {
@@ -2938,8 +2983,10 @@ class VisionScorer {
             const data = await resp.json().catch(() => ({}));
             status.textContent = resp.ok
                 ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || ('HTTP ' + resp.status)}`;
+            return resp.ok;
         } catch (e) {
             status.textContent = '✗ ' + e.message;
+            return false;
         }
     }
 

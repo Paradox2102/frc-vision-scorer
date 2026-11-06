@@ -1409,6 +1409,34 @@ a.btn-small { text-decoration: none; cursor: pointer; display: inline-flex; alig
 .review-meta { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .review-team { width: 80px; }
 .review-status { font-size: 0.8rem; color: var(--text-secondary, #9bb); }
+/* Whole-match label confidence: "3128 · 62%  (alt 6773 · 21%)" + badge + "Use" */
+.review-conf {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin-top: 6px; font-size: 0.8rem; color: var(--text-secondary);
+}
+.review-share { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.review-alt { font-variant-numeric: tabular-nums; }
+.low-conf-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 6px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    background: rgba(249, 115, 22, 0.2);
+    color: var(--orange);
+}
+.review-robot:has(.review-conf.low) { border-color: rgba(249, 115, 22, 0.55); }
+.review-use-alt {
+    margin-left: auto;
+    padding: 0.2rem 0.6rem;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+.review-use-alt:hover { border-color: var(--blue-alliance); color: var(--blue-alliance); }
 
 /* Gallery manager: one collapsible accordion row per team (scales to 30-75 teams) */
 .gallery-toolbar {

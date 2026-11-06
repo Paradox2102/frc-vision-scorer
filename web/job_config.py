@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from web import clef_reader, vlm_models
+from web import clef_reader, jev_reader, vlm_models
 
 # Matches the truthiness rule used by the app.py env constants.
 _FALSY = ("0", "false", "False")
@@ -497,8 +497,11 @@ KNOBS = [
     # a closed-set choice over the full 6-team roster + none/other escapes.
     # No GPU: vLLM is never started for a clef job and there is no mid-job
     # fallback to the in-process model (quota/auth failure disables reads).
+    # "jev": TypeSafe Jev decision model (web/jev_reader.py) — same closed-set
+    # read with four escapes and "tentative" low-probability reads (see
+    # jev_tentative_min_p); same cloud-reader rules as clef.
     Knob("team_reader", "TEAM_READER", str, "local",
-         choices=("local", "deepseek", "vllm", "clef"), section="Identity & votes"),
+         choices=("local", "deepseek", "vllm", "clef", "jev"), section="Identity & votes"),
     # Surface-aware vote gate: the bumper readers also report whether the
     # digits sit on a robot bumper band ("bumper") or are PRINTED on
     # equipment ("printed") — qm11's OVERFLOW crate base read "1477" at
@@ -548,6 +551,22 @@ KNOBS = [
     # readers.
     Knob("clef_model", "CLEF_MODEL", str, clef_reader.DEFAULT_MODEL,
          choices=tuple(clef_reader.CLEF_MODELS), section="VLM reader"),
+    # Which TypeSafe Jev model serves team_reader="jev" reads. Pinned to
+    # jev-1.14.0 ($0.042/M input tokens, ~0.2 s/read): the 200-crop bench
+    # (59/90 legible, 0 wrong, 2% FP) and the tentative floor below were
+    # measured on it; "jev-latest" floats. Ignored by the other readers.
+    Knob("jev_model", "JEV_MODEL", str, jev_reader.DEFAULT_MODEL,
+         choices=tuple(jev_reader.JEV_MODELS), section="VLM reader"),
+    # Jev "tentative" reads (team_reader="jev" only): when the top option is
+    # "unreadable" but the best TEAM option has p >= this, the read names that
+    # team as tentative. Bench: the true team was the best team option in
+    # 23/31 legible abstains; p >= 0.17 (fitted to the bench) -> ~73/90 with
+    # 0 wrong. Tentative reads are WEAK evidence (qm8: Clef reads < 0.65 were
+    # 3/4 wrong on red): they vote p x camera weight (below a normal read's
+    # 0.5) and never drive a consecutive / contradiction / co-occlusion lock.
+    # 0 disables tentative reads.
+    Knob("jev_tentative_min_p", "JEV_TENTATIVE_MIN_P", float,
+         jev_reader.DEFAULT_TENTATIVE_MIN_P, min=0.0, max=1.0, section="VLM reader"),
     # Multi-frame Clef reads (team_reader="clef" only; ignored otherwise): send
     # the newest bumper crop plus the sharpest earlier crops of the SAME
     # identity (a per-identity rolling buffer of the last clef_mf_window_s

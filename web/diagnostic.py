@@ -137,7 +137,11 @@ class DiagnosticRecorder:
                        clef_same_robot: float | None = None,
                        trigger: str | None = None,
                        evicted: bool = False,
-                       subject: str | None = None) -> None:
+                       subject: str | None = None,
+                       jev_probs: dict | None = None,
+                       tentative: bool = False,
+                       runner_up: str | None = None,
+                       runner_up_p: float | None = None) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -183,6 +187,21 @@ class DiagnosticRecorder:
         # otherwise, so every other row is unchanged.
         if subject is not None:
             record["subject"] = str(subject)
+        # team_reader="jev" only: the per-option probabilities (roster teams +
+        # not_robot/unreadable/printed/other; same closed-set probability
+        # scale as clef_probs, so the finalize evidence floor treats both);
+        # ``tentative`` marks a low-probability best-guess read (top option
+        # "unreadable", vote_weight = p x source weight); runner_up /
+        # runner_up_p = the second-best team option. Each omitted when absent,
+        # so every other reader's rows are unchanged.
+        if jev_probs:
+            record["jev_probs"] = {str(k): float(v) for k, v in jev_probs.items()}
+        if tentative:
+            record["tentative"] = True
+        if runner_up is not None:
+            record["runner_up"] = str(runner_up)
+        if runner_up_p is not None:
+            record["runner_up_p"] = float(runner_up_p)
         self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

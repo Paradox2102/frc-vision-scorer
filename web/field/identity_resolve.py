@@ -492,14 +492,16 @@ def apply_evidence_floor(
     min_margin: float = 0.0,
 ) -> tuple[list[dict] | None, int]:
     """Clef evidence floor (knob ``clef_min_evidence_conf``): drop team-naming
-    Clef reads too weak to be slot evidence for the finalize resolvers.
+    Clef / Jev reads too weak to be slot evidence for the finalize resolvers.
 
     A row is dropped when it names a team (``matched_team``), carries
-    ``clef_probs`` (a Clef decision-model read; other readers' confidences are
-    on a different scale and pass through untouched) and either its
-    ``confidence`` (= p(team), the closed-set probability) is below
-    ``min_conf`` or ``p(team) - p(none)`` is below ``min_margin``. A floor of
-    0 disables that rule. Rows naming no team carry no vote and are kept.
+    ``clef_probs`` or ``jev_probs`` (a decision-model read; other readers'
+    confidences are on a different scale and pass through untouched) and
+    either its ``confidence`` (= p(team), the closed-set probability) is below
+    ``min_conf`` or ``p(team) - p(no-number escape)`` is below ``min_margin``
+    (Clef ``none``; Jev ``unreadable``). A floor of 0 disables that rule. Rows
+    naming no team carry no vote and are kept. Jev tentative reads (p < 0.5)
+    are dropped by any floor above their p.
 
     qm8 0f632e0a: all 3 wrong red reads were blurry-bumper "6497" at conf
     0.58/0.59/0.64 (margins 0.28-0.38); below 0.65 3/4 red reads were wrong,
@@ -513,10 +515,12 @@ def apply_evidence_floor(
     for row in vlm_read_rows:
         team = row.get("matched_team")
         probs = row.get("clef_probs")
+        if not isinstance(probs, dict):
+            probs = row.get("jev_probs")
         if team is not None and isinstance(probs, dict):
             p_team = float(probs.get(str(team), row.get("confidence") or 0.0))
             conf = float(row.get("confidence") or p_team)
-            margin = p_team - float(probs.get("none", 0.0))
+            margin = p_team - float(probs.get("none", probs.get("unreadable", 0.0)))
             if (min_conf > 0.0 and conf < min_conf - SCORE_EPS) or (
                     min_margin > 0.0 and margin < min_margin - SCORE_EPS):
                 dropped += 1

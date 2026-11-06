@@ -455,3 +455,36 @@ def prob_vote_multiplier(prob, enabled: bool) -> float:
         return 1.0
     p = max(0.0, min(1.0, float(prob)))
     return round(max(0.25, p ** 0.5), 3)
+
+
+# A read at or above this confidence gets the full vote tier and may drive
+# the >= 0.85 lock/confirm paths (co-occlusion resolution, gallery deposit).
+FULL_VOTE_CONF = 0.85
+# Tentative reads vote strictly below a normal read's 0.5 floor tier.
+TENTATIVE_VOTE_CAP = 0.49
+
+
+def is_tentative_read(res) -> bool:
+    """A tentative (low-probability, best-guess) read: team_reader="jev"
+    names the best team when the top option was "unreadable" (see
+    web/jev_reader.map_jev_answers). Weak evidence: it votes, but never locks."""
+    return isinstance(res, dict) and bool(res.get("tentative"))
+
+
+def read_vote_base(res) -> float:
+    """Confidence tier of one read's vote, before the camera source weight and
+    the tracker-prob multiplier: 1.0 at confidence >= 0.85, else 0.5 (the
+    long-standing step rule); a tentative read votes its probability p
+    (capped below 0.5), so it is strictly weaker than any normal read."""
+    conf = float((res or {}).get("confidence") or 0.0)
+    if is_tentative_read(res):
+        return max(0.0, min(conf, TENTATIVE_VOTE_CAP))
+    return 1.0 if conf >= FULL_VOTE_CONF else 0.5
+
+
+def read_can_lock(res, min_conf: float = FULL_VOTE_CONF) -> bool:
+    """True when a read may drive a lock / confirm path gated on ``min_conf``.
+    Tentative reads never can, whatever their confidence."""
+    if is_tentative_read(res):
+        return False
+    return float((res or {}).get("confidence") or 0.0) >= min_conf

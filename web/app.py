@@ -53,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
 from web.job_config import JobConfig
 from web import clef_reader
+from web import jev_reader
 from web import job_config as job_config_registry
 from web.legibility import legibility_score
 from web import reid
@@ -163,7 +164,10 @@ from web.field.identity_confidence import (
     normalize_surface,
     occlusion_blocks_read,
     prob_vote_multiplier,
+    is_tentative_read,
+    read_can_lock,
     read_clock_sec,
+    read_vote_base,
     surface_vote_multiplier,
     tentative_claim_winners,
     vote_ray_cross_m,
@@ -903,8 +907,23 @@ VLM_MODEL_NAME = os.environ.get("VLM_MODEL_NAME", "Qwen/Qwen3-VL-4B-Instruct")
 # weights live in the vLLM process, so job pruning here never reloads them.
 VLM_SERVER_URL = os.environ.get("VLM_SERVER_URL", "http://127.0.0.1:8006/v1")
 # Valid per-job bumper readers. "clef" = Cloudflare Workers AI decision models
-# (web/clef_reader.py): no GPU, vLLM never started, no in-process fallback.
-_TEAM_READERS = ("local", "deepseek", "vllm", "clef")
+# (web/clef_reader.py), "jev" = TypeSafe Jev (web/jev_reader.py): cloud
+# decision-model readers — no GPU, vLLM never started, no in-process fallback.
+_TEAM_READERS = ("local", "deepseek", "vllm", "clef", "jev")
+_CLOUD_READERS = ("clef", "jev")
+
+
+def _read_diag_extras(res: dict) -> dict:
+    """Optional vlm_read diagnostic fields a read result carries: multi-frame
+    clef (clef_frames, clef_same_robot), jev (jev_probs; tentative +
+    runner_up / runner_up_p only on reads that set them). Empty for the other
+    readers, so their rows are unchanged."""
+    out = {k: res[k] for k in ("clef_frames", "clef_same_robot", "jev_probs",
+                               "runner_up", "runner_up_p")
+           if res.get(k) is not None}
+    if res.get("tentative"):
+        out["tentative"] = True
+    return out
 
 # Active served model for the analysis-phase read path's chat payload. Default
 # keeps today's exact behavior (Qwen3-VL-4B on vLLM, no extra payload keys). A
@@ -2438,11 +2457,19 @@ class InferenceJob:
     # ---- team_reader="clef" (Cloudflare Workers AI decision models) ----
 
     def _get_clef_session(self):
-        """This job's Clef session, built on first use from the clef_model knob.
-        getattr defaults keep __new__-built test jobs and legacy configs working."""
+        """This job's cloud-reader session (team_reader="clef": ClefSession from
+        the clef_model knob; "jev": JevSession from jev_model /
+        jev_tentative_min_p), built on first use. getattr defaults keep
+        __new__-built test jobs and legacy configs working."""
         session = getattr(self, "_clef_session", None)
         if session is None:
             cfg = getattr(self, "config", None)
+            if getattr(self, "team_reader", "local") == "jev":
+                session = jev_reader.JevSession(
+                    getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
+                    tentative_min_p=getattr(cfg, "jev_tentative_min_p", None))
+                self._clef_session = session
+                return session
             model = getattr(cfg, "clef_model", None)
             session = clef_reader.ClefSession(
                 model or clef_reader.DEFAULT_MODEL,
@@ -2456,8 +2483,10 @@ class InferenceJob:
         roster (both alliances) and the job's session. Clef offers all six teams
         plus none/other escapes even when a caller passes roster-minus-confirmed
         lists, so a missing true team can't force a wrong roster pick. Empty for
-        every other provider, so vllm/local/deepseek calls are byte-identical."""
-        if provider != "clef":
+        every other provider, so vllm/local/deepseek calls are byte-identical.
+        team_reader="jev" takes the same kwargs (its JevSession rides in
+        ``clef_session``)."""
+        if provider not in _CLOUD_READERS:
             return {}
         return {
             "full_roster": {"red": list(getattr(self, "match_red_teams", None) or []),
@@ -2480,13 +2509,14 @@ class InferenceJob:
             return
         self._clef_warned = True
         reason = session.disabled_reason or "unavailable"
+        name = getattr(session, "name", "clef")
         status = getattr(self, "vlm_status", None)
         if isinstance(status, dict):
-            status["last_error"] = f"clef: {reason}"
+            status["last_error"] = f"{name}: {reason}"
         await self._warn_degraded(
-            "clef",
-            f"Clef bumper reader disabled for this job ({reason}); team-number "
-            "reads are skipped — no local-model fallback.",
+            name,
+            f"{getattr(session, 'label', 'Clef')} bumper reader disabled for this job "
+            f"({reason}); team-number reads are skipped — no local-model fallback.",
         )
 
     # ---- read-trigger telemetry (always on) + per-slot read census ----
@@ -2599,8 +2629,9 @@ class InferenceJob:
             interval = float(getattr(cfg, "read_census_interval_s", 2.0))
             reader = getattr(self, "team_reader", "local")
             rate = f"~{6.0 / interval:.1f} bumper reads/s (6 slots / {interval:g} s)"
-            if reader == "clef":
-                print(f"  [census] read_census ON: {rate} on Clef")
+            if reader in _CLOUD_READERS:
+                print(f"  [census] read_census ON: {rate} on "
+                      f"{'Jev' if reader == 'jev' else 'Clef'}")
             else:
                 print(f"  [census] WARNING read_census ON with team_reader={reader}: "
                       f"{rate} of local GPU VLM time")
@@ -2641,16 +2672,18 @@ class InferenceJob:
             return
         self._clef_usage_done = True
         st = session.stats()
+        # "clef." / "jev." keys (and gauge) by the session's reader name.
+        _n = getattr(session, "name", "clef")
         timings = getattr(self, "timings", None)
         if isinstance(timings, dict):
             # Numeric only: the end-of-job pass rounds every timings value to
             # 2 dp, so cost is kept in cents (full precision in the gauge).
-            timings["clef.requests"] = st["requests"]
-            timings["clef.input_tokens"] = st["input_tokens"]
-            timings["clef.cost_cents"] = st["cost_usd"] * 100.0
-            timings["clef.errors"] = st["errors"]
-            timings["clef.quota_errors"] = st["quota_errors"]
-            timings["clef.latency_p50_s"] = st["latency_p50_s"] or 0.0
+            timings[f"{_n}.requests"] = st["requests"]
+            timings[f"{_n}.input_tokens"] = st["input_tokens"]
+            timings[f"{_n}.cost_cents"] = st["cost_usd"] * 100.0
+            timings[f"{_n}.errors"] = st["errors"]
+            timings[f"{_n}.quota_errors"] = st["quota_errors"]
+            timings[f"{_n}.latency_p50_s"] = st["latency_p50_s"] or 0.0
             if self._clef_mf_enabled():
                 timings["clef.mf_reads"] = st["mf_reads"]
                 timings["clef.mf_images"] = st["mf_images"]
@@ -2660,7 +2693,7 @@ class InferenceJob:
         diags = getattr(self, "identity_diagnostics", None)
         if diags is not None:
             try:
-                diags.gauge("clef_usage", st)
+                diags.gauge(f"{_n}_usage", st)
                 buf = getattr(self, "_crop_buffer", None)
                 if buf is not None:
                     diags.gauge("clef_mf_buffer", {
@@ -2926,8 +2959,8 @@ class InferenceJob:
                 getattr(getattr(self, "config", None), "surface_gate", False)) == 0.0:
             print(f"  VLM vote dropped [printed-surface]: slot {slot_id} += {team}")
             return
-        conf = res.get("confidence", 0.0)
-        weight = (1.0 if conf >= 0.85 else 0.5) * float(source_weight)
+        # Tentative (jev) reads vote p x source weight, below the 0.5 tier.
+        weight = read_vote_base(res) * float(source_weight)
         weight *= prob_vote_multiplier(
             getattr(robot, "last_tracker_prob", None),
             getattr(getattr(self, "config", None), "vote_prob_weight", False))
@@ -3215,12 +3248,11 @@ class InferenceJob:
         else:
             diag_robot_id = identity_id
         conf = float(res.get("confidence", 0.0))
-        vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
+        vote_weight = read_vote_base(res) * source_weight
         vote_weight *= prob_vote_multiplier(
             getattr(robot, "last_tracker_prob", None),
             getattr(getattr(self, "config", None), "vote_prob_weight", False))
-        _mf_diag = {k: res[k] for k in ("clef_frames", "clef_same_robot")
-                    if res.get(k) is not None}
+        _mf_diag = _read_diag_extras(res)
         self.diagnostic.record_vlm_read(
             frame=crop_frame, robot_id=diag_robot_id,
             crop_b64=crop_b64,
@@ -3454,9 +3486,9 @@ class InferenceJob:
 
     async def _run_adjudication(self, batch) -> None:
         crops = [crop for (_i, _s, crop) in batch]
-        if getattr(self, "team_reader", "local") == "clef":
-            # Clef job: no vLLM server exists, so ask the same decision model
-            # (robot / equipment / person / unclear choice question).
+        if getattr(self, "team_reader", "local") in _CLOUD_READERS:
+            # Clef / Jev job: no vLLM server exists, so ask the same decision
+            # model (robot / equipment / person / unclear choice question).
             results = await asyncio.to_thread(
                 _clef_classify_crops, crops, session=self._get_clef_session())
             await self._maybe_warn_clef_unavailable()
@@ -3709,7 +3741,7 @@ class InferenceJob:
             print(f"  VLM failed [{provider}]: {e}")
             self.vlm_status["last_error"] = str(e)
             return
-        if provider == "clef":
+        if provider in _CLOUD_READERS:
             await self._maybe_warn_clef_unavailable()
 
         ocr_crops = []
@@ -3736,7 +3768,8 @@ class InferenceJob:
                 ident = self.identity_registry.identities.get(identity_id)
                 if ident is None:
                     continue
-                usable = bool(res.get("team_number")) and not res.get("error")
+                usable = (bool(res.get("team_number")) and not res.get("error")
+                          and not is_tentative_read(res))
                 if usable and getattr(ident, "is_ambiguous", False):
                     continue
                 self._consume_immediate_request(ident, current_match_time)
@@ -3769,7 +3802,8 @@ class InferenceJob:
             conf = float(res.get("confidence", 0.0))
             self._capture_slot_crop(robot.robot_id, crop_b64, conf, robot.appearance_embedding,
                                     robot_crop_b64=robot.appearance_crop_b64)
-            vote_weight = (1.0 if conf >= 0.85 else 0.5) * source_weight
+            # Confidence tier (tentative jev reads: p, below 0.5) x camera.
+            vote_weight = read_vote_base(res) * source_weight
             vote_weight *= prob_vote_multiplier(
                 getattr(robot, "last_tracker_prob", None),
                 getattr(getattr(self, "config", None), "vote_prob_weight", False))
@@ -3805,9 +3839,9 @@ class InferenceJob:
                              if slot_identity is not None else robot.robot_id)
             # Multi-frame clef reads only: which frames/cams went into the
             # request (newest first; the row's frame/crop are the newest) and
-            # the same_robot probability. Absent otherwise (rows unchanged).
-            _mf_diag = {k: res[k] for k in ("clef_frames", "clef_same_robot")
-                        if res.get(k) is not None}
+            # the same_robot probability; jev reads: jev_probs, tentative,
+            # runner_up. Absent otherwise (rows unchanged).
+            _mf_diag = _read_diag_extras(res)
             # Why this read was attempted (scheduler snapshot; always on).
             _trigger = read_triggers.get(identity_id, TRIGGER_UNSPECIFIED)
             self.diagnostic.record_vlm_read(
@@ -3837,8 +3871,10 @@ class InferenceJob:
             if res.get("error") == clef_reader.INCONSISTENT_ERROR:
                 self._on_tracklet_inconsistent(identity_id, slot_id, res, crop_frame)
 
-            # Update success/backoff based on whether read succeeded
-            if res.get("error") or not team:
+            # Update success/backoff based on whether read succeeded. A
+            # tentative read schedules like a failed one (backoff, no
+            # has_vlm_read / agrees / contradicts): its digits were unreadable.
+            if res.get("error") or not team or is_tentative_read(res):
                 ident.vlm_fail_count += 1
                 ident.backoff_until = current_match_time + read_backoff_sec(
                     self.confidence_config, ident.vlm_fail_count, capped=VLM_READ_CLOCK_FIX)
@@ -3859,7 +3895,7 @@ class InferenceJob:
                     ident.needs_immediate_read = False
 
             if (robot.team_number_confirmed and team == robot.team_number
-                    and conf >= 0.85):
+                    and read_can_lock(res)):
                 self._deposit_to_gallery(robot, legibility=conf,
                                          image_bytes=_thumbnail_bytes(robot.appearance_crop_b64 or crop_b64))
             if not team:
@@ -3923,6 +3959,14 @@ class InferenceJob:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + vote_weight
             vote_total = robot.team_ocr_votes[team]
+            if is_tentative_read(res):
+                # Weak evidence only: the vote above counts, but a tentative
+                # read never unlocks a confirmed label or advances (or resets)
+                # the consecutive-lock run.
+                print(f"  VLM read [{cam}] (tentative p={conf:.2f}): "
+                      f"{self._slot_label(slot_id)} += {team} "
+                      f"(w={vote_weight:.2f}, total={vote_total:.1f})")
+                continue
             self._handle_confirmed_vlm_contradiction(
                 robot, team, conf, res.get("raw_read"), cam
             )
@@ -3965,8 +4009,7 @@ class InferenceJob:
         pass_reads = {}
         for (_priority, source_weight, identity_id, slot_id, cam, crop_b64, *_extra), res in zip(chosen, results):
             team_val = res.get("team_number")
-            conf_val = float(res.get("confidence", 0.0))
-            if team_val and conf_val >= 0.85:
+            if team_val and read_can_lock(res):
                 pass_reads[identity_id] = team_val
 
         for event in list(self.co_occlusion_tracker.get_active_events()):
@@ -4222,11 +4265,12 @@ class InferenceJob:
                 matched_team=res.get("team_number"),
                 alliance_read=res.get("alliance", "unknown"),
                 confidence=float(res.get("confidence", 0.0)),
-                vote_weight=1.0 if float(res.get("confidence", 0.0)) >= 0.85 else 0.5,
+                vote_weight=read_vote_base(res),
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
                 trigger=trigger,
                 subject=res.get("subject"),
+                **_read_diag_extras(res),
             )
             self._count_read_trigger(
                 trigger, crop_frame / (getattr(self, "video_fps", None) or 10.0))
@@ -4247,13 +4291,18 @@ class InferenceJob:
                       f"{self._slot_label(canonical_id)} += {team}")
                 continue
             conf = result.get("confidence", 0.0)
-            weight = 1.0 if conf >= 0.85 else 0.5
+            weight = read_vote_base(result)
             weight *= prob_vote_multiplier(
                 getattr(robot, "last_tracker_prob", None),
                 getattr(getattr(self, "config", None), "vote_prob_weight", False))
             if robot.team_ocr_votes is None:
                 robot.team_ocr_votes = {}
             robot.team_ocr_votes[team] = robot.team_ocr_votes.get(team, 0.0) + weight
+            if is_tentative_read(result):
+                # Weak evidence: vote only, never a lock/unlock (see above).
+                print(f"  Vision read (tentative p={float(conf):.2f}): Robot {canonical_id} "
+                      f"+= {team} (w={weight:.2f})")
+                continue
             self._handle_confirmed_vlm_contradiction(
                 robot, team, float(conf), result.get("raw_read"), "main"
             )
@@ -6973,11 +7022,16 @@ class InferenceJob:
         # team_reader="clef": build this job's Workers AI session up front so
         # missing credentials surface at job start (one log line + UI warning),
         # not at the first read. vLLM is never started for a clef job.
-        if getattr(self, "team_reader", "local") == "clef":
+        if getattr(self, "team_reader", "local") in _CLOUD_READERS:
             _cs = self._get_clef_session()
-            print(f"  [clef] bumper reader: {_cs.model_key} via Cloudflare Workers AI "
-                  f"(concurrency {_cs.concurrency}, min team p {_cs.min_team_prob}); "
-                  "vLLM not used")
+            if _cs.name == "jev":
+                print(f"  [jev] bumper reader: {_cs.model_key} via TypeSafe "
+                      f"(concurrency {_cs.concurrency}, min team p {_cs.min_team_prob}, "
+                      f"tentative p >= {_cs.tentative_min_p:g}); vLLM not used")
+            else:
+                print(f"  [clef] bumper reader: {_cs.model_key} via Cloudflare Workers AI "
+                      f"(concurrency {_cs.concurrency}, min team p {_cs.min_team_prob}); "
+                      "vLLM not used")
             await self._maybe_warn_clef_unavailable()
         # Gate on calibration / loaded event (decision 7). No fallback to the old
         # pixel-space pipeline: if field tracking can't be initialized, end cleanly.
@@ -10538,20 +10592,22 @@ def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
     clef_multiframe): one multi-image request, described by
     ``clef_item_meta[i]`` (see ClefSession.read_bumpers)."""
     print(f"  Team reader [{provider}]: sending {len(robot_crops_b64)} bumper crops")
-    if provider == "clef":
-        # Cloud reader: returns here on every path. It must never fall through
-        # to the in-process Qwen reader below, which would load ~8GB onto the
-        # GPU mid-job (e.g. after the Workers AI quota runs out).
+    if provider in _CLOUD_READERS:
+        # Cloud reader (clef / jev): returns here on every path. It must never
+        # fall through to the in-process Qwen reader below, which would load
+        # ~8GB onto the GPU mid-job (e.g. after the cloud quota runs out).
         try:
             _mf = {} if clef_item_meta is None else {"item_meta": clef_item_meta}
+            if provider == "jev" and clef_session is None:
+                clef_session = _jev_default_session()
             return _clef_read_bumpers(
                 robot_crops_b64, match_teams, blue_teams, red_teams,
                 expected_alliances=expected_alliances,
                 full_roster=full_roster, session=clef_session, **_mf,
             )
         except Exception as e:
-            print(f"  Clef reader failed ({e!r}); reads skipped (no local fallback)")
-            return [clef_reader.error_entry(f"clef: {e}") for _ in robot_crops_b64]
+            print(f"  {provider} reader failed ({e!r}); reads skipped (no local fallback)")
+            return [clef_reader.error_entry(f"{provider}: {e}") for _ in robot_crops_b64]
     if provider == "deepseek":
         return _deepseek_read_bumpers(
             robot_crops_b64, match_teams, blue_teams, red_teams,
@@ -10612,6 +10668,19 @@ def _clef_read_bumpers(robot_crops_b64: list, match_teams: list,
     return session.read_bumpers(robot_crops_b64, red, blue,
                                 expected_alliances=expected_alliances,
                                 extra_teams=extra, **_mf)
+
+
+_jev_default: Optional["jev_reader.JevSession"] = None
+
+
+def _jev_default_session():
+    """Process-wide JevSession for a jev read outside a job (no per-job
+    session passed in) — the jev counterpart of clef_reader.default_session."""
+    global _jev_default
+    if _jev_default is None:
+        _jev_default = jev_reader.JevSession(
+            os.environ.get("JEV_MODEL") or jev_reader.DEFAULT_MODEL)
+    return _jev_default
 
 
 def _clef_classify_crops(crops_b64: list, session=None) -> list:

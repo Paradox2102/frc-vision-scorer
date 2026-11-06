@@ -300,6 +300,114 @@ def _install_multiplex_shims(model: Any) -> None:
     _shim_bound_tracker_memory(model)
 
 
+def _is_multiplex_model(model: Any) -> bool:
+    """True for SAM 3.1 multiplex model classes (their
+    ``_prepare_backbone_feats`` has the same signature but different state
+    layout, so the base-SAM3 skip-detector replacement must never land there)."""
+    return any("multiplex" in cls.__name__.lower()
+               for cls in type(model).__mro__)
+
+
+def install_skip_detector_heads(model: Any) -> bool:
+    """Replace base SAM3's ``_prepare_backbone_feats`` with a backbone-only
+    version (the ``sam3_skip_detector_heads`` knob).
+
+    On the instance-prompt (``propagation_partial``) path, and for every
+    instance add/refine, upstream ``_prepare_backbone_feats`` calls
+    ``run_backbone_and_detection`` and DISCARDS the detections: only
+    ``feature_cache[frame_idx]`` (tracker backbone features) is consumed. The
+    DETR encoder/decoder/seg heads/NMS cost ~33-38 ms/frame. This computes just
+    ``detector.backbone.forward_image`` + the tracker neck convs, matching the
+    upstream cache entry exactly (bf16 cast of the 3 FPN levels as upstream's
+    all-gather does, ``vision_pos_enc`` passed through as the list, previous
+    frame popped). Offline 2026-11-06: byte-identical masks, -36 ms/frame.
+
+    ``propagation_full`` (text/VG propagation) calls
+    ``run_backbone_and_detection`` directly and is untouched.
+
+    Guarded like the multiplex shims: returns False (and logs) without
+    touching the model unless it has the expected shape; idempotent.
+    """
+    import functools
+    import inspect
+
+    if model is None:
+        return False
+    orig = getattr(model, "_prepare_backbone_feats", None)
+    if orig is None:
+        print("  [SAM3] skip_detector_heads: model has no _prepare_backbone_feats "
+              "— not installed")
+        return False
+    if getattr(orig, "_frc_skip_detector_shim", False):
+        return True
+    if _is_multiplex_model(model):
+        print("  [SAM3] skip_detector_heads: multiplex model — not installed")
+        return False
+    detector = getattr(model, "detector", None)
+    backbone = getattr(detector, "backbone", None)
+    decoder = getattr(getattr(model, "tracker", None), "sam_mask_decoder", None)
+    if not callable(getattr(backbone, "forward_image", None)) or decoder is None \
+            or not callable(getattr(decoder, "conv_s0", None)) \
+            or not callable(getattr(decoder, "conv_s1", None)):
+        print("  [SAM3] skip_detector_heads: missing detector.backbone.forward_image "
+              "or tracker.sam_mask_decoder.conv_s0/conv_s1 — not installed")
+        return False
+    try:
+        params = list(inspect.signature(orig).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if params != ["inference_state", "frame_idx", "reverse"]:
+        print(f"  [SAM3] skip_detector_heads: unexpected _prepare_backbone_feats "
+              f"signature {params} — not installed")
+        return False
+
+    import torch
+
+    fallback_logged = [False]
+
+    @functools.wraps(orig)
+    def _prepare_backbone_feats(inference_state, frame_idx, reverse, _orig=orig):
+        input_batch = inference_state["input_batch"]
+        feature_cache = inference_state["feature_cache"]
+        if frame_idx in feature_cache:
+            return
+        img = input_batch.img_batch[frame_idx]
+        image = img.unsqueeze(0).to(dtype=torch.float32, device=model.device)
+        bb = model.detector.backbone.forward_image(image)
+        sam2_out = bb.get("sam2_backbone_out") if isinstance(bb, dict) else None
+        if not isinstance(sam2_out, dict) or "backbone_fpn" not in sam2_out \
+                or "vision_pos_enc" not in sam2_out:
+            # Unknown backbone layout: never break tracking, run upstream.
+            if not fallback_logged[0]:
+                fallback_logged[0] = True
+                keys = list(bb) if isinstance(bb, dict) else type(bb).__name__
+                print(f"  [SAM3] skip_detector_heads: unexpected backbone output "
+                      f"{keys} — falling back to the full detector path")
+            return _orig(inference_state, frame_idx, reverse)
+        # Upstream casts these to bf16 for its all-gather; keep parity.
+        fpn = [x.to(torch.bfloat16) for x in sam2_out["backbone_fpn"]]
+        sam_mask_decoder = model.tracker.sam_mask_decoder
+        tracker_backbone_fpn = [
+            sam_mask_decoder.conv_s0(fpn[0]),
+            sam_mask_decoder.conv_s1(fpn[1]),
+            fpn[2],  # fpn_2 doesn't need conv (upstream)
+        ]
+        feature_cache[frame_idx] = (
+            input_batch.img_batch[frame_idx],
+            {"tracker_backbone_out": {
+                "vision_features": tracker_backbone_fpn[-1],
+                "vision_pos_enc": sam2_out["vision_pos_enc"],
+                "backbone_fpn": tracker_backbone_fpn,
+            }},
+        )
+        # remove old features to save GPU memory (upstream)
+        feature_cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+
+    _prepare_backbone_feats._frc_skip_detector_shim = True
+    model._prepare_backbone_feats = _prepare_backbone_feats
+    return True
+
+
 def _list_frame_paths(frames_dir: str) -> list[str]:
     names = [n for n in sorted(os.listdir(frames_dir))
              if n.lower().endswith((".jpg", ".jpeg", ".png"))]
@@ -333,6 +441,12 @@ class Sam3PredictorAdapter:
     def __init__(self, predictor: Any, chunk_frames: int = SAM3_CHUNK_FRAMES) -> None:
         self._predictor = predictor
         self._chunk_frames = max(int(chunk_frames), 16)
+        # remove_object: send the session-level ``remove_object`` request
+        # (True) or do adapter bookkeeping only (False). Sam3FieldTracker sets
+        # False for the SAM 3.1 multiplex predictor, whose
+        # remove_objects._slice_state can KeyError on the memory the
+        # _shim_bound_tracker_memory trim leaves behind.
+        self.session_remove = True
 
     # ── SAM2-protocol surface ────────────────────────────────────────
 
@@ -432,6 +546,70 @@ class Sam3PredictorAdapter:
                 )
                 return  # _stream_chunk recurses across remaining chunks
         # zero-length range: nothing to do
+
+    def remove_object(self, state: dict, obj_id: int) -> None:
+        """Retire ``obj_id`` (a culled/evicted track) from SAM3 entirely.
+
+        Without this a culled hijack keeps being re-anchored every window and
+        re-seeded at every chunk boundary (its mask stays non-empty), so SAM3
+        tracks it forever at ~26-42 ms/frame while the tracker just filters
+        its outputs. Bookkeeping: drop it from ``last_box`` (no more
+        re-anchor/re-seed), ``pending``, the live chunk's ``prompted`` set and
+        ``solo_ids``. Session: send upstream ``remove_object`` when the id is
+        live in the current chunk session (survivors' masks are unchanged —
+        offline 2026-11-06, byte-identical).
+
+        Upstream records the removal as a ``remove`` action, which
+        ``parse_action_history_for_propagation`` treats as a no-op: the next
+        propagate still runs ``propagation_partial`` over whatever was
+        added/refined since the last propagate (the per-window re-anchor of
+        survivors), or ``propagation_fetch`` when nothing was — the same
+        outcome as today's all-stale window. A failed removal degrades to
+        bookkeeping-only; it must never kill the view.
+        """
+        oid = int(obj_id)
+        state["last_box"].pop(oid, None)
+        state["pending"] = [p for p in state["pending"] if int(p[1]) != oid]
+        solo = state.get("solo_ids")
+        if isinstance(solo, set):
+            solo.discard(oid)
+        chunk = state.get("chunk")
+        if not chunk:
+            return
+        chunk["prompted"].discard(oid)
+        if not self.session_remove:
+            return
+        sid = chunk["session_id"]
+        in_session = self._session_has_object(sid, oid)
+        if in_session is False:
+            return
+        try:
+            self._predictor.handle_request(
+                {"type": "remove_object", "session_id": sid, "obj_id": oid}
+            )
+            chunk["retired"] = chunk.get("retired", 0) + 1
+        except Exception as exc:
+            print(f"  [SAM3] remove_object failed for obj {oid} in chunk "
+                  f"[{chunk['lo']},{chunk['hi']}) — bookkeeping-only retire: "
+                  f"{exc!r}")
+
+    def _session_has_object(self, session_id: str, obj_id: int) -> bool | None:
+        """Whether the chunk session tracks ``obj_id`` (upstream
+        ``remove_object`` asserts it does). None when the predictor exposes
+        no session introspection (stubs) — the caller then just tries."""
+        get_session = getattr(self._predictor, "_get_session", None)
+        if get_session is None:
+            return None
+        try:
+            sess_state = get_session(session_id)["state"]
+            per_gpu = (sess_state.get("tracker_metadata") or {}).get(
+                "obj_ids_per_gpu")
+            if per_gpu is None:
+                return False  # metadata uninitialized: nothing added yet
+            return any(int(obj_id) in {int(x) for x in np.asarray(ids).reshape(-1)}
+                       for ids in per_gpu)
+        except Exception:
+            return None
 
     def reset_state(self, state: dict) -> None:
         if state.get("closed"):
@@ -563,6 +741,9 @@ class Sam3PredictorAdapter:
             # flat, the growth is intra-chunk (prompt accumulation).
             refused = int(chunk.get("refused", 0) or 0)
             refused_note = f" refused_prompts={refused}" if refused else ""
+            retired = int(chunk.get("retired", 0) or 0)
+            if retired:
+                refused_note += f" retired_objects={retired}"
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -571,7 +752,7 @@ class Sam3PredictorAdapter:
                     print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']}) "
                           f"VRAM allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB"
                           f"{refused_note}")
-                elif refused:
+                elif refused_note:
                     print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']})"
                           f"{refused_note}")
             except Exception:
@@ -706,6 +887,8 @@ class Sam3FieldTracker(Sam2FieldTracker):
         use_fa3: bool = True,  # accepted for call-site compat; multiplex-only
         chunk_frames: int | None = None,
         multiplex: bool = SAM3_MULTIPLEX,
+        skip_detector_heads: bool = False,
+        retire_culled: bool = False,
     ) -> None:
         if device != "cuda":
             raise RuntimeError("SAM 3 video model currently requires CUDA")
@@ -757,14 +940,41 @@ class Sam3FieldTracker(Sam2FieldTracker):
                         int(max_objects),
                     )
 
+        # sam3_skip_detector_heads: base SAM3 only (never the multiplex model;
+        # install_skip_detector_heads also refuses multiplex classes itself).
+        self.skip_detector_heads_active = False
+        if skip_detector_heads and not multiplex:
+            self.skip_detector_heads_active = install_skip_detector_heads(
+                getattr(predictor, "model", None))
+            if self.skip_detector_heads_active:
+                print("  [SAM3] skip_detector_heads: partial-path detector heads "
+                      "disabled (backbone + tracker neck only)")
+
+        adapter = Sam3PredictorAdapter(
+            predictor,
+            chunk_frames=chunk_frames if chunk_frames else SAM3_CHUNK_FRAMES,
+        )
+        # Multiplex remove_objects can KeyError on trimmed memory: retire by
+        # adapter bookkeeping only there.
+        adapter.session_remove = not multiplex
+        self.retire_culled = bool(retire_culled)
+
         super().__init__(
-            predictor=Sam3PredictorAdapter(
-                predictor,
-                chunk_frames=chunk_frames if chunk_frames else SAM3_CHUNK_FRAMES,
-            ),
+            predictor=adapter,
             device=device,
             offload_video_to_cpu=offload_video_to_cpu,
             offload_state_to_cpu=offload_state_to_cpu,
         )
         # The adapter returns real torch tensors and benefits from inference mode.
         self._real_torch = True
+
+    def _retire_object(self, state: Any, oid: int) -> None:
+        """sam3_retire_culled: drop a culled/evicted id from the SAM3 session
+        so it stops costing propagation (base-class hook, no-op unless the
+        knob is on)."""
+        if not self.retire_culled:
+            return
+        try:
+            self._predictor.remove_object(state, oid)
+        except Exception as exc:  # never let a retire kill the view
+            print(f"  [SAM3] retire of obj {int(oid)} failed: {exc!r}")

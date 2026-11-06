@@ -991,3 +991,465 @@ def test_solo_ids_scopes_open_chunk_for_boundary_reseed(tmp_path):
     assert {p["obj_id"] for p in prompts} == {3}, (
         "solo_ids must exclude obj 7 from the boundary re-seed")
     adapter.reset_state(state)
+
+
+# ---------------------------------------------------------------------------
+# sam3_skip_detector_heads: backbone-only _prepare_backbone_feats
+# ---------------------------------------------------------------------------
+
+def _ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
+
+class _SkipModel:
+    """Minimal base-SAM3 model shape for install_skip_detector_heads."""
+
+    device = "cpu"
+
+    def __init__(self, *, conv_s1=True, backbone_out=None):
+        import torch
+
+        self.orig_calls = []
+        self.forward_calls = 0
+        self._fpn = [torch.full((1, 2, 4, 4), float(i + 1)) for i in range(3)]
+        self._pos = [torch.zeros(1, 2, 4, 4) for _ in range(3)]
+        self._backbone_out = backbone_out
+
+        def forward_image(image):
+            self.forward_calls += 1
+            assert image.dtype == torch.float32 and image.shape[0] == 1
+            if self._backbone_out is not None:
+                return self._backbone_out
+            return {"sam2_backbone_out": {"backbone_fpn": list(self._fpn),
+                                          "vision_pos_enc": self._pos}}
+
+        decoder = _ns(conv_s0=lambda x: x * 2)
+        if conv_s1:
+            decoder.conv_s1 = lambda x: x * 3
+        self.detector = _ns(backbone=_ns(forward_image=forward_image))
+        self.tracker = _ns(sam_mask_decoder=decoder)
+
+    def _prepare_backbone_feats(self, inference_state, frame_idx, reverse):
+        self.orig_calls.append((frame_idx, reverse))
+
+
+def _skip_state(n=4):
+    import torch
+    return {"input_batch": _ns(img_batch=torch.zeros(n, 3, 4, 4)),
+            "feature_cache": {}}
+
+
+def test_skip_detector_heads_install_matches_upstream_cache_entry():
+    import torch
+    from web.field.sam3_tracker import install_skip_detector_heads
+
+    model = _SkipModel()
+    assert install_skip_detector_heads(model) is True
+    st = _skip_state()
+    st["feature_cache"][0] = "prev"
+    st["feature_cache"]["text"] = "keep"
+    model._prepare_backbone_feats(st, 1, False)
+
+    assert model.orig_calls == [], "detector path must not run"
+    img, cache = st["feature_cache"][1]
+    ref = st["input_batch"].img_batch[1]
+    assert img.data_ptr() == ref.data_ptr() and img.shape == ref.shape
+    out = cache["tracker_backbone_out"]
+    fpn = out["backbone_fpn"]
+    assert [t.dtype for t in fpn] == [torch.bfloat16] * 3
+    assert torch.equal(fpn[0], (model._fpn[0].to(torch.bfloat16)) * 2)  # conv_s0
+    assert torch.equal(fpn[1], (model._fpn[1].to(torch.bfloat16)) * 3)  # conv_s1
+    assert torch.equal(fpn[2], model._fpn[2].to(torch.bfloat16))        # no conv
+    assert out["vision_features"] is fpn[-1]
+    assert out["vision_pos_enc"] is model._pos  # the list, passed through
+    assert 0 not in st["feature_cache"], "previous frame must be popped"
+    assert st["feature_cache"]["text"] == "keep"
+
+    # reverse pops the NEXT frame
+    st["feature_cache"][3] = "next"
+    model._prepare_backbone_feats(st, 2, True)
+    assert 3 not in st["feature_cache"] and 2 in st["feature_cache"]
+
+    # already-cached frame: early return, no backbone call
+    n = model.forward_calls
+    model._prepare_backbone_feats(st, 2, False)
+    assert model.forward_calls == n
+
+    # idempotent
+    fn = model._prepare_backbone_feats
+    assert install_skip_detector_heads(model) is True
+    assert model._prepare_backbone_feats is fn
+
+
+def test_skip_detector_heads_falls_back_on_unknown_backbone_layout(capsys):
+    from web.field.sam3_tracker import install_skip_detector_heads
+
+    model = _SkipModel(backbone_out={"vision_features": None})
+    assert install_skip_detector_heads(model)
+    model._prepare_backbone_feats(_skip_state(), 1, False)
+    model._prepare_backbone_feats(_skip_state(), 2, False)
+    assert model.orig_calls == [(1, False), (2, False)]
+    assert capsys.readouterr().out.count("falling back") == 1
+
+
+def test_skip_detector_heads_refuses_mismatched_models():
+    from web.field.sam3_tracker import install_skip_detector_heads
+
+    assert install_skip_detector_heads(None) is False
+
+    no_conv = _SkipModel(conv_s1=False)
+    orig = no_conv._prepare_backbone_feats
+    assert install_skip_detector_heads(no_conv) is False
+    assert no_conv._prepare_backbone_feats == orig
+
+    class _BadSig(_SkipModel):
+        def _prepare_backbone_feats(self, inference_state, frame_idx):
+            pass
+
+    bad = _BadSig()
+    assert install_skip_detector_heads(bad) is False
+    assert not getattr(bad._prepare_backbone_feats, "_frc_skip_detector_shim", False)
+
+    class Sam3MultiplexTrackingWithInteractivity(_SkipModel):
+        pass
+
+    mux = Sam3MultiplexTrackingWithInteractivity()
+    assert install_skip_detector_heads(mux) is False
+    assert not getattr(mux._prepare_backbone_feats, "_frc_skip_detector_shim", False)
+
+    no_method = _ns(detector=_SkipModel().detector, tracker=_SkipModel().tracker)
+    assert install_skip_detector_heads(no_method) is False
+
+
+def _patch_builders_with_model(monkeypatch):
+    import sam3.model_builder as model_builder
+
+    built = {}
+
+    def fake_video(**kwargs):
+        built["video"] = _ns(model=_SkipModel())
+        return built["video"]
+
+    def fake_mux(**kwargs):
+        built["mux"] = _ns(model=_SkipModel())
+        return built["mux"]
+
+    monkeypatch.setattr(model_builder, "build_sam3_video_predictor", fake_video)
+    monkeypatch.setattr(model_builder, "build_sam3_predictor", fake_mux)
+    return built
+
+
+def test_sam3_tracker_skip_detector_heads_default_off(monkeypatch):
+    built = _patch_builders_with_model(monkeypatch)
+    tracker = Sam3FieldTracker(checkpoint="ckpt.pt")
+    assert tracker.skip_detector_heads_active is False
+    assert not getattr(built["video"].model._prepare_backbone_feats,
+                       "_frc_skip_detector_shim", False)
+    assert tracker.retire_culled is False
+    assert tracker._predictor.session_remove is True
+
+
+def test_sam3_tracker_skip_detector_heads_installs_on_base_only(monkeypatch):
+    built = _patch_builders_with_model(monkeypatch)
+    tracker = Sam3FieldTracker(checkpoint="ckpt.pt", skip_detector_heads=True)
+    assert tracker.skip_detector_heads_active is True
+    assert getattr(built["video"].model._prepare_backbone_feats,
+                   "_frc_skip_detector_shim", False)
+
+    mux = Sam3FieldTracker(checkpoint="ckpt.pt", skip_detector_heads=True,
+                           multiplex=True, retire_culled=True)
+    assert mux.skip_detector_heads_active is False
+    assert not getattr(built["mux"].model._prepare_backbone_feats,
+                       "_frc_skip_detector_shim", False)
+    # multiplex: retire is adapter bookkeeping only
+    assert mux._predictor.session_remove is False
+
+
+# ---------------------------------------------------------------------------
+# sam3_retire_culled: Sam3PredictorAdapter.remove_object + track() hook
+# ---------------------------------------------------------------------------
+
+class RemoveStubPredictor(ActionHistoryStubPredictor):
+    """ActionHistoryStubPredictor + upstream-like session introspection and
+    remove_object (asserts the object exists, like base SAM3)."""
+
+    def __init__(self, fail_remove=False):
+        super().__init__()
+        self.fail_remove = fail_remove
+
+    def _get_session(self, sid):
+        sess = self._sessions[sid]
+        ids = sorted(sess.setdefault("known", set()))
+        return {"state": {"tracker_metadata": {
+            "obj_ids_per_gpu": [np.array(ids, dtype=np.int64)]}}}
+
+    def handle_request(self, request):
+        if request["type"] == "add_prompt":
+            self._sessions[request["session_id"]].setdefault(
+                "known", set()).add(request["obj_id"])
+        if request["type"] == "remove_object":
+            self.requests.append(request)
+            if self.fail_remove:
+                raise RuntimeError("boom")
+            sess = self._sessions[request["session_id"]]
+            assert request["obj_id"] in sess.get("known", set())
+            sess["known"].discard(request["obj_id"])
+            sess["prompted_since"].discard(request["obj_id"])
+            return {"is_success": True}
+        return super().handle_request(request)
+
+    def handle_stream_request(self, request):
+        sess = self._sessions[request["session_id"]]
+        sess["prompted_since"] &= sess.get("known", set())
+        yield from super().handle_stream_request(request)
+
+
+def _two_object_adapter(tmp_path, raw):
+    _write_frames(tmp_path, 24)
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=64)
+    state = adapter.init_state(video_path=str(tmp_path))
+    for oid, box in ((1, [1, 1, 5, 5]), (2, [4, 2, 9, 6])):
+        adapter.add_new_points_or_box(
+            state, frame_idx=0, obj_id=oid, box=np.array(box, np.float32))
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=7))
+    return adapter, state
+
+
+def test_remove_object_bookkeeping_and_session_request(tmp_path):
+    raw = RemoveStubPredictor()
+    adapter, state = _two_object_adapter(tmp_path, raw)
+    sid = state["chunk"]["session_id"]
+    state["pending"].append((40, 2, (1.0, 1.0, 2.0, 2.0), []))
+    state["pending"].append((40, 1, (1.0, 1.0, 2.0, 2.0), []))
+    state["chunk"]["prompted"].add(2)
+    state["solo_ids"] = {1, 2}
+
+    raw.requests.clear()
+    adapter.remove_object(state, 2)
+
+    assert raw.requests == [{"type": "remove_object", "session_id": sid,
+                             "obj_id": 2}]
+    assert 2 not in state["last_box"] and 1 in state["last_box"]
+    assert [p[1] for p in state["pending"]] == [1]
+    assert 2 not in state["chunk"]["prompted"]
+    assert state["solo_ids"] == {1}
+    state["solo_ids"] = None
+
+    # next window: only the survivor is re-anchored and keeps emitting
+    raw.requests.clear()
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=8,
+                                         max_frame_num_to_track=7))
+    prompts = [r for r in raw.requests if r["type"] == "add_prompt"]
+    assert {p["obj_id"] for p in prompts} == {1}
+    assert w2 and all(set(ids.tolist()) == {1} for _, ids, *_ in w2)
+
+    # idempotent: second retire of the same id sends nothing (not in session)
+    raw.requests.clear()
+    adapter.remove_object(state, 2)
+    assert raw.requests == []
+    adapter.reset_state(state)
+
+
+def test_remove_last_object_then_propagate_does_not_crash(tmp_path):
+    raw = RemoveStubPredictor()
+    adapter, state = _two_object_adapter(tmp_path, raw)
+    adapter.remove_object(state, 1)
+    adapter.remove_object(state, 2)
+    assert state["last_box"] == {}
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=8,
+                                         max_frame_num_to_track=3))
+    assert all(len(ids) == 0 for _, ids, *_ in w2)
+    adapter.reset_state(state)
+
+
+def test_remove_object_skips_session_call_for_unknown_id(tmp_path):
+    raw = RemoveStubPredictor()
+    adapter, state = _two_object_adapter(tmp_path, raw)
+    state["last_box"][9] = (5, (1.0, 1.0, 3.0, 3.0))  # never in the session
+    raw.requests.clear()
+    adapter.remove_object(state, 9)
+    assert raw.requests == []
+    assert 9 not in state["last_box"]
+    adapter.reset_state(state)
+
+
+def test_remove_object_without_chunk_is_bookkeeping_only(tmp_path):
+    _write_frames(tmp_path, 4)
+    raw = RemoveStubPredictor()
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=16)
+    state = adapter.init_state(video_path=str(tmp_path))
+    adapter.add_new_points_or_box(
+        state, frame_idx=2, obj_id=4, box=np.array([1, 1, 5, 5], np.float32))
+    assert state["chunk"] is None and state["pending"]
+    adapter.remove_object(state, 4)
+    assert state["pending"] == [] and state["last_box"] == {}
+    assert raw.requests == []
+
+
+def test_remove_object_multiplex_is_bookkeeping_only(tmp_path):
+    raw = RemoveStubPredictor()
+    adapter, state = _two_object_adapter(tmp_path, raw)
+    adapter.session_remove = False
+    raw.requests.clear()
+    adapter.remove_object(state, 2)
+    assert raw.requests == []
+    assert 2 not in state["last_box"]
+    adapter.reset_state(state)
+
+
+def test_remove_object_tolerates_session_failure(tmp_path, capsys):
+    raw = RemoveStubPredictor(fail_remove=True)
+    adapter, state = _two_object_adapter(tmp_path, raw)
+    adapter.remove_object(state, 2)  # must not raise
+    assert 2 not in state["last_box"]
+    assert "bookkeeping-only retire" in capsys.readouterr().out
+    # the view keeps going
+    w2 = list(adapter.propagate_in_video(state, start_frame_idx=8,
+                                         max_frame_num_to_track=3))
+    assert w2
+    adapter.reset_state(state)
+
+
+def test_remove_object_without_session_introspection_tries_request(tmp_path):
+    """Predictors without _get_session (stubs) get the request; a failure is
+    swallowed like any other."""
+    _write_frames(tmp_path, 4)
+    raw = StubSam3Predictor()
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=16)
+    state = adapter.init_state(video_path=str(tmp_path))
+    adapter.add_new_points_or_box(
+        state, frame_idx=0, obj_id=3, box=np.array([1, 1, 5, 5], np.float32))
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=2))
+    adapter.remove_object(state, 3)  # StubSam3Predictor raises on it
+    assert raw.requests[-1]["type"] == "remove_object"
+    assert 3 not in state["last_box"]
+    adapter.reset_state(state)
+
+
+def _retire_tracker(retire_culled):
+    """Sam3FieldTracker whose adapter is swapped for a SAM2-protocol cull stub
+    that records remove_object calls (the hook's only contract)."""
+    from tests.field.test_sam2_tracker import CullStubPredictor
+
+    class _RecordingCullStub(CullStubPredictor):
+        def __init__(self):
+            super().__init__()
+            self.removed = []
+
+        def remove_object(self, state, oid):
+            self.removed.append(int(oid))
+
+    tracker = Sam3FieldTracker(predictor=StubSam3Predictor(),
+                               retire_culled=retire_culled)
+    stub = _RecordingCullStub()
+    tracker._predictor = stub
+    tracker._real_torch = False
+    return tracker, stub
+
+
+def _culled(diag):
+    return {(e["details"]["object_id"], e.get("reason"))
+            for e in diag._events if e.get("event") == "sam3.object_culled"}
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_retire_hook_fires_on_absent_stationary_cull_only_when_on(retire):
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import bottom_center
+
+    tracker, stub = _retire_tracker(retire)
+    diag = IdentityDiagnosticRecorder()
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [(stub._rect_for(1), "blue")],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_corrob_ios=0.3, cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert (2, "detector_absent_stationary") in _culled(diag)
+    assert stub.removed == ([2] if retire else [])
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_retire_hook_fires_on_eviction_only_when_on(retire):
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import bottom_center
+
+    tracker, stub = _retire_tracker(retire)
+    diag = IdentityDiagnosticRecorder()
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [(stub._rect_for(1), "blue"),
+                               (stub._rect_for(15), "red")],
+        object_metadata={1: "blue", 2: "red"},
+        max_active_objects=2, max_lifetime_objects=20, cull_enabled=False,
+        cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    culled = _culled(diag)
+    assert (2, "evicted_for_new_detection") in culled
+    # every eviction (2, then the seeded 3 later) is retired, each once
+    expected = sorted(oid for oid, _r in culled)
+    assert sorted(stub.removed) == (expected if retire else [])
+    assert 2 in expected
+
+
+@pytest.mark.parametrize("retire", [False, True])
+def test_retire_hook_fires_on_person_veto_only_when_on(retire):
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    from web.field.sam2_tracker import bottom_center
+
+    tracker, stub = _retire_tracker(retire)
+    diag = IdentityDiagnosticRecorder()
+    tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [(stub._rect_for(1), "blue")],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=False,
+        person_fn=lambda idx, path: [(18.0, 0.0, 26.0, 8.0)],
+        project_fn=lambda box: bottom_center(box), diagnostics=diag,
+    )
+    assert (2, "person_overlap") in _culled(diag)
+    assert stub.removed == ([2] if retire else [])
+
+
+def test_retire_hook_failure_does_not_kill_track(capsys):
+    from web.field.sam2_tracker import bottom_center
+
+    tracker, stub = _retire_tracker(True)
+
+    def boom(state, oid):
+        raise RuntimeError("remove exploded")
+
+    stub.remove_object = boom
+    result = tracker.track(
+        frames_dir="ignored_by_stub", prompt_idx=0,
+        prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
+        reprompt_every=2,
+        detect_fn=lambda *_a: [(stub._rect_for(1), "blue")],
+        object_metadata={1: "blue", 2: "red"}, max_active_objects=6,
+        cull_enabled=True, cull_uncorroborated_reprompts=3, cull_evidence_window=5,
+        cull_corrob_ios=0.3, cull_stationary_m=0.5,
+        project_fn=lambda box: bottom_center(box),
+    )
+    assert 1 in result[stub.NUM_FRAMES - 1]
+    assert 2 not in result[stub.NUM_FRAMES - 1]
+    assert "retire of obj 2 failed" in capsys.readouterr().out
+
+
+def test_sam2_retire_hook_is_noop():
+    from web.field.sam2_tracker import Sam2FieldTracker
+
+    tracker = Sam2FieldTracker(predictor=object())
+    assert tracker._retire_object({}, 3) is None

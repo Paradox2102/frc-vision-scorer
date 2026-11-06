@@ -163,6 +163,24 @@ KNOBS = [
     # fallback). Post-shim A/B: docs/default-on-ab-2026-07-20.md.
     Knob("sam3_multiplex", "SAM3_MULTIPLEX", bool, False,
          section="Tracking backend"),
+    # Base SAM3 only (ignored under sam3_multiplex): on the instance-prompt
+    # propagation_partial path, upstream _prepare_backbone_feats runs the full
+    # detector (DETR encoder/decoder/seg heads/NMS, ~33-38 ms/frame) and
+    # discards the detections; only the tracker backbone features are used.
+    # ON computes backbone + tracker neck only. Offline 2026-11-06 (qm11 v_main,
+    # 9 objs): byte-identical masks, -36 ms/frame
+    # (docs/sam3-per-frame-profile-2026-11-06.md). DEFAULT OFF pending live A/B.
+    Knob("sam3_skip_detector_heads", "SAM3_SKIP_DETECTOR_HEADS", bool, False,
+         section="Tracking backend"),
+    # Retire culled/evicted tracks from the SAM3 session (remove_object)
+    # instead of only filtering their outputs. Today a culled hijack keeps its
+    # last_box fresh, so the adapter re-anchors it every window and re-seeds
+    # it at every chunk boundary: tracked forever at ~42 ms/frame. Offline
+    # 2026-11-06: -~42 ms/frame per retired object, survivors' masks
+    # byte-identical. Bookkeeping-only under sam3_multiplex. DEFAULT OFF
+    # pending live A/B.
+    Knob("sam3_retire_culled", "SAM3_RETIRE_CULLED", bool, False,
+         section="Tracking backend"),
     # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
     # skip full-frame mask propagation for a tracked object while its match is
     # comfortably inside selective_margin_entry (in 1 - expanded-IoU cost

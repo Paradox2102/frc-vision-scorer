@@ -8624,12 +8624,17 @@ class InferenceJob:
                                 use_fa3=SAM3_USE_FA3,
                                 chunk_frames=self.config.sam3_chunk_frames,
                                 multiplex=self.config.sam3_multiplex,
+                                skip_detector_heads=self.config.sam3_skip_detector_heads,
+                                retire_culled=self.config.sam3_retire_culled,
                             )
                             detail = (
                                 f"video model w/ instance prompts, "
                                 f"chunk={self.config.sam3_chunk_frames} frames, "
                                 f"compile={self.config.sam3_compile}, "
-                                f"multiplex={self.config.sam3_multiplex}"
+                                f"multiplex={self.config.sam3_multiplex}, "
+                                f"skip_detector_heads={self.config.sam3_skip_detector_heads}"
+                                f"(active={tracker.skip_detector_heads_active}), "
+                                f"retire_culled={self.config.sam3_retire_culled}"
                             )
                         else:
                             from web.field.sam2_tracker import Sam2FieldTracker

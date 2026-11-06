@@ -1101,6 +1101,14 @@ class Sam2FieldTracker:
             self._device = device
             self._real_torch = True
 
+    def _retire_object(self, state, oid: int) -> None:
+        """Hook called by :meth:`track` right after ``oid`` joins
+        ``culled_set`` (cull, size-prior cull, person veto, eviction). No-op
+        for SAM2: culled ids are only filtered from outputs. Sam3FieldTracker
+        overrides it (``sam3_retire_culled``) to drop the id from the SAM3
+        session so it stops costing propagation."""
+        return None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -1990,6 +1998,7 @@ class Sam2FieldTracker:
                                     and absent_enough(hist, cull_uncorroborated_reprompts)
                                     and is_stationary(win, cull_stationary_m)):
                                 culled_set.add(oid)
+                                self._retire_object(state, oid)
                                 if diagnostics:
                                     # Uncapped counter so the cull count survives
                                     # event-list truncation (max_events) over a full
@@ -2028,6 +2037,7 @@ class Sam2FieldTracker:
                                     and len(svh) == size_prior_boundaries
                                     and all(svh)):
                                 culled_set.add(oid)
+                                self._retire_object(state, oid)
                                 if diagnostics:
                                     diagnostics.increment(f"{self.DIAG_PREFIX}_objects_culled")
                                     diagnostics.record(
@@ -2100,6 +2110,8 @@ class Sam2FieldTracker:
                                     )
                         if veto_culled:
                             culled_set |= veto_culled
+                            for o in sorted(veto_culled):
+                                self._retire_object(state, o)
                             active_objects = [
                                 o for o in active_objects if o not in veto_culled]
                             for o in veto_culled:
@@ -2479,6 +2491,7 @@ class Sam2FieldTracker:
                                 )
                                 if victim is not None:
                                     culled_set.add(victim)
+                                    self._retire_object(state, victim)
                                     existing.pop(victim, None)
                                     existing_colors.pop(victim, None)
                                     roster_capped = False

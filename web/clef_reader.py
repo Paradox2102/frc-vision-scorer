@@ -515,7 +515,21 @@ class ClefSession:
 
     One session per job (built at job start for team_reader="clef"); every
     read and classify of that job goes through it, so a latch set by the first
-    quota-exhausted response stops all later HTTP for the job."""
+    quota-exhausted response stops all later HTTP for the job.
+
+    The transport is pluggable for other "System One" decision-model APIs
+    (web/jev_reader.py JevSession): a subclass overrides the class
+    attributes below and the ``_configure`` / ``_url`` / ``_headers`` /
+    ``_prep_image`` / ``_options`` / ``_read_payload`` / ``_classify_payload``
+    / ``_unwrap`` / ``_map_read`` / ``_estimate_tokens`` / ``_is_quota``
+    hooks; retries, the latch, concurrency and accounting are shared."""
+
+    # Log/error prefix + timings key prefix, the UI label, and the vendor
+    # named in latch messages; ``auth_hint`` is what to check on 401/403.
+    name = "clef"
+    label = "Clef"
+    vendor = "Workers AI"
+    auth_hint = "CLOUDFLARE_API_TOKEN / Workers AI permission"
 
     def __init__(self, model_key: str = DEFAULT_MODEL, *,
                  account: Optional[str] = None, token: Optional[str] = None,
@@ -525,12 +539,7 @@ class ClefSession:
                  same_robot_min: Optional[float] = None,
                  sleep_fn: Optional[Callable[[float], None]] = None,
                  log_fn: Optional[Callable[[str], None]] = None):
-        if model_key not in CLEF_MODELS:
-            raise ValueError(f"unknown clef model {model_key!r}; valid: {sorted(CLEF_MODELS)}")
-        self.model_key = model_key
-        self.spec = CLEF_MODELS[model_key]
-        self._account = account if account is not None else os.environ.get(CF_ENV_KEYS[0], "")
-        self._token = token if token is not None else os.environ.get(CF_ENV_KEYS[1], "")
+        self._configure(model_key, account, token)
         self.concurrency = max(1, concurrency if concurrency is not None
                                else _env_int("CLEF_CONCURRENCY", 8))
         self.timeout_s = timeout_s if timeout_s is not None else _env_float("CLEF_TIMEOUT_S", 15.0)
@@ -554,10 +563,54 @@ class ClefSession:
                    "auth_errors": 0, "retries": 0, "skipped": 0,
                    "mf_reads": 0, "mf_images": 0, "inconsistent": 0}
         self._latencies: list[float] = []
-        missing = [n for n, v in zip(CF_ENV_KEYS, (self._account, self._token)) if not v]
+        missing = self._missing_credentials()
         if missing:
             self._latch("credentials", f"{' / '.join(missing)} not set",
-                        f"[clef] {' / '.join(missing)} not set — reads disabled for this job")
+                        f"[{self.name}] {' / '.join(missing)} not set — reads disabled "
+                        "for this job")
+
+    # ---- transport hooks (overridden by other System One APIs) ----
+    def _configure(self, model_key: str, account: Optional[str], token: Optional[str]) -> None:
+        """Validate the model key and pick up credentials (env when None)."""
+        if model_key not in CLEF_MODELS:
+            raise ValueError(f"unknown clef model {model_key!r}; valid: {sorted(CLEF_MODELS)}")
+        self.model_key = model_key
+        self.spec = CLEF_MODELS[model_key]
+        self._account = account if account is not None else os.environ.get(CF_ENV_KEYS[0], "")
+        self._token = token if token is not None else os.environ.get(CF_ENV_KEYS[1], "")
+
+    def _missing_credentials(self) -> list:
+        return [n for n, v in zip(CF_ENV_KEYS, (self._account, self._token)) if not v]
+
+    def _headers(self) -> dict:
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self._token}"}
+
+    def _prep_image(self, jpg: bytes) -> tuple[bytes, int, int]:
+        return clef_image(jpg)
+
+    def _options(self, red: list, blue: list, extra: Iterable) -> list[dict]:
+        return roster_options(red, blue, extra)
+
+    def _read_payload(self, img: bytes, red: list, blue: list, expected: str,
+                      options: list[dict], seed) -> dict:
+        return build_read_payload(self.model_key, img, red, blue, expected,
+                                  options=options, seed=seed)
+
+    def _classify_payload(self, img: bytes) -> dict:
+        return build_classify_payload(self.model_key, img)
+
+    def _unwrap(self, body) -> tuple[dict, dict]:
+        return unwrap_response(body)
+
+    def _map_read(self, answers: dict, roster_alliance: dict, expected: str) -> dict:
+        return map_read_answers(answers, roster_alliance, expected, self.min_team_prob)
+
+    def _estimate_tokens(self, payload: dict, image_wh) -> int:
+        return estimate_tokens(payload, image_wh)
+
+    def _is_quota(self, status: int, text: str) -> bool:
+        return is_quota_error(status, text)
 
     # ---- state ----
     @property
@@ -592,16 +645,15 @@ class ClefSession:
         """POST one payload with retries; returns the answers dict."""
         if self._disabled.is_set():
             self._bump("skipped")
-            raise ClefUnavailable(f"clef unavailable: {self.disabled_reason}")
+            raise ClefUnavailable(f"{self.name} unavailable: {self.disabled_reason}")
         data = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self._token}"}
+        headers = self._headers()
         sleep = self._sleep or time.sleep
         last = "no attempt"
         for attempt in range(self.retries + 1):
             if attempt and self._disabled.is_set():   # another thread latched mid-retry
                 self._bump("skipped")
-                raise ClefUnavailable(f"clef unavailable: {self.disabled_reason}")
+                raise ClefUnavailable(f"{self.name} unavailable: {self.disabled_reason}")
             retry_after = None
             self._bump("requests")
             t0 = time.monotonic()
@@ -616,7 +668,7 @@ class ClefSession:
                 if status == 200:
                     latency = time.monotonic() - t0
                     try:
-                        answers, usage = unwrap_response(json.loads(text))
+                        answers, usage = self._unwrap(json.loads(text))
                     except ValueError as e:
                         raise ClefError(f"bad response JSON: {self._redact(e)}") from None
                     tokens = usage.get("input_tokens")
@@ -626,24 +678,24 @@ class ClefSession:
                         if isinstance(tokens, (int, float)):
                             self._c["input_tokens"] += int(tokens)
                         else:
-                            self._c["input_tokens"] += estimate_tokens(payload, image_wh)
+                            self._c["input_tokens"] += self._estimate_tokens(payload, image_wh)
                             self._c["estimated_token_responses"] += 1
                         out_tok = usage.get("output_tokens")
                         if isinstance(out_tok, (int, float)):
                             self._c["output_tokens"] += int(out_tok)
                     return answers
                 msg = f"HTTP {status}: {self._redact((text or '')[:300])}"
-                if is_quota_error(status, text):
+                if self._is_quota(status, text):
                     self._bump("quota_errors")
-                    self._latch("quota", "Workers AI quota exhausted",
-                                "[clef] Workers AI quota exhausted — reads disabled for this job")
-                    raise ClefQuotaExhausted(f"Workers AI quota exhausted ({msg})")
+                    self._latch("quota", f"{self.vendor} quota exhausted",
+                                f"[{self.name}] {self.vendor} quota exhausted — reads "
+                                "disabled for this job")
+                    raise ClefQuotaExhausted(f"{self.vendor} quota exhausted ({msg})")
                 if status in (401, 403):
                     self._bump("auth_errors")
-                    self._latch("auth", f"Workers AI auth failed (HTTP {status})",
-                                f"[clef] Workers AI auth failed (HTTP {status}) — check "
-                                "CLOUDFLARE_API_TOKEN / Workers AI permission; reads "
-                                "disabled for this job")
+                    self._latch("auth", f"{self.vendor} auth failed (HTTP {status})",
+                                f"[{self.name}] {self.vendor} auth failed (HTTP {status}) — "
+                                f"check {self.auth_hint}; reads disabled for this job")
                     raise ClefAuthError(msg)
                 if status != 429 and status < 500:
                     raise ClefError(msg)          # e.g. 400: payload problem, don't retry
@@ -685,7 +737,7 @@ class ClefSession:
         error="tracklet_inconsistent"."""
         red = [str(t) for t in red or ()]
         blue = [str(t) for t in blue or ()]
-        options = roster_options(red, blue, extra_teams)
+        options = self._options(red, blue, extra_teams)
         roster_alliance = {o["id"]: o.get("alliance") or "unknown"
                            for o in options if o["kind"] == "team"}
         expected_alliances = list(expected_alliances or [])
@@ -705,29 +757,32 @@ class ClefSession:
                     return res
                 if not crops:
                     self._bump("errors")
-                    return error_entry("clef: empty crop list")
+                    return error_entry(f"{self.name}: empty crop list")
                 item = crops[0]          # a 1-element list reads like its string
-            crop_b64 = item
-            try:
-                if self._disabled.is_set():
-                    self._bump("skipped")
-                    return error_entry(f"clef unavailable: {self.disabled_reason}")
-                img, w, h = clef_image(base64.b64decode(crop_b64))
-                payload = build_read_payload(self.model_key, img, red, blue, expected,
-                                             options=options, seed=crop_b64)
-                answers = self._request(payload, (w, h))
-                return map_read_answers(answers, roster_alliance, expected, self.min_team_prob)
-            except ClefUnavailable as e:
-                return error_entry(str(e))
-            except Exception as e:
-                self._bump("errors")
-                return error_entry(self._redact(f"clef: {e}"))
+            return self._read_single(item, red, blue, expected, options, roster_alliance)
 
         results = self._run(list(crops_b64), _one)
         identified = sum(1 for r in results if r.get("team_number"))
-        print(f"  Clef [{self.model_key}]: identified {identified}/{len(results)} robots: "
-              f"{[r.get('team_number') for r in results]}")
+        print(f"  {self.label} [{self.model_key}]: identified {identified}/{len(results)} "
+              f"robots: {[r.get('team_number') for r in results]}")
         return results
+
+    def _read_single(self, crop_b64: str, red: list, blue: list, expected: str,
+                     options: list, roster_alliance: dict) -> dict:
+        """One request with one image; never raises (error entry instead)."""
+        try:
+            if self._disabled.is_set():
+                self._bump("skipped")
+                return error_entry(f"{self.name} unavailable: {self.disabled_reason}")
+            img, w, h = self._prep_image(base64.b64decode(crop_b64))
+            payload = self._read_payload(img, red, blue, expected, options, crop_b64)
+            answers = self._request(payload, (w, h))
+            return self._map_read(answers, roster_alliance, expected)
+        except ClefUnavailable as e:
+            return error_entry(str(e))
+        except Exception as e:
+            self._bump("errors")
+            return error_entry(self._redact(f"{self.name}: {e}"))
 
     def _read_multi(self, crops: list, meta: Optional[dict], red: list, blue: list,
                     expected: str, options: list, roster_alliance: dict) -> dict:
@@ -766,15 +821,15 @@ class ClefSession:
                 if self._disabled.is_set():
                     self._bump("skipped")
                     return {"object": "unclear",
-                            "error": f"clef unavailable: {self.disabled_reason}"}
-                img, w, h = clef_image(base64.b64decode(crop_b64))
-                answers = self._request(build_classify_payload(self.model_key, img), (w, h))
+                            "error": f"{self.name} unavailable: {self.disabled_reason}"}
+                img, w, h = self._prep_image(base64.b64decode(crop_b64))
+                answers = self._request(self._classify_payload(img), (w, h))
                 return map_classify_answers(answers)
             except ClefUnavailable as e:
                 return {"object": "unclear", "error": str(e)}
             except Exception as e:
                 self._bump("errors")
-                return {"object": "unclear", "error": self._redact(f"clef: {e}")}
+                return {"object": "unclear", "error": self._redact(f"{self.name}: {e}")}
 
         return self._run(list(crops_b64), _one)
 
@@ -796,7 +851,7 @@ class ClefSession:
         tok = st["input_tokens"]
         tok_s = (f"{tok / 1e6:.2f}M" if tok >= 1e6 else
                  f"{tok / 1e3:.1f}k" if tok >= 1e3 else str(tok))
-        line = (f"[clef] {st['model']}: {st['ok']} reads, {tok_s} tokens, "
+        line = (f"[{self.name}] {st['model']}: {st['ok']} reads, {tok_s} tokens, "
                 f"~${st['cost_usd']:.4f}, {st['errors']} errors")
         if st["latency_p50_s"] is not None:
             line += f", p50 {st['latency_p50_s']:.2f}s"

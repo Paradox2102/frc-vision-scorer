@@ -13,14 +13,16 @@
 # OOM'd the main view; SAM3's peak is model + per-object state, not frame
 # residency.
 #
-# TEAM_READER=vllm only sets the DEFAULT reader; the UI radio per-job
-# override wins either way, and the app never preloads in-process Qwen when
-# the configured reader is vllm.
+# TEAM_READER only sets the DEFAULT reader; the UI radio per-job override
+# wins either way. Default jev (Nov 6 2026 live-event config: hosted Jev
+# image reader, needs JEV_TYPESAFE_API_TOKEN in .env, no vLLM/GPU). Export
+# TEAM_READER=vllm before running this to get the local Qwen reader back;
+# the app never preloads in-process Qwen when the reader is vllm.
 
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
-export TEAM_READER=vllm
+export TEAM_READER="${TEAM_READER:-jev}"
 
 # 2026-06-11 whole-card OOM containment: full-card SAM3 runs OOM'd at ~21GB
 # even with the dark-reanchor attempt cap, while the previous day's runs

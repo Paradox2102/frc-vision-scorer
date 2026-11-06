@@ -198,6 +198,98 @@ def _shim_build_output_keep_refined(model: Any) -> None:
     model._build_sam2_output = _build_keeping_refined
 
 
+# Conditioning frames (prompt/refine frames) whose heavy memory tensors the
+# multiplex memory bound keeps per object state: the first (initial prompt)
+# plus this many temporally closest to the frame being tracked.
+SAM3_MULTIPLEX_COND_MEM_FRAMES = 6
+# Heavy per-frame tensors dropped from out-of-window frame outputs; the small
+# ones (pred_masks, object_score_logits, obj_ptr, ...) stay so every upstream
+# lookup still finds its frame entry.
+_MUX_HEAVY_KEYS = ("maskmem_features", "maskmem_pos_enc", "image_features",
+                   "image_pos_enc", "pred_masks_high_res")
+
+
+def _trim_cond_memory(output_dict: dict, frame_idx: int, keep: int) -> int:
+    """Drop heavy tensors from conditioning-frame outputs outside {first} ∪
+    {``keep`` temporally closest to ``frame_idx``}. Entries are replaced by
+    trimmed copies, never deleted (preflight asserts consolidated cond frame
+    indices exist in output_dict; the memory gather skips an entry whose
+    ``maskmem_features`` is None). Returns how many entries were trimmed."""
+    cond = output_dict.get("cond_frame_outputs") if isinstance(output_dict, dict) else None
+    if not isinstance(cond, dict) or len(cond) <= keep + 1:
+        return 0
+    keys = sorted(cond)
+    keepers = {keys[0]} | set(sorted(keys, key=lambda t: abs(t - frame_idx))[:keep])
+    n = 0
+    for t in keys:
+        out = cond[t]
+        if t in keepers or not isinstance(out, dict):
+            continue
+        if any(out.get(k) is not None for k in _MUX_HEAVY_KEYS):
+            cond[t] = {k: v for k, v in out.items() if k not in _MUX_HEAVY_KEYS}
+            n += 1
+    return n
+
+
+def _trim_non_cond_memory(output_dict: dict, frame_idx: int, window: int) -> int:
+    """Drop heavy tensors from non-conditioning frame outputs more than
+    ``window`` frames from ``frame_idx`` (entries kept, trimmed in place of
+    deletion, same contract as _trim_cond_memory). Returns entries trimmed."""
+    nc = output_dict.get("non_cond_frame_outputs") if isinstance(output_dict, dict) else None
+    if not isinstance(nc, dict):
+        return 0
+    n = 0
+    for t in list(nc):
+        out = nc[t]
+        if abs(t - frame_idx) <= window or not isinstance(out, dict):
+            continue
+        if any(out.get(k) is not None for k in _MUX_HEAVY_KEYS):
+            nc[t] = {k: v for k, v in out.items() if k not in _MUX_HEAVY_KEYS}
+            n += 1
+    return n
+
+
+def _shim_bound_tracker_memory(model: Any) -> None:
+    """Instance-prompted objects each get a singleton SAM2 state whose
+    per-frame memory is laid out in multiplex ("mux") space -- ~19 MB of
+    maskmem per object per frame, ~30x SAM2's -- and the multiplex tracker
+    keeps EVERY propagated (non-cond) and prompted (cond) frame's memory (its
+    ``trim_past_non_cond_mem_for_eval`` path is never reached by the
+    interactive per-frame step). Offline, VRAM grew ~0.27 GB/frame with 3
+    objects and the qm11 auto-only job OOM'd every view ~20 frames in
+    (2026-11-06). After each propagated frame, trim heavy tensors outside
+    what memory attention can read:
+    - non-cond: frames > r * num_maskmem away (attention reads the previous
+      num_maskmem - 1 frames when use_memory_selection is off);
+    - cond: all but the first and the ``SAM3_MULTIPLEX_COND_MEM_FRAMES``
+      closest (attention reads max_cond_frames_in_attn=4 closest, plus any
+      unselected cond frame inside the num_maskmem window)."""
+    import functools
+
+    step = getattr(model, "_propogate_tracker_one_frame_local_gpu", None)
+    if step is None or getattr(step, "_frc_bound_memory_shim", False):
+        return
+    tracker = getattr(model, "tracker", None)
+    if getattr(tracker, "use_memory_selection", False):
+        return  # memory selection may read far frames; don't trim under it
+    window = int(getattr(tracker, "memory_temporal_stride_for_eval", 1) or 1) * \
+        int(getattr(tracker, "num_maskmem", 7) or 7)
+
+    @functools.wraps(step)
+    def _step_bounding_memory(inference_states, frame_idx, *a, _orig=step, **kw):
+        result = _orig(inference_states, frame_idx, *a, **kw)
+        for s in inference_states or ():
+            if isinstance(s, dict):
+                od = s.get("output_dict")
+                _trim_non_cond_memory(od, int(frame_idx), window)
+                _trim_cond_memory(od, int(frame_idx),
+                                  SAM3_MULTIPLEX_COND_MEM_FRAMES)
+        return result
+
+    _step_bounding_memory._frc_bound_memory_shim = True
+    model._propogate_tracker_one_frame_local_gpu = _step_bounding_memory
+
+
 def _install_multiplex_shims(model: Any) -> None:
     """Compat shims for the SAM 3.1 multiplex model (no-op without a model)."""
     if model is None:
@@ -205,6 +297,7 @@ def _install_multiplex_shims(model: Any) -> None:
     _shim_init_state_drop_state_offload(model)
     _shim_fetch_tolerate_uncached_frame(model)
     _shim_build_output_keep_refined(model)
+    _shim_bound_tracker_memory(model)
 
 
 def _list_frame_paths(frames_dir: str) -> list[str]:

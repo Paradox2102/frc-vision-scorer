@@ -9,6 +9,8 @@ from web.field.sam3_tracker import (
     Sam3FieldTracker,
     Sam3PredictorAdapter,
     _install_multiplex_shims,
+    _trim_cond_memory,
+    _trim_non_cond_memory,
 )
 
 
@@ -768,6 +770,71 @@ def test_sam3_multiplex_build_output_shim_keeps_refined_masks_on_uncached_frame(
     first = model._build_sam2_output
     _install_multiplex_shims(model)
     assert model._build_sam2_output is first, "double-wrapped"
+
+
+def _heavy_out(t):
+    return {"maskmem_features": f"mf{t}", "maskmem_pos_enc": [f"pe{t}"],
+            "image_features": f"if{t}", "image_pos_enc": f"ip{t}",
+            "pred_masks_high_res": f"hr{t}", "pred_masks": f"pm{t}",
+            "obj_ptr": f"op{t}", "object_score_logits": 1.0}
+
+
+def test_mux_memory_trim_keeps_attention_window_and_entries():
+    """Multiplex singleton states grew ~19 MB/object/frame unbounded (OOM ~20
+    frames in). Trimming strips heavy tensors only outside what memory
+    attention reads, and never deletes entries (preflight asserts
+    consolidated cond indices exist; the gather skips maskmem=None)."""
+    od = {"non_cond_frame_outputs": {t: _heavy_out(t) for t in range(0, 30)},
+          "cond_frame_outputs": {t: _heavy_out(t) for t in (0, 3, 9, 15, 21, 24, 27, 29)}}
+    assert _trim_non_cond_memory(od, 29, 7) == 22
+    nc = od["non_cond_frame_outputs"]
+    assert set(nc) == set(range(30)), "entries must be kept"
+    for t in range(22, 30):
+        assert nc[t]["maskmem_features"] == f"mf{t}"
+    for t in range(0, 22):
+        assert "maskmem_features" not in nc[t] and "image_features" not in nc[t]
+        assert nc[t]["pred_masks"] == f"pm{t}" and nc[t]["obj_ptr"] == f"op{t}"
+
+    assert _trim_cond_memory(od, 29, 4) == 3
+    cond = od["cond_frame_outputs"]
+    assert set(cond) == {0, 3, 9, 15, 21, 24, 27, 29}
+    kept = {t for t, o in cond.items() if "maskmem_features" in o}
+    assert kept == {0, 21, 24, 27, 29}, "first + 4 closest keep memory"
+    assert _trim_cond_memory(od, 29, 4) == 0, "idempotent"
+    assert _trim_non_cond_memory({}, 3, 7) == 0
+    assert _trim_cond_memory({"cond_frame_outputs": {1: _heavy_out(1)}}, 9, 4) == 0
+
+
+def test_mux_memory_shim_wraps_step_once_and_trims_states():
+    class Tracker:
+        use_memory_selection = False
+        num_maskmem = 2
+        memory_temporal_stride_for_eval = 1
+
+    class Model:
+        tracker = Tracker()
+
+        def _propogate_tracker_one_frame_local_gpu(self, states, frame_idx, reverse):
+            return "out"
+
+    m = Model()
+    _install_multiplex_shims(m)
+    first = m._propogate_tracker_one_frame_local_gpu
+    _install_multiplex_shims(m)
+    assert m._propogate_tracker_one_frame_local_gpu is first
+    st = {"output_dict": {"non_cond_frame_outputs": {t: _heavy_out(t) for t in range(6)},
+                          "cond_frame_outputs": {0: _heavy_out(0)}}}
+    assert m._propogate_tracker_one_frame_local_gpu([st], 5, False) == "out"
+    nc = st["output_dict"]["non_cond_frame_outputs"]
+    assert [t for t in nc if "maskmem_features" in nc[t]] == [3, 4, 5]
+
+    class MS(Model):
+        tracker = type("T", (), {"use_memory_selection": True})()
+
+    ms = MS()
+    _install_multiplex_shims(ms)
+    assert not getattr(ms._propogate_tracker_one_frame_local_gpu,
+                       "_frc_bound_memory_shim", False), "no trim under memory selection"
 
 
 def test_sam3_multiplex_fetch_shim_cleans_up_on_error_and_is_idempotent():

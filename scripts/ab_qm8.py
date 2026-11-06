@@ -683,7 +683,9 @@ def score(expect_replay: str | None = None) -> dict:
     replay PER KEY THAT HAS PATHS, so a job that exports zero autonomous_paths
     silently inherits the previous replay's score (2026-07-20: the post-shim
     mux arm scored the prior gir arm's replay bit-for-bit). Refuse that."""
-    ours = load_our_auto_paths("2026cur")
+    # Score ONLY this job's replay: load_our_auto_paths is newest-per-SLOT,
+    # so a replay missing a slot silently inherits it from an older run.
+    ours = load_our_auto_paths("2026cur", only_replay=expect_replay)
     if expect_replay is not None:
         rids = {rec["replay_id"] for key, rec in ours.items() if key[0] == MATCH}
         if expect_replay not in rids:

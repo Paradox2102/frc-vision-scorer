@@ -191,11 +191,16 @@ def _local_meta(replay_id: str, stored_path: str) -> Optional[Path]:
     return None
 
 
-def load_our_auto_paths(event_key: str) -> dict[tuple[str, int, int], dict]:
+def load_our_auto_paths(
+    event_key: str, only_replay: Optional[str] = None
+) -> dict[tuple[str, int, int], dict]:
     """Map ``(match_number, alliance, position)`` -> our auto path + metadata.
 
     One entry per slot of the most recent replay for each match (later replays
-    win, matching how the UI shows the freshest analysis).
+    win, matching how the UI shows the freshest analysis). NOTE: "most recent"
+    is per SLOT, so a replay missing a slot inherits that slot from an older
+    replay. ``only_replay`` restricts loading to that one replay id (A/B
+    scoring must not mix runs).
     """
     if not DB_PATH.exists():
         raise SystemExit(f"DB not found: {DB_PATH}")
@@ -210,6 +215,8 @@ def load_our_auto_paths(event_key: str) -> dict[tuple[str, int, int], dict]:
 
     out: dict[tuple[str, int, int], dict] = {}
     for r in rows:
+        if only_replay is not None and r["id"] != only_replay:
+            continue
         parsed = match_number_from_key(r["match_key"])
         if parsed is None or parsed[0] != "qual":
             continue  # Manta cache here is qual-only; extend when needed

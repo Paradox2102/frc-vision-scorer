@@ -241,6 +241,11 @@ def test_map_other_escape_tops_name_no_team(escape):
         assert r["surface"] == "unknown"
 
 
+def test_map_zero_probability_runner_up_is_omitted():
+    r = _map({"4786": 0.95, "6800": 0.0, "870": 0.0, "unreadable": 0.05})
+    assert r["team_number"] == "4786" and "runner_up" not in r
+
+
 def test_map_alliance_comes_from_roster():
     r = _map({"2992": 0.9, "unreadable": 0.1}, expected="blue")
     assert r["alliance"] == "red"

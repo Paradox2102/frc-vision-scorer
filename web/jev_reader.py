@@ -290,7 +290,8 @@ def map_jev_answers(answers: dict, roster_alliance: dict, expected_alliance: str
                  confidence = p). not_robot / printed / other tops name no
                  team. p is the closed-set probability, used as-is (no
                  blend_read_confidence), like Clef.
-    runner_up / runner_up_p: the second-best TEAM option (any team-naming read).
+    runner_up / runner_up_p: the second-best TEAM option (any team-naming
+                 read; omitted when its p is 0).
     surface:     "printed" when the top is ``printed``; "bumper" for a team /
                  unreadable / other top; else "unknown".
     jev_probs:   the full option distribution (roster teams + escapes).
@@ -323,7 +324,7 @@ def map_jev_answers(answers: dict, roster_alliance: dict, expected_alliance: str
         "tentative": tentative,
         "jev_probs": {k: round(float(v), 6) for k, v in probs.items()},
     }
-    if team is not None and len(ranked) > 1:
+    if team is not None and len(ranked) > 1 and ranked[1][0] > 0.0:
         out["runner_up"] = ranked[1][1]
         out["runner_up_p"] = round(float(ranked[1][0]), 4)
     return out

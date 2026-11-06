@@ -109,6 +109,7 @@ from web.field.detect_schema import (
     select_gap_fills,
 )
 from web.field.selective_prop import SelectiveConfig
+from web.analysis_prefetch import MISS as _PREFETCH_MISS
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.detection_archive import DetectionArchive
 from web.field.hardneg_miner import mine_hard_negatives
@@ -1458,6 +1459,10 @@ class InferenceJob:
         # next to self.timings, but declared here so crop-encode timers work when
         # _bumper_crop_b64 / _masked_robot_crop_b64 fire on early pre-loop paths.
         self._loop_stage_s = defaultdict(float)
+        # stream_analysis prefetcher + its worker task (None unless the knob
+        # is on and the SAM pass started one).
+        self._analysis_prefetch = None
+        self._analysis_prefetch_task = None
         # Per-job A/B knobs, all resolved through self.config (override > env >
         # default). The attributes survive because downstream plumbing and the
         # job-control endpoints read them directly.
@@ -2326,6 +2331,103 @@ class InferenceJob:
         print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames "
               f"in {elapsed:.2f}s ({elapsed / max(1, n) * 1000:.1f} ms/frame)")
         return view_tracks
+
+    def _start_analysis_prefetch(self, analysis_frames, device: str):
+        """stream_analysis: start the SAM-independent loop-work prefetch on a
+        worker thread (see web/analysis_prefetch.py) so it runs while the
+        views propagate. Returns the prefetcher, or None — always None with
+        the knob OFF, which leaves the loop on its unchanged inline path."""
+        from web.analysis_prefetch import (
+            AnalysisPrefetcher, ocr_frames_for, stream_analysis_plan)
+
+        plan = stream_analysis_plan(
+            enabled=bool(getattr(self.config, "stream_analysis", False)),
+            use_sam2=bool(self.use_sam2),
+            device=device,
+            needs_vllm=self._needs_vllm_server(),
+            vram_fit=bool(getattr(self, "sam2_max_gpu_frames", 0) > 0),
+        )
+        for note in plan.notes:
+            print(f"  [stream] {note}")
+        if not plan.active or not analysis_frames:
+            return None
+
+        frames = sorted(analysis_frames)
+        video_path = str(self.video_path)
+
+        def read_frames():
+            # The loop's decode, verbatim: seek once to the first analysis
+            # frame, read forward, keep the analysis frames.
+            want = set(frames)
+            cap_pf = cv2.VideoCapture(video_path)
+            try:
+                cap_pf.set(cv2.CAP_PROP_POS_FRAMES, frames[0])
+                fpos = frames[0]
+                while fpos <= frames[-1]:
+                    ok, fr = cap_pf.read()
+                    if not ok:
+                        break
+                    if fpos in want:
+                        yield fpos, fr
+                    fpos += 1
+            finally:
+                cap_pf.release()
+
+        setup_gpu = None
+        if plan.gpu:
+            def setup_gpu():
+                # Private instances (same weights, same call kwargs as the
+                # loop): the SAM thread's detect_fn is using the job's own
+                # person_model concurrently.
+                main_m = YOLO(str(MODEL_PATH))
+                person_m = YOLO(str(PROJECT_ROOT / "yolo26n.pt"))
+
+                def main_det(overhead):
+                    res = main_m(overhead, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                    return sv.Detections.from_ultralytics(res)
+
+                def person_det(view_frame):
+                    res = person_m(view_frame, classes=[0],
+                                   conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                    d = sv.Detections.from_ultralytics(res)
+                    return [tuple(d.xyxy[i]) for i in range(len(d))]
+                return main_det, person_det
+
+        pf = AnalysisPrefetcher(
+            read_frames,
+            overhead_height=self.overhead_height,
+            views=[(v.name, v.extract) for v in self.views] if plan.gpu else [],
+            ocr_frames=ocr_frames_for(frames, OCR_FRAME_INTERVAL),
+            ocr_fn=self.ocr_score if plan.ocr else None,
+            setup_gpu=setup_gpu,
+            should_stop=lambda: self._stopped,
+        )
+        self._analysis_prefetch = pf
+        self._analysis_prefetch_task = asyncio.create_task(
+            asyncio.to_thread(pf.run))
+        print(f"  [stream] analysis prefetch started over {len(frames)} frames "
+              f"(ocr={plan.ocr}, gpu={plan.gpu})")
+        return pf
+
+    async def _finish_analysis_prefetch(self) -> None:
+        """Stop the prefetch worker, wait for it, fold its stats into
+        timings. No-op when stream_analysis never started one."""
+        pf = getattr(self, "_analysis_prefetch", None)
+        task = getattr(self, "_analysis_prefetch_task", None)
+        if pf is None:
+            return
+        pf.cancel()
+        if task is not None:
+            try:
+                await task
+            except Exception as e:
+                print(f"  [stream] prefetch task failed: {e}")
+        self.timings.update(pf.stats())
+        print(f"  [stream] prefetch {pf.frames_done} frames in {pf.wall_s:.1f}s; "
+              f"hits={pf.hits} misses={pf.misses}")
+        pf.clear()
+        self._analysis_prefetch = None
+        self._analysis_prefetch_task = None
 
     def _ray_zone_list(self, view):
         """Inflated user zones for the ray-beyond-contact seed gate, or None
@@ -7642,6 +7744,10 @@ class InferenceJob:
                     self.robot_embedder = None
             if self.use_sam2:
                 self._raise_if_stopped()  # phase boundary: after model load
+                # stream_analysis: precompute the loop's SAM-independent work
+                # (OCR / main YOLO / person det) while the views propagate.
+                # Returns None with the knob OFF.
+                self._start_analysis_prefetch(all_frames, device)
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
@@ -8425,6 +8531,10 @@ class InferenceJob:
             self._inference_start_time = time.time()
 
             _loop_t0 = time.perf_counter()
+            # stream_analysis prefetch cache (None with the knob OFF: every
+            # site below then takes its original inline path).
+            _pf = self._analysis_prefetch
+            _MISS = _PREFETCH_MISS
             while True:
                 with self._stage("loop.decode"):
                     ret, frame = cap.read()
@@ -8438,6 +8548,8 @@ class InferenceJob:
                     continue
 
                 self._evidence_frame = frame_num
+                if _pf is not None:
+                    _pf.note_loop_frame(frame_num)
 
                 if (
                     previous_processed_source_frame is not None
@@ -8457,8 +8569,10 @@ class InferenceJob:
                 # Existing 3-class YOLO intentionally feeds fuel/hub detection
                 # and their HUD annotations; robots come from the bumper model.
                 with self._stage("loop.yolo_main"):
-                    results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
-                    detections = sv.Detections.from_ultralytics(results)
+                    detections = _pf.take_main(frame_num) if _pf is not None else _MISS
+                    if detections is _MISS:
+                        results = self.model(overhead_frame, conf=DET_CONF_THRESHOLD, verbose=False)[0]
+                        detections = sv.Detections.from_ultralytics(results)
                 
                 # Update hub positions (alliance assignment is static from setup)
                 self.update_hub_positions(detections)
@@ -8498,16 +8612,20 @@ class InferenceJob:
                                 small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
                             with self._stage("loop.person_det"):
-                                person_results = self.person_model(
-                                    view_frame,
-                                    classes=[0],
-                                    conf=DET_CONF_THRESHOLD,
-                                    verbose=False,
-                                )[0]
-                                pdets = sv.Detections.from_ultralytics(person_results)
-                            person_boxes_all = [
-                                tuple(pdets.xyxy[i]) for i in range(len(pdets))
-                            ]
+                                person_boxes_all = (
+                                    _pf.take_person(frame_num, view.name)
+                                    if _pf is not None else _MISS)
+                                if person_boxes_all is _MISS:
+                                    person_results = self.person_model(
+                                        view_frame,
+                                        classes=[0],
+                                        conf=DET_CONF_THRESHOLD,
+                                        verbose=False,
+                                    )[0]
+                                    pdets = sv.Detections.from_ultralytics(person_results)
+                                    person_boxes_all = [
+                                        tuple(pdets.xyxy[i]) for i in range(len(pdets))
+                                    ]
 
                             embed_candidates = []
                             for obj_id, info in view_raw.get(local_idx, {}).items():
@@ -8964,7 +9082,10 @@ class InferenceJob:
                             print(f"  [DEBUG] OCR regions: {self.ocr_regions}")
                             print(f"  [DEBUG] overhead_frame shape: {overhead_frame.shape}")
                         for alliance in ["blue", "red"]:
-                            ocr_val = self.ocr_score(overhead_frame, alliance)
+                            ocr_val = (_pf.take_ocr(frame_num, alliance)
+                                       if _pf is not None else _MISS)
+                            if ocr_val is _MISS:
+                                ocr_val = self.ocr_score(overhead_frame, alliance)
                             if processed_frame_num <= 50:
                                 print(f"  [DEBUG] OCR {alliance}: {ocr_val}")
                             if ocr_val is not None:
@@ -9258,6 +9379,10 @@ class InferenceJob:
                 frame_num += 1
                 processed_frame_num += 1
             
+            # stream_analysis: stop the prefetch worker and record its hit
+            # stats (no-op when the knob is OFF).
+            await self._finish_analysis_prefetch()
+
             # Drain the in-flight background VLM pass (if any) BEFORE finalizing:
             # its votes must land before assign_teams_from_votes/finalization
             # runs. Awaited, not cancelled — reached on normal break and on the
@@ -9412,6 +9537,12 @@ class InferenceJob:
             self._close_log_file()
             if cap is not None:
                 cap.release()
+            # stream_analysis worker: a stop/error before the loop finished
+            # must not leave it decoding + detecting in the background.
+            _pf_left = getattr(self, "_analysis_prefetch", None)
+            if _pf_left is not None:
+                _pf_left.cancel()
+                _pf_left.clear()
             # Sweep per-view frame-export tempdirs a mid-phase stop (or any
             # exception) left behind: the per-view propagation loop only cleans
             # the view it just finished, so a JobStopped/TrackStopped raised

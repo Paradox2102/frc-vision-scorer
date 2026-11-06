@@ -37,6 +37,10 @@ SPRINT = {"sam2_prompt_offset_seconds": 0.0, "motion_override": True,
 # Reader base for the qwen35-escape profile: local vLLM reader with the Oct 31
 # Clef combo's census + keep-evicted read settings (see that profile).
 _QWEN35_R = {"team_reader": "vllm", "read_census": True, "read_keep_evicted": True}
+# Reader base for the "speed" profile: the "jev" profile's reader config.
+_SPEED_R = {"team_reader": "jev", "read_census": True, "read_keep_evicted": True}
+_SPEED_B2 = {**_SPEED_R, "sam2_track_fps": 5, "corner_track_stride": 3,
+             "selective_mask_prop": True, "selective_app_weight": 0.3}
 PROFILES = {
     "full": [
         ("baseline", {}),
@@ -508,6 +512,28 @@ PROFILES = {
     "jev": [
         ("jev", {"team_reader": "jev", "read_census": True, "read_keep_evicted": True}),
     ],
+    # Live-event speed A/B (2026-11-05): full-match wall NEED < 12 min, WANT
+    # < 8 min (from ~24 min) without a meaningful accuracy drop. Arm A is the
+    # "jev" profile run above (same code, all defaults: sam2_track_fps 8,
+    # corner_track_stride 2) -- not re-run here. Every arm shares the jev
+    # reader config, so only the speed levers differ:
+    #   B1  track at 5 fps, corners at stride 3 (dense head unchanged);
+    #   B2  + selective mask propagation (SAM only in ambiguous windows) with
+    #       the 0.3 appearance term. CAUTION: selective's frame-denominated
+    #       knobs (gap_trigger 7, min_streak 5, window_max 120, starve/coast
+    #       frames) are NOT rescaled for fps/stride the way the uniform
+    #       tracker's are -- at 5 fps / stride 3 a corner "frame" is 0.6 s
+    #       (vs 0.125 s at the 8 fps / stride 1 it was tuned at);
+    #   B3  + stream_analysis (loop's OCR / main YOLO / person det prefetched
+    #       during SAM propagation; web/analysis_prefetch.py).
+    # Run with --full-match. Wall time per stage (timings.total,
+    # timings.sam2_tracking, timings.analysis_loop, stream.*) lands in each
+    # result row's "timings", read from the replays table by job_id.
+    "speed": [
+        ("B1-fps5-cs3", {**_SPEED_R, "sam2_track_fps": 5, "corner_track_stride": 3}),
+        ("B2-+selective", _SPEED_B2),
+        ("B3-+stream", {**_SPEED_B2, "stream_analysis": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 
@@ -572,6 +598,33 @@ def _replay_saved(job_id: str, tries: int = 10, delay: float = 0.5) -> bool:
             pass
         time.sleep(delay)
     return False
+
+
+# Per-stage wall-time keys copied from the replay's timings JSON into each
+# result row (prefix match for the stream_analysis "stream.*" stats).
+TIMING_KEYS = ("total", "sam2_tracking", "analysis_loop", "frame_export",
+               "model_load")
+
+
+def replay_timings(job_id: str | None) -> dict:
+    """Stage wall times for ``job_id`` from the replays table (read-only):
+    TIMING_KEYS plus any ``stream.*`` keys. {} if missing/unreadable."""
+    import sqlite3
+    if not job_id:
+        return {}
+    db = REPO / "frc_scorer.db"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT timings FROM replays WHERE id = ?",
+                              (job_id,)).fetchone()
+        finally:
+            con.close()
+        t = json.loads(row[0]) if row and row[0] else {}
+    except (sqlite3.Error, ValueError, TypeError):
+        return {}
+    return {k: v for k, v in t.items()
+            if k in TIMING_KEYS or k.startswith("stream.")}
 
 
 async def drive(job_id: str) -> str:
@@ -680,10 +733,12 @@ def main(args) -> None:
         except Exception as e:
             metrics = {"error": repr(e)}
         row = {"config": name, "cfg": cfg, "job_id": jid, "job_s": job_s,
-               "metrics": metrics}
+               "timings": replay_timings(jid), "metrics": metrics}
         results.append(row)
         RESULTS.write_text(json.dumps(results, indent=2))  # stream partial
         print(f"  metrics={metrics}", flush=True)
+        if row["timings"]:
+            print(f"  timings={row['timings']}", flush=True)
     # summary table
     print("\n\n===== A/B SUMMARY (2026cur qm8) =====", flush=True)
     print(f"{'config':>13} {'aggMeanNN':>10} {'redMeanNN':>10} {'nRed':>5} {'redCov%':>28}", flush=True)

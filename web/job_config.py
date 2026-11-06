@@ -273,6 +273,21 @@ KNOBS = [
     # head used in the Oct 31 full-match A/B that made stride 2 the default.
     Knob("corner_dense_seconds", "CORNER_DENSE_SECONDS", float, 25.0, min=0.0,
          section="Tracking backend"),
+    # Overlap the analysis loop's SAM-independent per-frame work with SAM
+    # propagation (web/analysis_prefetch.py): while the views propagate, a
+    # worker thread decodes the analysis frames and runs the scoreboard OCR
+    # (tesseract, CPU) plus the main 3-class YOLO and per-view person
+    # detector on private model instances; the loop then takes those results
+    # from a cache and computes anything missing inline. The full "loop trails
+    # a SAM ready-horizon" design is NOT safe: late_seed_backfill (default on)
+    # and the tracker's retroactive color backfill keep a view's frames
+    # mutable until that view finishes (qm8 corner_right: first backfill seed
+    # at local frame 40/727 pins the safe horizon at ~3% of the match), so the
+    # loop still starts after the last view. GPU prefetch is skipped (OCR
+    # only) without CUDA, for vLLM-reader jobs (VRAM handoff) and under the
+    # sam2_max_gpu_frames VRAM-fit mode. DEFAULT OFF -> unchanged path.
+    Knob("stream_analysis", "STREAM_ANALYSIS", bool, False,
+         section="Tracking backend"),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False,
          section="Track hygiene"),
     # Scope the absence-based cull to the main view: mid-field equipment is

@@ -540,6 +540,15 @@ PROFILES = {
         ("B4-fps4-cs3-stream", {**_SPEED_R, "sam2_track_fps": 4,
                                 "corner_track_stride": 3, "stream_analysis": True}),
     ],
+    # Nov 6: B4 + SAM 3.1 Object Multiplex (joint multi-object propagation).
+    # SAM costs ~500 ms/frame/view regardless of fps because the base
+    # predictor propagates objects one at a time; multiplex is the remaining
+    # lever toward < 8 min. Compare against speed-b4 (qm8 754 s / 0.795,
+    # qm11 704 s / 0.751). Run with --full-match --restart-between.
+    "speed-mux": [
+        ("B4-mux", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+                    "stream_analysis": True, "sam3_multiplex": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

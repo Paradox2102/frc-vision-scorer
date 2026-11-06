@@ -89,6 +89,85 @@ SAM3_RESEED_MAX_AGE = int(os.environ.get("SAM3_RESEED_MAX_AGE", "24"))
 # the full rationale/risk note). Module env default stays off for direct/
 # library callers; the pipeline passes the Knob value into the constructor.
 SAM3_MULTIPLEX = os.environ.get("SAM3_MULTIPLEX", "0") not in ("0", "false", "False")
+# Per-session object capacity for the SAM 3.1 multiplex model (the builder
+# default is 16). Every (re)seed mints a new obj_id and a chunk session never
+# removes objects, so a session's lifetime id count — not the ~6-robot roster —
+# is what hits the cap; at 16 a chunk filled within ~16 frames and every later
+# add_prompt was refused.
+SAM3_MULTIPLEX_MAX_OBJECTS = 64
+
+
+def _shim_init_state_drop_state_offload(model: Any) -> None:
+    """Sam3BasePredictor.start_session unconditionally forwards
+    offload_state_to_cpu into model.init_state(**kwargs), but the 3.1
+    multiplex model's init_state doesn't accept it — every session raised
+    TypeError and all views fell to the no-SAM3 fallback (qm11 2026-07-20
+    A/B). Shim the built model's init_state to accept-and-drop the kwarg,
+    signature-guarded so a fixed upstream disables it."""
+    import functools
+    import inspect
+
+    init_state = getattr(model, "init_state", None)
+    if init_state is None:
+        return
+    try:
+        params = inspect.signature(init_state).parameters
+    except (TypeError, ValueError):
+        params = {}
+    accepts = "offload_state_to_cpu" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if accepts:
+        return
+
+    @functools.wraps(init_state)
+    def _drop_state_offload(*a, offload_state_to_cpu=False,
+                            _orig=init_state, **kw):
+        return _orig(*a, **kw)
+
+    model.init_state = _drop_state_offload
+
+
+def _shim_fetch_tolerate_uncached_frame(model: Any) -> None:
+    """When no add/refine was accepted since the previous propagate, the
+    multiplex model routes the request to ``propagation_fetch``, whose
+    ``fetch_and_process_single_frame_results`` indexes
+    ``cached_frame_outputs[frame_idx]`` unguarded — any frame never
+    propagated raises a bare ``KeyError: <frame_idx>``. Base SAM3 does
+    ``cached_frame_outputs.get(frame_idx, {})`` and yields an empty frame;
+    mirror that by inserting an empty placeholder for the duration of the
+    call only (no cached state is left behind)."""
+    import functools
+
+    fetch = getattr(model, "fetch_and_process_single_frame_results", None)
+    if fetch is None or getattr(fetch, "_frc_uncached_frame_shim", False):
+        return
+
+    @functools.wraps(fetch)
+    def _fetch_tolerating_uncached(inference_state, frame_idx, *a,
+                                   _orig=fetch, **kw):
+        cache = inference_state.get("cached_frame_outputs") \
+            if isinstance(inference_state, dict) else None
+        if not isinstance(cache, dict) or frame_idx in cache:
+            return _orig(inference_state, frame_idx, *a, **kw)
+        placeholder: dict = {}
+        cache[frame_idx] = placeholder
+        try:
+            return _orig(inference_state, frame_idx, *a, **kw)
+        finally:
+            if cache.get(frame_idx) is placeholder:
+                del cache[frame_idx]
+
+    _fetch_tolerating_uncached._frc_uncached_frame_shim = True
+    model.fetch_and_process_single_frame_results = _fetch_tolerating_uncached
+
+
+def _install_multiplex_shims(model: Any) -> None:
+    """Compat shims for the SAM 3.1 multiplex model (no-op without a model)."""
+    if model is None:
+        return
+    _shim_init_state_drop_state_offload(model)
+    _shim_fetch_tolerate_uncached_frame(model)
 
 
 def _list_frame_paths(frames_dir: str) -> list[str]:
@@ -247,7 +326,7 @@ class Sam3PredictorAdapter:
         for nx, ny in (neg or []):
             pts.append([nx / width, ny / height])
             lbl.append(0)
-        self._predictor.handle_request(
+        response = self._predictor.handle_request(
             {
                 "type": "add_prompt",
                 "session_id": chunk["session_id"],
@@ -258,6 +337,20 @@ class Sam3PredictorAdapter:
                 "rel_coordinates": True,
             }
         )
+        # An explicit ``"outputs": None`` is the multiplex model refusing a
+        # NEW object at its capacity (add_sam2_new_points); the add never
+        # enters the session's action history, so don't count it as
+        # prompted. A None response / missing key (base predictor, stubs)
+        # means accepted.
+        if isinstance(response, dict) and "outputs" in response \
+                and response["outputs"] is None:
+            chunk["refused"] = chunk.get("refused", 0) + 1
+            if chunk["refused"] == 1:
+                print(f"  [SAM3] add_prompt refused for obj {int(obj_id)} in "
+                      f"chunk [{chunk['lo']},{chunk['hi']}) (tracker object "
+                      f"capacity reached) — further refusals in this chunk "
+                      f"suppressed")
+            return
         chunk["prompted"].add(int(obj_id))
 
     def _open_chunk_for(self, state: dict, global_idx: int, *, reverse: bool) -> None:
@@ -293,6 +386,8 @@ class Sam3PredictorAdapter:
             # obj_ids prompted since the last propagate request in this
             # session; consumed (cleared) by each _stream_chunk call.
             "prompted": set(),
+            # add_prompts the session refused (object capacity reached)
+            "refused": 0,
         }
 
         # Seed: pending prompts that fall in this window, then carried
@@ -336,13 +431,19 @@ class Sam3PredictorAdapter:
             # memory climbs across chunk closes, session state is not being
             # released (close_session leak / lingering references); if it is
             # flat, the growth is intra-chunk (prompt accumulation).
+            refused = int(chunk.get("refused", 0) or 0)
+            refused_note = f" refused_prompts={refused}" if refused else ""
             try:
                 import torch
                 if torch.cuda.is_available():
                     alloc = torch.cuda.memory_allocated() / 2**30
                     reserved = torch.cuda.memory_reserved() / 2**30
                     print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']}) "
-                          f"VRAM allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+                          f"VRAM allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB"
+                          f"{refused_note}")
+                elif refused:
+                    print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']})"
+                          f"{refused_note}")
             except Exception:
                 pass
 
@@ -490,10 +591,12 @@ class Sam3FieldTracker(Sam2FieldTracker):
                 # use_fa3 param above: the builder's own default is True, and
                 # FlashAttention-3 is NOT installed on this host (see
                 # docs/SAM3.md) -- passing the builder's default would break
-                # at model-build time. Bucket capacity (max_num_objects /
-                # multiplex_count, both default 16) is left untouched: our
-                # ~6-robot rosters fit comfortably, and an untested larger
-                # capacity is a bigger risk than the default.
+                # at model-build time. Object capacity (max_num_objects,
+                # builder default 16) is NOT the roster size: each (re)seed
+                # mints a new obj_id and chunk sessions never remove objects,
+                # so 16 filled within ~16 frames and later adds were refused
+                # (see SAM3_MULTIPLEX_MAX_OBJECTS). multiplex_count (objects
+                # per bucket) stays at its default.
                 from sam3.model_builder import build_sam3_predictor
 
                 predictor = build_sam3_predictor(
@@ -501,35 +604,12 @@ class Sam3FieldTracker(Sam2FieldTracker):
                     checkpoint_path=checkpoint,
                     compile=compile_model,
                     use_fa3=False,
+                    max_num_objects=max(SAM3_MULTIPLEX_MAX_OBJECTS,
+                                        int(max_objects)),
                 )
-                # Sam3BasePredictor.start_session unconditionally forwards
-                # offload_state_to_cpu into model.init_state(**kwargs), but
-                # the 3.1 multiplex model's init_state doesn't accept it —
-                # every session raised TypeError and all views fell to the
-                # no-SAM3 fallback (qm11 2026-07-20 A/B). Shim the built
-                # model's init_state to accept-and-drop the kwarg,
-                # signature-guarded so a fixed upstream disables it.
-                import functools
-                import inspect
-
-                model = getattr(predictor, "model", None)
-                init_state = getattr(model, "init_state", None)
-                if init_state is not None:
-                    try:
-                        params = inspect.signature(init_state).parameters
-                    except (TypeError, ValueError):
-                        params = {}
-                    accepts = "offload_state_to_cpu" in params or any(
-                        p.kind is inspect.Parameter.VAR_KEYWORD
-                        for p in params.values()
-                    )
-                    if not accepts:
-                        @functools.wraps(init_state)
-                        def _drop_state_offload(*a, offload_state_to_cpu=False,
-                                                _orig=init_state, **kw):
-                            return _orig(*a, **kw)
-
-                        model.init_state = _drop_state_offload
+                # init_state offload kwarg + uncached-frame fetch KeyError —
+                # see the module-level shim helpers.
+                _install_multiplex_shims(getattr(predictor, "model", None))
             else:
                 from sam3.model_builder import build_sam3_video_predictor
 

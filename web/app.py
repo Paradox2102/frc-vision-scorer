@@ -8273,6 +8273,11 @@ class InferenceJob:
                             raise
                         except Exception as e:
                             print(f"  [{self.tracker_tag}] Error during propagation for view {view.name}: {e}")
+                            # Full traceback: a bare ``KeyError: 76`` (the
+                            # 2026-07-20 multiplex crash) is undiagnosable
+                            # from the message alone.
+                            import traceback as _tb
+                            _tb.print_exc()
                             # A dead view means a mostly-empty overlay for that
                             # camera; without this warning the job still reports
                             # "completed" and the gap reads as a tracker bug

@@ -549,6 +549,14 @@ PROFILES = {
         ("B4-mux", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
                     "stream_analysis": True, "sam3_multiplex": True}),
     ],
+    # Full-match multiplex OOMs at the default 200-frame chunk (10-12
+    # singleton object states per session); 100-frame chunks halve the
+    # per-session accumulation.
+    "speed-mux-c100": [
+        ("B4-mux-c100", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+                         "stream_analysis": True, "sam3_multiplex": True,
+                         "sam3_chunk_frames": 100}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

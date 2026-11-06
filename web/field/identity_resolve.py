@@ -529,6 +529,33 @@ def apply_evidence_floor(
     return kept, dropped
 
 
+def label_share(scores: dict | None, team) -> dict:
+    """How strongly a slot's evidence backs its label: the label team's share
+    of the slot's total (non-negative) team score, plus the strongest other
+    team (``runner_up_team``) and its share. ``scores`` is the slot's
+    {team: score} (``combine_scores``: summed read vote_weight + gallery
+    blend), the same numbers the whole-match assignment used.
+
+    Returns ``{"label_share", "runner_up_team", "runner_up_share"}``: all
+    None with no evidence (no scores / zero total); ``label_share`` None for
+    an unlabelled slot (its runner-up is then the best-scoring team, a
+    suggestion for review); a single-team slot labelled with that team is
+    1.0 with no runner-up. Shares are rounded to 4 dp.
+    """
+    pos = {str(t): max(0.0, float(v)) for t, v in (scores or {}).items()}
+    total = sum(pos.values())
+    if total <= SCORE_EPS:
+        return {"label_share": None, "runner_up_team": None, "runner_up_share": None}
+    team = None if team is None else str(team)
+    share = None if team is None else round(pos.get(team, 0.0) / total, 4)
+    others = sorted(((v, t) for t, v in pos.items() if t != team and v > SCORE_EPS),
+                    key=lambda vt: (-vt[0], vt[1]))
+    if not others:
+        return {"label_share": share, "runner_up_team": None, "runner_up_share": None}
+    return {"label_share": share, "runner_up_team": others[0][1],
+            "runner_up_share": round(others[0][0] / total, 4)}
+
+
 def vlm_read_rows_from_jsonl(lines) -> list[dict]:
     """``vlm_read`` rows from diagnostic JSONL lines (an iterable of str).
 
@@ -571,7 +598,9 @@ def resolve_slot_labels(
     (qm11 80a1cd4c: 5 of 6 final identities were born in the last ~10 s).
 
     Returns ``{"slot_meta", "changes", "assignment", "contested", "scores",
-    "evidence", "stats"}``; ``slot_meta`` is a new dict (input unmutated).
+    "evidence", "stats", "label_conf"}``; ``slot_meta`` is a new dict (input
+    unmutated); ``label_conf`` is ``{slot_id: label_share(...)}`` for every
+    slot in ``slot_meta`` against its final label.
     """
     evidence, stats = build_slot_evidence(
         vlm_read_rows, identity_log, votes_by_slot, gallery_by_slot, slot_alliance)
@@ -587,7 +616,10 @@ def resolve_slot_labels(
         norm_meta, assignment, scores, confirm_margin=confirm_margin,
         strip_slots=contested)
     stats = {**stats, "contested": sorted(contested)}
+    label_conf = {sid: label_share(scores.get(sid), m.get("team_number"))
+                  for sid, m in new_meta.items()}
     return {
+        "label_conf": label_conf,
         "slot_meta": new_meta,
         "changes": changes,
         "assignment": assignment,

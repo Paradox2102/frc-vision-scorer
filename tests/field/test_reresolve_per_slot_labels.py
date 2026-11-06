@@ -174,3 +174,19 @@ def test_tied_slot_is_left_unassigned_and_live_label_stripped(tmp_path, monkeypa
     job._reresolve_replay_frames()
     assert job._resolved_team_by_slot == {2: None}
     assert all(fr["robots"][0]["team_number"] is None for fr in job._replay.frames)
+
+
+def test_reresolve_keeps_slot_scores_for_label_share(tmp_path, monkeypatch):
+    """The whole-match scores behind each label are kept so the DB rows and
+    the replay summary can report the label's share + runner-up."""
+    from web.field.identity_resolve import label_share
+    job = _job(tmp_path, monkeypatch)
+    _churny_match(job, tmp_path, noise=[
+        {"frame": 8, "robot_id": 100, "matched_team": "2992"}])
+    job._reresolve_replay_frames()
+    scores = job._slot_label_scores
+    assert scores[0] == {"4786": 12.0, "2992": 1.0}
+    lc = label_share(scores[0], job._final_slot_meta[0]["team_number"])
+    assert lc == {"label_share": round(12 / 13, 4), "runner_up_team": "2992",
+                  "runner_up_share": round(1 / 13, 4)}
+    assert label_share(scores[1], "3181")["label_share"] == 1.0

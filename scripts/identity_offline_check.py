@@ -174,6 +174,10 @@ def run_check(bindings, frame_nums, reads, truth: dict, slot_meta=None,
             "confirmed": bool(res["slot_meta"].get(sid, {}).get("confirmed")),
             "scores": {t: round(v, 3) for t, v in sorted(
                 res["scores"].get(sid, {}).items(), key=lambda kv: -kv[1])},
+            # The label's share of the slot's team score + the runner-up
+            # (what the replay review list shows; None without evidence).
+            **res["label_conf"].get(sid, {"label_share": None, "runner_up_team": None,
+                                          "runner_up_share": None}),
         }
     per_slot_ids = defaultdict(set)
     for row in ilog:
@@ -201,12 +205,18 @@ def format_report(res: dict) -> str:
         + f" used={st['reads_used']} "
         f"dropped_misattr={st['reads_dropped_misattributed']} "
         f"fallback={st['fallback_used']} contested={[LABELS[s] for s in st['contested']]}",
-        f"{'slot':<5}{'truth':<7}{'resolved':<10}{'today':<8}{'status':<7}scores",
+        f"{'slot':<5}{'truth':<7}{'resolved':<10}{'today':<8}{'status':<7}"
+        f"{'share':<7}{'runner-up':<15}scores",
     ]
     for lab, s in res["slots"].items():
         conf = "*" if s["confirmed"] else ""
+        share = s.get("label_share")
+        share_s = "-" if share is None else f"{share:.0%}"
+        ru = s.get("runner_up_team")
+        ru_s = "-" if ru is None else f"{ru} {s.get('runner_up_share') or 0:.0%}"
         lines.append(f"{lab:<5}{str(s['truth']):<7}{str(s['resolved']) + conf:<10}"
-                     f"{str(s['today']):<8}{s['status']:<7}{s['scores']}")
+                     f"{str(s['today']):<8}{s['status']:<7}{share_s:<7}{ru_s:<15}"
+                     f"{s['scores']}")
     lines.append(f"per-slot resolve: {res['correct']}/6 correct, {res['wrong']} wrong, "
                  f"{res['blank']} blank (today {res['today_correct']}/6)  "
                  f"[* = confirmed, margin >= 2.0]")

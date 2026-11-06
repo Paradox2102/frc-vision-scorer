@@ -1511,6 +1511,10 @@ class InferenceJob:
         # None unless global_identity_resolve ran. Feeds the replay row's
         # blue_teams/red_teams.
         self._final_slot_meta: Optional[dict] = None
+        # Per-slot {team: score} behind the whole-match labels (slot_id ->
+        # scores; None unless global_identity_resolve ran). The DB rows and
+        # the replay summary derive label_share / runner_up from it.
+        self._slot_label_scores: Optional[dict] = None
         # Time-varying per-slot team segments (slot_id -> [segment dict]); None
         # unless identity_swap_resolve or identity_segment_resolve ran. Feeds
         # the replay per-frame labels, the replay events and
@@ -6795,6 +6799,7 @@ class InferenceJob:
                 new_meta, changes, gstats = res["slot_meta"], res["changes"], res["stats"]
                 slot_meta = new_meta
                 self._final_slot_meta = {sid: dict(m) for sid, m in new_meta.items()}
+                self._slot_label_scores = {sid: dict(sc) for sid, sc in res["scores"].items()}
                 for ch in changes:
                     iid = assignments.get(ch["slot_id"])
                     if iid is not None:
@@ -9442,6 +9447,7 @@ class InferenceJob:
                 rec = getattr(self, "_replay", None)
                 if rec is not None and rec.is_open:
                     status = "complete" if self.status == "completed" else "partial"
+                    from web.field.identity_resolve import label_share as _label_share
                     blue_teams = [self.robot_tracks[s].team_number for s in sorted(self.robot_tracks)
                                   if self.robot_tracks[s].alliance == "blue"]
                     red_teams = [self.robot_tracks[s].team_number for s in sorted(self.robot_tracks)
@@ -9481,6 +9487,16 @@ class InferenceJob:
                             if _fsm:
                                 blue_teams = [_fsm.get(s, {}).get("team_number") for s in range(3)]
                                 red_teams = [_fsm.get(s, {}).get("team_number") for s in range(3, 6)]
+                                # Per-slot label + how strongly the evidence
+                                # backs it (share of the slot's team score)
+                                # and the runner-up, for the review list.
+                                _sls = getattr(self, "_slot_label_scores", None) or {}
+                                summary["slot_labels"] = [
+                                    {"slot": s, "slot_label": self._slot_label(s),
+                                     "team_number": _fsm.get(s, {}).get("team_number"),
+                                     **_label_share(_sls.get(s),
+                                                    _fsm.get(s, {}).get("team_number"))}
+                                    for s in range(6)]
                         except Exception as e:
                             print(f"[backward-confirm] re-resolution skipped: {e}")
                     if TRACKER_TRACE and getattr(self, "_tracker_trace", None):
@@ -9526,23 +9542,29 @@ class InferenceJob:
             try:
                 identity_rows = []
                 crop_rows = []
+                from web.field.identity_resolve import label_share as _label_share
+                _sls = getattr(self, "_slot_label_scores", None)
                 for slot_id, identity_id in self._canonical_identity_slots().items():
                     robot = self.robot_tracks.get(identity_id)
                     if robot is None:
                         continue
                     crops = self._slot_crops.get(identity_id, [])
+                    # Global-resolve override (empty when knob off -> falls back
+                    # to the live value, byte-identical to legacy behavior).
+                    _team = getattr(self, "_resolved_team_by_slot", {}).get(
+                        identity_id, robot.team_number)
                     identity_rows.append({
                         "job_id": self.job_id, "identity_id": identity_id, "slot": slot_id,
                         "slot_label": self._slot_label(slot_id),
                         "alliance": robot.alliance,
-                        # Global-resolve override (empty when knob off -> falls back
-                        # to the live value, byte-identical to legacy behavior).
-                        "team_number": getattr(self, "_resolved_team_by_slot", {}).get(
-                            identity_id, robot.team_number),
+                        "team_number": _team,
                         "confirmed": int(bool(getattr(self, "_resolved_confirmed_by_slot", {}).get(
                             identity_id, robot.team_number_confirmed))),
                         "source": self._slot_source.get(identity_id, "ocr"),
                         "confidence": (crops[0]["quality"] if crops else None),
+                        # Label share of the slot's whole-match team score +
+                        # runner-up (NULL without the global resolve).
+                        **(_label_share(_sls.get(slot_id), _team) if _sls is not None else {}),
                     })
                     for c in crops:
                         has_embedding = c["embedding"] is not None
@@ -12700,6 +12722,11 @@ async def get_replay_identities(job_id: str):
             "alliance": r["alliance"],
             "team_number": r["team_number"], "confirmed": bool(r["confirmed"]),
             "source": r["source"], "confidence": r["confidence"],
+            # Whole-match label confidence (None on older rows / no global
+            # resolve): the label's share of the slot's team score + runner-up.
+            "label_share": r.get("label_share"),
+            "runner_up_team": r.get("runner_up_team"),
+            "runner_up_share": r.get("runner_up_share"),
             "identity_id": identity_id,
             "crops": [
                 "data:image/jpeg;base64," + base64.b64encode(c["image"]).decode()
@@ -12747,9 +12774,24 @@ async def correct_replay_identity(job_id: str, request: Request):
     resolved_slot = rec.get("slot")
         
     alliance = rec["alliance"]
-    # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence)
+    # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence).
+    # The stored label share describes the OLD label: picking the runner-up
+    # swaps label and runner-up (shares included); any other new team has an
+    # unknown share, so the share is cleared and the old label becomes the
+    # alternative (its share kept). Re-saving the same team changes nothing.
+    conf = {}
+    old_team = rec.get("team_number")
+    if str(old_team) != team:
+        if rec.get("runner_up_team") is not None and str(rec["runner_up_team"]) == team:
+            conf = {"label_share": rec.get("runner_up_share"),
+                    "runner_up_team": old_team, "runner_up_share": rec.get("label_share")}
+        else:
+            conf = {"label_share": None,
+                    "runner_up_team": old_team,
+                    "runner_up_share": rec.get("label_share") if old_team is not None else None}
     await database.upsert_match_robot_identity(
-        {**rec, "job_id": job_id, "identity_id": resolved_identity_id, "team_number": team})
+        {**rec, **conf, "job_id": job_id, "identity_id": resolved_identity_id,
+         "team_number": team})
     # 2. update the replay's team lists for display + mint exemplars
     replay = await database.get_replay(job_id)
     minted = 0

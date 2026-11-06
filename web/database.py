@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS match_robot_identity (
     source TEXT,
     confidence REAL,
     created_at TEXT DEFAULT (datetime('now')),
+    label_share REAL,
+    runner_up_team TEXT,
+    runner_up_share REAL,
     PRIMARY KEY (job_id, identity_id)
 );
 CREATE TABLE IF NOT EXISTS match_robot_binding (
@@ -241,6 +244,19 @@ async def _migrate_identity_tables(db) -> None:
     )
 
 
+_IDENTITY_LABEL_CONF_COLUMNS = (("label_share", "REAL"), ("runner_up_team", "TEXT"),
+                                ("runner_up_share", "REAL"))
+
+
+async def _migrate_identity_label_conf(db) -> None:
+    """Add match_robot_identity.label_share / runner_up_team / runner_up_share
+    to a pre-existing table. Idempotent: only missing columns are added."""
+    have = await _table_columns(db, "match_robot_identity")
+    for col, typ in _IDENTITY_LABEL_CONF_COLUMNS:
+        if col not in have:
+            await db.execute(f"ALTER TABLE match_robot_identity ADD COLUMN {col} {typ}")
+
+
 async def init_db():
     """Initialize the database and create tables if they don't exist."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -271,6 +287,11 @@ async def init_db():
                 await db.execute(f"ALTER TABLE match_robot_crop ADD COLUMN {col_def}")
             except Exception:
                 pass  # column already exists
+        # Whole-match label confidence (finalize resolve): the label team's
+        # share of the slot's team score + the runner-up team and its share.
+        # NULL on rows written before the columns existed (or without the
+        # global resolve). ``confidence`` stays the best crop's quality.
+        await _migrate_identity_label_conf(db)
         # identity_segment_resolve: per-segment label source on a table that
         # predates it.
         if "source" not in await _table_columns(db, "match_robot_identity_segment"):
@@ -928,11 +949,13 @@ async def upsert_match_robot_identity(row: Dict[str, Any]) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO match_robot_identity "
-            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, "
+            "confidence, label_share, runner_up_team, runner_up_share) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (row["job_id"], identity_id, row.get("slot"), row.get("slot_label"), row.get("alliance"),
              row.get("team_number"), int(row.get("confirmed", 0)), row.get("source"),
-             row.get("confidence")))
+             row.get("confidence"), row.get("label_share"), row.get("runner_up_team"),
+             row.get("runner_up_share")))
         await db.commit()
 
 
@@ -968,14 +991,16 @@ async def upsert_match_robot_identities(rows: List[Dict[str, Any]]) -> None:
     params = [
         (row["job_id"], _identity_key(row), row.get("slot"), row.get("slot_label"),
          row.get("alliance"), row.get("team_number"), int(row.get("confirmed", 0)),
-         row.get("source"), row.get("confidence"))
+         row.get("source"), row.get("confidence"), row.get("label_share"),
+         row.get("runner_up_team"), row.get("runner_up_share"))
         for row in rows
     ]
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany(
             "INSERT OR REPLACE INTO match_robot_identity "
-            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
+            "(job_id, identity_id, slot, slot_label, alliance, team_number, confirmed, source, "
+            "confidence, label_share, runner_up_team, runner_up_share) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
         await db.commit()
 
 

@@ -88,11 +88,12 @@ JEV_ESCAPE_TEXT = {
     "other": "Legible bumper digits that are NOT any of the listed teams",
 }
 
-# Offer only the expected alliance's teams when the bumper colour is known
-# (the bench's "alliance" option mode, which the 59/90 / 0-wrong numbers and
-# the 0.17 tentative fit come from); all roster teams when it is unknown. The
-# "other" escape covers a wrong colour hint (missing-true bench: 0/116 named).
-JEV_ALLIANCE_OPTIONS = True
+# Offer all 6 roster teams (False) or only the expected alliance's 3 when the
+# bumper colour is known (True). 200-crop bench, Nov 5, with the 0.17 tentative
+# rule: all 6 = 70/90 legible right, 0 wrong, 2% FP (tentative 11 right / 0
+# wrong); alliance-only = 72 right, 1 wrong, and with the true team withheld
+# (a wrong colour hint) 5 wrong tentative reads. All 6 also matches live Clef.
+JEV_ALLIANCE_OPTIONS = False
 
 
 # --------------------------------------------------------------------------- #

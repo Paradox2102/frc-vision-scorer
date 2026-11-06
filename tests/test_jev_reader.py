@@ -164,10 +164,12 @@ def test_payload_shape_ref_model_header_and_escapes(monkeypatch):
     assert min(w, h_) >= 280
     assert set(p["questions"]) == {"team"}                  # no subject question
     crit = p["questions"]["team"]["criteria"]
-    # Blue colour hint -> the blue alliance's teams + the four escapes.
-    assert set(crit) == set(BLUE) | set(ESC)
+    # JEV_ALLIANCE_OPTIONS is off: even with a blue colour hint, all 6 roster
+    # teams + the four escapes, under the neutral roster line.
+    assert set(crit) == set(RED) | set(BLUE) | set(ESC)
     assert crit["4786"] == "Team 4786 (blue alliance)"
-    assert "Teams on the blue alliance in this match: 4786, 6800, 870." in p["state"]["context"]
+    assert "Teams in this match:" in p["state"]["context"]
+    assert "Teams on the blue alliance" not in p["state"]["context"]
     assert "`crop`" in p["questions"]["team"]["instructions"]
 
 

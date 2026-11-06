@@ -534,6 +534,12 @@ PROFILES = {
         ("B2-+selective", _SPEED_B2),
         ("B3-+stream", {**_SPEED_B2, "stream_analysis": True}),
     ],
+    # Nov 6: selective cut auto coverage at fps5 (qm8 2724 100->32%), so
+    # trade it for a lower track rate instead: fps4 + corner stride 3 + stream.
+    "speed-b4": [
+        ("B4-fps4-cs3-stream", {**_SPEED_R, "sam2_track_fps": 4,
+                                "corner_track_stride": 3, "stream_analysis": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 
@@ -740,7 +746,7 @@ def main(args) -> None:
         if row["timings"]:
             print(f"  timings={row['timings']}", flush=True)
     # summary table
-    print("\n\n===== A/B SUMMARY (2026cur qm8) =====", flush=True)
+    print(f"\n\n===== A/B SUMMARY ({MATCH_KEY}) =====", flush=True)
     print(f"{'config':>13} {'aggMeanNN':>10} {'redMeanNN':>10} {'nRed':>5} {'redCov%':>28}", flush=True)
     for r in results:
         m = r["metrics"]

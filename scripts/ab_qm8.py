@@ -540,6 +540,23 @@ PROFILES = {
         ("B4-fps4-cs3-stream", {**_SPEED_R, "sam2_track_fps": 4,
                                 "corner_track_stride": 3, "stream_analysis": True}),
     ],
+    # Nov 6: B4 + SAM 3.1 Object Multiplex (joint multi-object propagation).
+    # SAM costs ~500 ms/frame/view regardless of fps because the base
+    # predictor propagates objects one at a time; multiplex is the remaining
+    # lever toward < 8 min. Compare against speed-b4 (qm8 754 s / 0.795,
+    # qm11 704 s / 0.751). Run with --full-match --restart-between.
+    "speed-mux": [
+        ("B4-mux", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+                    "stream_analysis": True, "sam3_multiplex": True}),
+    ],
+    # Full-match multiplex OOMs at the default 200-frame chunk (10-12
+    # singleton object states per session); 100-frame chunks halve the
+    # per-session accumulation.
+    "speed-mux-c100": [
+        ("B4-mux-c100", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+                         "stream_analysis": True, "sam3_multiplex": True,
+                         "sam3_chunk_frames": 100}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 
@@ -674,7 +691,9 @@ def score(expect_replay: str | None = None) -> dict:
     replay PER KEY THAT HAS PATHS, so a job that exports zero autonomous_paths
     silently inherits the previous replay's score (2026-07-20: the post-shim
     mux arm scored the prior gir arm's replay bit-for-bit). Refuse that."""
-    ours = load_our_auto_paths("2026cur")
+    # Score ONLY this job's replay: load_our_auto_paths is newest-per-SLOT,
+    # so a replay missing a slot silently inherits it from an older run.
+    ours = load_our_auto_paths("2026cur", only_replay=expect_replay)
     if expect_replay is not None:
         rids = {rec["replay_id"] for key, rec in ours.items() if key[0] == MATCH}
         if expect_replay not in rids:

@@ -4,7 +4,14 @@ import cv2
 import numpy as np
 import pytest
 
-from web.field.sam3_tracker import Sam3FieldTracker, Sam3PredictorAdapter
+from web.field.sam3_tracker import (
+    SAM3_MULTIPLEX_MAX_OBJECTS,
+    Sam3FieldTracker,
+    Sam3PredictorAdapter,
+    _install_multiplex_shims,
+    _trim_cond_memory,
+    _trim_non_cond_memory,
+)
 
 
 class StubSam3Predictor:
@@ -618,6 +625,7 @@ def test_sam3_multiplex_on_uses_multiplex_builder_with_fa3_forced_off(monkeypatc
         "checkpoint_path": "ckpt.pt",
         "compile": True,
         "use_fa3": False,
+        "max_num_objects": SAM3_MULTIPLEX_MAX_OBJECTS,
     }
 
 
@@ -677,6 +685,283 @@ def test_sam3_multiplex_leaves_native_init_state_unshimmed(monkeypatch):
                         lambda **kw: built)
     Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True)
     assert built.model.init_state.__func__ is Model.init_state
+
+
+def test_sam3_multiplex_raises_object_capacity_above_builder_default(monkeypatch):
+    """The 3.1 builder defaults max_num_objects=16, but a chunk session's
+    lifetime obj_id count (every re-seed mints a new id, nothing is removed)
+    blows through 16 within ~16 frames; every later add was refused and the
+    following fetch-propagate crashed with KeyError. The multiplex build must
+    pass an explicit, larger capacity (and never below max_objects)."""
+    calls = _patch_sam3_builders(monkeypatch)
+    Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True)
+    assert calls["multiplex"]["max_num_objects"] >= 64
+    assert SAM3_MULTIPLEX_MAX_OBJECTS >= 64
+
+    calls = _patch_sam3_builders(monkeypatch)
+    Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True, max_objects=200)
+    assert calls["multiplex"]["max_num_objects"] == 200
+
+
+class _FetchModel:
+    """Mimics the multiplex model's unguarded propagation_fetch lookup."""
+
+    def __init__(self):
+        self.seen = []
+
+    def fetch_and_process_single_frame_results(self, inference_state, frame_idx):
+        obj_id_to_mask = inference_state["cached_frame_outputs"][frame_idx]
+        self.seen.append(obj_id_to_mask)
+        return frame_idx, {"n": len(obj_id_to_mask)}
+
+
+def test_sam3_multiplex_fetch_shim_tolerates_uncached_frame():
+    """propagation_fetch on a never-propagated frame raised a bare
+    KeyError(frame_idx) upstream; the shim must yield an empty frame (base
+    SAM3 semantics) without leaving a placeholder in cached_frame_outputs,
+    and pass real cached outputs through untouched."""
+    model = _FetchModel()
+    _install_multiplex_shims(model)
+
+    real = {7: "mask"}
+    state = {"cached_frame_outputs": {3: real}}
+    assert model.fetch_and_process_single_frame_results(state, 50) == (50, {"n": 0})
+    assert model.seen[-1] == {}
+    assert state["cached_frame_outputs"] == {3: real}, "placeholder leaked"
+
+    assert model.fetch_and_process_single_frame_results(state, 3) == (3, {"n": 1})
+    assert model.seen[-1] is real
+    assert state["cached_frame_outputs"] == {3: real}
+
+
+def test_sam3_multiplex_build_output_shim_keeps_refined_masks_on_uncached_frame():
+    """Upstream multiplex ``_build_sam2_output`` returns {} for any frame not
+    in cached_frame_outputs, discarding the masks partial propagation just
+    produced — instance-prompt tracking came back empty on every propagated
+    frame. Runs the REAL upstream method on a stub object: unshimmed it drops
+    the refined masks; shimmed it returns them (base SAM3 semantics), merges
+    over a cached frame as before, and leaves no placeholder behind."""
+    import types
+
+    mt = pytest.importorskip("sam3.model.sam3_multiplex_tracking")
+    real_build = mt.Sam3MultiplexTrackingWithInteractivity._build_sam2_output
+
+    class Model:
+        pass
+
+    refined = {1: "m1", 3: "m3"}
+    raw = Model()
+    raw._build_sam2_output = types.MethodType(real_build, raw)
+    state = {"cached_frame_outputs": {}}
+    assert raw._build_sam2_output(state, 5, refined) == {}, \
+        "upstream no longer drops refined masks — shim may be obsolete"
+
+    model = Model()
+    model._build_sam2_output = types.MethodType(real_build, model)
+    _install_multiplex_shims(model)
+    assert model._build_sam2_output(state, 5, refined) == refined
+    assert state["cached_frame_outputs"] == {}, "placeholder leaked"
+
+    cached = {2: "c2", 3: "old"}
+    state = {"cached_frame_outputs": {4: cached}}
+    assert model._build_sam2_output(state, 4, refined) == {2: "c2", 3: "m3", 1: "m1"}
+    assert state["cached_frame_outputs"] == {4: {2: "c2", 3: "old"}}
+
+    first = model._build_sam2_output
+    _install_multiplex_shims(model)
+    assert model._build_sam2_output is first, "double-wrapped"
+
+
+def _heavy_out(t):
+    return {"maskmem_features": f"mf{t}", "maskmem_pos_enc": [f"pe{t}"],
+            "image_features": f"if{t}", "image_pos_enc": f"ip{t}",
+            "pred_masks_high_res": f"hr{t}", "pred_masks": f"pm{t}",
+            "obj_ptr": f"op{t}", "object_score_logits": 1.0}
+
+
+def test_mux_memory_trim_keeps_attention_window_and_entries():
+    """Multiplex singleton states grew ~19 MB/object/frame unbounded (OOM ~20
+    frames in). Trimming strips heavy tensors only outside what memory
+    attention reads, and never deletes entries (preflight asserts
+    consolidated cond indices exist; the gather skips maskmem=None)."""
+    od = {"non_cond_frame_outputs": {t: _heavy_out(t) for t in range(0, 30)},
+          "cond_frame_outputs": {t: _heavy_out(t) for t in (0, 3, 9, 15, 21, 24, 27, 29)}}
+    assert _trim_non_cond_memory(od, 29, 7) == 22
+    nc = od["non_cond_frame_outputs"]
+    assert set(nc) == set(range(30)), "entries must be kept"
+    for t in range(22, 30):
+        assert nc[t]["maskmem_features"] == f"mf{t}"
+    for t in range(0, 22):
+        assert "maskmem_features" not in nc[t] and "image_features" not in nc[t]
+        assert nc[t]["pred_masks"] == f"pm{t}" and nc[t]["obj_ptr"] == f"op{t}"
+
+    assert _trim_cond_memory(od, 29, 4) == 3
+    cond = od["cond_frame_outputs"]
+    assert set(cond) == {0, 3, 9, 15, 21, 24, 27, 29}
+    kept = {t for t, o in cond.items() if "maskmem_features" in o}
+    assert kept == {0, 21, 24, 27, 29}, "first + 4 closest keep memory"
+    assert _trim_cond_memory(od, 29, 4) == 0, "idempotent"
+    assert _trim_non_cond_memory({}, 3, 7) == 0
+    assert _trim_cond_memory({"cond_frame_outputs": {1: _heavy_out(1)}}, 9, 4) == 0
+
+
+def test_mux_memory_shim_wraps_step_once_and_trims_states():
+    class Tracker:
+        use_memory_selection = False
+        num_maskmem = 2
+        memory_temporal_stride_for_eval = 1
+
+    class Model:
+        tracker = Tracker()
+
+        def _propogate_tracker_one_frame_local_gpu(self, states, frame_idx, reverse):
+            return "out"
+
+    m = Model()
+    _install_multiplex_shims(m)
+    first = m._propogate_tracker_one_frame_local_gpu
+    _install_multiplex_shims(m)
+    assert m._propogate_tracker_one_frame_local_gpu is first
+    st = {"output_dict": {"non_cond_frame_outputs": {t: _heavy_out(t) for t in range(6)},
+                          "cond_frame_outputs": {0: _heavy_out(0)}}}
+    assert m._propogate_tracker_one_frame_local_gpu([st], 5, False) == "out"
+    nc = st["output_dict"]["non_cond_frame_outputs"]
+    assert [t for t in nc if "maskmem_features" in nc[t]] == [3, 4, 5]
+
+    class MS(Model):
+        tracker = type("T", (), {"use_memory_selection": True})()
+
+    ms = MS()
+    _install_multiplex_shims(ms)
+    assert not getattr(ms._propogate_tracker_one_frame_local_gpu,
+                       "_frc_bound_memory_shim", False), "no trim under memory selection"
+
+
+def test_sam3_multiplex_fetch_shim_cleans_up_on_error_and_is_idempotent():
+    class Boom(_FetchModel):
+        def fetch_and_process_single_frame_results(self, inference_state,
+                                                   frame_idx):
+            inference_state["cached_frame_outputs"][frame_idx]
+            raise RuntimeError("boom")
+
+    model = Boom()
+    _install_multiplex_shims(model)
+    first = model.fetch_and_process_single_frame_results
+    _install_multiplex_shims(model)
+    assert model.fetch_and_process_single_frame_results is first, "double-wrapped"
+
+    state = {"cached_frame_outputs": {}}
+    with pytest.raises(RuntimeError):
+        model.fetch_and_process_single_frame_results(state, 9)
+    assert state["cached_frame_outputs"] == {}
+
+
+def test_sam3_multiplex_shims_tolerate_model_without_methods(monkeypatch):
+    """No crash when the built model lacks init_state / fetch (or is absent)."""
+    _install_multiplex_shims(None)
+    _install_multiplex_shims(object())
+
+    class Bare:
+        pass
+
+    bare = Bare()
+    _install_multiplex_shims(bare)
+    assert not hasattr(bare, "fetch_and_process_single_frame_results")
+
+    calls = _patch_sam3_builders(monkeypatch)  # builder returns object()
+    Sam3FieldTracker(checkpoint="ckpt.pt", multiplex=True)
+    assert calls["multiplex"] is not None
+
+
+class CapacityStubPredictor(ActionHistoryStubPredictor):
+    """Refuses NEW obj_ids beyond ``capacity`` per session the way the
+    multiplex model does: ``{"frame_index": f, "outputs": None}``, and the
+    refused add never enters the action history."""
+
+    def __init__(self, capacity):
+        super().__init__()
+        self.capacity = capacity
+
+    def handle_request(self, request):
+        if request["type"] == "add_prompt":
+            self.requests.append(request)
+            sess = self._sessions[request["session_id"]]
+            known = sess.setdefault("known", set())
+            oid = request["obj_id"]
+            if oid not in known and len(known) >= self.capacity:
+                return {"frame_index": request["frame_index"], "outputs": None}
+            known.add(oid)
+            sess["prompted_since"].add(oid)
+            return {"frame_index": request["frame_index"], "outputs": {}}
+        return super().handle_request(request)
+
+
+def test_sam3_adapter_counts_refused_prompts_and_warns_once(tmp_path, capsys):
+    _write_frames(tmp_path, 8)
+    raw = CapacityStubPredictor(capacity=2)
+    adapter = Sam3PredictorAdapter(raw, chunk_frames=16)
+    state = adapter.init_state(video_path=str(tmp_path))
+    for oid in (1, 2, 3, 4):
+        adapter.add_new_points_or_box(
+            state, frame_idx=0, obj_id=oid,
+            box=np.array([1, 1, 5, 5], np.float32),
+        )
+    # Prompts are queued until the first propagate opens the chunk.
+    gen = adapter.propagate_in_video(state, start_frame_idx=0,
+                                     max_frame_num_to_track=3)
+    first = next(gen)
+    chunk = state["chunk"]
+    # 3 and 4 refused at the chunk-open seed, then retried (and refused
+    # again) by the pre-propagate roster refresh since they never entered
+    # `prompted`.
+    assert chunk["refused"] == 4
+    assert chunk["prompted"] == set()  # consumed by the propagate
+    assert set(first[1].tolist()) == {1, 2}
+    rest = list(gen)
+    assert all(set(ids.tolist()) == {1, 2} for _, ids, *_ in rest)
+
+    # Mid-chunk adds after the propagate: accepted ones land in `prompted`,
+    # refused ones don't.
+    adapter.add_new_points_or_box(
+        state, frame_idx=2, obj_id=1, box=np.array([1, 1, 5, 5], np.float32)
+    )
+    adapter.add_new_points_or_box(
+        state, frame_idx=2, obj_id=5, box=np.array([1, 1, 5, 5], np.float32)
+    )
+    assert state["chunk"]["prompted"] == {1}
+    assert state["chunk"]["refused"] == 5
+
+    out = capsys.readouterr().out
+    warn = [l for l in out.splitlines() if "add_prompt refused" in l]
+    assert len(warn) == 1
+    assert "obj 3" in warn[0] and "[0,8)" in warn[0]
+    adapter.reset_state(state)
+
+
+def test_sam3_adapter_treats_missing_outputs_as_accepted(tmp_path):
+    """Only an explicit ``"outputs": None`` means refused; a None response or
+    a response without the key (base predictor, stubs) is accepted."""
+    _write_frames(tmp_path, 4)
+
+    class NoneResponse(StubSam3Predictor):
+        def handle_request(self, request):
+            if request["type"] == "add_prompt":
+                self.requests.append(request)
+                return None if request["obj_id"] == 1 else {"frame_index": 0}
+            return super().handle_request(request)
+
+    adapter = Sam3PredictorAdapter(NoneResponse(), chunk_frames=16)
+    state = adapter.init_state(video_path=str(tmp_path))
+    list(adapter.propagate_in_video(state, start_frame_idx=0,
+                                    max_frame_num_to_track=1))
+    for oid in (1, 2):
+        adapter.add_new_points_or_box(
+            state, frame_idx=1, obj_id=oid,
+            box=np.array([1, 1, 5, 5], np.float32),
+        )
+    assert state["chunk"]["prompted"] == {1, 2}
+    assert state["chunk"]["refused"] == 0
+    adapter.reset_state(state)
 
 
 def test_solo_ids_scopes_open_chunk_for_boundary_reseed(tmp_path):

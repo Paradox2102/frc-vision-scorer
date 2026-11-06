@@ -52,7 +52,7 @@ def _make_job(slots=SLOTS):
     """Bare InferenceJob with a REAL IdentityRegistry / ConfidenceConfig and
     the REAL scheduler + read-pass methods (only the reader is faked)."""
     job = InferenceJob.__new__(InferenceJob)
-    job.config = JobConfig()
+    job.config = JobConfig({"read_census": False, "read_keep_evicted": False})
     job._camera_centers_xy = {}
     job.match_teams = list(TEAMS)
     job.match_blue_teams = TEAMS[:3]

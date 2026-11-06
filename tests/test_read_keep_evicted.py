@@ -1,4 +1,4 @@
-"""read_keep_evicted (knob, default OFF): a bumper read whose identity is
+"""read_keep_evicted (knob, default ON since Nov 6 2026; tests pin it explicitly): a bumper read whose identity is
 evicted (registry caps) while the read is in flight still writes its
 vlm_read row, flagged ``"evicted": true``, as evidence for the finalize slot
 resolvers — and nothing else (no vote, no live identity / backoff / census
@@ -46,7 +46,7 @@ def _make_job(diag_path, *, keep=False, current_frame=92):
     snapshot (_schedule_vlm_pass) and read pass; only the reader is faked.
     Identity 7 holds slot 1 (blue), identity 9 slot 4 (red)."""
     job = InferenceJob.__new__(InferenceJob)
-    job.config = JobConfig({"read_keep_evicted": True} if keep else {})
+    job.config = JobConfig({"read_keep_evicted": bool(keep)})
     job._camera_centers_xy = {}
     job.match_teams = ["4174", "1538"]
     job.match_blue_teams = ["4174"]
@@ -172,9 +172,9 @@ IDENTITY_LOG = [
 
 # ------------------------------------------------------------------ knob
 
-def test_knob_declared_default_off():
-    assert JobConfig().read_keep_evicted is False
-    assert JobConfig({"read_keep_evicted": True}).read_keep_evicted is True
+def test_knob_declared_default_on():
+    assert JobConfig().read_keep_evicted is True
+    assert JobConfig({"read_keep_evicted": False}).read_keep_evicted is False
 
 
 # ------------------------------------------------------- read pass: rows

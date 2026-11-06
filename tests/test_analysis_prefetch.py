@@ -201,8 +201,8 @@ def test_prefetch_runs_on_worker_thread():
 # ---------------------------------------------------------------------------
 # Knob registry + A/B speed-profile composition
 # ---------------------------------------------------------------------------
-def test_knob_default_off():
-    assert JobConfig().stream_analysis is False
+def test_knob_default_on():
+    assert JobConfig().stream_analysis is True
     assert "stream_analysis" not in JobConfig().non_defaults()
 
 

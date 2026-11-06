@@ -15,7 +15,7 @@ def test_defaults_without_env(monkeypatch):
     cfg = JobConfig()
     assert cfg.tracking_backend == "sam3"
     assert cfg.sam2_model_size == "small"
-    assert cfg.sam2_track_fps == 8.0
+    assert cfg.sam2_track_fps == 5.0
     assert cfg.sam2_export_scale == 0.5
     assert cfg.reprompt_seconds == 2.0
     assert cfg.cull_hijack_enabled is False
@@ -356,10 +356,10 @@ def test_sam3_multiplex_knob_env_and_override(monkeypatch):
     assert cfg2.sam3_multiplex is False
 
 
-def test_selective_mask_prop_knob_default_off(monkeypatch):
+def test_selective_mask_prop_knob_default_on(monkeypatch):
     monkeypatch.delenv("SELECTIVE_MASK_PROP", raising=False)
     cfg = JobConfig()
-    assert cfg.selective_mask_prop is False
+    assert cfg.selective_mask_prop is True
     assert cfg.selective_margin_entry == 0.05
     assert cfg.selective_margin_exit == 0.10
     assert cfg.selective_gap_trigger == 7
@@ -455,7 +455,7 @@ def test_selective_app_knobs_default(monkeypatch):
     monkeypatch.delenv("SELECTIVE_APP_WEIGHT", raising=False)
     monkeypatch.delenv("SELECTIVE_APP_EMA", raising=False)
     cfg = JobConfig()
-    assert cfg.selective_app_weight == 0.0
+    assert cfg.selective_app_weight == 0.3
     assert cfg.selective_app_ema == 0.9
 
 

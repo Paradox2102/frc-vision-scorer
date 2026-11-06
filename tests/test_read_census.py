@@ -47,7 +47,8 @@ def _job(tmp_path=None, *, census=False, interval=2.0, honor=False, reader="loca
     """Bare InferenceJob with a REAL IdentityRegistry / ConfidenceConfig and
     the REAL scheduler + read pass (only the reader is faked)."""
     job = InferenceJob.__new__(InferenceJob)
-    cfg = {"team_reader": reader}
+    # Pin the legacy (pre-Nov-6) OFF behaviour explicitly: defaults now ship ON.
+    cfg = {"team_reader": reader, "read_census": False, "read_keep_evicted": False}
     if census:
         cfg.update(read_census=True, read_census_interval_s=interval,
                    read_census_honor_backoff=honor)
@@ -591,13 +592,14 @@ def test_default_off_collect_equals_decide_vlm_read():
         assert job._collect_due_vlm_reads(now) == want
 
 
-def test_knobs_default_off_and_bounds():
+def test_knobs_default_on_and_bounds():
     cfg = JobConfig()
-    assert cfg.read_census is False
+    assert cfg.read_census is True
     assert cfg.read_census_interval_s == 2.0
     assert cfg.read_census_honor_backoff is False
     for k in ("read_census", "read_census_interval_s", "read_census_honor_backoff"):
         assert k not in cfg.non_defaults()
+    assert JobConfig({"read_census": False}).read_census is False
     on = JobConfig({"read_census": True, "read_census_interval_s": 3})
     assert on.read_census is True and on.read_census_interval_s == 3.0
     for bad in ({"read_census_interval_s": 0.1}, {"read_census_interval_s": 60.0}):

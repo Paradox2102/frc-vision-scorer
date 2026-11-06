@@ -54,8 +54,8 @@ class TestRuntimeOverrideResolution:
         assert JobConfig().corner_track_stride == 3
 
     def test_runtime_override_shows_in_non_defaults(self):
-        job_config.set_runtime_override("corner_track_stride", 3)
-        assert JobConfig().non_defaults()["corner_track_stride"] == 3
+        job_config.set_runtime_override("corner_track_stride", 4)
+        assert JobConfig().non_defaults()["corner_track_stride"] == 4
 
 
 class TestDescribeKnobs:
@@ -116,8 +116,8 @@ class TestSettingsEndpoints:
         client.post("/api/settings",
                     json={"name": "reprompt_seconds", "value": 3.0})
         client.post("/api/settings",
-                    json={"name": "corner_track_stride", "value": 3})
+                    json={"name": "corner_track_stride", "value": 4})
         r = client.post("/api/settings/reset")
         assert r.status_code == 200
         assert JobConfig().reprompt_seconds == 2.0
-        assert JobConfig().corner_track_stride == 2
+        assert JobConfig().corner_track_stride == 3

@@ -46,7 +46,12 @@ KNOBS = [
          choices=("sam2", "sam3"), section="Tracking backend"),
     Knob("sam2_model_size", "SAM2_MODEL_SIZE", str, "small",
          choices=("tiny", "small", "base_plus", "large"), section="Tracking backend"),
-    Knob("sam2_track_fps", "SAM2_TRACK_FPS", float, 8.0, min=0.5, max=60.0,
+    # Nov 6 2026 interim live-event defaults ("B3"): sam2_track_fps 5,
+    # corner_track_stride 3, selective_mask_prop + selective_app_weight 0.3,
+    # stream_analysis, team_reader jev + read_census + read_keep_evicted.
+    # Full match 8.9 min (qm8) / 11.3 min (qm11) vs ~25 min; costs some auto
+    # coverage on a few robots. Superseded once SAM 3.1 multiplex works.
+    Knob("sam2_track_fps", "SAM2_TRACK_FPS", float, 5.0, min=0.5, max=60.0,
          section="Tracking backend"),
     # Floor 0.25: below that SAM2 is starved of pixels; above 1.0 only
     # upsamples (no information) and inflates mask RAM.
@@ -162,7 +167,7 @@ KNOBS = [
     # defaults and are A/B-tunable. selective_margin_exit doubles as the seed
     # margin and selective_min_streak doubles as SEED/EXIT_CONSECUTIVE.
     # DEFAULT OFF pending qm8-qm12 A/B.
-    Knob("selective_mask_prop", "SELECTIVE_MASK_PROP", bool, False,
+    Knob("selective_mask_prop", "SELECTIVE_MASK_PROP", bool, True,
          section="Tracking backend"),
     Knob("selective_margin_entry", "SELECTIVE_MARGIN_ENTRY", float, 0.05,
          min=0.0, max=1.0, section="Tracking backend"),
@@ -213,7 +218,7 @@ KNOBS = [
     # same-alliance robots separate by appearance where motion+IoU cannot.
     # 0.0 = OFF (exact no-op). Track gallery EMA refreshes only on confident
     # matches (assignment margin >= selective_margin_exit).
-    Knob("selective_app_weight", "SELECTIVE_APP_WEIGHT", float, 0.0,
+    Knob("selective_app_weight", "SELECTIVE_APP_WEIGHT", float, 0.3,
          min=0.0, max=5.0, section="Tracking backend"),
     Knob("selective_app_ema", "SELECTIVE_APP_EMA", float, 0.9,
          min=0.0, max=1.0, section="Tracking backend"),
@@ -263,7 +268,7 @@ KNOBS = [
     # budget). Default 2. Wall-clock-denominated tracker knobs
     # (reprompt_seconds, evict_dark_frames) are rescaled per view
     # automatically.
-    Knob("corner_track_stride", "CORNER_TRACK_STRIDE", int, 2, min=1, max=8,
+    Knob("corner_track_stride", "CORNER_TRACK_STRIDE", int, 3, min=1, max=8,
          section="Tracking backend"),
     # Dense head for corner decimation: corners run full-rate for the first
     # N seconds of tracked footage (the lock-formation window), then pay the
@@ -286,7 +291,7 @@ KNOBS = [
     # loop still starts after the last view. GPU prefetch is skipped (OCR
     # only) without CUDA, for vLLM-reader jobs (VRAM handoff) and under the
     # sam2_max_gpu_frames VRAM-fit mode. DEFAULT OFF -> unchanged path.
-    Knob("stream_analysis", "STREAM_ANALYSIS", bool, False,
+    Knob("stream_analysis", "STREAM_ANALYSIS", bool, True,
          section="Tracking backend"),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False,
          section="Track hygiene"),
@@ -515,7 +520,7 @@ KNOBS = [
     # "jev": TypeSafe Jev decision model (web/jev_reader.py) — same closed-set
     # read with four escapes and "tentative" low-probability reads (see
     # jev_tentative_min_p); same cloud-reader rules as clef.
-    Knob("team_reader", "TEAM_READER", str, "local",
+    Knob("team_reader", "TEAM_READER", str, "jev",
          choices=("local", "deepseek", "vllm", "clef", "jev"), section="Identity & votes"),
     # Surface-aware vote gate: the bumper readers also report whether the
     # digits sit on a robot bumper band ("bumper") or are PRINTED on
@@ -615,7 +620,7 @@ KNOBS = [
     # blue) slots at ~1 read / 4.5 s — scripts/sim_read_census.py on the qm11
     # timeline: OFF 265 reads, ON 455 (2.7/s, p90 gap <= 3.5 s), ON+honour
     # 330 (p90 4.5-6 s). DEFAULT OFF pending a full-match A/B.
-    Knob("read_census", "READ_CENSUS", bool, False, section="VLM reader"),
+    Knob("read_census", "READ_CENSUS", bool, True, section="VLM reader"),
     Knob("read_census_interval_s", "READ_CENSUS_INTERVAL_S", float, 2.0,
          min=0.5, max=30.0, section="VLM reader"),
     Knob("read_census_honor_backoff", "READ_CENSUS_HONOR_BACKOFF", bool, False,
@@ -630,7 +635,7 @@ KNOBS = [
     # match lost 84 of 328 paid reads (26%) to in-flight eviction with
     # read_census on (reads.dropped_evicted; reads.kept_evicted counts the
     # rows kept). DEFAULT OFF pending a full-match A/B.
-    Knob("read_keep_evicted", "READ_KEEP_EVICTED", bool, False, section="VLM reader"),
+    Knob("read_keep_evicted", "READ_KEEP_EVICTED", bool, True, section="VLM reader"),
     # Clef evidence floor (finalize only): team-naming Clef reads whose
     # p(team) is below this are ignored as slot evidence by the finalize
     # resolvers (global_identity_resolve, identity_swap_resolve,

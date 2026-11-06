@@ -496,6 +496,18 @@ PROFILES = {
         ("q35-4b-escape", {**_QWEN35_R, "vlm_model": "qwen3.5-4b"}),
         ("qwen3-vl-4b", {**_QWEN35_R}),
     ],
+    # TypeSafe Jev 1.14 cloud reader (web/jev_reader.py; 200-crop bench
+    # 2026-11-05: argmax 59/90 legible, 0 wrong, 2% FP; + tentative reads at
+    # p >= 0.17 on an "unreadable" top, voting p x camera weight and never
+    # locking). Same census + keep-evicted read settings as the Oct 31 Clef
+    # combo baselines (3e95c939 qm8 / 73d2a195 qm11: team_reader=clef +
+    # read_census + read_keep_evicted) and the qwen35-escape profile, so only
+    # the reader differs. Run with --full-match. Audit tentative reads via
+    # the `tentative` / `runner_up` fields on the vlm_read diagnostic rows;
+    # cost lands in replay timings (jev.requests / jev.cost_cents).
+    "jev": [
+        ("jev", {"team_reader": "jev", "read_census": True, "read_keep_evicted": True}),
+    ],
 }
 CONFIGS = PROFILES["full"]
 

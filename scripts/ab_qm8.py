@@ -34,6 +34,9 @@ TRACKER_SIDE = {"merge_main_guard": True, "sticky_max_dist_m": 2.5}
 # seed extents. Shared by the endgame profiles and the backfill A/B below.
 SPRINT = {"sam2_prompt_offset_seconds": 0.0, "motion_override": True,
           "motion_gated_conf": True, "seed_union_extent": True}
+# Reader base for the qwen35-escape profile: local vLLM reader with the Oct 31
+# Clef combo's census + keep-evicted read settings (see that profile).
+_QWEN35_R = {"team_reader": "vllm", "read_census": True, "read_keep_evicted": True}
 PROFILES = {
     "full": [
         ("baseline", {}),
@@ -480,6 +483,18 @@ PROFILES = {
     # propagation" = 0 before reading the metrics.
     "mux-single": [
         ("mux-fixed", {"sam3_multiplex": True}),
+    ],
+    # Qwen3.5-4B + escape read prompt (vlm_models "qwen3.5-4b", read_prompt=
+    # "escape"; 2026-11-05 200-crop bench: 70/90, 0 wrong, 2% FP at 0.9 s/crop)
+    # vs the incumbent Qwen3-VL-4B on the same vLLM read path. Run with
+    # --full-match --restart-between. R matches the Oct 31 Clef combo baselines
+    # (3e95c939 qm8 / 73d2a195 qm11: team_reader=clef + read_census +
+    # read_keep_evicted), so against those only the reader differs; the two
+    # arms here differ ONLY in vlm_model. Audit escape reads via the `subject`
+    # field on the vlm_read diagnostic rows.
+    "qwen35-escape": [
+        ("q35-4b-escape", {**_QWEN35_R, "vlm_model": "qwen3.5-4b"}),
+        ("qwen3-vl-4b", {**_QWEN35_R}),
     ],
 }
 CONFIGS = PROFILES["full"]

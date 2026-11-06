@@ -912,8 +912,11 @@ _TEAM_READERS = ("local", "deepseek", "vllm", "clef")
 # `_active_vlm_payload_model` is the served HF id for the payload's `model`
 # field, and `_active_vlm_extra_body` is any per-model keys merged top-level into
 # the chat payload (e.g. GLM's enable_thinking=false).
+# `_active_vlm_read_prompt` picks _vllm_read_bumpers' prompt/schema variant
+# ("incumbent" | "escape", vlm_models.read_prompt).
 _active_vlm_payload_model = VLM_MODEL_NAME
 _active_vlm_extra_body: dict = {}
+_active_vlm_read_prompt = "incumbent"
 
 
 def _apply_vlm_model(key: str) -> None:
@@ -921,16 +924,18 @@ def _apply_vlm_model(key: str) -> None:
 
     Records the requested model with the phase-exclusive lifecycle (so
     ensure_started serves/verifies the right model) and sets the payload model
-    name + extra body used by _vlm_chat_payload. The default key (qwen3-vl-4b) is
-    a no-op that leaves behavior byte-identical to the incumbent.
+    name + extra body used by _vlm_chat_payload, and the bumper-read prompt
+    variant used by _vllm_read_bumpers. The default key (qwen3-vl-4b) is a no-op
+    that leaves behavior byte-identical to the incumbent.
     """
-    global _active_vlm_payload_model, _active_vlm_extra_body
+    global _active_vlm_payload_model, _active_vlm_extra_body, _active_vlm_read_prompt
     from web import vlm_models, vllm_lifecycle
     if key is None:
         key = vlm_models.DEFAULT_KEY
     vllm_lifecycle.set_active_model(key)
     _active_vlm_payload_model = vlm_models.payload_model(key, default=VLM_MODEL_NAME)
     _active_vlm_extra_body = vlm_models.extra_body(key)
+    _active_vlm_read_prompt = vlm_models.read_prompt(key)
 
 # Match-start calibration drift check: sample a few in-match frames from the main
 # view, auto-detect AprilTags, and verify the selected calibration epoch still
@@ -3229,6 +3234,7 @@ class InferenceJob:
             clef_probs=res.get("clef_probs"),
             trigger=trigger,
             evicted=True,
+            subject=res.get("subject"),
             **_mf_diag,
         )
         kept = getattr(self, "_read_kept_evicted_counts", None)
@@ -3816,6 +3822,7 @@ class InferenceJob:
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
                 trigger=_trigger,
+                subject=res.get("subject"),
                 **_mf_diag,
             )
             self._count_read_trigger(_trigger, current_match_time)
@@ -4219,6 +4226,7 @@ class InferenceJob:
                 surface=res.get("surface", "unknown"),
                 clef_probs=res.get("clef_probs"),
                 trigger=trigger,
+                subject=res.get("subject"),
             )
             self._count_read_trigger(
                 trigger, crop_frame / (getattr(self, "video_fps", None) or 10.0))
@@ -11228,6 +11236,96 @@ _BUMPER_READ_SCHEMA = {
     "required": ["team", "color"],
 }
 
+# Escape variant (vlm_models read_prompt="escape", e.g. Qwen3.5-4B): the crop
+# may not be a robot at all, and the model says so BEFORE any digits. Property
+# order matters: under guided decoding "subject" is emitted first, so the model
+# decides "is there a readable bumper" before it can copy a roster number.
+# Benched 2026-11-05 (scripts/bench_bumper_readers.py --prompt escape): Qwen3.5-4B
+# 87% -> 2% false positives on junk crops. Qwen3-VL models go over-conservative
+# on it, hence per-model selection.
+_BUMPER_READ_ESCAPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string",
+                    "enum": ["bumper", "no_digits", "printed", "not_robot"]},
+        "team": {"type": ["string", "null"]},
+        "color": {"type": "string", "enum": ["red", "blue", "none"]},
+    },
+    "required": ["subject", "team", "color"],
+}
+
+
+def _escape_read_hint_line(expected_alliance: str, red_teams: list,
+                           blue_teams: list, match_teams: list) -> str:
+    """Roster line for the escape prompt: no "computer vision sees ... pixels"
+    and no "should be matched only against" (both invite guessing)."""
+    if expected_alliance in ("blue", "red"):
+        cand = ", ".join(red_teams if expected_alliance == "red" else blue_teams)
+        return f"Teams on the {expected_alliance} alliance in this match: {cand}."
+    return f"Teams in this match: {', '.join(match_teams)}."
+
+
+def _escape_read_prompt(hint_line: str) -> str:
+    """Escape bumper-read prompt (reply shape: _BUMPER_READ_ESCAPE_SCHEMA)."""
+    return (
+        "This image is an automatic crop from a robot detector running on FRC match video. "
+        "It usually shows one FRC robot, but the detector makes mistakes: the crop may instead "
+        "show game pieces (balls), a pile of balls, field structures, signs, people, or only "
+        "part of a robot.\n\n"
+        "An FRC robot bumper is a solid RED or BLUE fabric band around the base of a robot "
+        "with a WHITE team number (1 to 5 digits, e.g. 294, 2485, 4322) printed on it.\n\n"
+        'First decide what the image shows ("subject"):\n'
+        '- "bumper": a robot bumper with white digits you can actually see\n'
+        '- "no_digits": a robot, but its bumper digits are not visible or not readable '
+        "(blurred, cut off, turned away, too small)\n"
+        '- "printed": digits printed on a crate, bin, sign or field structure, not on a robot '
+        "bumper\n"
+        '- "not_robot": no robot at all (balls, field elements, people, empty floor)\n\n'
+        'Only if subject is "bumper", read the WHITE digits left to right and report exactly '
+        "what you see. Use only the bumper band for color, not robot paint.\n"
+        f"{hint_line}\n"
+        "The team list is only for matching partially visible digits. Never answer with a team "
+        "from the list unless you can see its digits on a bumper in this image. If subject is "
+        'not "bumper", team must be null and color "none" is allowed.\n\n'
+        'Reply with ONLY compact JSON: {"subject": "...", "team": "<digits>" or null, '
+        '"color": "red" | "blue" | "none"}'
+    )
+
+
+def _parse_escape_read(output_text: str) -> tuple:
+    """(team, color, surface, subject) from an escape-schema reply.
+
+    Unless subject is "bumper" the team is forced to None (no roster matching
+    on junk, so no vote). surface: "bumper" / "printed" from the subject, else
+    "unknown" (via normalize_surface). subject is None if unparseable."""
+    team = None
+    color = "unknown"
+    subject = None
+    try:
+        clean = (output_text or "").strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.strip()
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(clean[start:end])
+            team = parsed.get("team")
+            color = parsed.get("color", "unknown")
+            if team is not None:
+                team = str(team)
+            s = parsed.get("subject")
+            subject = str(s).strip().lower() if s is not None else None
+    except (json.JSONDecodeError, Exception):
+        pass
+    if subject != "bumper":
+        team = None
+    surface = normalize_surface(subject)
+    return team, color, surface, subject
+
+
 _OBJECT_CLASS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -11350,6 +11448,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             else blue_teams if expected_alliance == "blue"
             else match_teams
         )
+        escape = _active_vlm_read_prompt == "escape"
         candidate_str = ", ".join(candidate_teams)
         hint = (
             f"Computer vision sees {expected_alliance.upper()} bumper pixels, so partial or uncertain reads "
@@ -11374,10 +11473,17 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             'or "printed" if they are printed on a crate, bin, sign, or other '
             'field structure}.'
         )
+        schema_name, schema = "bumper_read", _BUMPER_READ_SCHEMA
+        if escape:
+            # Escape variant (per-model, vlm_models read_prompt="escape"):
+            # explicit not-a-bumper subject decided before the digits.
+            prompt = _escape_read_prompt(_escape_read_hint_line(
+                expected_alliance, red_teams, blue_teams, match_teams))
+            schema_name, schema = "bumper_read_escape", _BUMPER_READ_ESCAPE_SCHEMA
         payload = _vlm_chat_payload(
             data_uri, prompt, max_tokens=64,
             logprobs=VLM_LOGPROB_CONFIDENCE,
-            schema_name="bumper_read", schema=_BUMPER_READ_SCHEMA,
+            schema_name=schema_name, schema=schema,
         )
         body = _post_vlm_chat(payload)
         choice = body["choices"][0]
@@ -11393,24 +11499,28 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
         team = None
         color = "unknown"
         surface = "unknown"
-        try:
-            clean = output_text
-            if "```" in clean:
-                clean = clean.split("```")[1]
-                if clean.startswith("json"):
-                    clean = clean[4:]
-                clean = clean.strip()
-            start = clean.find("{")
-            end = clean.rfind("}") + 1
-            if start >= 0 and end > start:
-                parsed = json.loads(clean[start:end])
-                team = parsed.get("team")
-                color = parsed.get("color", "unknown")
-                surface = normalize_surface(parsed.get("surface"))
-                if team is not None:
-                    team = str(team)
-        except (json.JSONDecodeError, Exception):
-            pass
+        subject = None
+        if escape:
+            team, color, surface, subject = _parse_escape_read(output_text)
+        else:
+            try:
+                clean = output_text
+                if "```" in clean:
+                    clean = clean.split("```")[1]
+                    if clean.startswith("json"):
+                        clean = clean[4:]
+                    clean = clean.strip()
+                start = clean.find("{")
+                end = clean.rfind("}") + 1
+                if start >= 0 and end > start:
+                    parsed = json.loads(clean[start:end])
+                    team = parsed.get("team")
+                    color = parsed.get("color", "unknown")
+                    surface = normalize_surface(parsed.get("surface"))
+                    if team is not None:
+                        team = str(team)
+            except (json.JSONDecodeError, Exception):
+                pass
 
         read = "".join(ch for ch in team if ch.isdigit()) if team else ""
         model_color = color if color in ("blue", "red") else "unknown"
@@ -11421,7 +11531,7 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
         confidence = blend_read_confidence(confidence, digit_prob)
         print(f"    vLLM read: raw={output_text!r} -> team={matched}, "
               f"digit_prob={None if digit_prob is None else round(digit_prob, 3)}")
-        return {
+        result = {
             "team_number": matched,
             "alliance": alliance,
             "confidence": confidence,
@@ -11429,6 +11539,11 @@ def _vllm_read_bumpers(robot_crops_b64: list, match_teams: list,
             "digit_prob": digit_prob,
             "surface": surface,
         }
+        if escape:
+            # What the model said the crop shows (bumper / no_digits / printed /
+            # not_robot, None if unparseable) — recorded on the vlm_read row.
+            result["subject"] = subject
+        return result
 
     results: list = [None] * len(robot_crops_b64)
     from concurrent.futures import ThreadPoolExecutor

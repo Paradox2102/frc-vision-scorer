@@ -83,3 +83,45 @@ def test_describe_rows_shape(monkeypatch):
     for r in rows:
         assert set(r) == {"key", "label", "hf_repo", "status", "notes", "approx_gb"}
         assert r["status"] in ("ready", "needs_download")
+
+
+def test_qwen35_4b_entry_fields():
+    m = vlm_models.get("qwen3.5-4b")
+    assert m.label == "Qwen3.5-4B (escape prompt)"
+    assert m.hf_repo == "Qwen/Qwen3.5-4B"
+    assert m.gpu_util == 0.5
+    assert m.approx_gb == 9.3
+    # start_vllm.sh passes --dtype float16 first; argparse last-wins -> bf16.
+    assert vlm_models.extra_serve_args("qwen3.5-4b") == ["--dtype", "bfloat16"]
+    # Qwen3.5 thinks by default; 64-token reads need thinking off.
+    assert vlm_models.extra_body("qwen3.5-4b") == {
+        "chat_template_kwargs": {"enable_thinking": False}}
+    assert m.read_prompt == "escape"
+
+
+def test_qwen35_4b_appended_after_existing_entries():
+    keys = vlm_models.model_keys()
+    assert keys[0] == vlm_models.DEFAULT_KEY
+    assert keys[-1] == "qwen3.5-4b"
+    assert keys.index("qwen3.5-4b") > keys.index("lfm2.5-vl")
+
+
+def test_read_prompt_helper():
+    # Only Qwen3.5-4B uses the escape prompt (it makes Qwen3-VL over-conservative).
+    assert vlm_models.read_prompt("qwen3.5-4b") == "escape"
+    for k in ("qwen3-vl-4b", "glm-4.6v-flash", "qwen3-vl-8b", "lfm2.5-vl"):
+        assert vlm_models.read_prompt(k) == "incumbent"
+    # Unknown keys never change the read prompt.
+    assert vlm_models.read_prompt("nope-not-a-model") == "incumbent"
+
+
+def test_qwen35_served_matches_is_specific():
+    assert vlm_models.served_matches("qwen3.5-4b", "Qwen/Qwen3.5-4B") is True
+    assert vlm_models.served_matches("qwen3.5-4b", "Qwen/Qwen3-VL-4B-Instruct") is False
+    assert vlm_models.served_matches("qwen3-vl-4b", "Qwen/Qwen3.5-4B") is False
+
+
+def test_vlm_model_knob_choices_include_qwen35():
+    from web import job_config
+    knob = next(k for k in job_config.KNOBS if k.name == "vlm_model")
+    assert "qwen3.5-4b" in knob.choices

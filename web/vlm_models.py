@@ -43,6 +43,13 @@ class VlmModel:
     # _vlm_chat_payload when this model is active (e.g. disabling GLM's thinking
     # so 64-token reads don't come back empty). Empty for others.
     extra_body: dict = field(default_factory=dict)
+    # Which bumper-read prompt/schema web/app.py's _vllm_read_bumpers sends for
+    # this model: "incumbent" (the original prompt + _BUMPER_READ_SCHEMA) or
+    # "escape" (subject decided first: bumper/no_digits/printed/not_robot, so
+    # junk crops have an explicit way out instead of a copied roster number).
+    # The escape prompt makes Qwen3-VL models over-conservative, so it is a
+    # per-model choice, not a global switch.
+    read_prompt: str = "incumbent"
 
 
 # Order here is the UI order (default first). Every model is served by the same
@@ -97,6 +104,28 @@ _REGISTRY: dict[str, VlmModel] = {
               "upgraded 2026-07-22); verified serving on this stack.",
         approx_gb=3.2,
     ),
+    "qwen3.5-4b": VlmModel(
+        key="qwen3.5-4b",
+        label="Qwen3.5-4B (escape prompt)",
+        hf_repo="Qwen/Qwen3.5-4B",
+        # 0.5x24 = 12GB: 9.3GB bf16 weights + ~2.7GB KV/encoder. Not higher: the
+        # analysis loop runs YOLO/DINOv2/person-det (~3GB) in the app process
+        # on the same card while the reader serves (see the GLM entry's note).
+        gpu_util=0.5,
+        notes="bf16 (9.3 GB), served with the escape read prompt. 2026-11-05 "
+              "200-crop bench: 70/90 correct, 0 wrong, 2% FP at 0.9 s/crop "
+              "(incumbent prompt: 87% FP — copies roster numbers onto ball "
+              "piles/field structures; Qwen3-VL-8B: 69/0/1% at 2.1 s).",
+        approx_gb=9.3,
+        # start_vllm.sh passes --dtype float16 then appends "$@"; argparse is
+        # last-wins (verified live), so this runs Qwen3.5 (hybrid Gated-DeltaNet)
+        # in its native bf16.
+        extra_serve_args=("--dtype", "bfloat16"),
+        # Qwen3.5 thinks by default; at the 64-token read budget the reasoning
+        # eats the allowance and the reply comes back empty (as with GLM).
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        read_prompt="escape",
+    ),
 }
 
 
@@ -136,6 +165,16 @@ def extra_serve_args(key: str) -> list:
 def extra_body(key: str) -> dict:
     """Extra chat/completions payload keys for this model (empty dict if none)."""
     return dict(get(key).extra_body)
+
+
+def read_prompt(key: str) -> str:
+    """The bumper-read prompt variant for this model ("incumbent" | "escape").
+
+    Unknown keys get "incumbent" so a bad key never changes the read prompt."""
+    try:
+        return get(key).read_prompt
+    except ValueError:
+        return "incumbent"
 
 
 def served_matches(key: str, served_id: Optional[str]) -> bool:

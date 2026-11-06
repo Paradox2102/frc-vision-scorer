@@ -136,7 +136,8 @@ class DiagnosticRecorder:
                        clef_frames: list | None = None,
                        clef_same_robot: float | None = None,
                        trigger: str | None = None,
-                       evicted: bool = False) -> None:
+                       evicted: bool = False,
+                       subject: str | None = None) -> None:
         if frame is None or robot_id is None or crop_b64 is None:
             logger.warning("record_vlm_read: missing required field; dropped")
             return
@@ -176,6 +177,12 @@ class DiagnosticRecorder:
         # otherwise, so every other row is unchanged.
         if evicted:
             record["evicted"] = True
+        # Escape-prompt vLLM reads only (vlm_models read_prompt="escape"): what
+        # the model said the crop shows (bumper / no_digits / printed /
+        # not_robot) — lets a live job's escape reads be audited. Omitted
+        # otherwise, so every other row is unchanged.
+        if subject is not None:
+            record["subject"] = str(subject)
         self._emit(record)
 
     def record_vlm_filtered(self, frame: int | None, robot_id: int | None,

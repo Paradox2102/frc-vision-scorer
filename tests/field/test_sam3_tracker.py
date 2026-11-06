@@ -732,6 +732,44 @@ def test_sam3_multiplex_fetch_shim_tolerates_uncached_frame():
     assert state["cached_frame_outputs"] == {3: real}
 
 
+def test_sam3_multiplex_build_output_shim_keeps_refined_masks_on_uncached_frame():
+    """Upstream multiplex ``_build_sam2_output`` returns {} for any frame not
+    in cached_frame_outputs, discarding the masks partial propagation just
+    produced — instance-prompt tracking came back empty on every propagated
+    frame. Runs the REAL upstream method on a stub object: unshimmed it drops
+    the refined masks; shimmed it returns them (base SAM3 semantics), merges
+    over a cached frame as before, and leaves no placeholder behind."""
+    import types
+
+    mt = pytest.importorskip("sam3.model.sam3_multiplex_tracking")
+    real_build = mt.Sam3MultiplexTrackingWithInteractivity._build_sam2_output
+
+    class Model:
+        pass
+
+    refined = {1: "m1", 3: "m3"}
+    raw = Model()
+    raw._build_sam2_output = types.MethodType(real_build, raw)
+    state = {"cached_frame_outputs": {}}
+    assert raw._build_sam2_output(state, 5, refined) == {}, \
+        "upstream no longer drops refined masks — shim may be obsolete"
+
+    model = Model()
+    model._build_sam2_output = types.MethodType(real_build, model)
+    _install_multiplex_shims(model)
+    assert model._build_sam2_output(state, 5, refined) == refined
+    assert state["cached_frame_outputs"] == {}, "placeholder leaked"
+
+    cached = {2: "c2", 3: "old"}
+    state = {"cached_frame_outputs": {4: cached}}
+    assert model._build_sam2_output(state, 4, refined) == {2: "c2", 3: "m3", 1: "m1"}
+    assert state["cached_frame_outputs"] == {4: {2: "c2", 3: "old"}}
+
+    first = model._build_sam2_output
+    _install_multiplex_shims(model)
+    assert model._build_sam2_output is first, "double-wrapped"
+
+
 def test_sam3_multiplex_fetch_shim_cleans_up_on_error_and_is_idempotent():
     class Boom(_FetchModel):
         def fetch_and_process_single_frame_results(self, inference_state,

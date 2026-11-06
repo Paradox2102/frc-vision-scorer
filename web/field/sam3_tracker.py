@@ -162,12 +162,49 @@ def _shim_fetch_tolerate_uncached_frame(model: Any) -> None:
     model.fetch_and_process_single_frame_results = _fetch_tolerating_uncached
 
 
+def _shim_build_output_keep_refined(model: Any) -> None:
+    """The multiplex ``_build_sam2_output(state, frame_idx, refined)`` opens
+    with ``if frame_idx not in cached_frame_outputs: return {}`` — it DROPS
+    the freshly propagated (refined) masks on any frame without a cached
+    entry. Meta's demo flow always runs a text-prompt ``propagation_full``
+    first, which caches every frame; pure instance-prompt tracking never
+    does, so every propagated frame came back empty and masks survived only
+    on prompt frames (2026-11-06 offline A/B: SAM2 produced masks for all
+    objects, output was ``{}``). Base SAM3 starts from
+    ``cached.get(frame_idx, {})`` and overlays the refined masks; mirror that
+    with a call-scoped empty placeholder so the upstream overlay (and its
+    non-None assert) still runs and no cached state is left behind."""
+    import functools
+
+    build = getattr(model, "_build_sam2_output", None)
+    if build is None or getattr(build, "_frc_keep_refined_shim", False):
+        return
+
+    @functools.wraps(build)
+    def _build_keeping_refined(inference_state, frame_idx, *a, _orig=build, **kw):
+        cache = inference_state.get("cached_frame_outputs") \
+            if isinstance(inference_state, dict) else None
+        if not isinstance(cache, dict) or frame_idx in cache:
+            return _orig(inference_state, frame_idx, *a, **kw)
+        placeholder: dict = {}
+        cache[frame_idx] = placeholder
+        try:
+            return _orig(inference_state, frame_idx, *a, **kw)
+        finally:
+            if cache.get(frame_idx) is placeholder:
+                del cache[frame_idx]
+
+    _build_keeping_refined._frc_keep_refined_shim = True
+    model._build_sam2_output = _build_keeping_refined
+
+
 def _install_multiplex_shims(model: Any) -> None:
     """Compat shims for the SAM 3.1 multiplex model (no-op without a model)."""
     if model is None:
         return
     _shim_init_state_drop_state_offload(model)
     _shim_fetch_tolerate_uncached_frame(model)
+    _shim_build_output_keep_refined(model)
 
 
 def _list_frame_paths(frames_dir: str) -> list[str]:

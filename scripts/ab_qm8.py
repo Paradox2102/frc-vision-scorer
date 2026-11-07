@@ -306,6 +306,9 @@ PROFILES = {
         ("baseline", {}),
         ("ground_offset_0.475", {"ground_center_offset_m": 0.475}),
     ],
+    # Repeat of the offset arm alone: identity outcomes on qm8 hinge on a few
+    # binding decisions, so one arm can't separate a regression from a swap.
+    "ground-offset-repeat": [("ground_offset_0.475_r2", {"ground_center_offset_m": 0.475})],
     # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
     # fusion knobs vs current shipped defaults (baseline). Each alone — not
     # stacked — so a regressor is attributable (the geo4 stack masked which

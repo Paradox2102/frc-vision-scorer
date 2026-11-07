@@ -869,6 +869,20 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("corner_dup_radius_m", "CORNER_DUP_RADIUS_M", float, 2.0, min=0.5,
          max=4.0, section="Fusion & field position"),
+    # alliance_by_territory: decide an unknown-colour robot's alliance by the
+    # field half it stands in (x < L/2 -> blue). An older-game assumption: in
+    # 2026 robots cross midfield constantly. qm8 hand GT (Nov 7 2026): in the
+    # OPPONENT's half a robot is followed by a WRONG-alliance slot 63% of its
+    # tracked time (own half: 4%); ~1/3 of all mis-identifications are
+    # cross-alliance. False = territory-free: in the field tracker an
+    # unknown-colour detection may only EXTEND a live/coasting slot of either
+    # alliance (known-colour assignment first, then one joint pass for the
+    # leftover unknowns) and never seeds one; an unknown-alliance identity
+    # birth is deferred; the SAM prompt/re-prompt gap-fill cap counts the whole
+    # field (<= 6) instead of 3 per half. DEFAULT True (legacy, byte-identical)
+    # pending A/B (ab_qm8 territory-free).
+    Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, True,
+         section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

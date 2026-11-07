@@ -373,7 +373,8 @@ def merge_robot_detections(bumper_robots, robot_boxes, ios_thresh,
     return merged
 
 
-def select_gap_fills(bumper_halves, unknown_halves, max_per_half=3):
+def select_gap_fills(bumper_halves, unknown_halves, max_per_half=3,
+                     by_territory=True):
     """Pick which unknown gap-fill boxes to seed, capping each field half.
 
     bumper_halves:  list of "blue"/"red" for the bumper boxes in this frame.
@@ -381,7 +382,20 @@ def select_gap_fills(bumper_halves, unknown_halves, max_per_half=3):
                     off-field, never selected), in their original order.
     Returns the indices into unknown_halves to keep. A half accepts a fill only
     while its running count (bumpers + already-kept fills) is below max_per_half.
+
+    by_territory=False (job knob alliance_by_territory off): field half is not
+    a proxy for alliance (2026 robots cross midfield constantly), so the whole
+    field shares ONE quota of 2 * max_per_half (= the 6-robot roster); the
+    half labels then only mean on-field (non-None).
     """
+    if not by_territory:
+        total = sum(1 for h in bumper_halves if h in ("blue", "red"))
+        keep = []
+        for idx, h in enumerate(unknown_halves):
+            if h in ("blue", "red") and total < 2 * max_per_half:
+                total += 1
+                keep.append(idx)
+        return keep
     counts = {"blue": 0, "red": 0}
     for h in bumper_halves:
         if h in counts:

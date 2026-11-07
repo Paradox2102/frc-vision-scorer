@@ -2181,7 +2181,8 @@ class InferenceJob:
                     for i in select_gap_fills(
                         strong_halves,
                         [h for _i, h in motion_entries],
-                        max_per_half=3))
+                        max_per_half=3,
+                        by_territory=self.config.alliance_by_territory))
                 survivors = [idx for idx in keep
                              if merged[idx][2] or idx in kept_motion]
                 # EXPORT-coord boxes straight through to the TBD tracker.
@@ -5906,6 +5907,7 @@ class InferenceJob:
             continuity=bool(getattr(cfg, "identity_continuity", False)),
             continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
             warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
+            alliance_by_territory=bool(getattr(cfg, "alliance_by_territory", True)),
         )
 
     def _retire_evicted_tracks(self, evicted_ids) -> None:
@@ -6705,7 +6707,8 @@ class InferenceJob:
                 phys_reach_slack_m=self.config.phys_reach_slack_m,
                 phys_corner_slack_m=self.config.phys_corner_slack_m,
                 reseed_hold_s=self.config.reseed_hold_s,
-                corner_dup_radius_m=self.config.corner_dup_radius_m)
+                corner_dup_radius_m=self.config.corner_dup_radius_m,
+                alliance_by_territory=self.config.alliance_by_territory)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -7697,7 +7700,9 @@ class InferenceJob:
                                                 pool_halves.append(half)
                                                 pool_entries.append((box, color))
 
-                                        keep_indices = select_gap_fills(bumper_halves, pool_halves, max_per_half=3)
+                                        keep_indices = select_gap_fills(
+                                            bumper_halves, pool_halves, max_per_half=3,
+                                            by_territory=self.config.alliance_by_territory)
 
                                         for box, color, strong in merged:
                                             if strong and color != "unknown":
@@ -7959,7 +7964,8 @@ class InferenceJob:
                                         for i in select_gap_fills(
                                             strong_halves,
                                             [h for _i, h in motion_entries],
-                                            max_per_half=3))
+                                            max_per_half=3,
+                                            by_territory=self.config.alliance_by_territory))
                                     # Corroborate-only band: same field filter as
                                     # the main cascade, but these boxes never
                                     # compete for a roster seat — they ride as

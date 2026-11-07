@@ -197,8 +197,16 @@ class IdentityRegistry:
         continuity_max_m: float = 1.0,
         continuity_soft_penalty: float = 0.1,
         warmup_frames: int = 0,
+        alliance_by_territory: bool = True,
     ) -> None:
         self.identities: dict[int, RobotIdentity] = {}
+        # alliance_by_territory (job knob, default True = legacy): a birth
+        # from an observation with no known alliance takes its alliance from
+        # the field half (alliance_side_fn). False: that birth is DEFERRED
+        # (no identity) until an observation with a known alliance arrives —
+        # an unknown-alliance observation can still MATCH an existing
+        # identity of either alliance (the cost's alliance check skips it).
+        self.alliance_by_territory = bool(alliance_by_territory)
         self.association_threshold = association_threshold
         self.app_floor = app_floor
         self.ema_alpha = ema_alpha
@@ -416,6 +424,12 @@ class IdentityRegistry:
                 if row is not None:
                     self.frame_rejections.append(row)
                 alliance = obs.alliance
+                if alliance not in {"red", "blue"} and not self.alliance_by_territory:
+                    # Territory-free: never guess the alliance from field half.
+                    self.stats["births_deferred_no_alliance"] += 1
+                    if row is not None:
+                        row["outcome"] = "deferred_no_alliance"
+                    continue
                 if alliance not in {"red", "blue"}:
                     if alliance_side_fn is not None and obs.pos is not None:
                         alliance = alliance_side_fn(obs.pos)

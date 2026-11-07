@@ -313,6 +313,11 @@ PROFILES = {
     # labels swing 2-66% at identical settings, so the label question needs n>=3/arm.
     "ground-offset-x2": [("baseline_r3", {}), ("ground_offset_0.475_r3", {"ground_center_offset_m": 0.475}),
                          ("baseline_r4", {}), ("ground_offset_0.475_r4", {"ground_center_offset_m": 0.475})],
+    # alliance_by_territory=False: unknown-colour detections no longer take
+    # their alliance from the field half (qm8 GT: opponent-half robots ride a
+    # wrong-alliance slot 63% of the time). Two interleaved pairs.
+    "territory-free": [("baseline_t1", {}), ("territory_free_t1", {"alliance_by_territory": False}),
+                       ("baseline_t2", {}), ("territory_free_t2", {"alliance_by_territory": False})],
     # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
     # fusion knobs vs current shipped defaults (baseline). Each alone — not
     # stacked — so a regressor is attributable (the geo4 stack masked which

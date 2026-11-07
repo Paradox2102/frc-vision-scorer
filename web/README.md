@@ -36,7 +36,7 @@ Pick a match (only matches with a replay whose source video still exists are
 listed), the video (byte-identical uploads are merged by fingerprint), then a
 robot. Selecting a robot reloads its saved track and seeks to its last
 keyframe. Set **auto start** (pre-filled from the latest replay's auto period)
-and pick a range: Auto (t0→+20 s), Full match (t0→+163 s) or Whole video.
+and pick a range: Auto (t0−3 → +23 s), Full match (t0−3 → +169 s; the 2026 clock hits 0:00 ~166 s after auto start) or Whole video. Both presets pad 3 s on each side.
 
 **Cursor convention:** the cursor is a perspective-correct robot-sized box
 (0.95 × 0.95 m footprint, 0.6 m tall, projected with the event calibration for

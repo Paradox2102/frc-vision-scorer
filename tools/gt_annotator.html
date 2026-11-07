@@ -106,8 +106,8 @@
       <button id="setT0" title="Set match_t0_frame (autonomous start) to the current frame">Set auto start = current frame</button>
       <span class="sep"></span>
       <span class="dim">range</span>
-      <button class="rp" data-p="auto">Auto (t0→+20 s)</button>
-      <button class="rp" data-p="full">Full match (t0→+163 s)</button>
+      <button class="rp" data-p="auto" title="3 s before auto start through 3 s after auto ends">Auto (t0−3 → +23 s)</button>
+      <button class="rp" data-p="full" title="3 s before auto start through 3 s after the match clock hits 0:00">Full match (t0−3 → +169 s)</button>
       <button class="rp" data-p="whole">Whole video</button>
       <span id="rangeTxt" class="dim"></span>
       <span class="sep"></span>
@@ -167,7 +167,10 @@ const video = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
 const tl = $("timeline"), tctx = tl.getContext("2d");
 const mapC = $("map"), mctx = mapC.getContext("2d");
 const MAX_SPEED_MPS = 6.0, JUMP_SLACK_M = 0.5, REANCHOR_N = 10, DECIMATE = 2;
-const TRAIL_S = 2.0, OTHER_GAP_S = 1.0, AUTO_S = 20, FULL_S = 163;
+const TRAIL_S = 2.0, OTHER_GAP_S = 1.0, AUTO_S = 20, FULL_S = 166, TELEOP_S = 24, PAD_S = 3;
+// 2026 match timeline measured off the qm8 broadcast clock (t0 = auto start):
+// auto 0–20 s, clock frozen at 2:20 until teleop starts ~24 s, 0:00 at ~166 s.
+// Presets pad PAD_S on both sides so the opening and the buzzer are never clipped.
 const HAS_RVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
 const S = {
@@ -652,7 +655,7 @@ function applyPreset(p, quiet) {
   S.preset = p; LS.set("gt.preset", p);
   const last = S.frameCount > 0 ? S.frameCount - 1 : 0;
   let a = 0, b = last;
-  if (p !== "whole" && S.t0 != null) { a = S.t0; b = S.t0 + Math.round((p === "auto" ? AUTO_S : FULL_S) * S.fps); }
+  if (p !== "whole" && S.t0 != null) { a = S.t0 - Math.round(PAD_S * S.fps); b = S.t0 + Math.round(((p === "auto" ? AUTO_S : FULL_S) + PAD_S) * S.fps); }
   else if (p !== "whole" && !quiet) flash("set the auto start first", true);
   S.range = { start: clamp(a, 0, last), end: clamp(b, 0, last) };
   for (const btn of document.querySelectorAll(".rp")) btn.classList.toggle("on", btn.dataset.p === p);
@@ -816,7 +819,7 @@ $("replaySel").onchange = async (e) => {
 function fmtMatch(f) {
   if (S.t0 == null) return "—";
   const t = (f - S.t0) / S.fps;
-  const lab = t < 0 ? "pre" : t < AUTO_S ? "AUTO" : t < AUTO_S + 3 ? "TRANS" : t < FULL_S ? "TELEOP" : "post";
+  const lab = t < 0 ? "pre" : t < AUTO_S ? "AUTO" : t < TELEOP_S ? "TRANS" : t < FULL_S ? "TELEOP" : "post";
   return `${lab} ${t.toFixed(2)}s`;
 }
 function updateReadout() {
@@ -1002,7 +1005,7 @@ function drawTimeline() {
   if (S.t0 != null) {
     tctx.fillStyle = "rgba(255,255,255,.04)"; tctx.fillRect(X(S.t0), 0, X(S.t0 + AUTO_S * S.fps) - X(S.t0), H);
     tctx.fillStyle = "rgba(255,255,255,.35)";
-    for (const s of [0, AUTO_S, AUTO_S + 3, FULL_S]) { const x = X(S.t0 + s * S.fps); if (x >= 0 && x <= W) tctx.fillRect(x, 0, dpr, H); }
+    for (const s of [0, AUTO_S, TELEOP_S, FULL_S]) { const x = X(S.t0 + s * S.fps); if (x >= 0 && x <= W) tctx.fillRect(x, 0, dpr, H); }
   }
   // other robots' coverage, thin rows at the top
   const others = rosterList().filter((r) => r.team !== S.team);

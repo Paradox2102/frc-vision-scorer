@@ -38,6 +38,15 @@ SCHEMA_VERSION = 1
 STATES = ("visible", "estimated", "unknown")
 POSITIONED_STATES = ("visible", "estimated")
 ON_FIELD_MARGIN_M = 0.5
+# Height (m) of the image feature the annotator lines the robot box up with.
+# The box's floor outline is matched by eye to the BUMPERS, whose visible edge
+# sits above the carpet; from the elevated main camera that height projects
+# ~4x further away at the far wall (1 px ~ 4 cm). Projecting clicks onto the
+# z = click_height_m plane removes that parallax. 0.10 m was fitted on qm8
+# (Nov 7): far-wall overshoot 8.0% -> 1.4%, side walls 4.2% -> 0.7%, far-trench
+# crossings centred at 7.28 m. Stored per doc so it can be re-tuned without
+# re-annotating; docs without the field keep the legacy 0.0.
+DEFAULT_CLICK_HEIGHT_M = 0.10
 
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _FP_BYTES = 4 * 1024 * 1024
@@ -146,6 +155,7 @@ def new_gt(match_key: str, event_key: str, team: str, alliance: Optional[str],
         "match_t0_frame": match_t0_frame,
         "annotator": annotator,
         "calibration": {},              # {camera: version_id} used for field_xy
+        "click_height_m": DEFAULT_CLICK_HEIGHT_M,  # plane the clicks project onto
         "keyframes": [],
         "notes": "",
     }
@@ -220,10 +230,12 @@ def choose_view(views: Iterable, uv) -> Optional[tuple]:
     return None
 
 
-def project_uv(views: Iterable, uv, field_dims: Optional[tuple] = None) -> dict:
+def project_uv(views: Iterable, uv, field_dims: Optional[tuple] = None,
+               z: float = 0.0) -> dict:
     """Composite-frame pixel -> {view, field_xy, on_field}.
 
-    Projects the clicked point on the carpet (z=0) with the view's calibration.
+    Projects the clicked point onto the plane at height ``z`` (0 = carpet; the
+    annotator uses the doc's ``click_height_m``) with the view's calibration.
     ``field_xy`` is None when no calibrated view contains the point or the ray
     misses the floor; ``on_field`` checks ``field_dims`` (length, width) with a
     0.5 m margin when given."""
@@ -232,7 +244,7 @@ def project_uv(views: Iterable, uv, field_dims: Optional[tuple] = None) -> dict:
         return {"view": None, "field_xy": None, "on_field": False}
     view, local = hit
     cal = getattr(view, "calibration", None)
-    xy = cal.image_to_field(local) if cal is not None else None
+    xy = cal.image_to_field(local, z=z) if cal is not None else None
     on_field = xy is not None
     if xy is not None and field_dims is not None:
         L, W = field_dims
@@ -248,11 +260,12 @@ def reproject_doc(doc: dict, views, field_dims: Optional[tuple] = None) -> dict:
     The server does this on every save so field_xy always reflects the
     calibration in force (recorded under ``calibration``)."""
     doc = dict(doc)
+    z = float(doc.get("click_height_m") or 0.0)
     out = []
     for kf in doc.get("keyframes") or []:
         kf = dict(kf)
         if kf.get("state") in POSITIONED_STATES and kf.get("uv") is not None:
-            r = project_uv(views, kf["uv"], field_dims)
+            r = project_uv(views, kf["uv"], field_dims, z=z)
             kf["view"], kf["field_xy"] = r["view"], r["field_xy"]
         else:
             kf.pop("field_xy", None)

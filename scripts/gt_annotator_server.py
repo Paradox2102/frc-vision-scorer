@@ -454,7 +454,7 @@ def api_project(body: dict = Body(...)):
     except (ValueError, KeyError, TypeError) as e:
         raise HTTPException(400, f"bad request: {e}")
     views, _sel, dims, _ = views_for(event_key, match_key)
-    return gt.project_uv(views, (u, v), dims)
+    return gt.project_uv(views, (u, v), dims, z=gt.DEFAULT_CLICK_HEIGHT_M)
 
 
 @app.get("/api/gt/{match_key}")
@@ -528,6 +528,8 @@ def api_gt_put(match_key: str, team: str, body: dict = Body(...)):
                     annotator=str(body.get("annotator") or "")[:80])
     if existing and existing.get("created_at"):
         doc["created_at"] = existing["created_at"]
+    if existing and existing.get("click_height_m") is not None:
+        doc["click_height_m"] = existing["click_height_m"]   # keep a re-tuned value
     doc["notes"] = str(body.get("notes") or "")[:4000]
     doc["keyframes"] = _clean_keyframes(body.get("keyframes") or [])
     views, sel, dims, _ = views_for(m["event_key"], match_key)

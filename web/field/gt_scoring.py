@@ -428,6 +428,70 @@ def aggregate(robot_recs: dict, radius: float) -> dict:
     }
 
 
+def identity_metrics(recs: list, team: str, alliance: Optional[str],
+                     team_alliance: dict, length_m: float, step_s: float) -> dict:
+    """Identity-focused view of one robot's processed samples (time order):
+
+    * lost: no pipeline robot within the radius — seconds, episodes, longest.
+    * misid: matched robot labelled with ANOTHER team — seconds, split into
+      cross-alliance (label belongs to the other alliance) vs same-alliance.
+    * wrong_colour: matched pipeline SLOT belongs to the other alliance
+      (B* vs R*) — a tracking error independent of bumper reads; reported
+      overall and split by whether the robot is in its own or the opponent's
+      half (``x`` = GT x)."""
+    proc = sorted((r for r in recs if r["processed"]), key=lambda r: r["rf"])
+    lost_eps, run = [], 0
+    for r in proc:
+        if r["slot"] is None:
+            run += 1
+        elif run:
+            lost_eps.append(run); run = 0
+    if run:
+        lost_eps.append(run)
+    matched = [r for r in proc if r["slot"] is not None]
+    mis = [r for r in matched if r["team"] is not None and r["team"] != team]
+    cross = sum(1 for r in mis if alliance and team_alliance.get(r["team"])
+                and team_alliance[r["team"]] != alliance)
+    def _slot_al(slot):
+        return "blue" if str(slot).startswith("B") else "red" if str(slot).startswith("R") else None
+    wc = [r for r in matched if alliance and _slot_al(r["slot"]) not in (None, alliance)]
+    def _half(r):
+        if r.get("x") is None or not alliance:
+            return None
+        return "own" if ("blue" if r["x"] < length_m / 2 else "red") == alliance else "opp"
+    own = [r for r in matched if _half(r) == "own"]
+    opp = [r for r in matched if _half(r) == "opp"]
+    wcs = set(id(r) for r in wc)
+    return {
+        "lost_s": round(sum(lost_eps) * step_s, 2), "lost_episodes": len(lost_eps),
+        "longest_lost_s": round(max(lost_eps, default=0) * step_s, 2),
+        "misid_s": round(len(mis) * step_s, 2),
+        "misid_cross_s": round(cross * step_s, 2),
+        "misid_same_s": round((len(mis) - cross) * step_s, 2),
+        "wrong_colour_rate": _rate(len(wc), len(matched)),
+        "wrong_colour_own_half": _rate(sum(1 for r in own if id(r) in wcs), len(own)),
+        "wrong_colour_opp_half": _rate(sum(1 for r in opp if id(r) in wcs), len(opp)),
+        "n_matched": len(matched), "n_wrong_colour": len(wc),
+        "n_own": len(own), "n_own_wc": sum(1 for r in own if id(r) in wcs),
+        "n_opp": len(opp), "n_opp_wc": sum(1 for r in opp if id(r) in wcs),
+    }
+
+
+def aggregate_identity(rows: list) -> dict:
+    """Pool identity_metrics across robots (seconds summed, rates pooled)."""
+    tot = lambda k: round(sum(r[k] for r in rows), 2)
+    nm, nwc = sum(r["n_matched"] for r in rows), sum(r["n_wrong_colour"] for r in rows)
+    return {
+        "lost_s": tot("lost_s"), "lost_episodes": sum(r["lost_episodes"] for r in rows),
+        "longest_lost_s": max((r["longest_lost_s"] for r in rows), default=0),
+        "misid_s": tot("misid_s"), "misid_cross_s": tot("misid_cross_s"),
+        "misid_same_s": tot("misid_same_s"),
+        "wrong_colour_rate": _rate(nwc, nm),
+        "wrong_colour_own_half": _rate(sum(r["n_own_wc"] for r in rows), sum(r["n_own"] for r in rows)),
+        "wrong_colour_opp_half": _rate(sum(r["n_opp_wc"] for r in rows), sum(r["n_opp"] for r in rows)),
+    }
+
+
 def _in_group(state: str, group: str) -> bool:
     return state in POSITIONED if group == "all" else state == group
 
@@ -435,7 +499,8 @@ def _in_group(state: str, group: str) -> bool:
 def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: float = 1.0,
                 period: str = "full", eval_step_s: float = 0.25, lag_ms: float = 0.0,
                 interp_max_gap_s: float = 1.0, force: bool = False,
-                details: bool = False) -> dict:
+                details: bool = False, roster: Optional[dict] = None,
+                field_length_m: float = 16.541) -> dict:
     """Score one replay against a match's GT docs. See module doc.
 
     Returns ``{params, window, alignment, warnings, robots: [...],
@@ -506,6 +571,7 @@ def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: flo
             continue
         j = ev_index[rfv]
         rec = {"frame": int(round(tr.g[i])), "rf": round(rfv, 2), "state": st,
+               "x": float(tr.xy[i][0]),
                "processed": bool(processed[j]), "slot": None, "team": None,
                "dist": None, "label_present": False, "label_dist": None}
         if processed[j]:
@@ -533,6 +599,17 @@ def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: flo
         if details:
             row["samples"] = recs
         robots.append(row)
+    # identity view (visible samples): team -> alliance from the GT docs plus
+    # an optional roster {team: alliance} for teams without GT (no-shows etc.)
+    team_alliance = {str(t): a for t, a in (roster or {}).items()}
+    team_alliance.update({tr.team: tr.alliance for tr in tracks if tr.alliance})
+    step = eval_step_s if eval_step_s and eval_step_s > 0 else (1.0 / tracks[0].gt_fps if R else 0.0)
+    id_rows = []
+    for ri, tr in enumerate(tracks):
+        im = identity_metrics([r for r in recs_by_robot[ri] if r["state"] == "visible"],
+                              tr.team, tr.alliance, team_alliance, field_length_m, step)
+        robots[ri]["identity"] = im
+        id_rows.append(im)
     agg = {grp: aggregate({tr.team: [r for r in recs_by_robot[ri] if _in_group(r["state"], grp)]
                            for ri, tr in enumerate(tracks)}, match_radius_m)
            for grp in STATE_GROUPS}
@@ -546,5 +623,6 @@ def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: flo
         "warnings": warnings,
         "robots": robots,
         "aggregate": agg,
+        "identity": aggregate_identity(id_rows),
         "headline": agg["visible"],
     }

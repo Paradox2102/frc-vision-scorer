@@ -241,3 +241,18 @@ def test_align_gt_identity():
     al = align_gt(gt("1", []), replay_fingerprint=FP, replay_auto_start=None,
                   replay_src_fps=60)
     assert al["mode"] == "fingerprint" and al["scale"] == 1 and al["offset"] == 0
+
+
+def test_identity_metrics_lost_misid_and_wrong_colour():
+    from web.field.gt_scoring import identity_metrics
+    mk = lambda rf, slot, team, x: {"rf": rf, "processed": True, "slot": slot, "team": team, "x": x}
+    recs = [mk(0, "R1", "254", 12.0), mk(1, None, None, 12.0), mk(2, None, None, 12.0),   # lost 2 samples
+            mk(3, "R1", "1678", 12.0),                     # same-alliance misID
+            mk(4, "B2", "118", 5.0), mk(5, "B2", "118", 5.0),  # opp half, blue slot, blue team -> cross + wrong colour
+            mk(6, "R1", "254", 12.0), mk(7, None, None, 5.0)]  # lost 1 at end
+    im = identity_metrics(recs, "254", "red", {"254": "red", "1678": "red", "118": "blue"},
+                          16.541, 0.25)
+    assert im["lost_episodes"] == 2 and im["lost_s"] == 0.75 and im["longest_lost_s"] == 0.5
+    assert im["misid_s"] == 0.75 and im["misid_cross_s"] == 0.5 and im["misid_same_s"] == 0.25
+    assert im["wrong_colour_rate"] == round(2 / 5, 4)
+    assert im["wrong_colour_opp_half"] == 1.0 and im["wrong_colour_own_half"] == 0.0

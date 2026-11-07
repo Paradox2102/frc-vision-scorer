@@ -94,7 +94,42 @@ def _probe_fps(path: Path) -> Optional[float]:
         return None
 
 
-def load_replay(row: dict):
+def match_roster(match_key: str) -> dict:
+    """{team: alliance} from the TBA roster in the DB (covers no-show teams that
+    have no GT doc, so a label of theirs is classified cross/same alliance)."""
+    try:
+        con = sqlite3.connect(str(DB_PATH))
+        rows = con.execute("SELECT r.team_number, r.alliance FROM match_robots r JOIN matches m "
+                           "ON m.id = r.match_id WHERE m.tba_match_key = ?", (match_key,)).fetchall()
+        con.close()
+        return {str(t): a for t, a in rows}
+    except sqlite3.Error:
+        return {}
+
+
+def _shift_meta(meta: dict, event_key: str, match_key: str, offset_m: float) -> dict:
+    """Scoring-side half-robot correction: push every pipeline position
+    ``offset_m`` away from the main camera (same geometry as the pipeline's
+    ground_center_offset_m knob) so a robot tracked at its near bumper edge is
+    not counted as lost. No-op for 0 or when no calibration is found."""
+    if not offset_m:
+        return meta
+    from web.field import store as field_store
+    from web.field.match_order import select_epoch
+    from web.field.calibration import push_from_camera
+    v = select_epoch(field_store.load_versions(event_key, "main"), match_key)
+    if not v:
+        return meta
+    cal = v["calibration"]
+    meta = json.loads(json.dumps(meta))
+    for f in meta.get("frames") or []:
+        for r in f.get("robots") or []:
+            if r.get("field_pos"):
+                r["field_pos"] = list(push_from_camera(cal, r["field_pos"], offset_m))
+    return meta
+
+
+def load_replay(row: dict, score_shift_m: float = 0.0):
     """-> ReplayTrack for a replay row (fingerprint + fps from its source video)."""
     meta_p = REPLAYS_DIR / row["id"] / "meta.json"
     if not meta_p.exists():
@@ -102,6 +137,9 @@ def load_replay(row: dict):
     if meta_p is None or not meta_p.exists():
         raise FileNotFoundError(f"meta.json missing for replay {row['id']}")
     meta = json.loads(meta_p.read_text())
+    if score_shift_m:
+        mk = row.get("match_key") or ""
+        meta = _shift_meta(meta, mk.split("_")[0], mk, score_shift_m)
     vid = _resolve(row.get("source_video_path"))
     fp = video_fingerprint(vid) if vid else None
     fps = _probe_fps(vid) if vid else None
@@ -114,7 +152,7 @@ def load_replay(row: dict):
 def score_replay(replay_id: str, *, period: str = "full", match_radius_m: float = 1.0,
                  gt_dir: Path = GT_DIR, force: bool = False, eval_step_s: float = 0.25,
                  lag_ms: float = 0.0, details: bool = False,
-                 gt_docs: Optional[list] = None) -> dict:
+                 gt_docs: Optional[list] = None, score_shift_m: float = 0.0) -> dict:
     """Score one replay against its match's GT. Never raises for expected
     failures (no GT, alignment, missing files): returns ``{"error": ...}``."""
     try:
@@ -126,10 +164,11 @@ def score_replay(replay_id: str, *, period: str = "full", match_radius_m: float 
                 "created_at": row["created_at"]}
         if not docs:
             return {**base, "error": f"no ground truth for {row['match_key']} in {gt_dir}"}
-        rt = load_replay(row)
+        rt = load_replay(row, score_shift_m)
         res = score_match(docs, rt, match_radius_m=match_radius_m, period=period,
                           eval_step_s=eval_step_s, lag_ms=lag_ms, force=force,
-                          details=details)
+                          details=details, roster=match_roster(row["match_key"]))
+        res["params"]["score_shift_m"] = score_shift_m
         if rt.fingerprint is None:
             res["warnings"].append("replay source video not found; no fingerprint check")
         return {**base, **res}
@@ -169,6 +208,20 @@ def print_robots(res: dict) -> None:
               f"{_f(v['label_present'], pct=True):>7} {_f(v['label_on_wrong_robot'], pct=True):>6} "
               f"{v['slot_switches']:>3} {slot:>8}  {est:<14} {r['n_unknown']}")
     print("  " + agg_line(res))
+    print("  " + identity_line(res))
+    for r in res["robots"]:
+        i = r["identity"]
+        print(f"    {r['team']:>6}  lost {i['lost_s']:5.1f}s/{i['lost_episodes']:2d} eps (max {i['longest_lost_s']:4.1f}s)  "
+              f"misID {i['misid_s']:5.1f}s (cross {i['misid_cross_s']:5.1f} / same {i['misid_same_s']:5.1f})  "
+              f"wrong-colour slot {_f(i['wrong_colour_rate'], pct=True)} (own {_f(i['wrong_colour_own_half'], pct=True)} / opp {_f(i['wrong_colour_opp_half'], pct=True)})")
+
+
+def identity_line(res: dict) -> str:
+    i = res["identity"]
+    return (f"IDENTITY: lost {i['lost_s']:.1f}s in {i['lost_episodes']} eps (max {i['longest_lost_s']:.1f}s)  "
+            f"misID {i['misid_s']:.1f}s (cross {i['misid_cross_s']:.1f} / same {i['misid_same_s']:.1f})  "
+            f"wrong-colour slot {_f(i['wrong_colour_rate'], pct=True)} "
+            f"(own half {_f(i['wrong_colour_own_half'], pct=True)} / opp half {_f(i['wrong_colour_opp_half'], pct=True)})")
 
 
 def agg_line(res: dict) -> str:
@@ -194,6 +247,10 @@ def main() -> None:
     ap.add_argument("--lag-ms", type=float, default=0.0,
                     help="shift follow-sourced GT keyframes earlier by lag_ms * playback rate")
     ap.add_argument("--gt-dir", default=str(GT_DIR))
+    ap.add_argument("--score-shift", type=float, default=0.0, metavar="M",
+                    help="push pipeline positions M metres away from the main camera before "
+                         "scoring (0.475 = half a robot: removes the near-bumper-edge bias so "
+                         "position error isn't counted as a lost track)")
     ap.add_argument("--json", help="write full results JSON here")
     ap.add_argument("--details", action="store_true", help="include per-sample records in --json")
     ap.add_argument("--force", action="store_true",
@@ -201,7 +258,8 @@ def main() -> None:
     a = ap.parse_args()
 
     kw = dict(period=a.period, match_radius_m=a.match_radius, gt_dir=Path(a.gt_dir),
-              force=a.force, eval_step_s=a.eval_step, lag_ms=a.lag_ms, details=a.details)
+              force=a.force, eval_step_s=a.eval_step, lag_ms=a.lag_ms, details=a.details,
+              score_shift_m=a.score_shift)
     if a.replay:
         ids = [a.replay]
     else:

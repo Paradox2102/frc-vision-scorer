@@ -512,6 +512,16 @@ window.addEventListener("beforeunload", (e) => {
 });
 
 // ------------------------------------------------------------- loading ---
+// AdvantageScope 2026 Field2d drawing (hub, trench, bumps, depot, tower,
+// outpost) under the map; the server ships it pre-rotated to blue-left.
+async function loadField2d() {
+  try {
+    const cfg = await api("GET", "/api/field2d?season=2026");
+    const img = new Image();
+    img.onload = () => { S.field2d = { cfg, img }; S.dataVersion++; };
+    img.src = cfg.image_url;
+  } catch (e) { /* plain map fallback */ }
+}
 async function init() {
   $("annotator").value = LS.get("gt.annotator", "");
   S.rate = LS.get("gt.rate", 0.75); $("rateSel").value = String(S.rate);
@@ -519,6 +529,7 @@ async function init() {
   S.preset = LS.get("gt.preset", "full");
   S.loupe = LS.get("gt.loupe", false);
   S.boxScale = clamp(LS.get("gt.boxScale", 1), 0.8, 1.4);
+  loadField2d();
   let data;
   try { data = await api("GET", "/api/matches"); }
   catch (e) { $("empty").textContent = "failed to load matches: " + e.message; return; }
@@ -1048,11 +1059,19 @@ function buildMapStatic() {
   const M = { s, ox: (W - L * s) / 2, oy: (H - Wd * s) / 2, fw: Wd };
   S.mapM = M;
   c.fillStyle = "#101214"; c.fillRect(0, 0, W, H);
-  c.fillStyle = "#1a2a1e"; c.fillRect(M.ox, M.oy, L * s, Wd * s);
-  c.strokeStyle = "#556"; c.lineWidth = 1; c.strokeRect(M.ox, M.oy, L * s, Wd * s);
-  c.beginPath(); c.moveTo(M.ox + L / 2 * s, M.oy); c.lineTo(M.ox + L / 2 * s, M.oy + Wd * s); c.strokeStyle = "#667"; c.stroke();
-  c.fillStyle = "rgba(74,144,255,.5)"; c.fillRect(M.ox - 3, M.oy, 3, Wd * s);
-  c.fillStyle = "rgba(255,90,90,.5)"; c.fillRect(M.ox + L * s, M.oy, 3, Wd * s);
+  if (S.field2d) {
+    // map the drawing's carpet rect onto [0,L]x[0,W]; include the canvas margin
+    const f = S.field2d.cfg, [tlx, tly] = f.field_top_left_px, [brx, bry] = f.field_bottom_right_px;
+    const px = (brx - tlx) / L, py = (bry - tly) / Wd, mx = M.ox / s, my = M.oy / s;
+    c.drawImage(S.field2d.img, tlx - mx * px, tly - my * py, (L + 2 * mx) * px, (Wd + 2 * my) * py, 0, 0, W, H);
+    c.fillStyle = "rgba(0,0,0,.38)"; c.fillRect(0, 0, W, H);   // dim so tracks stand out
+  } else {
+    c.fillStyle = "#1a2a1e"; c.fillRect(M.ox, M.oy, L * s, Wd * s);
+    c.strokeStyle = "#556"; c.lineWidth = 1; c.strokeRect(M.ox, M.oy, L * s, Wd * s);
+    c.beginPath(); c.moveTo(M.ox + L / 2 * s, M.oy); c.lineTo(M.ox + L / 2 * s, M.oy + Wd * s); c.strokeStyle = "#667"; c.stroke();
+    c.fillStyle = "rgba(74,144,255,.5)"; c.fillRect(M.ox - 3, M.oy, 3, Wd * s);
+    c.fillStyle = "rgba(255,90,90,.5)"; c.fillRect(M.ox + L * s, M.oy, 3, Wd * s);
+  }
   const a = S.range.start, b = S.range.end, gapF = OTHER_GAP_S * S.fps;
   const path = (arr, col, lw, dash, alpha) => {
     c.strokeStyle = col; c.lineWidth = lw; c.globalAlpha = alpha; c.setLineDash(dash || []);

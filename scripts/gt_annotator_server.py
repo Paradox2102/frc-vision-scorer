@@ -350,6 +350,36 @@ def index():
     return HTML_PATH.read_text()
 
 
+FIELD2D_DIR = ROOT / "data" / "field" / "advantagescope"
+
+
+def _field2d_paths(season: str):
+    year = str(season)[:4]
+    if not year.isdigit():
+        raise HTTPException(400, "bad season")
+    return FIELD2D_DIR / f"{year}_field2d.json", FIELD2D_DIR / f"{year}_field2d.jpg", year
+
+
+@app.get("/api/field2d")
+def api_field2d(season: str = "2026"):
+    """Top-down field drawing (AdvantageScope Field2d, pre-rotated to the
+    WPILib blue-left frame) + the pixel rect of the field carpet in it."""
+    cfg_p, img_p, year = _field2d_paths(season)
+    if not cfg_p.is_file() or not img_p.is_file():
+        raise HTTPException(404, f"no field drawing for {year}")
+    cfg = json.loads(cfg_p.read_text())
+    cfg["image_url"] = f"/api/field2d/{year}.jpg"
+    return cfg
+
+
+@app.get("/api/field2d/{year}.jpg")
+def api_field2d_image(year: str):
+    _cfg_p, img_p, _ = _field2d_paths(year)
+    if not img_p.is_file():
+        raise HTTPException(404, "missing")
+    return FileResponse(img_p, media_type="image/jpeg")
+
+
 @app.get("/api/matches")
 def api_matches():
     return {"matches": build_matches(), "gt_dir": str(GT_DIR)}

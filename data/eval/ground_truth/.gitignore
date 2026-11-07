@@ -1,0 +1,3 @@
+# save_gt keeps the previous version alongside; not ground truth
+*.json.bak
+.tmp-*

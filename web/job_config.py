@@ -420,6 +420,17 @@ KNOBS = [
     # DEFAULT OFF (byte-identical default path) pending A/B.
     Knob("mask_footprint_pos", "MASK_FOOTPRINT_POS", bool, False,
          section="Track hygiene"),
+    # Ground-centre offset (m): a robot's lowest image point (box bottom-centre
+    # OR mask footprint) is its NEAR bumper edge as seen from an elevated
+    # camera, so every projected robot position lands ~half a robot too close
+    # to that camera (qm8 hand GT: ~0.5-0.6 m; post-hoc +0.475 m push took
+    # coverage 58->74%, median err 0.66->0.39 m). When > 0, every robot
+    # ground-point projection (detections, seeding, SAM tracklets, tracker
+    # project_fn) is pushed this far AWAY from its own view's camera centre
+    # along the horizontal ground ray. Pose-free (homography) views: no shift.
+    # DEFAULT 0.0 = OFF (byte-identical) pending A/B (ab_qm8 ground-offset).
+    Knob("ground_center_offset_m", "GROUND_CENTER_OFFSET_M", float, 0.0,
+         min=0.0, max=2.0, section="Track hygiene"),
     # Size-prior hijack cull: a tracked mask whose pixel width, at its
     # projected field position, stays far wider (or narrower) than a robot
     # could appear for size_prior_boundaries consecutive boundaries has latched

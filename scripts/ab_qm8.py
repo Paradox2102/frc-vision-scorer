@@ -298,6 +298,14 @@ PROFILES = {
         ("baseline", {}),
         ("mask_footprint", {"mask_footprint_pos": True}),
     ],
+    # Ground-centre offset: push every projected robot ground point 0.475 m
+    # (half a 0.95 m robot) away from its view's camera centre — the box/mask
+    # bottom is the NEAR bumper edge, not the footprint centre. qm8 hand GT
+    # post-hoc: coverage 58->74%, median err 0.66->0.39 m.
+    "ground-offset": [
+        ("baseline", {}),
+        ("ground_offset_0.475", {"ground_center_offset_m": 0.475}),
+    ],
     # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
     # fusion knobs vs current shipped defaults (baseline). Each alone — not
     # stacked — so a regressor is attributable (the geo4 stack masked which

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import math
 import os
+from web.field.calibration import push_from_camera
 from web.field.tracker import FieldDetection
 from web.field.zones import point_in_zones, ray_enters_zones
 
@@ -214,10 +215,17 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
                         width_max_range=DET_FIELD_WIDTH_MAX_RANGE_M,
                         blocked_zones=None,
                         rejected_out=None,
-                        frac_backstop=None):
+                        frac_backstop=None,
+                        ground_offset_m: float = 0.0):
     """Project image boxes to field-space detections, dropping off-field and
     implausibly-large boxes. If `rejected_out` is a list, each dropped box is
     appended as {"box", "reason", "field_xy"} for hard-negative mining.
+
+    ``ground_offset_m`` > 0 pushes each projected bottom-centre that far away
+    from the camera (``calibration.push_from_camera``): the box bottom is the
+    robot's near bumper edge, not its footprint centre. The on-field and
+    too-large checks run on the SHIFTED point — the robot's true centre — so
+    they agree with the position the detection carries downstream.
 
     ``blocked_zones`` is accepted for call-site compatibility but detections
     inside a zone are KEPT: zones gate slot *seeding* (FieldTracker._assign),
@@ -228,7 +236,8 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
     out = []
     for idx, box in enumerate(robot_boxes):
         uv = _bottom_center(box)
-        xy = calibration.image_to_field(uv)
+        xy = push_from_camera(calibration, calibration.image_to_field(uv),
+                              ground_offset_m)
         if xy is None or not _on_field(xy, field_dims, margin):
             if rejected_out is not None:
                 rejected_out.append({"box": tuple(float(v) for v in box),
@@ -254,6 +263,7 @@ def filter_field_robot_boxes(
     blocked_zones=None,
     ray_blocked_zones=None,
     frac_backstop=None,
+    ground_offset_m: float = 0.0,
 ):
     """Return indices of boxes whose ground contact is a plausible field robot.
 
@@ -263,6 +273,13 @@ def filter_field_robot_boxes(
     ``ray_blocked_zones``: zones additionally tested along the viewing ray
     BEYOND the contact point (see ``zones.ray_enters_zones``). Pass only for
     low cameras, whose occluded-base contacts land short of the structure.
+
+    ``ground_offset_m`` > 0: on-field, ``blocked_zones`` and too-large checks
+    use the camera-pushed robot centre (same point ``to_field_detections``
+    emits). The ray-beyond-contact test keeps the RAW image contact: it is a
+    signature of where the observed bottom edge lands (its 3 m look-ahead was
+    tuned on raw contacts), and pushing its origin would extend the look-ahead
+    and newly block real robots standing ~3 m in front of a structure.
     """
     cam_xy = None
     if ray_blocked_zones and calibration.camera_center is not None:
@@ -270,12 +287,13 @@ def filter_field_robot_boxes(
                   float(calibration.camera_center[1]))
     kept = []
     for idx, box in enumerate(robot_boxes):
-        xy = calibration.image_to_field(_bottom_center(box))
+        contact = calibration.image_to_field(_bottom_center(box))
+        xy = push_from_camera(calibration, contact, ground_offset_m)
         if xy is None or not _on_field(xy, field_dims, margin):
             continue
         if point_in_zones(xy, blocked_zones):
             continue
-        if cam_xy is not None and ray_enters_zones(cam_xy, xy, ray_blocked_zones):
+        if cam_xy is not None and ray_enters_zones(cam_xy, contact, ray_blocked_zones):
             continue
         if _too_large(
             box,

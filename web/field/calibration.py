@@ -125,6 +125,33 @@ class CameraCalibration:
         return self._cast_norm_ray_to_z(norm, z)
 
 
+def push_from_camera(cal, xy, offset_m) -> "tuple | None":
+    """Push a projected ground point ``offset_m`` metres AWAY from the camera.
+
+    A robot box/mask's lowest image point is its NEAR bumper edge as seen from
+    an elevated camera, so the carpet projection of that point sits ~half a
+    robot too close to the camera. Moving it along the horizontal ground ray
+    (direction = xy - camera_center_xy) recovers the footprint centre:
+    ``xy' = xy + offset * (xy - c_xy) / |xy - c_xy|``.
+
+    Returns ``xy`` unchanged (the same object) when ``offset_m`` <= 0, ``xy``
+    is None, the calibration has no pose (homography mode: ``camera_center``
+    is None), or the point sits (numerically) under the camera.
+    """
+    if xy is None or cal is None or not offset_m or offset_m <= 0:
+        return xy
+    cc = getattr(cal, "camera_center", None)
+    if cc is None:
+        return xy
+    dx = float(xy[0]) - float(cc[0])
+    dy = float(xy[1]) - float(cc[1])
+    d = (dx * dx + dy * dy) ** 0.5
+    if d < 1e-6:
+        return xy
+    k = float(offset_m) / d
+    return (float(xy[0]) + k * dx, float(xy[1]) + k * dy)
+
+
 class Calibrator:
     MIN_INTRINSIC_VIEWS = 4
 

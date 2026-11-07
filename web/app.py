@@ -63,7 +63,8 @@ from web.field.sam2_tracker import TrackStopped
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
 from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
-                                   holdout_field_error, tag_alignment_error, MIN_POSE_TAGS)
+                                   holdout_field_error, tag_alignment_error, MIN_POSE_TAGS,
+                                   push_from_camera)
 from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
 from web.field.apriltag_detect import detect_tags
 from web.field.drift_monitor import DriftMonitor
@@ -2086,9 +2087,12 @@ class InferenceJob:
             (self.field_model.length_m, self.field_model.width_m),
             self.config.start_zone_depth_m)
 
+        off = self.config.ground_center_offset_m
+
         def _probe(box):
             uv = ((box[0] + box[2]) / 2.0, box[3] + top_crop_px)
-            xy = view.calibration.image_to_field(uv)
+            xy = push_from_camera(
+                view.calibration, view.calibration.image_to_field(uv), off)
             return xy is not None and point_in_zones(xy, zones)
         return _probe
 
@@ -2150,6 +2154,7 @@ class InferenceJob:
                     self.field_dims,
                     frame_shape=(full_h, full_w, 3),
                     frac_backstop=self.config.det_frac_backstop,
+                    ground_offset_m=self.config.ground_center_offset_m,
                 )
                 # Per-half roster cap, identical to make_detect_fn: strong
                 # candidates always ride; the subordinate (motion) tier — empty
@@ -2160,7 +2165,9 @@ class InferenceJob:
                     _box, _color, strong = merged[idx]
                     fb = full_boxes[idx]
                     uv = ((fb[0] + fb[2]) / 2.0, fb[3])
-                    xy = view.calibration.image_to_field(uv)
+                    xy = push_from_camera(
+                        view.calibration, view.calibration.image_to_field(uv),
+                        self.config.ground_center_offset_m)
                     half = None
                     if xy is not None and self.field_model is not None:
                         half = self.field_model.alliance_side(xy)
@@ -2517,6 +2524,7 @@ class InferenceJob:
             frame_shape=frame.shape,
             rejected_out=rejected,
             frac_backstop=self.config.det_frac_backstop,
+            ground_offset_m=self.config.ground_center_offset_m,
         )
         # Corner-camera range falloff: attenuate (via det.score, which scales
         # the fusion weight) instead of hard-dropping, so center-field robots
@@ -7657,6 +7665,7 @@ class InferenceJob:
                                             blocked_zones=self.static_seed_zones,
                                             ray_blocked_zones=self._ray_zone_list(view),
                                             frac_backstop=self.config.det_frac_backstop,
+                                            ground_offset_m=self.config.ground_center_offset_m,
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
 
@@ -7673,7 +7682,10 @@ class InferenceJob:
                                             x1, y1, x2, y2 = box
                                             full_box = (x1, y1 + top_crop_px, x2, y2 + top_crop_px)
                                             uv = ((full_box[0] + full_box[2]) / 2.0, full_box[3])
-                                            xy = view.calibration.image_to_field(uv)
+                                            xy = push_from_camera(
+                                                view.calibration,
+                                                view.calibration.image_to_field(uv),
+                                                self.config.ground_center_offset_m)
                                             half = None
                                             if xy is not None and self.field_model is not None:
                                                 half = self.field_model.alliance_side(xy)
@@ -7915,6 +7927,7 @@ class InferenceJob:
                                             3,
                                         ),
                                         frac_backstop=self.config.det_frac_backstop,
+                                        ground_offset_m=self.config.ground_center_offset_m,
                                     )
                                     # YOLO priority at boundaries too: motion
                                     # hints share the per-half quota (3 = slots
@@ -7929,7 +7942,10 @@ class InferenceJob:
                                         box, _color, strong = merged[idx]
                                         fb = full_boxes[idx]
                                         uv = ((fb[0] + fb[2]) / 2.0, fb[3])
-                                        xy = view.calibration.image_to_field(uv)
+                                        xy = push_from_camera(
+                                            view.calibration,
+                                            view.calibration.image_to_field(uv),
+                                            self.config.ground_center_offset_m)
                                         half = None
                                         if xy is not None and self.field_model is not None:
                                             half = self.field_model.alliance_side(xy)
@@ -7959,6 +7975,7 @@ class InferenceJob:
                                         frame_shape=(crop.shape[0] + top_crop_px,
                                                      crop.shape[1], 3),
                                         frac_backstop=self.config.det_frac_backstop,
+                                        ground_offset_m=self.config.ground_center_offset_m,
                                     ) if corrob_full else []
                                     out = [
                                         (tuple(v * SAM2_SCALE for v in merged[idx][0]),
@@ -8033,15 +8050,31 @@ class InferenceJob:
                                 if (_cropped_full_h is not None and _top_crop > 0) else 0
                             )
 
-                            def _make_project_fn(cal, y_off, scale):
+                            def _make_project_fn(cal, y_off, scale, ground_offset_m=0.0):
                                 def _project(box):
                                     x1, y1, x2, y2 = box
                                     fx1, fx2 = x1 / scale, x2 / scale
                                     fy2 = y2 / scale + y_off
-                                    return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
+                                    return push_from_camera(
+                                        cal,
+                                        cal.image_to_field(((fx1 + fx2) / 2.0, fy2)),
+                                        ground_offset_m)
                                 return _project
 
-                            _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
+                            # Robot-centre projector (ground_center_offset_m
+                            # applied): tracker stationarity/re-anchor jumps,
+                            # seed/corrob zone gates. _project_contact_fn is
+                            # the RAW bottom-edge contact, used only by the
+                            # seed gate's ray-beyond-contact test (same split
+                            # as filter_field_robot_boxes). Identical when the
+                            # offset is 0.
+                            _project_fn = _make_project_fn(
+                                view.calibration, _y_off, _sam2_scale,
+                                self.config.ground_center_offset_m)
+                            _project_contact_fn = (
+                                _make_project_fn(view.calibration, _y_off, _sam2_scale)
+                                if self.config.ground_center_offset_m > 0
+                                else _project_fn)
 
                             # Hard-negative mining (post-job, best-effort): capture
                             # the pieces mine_hard_negatives needs to map a cull
@@ -8060,7 +8093,8 @@ class InferenceJob:
                             # Low cameras also test the viewing ray beyond the
                             # contact — an occluded structure base projects short
                             # of its zone (qm28 outpost phantom).
-                            def _make_seed_gate_fn(project, zones, ray_zones, cam_xy):
+                            def _make_seed_gate_fn(project, zones, ray_zones, cam_xy,
+                                                   project_contact=None):
                                 def _gate(box):
                                     xy = project(box)
                                     if xy is None:
@@ -8068,7 +8102,11 @@ class InferenceJob:
                                     if point_in_zones(xy, zones):
                                         return False
                                     if ray_zones and cam_xy is not None:
-                                        return not ray_enters_zones(cam_xy, xy, ray_zones)
+                                        contact = (xy if project_contact is None
+                                                   else project_contact(box))
+                                        if contact is None:
+                                            return True
+                                        return not ray_enters_zones(cam_xy, contact, ray_zones)
                                     return True
                                 return _gate
 
@@ -8080,6 +8118,7 @@ class InferenceJob:
                                 None if _cam_center is None else (
                                     float(_cam_center[0]), float(_cam_center[1])
                                 ),
+                                project_contact=_project_contact_fn,
                             )
 
                             # Size-prior hijack cull (A/B knob): expected robot pixel
@@ -8470,6 +8509,7 @@ class InferenceJob:
                     frame_shape=early_overhead.shape,
                     rejected_out=early_rejected,
                     frac_backstop=self.config.det_frac_backstop,
+                    ground_offset_m=self.config.ground_center_offset_m,
                 )
                 if early_rejected:
                     self.hard_neg_logger.maybe_log(
@@ -8661,6 +8701,7 @@ class InferenceJob:
                                     self.field_dims,
                                     frame_shape=view_frame.shape,
                                     frac_backstop=self.config.det_frac_backstop,
+                                    ground_offset_m=self.config.ground_center_offset_m,
                                 ):
                                     continue
                                 # ground_uv picks the mask's carpet-contact
@@ -8681,7 +8722,12 @@ class InferenceJob:
                                 )
                                 uv = (mu / SAM2_SCALE,
                                       mv / SAM2_SCALE + sam2_y_offset)
-                                xy = cal.image_to_field(uv)
+                                # ground_center_offset_m: the contact point is
+                                # the robot's NEAR edge from this camera; push
+                                # to the footprint centre (no-op when 0).
+                                xy = push_from_camera(
+                                    cal, cal.image_to_field(uv),
+                                    self.config.ground_center_offset_m)
                                 corner_weight = corner_detection_weight(
                                     view.name, xy, self.field_dims
                                 )

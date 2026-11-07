@@ -883,6 +883,24 @@ KNOBS = [
     # pending A/B (ab_qm8 territory-free).
     Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, True,
          section="Fusion & field position"),
+    # bumper_color_read: re-read each main-backed tracker input's bumper colour
+    # from the main-view pixels every frame (web/field/bumper_colour.py: push
+    # pos 0.475 m from the camera to the robot centre, project a 0.95 m square
+    # bumper band z 0.03-0.16 m, HSV red-vs-blue fraction excluding the
+    # static red/blue of a ~40-frame median background). Why: qm8 hand GT
+    # (Nov 7 2026) — ~40% of tracker inputs carry colour "unknown" (selective
+    # SAM tracks are TBD) and take their alliance from the field half (63%
+    # wrong-colour-slot time in the opponent's half); the 6% known-but-wrong
+    # inputs are 99% STALE (SAM colour fixed at seed, mask slid onto the other
+    # alliance's robot). Offline read vs GT: own half 74% correct / 0.1% wrong
+    # / 26% undecided; opponent half 32% / 2.3% / 66%. No per-track memory
+    # (harmful: tracks swap robots). Corner-only inputs untouched.
+    # "off" (default, byte-identical); "override" = a decided read replaces
+    # the pipeline colour, undecided keeps it; "strict" = colour := the read
+    # (undecided -> unknown, discarding stale pipeline colours). Pending A/B
+    # (ab_qm8 bumper-colour).
+    Knob("bumper_color_read", "BUMPER_COLOR_READ", str, "off",
+         choices=("off", "override", "strict"), section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

@@ -318,6 +318,16 @@ PROFILES = {
     # wrong-alliance slot 63% of the time). Two interleaved pairs.
     "territory-free": [("baseline_t1", {}), ("territory_free_t1", {"alliance_by_territory": False}),
                        ("baseline_t2", {}), ("territory_free_t2", {"alliance_by_territory": False})],
+    # bumper_color_read: per-frame main-view bumper colour read on every
+    # main-backed tracker input (qm8 GT offline: own half 74% correct / 0.1%
+    # wrong, opponent half 32% / 2.3%). override = decided reads replace the
+    # pipeline colour; strict = colour := read (drops stale SAM colours),
+    # paired with territory-free so undecided inputs don't fall back to the
+    # field half.
+    "bumper-colour": [("baseline_c1", {}),
+                      ("colour_override_c1", {"bumper_color_read": "override"}),
+                      ("colour_strict_tfree_c1", {"bumper_color_read": "strict",
+                                                  "alliance_by_territory": False})],
     # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
     # fusion knobs vs current shipped defaults (baseline). Each alone — not
     # stacked — so a regressor is attributable (the geo4 stack masked which

@@ -339,6 +339,16 @@ PROFILES = {
                           "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
         ("combo_ovr_i2", {"bumper_color_read": "override", "alliance_by_territory": False,
                           "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    # Label stage: hand-GT read analysis (Nov 7) shows team-naming reads are
+    # 94-100% right but the whole-match per-slot resolve wastes them; nearest
+    # read within the same slot+identity binding (else slot majority) took
+    # label correctness 35-46% -> 58-71% offline. identity_segment_resolve is
+    # the existing segment-level labeller (default OFF, never run live).
+    "segment-labels": [
+        ("segments", {"identity_segment_resolve": True}),
+        ("segments_strict_combo", {"identity_segment_resolve": True, "bumper_color_read": "strict",
+                                   "alliance_by_territory": False, "dup_seed_guard_m": 1.0,
+                                   "dup_reap_m": 0.7, "dup_reap_updates": 8})],
     "bumper-colour": [("baseline_c1", {}),
                       ("colour_override_c1", {"bumper_color_read": "override"}),
                       ("colour_strict_tfree_c1", {"bumper_color_read": "strict",

@@ -420,6 +420,17 @@ KNOBS = [
     # DEFAULT OFF (byte-identical default path) pending A/B.
     Knob("mask_footprint_pos", "MASK_FOOTPRINT_POS", bool, False,
          section="Track hygiene"),
+    # Ground-centre offset (m): a robot's lowest image point (box bottom-centre
+    # OR mask footprint) is its NEAR bumper edge as seen from an elevated
+    # camera, so every projected robot position lands ~half a robot too close
+    # to that camera (qm8 hand GT: ~0.5-0.6 m; post-hoc +0.475 m push took
+    # coverage 58->74%, median err 0.66->0.39 m). When > 0, every robot
+    # ground-point projection (detections, seeding, SAM tracklets, tracker
+    # project_fn) is pushed this far AWAY from its own view's camera centre
+    # along the horizontal ground ray. Pose-free (homography) views: no shift.
+    # DEFAULT 0.0 = OFF (byte-identical) pending A/B (ab_qm8 ground-offset).
+    Knob("ground_center_offset_m", "GROUND_CENTER_OFFSET_M", float, 0.0,
+         min=0.0, max=2.0, section="Track hygiene"),
     # Size-prior hijack cull: a tracked mask whose pixel width, at its
     # projected field position, stays far wider (or narrower) than a robot
     # could appear for size_prior_boundaries consecutive boundaries has latched
@@ -712,7 +723,12 @@ KNOBS = [
     # 76.2% / segments 78.3% (labels 96.6% precise, 81% of reads labelled);
     # qm8 2 jobs gir 48.4% / swap 51.1% / segments 61.8% (92.9% precise).
     # Slot-time coverage 31-69%. DEFAULT OFF pending a live full-match A/B.
-    Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, False,
+    # DEFAULT FLIPPED Nov 7 2026 (Nick) with the identity combo below — qm8
+    # full match vs hand GT, job ecc13f9d: mis-ID 199-274 s -> 38 s, wrong
+    # labels 31-41% -> 5%, cross-alliance mis-ID 62-84 s -> 4 s (30% of time
+    # unlabelled instead of guessed). One match, one run: re-check on held-out
+    # matches (qm22/14/13/7 vs Manta auto).
+    Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, True,
          section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
@@ -858,6 +874,57 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("corner_dup_radius_m", "CORNER_DUP_RADIUS_M", float, 2.0, min=0.5,
          max=4.0, section="Fusion & field position"),
+    # alliance_by_territory: decide an unknown-colour robot's alliance by the
+    # field half it stands in (x < L/2 -> blue). An older-game assumption: in
+    # 2026 robots cross midfield constantly. qm8 hand GT (Nov 7 2026): in the
+    # OPPONENT's half a robot is followed by a WRONG-alliance slot 63% of its
+    # tracked time (own half: 4%); ~1/3 of all mis-identifications are
+    # cross-alliance. False = territory-free: in the field tracker an
+    # unknown-colour detection may only EXTEND a live/coasting slot of either
+    # alliance (known-colour assignment first, then one joint pass for the
+    # leftover unknowns) and never seeds one; an unknown-alliance identity
+    # birth is deferred; the SAM prompt/re-prompt gap-fill cap counts the whole
+    # field (<= 6) instead of 3 per half. DEFAULT True (legacy, byte-identical)
+    # pending A/B (ab_qm8 territory-free).
+    # DEFAULT FLIPPED to False Nov 7 2026 (identity combo; see identity_segment_resolve).
+    Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, False,
+         section="Fusion & field position"),
+    # Duplicate-slot guards (FieldTracker). Hand GT on qm8: most slot "swaps"
+    # are duplicates — two slots on one robot (a second main-view SAM object
+    # seeds a free slot next to the robot's existing slot, then the two take
+    # turns). dup_seed_guard_m: no seed within this distance of any active
+    # slot. dup_reap_m / dup_reap_updates: two active slots within dup_reap_m
+    # for that many consecutive updates -> expire the younger. Offline replay
+    # vs GT (qm8, with bumper_color_read=strict + alliance_by_territory=False):
+    # slot purity 47.8 -> 61.4%, robot-on-main-slot 43.9 -> 54.4%, switches
+    # 110 -> 88, coverage -0.3 pt. DEFAULT 0 = off pending live A/B.
+    # DEFAULTS FLIPPED Nov 7 2026 (identity combo): guard 1.0 m, reap 0.7 m x 8.
+    Knob("dup_seed_guard_m", "DUP_SEED_GUARD_M", float, 1.0, min=0.0, max=3.0,
+         section="Fusion & field position"),
+    Knob("dup_reap_m", "DUP_REAP_M", float, 0.7, min=0.0, max=3.0,
+         section="Fusion & field position"),
+    Knob("dup_reap_updates", "DUP_REAP_UPDATES", int, 8, min=1, max=60,
+         section="Fusion & field position"),
+    # bumper_color_read: re-read each main-backed tracker input's bumper colour
+    # from the main-view pixels every frame (web/field/bumper_colour.py: push
+    # pos 0.475 m from the camera to the robot centre, project a 0.95 m square
+    # bumper band z 0.03-0.16 m, HSV red-vs-blue fraction excluding the
+    # static red/blue of a ~40-frame median background). Why: qm8 hand GT
+    # (Nov 7 2026) — ~40% of tracker inputs carry colour "unknown" (selective
+    # SAM tracks are TBD) and take their alliance from the field half (63%
+    # wrong-colour-slot time in the opponent's half); the 6% known-but-wrong
+    # inputs are 99% STALE (SAM colour fixed at seed, mask slid onto the other
+    # alliance's robot). Offline read vs GT: own half 74% correct / 0.1% wrong
+    # / 26% undecided; opponent half 32% / 2.3% / 66%. No per-track memory
+    # (harmful: tracks swap robots). Corner-only inputs untouched.
+    # "off" (default, byte-identical); "override" = a decided read replaces
+    # the pipeline colour, undecided keeps it; "strict" = colour := the read
+    # (undecided -> unknown, discarding stale pipeline colours). Pending A/B
+    # (ab_qm8 bumper-colour).
+    # DEFAULT FLIPPED to "strict" Nov 7 2026 (identity combo; pairs with
+    # alliance_by_territory=False — strict leaves more inputs colourless).
+    Knob("bumper_color_read", "BUMPER_COLOR_READ", str, "strict",
+         choices=("off", "override", "strict"), section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

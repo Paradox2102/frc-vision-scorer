@@ -134,7 +134,8 @@ class FieldTracker:
                  phys_reach_slack_m=1.0, phys_corner_slack_m=2.0,
                  reseed_hold_s=1.5, reseed_fresh_cost_m=3.0,
                  corner_dup_radius_m=2.0, assign_partial_fix=False,
-                 phys_excess_weight=2.0):
+                 phys_excess_weight=2.0, alliance_by_territory=True,
+                 dup_seed_guard_m=0.0, dup_reap_m=0.0, dup_reap_updates=8):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -213,6 +214,29 @@ class FieldTracker:
         self.reseed_hold_s = float(reseed_hold_s)
         self.reseed_fresh_cost_m = float(reseed_fresh_cost_m)
         self.corner_dup_radius_m = float(corner_dup_radius_m)
+        # alliance_by_territory (default True = legacy): an unknown-colour
+        # detection is offered only to the alliance whose field half it is in,
+        # and may seed a slot there. False (territory-free; robots cross
+        # midfield constantly in 2026): known-colour detections are assigned
+        # per alliance first, then ONE joint pass offers the leftover unknown
+        # detections to the still-unmatched pre-existing slots of BOTH
+        # alliances (each det claimed at most once, min total cost); unknown
+        # detections never seed. See _assign_territory_free.
+        self.alliance_by_territory = bool(alliance_by_territory)
+        # Duplicate-slot guards (default 0 = off). Hand GT on qm8: most slot
+        # "swaps" are DUPLICATES — two slots on one robot (a second main-view
+        # SAM object on an already-tracked robot seeds a free slot, and the two
+        # then take turns being nearest). Robots are 0.95 m squares, so two
+        # real robot centres can't sit much closer than ~0.9 m.
+        # dup_seed_guard_m: never seed a free slot from a detection within this
+        #   distance of an ACTIVE slot (either alliance; visible or coasting).
+        # dup_reap_m / dup_reap_updates: two active slots that stay within
+        #   dup_reap_m for dup_reap_updates consecutive updates are one robot —
+        #   expire the younger (fewer hits; tie -> higher slot id).
+        self.dup_seed_guard_m = float(dup_seed_guard_m)
+        self.dup_reap_m = float(dup_reap_m)
+        self.dup_reap_updates = int(dup_reap_updates)
+        self._dup_pair_n: dict = {}
         self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
         self._frame_idx = 0
         # Opt-in measurement history for the offline RTS smoothing pass
@@ -267,6 +291,10 @@ class FieldTracker:
             "reseed_fresh_cost_m": self.reseed_fresh_cost_m,
             "corner_dup_radius_m": self.corner_dup_radius_m,
             "assign_partial_fix": self.assign_partial_fix,
+            "alliance_by_territory": self.alliance_by_territory,
+            "dup_seed_guard_m": self.dup_seed_guard_m,
+            "dup_reap_m": self.dup_reap_m,
+            "dup_reap_updates": self.dup_reap_updates,
         }
 
     def _reach_excess(self, t, pos, det_corner, dt) -> float:
@@ -284,16 +312,20 @@ class FieldTracker:
         dist = float(np.hypot(pos[0] - t.last_meas_pos[0], pos[1] - t.last_meas_pos[1]))
         return max(0.0, dist - reach)
 
-    def _corner_dups(self, dets_with_idx) -> set:
+    def _corner_dups(self, dets_with_idx, context=()) -> set:
         """Original indices of corner-only detections that are an unfused
         corner view of a main-backed detection of the same alliance pool this
         frame: within corner_dup_radius_m of it, and (when camera membership
         is known) from a corner camera that main-backed cluster lacks — if
         the cluster already holds that camera's view, the corner camera saw a
-        second robot there (e.g. one hidden from main), not a duplicate."""
+        second robot there (e.g. one hidden from main), not a duplicate.
+        ``context``: extra ``(idx, det)`` pairs that count as main-backed
+        partners but are not themselves candidates (territory-free passes,
+        where the legacy pool's unknown/known mix is split across passes)."""
         if not self.corner_dup_suppress:
             return set()
-        mains = [d for _i, d in dets_with_idx if d.box is not None]
+        mains = [d for _i, d in list(dets_with_idx) + list(context)
+                 if d.box is not None]
         r = self.corner_dup_radius_m
         out = set()
         for i, d in dets_with_idx:
@@ -393,18 +425,21 @@ class FieldTracker:
         # detection from seeding slots in both alliances simultaneously.
         half = self.field_length / 2.0
         indexed = list(enumerate(detections))
-        for alliance in ALLIANCES:
-            def _territory(pos):
-                return "blue" if pos[0] < half else "red"
-            pairs = [(i, d) for (i, d) in indexed
-                     if d.color == alliance
-                     or (d.color == "unknown" and _territory(d.pos) == alliance)]
-            self._assign(
-                self._slots(alliance),
-                pairs,
-                alliance,
-                dt,
-            )
+        if not self.alliance_by_territory:
+            self._assign_territory_free(indexed, dt)
+        else:
+            for alliance in ALLIANCES:
+                def _territory(pos):
+                    return "blue" if pos[0] < half else "red"
+                pairs = [(i, d) for (i, d) in indexed
+                         if d.color == alliance
+                         or (d.color == "unknown" and _territory(d.pos) == alliance)]
+                self._assign(
+                    self._slots(alliance),
+                    pairs,
+                    alliance,
+                    dt,
+                )
 
         # Coast/expire logic: runs after _assign has updated missed counts
         for t in self.tracks:
@@ -419,26 +454,10 @@ class FieldTracker:
                 if t.kf is not None:
                     t.kf.decay_velocity(self.coast_vel_decay)
             if t.missed > budget:
-                # Expire the track
-                t.expired_pos = t.kf.pos if t.kf is not None else None
-                t.expired_k = self._frame_idx
-                self.slot_events.append({
-                    "event": "expire", "slot_id": t.slot_id,
-                    "pos": t.expired_pos, "missed": int(t.missed)})
-                t.active = False
-                t.kf = None
-                t.box = None
-                t.coasting = False
-                t.occ_coasting = False
-                tids_to_del = [tid for tid, sid in self._id_to_slot.items() if sid == t.slot_id]
-                for tid in tids_to_del:
-                    del self._id_to_slot[tid]
-                    self.binding_events.append({
-                        "event": "slot_expired",
-                        "slot_id": t.slot_id,
-                        "track_id": tid,
-                        "alliance": t.alliance,
-                    })
+                self._expire(t)
+
+        if self.dup_reap_m > 0:
+            self._reap_duplicates()
 
         if self.record_history:
             for t in self.tracks:
@@ -461,16 +480,72 @@ class FieldTracker:
 
         return self._emit()
 
-    def _assign(self, slots, dets_with_idx, alliance, dt):
-        """Match active tracks to dets, update matched, coast unmatched, seed free slots."""
-        active_slots = [t for t in slots if t.active]
-        free_slots = [t for t in slots if not t.active]
+    def _assign_territory_free(self, indexed, dt):
+        """alliance_by_territory=False: assignment without field-half alliance.
+
+        1. Per alliance, that colour's KNOWN detections are matched/seeded
+           exactly as in the legacy pass (unknown dets are context only: they
+           still count for corner-dup partners and track_id ambiguity, as they
+           would have in the legacy same-half pool).
+        2. ONE joint pass offers the leftover UNKNOWN-colour detections to the
+           slots of BOTH alliances that were active before this frame and are
+           still unmatched (same gates/penalties, incl. color_penalty). A
+           single min-cost assignment over that joint matrix means one
+           detection can claim at most one slot. Never seeds.
+        3. Pre-existing active slots still unmatched miss this frame (the
+           missed counter is deferred to here so step 2 sees the same coast
+           gate the legacy pass would).
+        Deterministic: no ordering between alliances matters (step 1's
+        passes touch disjoint slots and detections)."""
+        pre_active = {t.slot_id for t in self.tracks if t.active}
+        known = [(i, d) for i, d in indexed if d.color in ALLIANCES]
+        unknown = [(i, d) for i, d in indexed if d.color == "unknown"]
+        for alliance in ALLIANCES:
+            self._assign(self._slots(alliance),
+                         [(i, d) for i, d in known if d.color == alliance],
+                         alliance, dt, count_miss=False, context=unknown)
+        claimed = set(self.last_det_to_slot.values())
+        eligible = {sid for sid in pre_active if sid not in claimed}
+        if unknown and eligible:
+            self._assign(list(self.tracks), unknown, "unknown", dt,
+                         seed=False, count_miss=False, eligible=eligible,
+                         context=known)
+        claimed = set(self.last_det_to_slot.values())
+        for t in self.tracks:
+            if t.slot_id in pre_active and t.active and t.slot_id not in claimed:
+                t.missed += 1
+
+    def _joint_assignment(self, cost):
+        """Min-cost assignment for the territory-free joint pass (up to 6
+        slots x N unknown dets — too big for the brute force). Gated-out
+        pairs cost a large constant, so in-gate matches are maximised then
+        cost-minimised (the assign_partial_fix semantics); callers drop
+        non-finite pairs. Deterministic."""
+        from scipy.optimize import linear_sum_assignment
+        c = np.where(np.isfinite(cost), cost, _GATED_OUT_COST)
+        rows, cols = linear_sum_assignment(c)
+        return [int(r) for r in rows], [int(k) for k in cols]
+
+    def _assign(self, slots, dets_with_idx, alliance, dt, *, seed=True,
+                count_miss=True, eligible=None, context=()):
+        """Match active tracks to dets, update matched, coast unmatched, seed free slots.
+
+        Legacy calls use the defaults. Territory-free passes
+        (_assign_territory_free) may disable seeding (``seed``) and the
+        missed-counter increment (``count_miss``), restrict matching to the
+        slot ids in ``eligible`` (others are neither matched nor sticky-
+        rebound; a sticky id pointing at one routes to distance matching),
+        and pass ``context`` detections that count for corner-dup partners
+        and track_id ambiguity without being matchable here."""
+        active_slots = [t for t in slots if t.active
+                        and (eligible is None or t.slot_id in eligible)]
+        free_slots = [t for t in slots if not t.active] if seed else []
 
         # corner_dup_suppress: an unfused corner view of a main-backed robot is
         # that robot measured twice (worse geometry); it is dropped from the
         # pool before any matching or seeding, so it can neither seed a second
         # slot nor keep a slot riding it (that slot re-acquires the main view).
-        dup_idx = self._corner_dups(dets_with_idx)
+        dup_idx = self._corner_dups(dets_with_idx, context)
         if dup_idx:
             self.slot_events.append({"event": "corner_dup", "slot_id": None,
                                      "det_idx": sorted(int(i) for i in dup_idx),
@@ -485,7 +560,7 @@ class FieldTracker:
         # distance matching, which preserves per-slot continuity, and learn
         # nothing from them.
         tid_counts: dict = {}
-        for _i, d in dets_with_idx:
+        for _i, d in list(dets_with_idx) + list(context):
             if d.track_id is not None:
                 tid_counts[d.track_id] = tid_counts.get(d.track_id, 0) + 1
         ambiguous_tids = {t for t, n in tid_counts.items() if n > 1}
@@ -504,6 +579,13 @@ class FieldTracker:
                 # Re-bind to the known slot.
                 slot_id = self._id_to_slot[tid]
                 slot = next((t for t in slots if t.slot_id == slot_id), None)
+                if (eligible is not None and slot is not None and slot.active
+                        and slot.slot_id not in eligible):
+                    # Territory-free joint pass: the id's slot already took a
+                    # measurement this frame (or was just seeded). Keep the
+                    # mapping; let distance matching place this detection.
+                    remaining_pairs.append((orig_idx, d))
+                    continue
                 if slot is not None and slot.active:
                     if (self.sticky_max_dist_m > 0 and slot.kf is not None
                             and float(np.linalg.norm(
@@ -660,8 +742,12 @@ class FieldTracker:
                             c += self.color_penalty
                         cost[i, j] = c
 
-            # Find best assignment (brute force over <=3! permutations)
-            rows, cols = self._best_assignment(cost)
+            # Find best assignment (brute force over <=3! permutations;
+            # the territory-free joint pass spans both alliances -> LSA).
+            if eligible is not None:
+                rows, cols = self._joint_assignment(cost)
+            else:
+                rows, cols = self._best_assignment(cost)
 
             # Determine which (slot_idx, det_idx) pairs are valid (gated)
             matched_slot_indices = set()
@@ -700,9 +786,10 @@ class FieldTracker:
                     }
 
             # Increment missed for unmatched active slots
-            for i, t in enumerate(active_slots):
-                if i not in matched_slot_indices:
-                    t.missed += 1
+            if count_miss:
+                for i, t in enumerate(active_slots):
+                    if i not in matched_slot_indices:
+                        t.missed += 1
 
             # Seed leftover detections into free slots — but never seed a new
             # slot from a detection inside a static-structure zone (a real robot
@@ -710,21 +797,43 @@ class FieldTracker:
             cands = [(idxs[j], dets[j]) for j in range(len(dets))
                      if j not in matched_det_indices and j not in guard_blocked
                      and not point_in_zones(dets[j].pos, self.zones)]
+            cands = self._dup_seed_filter(cands)
             for slot, (orig_idx, d) in self._seed_pairs(free_slots, cands, dt):
                 self._seed_slot(slot, d, orig_idx, ambiguous_tids)
 
         elif active_slots and not dets:
             # No detections: all active slots missed
-            for t in active_slots:
-                t.missed += 1
+            if count_miss:
+                for t in active_slots:
+                    t.missed += 1
 
         else:
             # No active slots: seed as many dets as we have free slots, skipping
             # any detection sitting inside a static-structure zone.
             cands = [(idxs[j], d) for j, d in enumerate(dets)
                      if not point_in_zones(d.pos, self.zones)]
+            cands = self._dup_seed_filter(cands)
             for slot, (orig_idx, d) in self._seed_pairs(free_slots, cands, dt):
                 self._seed_slot(slot, d, orig_idx, ambiguous_tids)
+
+    def _dup_seed_filter(self, cands):
+        """dup_seed_guard_m: drop seed candidates within the guard distance of
+        any active slot (either alliance) — a second detection of a robot that
+        already has a slot. No-op when the guard is 0."""
+        if self.dup_seed_guard_m <= 0 or not cands:
+            return cands
+        act = [t.kf.pos for t in self.tracks if t.active and t.kf is not None]
+        if not act:
+            return cands
+        out = []
+        for c in cands:
+            p = c[1].pos
+            if min(np.hypot(p[0] - q[0], p[1] - q[1]) for q in act) < self.dup_seed_guard_m:
+                self.slot_events.append({"event": "dup_seed_blocked",
+                                         "pos": (float(p[0]), float(p[1]))})
+                continue
+            out.append(c)
+        return out
 
     def _seed_pairs(self, free_slots, cands, dt):
         """Which free slot each seedable detection ``(orig_idx, det)`` seeds.
@@ -766,6 +875,49 @@ class FieldTracker:
                 continue
             pairs.append((free_slots[r], cands[c]))
         return pairs
+
+    def _expire(self, t, event: str = "expire"):
+        """Deactivate slot ``t`` (coast budget exhausted, or a reaped duplicate)."""
+        t.expired_pos = t.kf.pos if t.kf is not None else None
+        t.expired_k = self._frame_idx
+        self.slot_events.append({
+            "event": event, "slot_id": t.slot_id,
+            "pos": t.expired_pos, "missed": int(t.missed)})
+        t.active = False
+        t.kf = None
+        t.box = None
+        t.coasting = False
+        t.occ_coasting = False
+        tids_to_del = [tid for tid, sid in self._id_to_slot.items() if sid == t.slot_id]
+        for tid in tids_to_del:
+            del self._id_to_slot[tid]
+            self.binding_events.append({
+                "event": "slot_expired",
+                "slot_id": t.slot_id,
+                "track_id": tid,
+                "alliance": t.alliance,
+            })
+
+    def _reap_duplicates(self):
+        """Expire the younger of two active slots that have sat within
+        dup_reap_m of each other for dup_reap_updates consecutive updates."""
+        act = [t for t in self.tracks if t.active and t.kf is not None]
+        close = set()
+        for i, a in enumerate(act):
+            for b in act[i + 1:]:
+                if np.hypot(a.kf.pos[0] - b.kf.pos[0], a.kf.pos[1] - b.kf.pos[1]) < self.dup_reap_m:
+                    close.add((a.slot_id, b.slot_id))
+        self._dup_pair_n = {k: self._dup_pair_n.get(k, 0) + 1 for k in close}
+        by_id = {t.slot_id: t for t in act}
+        for (sa, sb), n in sorted(self._dup_pair_n.items()):
+            if n < self.dup_reap_updates:
+                continue
+            a, b = by_id.get(sa), by_id.get(sb)
+            if a is None or b is None or not a.active or not b.active:
+                continue
+            young = min((a, b), key=lambda t: (t.hits, -t.slot_id))   # fewer hits; tie -> higher id
+            self._expire(young, event="dup_reaped")
+            self._dup_pair_n = {k: v for k, v in self._dup_pair_n.items() if young.slot_id not in k}
 
     def _seed_slot(self, slot, d, orig_idx, ambiguous_tids):
         """Seed free ``slot`` from detection ``d`` (fused index ``orig_idx``)."""

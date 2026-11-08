@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GT Track Annotator</title>
+<style>
+  :root {
+    --bg: #15171a; --panel: #1e2125; --panel2: #262a2f; --line: #353a41; --fg: #e3e6ea; --dim: #8b929b;
+    --blue: #4a90ff; --red: #ff5a5a; --vis: #3ddc84; --est: #ffb020; --unk: #9a7cff; --warn: #ff6b3d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         display: grid; grid-template-rows: auto 1fr; overflow: hidden; }
+  header { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 6px 10px; background: var(--panel);
+           border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 13px; margin: 0 6px 0 0; font-weight: 600; letter-spacing: .02em; }
+  select, input, button { font: inherit; color: var(--fg); background: var(--panel2); border: 1px solid var(--line);
+                          border-radius: 4px; padding: 3px 6px; }
+  button { cursor: pointer; }
+  button:hover { border-color: #59606a; }
+  button.on { outline: 2px solid var(--fg); }
+  label.k { color: var(--dim); }
+  #robots { display: flex; gap: 4px; }
+  .rb { position: relative; min-width: 66px; padding: 3px 8px; border: 1px solid transparent; font-weight: 600; }
+  .rb.blue { background: #1d3a66; } .rb.red { background: #6a2020; }
+  .rb.sel.blue { background: var(--blue); color: #000; } .rb.sel.red { background: var(--red); color: #000; }
+  .rb .st { font-weight: 400; opacity: .7; font-size: 10px; }
+  .rb .bd { position: absolute; top: -6px; right: -6px; background: #000; color: var(--fg); border: 1px solid var(--line);
+            border-radius: 8px; padding: 0 4px; font-size: 10px; font-weight: 400; }
+  .rb .bd:empty { display: none; }
+  #save { padding: 2px 8px; border-radius: 4px; background: var(--panel2); }
+  #save.saved { color: var(--vis); } #save.unsaved { color: var(--est); } #save.saving { color: var(--dim); }
+  #save.error { color: #000; background: var(--warn); }
+  main { display: grid; grid-template-columns: 1fr minmax(260px, min(410px, 32vw)); min-height: 0; }
+  #left { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 6px; gap: 4px; }
+  #stageWrap { flex: 1; min-height: 0; position: relative; }
+  #stage { position: absolute; background: #000; }
+  #stage video, #stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #stage video { object-fit: fill; }
+  #ov { cursor: none; touch-action: none; }
+  #toast { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); background: var(--warn); color: #000;
+           padding: 4px 10px; border-radius: 4px; font-weight: 600; pointer-events: none; opacity: 0; transition: opacity .25s; z-index: 5; }
+  #toast.show { opacity: 1; transition: none; }
+  #toast.info { background: #9ad; }
+  #recBadge { position: absolute; left: 8px; top: 8px; padding: 3px 8px; border-radius: 4px; background: rgba(0,0,0,.7);
+              font-weight: 700; pointer-events: none; z-index: 4; }
+  #recBadge.rec { background: #c01818; color: #fff; } #recBadge.recest { background: var(--est); color: #000; }
+  #timeline { width: 100%; height: 46px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; cursor: pointer; }
+  #rangeRow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #rangeRow .sep { width: 1px; height: 16px; background: var(--line); }
+  #side { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .box { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+  .box h3 { margin: 0 0 4px; font-size: 11px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .row { display: flex; justify-content: space-between; gap: 8px; }
+  .big { font-size: 15px; font-weight: 600; }
+  .dim { color: var(--dim); }
+  .warn { color: var(--warn); }
+  #map { width: 100%; display: block; background: #101214; border-radius: 3px; }
+  table.keys { border-collapse: collapse; width: 100%; }
+  table.keys td { padding: 1px 4px; vertical-align: top; }
+  table.keys td:first-child { color: var(--fg); white-space: nowrap; width: 1%; }
+  table.keys td:last-child { color: var(--dim); }
+  kbd { background: #111; border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; font: inherit; font-size: 11px; }
+  .legend span { margin-right: 10px; white-space: nowrap; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
+  #empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>GT Track Annotator</h1>
+  <label class="k">match</label><select id="matchSel" title="match"></select>
+  <label class="k">video</label><select id="videoSel" title="source video (byte-identical copies are merged)"></select>
+  <div id="robots"></div>
+  <button id="modeBtn" title="M: toggle follow / step mode">FOLLOW</button>
+  <label class="k">rate</label>
+  <select id="rateSel" title="playback rate (follow + Space)">
+    <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+    <option value="0.75" selected>0.75×</option><option value="1">1×</option>
+  </select>
+  <label class="k">Δt</label>
+  <select id="stepSel" title="step size for arrows / step mode / U">
+    <option value="0.1">0.1 s</option><option value="0.25" selected>0.25 s</option>
+    <option value="0.5">0.5 s</option><option value="1">1.0 s</option>
+  </select>
+  <label class="k">annotator</label><input id="annotator" size="9" placeholder="name">
+  <button id="saveBtn" title="Ctrl+S">save</button>
+  <span id="save" class="saved">—</span>
+</header>
+<main>
+  <div id="left">
+    <div id="stageWrap">
+      <div id="stage">
+        <video id="vid" muted playsinline preload="auto"></video>
+        <canvas id="ov"></canvas>
+        <div id="recBadge">paused</div>
+        <div id="toast"></div>
+      </div>
+      <div id="empty">loading…</div>
+    </div>
+    <canvas id="timeline" title="click/drag: seek · shift-drag: select range (Delete removes it)"></canvas>
+    <div id="rangeRow">
+      <span class="dim">auto start</span><span id="t0Txt">—</span>
+      <button id="setT0" title="Set match_t0_frame (autonomous start) to the current frame">Set auto start = current frame</button>
+      <span class="sep"></span>
+      <span class="dim">range</span>
+      <button class="rp" data-p="auto" title="3 s before auto start through 3 s after auto ends">Auto (t0−3 → +23 s)</button>
+      <button class="rp" data-p="full" title="3 s before auto start through 3 s after the match clock hits 0:00">Full match (t0−3 → +169 s)</button>
+      <button class="rp" data-p="whole">Whole video</button>
+      <span id="rangeTxt" class="dim"></span>
+      <span class="sep"></span>
+      <span id="selTxt"></span>
+    </div>
+  </div>
+  <div id="side">
+    <div class="box">
+      <div class="row"><span class="big" id="frameTxt">frame —</span><span class="big" id="mtTxt">—</span></div>
+      <div class="row"><span class="dim" id="vtTxt"></span><span id="stateTxt" class="dim"></span></div>
+      <div id="projTxt" class="dim">cursor: —</div>
+      <div id="progTxt" class="dim"></div>
+      <div id="warnTxt" class="warn"></div>
+    </div>
+    <div class="box">
+      <h3>Field (blue wall left) — GT paths</h3>
+      <canvas id="map"></canvas>
+      <div class="row" style="margin-top:4px">
+        <label class="k">pipeline replay</label>
+        <select id="replaySel" style="max-width:250px"><option value="">— none —</option></select>
+      </div>
+      <div id="replayTxt" class="dim"></div>
+    </div>
+    <div class="box legend">
+      <span><i class="sw" style="background:var(--vis)"></i>visible</span>
+      <span><i class="sw" style="background:var(--est)"></i>estimated</span>
+      <span><i class="sw" style="background:var(--unk)"></i>unknown</span>
+      <span><i class="sw" style="background:rgba(255,107,61,.45)"></i>gap &gt; 2·Δt</span>
+    </div>
+    <div class="box">
+      <h3>Keys</h3>
+      <table class="keys">
+        <tr><td>FOLLOW</td><td>press &amp; hold on the robot: plays at rate, records cursor every 2nd frame. Release = pause (move to the other camera panel, press again).</td></tr>
+        <tr><td><kbd>Shift</kbd> held</td><td>follow samples are <b>estimated</b> (occluded guess)</td></tr>
+        <tr><td><kbd>M</kbd></td><td>toggle STEP mode: click = visible + advance Δt</td></tr>
+        <tr><td><kbd>Shift</kbd>+click / <kbd>E</kbd> click</td><td>step: estimated + advance</td></tr>
+        <tr><td><kbd>U</kbd></td><td>unknown at this frame + advance Δt</td></tr>
+        <tr><td><kbd>Space</kbd></td><td>play / pause (no recording)</td></tr>
+        <tr><td><kbd>←</kbd><kbd>→</kbd></td><td>step Δt · <kbd>Shift</kbd>: 1 frame</td></tr>
+        <tr><td><kbd>[</kbd><kbd>]</kbd></td><td>prev / next keyframe · <kbd>Shift</kbd>: prev / next gap</td></tr>
+        <tr><td><kbd>Del</kbd> <kbd>⌫</kbd></td><td>delete keyframe here, or the timeline selection</td></tr>
+        <tr><td>shift-drag timeline</td><td>select range · <kbd>Esc</kbd> clears</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Y</kbd></td><td>undo / redo</td></tr>
+        <tr><td><kbd>-</kbd> <kbd>=</kbd></td><td>robot box smaller / bigger (0.8–1.4×)</td></tr>
+        <tr><td><kbd>L</kbd></td><td>magnifier on/off</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>save now (autosaves anyway)</td></tr>
+      </table>
+      <div class="dim" style="margin-top:4px">Keep the robot box on the robot: the crosshair is the centre of its footprint on the carpet (that point is what's recorded).</div>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+// ------------------------------------------------------------------ state ---
+const $ = (id) => document.getElementById(id);
+const video = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
+const tl = $("timeline"), tctx = tl.getContext("2d");
+const mapC = $("map"), mctx = mapC.getContext("2d");
+const MAX_SPEED_MPS = 6.0, JUMP_SLACK_M = 0.5, REANCHOR_N = 10, DECIMATE = 2;
+const TRAIL_S = 2.0, OTHER_GAP_S = 1.0, AUTO_S = 20, FULL_S = 166, TELEOP_S = 24, PAD_S = 3;
+// 2026 match timeline measured off the qm8 broadcast clock (t0 = auto start):
+// auto 0–20 s, clock frozen at 2:20 until teleop starts ~24 s, 0:00 at ~166 s.
+// Presets pad PAD_S on both sides so the opening and the buzzer are never clipped.
+const HAS_RVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+
+const S = {
+  matches: [], match: null, video: null, fps: 60, frameCount: 0, vw: 1920, vh: 1080,
+  views: [], grid: null, field: { length_m: 16.54, width_m: 8.07 }, margin: 0.5, calib: {},
+  team: null, alliance: null, docs: {}, kfs: [], notes: "", t0: null,
+  undo: [], redo: [], dirty: false, saving: false, saveAgain: false, lastSaveAt: 0, saveTimer: null,
+  mode: "follow", rate: 0.75, step: 0.25, preset: "full", range: { start: 0, end: 0 },
+  presented: null, recording: false, rec: null, shift: false, estArm: false,
+  cursor: { u: 0, v: 0, inside: false, cx: 0, cy: 0 }, loupe: false, boxScale: 1, boxGrid: null, sel: null, selDrag: null, scrub: false,
+  replay: null, dataVersion: 0, mapVersion: -1, mapStatic: null, lastMapBuild: 0, backupAt: 0,
+};
+
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
+};
+
+async function api(method, url, body) {
+  const r = await fetch(url, { method, headers: body ? { "Content-Type": "application/json" } : {},
+                               body: body ? JSON.stringify(body) : undefined });
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* non-JSON */ }
+  if (!r.ok) {
+    const d = j && (j.detail || j.error);
+    const err = new Error(typeof d === "string" ? d : (d ? JSON.stringify(d) : r.statusText));
+    err.status = r.status; throw err;
+  }
+  return j;
+}
+const enc = encodeURIComponent;
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const r2 = (x) => Math.round(x * 100) / 100;
+
+// ------------------------------------------------------- keyframe helpers ---
+function lowerBound(arr, f) { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m].frame < f) lo = m + 1; else hi = m; } return lo; }
+function kfAt(arr, f) { const i = lowerBound(arr, f); return (i < arr.length && arr[i].frame === f) ? arr[i] : null; }
+const positioned = (k) => k && k.state !== "unknown" && k.uv;
+const kfXY = (k) => (k && (k.field_xy || k._xy)) || null;
+function setKf(kf) { const i = lowerBound(S.kfs, kf.frame); if (i < S.kfs.length && S.kfs[i].frame === kf.frame) S.kfs[i] = kf; else S.kfs.splice(i, 0, kf); }
+function deleteRange(a, b) { const i = lowerBound(S.kfs, a), j = lowerBound(S.kfs, b + 1); if (j > i) S.kfs.splice(i, j - i); return Math.max(0, j - i); }
+function pushUndo() { S.undo.push(S.kfs.slice()); if (S.undo.length > 200) S.undo.shift(); S.redo.length = 0; }
+function stepFrames() { return Math.max(1, Math.round(S.step * S.fps)); }
+function viewOf(u, v) { for (const vw of S.views) { const [x, y, w, h] = vw.crop; if (u >= x && u < x + w && v >= y && v < y + h) return vw.name; } return null; }
+
+function edited() {
+  S.dirty = true; S.dataVersion++;
+  setSaveStatus("unsaved"); backupLocal(false); scheduleSave(); updateBadges(); requestDraw();
+}
+
+// ---------------------------------------------------- client projection ---
+// Bilinear lookup in the server's per-view projection grid (exact field_xy is
+// recomputed server-side on save; this is only for live feedback + guards).
+function projectUV(u, v) {
+  if (!S.grid) return { view: viewOf(u, v), xy: null, onField: true, approx: false };
+  for (const g of S.grid) {
+    const [x, y, w, h] = g.crop;
+    if (!(u >= x && u < x + w && v >= y && v < y + h)) continue;
+    const lu = (u - x) / g.step, lv = (v - y) / g.step;
+    const i0 = Math.min(Math.floor(lu), g.nx - 2), j0 = Math.min(Math.floor(lv), g.ny - 2);
+    const fx = lu - i0, fy = lv - j0;
+    const p00 = g.xy[j0 * g.nx + i0], p10 = g.xy[j0 * g.nx + i0 + 1];
+    const p01 = g.xy[(j0 + 1) * g.nx + i0], p11 = g.xy[(j0 + 1) * g.nx + i0 + 1];
+    if (!p00 || !p10 || !p01 || !p11) return { view: g.name, xy: null, onField: false, approx: true };
+    const X = (1 - fy) * ((1 - fx) * p00[0] + fx * p10[0]) + fy * ((1 - fx) * p01[0] + fx * p11[0]);
+    const Y = (1 - fy) * ((1 - fx) * p00[1] + fx * p10[1]) + fy * ((1 - fx) * p01[1] + fx * p11[1]);
+    const m = S.margin, L = S.field.length_m, W = S.field.width_m;
+    const onField = X >= -m && X <= L + m && Y >= -m && Y <= W + m;
+    return { view: g.name, xy: [X, Y], onField, approx: true };
+  }
+  return { view: null, xy: null, onField: false, approx: true };
+}
+function plausible(prev, f, xy) {
+  const dt = Math.abs(f - prev.frame) / S.fps;
+  return Math.hypot(xy[0] - prev.xy[0], xy[1] - prev.xy[1]) <= MAX_SPEED_MPS * dt + JUMP_SLACK_M;
+}
+// Robot-sized box around a ground point: [dx0, dy0, dx1, dy1] offsets (composite px)
+// from the server's per-view grid (bilinear when all 4 nodes exist, else nearest).
+function boxAt(u, v) {
+  if (!S.boxGrid) return null;
+  for (const g of S.boxGrid) {
+    const [x, y, w, h] = g.crop;
+    if (!(u >= x && u < x + w && v >= y && v < y + h)) continue;
+    const lu = (u - x) / g.step, lv = (v - y) / g.step;
+    const i0 = Math.min(Math.floor(lu), g.nx - 2), j0 = Math.min(Math.floor(lv), g.ny - 2);
+    const fx = lu - i0, fy = lv - j0;
+    const nodes = [[g.box[j0 * g.nx + i0], (1 - fx) * (1 - fy)], [g.box[j0 * g.nx + i0 + 1], fx * (1 - fy)],
+                   [g.box[(j0 + 1) * g.nx + i0], (1 - fx) * fy], [g.box[(j0 + 1) * g.nx + i0 + 1], fx * fy]];
+    let b;
+    if (nodes.every((n) => n[0])) {
+      b = [0, 1, 2, 3].map((c) => nodes.reduce((acc, n) => acc + n[0][c] * n[1], 0));
+    } else {
+      const ok = nodes.filter((n) => n[0]).sort((p, q) => q[1] - p[1]);
+      if (!ok.length) return null;
+      b = ok[0][0].slice();
+    }
+    const s = S.boxScale;
+    return [b[0] * s, b[1] * s, b[2] * s, b[3] * s];
+  }
+  return null;
+}
+function drawRobotBox(ctx, u, v, b, col, lw, dashed) {
+  ctx.strokeStyle = col; ctx.lineWidth = lw;
+  if (dashed) ctx.setLineDash([lw * 3, lw * 2]);
+  ctx.strokeRect(u + b[0], v + b[1], b[2] - b[0], b[3] - b[1]);
+  ctx.setLineDash([]);
+}
+function anchorBefore(f) {
+  for (let i = lowerBound(S.kfs, f) - 1; i >= 0; i--) {
+    const k = S.kfs[i];
+    if (f - k.frame > 5 * S.fps) return null;
+    if (positioned(k) && kfXY(k)) return { frame: k.frame, xy: kfXY(k) };
+  }
+  return null;
+}
+
+// ------------------------------------------------------------- toasts ---
+let toastTimer = null, lastToast = "", lastToastAt = 0;
+function flash(msg, info) {
+  const now = performance.now();
+  if (msg === lastToast && now - lastToastAt < 400) return;
+  lastToast = msg; lastToastAt = now;
+  const t = $("toast"); t.textContent = msg; t.className = "show" + (info ? " info" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.className = info ? "info" : ""; }, 1300);
+}
+
+// ------------------------------------------------------------ video time ---
+function curFrame() {
+  if (HAS_RVFC && S.presented != null) return S.presented;
+  return Math.floor(video.currentTime * S.fps + 1e-6);
+}
+function seekFrame(f) {
+  if (!S.video) return;
+  const hi = S.frameCount > 0 ? S.frameCount - 1 : 1e9;
+  f = clamp(Math.round(f), 0, hi);
+  S.presented = f;
+  video.currentTime = (f + 0.5) / S.fps;
+  updateReadout(); requestDraw();
+}
+function stepBy(df) {
+  if (S.recording) return;
+  if (!video.paused) video.pause();
+  seekFrame(clamp(curFrame() + df, S.range.start, S.range.end));
+}
+function onNewFrame(f) {
+  S.presented = f;
+  if (S.recording) onRecFrame(f);
+  if (!video.paused && f >= S.range.end) video.pause();
+  updateReadout(); requestDraw();
+}
+if (HAS_RVFC) {
+  const cb = (now, md) => { onNewFrame(Math.round(md.mediaTime * S.fps)); video.requestVideoFrameCallback(cb); };
+  video.requestVideoFrameCallback(cb);
+} else {
+  let last = -1;
+  setInterval(() => { if (video.paused) return; const f = Math.floor(video.currentTime * S.fps + 1e-6); if (f !== last) { last = f; onNewFrame(f); } }, 33);
+}
+video.addEventListener("seeked", () => { updateReadout(); requestDraw(); });
+video.addEventListener("pause", () => { updateRecBadge(); if (!S.recording && !HAS_RVFC) seekFrame(curFrame()); });
+video.addEventListener("play", updateRecBadge);
+video.addEventListener("loadedmetadata", () => { S.vw = video.videoWidth || 1920; S.vh = video.videoHeight || 1080; layout(); });
+
+function play() {
+  video.playbackRate = S.rate;
+  const p = video.play(); if (p && p.catch) p.catch(() => { /* aborted by pause */ });
+}
+
+// ----------------------------------------------------------- recording ---
+function startFollow() {
+  if (!S.team) { flash("pick a robot first"); return false; }
+  if (!S.video) return false;
+  const f = curFrame();
+  if (f >= S.range.end) { flash("at end of range"); return false; }
+  pushUndo();
+  S.recording = true;
+  S.rec = { lastFrame: null, prev: anchorBefore(f), rejected: [], dropped: 0, kept: 0 };
+  recordSample(f);
+  play(); updateRecBadge();
+  return true;
+}
+function stopFollow() {
+  if (!S.recording) return;
+  const R = S.rec;
+  S.recording = false; S.rec = null;
+  video.pause();
+  seekFrame(curFrame());           // snap to an exact frame
+  updateRecBadge();
+  if (R && R.dropped) $("warnTxt").textContent = `last stretch: ${R.kept} kept, ${R.dropped} dropped by guard`;
+  else $("warnTxt").textContent = "";
+  scheduleSave(true);
+}
+function onRecFrame(f) {
+  const R = S.rec;
+  if (!R || (R.lastFrame != null && f < R.lastFrame + DECIMATE)) return;
+  recordSample(f);
+}
+function recordSample(f) {
+  const R = S.rec;
+  deleteRange(R.lastFrame == null ? f : R.lastFrame + 1, f);   // overwrite the covered frames
+  R.lastFrame = f;
+  const c = S.cursor;
+  if (!c.inside) { edited(); return; }
+  const p = projectUV(c.u, c.v);
+  const kf = { frame: f, state: S.shift ? "estimated" : "visible", uv: [r2(c.u), r2(c.v)], src: "follow",
+               rate: S.rate, _xy: p.xy, view: p.view };
+  if (S.grid) {
+    if (!p.xy || !p.onField) { R.dropped++; R.rejected.length = 0; flash(p.xy ? "off-field — sample dropped" : "unprojectable — sample dropped"); edited(); return; }
+    if (R.prev && !plausible(R.prev, f, p.xy)) {
+      const rj = R.rejected;
+      if (rj.length && !plausible(rj[rj.length - 1], f, p.xy)) rj.length = 0;
+      rj.push({ frame: f, xy: p.xy, kf });
+      if (rj.length >= REANCHOR_N) {         // consistent new track: the old anchor was wrong
+        for (const r of rj) setKf(r.kf);
+        R.kept += rj.length; R.dropped -= rj.length - 1; rj.length = 0; R.prev = { frame: f, xy: p.xy };
+        flash("re-anchored after jump", true);
+      } else { R.dropped++; flash("jump > 6 m/s — sample dropped"); }
+      edited(); return;
+    }
+  }
+  R.rejected.length = 0;
+  setKf(kf); R.kept++;
+  if (p.xy) R.prev = { frame: f, xy: p.xy };
+  edited();
+}
+function stepClick(u, v, est) {
+  if (!S.team) { flash("pick a robot first"); return; }
+  const f = curFrame();
+  const p = projectUV(u, v);
+  if (S.grid && (!p.xy || !p.onField)) { flash(p.xy ? "off-field — not saved" : "unprojectable — not saved"); return; }
+  const a = anchorBefore(f);
+  if (a && p.xy && !plausible(a, f, p.xy)) flash("warning: jump > 6 m/s from previous keyframe", true);
+  pushUndo();
+  setKf({ frame: f, state: est ? "estimated" : "visible", uv: [r2(u), r2(v)], src: "click", _xy: p.xy, view: p.view });
+  S.estArm = false;
+  edited();
+  stepBy(stepFrames());
+}
+function markUnknown() {
+  if (!S.team || S.recording) return;
+  pushUndo();
+  setKf({ frame: curFrame(), state: "unknown", src: "click" });
+  edited(); stepBy(stepFrames());
+}
+function deleteHere() {
+  if (S.recording) return;
+  if (S.sel) {
+    pushUndo(); const n = deleteRange(S.sel.a, S.sel.b); S.sel = null; updateSelTxt();
+    if (n) { edited(); flash(`deleted ${n} keyframes`, true); } else S.undo.pop();
+    return;
+  }
+  const f = curFrame();
+  if (!kfAt(S.kfs, f)) { flash("no keyframe at this frame", true); return; }
+  pushUndo(); deleteRange(f, f); edited();
+}
+function undo() { if (S.recording || !S.undo.length) return; S.redo.push(S.kfs); S.kfs = S.undo.pop(); edited(); }
+function redo() { if (S.recording || !S.redo.length) return; S.undo.push(S.kfs); S.kfs = S.redo.pop(); edited(); }
+function jumpKf(dir) {
+  const f = curFrame(); let k = null;
+  if (dir > 0) { const i = lowerBound(S.kfs, f + 1); k = S.kfs[i]; }
+  else { const i = lowerBound(S.kfs, f) - 1; k = S.kfs[i]; }
+  if (k) { if (!video.paused) video.pause(); seekFrame(k.frame); } else flash("no more keyframes", true);
+}
+function gapList() {
+  const out = [], g = 2 * stepFrames(), a = S.range.start, b = S.range.end;
+  let prev = null;
+  for (let i = lowerBound(S.kfs, a); i < S.kfs.length && S.kfs[i].frame <= b; i++) {
+    const k = S.kfs[i]; if (!positioned(k)) continue;
+    const from = prev == null ? a : prev;
+    if (k.frame - from > g) out.push([from, k.frame]);
+    prev = k.frame;
+  }
+  if ((b - (prev == null ? a : prev)) > g) out.push([prev == null ? a : prev, b]);
+  return out;
+}
+function jumpGap(dir) {
+  const f = curFrame(), gaps = gapList();
+  const target = dir > 0 ? gaps.find((g) => g[0] > f) : [...gaps].reverse().find((g) => g[0] < f);
+  if (target) { if (!video.paused) video.pause(); seekFrame(target[0]); } else flash("no more gaps", true);
+}
+
+// --------------------------------------------------------------- saving ---
+function setSaveStatus(st, msg) {
+  const el = $("save"); el.className = st;
+  el.textContent = st === "saved" ? "saved " + new Date().toLocaleTimeString() : st === "error" ? "save error: " + msg : st;
+}
+function scheduleSave(soon) {
+  if (!S.team) return;
+  clearTimeout(S.saveTimer);
+  let delay = soon ? 50 : 600;
+  if (S.recording) delay = Math.max(0, 5000 - (Date.now() - S.lastSaveAt));
+  S.saveTimer = setTimeout(saveNow, delay);
+}
+const stripKf = (k) => { const o = { frame: k.frame, state: k.state, src: k.src }; if (k.uv) o.uv = k.uv; if (k.rate != null) o.rate = k.rate; if (k.note) o.note = k.note; return o; };
+async function saveNow() {
+  clearTimeout(S.saveTimer);
+  if (!S.team || !S.match || !S.video || !S.dirty) return;
+  if (S.saving) { S.saveAgain = true; return; }
+  S.saving = true; S.dirty = false; S.lastSaveAt = Date.now(); setSaveStatus("saving");
+  const team = S.team, mk = S.match.match_key, sent = S.kfs;
+  const body = { video_id: S.video.video_id, match_t0_frame: S.t0, annotator: $("annotator").value.trim(),
+                 notes: S.notes, alliance: S.alliance, keyframes: sent.map(stripKf) };
+  try {
+    const r = await api("PUT", `/api/gt/${enc(mk)}/${enc(team)}`, body);
+    S.docs[team] = r.doc;
+    if (team === S.team && S.match && mk === S.match.match_key) mergeServer(r.doc);
+    if (r.unprojectable_frames && r.unprojectable_frames.length)
+      $("warnTxt").textContent = `${r.unprojectable_frames.length} keyframes have no field position (server projection)`;
+    if (!S.dirty) { clearBackup(mk, team); setSaveStatus("saved"); } else setSaveStatus("unsaved");
+    S.dataVersion++; updateBadges(); requestDraw();
+  } catch (e) {
+    S.dirty = true; setSaveStatus("error", e.message);
+    if (e.status === 409) flash("save refused: " + e.message);
+  } finally {
+    S.saving = false;
+    if (S.saveAgain) { S.saveAgain = false; scheduleSave(true); }
+  }
+}
+function mergeServer(doc) {
+  // server is the source of truth for field_xy: copy it onto matching local keyframes
+  const m = new Map();
+  for (const k of doc.keyframes) m.set(k.frame, k);
+  for (const k of S.kfs) {
+    const s = m.get(k.frame);
+    if (s && s.state === k.state && s.uv && k.uv && s.uv[0] === k.uv[0] && s.uv[1] === k.uv[1]) { k.field_xy = s.field_xy; k.view = s.view; }
+  }
+}
+const bkKey = (mk, team) => `gtbk:${mk}:${team}`;
+function backupLocal(force) {
+  if (!S.team || !S.match || !S.dirty) return;
+  const now = Date.now();
+  if (!force && now - S.backupAt < 1500) { clearTimeout(S._bkT); S._bkT = setTimeout(() => backupLocal(true), 1600); return; }
+  S.backupAt = now;
+  LS.set(bkKey(S.match.match_key, S.team), { at: now, video_id: S.video && S.video.video_id, t0: S.t0, kfs: S.kfs.map(stripKf) });
+}
+function clearBackup(mk, team) { LS.del(bkKey(mk, team)); }
+window.addEventListener("beforeunload", (e) => {
+  if (S.dirty || S.saving) { backupLocal(true); e.preventDefault(); e.returnValue = ""; }
+});
+
+// ------------------------------------------------------------- loading ---
+// AdvantageScope 2026 Field2d drawing (hub, trench, bumps, depot, tower,
+// outpost) under the map; the server ships it pre-rotated to blue-left.
+async function loadField2d() {
+  try {
+    const cfg = await api("GET", "/api/field2d?season=2026");
+    const img = new Image();
+    img.onload = () => { S.field2d = { cfg, img }; S.dataVersion++; };
+    img.src = cfg.image_url;
+  } catch (e) { /* plain map fallback */ }
+}
+async function init() {
+  $("annotator").value = LS.get("gt.annotator", "");
+  S.rate = LS.get("gt.rate", 0.75); $("rateSel").value = String(S.rate);
+  S.step = LS.get("gt.step", 0.25); $("stepSel").value = String(S.step);
+  S.preset = LS.get("gt.preset", "full");
+  S.loupe = LS.get("gt.loupe", false);
+  S.boxScale = clamp(LS.get("gt.boxScale", 1), 0.8, 1.4);
+  loadField2d();
+  let data;
+  try { data = await api("GET", "/api/matches"); }
+  catch (e) { $("empty").textContent = "failed to load matches: " + e.message; return; }
+  S.matches = data.matches;
+  const ms = $("matchSel"); ms.innerHTML = "";
+  for (const m of S.matches) {
+    const o = document.createElement("option"); o.value = m.match_key;
+    const n = Object.values(m.gt_status || {}).length;
+    o.textContent = m.match_key + (n ? `  [GT ${n}/6]` : ""); ms.appendChild(o);
+  }
+  if (!S.matches.length) { $("empty").textContent = "no matches with a playable replay video"; return; }
+  const last = LS.get("gt.match", null);
+  const m0 = S.matches.find((m) => m.match_key === last) || S.matches.find((m) => m.match_key === "2026cur_qm8") || S.matches[0];
+  ms.value = m0.match_key;
+  await selectMatch(m0.match_key, LS.get("gt.team", null));
+}
+
+async function selectMatch(mk, wantTeam) {
+  if (S.dirty) await saveNow();
+  const m = S.matches.find((x) => x.match_key === mk); if (!m) return;
+  S.match = m; S.team = null; S.kfs = []; S.docs = {}; S.replay = null; S.sel = null; S.undo = []; S.redo = [];
+  LS.set("gt.match", mk);
+  const [views, gtd, reps, boxes] = await Promise.all([
+    api("GET", `/api/event/${enc(m.event_key)}/views?match_key=${enc(mk)}&grid=true`).catch((e) => { flash("calibration load failed: " + e.message); return null; }),
+    api("GET", `/api/gt/${enc(mk)}`).catch(() => ({ docs: [] })),
+    api("GET", `/api/replays/${enc(mk)}`).catch(() => ({ replays: [] })),
+    api("GET", `/api/event/${enc(m.event_key)}/robot_box_grid?match_key=${enc(mk)}`).catch(() => null),
+  ]);
+  S.boxGrid = boxes ? boxes.grid : null;
+  if (views) { S.views = views.views; S.grid = views.grid || null; S.field = views.field; S.margin = views.on_field_margin_m; S.calib = views.calibration; }
+  else { S.views = []; S.grid = null; }
+  for (const d of gtd.docs) S.docs[d.team] = d;
+  // video: prefer the one existing GT was made on
+  const vs = $("videoSel"); vs.innerHTML = "";
+  for (const v of m.videos) {
+    const o = document.createElement("option"); o.value = v.video_id;
+    o.textContent = `${v.name.slice(0, 26)} · ${v.replays} replays · ${v.frame_count}f`; vs.appendChild(o);
+  }
+  const fps = new Set(Object.values(S.docs).map((d) => d.video && d.video.fingerprint));
+  const gv = m.videos.find((v) => fps.has(v.fingerprint));
+  selectVideo((gv || m.videos.find((v) => v.video_id === m.default_video_id) || m.videos[0]).video_id);
+  const rs = $("replaySel"); rs.innerHTML = '<option value="">— none —</option>';
+  for (const r of reps.replays) {
+    const o = document.createElement("option"); o.value = r.id;
+    o.textContent = `${r.created_at.replace("T", " ").slice(5, 16)} ${r.label ? r.label.slice(0, 18) : r.id.slice(0, 8)}${r.video_fingerprint === S.video.fingerprint ? "" : " (other video)"}`;
+    rs.appendChild(o);
+  }
+  renderRobots();
+  const roster = rosterList();
+  const team = roster.find((r) => r.team === wantTeam) ? wantTeam : null;
+  if (team) await selectTeam(team); else { S.dataVersion++; updateReadout(); requestDraw(); }
+}
+function rosterList() {
+  const out = [];
+  if (!S.match) return out;
+  for (const a of ["blue", "red"]) for (const r of (S.match.roster[a] || [])) out.push({ ...r, alliance: a });
+  return out;
+}
+function selectVideo(id) {
+  const v = S.match.videos.find((x) => x.video_id === id); if (!v) return;
+  if (S.video && S.video.video_id === id) return;
+  S.video = v; $("videoSel").value = id;
+  S.fps = v.fps || 60; S.frameCount = v.frame_count || 0; S.vw = v.width || 1920; S.vh = v.height || 1080;
+  S.presented = null;
+  video.src = `/api/video/${enc(id)}`;
+  $("empty").style.display = "none";
+  if (S.t0 == null || !S.team) S.t0 = sharedT0();
+  applyPreset(S.preset, true);
+  layout();
+  const resume = () => seekFrame(resumeFrame());
+  video.addEventListener("loadedmetadata", resume, { once: true });
+}
+function sharedT0() {
+  for (const d of Object.values(S.docs)) if (d.video && d.video.fingerprint === S.video.fingerprint && d.match_t0_frame != null) return d.match_t0_frame;
+  return S.video.suggested_t0_frame;
+}
+function resumeFrame() {
+  const last = S.kfs[S.kfs.length - 1];
+  return last ? clamp(last.frame, S.range.start, S.range.end) : S.range.start;
+}
+async function selectTeam(team) {
+  if (S.recording) return;
+  if (S.dirty) await saveNow();
+  try { const g = await api("GET", `/api/gt/${enc(S.match.match_key)}`); S.docs = {}; for (const d of g.docs) S.docs[d.team] = d; } catch (e) { /* keep */ }
+  const r = rosterList().find((x) => x.team === team);
+  S.team = team; S.alliance = r ? r.alliance : null; LS.set("gt.team", team);
+  const doc = S.docs[team] || null;
+  S.kfs = doc ? doc.keyframes.map((k) => ({ ...k })) : [];
+  S.notes = doc ? (doc.notes || "") : "";
+  S.undo = []; S.redo = []; S.sel = null; S.dirty = false;
+  if (doc && doc.video && doc.video.fingerprint !== S.video.fingerprint) {
+    const v = S.match.videos.find((x) => x.fingerprint === doc.video.fingerprint);
+    if (v) selectVideo(v.video_id);
+    else flash(`GT for ${team} was made on ${doc.video.name}, which is not available — saves will be refused`);
+  }
+  S.t0 = doc && doc.match_t0_frame != null ? doc.match_t0_frame : sharedT0();
+  const bk = LS.get(bkKey(S.match.match_key, team), null);
+  if (bk && bk.kfs) {
+    const serverAt = doc && doc.updated_at ? Date.parse(doc.updated_at) : 0;
+    const differs = JSON.stringify(bk.kfs) !== JSON.stringify(S.kfs.map(stripKf));
+    if (bk.at > serverAt && differs &&
+        confirm(`Unsaved local edits for ${team} (${bk.kfs.length} keyframes, ${new Date(bk.at).toLocaleString()}) are newer than the server copy (${S.kfs.length}). Restore them?`)) {
+      S.kfs = bk.kfs.map((k) => ({ ...k })); if (bk.t0 != null) S.t0 = bk.t0; S.dirty = true;
+    } else clearBackup(S.match.match_key, team);
+  }
+  applyPreset(S.preset, true);
+  setSaveStatus(S.dirty ? "unsaved" : "saved");
+  renderRobots(); S.dataVersion++;
+  seekFrame(resumeFrame());
+  if (S.dirty) scheduleSave(true);
+}
+function renderRobots() {
+  const box = $("robots"); box.innerHTML = "";
+  for (const r of rosterList()) {
+    const b = document.createElement("button");
+    b.className = `rb ${r.alliance}` + (r.team === S.team ? " sel" : "");
+    b.innerHTML = `${r.team} <span class="st">${r.alliance[0].toUpperCase()}${r.station || "?"}</span><span class="bd"></span>`;
+    b.dataset.team = r.team;
+    b.onclick = () => selectTeam(r.team);
+    box.appendChild(b);
+  }
+  updateBadges();
+}
+function updateBadges() {
+  for (const b of document.querySelectorAll("#robots .rb")) {
+    const t = b.dataset.team;
+    const n = t === S.team ? S.kfs.length : ((S.docs[t] && S.docs[t].keyframes.length) || 0);
+    b.querySelector(".bd").textContent = n ? String(n) : "";
+  }
+}
+
+// ---------------------------------------------------------------- range ---
+function applyPreset(p, quiet) {
+  S.preset = p; LS.set("gt.preset", p);
+  const last = S.frameCount > 0 ? S.frameCount - 1 : 0;
+  let a = 0, b = last;
+  if (p !== "whole" && S.t0 != null) { a = S.t0 - Math.round(PAD_S * S.fps); b = S.t0 + Math.round(((p === "auto" ? AUTO_S : FULL_S) + PAD_S) * S.fps); }
+  else if (p !== "whole" && !quiet) flash("set the auto start first", true);
+  S.range = { start: clamp(a, 0, last), end: clamp(b, 0, last) };
+  for (const btn of document.querySelectorAll(".rp")) btn.classList.toggle("on", btn.dataset.p === p);
+  $("t0Txt").textContent = S.t0 == null ? "—" : `${S.t0} (${(S.t0 / S.fps).toFixed(2)} s)`;
+  $("rangeTxt").textContent = `${S.range.start}–${S.range.end}`;
+  S.dataVersion++; requestDraw();
+}
+
+// --------------------------------------------------------------- layout ---
+function layout() {
+  const wrap = $("stageWrap"), st = $("stage");
+  const W = wrap.clientWidth, H = wrap.clientHeight, ar = S.vw / S.vh;
+  let w = W, h = W / ar; if (h > H) { h = H; w = H * ar; }
+  w = Math.floor(w); h = Math.floor(h);
+  st.style.width = w + "px"; st.style.height = h + "px";
+  st.style.left = Math.floor((W - w) / 2) + "px"; st.style.top = Math.floor((H - h) / 2) + "px";
+  const dpr = window.devicePixelRatio || 1;
+  ov.width = Math.round(w * dpr); ov.height = Math.round(h * dpr);
+  tl.width = Math.round(tl.clientWidth * dpr); tl.height = Math.round(tl.clientHeight * dpr);
+  const mw = mapC.clientWidth || 390;
+  mapC.width = Math.round(mw * dpr); mapC.height = Math.round(mw * (S.field.width_m + 1) / (S.field.length_m + 1) * dpr);
+  mapC.style.height = (mapC.height / dpr) + "px";
+  S.mapVersion = -1;
+  requestDraw();
+}
+window.addEventListener("resize", layout);
+
+// --------------------------------------------------------------- pointer ---
+function evToUV(e) {
+  const r = ov.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const u = cx / r.width * S.vw, v = cy / r.height * S.vh;
+  return { u, v, cx, cy, inside: cx >= 0 && cy >= 0 && cx < r.width && cy < r.height };
+}
+ov.addEventListener("pointermove", (e) => {
+  Object.assign(S.cursor, evToUV(e)); S.shift = e.shiftKey;
+  updateProj(); requestDraw();
+});
+ov.addEventListener("pointerleave", () => { if (!S.recording) { S.cursor.inside = false; requestDraw(); } });
+ov.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  Object.assign(S.cursor, evToUV(e)); S.shift = e.shiftKey;
+  if (S.mode === "follow") {
+    if (!video.paused) video.pause();
+    if (startFollow()) { try { ov.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ } }
+  } else {
+    stepClick(S.cursor.u, S.cursor.v, e.shiftKey || S.estArm);
+  }
+});
+ov.addEventListener("pointerup", () => stopFollow());
+ov.addEventListener("pointercancel", () => stopFollow());
+ov.addEventListener("lostpointercapture", () => stopFollow());
+ov.addEventListener("contextmenu", (e) => e.preventDefault());
+
+function tlFrame(e) {
+  const r = tl.getBoundingClientRect();
+  const x = clamp((e.clientX - r.left) / r.width, 0, 1);
+  return Math.round(S.range.start + x * (S.range.end - S.range.start));
+}
+tl.addEventListener("pointerdown", (e) => {
+  if (S.recording || !S.video) return;
+  try { tl.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+  const f = tlFrame(e);
+  if (e.shiftKey) { S.selDrag = f; S.sel = { a: f, b: f }; updateSelTxt(); requestDraw(); }
+  else { S.scrub = true; if (!video.paused) video.pause(); seekFrame(f); }
+});
+tl.addEventListener("pointermove", (e) => {
+  if (S.selDrag != null) { const f = tlFrame(e); S.sel = { a: Math.min(S.selDrag, f), b: Math.max(S.selDrag, f) }; updateSelTxt(); requestDraw(); }
+  else if (S.scrub) seekFrame(tlFrame(e));
+});
+tl.addEventListener("pointerup", () => {
+  if (S.selDrag != null && S.sel && S.sel.a === S.sel.b) S.sel = null;
+  S.selDrag = null; S.scrub = false; updateSelTxt(); requestDraw();
+});
+function updateSelTxt() {
+  if (!S.sel) { $("selTxt").textContent = ""; return; }
+  const n = lowerBound(S.kfs, S.sel.b + 1) - lowerBound(S.kfs, S.sel.a);
+  $("selTxt").innerHTML = `<span class="warn">selection ${S.sel.a}–${S.sel.b}: ${n} kf — Del removes, Esc clears</span>`;
+}
+
+// ------------------------------------------------------------- keyboard ---
+document.addEventListener("keydown", (e) => {
+  const tag = (e.target && e.target.tagName) || "";
+  if ((tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") && e.key !== "Escape") return;
+  if (e.key === "Shift") { S.shift = true; updateRecBadge(); return; }
+  const k = e.key, ctrl = e.ctrlKey || e.metaKey;
+  if (ctrl && (k === "z" || k === "Z")) { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+  if (ctrl && (k === "y" || k === "Y")) { e.preventDefault(); redo(); return; }
+  if (ctrl && (k === "s" || k === "S")) { e.preventDefault(); S.dirty = true; saveNow(); return; }
+  if (ctrl || e.altKey) return;
+  const code = e.key === "=" || e.key === "+" ? "Equal" : e.key === "-" || e.key === "_" ? "Minus" : e.code;
+  switch (code) {
+    case "Space": e.preventDefault(); if (S.recording) break; if (video.paused) { if (curFrame() >= S.range.end) seekFrame(S.range.start); play(); } else video.pause(); break;
+    case "ArrowRight": e.preventDefault(); stepBy(e.shiftKey ? 1 : stepFrames()); break;
+    case "ArrowLeft": e.preventDefault(); stepBy(e.shiftKey ? -1 : -stepFrames()); break;
+    case "BracketLeft": e.preventDefault(); if (e.shiftKey) jumpGap(-1); else jumpKf(-1); break;
+    case "BracketRight": e.preventDefault(); if (e.shiftKey) jumpGap(1); else jumpKf(1); break;
+    case "Backspace": case "Delete": e.preventDefault(); deleteHere(); break;
+    case "Escape": S.sel = null; S.estArm = false; updateSelTxt(); updateRecBadge(); requestDraw(); if (tag) e.target.blur(); break;
+    case "KeyE": S.estArm = !S.estArm; updateRecBadge(); break;
+    case "KeyU": markUnknown(); break;
+    case "Minus": case "NumpadSubtract": case "Equal": case "NumpadAdd": {
+      const d = (code === "Minus" || code === "NumpadSubtract") ? -0.05 : 0.05;
+      S.boxScale = Math.round(clamp(S.boxScale + d, 0.8, 1.4) * 100) / 100; LS.set("gt.boxScale", S.boxScale);
+      flash(`robot box ${S.boxScale.toFixed(2)}×`, true); updateProj(); requestDraw(); break;
+    }
+    case "KeyL": S.loupe = !S.loupe; LS.set("gt.loupe", S.loupe); requestDraw(); break;
+    case "KeyM": toggleMode(); break;
+    default: return;
+  }
+});
+document.addEventListener("keyup", (e) => { if (e.key === "Shift") { S.shift = false; updateRecBadge(); } });
+window.addEventListener("blur", () => { S.shift = false; stopFollow(); });
+
+function toggleMode() {
+  if (S.recording) return;
+  S.mode = S.mode === "follow" ? "step" : "follow";
+  $("modeBtn").textContent = S.mode.toUpperCase(); $("modeBtn").classList.toggle("on", S.mode === "step");
+  updateRecBadge();
+}
+
+// --------------------------------------------------------------- controls ---
+$("matchSel").onchange = (e) => selectMatch(e.target.value, LS.get("gt.team", null));
+$("videoSel").onchange = async (e) => {
+  if (S.kfs.length && !confirm("Keyframes are frame indices into the video they were made on. Switch video anyway? (saving onto a different video will be refused)")) { e.target.value = S.video.video_id; return; }
+  if (S.dirty) await saveNow();
+  selectVideo(e.target.value);
+};
+$("modeBtn").onclick = toggleMode;
+$("rateSel").onchange = (e) => { S.rate = parseFloat(e.target.value); LS.set("gt.rate", S.rate); if (!video.paused) video.playbackRate = S.rate; e.target.blur(); };
+$("stepSel").onchange = (e) => { S.step = parseFloat(e.target.value); LS.set("gt.step", S.step); S.dataVersion++; requestDraw(); e.target.blur(); };
+$("annotator").onchange = (e) => { LS.set("gt.annotator", e.target.value.trim()); if (S.team && S.kfs.length) { S.dirty = true; scheduleSave(); } };
+$("saveBtn").onclick = () => { S.dirty = true; saveNow(); };
+$("setT0").onclick = () => {
+  if (!S.video) return;
+  S.t0 = curFrame(); applyPreset(S.preset === "whole" ? "full" : S.preset);
+  if (S.team) { S.dirty = true; scheduleSave(); }
+  flash(`auto start = frame ${S.t0}`, true);
+};
+for (const b of document.querySelectorAll(".rp")) b.onclick = () => { applyPreset(b.dataset.p); seekFrame(clamp(curFrame(), S.range.start, S.range.end)); };
+$("replaySel").onchange = async (e) => {
+  const id = e.target.value; S.replay = null; $("replayTxt").textContent = "";
+  if (id) {
+    try {
+      const r = await api("GET", `/api/replay/${enc(id)}/tracks`);
+      const auto = (r.periods || []).find((p) => p.label === "auto");
+      const meta = [...$("replaySel").options].find((o) => o.value === id);
+      // align by auto start when the replay was made from a different download
+      let offset = 0;
+      if (meta && meta.textContent.includes("other video") && auto && S.t0 != null) offset = S.t0 - auto.start_frame;
+      S.replay = { slots: r.slots, offset };
+      $("replayTxt").textContent = `${r.slots.length} slots` + (offset ? ` · aligned by auto start (offset ${offset} f)` : "");
+    } catch (err) { flash("replay load failed: " + err.message); }
+  }
+  S.mapVersion = -1; requestDraw(); e.target.blur();
+};
+
+// --------------------------------------------------------------- readouts ---
+function fmtMatch(f) {
+  if (S.t0 == null) return "—";
+  const t = (f - S.t0) / S.fps;
+  const lab = t < 0 ? "pre" : t < AUTO_S ? "AUTO" : t < TELEOP_S ? "TRANS" : t < FULL_S ? "TELEOP" : "post";
+  return `${lab} ${t.toFixed(2)}s`;
+}
+function updateReadout() {
+  const f = curFrame();
+  $("frameTxt").textContent = `frame ${f}`;
+  $("mtTxt").textContent = fmtMatch(f);
+  $("vtTxt").textContent = `video ${(f / S.fps).toFixed(3)} s @ ${S.fps} fps`;
+  const k = kfAt(S.kfs, f);
+  $("stateTxt").textContent = k ? `kf: ${k.state} (${k.src || "?"})` : "";
+}
+function updateProj() {
+  const c = S.cursor;
+  if (!c.inside) { $("projTxt").textContent = "cursor: —"; return; }
+  const p = projectUV(c.u, c.v);
+  const xy = p.xy ? `x ${p.xy[0].toFixed(2)}  y ${p.xy[1].toFixed(2)} m` : "unprojectable";
+  $("projTxt").innerHTML = `cursor ${c.u.toFixed(0)},${c.v.toFixed(0)} · ${p.view || "no view"} · box ${S.boxScale.toFixed(2)}× · ` +
+    (p.xy && !p.onField ? `<span class="warn">${xy} OFF-FIELD</span>` : p.xy ? xy : `<span class="warn">${xy}</span>`);
+}
+function updateRecBadge() {
+  const b = $("recBadge");
+  if (S.recording) {
+    const est = S.shift;
+    b.className = est ? "recest" : "rec";
+    b.textContent = `● REC ${est ? "estimated" : "visible"} ${S.rate}×` + (video.paused ? " (end of range)" : "");
+  } else {
+    b.className = "";
+    b.textContent = `${S.mode.toUpperCase()} · ${video.paused ? "paused" : "playing " + S.rate + "×"}` +
+      (S.mode === "step" && S.estArm ? " · next click ESTIMATED" : "") + (S.team ? ` · ${S.team}` : " · pick a robot");
+  }
+}
+function updateProgress() {
+  const sf = stepFrames(), a = S.range.start, b = S.range.end;
+  const nSteps = Math.floor((b - a) / sf) + 1;
+  let covered = 0, i = lowerBound(S.kfs, a - sf / 2);
+  for (let s = 0; s < nSteps; s++) {
+    const c = a + s * sf;
+    while (i < S.kfs.length && S.kfs[i].frame < c - sf / 2) i++;
+    if (i < S.kfs.length && S.kfs[i].frame <= c + sf / 2) covered++;
+  }
+  const nIn = lowerBound(S.kfs, b + 1) - lowerBound(S.kfs, a);
+  const gaps = gapList().length;
+  $("progTxt").textContent = `${nIn} kf in range · ${covered}/${nSteps} Δt-steps covered (${(100 * covered / Math.max(1, nSteps)).toFixed(0)}%) · ${gaps} gap${gaps === 1 ? "" : "s"}`;
+}
+
+// ---------------------------------------------------------------- drawing ---
+let drawPending = false;
+function requestDraw() { if (!drawPending) { drawPending = true; requestAnimationFrame(drawAll); } }
+let lastProgV = -1;
+function drawAll() {
+  drawPending = false;
+  drawOverlay(); drawTimeline(); drawMap();
+  updateRecBadge();
+  if (lastProgV !== S.dataVersion) { lastProgV = S.dataVersion; updateProgress(); updateSelTxt(); }
+}
+const ST_COL = { visible: "#3ddc84", estimated: "#ffb020", unknown: "#9a7cff" };
+const AL_COL = { blue: "#4a90ff", red: "#ff5a5a" };
+
+function interpAt(arr, f, maxGap, useUV) {
+  const i = lowerBound(arr, f), k1 = arr[i];
+  if (k1 && k1.frame === f) return positioned(k1) ? { k: k1, pt: useUV ? k1.uv : kfXY(k1), state: k1.state, exact: true } : null;
+  const k0 = arr[i - 1];
+  if (!positioned(k0) || !positioned(k1) || k1.frame - k0.frame > maxGap) return null;
+  let p0 = useUV ? k0.uv : kfXY(k0), p1 = useUV ? k1.uv : kfXY(k1);
+  if (!p0 || !p1) return null;
+  if (useUV && viewOf(p0[0], p0[1]) !== viewOf(p1[0], p1[1])) {   // camera handoff: don't lerp across panels
+    const near = (f - k0.frame) <= (k1.frame - f) ? k0 : k1;
+    return { k: near, pt: near.uv, state: near.state, exact: false };
+  }
+  const t = (f - k0.frame) / (k1.frame - k0.frame);
+  return { pt: [p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])],
+           state: (k0.state === "estimated" || k1.state === "estimated") ? "estimated" : "visible", exact: false };
+}
+
+function marker(ctx, x, y, r, col, state, lw) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.lineWidth = lw; ctx.strokeStyle = col;
+  if (state === "estimated") { ctx.setLineDash([lw * 2, lw * 2]); ctx.stroke(); ctx.setLineDash([]); }
+  else { ctx.fillStyle = col; ctx.fill(); }
+}
+
+function drawOverlay() {
+  const dpr = window.devicePixelRatio || 1, W = ov.width / dpr, H = ov.height / dpr;
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, ov.width, ov.height);
+  if (!S.video) return;
+  const sx = ov.width / S.vw, sy = ov.height / S.vh, k = S.vw / W;   // k = composite px per CSS px
+  octx.setTransform(sx, 0, 0, sy, 0, 0);
+  // camera crop boundaries
+  octx.lineWidth = 1 * k; octx.strokeStyle = "rgba(255,255,255,.18)"; octx.font = `${11 * k}px monospace`; octx.fillStyle = "rgba(255,255,255,.35)";
+  for (const v of S.views) { const [x, y, w, h] = v.crop; octx.strokeRect(x + .5, y + .5, w - 1, h - 1); octx.fillText(v.name, x + 6 * k, y + h - 6 * k); }
+  const f = curFrame(), fps = S.fps;
+  // other robots' GT at this frame
+  octx.font = `bold ${11 * k}px monospace`;
+  for (const r of rosterList()) {
+    if (r.team === S.team) continue;
+    const d = S.docs[r.team]; if (!d || !d.keyframes.length) continue;
+    const p = interpAt(d.keyframes, f, OTHER_GAP_S * fps, true); if (!p) continue;
+    const col = AL_COL[r.alliance];
+    const ob = boxAt(p.pt[0], p.pt[1]);
+    if (ob) { octx.globalAlpha = .45; drawRobotBox(octx, p.pt[0], p.pt[1], ob, col, 1.5 * k, p.state === "estimated"); octx.globalAlpha = 1; }
+    marker(octx, p.pt[0], p.pt[1], 5 * k, col, p.state, 2 * k);
+    octx.lineWidth = 3 * k; octx.strokeStyle = "rgba(0,0,0,.8)"; octx.strokeText(r.team, p.pt[0] + 9 * k, p.pt[1] - 6 * k);
+    octx.fillStyle = col; octx.fillText(r.team, p.pt[0] + 9 * k, p.pt[1] - 6 * k);
+  }
+  // selected robot: trail (last TRAIL_S seconds), broken at camera handoffs
+  if (S.team) {
+    const a = lowerBound(S.kfs, f - TRAIL_S * fps), b = lowerBound(S.kfs, f + 1);
+    let prev = null;
+    for (let i = a; i < b; i++) {
+      const kf = S.kfs[i]; if (!positioned(kf)) { prev = null; continue; }
+      const age = (f - kf.frame) / (TRAIL_S * fps), alpha = 0.15 + 0.75 * (1 - age);
+      octx.globalAlpha = alpha;
+      const col = ST_COL[kf.state];
+      if (prev && kf.frame - prev.frame <= 2 * stepFrames() && viewOf(prev.uv[0], prev.uv[1]) === viewOf(kf.uv[0], kf.uv[1])) {
+        octx.beginPath(); octx.moveTo(prev.uv[0], prev.uv[1]); octx.lineTo(kf.uv[0], kf.uv[1]);
+        octx.lineWidth = 2 * k; octx.strokeStyle = col;
+        if (kf.state === "estimated") octx.setLineDash([4 * k, 4 * k]);
+        octx.stroke(); octx.setLineDash([]);
+      }
+      if (kf.src === "click" || b - a < 40) marker(octx, kf.uv[0], kf.uv[1], 3 * k, col, kf.state, 1.5 * k);
+      prev = kf;
+    }
+    octx.globalAlpha = 1;
+    const cur = kfAt(S.kfs, f);
+    if (cur && positioned(cur)) {
+      octx.beginPath(); octx.arc(cur.uv[0], cur.uv[1], 10 * k, 0, Math.PI * 2);
+      octx.lineWidth = 2.5 * k; octx.strokeStyle = "#fff"; octx.stroke();
+      marker(octx, cur.uv[0], cur.uv[1], 5 * k, ST_COL[cur.state], cur.state, 2 * k);
+    } else if (cur) {
+      octx.fillStyle = ST_COL.unknown; octx.font = `bold ${14 * k}px monospace`; octx.fillText(`${S.team}: UNKNOWN @ this frame`, 10 * k, 40 * k);
+    } else if (!S.recording) {
+      const p = interpAt(S.kfs, f, OTHER_GAP_S * fps, true);
+      if (p) { octx.beginPath(); octx.arc(p.pt[0], p.pt[1], 9 * k, 0, Math.PI * 2); octx.lineWidth = 1.5 * k; octx.strokeStyle = "rgba(255,255,255,.6)"; octx.setLineDash([3 * k, 3 * k]); octx.stroke(); octx.setLineDash([]); }
+    }
+  }
+  // cursor: robot-sized box + ground-point crosshair
+  const c = S.cursor;
+  if (!c.inside) return;
+  const cb = boxAt(c.u, c.v);
+  const est = S.shift || (S.mode === "step" && S.estArm);
+  const bcol = S.recording ? (AL_COL[S.alliance] || "#fff") : (AL_COL[S.alliance] || "#00ffd0");
+  const cross = (ctx, x, y, r, gap, col, lw) => {
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+    ctx.moveTo(x - r, y); ctx.lineTo(x - gap, y); ctx.moveTo(x + gap, y); ctx.lineTo(x + r, y);
+    ctx.moveTo(x, y - r); ctx.lineTo(x, y - gap); ctx.moveTo(x, y + gap); ctx.lineTo(x, y + r); ctx.stroke();
+  };
+  if (cb) {
+    octx.globalAlpha = S.recording ? 1 : 0.75;
+    octx.lineWidth = 4 * k; octx.strokeStyle = "rgba(0,0,0,.55)";
+    octx.strokeRect(c.u + cb[0], c.v + cb[1], cb[2] - cb[0], cb[3] - cb[1]);
+    drawRobotBox(octx, c.u, c.v, cb, bcol, (S.recording ? 2.5 : 1.5) * k, est);
+    octx.globalAlpha = 1;
+  }
+  cross(octx, c.u, c.v, 9 * k, 2 * k, cb ? "#fff" : "#ff6b3d", 1.5 * k);
+  // magnifier (optional, L): opposite quadrant from the cursor so it never covers the robot
+  if (S.loupe) {
+    octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const Lp = Math.min(280, W * 0.45, H * 0.6), Z = 2.5, srcW = (Lp / Z) * k, srcH = srcW;
+    const su = clamp(c.u - srcW / 2, 0, S.vw - srcW), sv = clamp(c.v - srcH / 2, 0, S.vh - srcH);
+    const lx = c.cx < W / 2 ? W - Lp - 6 : 6, ly = c.cy < H / 2 ? H - Lp - 6 : 6;
+    const mx = (u) => lx + (u - su) / srcW * Lp, my = (v) => ly + (v - sv) / srcH * Lp;
+    octx.save();
+    octx.beginPath(); octx.rect(lx, ly, Lp, Lp); octx.clip();
+    try { octx.drawImage(video, su, sv, srcW, srcH, lx, ly, Lp, Lp); } catch (e) { /* video not ready */ }
+    if (cb) {
+      octx.strokeStyle = bcol; octx.lineWidth = S.recording ? 2.5 : 1.5;
+      if (est) octx.setLineDash([6, 4]);
+      octx.strokeRect(mx(c.u + cb[0]), my(c.v + cb[1]), mx(c.u + cb[2]) - mx(c.u + cb[0]), my(c.v + cb[3]) - my(c.v + cb[1]));
+      octx.setLineDash([]);
+    }
+    cross(octx, mx(c.u), my(c.v), 14, 3, cb ? "#fff" : "#ff6b3d", 1);
+    octx.restore();
+    octx.strokeStyle = "#888"; octx.lineWidth = 1; octx.strokeRect(lx + .5, ly + .5, Lp - 1, Lp - 1);
+  }
+}
+
+function drawTimeline() {
+  const dpr = window.devicePixelRatio || 1, W = tl.width, H = tl.height;
+  tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.fillStyle = "#1e2125"; tctx.fillRect(0, 0, W, H);
+  const a = S.range.start, b = Math.max(S.range.end, a + 1), span = b - a;
+  const X = (f) => (f - a) / span * W;
+  const sf = stepFrames();
+  // match period shading
+  if (S.t0 != null) {
+    tctx.fillStyle = "rgba(255,255,255,.04)"; tctx.fillRect(X(S.t0), 0, X(S.t0 + AUTO_S * S.fps) - X(S.t0), H);
+    tctx.fillStyle = "rgba(255,255,255,.35)";
+    for (const s of [0, AUTO_S, TELEOP_S, FULL_S]) { const x = X(S.t0 + s * S.fps); if (x >= 0 && x <= W) tctx.fillRect(x, 0, dpr, H); }
+  }
+  // other robots' coverage, thin rows at the top
+  const others = rosterList().filter((r) => r.team !== S.team);
+  others.forEach((r, idx) => {
+    const d = S.docs[r.team]; if (!d) return;
+    tctx.fillStyle = AL_COL[r.alliance]; tctx.globalAlpha = .55;
+    drawRuns(d.keyframes, a, b, X, sf, idx * 2 * dpr, 1.5 * dpr, () => AL_COL[r.alliance]);
+    tctx.globalAlpha = 1;
+  });
+  const top = others.length * 2 * dpr + 2 * dpr, mh = H - top - 4 * dpr;
+  // gaps
+  tctx.fillStyle = "rgba(255,107,61,.35)";
+  for (const [g0, g1] of gapList()) tctx.fillRect(X(g0), top, Math.max(dpr, X(g1) - X(g0)), mh);
+  // keyframe runs for the selected robot (merged, not one tick per keyframe)
+  drawRuns(S.kfs, a, b, X, sf, top + mh * 0.2, mh * 0.6, (st) => ST_COL[st]);
+  // selection
+  if (S.sel) { tctx.fillStyle = "rgba(120,170,255,.3)"; tctx.fillRect(X(S.sel.a), 0, Math.max(dpr, X(S.sel.b) - X(S.sel.a)), H); }
+  // cursor
+  const f = curFrame();
+  tctx.fillStyle = "#fff"; tctx.fillRect(X(f) - dpr, 0, 2 * dpr, H);
+}
+function drawRuns(arr, a, b, X, sf, y, h, colFn) {
+  let run = null;
+  const flush = () => { if (run) { tctx.fillStyle = colFn(run.st); const x0 = X(run.f0), x1 = X(run.f1); tctx.fillRect(x0, y, Math.max(1.5, x1 - x0), h); } };
+  for (let i = lowerBound(arr, a); i < arr.length && arr[i].frame <= b; i++) {
+    const kf = arr[i];
+    if (run && run.st === kf.state && kf.frame - run.f1 <= 2 * sf) run.f1 = kf.frame;
+    else { flush(); run = { st: kf.state, f0: kf.frame, f1: kf.frame }; }
+  }
+  flush();
+}
+
+function mapXY(x, y, M) { return [M.ox + x * M.s, M.oy + (M.fw - y) * M.s]; }
+function buildMapStatic() {
+  const W = mapC.width, H = mapC.height;
+  const off = S.mapStatic && S.mapStatic.width === W && S.mapStatic.height === H ? S.mapStatic : document.createElement("canvas");
+  off.width = W; off.height = H;
+  const c = off.getContext("2d"), L = S.field.length_m, Wd = S.field.width_m;
+  const s = Math.min(W / (L + 1), H / (Wd + 1));
+  const M = { s, ox: (W - L * s) / 2, oy: (H - Wd * s) / 2, fw: Wd };
+  S.mapM = M;
+  c.fillStyle = "#101214"; c.fillRect(0, 0, W, H);
+  if (S.field2d) {
+    // map the drawing's carpet rect onto [0,L]x[0,W]; include the canvas margin
+    const f = S.field2d.cfg, [tlx, tly] = f.field_top_left_px, [brx, bry] = f.field_bottom_right_px;
+    const px = (brx - tlx) / L, py = (bry - tly) / Wd, mx = M.ox / s, my = M.oy / s;
+    c.drawImage(S.field2d.img, tlx - mx * px, tly - my * py, (L + 2 * mx) * px, (Wd + 2 * my) * py, 0, 0, W, H);
+    c.fillStyle = "rgba(0,0,0,.38)"; c.fillRect(0, 0, W, H);   // dim so tracks stand out
+  } else {
+    c.fillStyle = "#1a2a1e"; c.fillRect(M.ox, M.oy, L * s, Wd * s);
+    c.strokeStyle = "#556"; c.lineWidth = 1; c.strokeRect(M.ox, M.oy, L * s, Wd * s);
+    c.beginPath(); c.moveTo(M.ox + L / 2 * s, M.oy); c.lineTo(M.ox + L / 2 * s, M.oy + Wd * s); c.strokeStyle = "#667"; c.stroke();
+    c.fillStyle = "rgba(74,144,255,.5)"; c.fillRect(M.ox - 3, M.oy, 3, Wd * s);
+    c.fillStyle = "rgba(255,90,90,.5)"; c.fillRect(M.ox + L * s, M.oy, 3, Wd * s);
+  }
+  const a = S.range.start, b = S.range.end, gapF = OTHER_GAP_S * S.fps;
+  const path = (arr, col, lw, dash, alpha) => {
+    c.strokeStyle = col; c.lineWidth = lw; c.globalAlpha = alpha; c.setLineDash(dash || []);
+    c.beginPath(); let prev = null;
+    for (let i = lowerBound(arr, a); i < arr.length && arr[i].frame <= b; i++) {
+      const kf = arr[i], xy = kf.pts ? kf.pts : (positioned(kf) ? kfXY(kf) : null);
+      if (!xy) { prev = null; continue; }
+      const [px, py] = mapXY(xy[0], xy[1], M);
+      if (prev != null && kf.frame - prev <= gapF) c.lineTo(px, py); else c.moveTo(px, py);
+      prev = kf.frame;
+    }
+    c.stroke(); c.globalAlpha = 1; c.setLineDash([]);
+  };
+  const dpr = window.devicePixelRatio || 1;
+  if (S.replay) {
+    for (const sl of S.replay.slots) {
+      const arr = sl.pts.map((p) => ({ frame: p[0] + S.replay.offset, pts: [p[1], p[2]] }));
+      const hi = S.team && sl.team_number === S.team;
+      path(arr, AL_COL[sl.alliance] || "#aaa", (hi ? 2 : 1) * dpr, [4 * dpr, 3 * dpr], hi ? .9 : .4);
+    }
+  }
+  for (const r of rosterList()) {
+    if (r.team === S.team) continue;
+    const d = S.docs[r.team]; if (d) path(d.keyframes, AL_COL[r.alliance], 1.5 * dpr, null, .7);
+  }
+  if (S.team) path(S.kfs, "#fff", 2.5 * dpr, null, 1);
+  S.mapStatic = off;
+}
+function drawMap() {
+  const now = performance.now();
+  if (S.mapVersion !== S.dataVersion && (!S.recording || now - S.lastMapBuild > 300)) {
+    buildMapStatic(); S.mapVersion = S.dataVersion; S.lastMapBuild = now;
+  }
+  if (!S.mapStatic || !S.mapM) return;
+  const dpr = window.devicePixelRatio || 1, M = S.mapM;
+  mctx.setTransform(1, 0, 0, 1, 0, 0); mctx.drawImage(S.mapStatic, 0, 0);
+  const f = curFrame(), fps = S.fps;
+  mctx.font = `${10 * dpr}px monospace`;
+  if (S.replay) {
+    for (const sl of S.replay.slots) {
+      const arr = sl.pts; const tf = f - S.replay.offset;
+      let best = null; let lo = 0, hi = arr.length;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m][0] < tf) lo = m + 1; else hi = m; }
+      for (const j of [lo - 1, lo]) if (arr[j] && Math.abs(arr[j][0] - tf) <= 0.5 * fps && (!best || Math.abs(arr[j][0] - tf) < Math.abs(best[0] - tf))) best = arr[j];
+      if (!best) continue;
+      const [px, py] = mapXY(best[1], best[2], M), r = 4 * dpr;
+      mctx.strokeStyle = AL_COL[sl.alliance] || "#aaa"; mctx.lineWidth = (S.team && sl.team_number === S.team ? 2.5 : 1) * dpr;
+      mctx.strokeRect(px - r, py - r, 2 * r, 2 * r);
+      mctx.fillStyle = "#aaa"; mctx.fillText(sl.slot + (sl.team_number ? ":" + sl.team_number : ""), px + r + 2, py + r + 8 * dpr);
+    }
+  }
+  for (const r of rosterList()) {
+    const arr = r.team === S.team ? S.kfs : (S.docs[r.team] && S.docs[r.team].keyframes);
+    if (!arr || !arr.length) continue;
+    const p = interpAt(arr, f, OTHER_GAP_S * fps, false); if (!p || !p.pt) continue;
+    const [px, py] = mapXY(p.pt[0], p.pt[1], M);
+    const sel = r.team === S.team;
+    marker(mctx, px, py, (sel ? 6 : 4.5) * dpr, AL_COL[r.alliance], p.state, 2 * dpr);
+    if (sel) { mctx.beginPath(); mctx.arc(px, py, 9 * dpr, 0, Math.PI * 2); mctx.strokeStyle = "#fff"; mctx.lineWidth = 1.5 * dpr; mctx.stroke(); }
+    mctx.fillStyle = "#ddd"; mctx.fillText(r.team, px + 7 * dpr, py - 6 * dpr);
+  }
+  const c = S.cursor;
+  if (c.inside) {
+    const p = projectUV(c.u, c.v);
+    if (p.xy) {
+      const [px, py] = mapXY(p.xy[0], p.xy[1], M);
+      mctx.strokeStyle = p.onField ? "#00ffd0" : "#ff6b3d"; mctx.lineWidth = dpr;
+      mctx.beginPath(); mctx.moveTo(px - 8 * dpr, py); mctx.lineTo(px + 8 * dpr, py); mctx.moveTo(px, py - 8 * dpr); mctx.lineTo(px, py + 8 * dpr); mctx.stroke();
+    }
+  }
+}
+
+// keep keyboard shortcuts working after using a control (Space must not re-click
+// a focused button, arrows must not change a focused <select>)
+document.addEventListener("click", (e) => { const b = e.target.closest && e.target.closest("button"); if (b) b.blur(); });
+document.addEventListener("change", (e) => { if (e.target.tagName === "SELECT") e.target.blur(); });
+
+toggleMode(); toggleMode();   // sync button label
+layout();
+init();
+</script>
+</body>
+</html>

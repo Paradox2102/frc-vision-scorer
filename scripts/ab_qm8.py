@@ -298,6 +298,61 @@ PROFILES = {
         ("baseline", {}),
         ("mask_footprint", {"mask_footprint_pos": True}),
     ],
+    # Ground-centre offset: push every projected robot ground point 0.475 m
+    # (half a 0.95 m robot) away from its view's camera centre — the box/mask
+    # bottom is the NEAR bumper edge, not the footprint centre. qm8 hand GT
+    # post-hoc: coverage 58->74%, median err 0.66->0.39 m.
+    "ground-offset": [
+        ("baseline", {}),
+        ("ground_offset_0.475", {"ground_center_offset_m": 0.475}),
+    ],
+    # Repeat of the offset arm alone: identity outcomes on qm8 hinge on a few
+    # binding decisions, so one arm can't separate a regression from a swap.
+    "ground-offset-repeat": [("ground_offset_0.475_r2", {"ground_center_offset_m": 0.475})],
+    # Two more interleaved pairs on the Nov 7 lens-refit calibration: auto
+    # labels swing 2-66% at identical settings, so the label question needs n>=3/arm.
+    "ground-offset-x2": [("baseline_r3", {}), ("ground_offset_0.475_r3", {"ground_center_offset_m": 0.475}),
+                         ("baseline_r4", {}), ("ground_offset_0.475_r4", {"ground_center_offset_m": 0.475})],
+    # alliance_by_territory=False: unknown-colour detections no longer take
+    # their alliance from the field half (qm8 GT: opponent-half robots ride a
+    # wrong-alliance slot 63% of the time). Two interleaved pairs.
+    "territory-free": [("baseline_t1", {}), ("territory_free_t1", {"alliance_by_territory": False}),
+                       ("baseline_t2", {}), ("territory_free_t2", {"alliance_by_territory": False})],
+    # bumper_color_read: per-frame main-view bumper colour read on every
+    # main-backed tracker input (qm8 GT offline: own half 74% correct / 0.1%
+    # wrong, opponent half 32% / 2.3%). override = decided reads replace the
+    # pipeline colour; strict = colour := read (drops stale SAM colours),
+    # paired with territory-free so undecided inputs don't fall back to the
+    # field half.
+    # Identity combo from the Nov 7 GT work: strict per-frame colour + no
+    # territory alliance + duplicate-slot guards (offline replay vs GT: slot
+    # purity 50 -> 61%, switches 178 -> 88). Two runs (labels are noisy).
+    "identity-combo": [("combo_i1", {"bumper_color_read": "strict", "alliance_by_territory": False,
+                                     "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
+                       ("combo_i2", {"bumper_color_read": "strict", "alliance_by_territory": False,
+                                     "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    # Same with OVERRIDE colour (keeps the seed colour when the read is
+    # undecided): offline vs GT keeps auto purity at baseline (91%) while
+    # full-match purity 50 -> 66%; strict lost auto purity (91 -> 80%).
+    "identity-combo-override": [
+        ("combo_ovr_i1", {"bumper_color_read": "override", "alliance_by_territory": False,
+                          "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
+        ("combo_ovr_i2", {"bumper_color_read": "override", "alliance_by_territory": False,
+                          "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    # Label stage: hand-GT read analysis (Nov 7) shows team-naming reads are
+    # 94-100% right but the whole-match per-slot resolve wastes them; nearest
+    # read within the same slot+identity binding (else slot majority) took
+    # label correctness 35-46% -> 58-71% offline. identity_segment_resolve is
+    # the existing segment-level labeller (default OFF, never run live).
+    "segment-labels": [
+        ("segments", {"identity_segment_resolve": True}),
+        ("segments_strict_combo", {"identity_segment_resolve": True, "bumper_color_read": "strict",
+                                   "alliance_by_territory": False, "dup_seed_guard_m": 1.0,
+                                   "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    "bumper-colour": [("baseline_c1", {}),
+                      ("colour_override_c1", {"bumper_color_read": "override"}),
+                      ("colour_strict_tfree_c1", {"bumper_color_read": "strict",
+                                                  "alliance_by_territory": False})],
     # yolo-sam3-fusion branch: per-feature isolation of the auto-measurable
     # fusion knobs vs current shipped defaults (baseline). Each alone — not
     # stacked — so a regressor is attributable (the geo4 stack masked which

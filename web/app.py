@@ -63,7 +63,8 @@ from web.field.sam2_tracker import TrackStopped
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
 from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
-                                   holdout_field_error, tag_alignment_error, MIN_POSE_TAGS)
+                                   holdout_field_error, tag_alignment_error, MIN_POSE_TAGS,
+                                   push_from_camera)
 from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
 from web.field.apriltag_detect import detect_tags
 from web.field.drift_monitor import DriftMonitor
@@ -2086,9 +2087,12 @@ class InferenceJob:
             (self.field_model.length_m, self.field_model.width_m),
             self.config.start_zone_depth_m)
 
+        off = self.config.ground_center_offset_m
+
         def _probe(box):
             uv = ((box[0] + box[2]) / 2.0, box[3] + top_crop_px)
-            xy = view.calibration.image_to_field(uv)
+            xy = push_from_camera(
+                view.calibration, view.calibration.image_to_field(uv), off)
             return xy is not None and point_in_zones(xy, zones)
         return _probe
 
@@ -2150,6 +2154,7 @@ class InferenceJob:
                     self.field_dims,
                     frame_shape=(full_h, full_w, 3),
                     frac_backstop=self.config.det_frac_backstop,
+                    ground_offset_m=self.config.ground_center_offset_m,
                 )
                 # Per-half roster cap, identical to make_detect_fn: strong
                 # candidates always ride; the subordinate (motion) tier — empty
@@ -2160,7 +2165,9 @@ class InferenceJob:
                     _box, _color, strong = merged[idx]
                     fb = full_boxes[idx]
                     uv = ((fb[0] + fb[2]) / 2.0, fb[3])
-                    xy = view.calibration.image_to_field(uv)
+                    xy = push_from_camera(
+                        view.calibration, view.calibration.image_to_field(uv),
+                        self.config.ground_center_offset_m)
                     half = None
                     if xy is not None and self.field_model is not None:
                         half = self.field_model.alliance_side(xy)
@@ -2174,7 +2181,8 @@ class InferenceJob:
                     for i in select_gap_fills(
                         strong_halves,
                         [h for _i, h in motion_entries],
-                        max_per_half=3))
+                        max_per_half=3,
+                        by_territory=self.config.alliance_by_territory))
                 survivors = [idx for idx in keep
                              if merged[idx][2] or idx in kept_motion]
                 # EXPORT-coord boxes straight through to the TBD tracker.
@@ -2517,6 +2525,7 @@ class InferenceJob:
             frame_shape=frame.shape,
             rejected_out=rejected,
             frac_backstop=self.config.det_frac_backstop,
+            ground_offset_m=self.config.ground_center_offset_m,
         )
         # Corner-camera range falloff: attenuate (via det.score, which scales
         # the fusion weight) instead of hard-dropping, so center-field robots
@@ -2767,6 +2776,124 @@ class InferenceJob:
         if att is None:
             att = self._slot_last_read_attempt = {}
         att[slot_id] = max(att.get(slot_id, -999.0), crop_time)
+
+    # --- bumper_color_read (web/field/bumper_colour.py) ---------------------
+    def _bumper_colour_mode(self) -> str:
+        cfg = getattr(self, "config", None)
+        mode = getattr(cfg, "bumper_color_read", "off") if cfg is not None else "off"
+        return mode if mode in ("override", "strict") else "off"
+
+    def _bumper_colour_main_view(self):
+        return next((v for v in (getattr(self, "views", None) or [])
+                     if v.name == "main"), None)
+
+    def _build_bumper_colour_background(self, n_frames: int = 40):
+        """Blocking: decode ~n_frames main-view frames sampled evenly across the
+        processed range (own VideoCapture, so the job's `cap` position is not
+        disturbed) and build the static red/blue background mask. Returns
+        (mask_or_None, n_decoded, seconds)."""
+        from web.field.bumper_colour import build_background
+        t0 = time.perf_counter()
+        view = self._bumper_colour_main_view()
+        ranges = list(getattr(self, "processing_ranges", None) or [])
+        if view is None or not ranges:
+            return None, 0, time.perf_counter() - t0
+        lo = min(int(r[0]) for r in ranges)
+        hi = max(int(r[1]) for r in ranges)
+        idxs = sorted({int(round(v)) for v in np.linspace(lo, hi, n_frames)})
+        x, y, w, h = view.crop
+        frames = []
+        cap_bg = cv2.VideoCapture(str(self.video_path))
+        try:
+            for f in idxs:
+                cap_bg.set(cv2.CAP_PROP_POS_FRAMES, f)
+                ok, im = cap_bg.read()
+                if ok and im is not None:
+                    frames.append(im[y:y + h, x:x + w].copy())
+        finally:
+            cap_bg.release()
+        mask = build_background(frames)
+        return mask, len(frames), time.perf_counter() - t0
+
+    async def _setup_bumper_colour_read(self) -> None:
+        """Once per job, before the early seed update: background mask + stats.
+        A failure disables the read for this job (pipeline colours untouched)."""
+        from web.field.bumper_colour import BumperColourStats
+        self._bc_bg = None
+        self._bc_ready = False
+        self._bc_stats = BumperColourStats()
+        mode = self._bumper_colour_mode()
+        if mode == "off":
+            return
+        view = self._bumper_colour_main_view()
+        if view is None or view.calibration is None:
+            await self._warn_degraded(
+                "bumper_color_read",
+                f"bumper_color_read={mode} needs a calibrated main view; read disabled.")
+            return
+        try:
+            mask, n, secs = await asyncio.to_thread(
+                self._build_bumper_colour_background)
+        except Exception as e:
+            await self._warn_degraded(
+                "bumper_color_read",
+                f"bumper colour background build failed ({e}); read disabled.")
+            return
+        if self.timings is not None:
+            self.timings["bumper_colour.bg_build"] = round(secs, 2)
+        if mask is None:
+            await self._warn_degraded(
+                "bumper_color_read",
+                "bumper colour background: no frames decoded; read disabled.")
+            return
+        self._bc_bg = mask
+        self._bc_ready = True
+        print(f"  [bumper-colour] mode={mode}: background from {n} frames in "
+              f"{secs:.1f}s ({int(mask.sum())} static red/blue px masked)")
+
+    def _apply_bumper_colour_read(self, detections, composite_frame,
+                                  early: bool = False) -> None:
+        """Re-read main-backed detections' colour from this frame's main view
+        (mutates the FieldDetection objects in place, so the fused observation,
+        tracker input, frame evidence and trace all see it). No-op when off."""
+        if not getattr(self, "_bc_ready", False) or composite_frame is None:
+            return
+        from web.field.bumper_colour import DEFAULT_OFFSET_M, apply_bumper_colour
+        view = self._bumper_colour_main_view()
+        if view is None:
+            return
+        x, y, w, h = view.crop
+        main_bgr = composite_frame[y:y + h, x:x + w]   # view, no copy
+        # pos is already pushed by ground_center_offset_m (main-backed fused
+        # pos = main geometry), so only the remainder is applied here.
+        offset = max(0.0, DEFAULT_OFFSET_M
+                     - float(getattr(self.config, "ground_center_offset_m", 0.0) or 0.0))
+        stats = self._bc_stats
+        n_before = stats.c["reads"]
+        apply_bumper_colour(self._bumper_colour_mode(), detections, main_bgr,
+                            view.calibration, self._bc_bg, offset, stats=stats)
+        if early:
+            stats.c["early_reads"] += stats.c["reads"] - n_before
+
+    def _finalize_bumper_colour_stats(self) -> None:
+        """One summary line + flat timings keys for the bumper colour read."""
+        stats = getattr(self, "_bc_stats", None)
+        if (stats is None or not getattr(self, "_bc_ready", False)
+                or getattr(self, "_bc_done", False)):
+            return
+        self._bc_done = True
+        c = stats.as_dict()
+        timings = getattr(self, "timings", None)
+        if isinstance(timings, dict):
+            for k, v in c.items():
+                timings[f"bumper_colour.{k}"] = v
+        n = max(1, c["reads"])
+        print(f"  [bumper-colour] mode={self._bumper_colour_mode()} reads={c['reads']} "
+              f"decided={c['red'] + c['blue']} ({(c['red'] + c['blue']) / n * 100:.0f}%: "
+              f"red {c['red']} blue {c['blue']}) undecided={c['undecided']} | "
+              f"agree={c['agree']} flipped={c['flipped']} "
+              f"unknown->known={c['unknown_to_known']} cleared(strict)={c['cleared']}"
+              f" | {self._loop_stage_s.get('loop.bumper_colour', 0.0):.1f}s in loop")
 
     def _finalize_clef_usage(self) -> None:
         """Fold Clef request/token/cost counters into timings + diagnostics and
@@ -5898,6 +6025,7 @@ class InferenceJob:
             continuity=bool(getattr(cfg, "identity_continuity", False)),
             continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
             warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
+            alliance_by_territory=bool(getattr(cfg, "alliance_by_territory", True)),
         )
 
     def _retire_evicted_tracks(self, evicted_ids) -> None:
@@ -6697,7 +6825,11 @@ class InferenceJob:
                 phys_reach_slack_m=self.config.phys_reach_slack_m,
                 phys_corner_slack_m=self.config.phys_corner_slack_m,
                 reseed_hold_s=self.config.reseed_hold_s,
-                corner_dup_radius_m=self.config.corner_dup_radius_m)
+                corner_dup_radius_m=self.config.corner_dup_radius_m,
+                alliance_by_territory=self.config.alliance_by_territory,
+                dup_seed_guard_m=self.config.dup_seed_guard_m,
+                dup_reap_m=self.config.dup_reap_m,
+                dup_reap_updates=self.config.dup_reap_updates)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -7657,6 +7789,7 @@ class InferenceJob:
                                             blocked_zones=self.static_seed_zones,
                                             ray_blocked_zones=self._ray_zone_list(view),
                                             frac_backstop=self.config.det_frac_backstop,
+                                            ground_offset_m=self.config.ground_center_offset_m,
                                         )
                                         merged = [merged[idx] for idx in keep_merged]
 
@@ -7673,7 +7806,10 @@ class InferenceJob:
                                             x1, y1, x2, y2 = box
                                             full_box = (x1, y1 + top_crop_px, x2, y2 + top_crop_px)
                                             uv = ((full_box[0] + full_box[2]) / 2.0, full_box[3])
-                                            xy = view.calibration.image_to_field(uv)
+                                            xy = push_from_camera(
+                                                view.calibration,
+                                                view.calibration.image_to_field(uv),
+                                                self.config.ground_center_offset_m)
                                             half = None
                                             if xy is not None and self.field_model is not None:
                                                 half = self.field_model.alliance_side(xy)
@@ -7685,7 +7821,9 @@ class InferenceJob:
                                                 pool_halves.append(half)
                                                 pool_entries.append((box, color))
 
-                                        keep_indices = select_gap_fills(bumper_halves, pool_halves, max_per_half=3)
+                                        keep_indices = select_gap_fills(
+                                            bumper_halves, pool_halves, max_per_half=3,
+                                            by_territory=self.config.alliance_by_territory)
 
                                         for box, color, strong in merged:
                                             if strong and color != "unknown":
@@ -7915,6 +8053,7 @@ class InferenceJob:
                                             3,
                                         ),
                                         frac_backstop=self.config.det_frac_backstop,
+                                        ground_offset_m=self.config.ground_center_offset_m,
                                     )
                                     # YOLO priority at boundaries too: motion
                                     # hints share the per-half quota (3 = slots
@@ -7929,7 +8068,10 @@ class InferenceJob:
                                         box, _color, strong = merged[idx]
                                         fb = full_boxes[idx]
                                         uv = ((fb[0] + fb[2]) / 2.0, fb[3])
-                                        xy = view.calibration.image_to_field(uv)
+                                        xy = push_from_camera(
+                                            view.calibration,
+                                            view.calibration.image_to_field(uv),
+                                            self.config.ground_center_offset_m)
                                         half = None
                                         if xy is not None and self.field_model is not None:
                                             half = self.field_model.alliance_side(xy)
@@ -7943,7 +8085,8 @@ class InferenceJob:
                                         for i in select_gap_fills(
                                             strong_halves,
                                             [h for _i, h in motion_entries],
-                                            max_per_half=3))
+                                            max_per_half=3,
+                                            by_territory=self.config.alliance_by_territory))
                                     # Corroborate-only band: same field filter as
                                     # the main cascade, but these boxes never
                                     # compete for a roster seat — they ride as
@@ -7959,6 +8102,7 @@ class InferenceJob:
                                         frame_shape=(crop.shape[0] + top_crop_px,
                                                      crop.shape[1], 3),
                                         frac_backstop=self.config.det_frac_backstop,
+                                        ground_offset_m=self.config.ground_center_offset_m,
                                     ) if corrob_full else []
                                     out = [
                                         (tuple(v * SAM2_SCALE for v in merged[idx][0]),
@@ -8033,15 +8177,31 @@ class InferenceJob:
                                 if (_cropped_full_h is not None and _top_crop > 0) else 0
                             )
 
-                            def _make_project_fn(cal, y_off, scale):
+                            def _make_project_fn(cal, y_off, scale, ground_offset_m=0.0):
                                 def _project(box):
                                     x1, y1, x2, y2 = box
                                     fx1, fx2 = x1 / scale, x2 / scale
                                     fy2 = y2 / scale + y_off
-                                    return cal.image_to_field(((fx1 + fx2) / 2.0, fy2))
+                                    return push_from_camera(
+                                        cal,
+                                        cal.image_to_field(((fx1 + fx2) / 2.0, fy2)),
+                                        ground_offset_m)
                                 return _project
 
-                            _project_fn = _make_project_fn(view.calibration, _y_off, _sam2_scale)
+                            # Robot-centre projector (ground_center_offset_m
+                            # applied): tracker stationarity/re-anchor jumps,
+                            # seed/corrob zone gates. _project_contact_fn is
+                            # the RAW bottom-edge contact, used only by the
+                            # seed gate's ray-beyond-contact test (same split
+                            # as filter_field_robot_boxes). Identical when the
+                            # offset is 0.
+                            _project_fn = _make_project_fn(
+                                view.calibration, _y_off, _sam2_scale,
+                                self.config.ground_center_offset_m)
+                            _project_contact_fn = (
+                                _make_project_fn(view.calibration, _y_off, _sam2_scale)
+                                if self.config.ground_center_offset_m > 0
+                                else _project_fn)
 
                             # Hard-negative mining (post-job, best-effort): capture
                             # the pieces mine_hard_negatives needs to map a cull
@@ -8060,7 +8220,8 @@ class InferenceJob:
                             # Low cameras also test the viewing ray beyond the
                             # contact — an occluded structure base projects short
                             # of its zone (qm28 outpost phantom).
-                            def _make_seed_gate_fn(project, zones, ray_zones, cam_xy):
+                            def _make_seed_gate_fn(project, zones, ray_zones, cam_xy,
+                                                   project_contact=None):
                                 def _gate(box):
                                     xy = project(box)
                                     if xy is None:
@@ -8068,7 +8229,11 @@ class InferenceJob:
                                     if point_in_zones(xy, zones):
                                         return False
                                     if ray_zones and cam_xy is not None:
-                                        return not ray_enters_zones(cam_xy, xy, ray_zones)
+                                        contact = (xy if project_contact is None
+                                                   else project_contact(box))
+                                        if contact is None:
+                                            return True
+                                        return not ray_enters_zones(cam_xy, contact, ray_zones)
                                     return True
                                 return _gate
 
@@ -8080,6 +8245,7 @@ class InferenceJob:
                                 None if _cam_center is None else (
                                     float(_cam_center[0]), float(_cam_center[1])
                                 ),
+                                project_contact=_project_contact_fn,
                             )
 
                             # Size-prior hijack cull (A/B knob): expected robot pixel
@@ -8377,6 +8543,10 @@ class InferenceJob:
                         "reads fall back to the slower in-process model.",
                     )
 
+            # bumper_color_read (default off: no-op, nothing decoded): build the
+            # static-colour background once, before the early seed update.
+            await self._setup_bumper_colour_read()
+
             # Early vision OCR pass at the autonomous start when timer gating succeeds.
             # Seeds the field tracker's slots from this frame so VLM reads bind to
             # slot ids (the same identity the main loop uses).
@@ -8470,6 +8640,7 @@ class InferenceJob:
                     frame_shape=early_overhead.shape,
                     rejected_out=early_rejected,
                     frac_backstop=self.config.det_frac_backstop,
+                    ground_offset_m=self.config.ground_center_offset_m,
                 )
                 if early_rejected:
                     self.hard_neg_logger.maybe_log(
@@ -8478,6 +8649,9 @@ class InferenceJob:
                         frame_num=early_ocr_source_frame,
                     )
                 early_dt = self.frame_skip / (self.video_fps or 30.0)
+                # bumper_color_read: every early det is main-backed (box set).
+                self._apply_bumper_colour_read(
+                    early_field_dets, early_ocr_frame, early=True)
                 early_outs = self.field_tracker.update(early_field_dets, {}, early_dt, frame_num=early_ocr_source_frame)
                 if TRACKER_TRACE:
                     # Replay input (scripts/replay_field_tracker.py): this
@@ -8661,6 +8835,7 @@ class InferenceJob:
                                     self.field_dims,
                                     frame_shape=view_frame.shape,
                                     frac_backstop=self.config.det_frac_backstop,
+                                    ground_offset_m=self.config.ground_center_offset_m,
                                 ):
                                     continue
                                 # ground_uv picks the mask's carpet-contact
@@ -8681,7 +8856,12 @@ class InferenceJob:
                                 )
                                 uv = (mu / SAM2_SCALE,
                                       mv / SAM2_SCALE + sam2_y_offset)
-                                xy = cal.image_to_field(uv)
+                                # ground_center_offset_m: the contact point is
+                                # the robot's NEAR edge from this camera; push
+                                # to the footprint centre (no-op when 0).
+                                xy = push_from_camera(
+                                    cal, cal.image_to_field(uv),
+                                    self.config.ground_center_offset_m)
                                 corner_weight = corner_detection_weight(
                                     view.name, xy, self.field_dims
                                 )
@@ -8822,6 +9002,16 @@ class InferenceJob:
                             fused, ev_list, main_guard=self.config.merge_main_guard)
 
                     field_dets = [obs.detection for obs in fused]
+                    if TRACKER_TRACE and getattr(self, "_bc_ready", False):
+                        _trace_pipe_col = [d.color for d in field_dets]
+                    # bumper_color_read: re-read main-backed fused detections'
+                    # colour from this frame's main view (in place: the fused
+                    # obs, tracker, frame evidence and trace see the same
+                    # value). After fused_registry.assign — the registry's own
+                    # id matching still uses the pipeline colour.
+                    if getattr(self, "_bc_ready", False):
+                        with self._stage("loop.bumper_colour"):
+                            self._apply_bumper_colour_read(field_dets, frame)
                     dt = self.frame_skip / (self.video_fps or 30.0)
                     portals = (self._portal_state
                                if self.config.occlusion_portal else None)
@@ -8851,7 +9041,10 @@ class InferenceJob:
                                 "has_main_box": o.detection.box is not None,
                                 "color": o.detection.color,
                                 "tid": o.track_id,
-                            } for o in fused],
+                                # bumper_color_read on: the pre-read colour.
+                                **({"color_pipe": _trace_pipe_col[_oi]}
+                                   if getattr(self, "_bc_ready", False) else {}),
+                            } for _oi, o in enumerate(fused)],
                             "tracks": [{
                                 "slot": t.slot_id, "label": self._slot_label(t.slot_id),
                                 "pos": [round(float(t.pos[0]), 4), round(float(t.pos[1]), 4)],
@@ -9409,6 +9602,8 @@ class InferenceJob:
             # Clef reads/tokens/cost into timings (+ one summary line) before
             # the complete payload is built. No-op for other readers.
             self._finalize_clef_usage()
+            # bumper_color_read counters (no-op when the knob is off).
+            self._finalize_bumper_colour_stats()
 
             # Fold the per-stage accumulators into timings as flat "loop.<stage>"
             # keys (survive the end-of-job round pass) and print one hot-path line.
@@ -9417,7 +9612,8 @@ class InferenceJob:
             if self._loop_stage_s:
                 _tot = time.perf_counter() - _loop_t0
                 _acct = sum(v for k, v in self._loop_stage_s.items()
-                            if k not in ("loop.person_det", "loop.embed", "loop.crop_encode"))  # nested inside evidence_build
+                            if k not in ("loop.person_det", "loop.embed", "loop.crop_encode",
+                                         "loop.bumper_colour"))  # nested inside evidence_build / fuse_track
                 print("  [profile] analysis loop stages (s): "
                       + ", ".join(f"{k.split('.',1)[1]}={v:.1f}" for k, v in sorted(self._loop_stage_s.items(), key=lambda kv: -kv[1]))
                       + f" | accounted {_acct:.1f}/{_tot:.1f}s")
@@ -9566,6 +9762,10 @@ class InferenceJob:
                 self._finalize_clef_usage()
             except Exception as e:
                 print(f"  [clef] usage summary failed: {e}")
+            try:
+                self._finalize_bumper_colour_stats()
+            except Exception as e:
+                print(f"  [bumper-colour] summary failed: {e}")
             # Finalize processing timings (covers partial/errored runs the success
             # path never reached) and round to 2 decimals for display/storage.
             timings = getattr(self, "timings", {}) or {}

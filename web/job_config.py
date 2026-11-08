@@ -883,6 +883,21 @@ KNOBS = [
     # pending A/B (ab_qm8 territory-free).
     Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, True,
          section="Fusion & field position"),
+    # Duplicate-slot guards (FieldTracker). Hand GT on qm8: most slot "swaps"
+    # are duplicates — two slots on one robot (a second main-view SAM object
+    # seeds a free slot next to the robot's existing slot, then the two take
+    # turns). dup_seed_guard_m: no seed within this distance of any active
+    # slot. dup_reap_m / dup_reap_updates: two active slots within dup_reap_m
+    # for that many consecutive updates -> expire the younger. Offline replay
+    # vs GT (qm8, with bumper_color_read=strict + alliance_by_territory=False):
+    # slot purity 47.8 -> 61.4%, robot-on-main-slot 43.9 -> 54.4%, switches
+    # 110 -> 88, coverage -0.3 pt. DEFAULT 0 = off pending live A/B.
+    Knob("dup_seed_guard_m", "DUP_SEED_GUARD_M", float, 0.0, min=0.0, max=3.0,
+         section="Fusion & field position"),
+    Knob("dup_reap_m", "DUP_REAP_M", float, 0.0, min=0.0, max=3.0,
+         section="Fusion & field position"),
+    Knob("dup_reap_updates", "DUP_REAP_UPDATES", int, 8, min=1, max=60,
+         section="Fusion & field position"),
     # bumper_color_read: re-read each main-backed tracker input's bumper colour
     # from the main-view pixels every frame (web/field/bumper_colour.py: push
     # pos 0.475 m from the camera to the robot centre, project a 0.95 m square

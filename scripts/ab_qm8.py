@@ -324,6 +324,13 @@ PROFILES = {
     # pipeline colour; strict = colour := read (drops stale SAM colours),
     # paired with territory-free so undecided inputs don't fall back to the
     # field half.
+    # Identity combo from the Nov 7 GT work: strict per-frame colour + no
+    # territory alliance + duplicate-slot guards (offline replay vs GT: slot
+    # purity 50 -> 61%, switches 178 -> 88). Two runs (labels are noisy).
+    "identity-combo": [("combo_i1", {"bumper_color_read": "strict", "alliance_by_territory": False,
+                                     "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
+                       ("combo_i2", {"bumper_color_read": "strict", "alliance_by_territory": False,
+                                     "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
     "bumper-colour": [("baseline_c1", {}),
                       ("colour_override_c1", {"bumper_color_read": "override"}),
                       ("colour_strict_tfree_c1", {"bumper_color_read": "strict",

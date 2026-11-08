@@ -229,5 +229,49 @@ def test_app_tracker_constructor_passes_knob():
     import inspect
     import web.app as app
     src = inspect.getsource(app)
-    assert "alliance_by_territory=self.config.alliance_by_territory)" in src
+    assert "alliance_by_territory=self.config.alliance_by_territory" in src
     assert src.count("by_territory=self.config.alliance_by_territory") >= 4
+
+
+# --- duplicate-slot guards (dup_seed_guard_m / dup_reap_*) ---------------------
+def _dup_tracker(**kw):
+    from web.field.tracker import FieldTracker
+    return FieldTracker(16.541, zones=[], **kw)
+
+
+def _det(x, y, color="blue", tid=None):
+    from web.field.tracker import FieldDetection
+    return FieldDetection(pos=(x, y), color=color, box=(0, 0, 10, 10), track_id=tid)
+
+
+def test_dup_seed_guard_blocks_second_detection_on_tracked_robot():
+    for guard, expect in ((0.0, 2), (1.0, 1)):
+        tr = _dup_tracker(dup_seed_guard_m=guard)
+        tr.update([_det(5.0, 4.0)], {}, 0.133)
+        tr.update([_det(5.0, 4.0), _det(5.4, 4.1)], {}, 0.133)   # duplicate 0.41 m away
+        assert sum(t.active for t in tr.tracks) == expect
+
+
+def test_dup_reaper_expires_younger_slot_after_n_updates():
+    tr = _dup_tracker(dup_reap_m=0.8, dup_reap_updates=3)
+    tr.update([_det(5.0, 4.0)], {}, 0.133)
+    for _ in range(5):
+        tr.update([_det(5.0, 4.0)], {}, 0.133)
+    tr.update([_det(5.0, 4.0), _det(5.5, 4.0)], {}, 0.133)        # duplicate seeds (no guard)
+    assert sum(t.active for t in tr.tracks) == 2
+    tr.dup_seed_guard_m = 1.0        # reaping only sticks with the seed guard (else the dup reseeds)
+    reaped = []
+    for _ in range(4):
+        tr.update([_det(5.0, 4.0), _det(5.5, 4.0)], {}, 0.133)
+        reaped += [e for e in tr.slot_events if e["event"] == "dup_reaped"]
+    act = [t for t in tr.tracks if t.active]
+    assert len(reaped) == 1 and len(act) == 1 and act[0].hits > 3   # the older slot survives
+
+
+def test_dup_guards_default_off_and_in_config():
+    from web.job_config import JobConfig
+    tr = _dup_tracker()
+    assert tr.dup_seed_guard_m == 0 and tr.dup_reap_m == 0
+    c = JobConfig({"dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})
+    assert (c.dup_seed_guard_m, c.dup_reap_m, c.dup_reap_updates) == (1.0, 0.7, 8)
+    assert tr.config_dict()["dup_reap_updates"] == 8

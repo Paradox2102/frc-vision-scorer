@@ -6826,7 +6826,10 @@ class InferenceJob:
                 phys_corner_slack_m=self.config.phys_corner_slack_m,
                 reseed_hold_s=self.config.reseed_hold_s,
                 corner_dup_radius_m=self.config.corner_dup_radius_m,
-                alliance_by_territory=self.config.alliance_by_territory)
+                alliance_by_territory=self.config.alliance_by_territory,
+                dup_seed_guard_m=self.config.dup_seed_guard_m,
+                dup_reap_m=self.config.dup_reap_m,
+                dup_reap_updates=self.config.dup_reap_updates)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}

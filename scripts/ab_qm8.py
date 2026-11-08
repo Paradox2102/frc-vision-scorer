@@ -331,6 +331,14 @@ PROFILES = {
                                      "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
                        ("combo_i2", {"bumper_color_read": "strict", "alliance_by_territory": False,
                                      "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    # Same with OVERRIDE colour (keeps the seed colour when the read is
+    # undecided): offline vs GT keeps auto purity at baseline (91%) while
+    # full-match purity 50 -> 66%; strict lost auto purity (91 -> 80%).
+    "identity-combo-override": [
+        ("combo_ovr_i1", {"bumper_color_read": "override", "alliance_by_territory": False,
+                          "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8}),
+        ("combo_ovr_i2", {"bumper_color_read": "override", "alliance_by_territory": False,
+                          "dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})],
     "bumper-colour": [("baseline_c1", {}),
                       ("colour_override_c1", {"bumper_color_read": "override"}),
                       ("colour_strict_tfree_c1", {"bumper_color_read": "strict",

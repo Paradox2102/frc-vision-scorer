@@ -203,7 +203,8 @@ def test_gap_fills_territory_free_whole_field_cap():
 # ------------------------------------------------------------- plumbing
 
 def test_job_config_knob():
-    assert JobConfig().alliance_by_territory is True
+    assert JobConfig().alliance_by_territory is False          # default flipped Nov 7 2026
+    assert JobConfig({"alliance_by_territory": True}).alliance_by_territory is True
     assert JobConfig({"alliance_by_territory": False}).alliance_by_territory is False
     assert JobConfig({"alliance_by_territory": "0"}).alliance_by_territory is False
 
@@ -219,8 +220,10 @@ def test_app_identity_registry_receives_knob():
     job = InferenceJob.__new__(InferenceJob)
     job.config = JobConfig({"alliance_by_territory": False})
     assert job._build_identity_registry().alliance_by_territory is False
-    job.config = JobConfig()
+    job.config = JobConfig({"alliance_by_territory": True})
     assert job._build_identity_registry().alliance_by_territory is True
+    job.config = JobConfig()                                   # default flipped Nov 7 2026
+    assert job._build_identity_registry().alliance_by_territory is False
 
 
 def test_app_tracker_constructor_passes_knob():
@@ -270,8 +273,10 @@ def test_dup_reaper_expires_younger_slot_after_n_updates():
 
 def test_dup_guards_default_off_and_in_config():
     from web.job_config import JobConfig
-    tr = _dup_tracker()
+    tr = _dup_tracker()          # FieldTracker itself stays off; JobConfig defaults are on
     assert tr.dup_seed_guard_m == 0 and tr.dup_reap_m == 0
+    d = JobConfig()
+    assert (d.dup_seed_guard_m, d.dup_reap_m, d.dup_reap_updates) == (1.0, 0.7, 8)
     c = JobConfig({"dup_seed_guard_m": 1.0, "dup_reap_m": 0.7, "dup_reap_updates": 8})
     assert (c.dup_seed_guard_m, c.dup_reap_m, c.dup_reap_updates) == (1.0, 0.7, 8)
     assert tr.config_dict()["dup_reap_updates"] == 8

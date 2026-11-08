@@ -227,8 +227,9 @@ def test_off_mode_is_noop():
 
 # --- knob + app wiring -----------------------------------------------------
 
-def test_knob_default_off_and_validated():
-    assert JobConfig().bumper_color_read == "off"
+def test_knob_default_strict_and_validated():
+    assert JobConfig().bumper_color_read == "strict"           # default flipped Nov 7 2026
+    assert JobConfig({"bumper_color_read": "off"}).bumper_color_read == "off"
     assert JobConfig({"bumper_color_read": "strict"}).bumper_color_read == "strict"
     with pytest.raises(ValueError):
         JobConfig({"bumper_color_read": "sometimes"})

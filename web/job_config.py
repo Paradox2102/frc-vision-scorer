@@ -723,7 +723,12 @@ KNOBS = [
     # 76.2% / segments 78.3% (labels 96.6% precise, 81% of reads labelled);
     # qm8 2 jobs gir 48.4% / swap 51.1% / segments 61.8% (92.9% precise).
     # Slot-time coverage 31-69%. DEFAULT OFF pending a live full-match A/B.
-    Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, False,
+    # DEFAULT FLIPPED Nov 7 2026 (Nick) with the identity combo below — qm8
+    # full match vs hand GT, job ecc13f9d: mis-ID 199-274 s -> 38 s, wrong
+    # labels 31-41% -> 5%, cross-alliance mis-ID 62-84 s -> 4 s (30% of time
+    # unlabelled instead of guessed). One match, one run: re-check on held-out
+    # matches (qm22/14/13/7 vs Manta auto).
+    Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, True,
          section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
@@ -881,7 +886,8 @@ KNOBS = [
     # birth is deferred; the SAM prompt/re-prompt gap-fill cap counts the whole
     # field (<= 6) instead of 3 per half. DEFAULT True (legacy, byte-identical)
     # pending A/B (ab_qm8 territory-free).
-    Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, True,
+    # DEFAULT FLIPPED to False Nov 7 2026 (identity combo; see identity_segment_resolve).
+    Knob("alliance_by_territory", "ALLIANCE_BY_TERRITORY", bool, False,
          section="Fusion & field position"),
     # Duplicate-slot guards (FieldTracker). Hand GT on qm8: most slot "swaps"
     # are duplicates — two slots on one robot (a second main-view SAM object
@@ -892,9 +898,10 @@ KNOBS = [
     # vs GT (qm8, with bumper_color_read=strict + alliance_by_territory=False):
     # slot purity 47.8 -> 61.4%, robot-on-main-slot 43.9 -> 54.4%, switches
     # 110 -> 88, coverage -0.3 pt. DEFAULT 0 = off pending live A/B.
-    Knob("dup_seed_guard_m", "DUP_SEED_GUARD_M", float, 0.0, min=0.0, max=3.0,
+    # DEFAULTS FLIPPED Nov 7 2026 (identity combo): guard 1.0 m, reap 0.7 m x 8.
+    Knob("dup_seed_guard_m", "DUP_SEED_GUARD_M", float, 1.0, min=0.0, max=3.0,
          section="Fusion & field position"),
-    Knob("dup_reap_m", "DUP_REAP_M", float, 0.0, min=0.0, max=3.0,
+    Knob("dup_reap_m", "DUP_REAP_M", float, 0.7, min=0.0, max=3.0,
          section="Fusion & field position"),
     Knob("dup_reap_updates", "DUP_REAP_UPDATES", int, 8, min=1, max=60,
          section="Fusion & field position"),
@@ -914,7 +921,9 @@ KNOBS = [
     # the pipeline colour, undecided keeps it; "strict" = colour := the read
     # (undecided -> unknown, discarding stale pipeline colours). Pending A/B
     # (ab_qm8 bumper-colour).
-    Knob("bumper_color_read", "BUMPER_COLOR_READ", str, "off",
+    # DEFAULT FLIPPED to "strict" Nov 7 2026 (identity combo; pairs with
+    # alliance_by_territory=False — strict leaves more inputs colourless).
+    Knob("bumper_color_read", "BUMPER_COLOR_READ", str, "strict",
          choices=("off", "override", "strict"), section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either

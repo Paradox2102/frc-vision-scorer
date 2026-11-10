@@ -359,3 +359,35 @@ def test_replay_provenance_records_config_stop_and_calibration():
     bare = InferenceJob.__new__(InferenceJob)
     assert InferenceJob._replay_provenance(bare) == {"config": {}, "stopped": False,
                                                      "calibration_version": None}
+
+
+def _realistic_event_result():
+    res = _ok_event_result()
+    res["digit_calls"] = {
+        "roster": ["3128", "2637"], "model_key": "jev-1.14",
+        "calls": {0: [{"3128": 0.91, "2637": 0.04}, None], 12: [{"3128": 0.5}]},
+        "wide_p": {0: {1: {"3128": 0.7}}},
+        "fingerprints": {0: {"slot": "B1", "first_frame": 4, "samples": [1, 2], "requests": 2}},
+    }
+    return res
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_finalize_summary_is_json_serialisable(monkeypatch, on):
+    order = []
+    _store(monkeypatch, order)
+    _stage(monkeypatch, order, _realistic_event_result())
+    job, rec = _event_job(on=on)
+    summary, _ = _apply(job, rec)
+    assert summary["window_labels_digit_calls"]["calls"][0][0]["3128"] == 0.91
+    json.dumps(summary)
+
+
+def test_a_stopped_event_job_touches_neither_store_nor_stage(monkeypatch):
+    order = []
+    _store(monkeypatch, order)
+    _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job()
+    job._stopped = True
+    summary, _ = _apply(job, rec)
+    assert order == [] and "window_labels" not in summary and rec.frames == FRAMES

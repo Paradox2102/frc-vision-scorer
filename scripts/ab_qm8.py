@@ -365,6 +365,8 @@ PROFILES = {
     "deinterlace": [("baseline", {}), ("deinterlace", {"bumper_deinterlace": True})],
     # Treatment arm alone (pair with existing baseline runs of the same code).
     "deinterlace-on": [("deinterlace", {"bumper_deinterlace": True})],
+    # Single window-labels arm (event-lineup baseline collection, Nov 10).
+    "wl-on": [("wl_08", {"window_labels": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

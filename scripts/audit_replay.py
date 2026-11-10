@@ -525,14 +525,20 @@ def render_view(view_img, t: dict) -> tuple:
 # Loading
 # --------------------------------------------------------------------------- #
 
-def load_replay_inputs(replay_id: str) -> dict:
+def load_replay_inputs(replay_id: str, meta_path: Optional[str] = None) -> dict:
+    """Replay row, meta (``meta_path`` overrides the replay's own meta.json,
+    e.g. an offline relabel: labels from it, positions are the same), video,
+    views, roster and fps."""
     from scripts.build_track_truth import job_views
     from scripts.relabel_replay import job_roster
     from scripts.score_ground_truth import REPLAYS_DIR, _probe_fps, _resolve, replay_row
     row = replay_row(replay_id)
-    meta_p = REPLAYS_DIR / row["id"] / "meta.json"
-    if not meta_p.exists():
-        meta_p = _resolve(row.get("meta_path"))
+    if meta_path:
+        meta_p = Path(meta_path)
+    else:
+        meta_p = REPLAYS_DIR / row["id"] / "meta.json"
+        if not meta_p.exists():
+            meta_p = _resolve(row.get("meta_path"))
     if meta_p is None or not meta_p.exists():
         raise SystemExit(f"meta.json missing for replay {row['id']}")
     video = _resolve(row.get("source_video_path"))
@@ -571,7 +577,7 @@ def write_jsonl(p: Path, rows: list) -> None:
 def cmd_sample(args) -> None:
     import cv2
     from web.field.window_crops import iter_view_frames
-    inp = load_replay_inputs(args.replay)
+    inp = load_replay_inputs(args.replay, getattr(args, "meta", None))
     row, meta, views = inp["row"], inp["meta"], inp["views"]
     if inp["video"] is None:
         raise SystemExit(f"source video missing for replay {row['id']}")
@@ -648,6 +654,7 @@ def cmd_sample(args) -> None:
     write_jsonl(out_dir / "items.jsonl", items)
     audit = {"replay": row["id"], "match_key": row["match_key"],
              "replay_created_at": row["created_at"], "video": inp["video"].name,
+             "meta": getattr(args, "meta", None),
              "fps": inp["fps"], "frame_period_s": period_s, "n_requested": args.n,
              "seed": args.seed, "unlabelled_frac": args.unlabelled_frac,
              "auto_min_share": args.auto_min_share,
@@ -893,6 +900,18 @@ def cmd_score(args) -> None:
             print(f"  -> label coverage {_pct(lab_s / (tot + lab_s))} of slot-time; a further "
                   f"~{share * tot:.0f} slot-s show a robot the judge could name")
 
+    if getattr(args, "json", None):
+        tot = audit.get("unlabelled_slot_s") or 0
+        lab_s = audit.get("labelled_slot_s") or 0
+        Path(args.json).write_text(json.dumps({
+            "audit": audit_dir.name, "replay": audit["replay"], "match_key": audit["match_key"],
+            "meta": audit.get("meta"), "answers": str(args.answers), "min_conf": mc,
+            "misid": est["misid"], "ci": list(ci) if ci else None, "misid_s": est["misid_s"],
+            "judge_coverage": est["coverage"], "n_confident": est["n_confident"],
+            "labelled_slot_s": lab_s, "unlabelled_slot_s": tot,
+            "label_coverage": (lab_s / (tot + lab_s)) if tot + lab_s else None}, indent=1))
+        print(f"score json -> {args.json}")
+
     gt = None if args.no_gt else gt_lookup(audit, recs)
     if gt is None:
         if args.dump:
@@ -960,6 +979,9 @@ def main() -> None:
     s.add_argument("--ground-center-offset", type=float, default=0.0,
                    help="the job's ground_center_offset_m (0 unless the job set it)")
     s.add_argument("--out", default=None, help="audit dir (default data/eval/audit/<mk>_<id8>)")
+    s.add_argument("--meta", default=None,
+                   help="take the labels from this meta.json (e.g. an event_relabel output); "
+                        "positions, video and views stay the replay's")
     j = sub.add_parser("jev", help="Jev as the judge (calls the Jev API)")
     j.add_argument("--audit", required=True)
     j.add_argument("--mode", choices=("multi", "views"), default="multi",
@@ -972,6 +994,7 @@ def main() -> None:
     c.add_argument("--min-conf", type=float, default=DEFAULT_MIN_CONF)
     c.add_argument("--no-gt", action="store_true")
     c.add_argument("--dump", default=None, help="write per-item rows (JSONL) here")
+    c.add_argument("--json", default=None, help="write the estimates (JSON) here")
     args = ap.parse_args()
     {"sample": cmd_sample, "jev": cmd_jev, "score": cmd_score}[args.cmd](args)
 

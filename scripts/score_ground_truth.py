@@ -129,13 +129,20 @@ def _shift_meta(meta: dict, event_key: str, match_key: str, offset_m: float) -> 
     return meta
 
 
-def load_replay(row: dict, score_shift_m: float = 0.0):
-    """-> ReplayTrack for a replay row (fingerprint + fps from its source video)."""
-    meta_p = REPLAYS_DIR / row["id"] / "meta.json"
-    if not meta_p.exists():
-        meta_p = _resolve(row.get("meta_path"))
+def load_replay(row: dict, score_shift_m: float = 0.0, meta_path=None):
+    """-> ReplayTrack for a replay row (fingerprint + fps from its source video).
+    ``meta_path``: score this meta.json instead of the replay's own (e.g. an
+    offline relabel from scripts/event_relabel.py); the video stays the
+    replay's."""
+    if meta_path:
+        meta_p = Path(meta_path)
+    else:
+        meta_p = REPLAYS_DIR / row["id"] / "meta.json"
+        if not meta_p.exists():
+            meta_p = _resolve(row.get("meta_path"))
     if meta_p is None or not meta_p.exists():
-        raise FileNotFoundError(f"meta.json missing for replay {row['id']}")
+        raise FileNotFoundError(f"meta.json missing for replay {row['id']}"
+                                + (f" ({meta_path})" if meta_path else ""))
     meta = json.loads(meta_p.read_text())
     if score_shift_m:
         mk = row.get("match_key") or ""
@@ -152,7 +159,8 @@ def load_replay(row: dict, score_shift_m: float = 0.0):
 def score_replay(replay_id: str, *, period: str = "full", match_radius_m: float = 1.0,
                  gt_dir: Path = GT_DIR, force: bool = False, eval_step_s: float = 0.25,
                  lag_ms: float = 0.0, details: bool = False,
-                 gt_docs: Optional[list] = None, score_shift_m: float = 0.0) -> dict:
+                 gt_docs: Optional[list] = None, score_shift_m: float = 0.0,
+                 meta_path: Optional[str] = None) -> dict:
     """Score one replay against its match's GT. Never raises for expected
     failures (no GT, alignment, missing files): returns ``{"error": ...}``."""
     try:
@@ -164,11 +172,12 @@ def score_replay(replay_id: str, *, period: str = "full", match_radius_m: float 
                 "created_at": row["created_at"]}
         if not docs:
             return {**base, "error": f"no ground truth for {row['match_key']} in {gt_dir}"}
-        rt = load_replay(row, score_shift_m)
+        rt = load_replay(row, score_shift_m, meta_path)
         res = score_match(docs, rt, match_radius_m=match_radius_m, period=period,
                           eval_step_s=eval_step_s, lag_ms=lag_ms, force=force,
                           details=details, roster=match_roster(row["match_key"]))
         res["params"]["score_shift_m"] = score_shift_m
+        res["params"]["meta"] = meta_path
         if rt.fingerprint is None:
             res["warnings"].append("replay source video not found; no fingerprint check")
         return {**base, **res}
@@ -251,15 +260,20 @@ def main() -> None:
                     help="push pipeline positions M metres away from the main camera before "
                          "scoring (0.475 = half a robot: removes the near-bumper-edge bias so "
                          "position error isn't counted as a lost track)")
+    ap.add_argument("--meta", default=None, metavar="FILE",
+                    help="with --replay: score this meta.json (e.g. an offline relabel) "
+                         "instead of the replay's own")
     ap.add_argument("--json", help="write full results JSON here")
     ap.add_argument("--details", action="store_true", help="include per-sample records in --json")
     ap.add_argument("--force", action="store_true",
                     help="assume identity frame alignment when videos differ (LOUD warning)")
     a = ap.parse_args()
+    if a.meta and not a.replay:
+        ap.error("--meta needs --replay")
 
     kw = dict(period=a.period, match_radius_m=a.match_radius, gt_dir=Path(a.gt_dir),
               force=a.force, eval_step_s=a.eval_step, lag_ms=a.lag_ms, details=a.details,
-              score_shift_m=a.score_shift)
+              score_shift_m=a.score_shift, meta_path=a.meta)
     if a.replay:
         ids = [a.replay]
     else:

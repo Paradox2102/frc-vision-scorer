@@ -46,6 +46,8 @@ ROBOT_HALF_M = 0.475
 ROBOT_HEIGHT_M = 0.5
 ROBOT_CENTRE_OFFSET_M = 0.475       # = window_crops.ROBOT_CENTRE_OFFSET_M
 TRAIL_LEN = 16
+LOCK_FILE = "render.lock"
+LOCK_GRACE_S = 10.0                 # an empty lock file this young is still being written
 RENDER_VIDEO = "hud.render.mp4"
 LIVE_VIDEO = "hud.live.mp4"
 STATS_FILE = "render.json"
@@ -424,6 +426,94 @@ def render_replay(replay_id: str, db_path=None) -> dict:
     return stats
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lock_holder(out_dir) -> Optional[int]:
+    """The live pid named by ``<out_dir>/render.lock``, or None (no lock, a
+    dead pid, or an unreadable lock older than LOCK_GRACE_S). An unreadable
+    lock still being written reports -1."""
+    p = Path(out_dir) / LOCK_FILE
+    try:
+        text = p.read_text().strip()
+        age = time.time() - p.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        pid = int(text)
+    except ValueError:
+        return -1 if age < LOCK_GRACE_S else None
+    return pid if pid > 0 and _pid_alive(pid) else None
+
+
+def acquire_lock(out_dir) -> bool:
+    """Create ``render.lock`` (O_EXCL) naming this pid; a stale lock (dead
+    pid) is replaced. False when a live process holds it."""
+    p = Path(out_dir) / LOCK_FILE
+    for _ in range(2):
+        try:
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if lock_holder(out_dir) is not None:
+                return False
+            p.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(str(os.getpid()))
+        return True
+    return False
+
+
+def release_lock(out_dir) -> None:
+    """Remove ``render.lock`` if this process holds it."""
+    p = Path(out_dir) / LOCK_FILE
+    try:
+        if int(p.read_text().strip()) == os.getpid():
+            p.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def run(replay_id: str, db_path=None) -> tuple:
+    """Lock, render and record the outcome in the DB (render_status
+    rendering -> rendered | render_failed + render_error, and the new video
+    columns). Returns (exit code, result): 0 rendered (result = stats), 1
+    failed, 3 locked by another live process (status left alone)."""
+    from web import database
+    row = database.get_replay_sync(replay_id, db_path)
+    if row is None:
+        return 1, {"replay_id": replay_id, "error": "replay not found"}
+    out_dir = Path(row.get("meta_path") or "").parent
+    if not out_dir.is_dir():
+        database.set_render_status_sync(replay_id, "render_failed", "replay directory missing",
+                                        db_path=db_path)
+        return 1, {"replay_id": replay_id, "error": "replay directory missing"}
+    if not acquire_lock(out_dir):
+        return 3, {"replay_id": replay_id, "error": f"locked by pid {lock_holder(out_dir)}"}
+    try:
+        database.set_render_status_sync(replay_id, "rendering", None, db_path=db_path)
+        try:
+            stats = render_replay(replay_id, db_path)
+        except Exception as e:
+            msg = str(e) if isinstance(e, RenderError) else f"{type(e).__name__}: {e}"
+            database.set_render_status_sync(replay_id, "render_failed", msg, db_path=db_path)
+            return 1, {"replay_id": replay_id, "error": msg}
+        database.set_render_status_sync(
+            replay_id, "rendered", None, db_path=db_path, codec=stats["codec"],
+            width=stats["width"], height=stats["height"], video_path=stats["video_path"],
+            thumb_path=stats["thumb_path"])
+        return 0, stats
+    finally:
+        release_lock(out_dir)
+
+
 def read_stats(out_dir) -> Optional[dict]:
     """The last render's stats (render.json), or None."""
     try:
@@ -438,12 +528,12 @@ def main(argv=None) -> int:
     ap.add_argument("--db", default=None, help="SQLite DB (default: web.database.DB_PATH)")
     args = ap.parse_args(argv)
     try:
-        stats = render_replay(args.replay_id, args.db)
-    except RenderError as e:
-        print(json.dumps({"replay_id": args.replay_id, "error": str(e)}))
-        return 1
-    print(json.dumps(stats))
-    return 0
+        os.nice(10)                 # yield CPU to the next job's analysis loop
+    except OSError:
+        pass
+    code, result = run(args.replay_id, args.db)
+    print(json.dumps(result))
+    return code
 
 
 if __name__ == "__main__":

@@ -126,6 +126,7 @@ from web.field.fused_track_id import FusedTrackRegistry
 from web.field.crop_buffer import CropBuffer
 from web.hud_util import select_coasting_ghosts, draw_dashed_box
 from web import hud_draw
+from web import hud_render
 from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import (
     inflate_zones,
@@ -1427,6 +1428,7 @@ class InferenceJob:
         # hud_post_render: record a draw list (no live encode); scouted routes
         # drawn on the field map, kept for meta.summary.hud_static.
         self._replay_draw_list = False
+        self._replay_render_pending = False
         self._radar_reference_paths: list = []
         self.calib = None
         self.field_model = None
@@ -9955,6 +9957,8 @@ class InferenceJob:
                         **artifacts,
                     })
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
+                    # hud_post_render: render once the identity rows exist (below).
+                    self._replay_render_pending = bool(self._replay_draw_list)
             except Exception as e:
                 print(f"[replay] finalize error: {e}")
             try:
@@ -10028,6 +10032,109 @@ class InferenceJob:
                         for sid, rows in sorted(segs.items()) for sg in rows])
                 except Exception as e:
                     print(f"  [identity-segments] segment persist failed ({e})")
+            await self._queue_hud_render()
+
+    async def _queue_hud_render(self) -> None:
+        """hud_post_render: queue the HUD render once the replay row and the
+        identity rows are written. Runs after the complete message was sent;
+        a failure to queue is logged, never raised."""
+        if not getattr(self, "_replay_render_pending", False):
+            return
+        self._replay_render_pending = False
+        try:
+            if await enqueue_render(self.job_id):
+                print(f"[hud-render] queued {self.job_id}")
+        except Exception as e:
+            print(f"[hud-render] could not queue the render: {e}")
+
+
+# --- HUD post-render queue (docs/superpowers/specs/2026-11-10-hud-post-render-design.md) ---
+# One global queue and one worker: renders run one at a time, each in its own
+# `python -m web.hud_render` subprocess, so a render never competes with the
+# next job's analysis loop for the GIL. The subprocess records rendering /
+# rendered / render_failed itself; the worker only catches a crash.
+_render_queue: Optional[asyncio.Queue] = None
+_render_queue_loop = None
+_render_worker_task = None
+_render_inflight: set = set()     # replay ids queued or running in this process
+
+
+def _render_command(replay_id: str) -> list:
+    return [sys.executable, "-m", "web.hud_render", replay_id, "--db", str(database.DB_PATH)]
+
+
+async def _run_render(replay_id: str) -> None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_render_command(replay_id), cwd=str(PROJECT_ROOT),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        rc = proc.returncode
+        tail = " | ".join((out or b"").decode(errors="replace").strip().splitlines()[-3:])
+    except Exception as e:
+        rc, tail = None, f"{type(e).__name__}: {e}"
+    row = await database.get_replay(replay_id)
+    if row is None:
+        return
+    status = row.get("render_status")
+    if status in ("queued", "rendering"):
+        out_dir = Path(row["meta_path"]).parent if row.get("meta_path") else None
+        if out_dir is None or hud_render.lock_holder(out_dir) is None:
+            status = "render_failed"
+            await database.set_render_status(replay_id, status,
+                                             f"renderer exited {rc}: {tail[-300:]}")
+    print(f"[hud-render] {replay_id}: {status}")
+
+
+async def _render_worker(q: asyncio.Queue) -> None:
+    while True:
+        replay_id = await q.get()
+        try:
+            await _run_render(replay_id)
+        except Exception as e:
+            print(f"[hud-render] worker error on {replay_id}: {e}")
+        finally:
+            _render_inflight.discard(replay_id)
+            q.task_done()
+
+
+def _render_queue_get() -> asyncio.Queue:
+    """The render queue, with its worker, on the running event loop."""
+    global _render_queue, _render_queue_loop, _render_worker_task
+    loop = asyncio.get_running_loop()
+    if _render_queue is None or _render_queue_loop is not loop:
+        _render_queue, _render_queue_loop = asyncio.Queue(), loop
+        _render_worker_task = loop.create_task(_render_worker(_render_queue))
+    return _render_queue
+
+
+async def enqueue_render(replay_id: str) -> bool:
+    """Queue a HUD render (render_status = queued). False when this replay
+    is already queued or rendering in this process."""
+    if replay_id in _render_inflight:
+        return False
+    _render_inflight.add(replay_id)
+    try:
+        await database.set_render_status(replay_id, "queued", None)
+        _render_queue_get().put_nowait(replay_id)
+    except Exception:
+        _render_inflight.discard(replay_id)
+        raise
+    return True
+
+
+async def _sweep_stale_renders() -> int:
+    """Startup: renders left queued / rendering by a dead server become
+    render_failed ("server restarted"), unless a live process (the back-fill
+    script) holds the replay's render.lock. Returns how many were swept."""
+    n = 0
+    for row in await database.list_replays_by_render_status(("queued", "rendering")):
+        out_dir = Path(row["meta_path"]).parent if row.get("meta_path") else None
+        if out_dir is not None and hud_render.lock_holder(out_dir) is not None:
+            continue
+        await database.set_render_status(row["id"], "render_failed", "server restarted")
+        n += 1
+    return n
 
 
 @app.on_event("startup")
@@ -10035,6 +10142,12 @@ async def startup():
     """Initialize database on startup."""
     from database import init_db
     await init_db()
+    try:
+        swept = await _sweep_stale_renders()
+        if swept:
+            print(f"[hud-render] {swept} unfinished render(s) marked render_failed")
+    except Exception as e:
+        print(f"[hud-render] startup sweep failed: {e}")
 
 
 @app.get("/")
@@ -12943,6 +13056,8 @@ async def list_replays_endpoint():
             "processing_sec": r["processing_sec"],
             "thumb_url": f"/api/replays/{r['id']}/thumb",
             "video_url": f"/api/replays/{r['id']}/video",
+            "render_status": r.get("render_status"),
+            "render_error": r.get("render_error"),
         })
     return out
 
@@ -13039,7 +13154,9 @@ async def get_replay_endpoint(replay_id: str):
     meta = json.loads(meta_path.read_text())
     # TBA match identity for the player header (the job GUID stays available
     # as `id` for troubleshooting).
-    info = {"id": row["id"], "label": row["label"], "match_key": row["match_key"]}
+    info = {"id": row["id"], "label": row["label"], "match_key": row["match_key"],
+            "render_status": row.get("render_status"), "render_error": row.get("render_error"),
+            "render_stats": hud_render.read_stats(meta_path.parent)}
     if row["match_key"]:
         match = await database.get_match_by_key(row["match_key"])
         if match:
@@ -13303,6 +13420,22 @@ async def clear_gallery(event_key: str):
     permanent data loss."""
     removed = await database.clear_gallery_exemplars(event_key)
     return {"status": "cleared", "event_key": event_key, "removed": removed}
+
+
+@app.post("/api/replays/{replay_id}/render")
+async def render_replay_endpoint(replay_id: str):
+    """Queue a HUD video render (final labels + recorded corrections). 409
+    while one is queued or running for this replay."""
+    row = await database.get_replay(replay_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    busy = replay_id in _render_inflight
+    if not busy and row.get("render_status") in ("queued", "rendering") and row.get("meta_path"):
+        busy = hud_render.lock_holder(Path(row["meta_path"]).parent) is not None
+    if busy or not await enqueue_render(replay_id):
+        return JSONResponse(status_code=409, content={
+            "error": "a render is already queued or running for this replay"})
+    return {"status": "queued", "id": replay_id}
 
 
 @app.delete("/api/replays/{replay_id}")

@@ -108,7 +108,9 @@ CREATE TABLE IF NOT EXISTS replays (
     codec TEXT,
     status TEXT,
     processing_sec REAL,
-    timings TEXT
+    timings TEXT,
+    render_status TEXT,
+    render_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS appearance_gallery (
@@ -280,7 +282,9 @@ async def init_db():
         # Event lineup anchor store (web/field/event_anchors.py).
         await db.executescript(_event_anchors.DDL)
         # Lightweight migrations: add columns to a pre-existing replays table.
-        for col_def in ("processing_sec REAL", "timings TEXT"):
+        # render_status / render_error: HUD post-render (NULL = live-encoded).
+        for col_def in ("processing_sec REAL", "timings TEXT", "render_status TEXT",
+                        "render_error TEXT"):
             try:
                 await db.execute(f"ALTER TABLE replays ADD COLUMN {col_def}")
             except Exception:
@@ -680,8 +684,26 @@ _REPLAY_COLUMNS = [
     "blue_score", "red_score", "blue_teams", "red_teams",
     "video_path", "meta_path", "source_video_path", "thumb_path",
     "fps", "frame_count", "duration_sec", "width", "height", "codec", "status",
-    "processing_sec", "timings",
+    "processing_sec", "timings", "render_status", "render_error",
 ]
+
+# HUD post-render (docs/superpowers/specs/2026-11-10-hud-post-render-design.md
+# section 7): replays.render_status is NULL (live-encoded), queued, rendering,
+# rendered or render_failed (+ render_error). A finished render also updates
+# the video columns below.
+RENDER_STATUSES = ("queued", "rendering", "rendered", "render_failed")
+_RENDER_UPDATE_COLUMNS = ("codec", "width", "height", "video_path", "thumb_path")
+
+
+def _render_update_sql(status, error, artifacts):
+    if status not in RENDER_STATUSES:
+        raise ValueError(f"invalid render_status: {status!r}")
+    bad = set(artifacts) - set(_RENDER_UPDATE_COLUMNS)
+    if bad:
+        raise ValueError(f"invalid render update columns: {sorted(bad)}")
+    cols = ["render_status", "render_error", *artifacts]
+    return (", ".join(f"{c} = ?" for c in cols),
+            [status, error, *artifacts.values()])
 
 
 async def insert_replay(row: Dict[str, Any]) -> None:
@@ -798,6 +820,40 @@ def get_slot_corrections_sync(replay_id: str, db_path=None) -> List[Dict]:
         return [dict(r) for r in rows]
     finally:
         con.close()
+
+
+async def set_render_status(replay_id: str, status: str, error: Optional[str] = None,
+                            **artifacts) -> None:
+    """Set a replay's render_status / render_error (and, for a finished
+    render, the video columns in ``artifacts``)."""
+    sets, values = _render_update_sql(status, error, artifacts)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE replays SET {sets} WHERE id = ?", (*values, replay_id))
+        await db.commit()
+
+
+def set_render_status_sync(replay_id: str, status: str, error: Optional[str] = None,
+                           db_path=None, **artifacts) -> None:
+    """set_render_status for the render subprocess and scripts."""
+    import sqlite3
+    sets, values = _render_update_sql(status, error, artifacts)
+    con = sqlite3.connect(str(db_path or DB_PATH), timeout=30)
+    try:
+        con.execute(f"UPDATE replays SET {sets} WHERE id = ?", (*values, replay_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+async def list_replays_by_render_status(statuses) -> List[Dict]:
+    """Replays whose render_status is one of ``statuses``."""
+    statuses = list(statuses)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"SELECT * FROM replays WHERE render_status IN ({','.join('?' for _ in statuses)})",
+            statuses)
+        return [dict(r) for r in await cur.fetchall()]
 
 
 async def update_replay_teams(replay_id: str, key: str, value: str) -> None:

@@ -1,0 +1,227 @@
+"""Render status (HUD post-render spec section 7): the replays columns and
+their migration, run() with the lockfile, the global queue's lifecycle, the
+startup sweep, POST /render (409 while in flight) and the endpoints."""
+import asyncio
+import json
+import sqlite3
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+import web.app as app_mod
+import web.database as database
+from web import hud_render
+from tests.test_hud_render import make_replay
+
+
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "t.db")
+    asyncio.run(database.init_db())
+    monkeypatch.setattr(app_mod, "_render_queue", None)
+    monkeypatch.setattr(app_mod, "_render_queue_loop", None)
+    monkeypatch.setattr(app_mod, "_render_inflight", set())
+    return tmp_path / "t.db"
+
+
+def _row(rid):
+    return database.get_replay_sync(rid)
+
+
+def _dead_pid() -> int:
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+# --- columns ---
+
+def test_migration_adds_the_render_columns(tmp_path, monkeypatch):
+    dbfile = tmp_path / "old.db"
+    con = sqlite3.connect(dbfile)
+    con.execute("CREATE TABLE replays (id TEXT PRIMARY KEY, created_at TEXT, label TEXT, "
+                "video_path TEXT, meta_path TEXT, status TEXT)")
+    con.execute("INSERT INTO replays (id, label, status) VALUES ('old', 'qm1', 'complete')")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB_PATH", dbfile)
+    asyncio.run(database.init_db())
+    asyncio.run(database.init_db())                        # idempotent
+    row = database.get_replay_sync("old")
+    assert row["render_status"] is None and row["render_error"] is None
+    asyncio.run(database.set_render_status("old", "render_failed", "boom"))
+    assert (_row("old")["render_status"], _row("old")["render_error"]) == ("render_failed", "boom")
+
+
+def test_knob_off_row_is_unchanged(db):
+    row = dict(id="j", created_at="2026-11-10T00:00:00", label="qm1", event_key="2026cur",
+               match_key="2026cur_qm1", comp_level=None, blue_score=1, red_score=2,
+               blue_teams="[1]", red_teams="[2]", video_path="v/hud.mp4", meta_path="v/meta.json",
+               source_video_path="s.mp4", thumb_path="v/thumb.jpg", fps=8.0, frame_count=5,
+               duration_sec=0.6, width=640, height=480, codec="h264", status="complete",
+               processing_sec=3.0, timings="{}")
+    asyncio.run(database.insert_replay(row))
+    got = _row("j")
+    assert {k: got[k] for k in row} == row
+    assert got["render_status"] is None and got["render_error"] is None
+
+
+def test_status_values_and_columns_are_validated(db):
+    with pytest.raises(ValueError):
+        database.set_render_status_sync("x", "done")
+    with pytest.raises(ValueError):
+        database.set_render_status_sync("x", "rendered", None, label="nope")
+
+
+# --- run() and the lockfile ---
+
+def test_run_sets_rendering_then_rendered_with_the_video_columns(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    seen = []
+    real = hud_render.render_replay
+    monkeypatch.setattr(hud_render, "render_replay",
+                        lambda r, p=None: (seen.append((_row(r)["render_status"],
+                                                        (d / "render.lock").exists())),
+                                           real(r, p))[1])
+    code, stats = hud_render.run(rid)
+    assert code == 0 and seen == [("rendering", True)]
+    row = _row(rid)
+    assert row["render_status"] == "rendered" and row["render_error"] is None
+    assert row["codec"] == stats["codec"] and (row["width"], row["height"]) == (320, 460)
+    assert not (d / "render.lock").exists()
+
+
+def test_run_records_the_failure_reason(db, tmp_path):
+    rid, d, _ = make_replay(tmp_path)
+    from pathlib import Path
+    Path(_row(rid)["source_video_path"]).unlink()
+    code, out = hud_render.run(rid)
+    assert code == 1 and out["error"].startswith("source video missing")
+    assert _row(rid)["render_status"] == "render_failed"
+    assert _row(rid)["render_error"].startswith("source video missing")
+
+
+def test_a_live_lock_blocks_and_a_stale_one_is_taken_over(db, tmp_path):
+    rid, d, _ = make_replay(tmp_path)
+    (d / "render.lock").write_text(str(__import__("os").getpid()))      # held by a live pid
+    code, out = hud_render.run(rid)
+    assert code == 3 and "locked" in out["error"] and _row(rid)["render_status"] is None
+    (d / "render.lock").write_text(str(_dead_pid()))                    # stale
+    code, _ = hud_render.run(rid)
+    assert code == 0 and _row(rid)["render_status"] == "rendered"
+    assert not (d / "render.lock").exists()
+
+
+# --- the queue ---
+
+def test_queue_lifecycle_runs_the_subprocess(db, tmp_path):
+    rid, d, _ = make_replay(tmp_path)
+
+    async def go():
+        assert await app_mod.enqueue_render(rid) is True
+        assert _row(rid)["render_status"] == "queued"
+        assert await app_mod.enqueue_render(rid) is False             # already in flight
+        await app_mod._render_queue.join()
+
+    asyncio.run(go())
+    row = _row(rid)
+    assert row["render_status"] == "rendered", row["render_error"]
+    assert row["codec"] and (d / "hud.mp4").exists() and app_mod._render_inflight == set()
+
+
+def test_worker_marks_a_crashed_renderer_failed(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    monkeypatch.setattr(app_mod, "_render_command",
+                        lambda r: [sys.executable, "-c", "import sys; print('boom'); sys.exit(7)"])
+
+    async def go():
+        await app_mod.enqueue_render(rid)
+        await app_mod._render_queue.join()
+
+    asyncio.run(go())
+    assert _row(rid)["render_status"] == "render_failed"
+    assert _row(rid)["render_error"] == "renderer exited 7: boom"
+
+
+def test_finalize_queues_only_when_pending(db, monkeypatch):
+    calls = []
+
+    async def fake(rid):
+        calls.append(rid)
+        return True
+
+    monkeypatch.setattr(app_mod, "enqueue_render", fake)
+    job = app_mod.InferenceJob.__new__(app_mod.InferenceJob)
+    job.job_id = "j1"
+    job._replay_render_pending = False
+    asyncio.run(job._queue_hud_render())
+    job._replay_render_pending = True
+    asyncio.run(job._queue_hud_render())
+    asyncio.run(job._queue_hud_render())
+    assert calls == ["j1"] and job._replay_render_pending is False
+
+
+# --- startup sweep ---
+
+def test_startup_sweep(db, tmp_path):
+    import os
+    rows = {}
+    for rid, status in (("q", "queued"), ("r", "rendering"), ("held", "rendering"),
+                        ("done", "rendered")):
+        rows[rid] = make_replay(tmp_path, rid=rid, n_meta=2)[1]
+        database.set_render_status_sync(rid, status)
+    (rows["held"] / "render.lock").write_text(str(os.getpid()))
+    assert asyncio.run(app_mod._sweep_stale_renders()) == 2
+    assert (_row("q")["render_status"], _row("q")["render_error"]) == ("render_failed",
+                                                                       "server restarted")
+    assert _row("r")["render_status"] == "render_failed"
+    assert _row("held")["render_status"] == "rendering"
+    assert _row("done")["render_status"] == "rendered"
+
+
+# --- endpoints ---
+
+class _FakeQueue:
+    def __init__(self):
+        self.items = []
+
+    def put_nowait(self, x):
+        self.items.append(x)
+
+
+def test_render_endpoint_queues_and_409s_while_in_flight(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    q = _FakeQueue()
+    monkeypatch.setattr(app_mod, "_render_queue_get", lambda: q)
+    c = TestClient(app_mod.app)
+    r = c.post(f"/api/replays/{rid}/render")
+    assert r.status_code == 200 and r.json() == {"status": "queued", "id": rid}
+    assert q.items == [rid] and _row(rid)["render_status"] == "queued"
+    assert c.post(f"/api/replays/{rid}/render").status_code == 409
+    assert c.post("/api/replays/nope/render").status_code == 404
+
+
+def test_render_endpoint_409s_while_the_script_holds_the_lock(db, tmp_path, monkeypatch):
+    import os
+    rid, d, _ = make_replay(tmp_path)
+    monkeypatch.setattr(app_mod, "_render_queue_get", lambda: _FakeQueue())
+    database.set_render_status_sync(rid, "rendering")
+    (d / "render.lock").write_text(str(os.getpid()))
+    c = TestClient(app_mod.app)
+    assert c.post(f"/api/replays/{rid}/render").status_code == 409
+    (d / "render.lock").write_text(str(_dead_pid()))                    # script died
+    assert c.post(f"/api/replays/{rid}/render").status_code == 200
+
+
+def test_list_and_meta_endpoints_report_the_render(db, tmp_path):
+    rid, d, _ = make_replay(tmp_path)
+    hud_render.run(rid)
+    c = TestClient(app_mod.app)
+    item = next(x for x in c.get("/api/replays").json() if x["id"] == rid)
+    assert item["render_status"] == "rendered" and item["render_error"] is None
+    info = c.get(f"/api/replays/{rid}").json()["replay_info"]
+    assert info["render_status"] == "rendered" and info["render_stats"]["frames"] == 12
+    assert c.get(f"/api/replays/{rid}/video").status_code == 200

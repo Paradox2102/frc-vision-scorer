@@ -730,6 +730,19 @@ KNOBS = [
     # matches (qm22/14/13/7 vs Manta auto).
     Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, True,
          section="Identity & votes"),
+    # Window labels: finalize-stage relabel of the replay from Jev reads on
+    # short track windows (digit pass, then a lineup pass on unread windows;
+    # one team per frame; unread windows stay unlabelled). Spec:
+    # docs/superpowers/specs/2026-11-09-jev-window-labels-design.md. qm8 GT,
+    # replay a0bbc991, offline: right 37% -> 46%, wrong 9% -> 2%, misID 69 s
+    # -> 17 s at lineup 0.8. Adds ~2-4 min and ~$0.26 of Jev calls per match.
+    # DEFAULT OFF pending the live A/B (ab_qm8 profile "window-labels").
+    Knob("window_labels", "WINDOW_LABELS", bool, False, section="Identity & votes"),
+    # Lowest probability at which a lineup answer names a window. 0.8 is the
+    # conservative setting from qm8; 0.65 is the A/B arm (53% right / 3% wrong
+    # / 21 s misID offline). A value above 1 disables the lineup pass.
+    Knob("window_labels_lineup_min_p", "WINDOW_LABELS_LINEUP_MIN_P", float, 0.8,
+         min=0.0, max=1.01, section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
     # expiry / coasting re-acquisition / feed change / identity birth /

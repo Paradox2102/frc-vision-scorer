@@ -595,3 +595,26 @@ def test_tracker_reacquire_knobs_env_override_and_range(monkeypatch):
         JobConfig({"corner_dup_radius_m": 0.1})
     with pytest.raises(ValueError):
         JobConfig({"phys_reach_mps": 0.5})
+
+
+def test_window_labels_knobs_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.window_labels is False
+    assert cfg.window_labels_lineup_min_p == 0.8
+    assert "window_labels" not in cfg.non_defaults()
+    assert "window_labels_lineup_min_p" not in cfg.non_defaults()
+
+
+def test_window_labels_knobs_env_override_and_range(monkeypatch):
+    monkeypatch.setenv("WINDOW_LABELS", "1")
+    cfg = JobConfig({"window_labels_lineup_min_p": "0.65"})
+    assert cfg.window_labels is True
+    assert cfg.window_labels_lineup_min_p == 0.65
+    assert JobConfig({"window_labels": "false"}).window_labels is False
+    assert JobConfig({"window_labels_lineup_min_p": 1.01}).window_labels_lineup_min_p == 1.01
+    with pytest.raises(ValueError):
+        JobConfig({"window_labels_lineup_min_p": 1.5})
+    with pytest.raises(ValueError):
+        JobConfig({"window_labels_lineup_min_p": -0.1})

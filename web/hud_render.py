@@ -25,6 +25,7 @@ import shutil
 import sys
 import time
 import zlib
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,11 @@ DEFAULT_FIELD_SEASON = "2026-rebuilt-welded"
 AHASH_MAX_BITS = 4                  # more differing bits than this = a mismatch
 MISALIGNED_FRAC = 0.02              # more mismatches than this share aborts
 APPROX_NOTE = "approx boxes"
+# Back-fill robot volume (spec section 6): 0.95 m x 0.95 m x 0.5 m.
+ROBOT_HALF_M = 0.475
+ROBOT_HEIGHT_M = 0.5
+ROBOT_CENTRE_OFFSET_M = 0.475       # = window_crops.ROBOT_CENTRE_OFFSET_M
+TRAIL_LEN = 16
 RENDER_VIDEO = "hud.render.mp4"
 LIVE_VIDEO = "hud.live.mp4"
 STATS_FILE = "render.json"
@@ -85,6 +91,90 @@ def _main_calibration(event_key, camera, version_id, match_key, warnings: list):
             warnings.append(f"calibration version {version_id!r} not found: using epoch "
                             f"{chosen['version_id']} for {match_key}")
     return chosen["calibration"] if chosen else None
+
+
+def _corner_views(event_key, match_key) -> list:
+    """Corner views as the live job built them (calibrated cameras only),
+    for a replay without hud_static: [{name, crop, masks}]."""
+    if not event_key:
+        return []
+    from web.field import store as field_store
+    from web.field.camera_view import load_views
+    from web.field.composite_layout import load_layout
+    from web.field.match_order import select_epoch
+    selection = {}
+    for name in load_layout():
+        pick = select_epoch(field_store.load_versions(event_key, name), match_key)
+        if pick is not None:
+            selection[name] = pick["version_id"]
+    return [{"name": v.name, "crop": [int(c) for c in v.crop],
+             "masks": [[int(c) for c in m] for m in v.masks]}
+            for v in load_views(event_key, selection=selection) if v.name != "main"]
+
+
+def _ground_center_offset(summary: dict) -> float:
+    """The job's ground_center_offset_m (summary.config holds non-defaults
+    only), else the knob default."""
+    v = (summary.get("config") or {}).get("ground_center_offset_m")
+    if v is None:
+        from web.job_config import KNOBS
+        v = next(k.default for k in KNOBS if k.name == "ground_center_offset_m")
+    return float(v)
+
+
+def backfill_box(cal, field_pos, gco: float) -> Optional[list]:
+    """[x1, y1, x2, y2]: the image bounding box of a 0.95 x 0.95 x 0.5 m robot
+    volume centred on push_from_camera(cal, field_pos, 0.475 - gco), as
+    window_crops.target centres its crops. None when any corner does not
+    project to a finite point."""
+    from web.field.calibration import push_from_camera
+    try:
+        offset = max(0.0, ROBOT_CENTRE_OFFSET_M - float(gco or 0.0))
+        cx, cy = push_from_camera(cal, (float(field_pos[0]), float(field_pos[1])), offset)
+        pts = [cal.field_to_image((cx + dx, cy + dy, z))
+               for dx in (-ROBOT_HALF_M, ROBOT_HALF_M)
+               for dy in (-ROBOT_HALF_M, ROBOT_HALF_M)
+               for z in (0.0, ROBOT_HEIGHT_M)]
+    except Exception:
+        return None
+    a = np.asarray(pts, float)
+    if a.shape != (8, 2) or not np.all(np.isfinite(a)):
+        return None
+    return [float(a[:, 0].min()), float(a[:, 1].min()),
+            float(a[:, 0].max()), float(a[:, 1].max())]
+
+
+def build_backfill_lines(frames: list, cal, gco: float, view_wh) -> dict:
+    """Approximate draw list from ``meta.frames[].robots[]`` (spec section 6):
+    projected main boxes (no mask, no score), radar dots with 16-position
+    trails, no corner boxes, hubs, hub boxes or decode hashes."""
+    w, h = view_wh
+    trails: dict = {}
+    out = {}
+    for idx, f in enumerate(frames):
+        i = int(f.get("i", idx))
+        main, radar, seen = [], [], set()
+        for r in f.get("robots") or []:
+            slot, pos = r.get("slot"), r.get("field_pos")
+            if slot is None or pos is None:
+                continue
+            seen.add(slot)
+            trail = trails.setdefault(slot, deque(maxlen=TRAIL_LEN))
+            trail.append((float(pos[0]), float(pos[1])))
+            radar.append({"slot": slot, "alliance": r.get("alliance"),
+                          "pos": [float(pos[0]), float(pos[1])], "state": "visible",
+                          "corner_only": False, "trail": [list(p) for p in trail]})
+            box = backfill_box(cal, pos, gco)
+            if box is not None and box[2] > 0 and box[3] > 0 and box[0] < w and box[1] < h:
+                main.append({"slot": slot, "slot_id": hud_draw.slot_id_from_label(slot),
+                             "alliance": r.get("alliance"), "box": box, "ghost": False,
+                             "score": None, "mask_poly": None})
+        for s in list(trails):
+            if s not in seen:
+                del trails[s]
+        out[i] = {"i": i, "frame_num": f.get("frame_num"), "main": main, "corners": {},
+                  "hubs": [], "hub_boxes": [], "radar": radar}
+    return out
 
 
 def draw_frame(img: np.ndarray, line: Optional[dict], rows_by_slot: dict,
@@ -212,8 +302,18 @@ def render_replay(replay_id: str, db_path=None) -> dict:
             if wire_cal is None:
                 warnings.append("field wireframe skipped: main calibration not found")
     else:
-        cap.release()
-        raise RenderError("no draw list (back-fill: Task 7)")
+        approx = True
+        flags = hud_draw.draw_flags()
+        overhead_height = int(vh * OVERHEAD_CROP_RATIO)
+        cal = _main_calibration(row.get("event_key"), "main", summary.get("calibration_version"),
+                                row.get("match_key"), warnings)
+        if cal is None:
+            cap.release()
+            raise RenderError("no draw list, and no main calibration to project boxes with")
+        lines = build_backfill_lines(frames, cal, _ground_center_offset(summary),
+                                     (vw, overhead_height))
+        views = _corner_views(row.get("event_key"), row.get("match_key"))
+        ocr_regions, refs, season, wire_cal = {}, [], getattr(cal, "field_season", None), None
     field_model = FieldModel.load(season or DEFAULT_FIELD_SEASON)
     radar = Radar(field_model.length_m, field_model.width_m, field_model=field_model)
     if refs:

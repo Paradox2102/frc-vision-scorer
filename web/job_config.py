@@ -732,9 +732,10 @@ KNOBS = [
          section="Identity & votes"),
     # Deinterlace bumper crops before the reader upscale: crops of moving robots
     # from interlaced source show comb teeth that blur the digits. When a crop
-    # combs, keep its sharper field (web/bumper_register.deinterlace_crop);
+    # combs, ECC-align and merge its two fields (web/bumper_register.deinterlace_crop);
     # un-combed crops are untouched. Clef-flash bench: 30 -> 35 / 48, 0 wrong.
-    # DEFAULT OFF pending the live A/B (ab_qm8 profile "deinterlace").
+    # Live qm8 full-match A/B (Nov 10, 2 runs/arm): NEUTRAL (misID 72/54 s vs
+    # 76/61 s baseline; only ~10% of reader crops comb). DEFAULT OFF.
     Knob("bumper_deinterlace", "BUMPER_DEINTERLACE", bool, False, section="VLM reader"),
     # Window labels: finalize-stage relabel of the replay from Jev reads on
     # short track windows (digit pass, then a lineup pass on unread windows;

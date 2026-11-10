@@ -153,3 +153,6 @@ data/hard_negatives/boxes/*/
 # Blog drafts (not part of the public repo)
 blog-post-*.md
 .worktrees/
+
+# Replay-audit crop images (regenerate with: scripts/audit_replay.py sample)
+data/eval/audit/*/items/*/*.jpg

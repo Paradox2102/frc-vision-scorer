@@ -1,0 +1,82 @@
+{
+ "sample_id": "s082",
+ "replay": "0baf4625-c2c5-4915-85ed-34d5c48eda2a",
+ "match_key": "2026cur_qm13",
+ "frame": 4944,
+ "frame_idx": 378,
+ "t_s": 82.4,
+ "period": "teleop",
+ "slot": "B1",
+ "slot_key": "B1",
+ "dup": 1,
+ "alliance": "blue",
+ "pipeline_label": "8725",
+ "stratum": "teleop|B1",
+ "field_pos": [
+  1.587,
+  5.977
+ ],
+ "centre_xy": [
+  1.34,
+  6.383
+ ],
+ "views": [
+  "main",
+  "corner_left"
+ ],
+ "targets": {
+  "main": {
+   "u": 298.1,
+   "v": 383.0,
+   "bumper_px": 74.4,
+   "side": 187,
+   "ok": true,
+   "why": null
+  },
+  "corner_left": {
+   "u": 263.9,
+   "v": 237.6,
+   "bumper_px": 93.1,
+   "side": 197,
+   "ok": true,
+   "why": null,
+   "proj_u": 217.6,
+   "proj_v": 301.5,
+   "snapped_bw": 0.85
+  },
+  "corner_right": {
+   "u": 74.5,
+   "v": 228.3,
+   "bumper_px": 31.0,
+   "side": 166,
+   "ok": false,
+   "why": "corner bumper < 60px"
+  }
+ },
+ "view_meta": {
+  "main": {
+   "x0": 204,
+   "y0": 267,
+   "side_px": 187,
+   "scale": 2.738,
+   "tick": [
+    258,
+    318
+   ],
+   "comb": 1.573,
+   "deinterlaced": true
+  },
+  "corner_left": {
+   "x0": 165,
+   "y0": 115,
+   "side_px": 197,
+   "scale": 2.599,
+   "tick": [
+    257,
+    319
+   ],
+   "comb": 0.476,
+   "deinterlaced": false
+  }
+ }
+}

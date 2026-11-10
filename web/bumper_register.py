@@ -411,6 +411,16 @@ def deinterlace_crop(img: np.ndarray, comb_thr: float = 0.9, unsharp_amount: flo
         return img
     if comb_ratio(img) <= comb_thr:
         return img
+    # Same path the bench validated as --frames anchor: both fields ECC-aligned
+    # and merged with anti-ghost weights (keeps both fields' rows), ~2-3 ms.
+    # Fall back to the sharper single field if the merge fails.
+    try:
+        out, _ = register_and_fuse([img], 0, upscale=1, deinterlace="fields",
+                                   comb_thr=comb_thr)
+        if out is not None and out.shape[:2] == img.shape[:2]:
+            return out
+    except Exception:
+        pass
     fields = split_fields(img)
     best = max(fields, key=laplacian_sharpness)
     out = unsharp(best.astype(np.float32), unsharp_sigma, unsharp_amount)

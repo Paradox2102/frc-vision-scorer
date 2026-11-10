@@ -66,6 +66,70 @@ Use the statuses this way:
 - `not_bumper`: there is no robot bumper, e.g. ball piles, field structures, or
   a number printed on a crate.
 
+## track_truth.jsonl (independent truth)
+
+The `label_*` fields were made by Claude looking at the crops, so they are
+circular for Claude-family arms. `track_truth.jsonl` says which team's robot
+each crop shows using evidence other than the crop's pixels. Rebuild it with
+`.venv/bin/python scripts/build_track_truth.py` (add `--validate-gt` for the GT
+check). It needs the local diagnostics, replays and source videos. The read
+localisations are cached in `results/` (about 4 min cold, seconds warm).
+
+| field | meaning |
+|---|---|
+| `truth_team` | the team, or `null` |
+| `truth_source` | `gt`, `track_votes` or `unknown` |
+| `segment_kind` | `slot` (position-verified track segment), `identity` (fallback, weaker) or `null` |
+| `votes`, `n_frames` | deduplicated votes (one per source frame and team) and their frame count |
+| `segment`, `half_span_s` | segment bounds in frames, and the half-width (5 or 10 s) that decided it |
+| `readers`, `votes_by_reader`, `vote_jobs` | where the votes came from |
+| `local_only_team` | the decision when only the local-VLM votes count (no Jev or Clef) |
+| `gt_team`, `slot`, `crop_frame_src`, `reason`, `notes` | diagnostics |
+
+How it works:
+
+1. **`gt`**, 2026cur_qm8 only. The crop's source-frame box (`tracklets.jsonl`)
+   is matched to the hand GT robots: by the annotator's pixel `uv` in the main
+   view (within 1 box width, runner-up at least 1.6x farther), or by GT
+   `field_xy` re-projected into a corner camera (within 3 box widths). GT
+   overrides votes.
+2. **`track_votes`, `slot`**. The crop's bumper bottom-centre is projected to
+   the field with the calibration in force when the job ran. In the main view
+   this lands 0.00 m from a replay slot, because the slot position is that
+   box's projection. The slot track is cut into runs at gaps and jumps, using
+   the window-label rule and constants. Every roster-matched read from every
+   job on a byte-identical video is then template-located in the source video.
+   A read votes when it lands on that slot within the run, inside
+   ±5 s of the crop (±10 s if 5 s has too few votes) but more than 1 s from it.
+3. **`track_votes`, `identity`**. This is the fallback when the crop can't be
+   located: all 2026hop crops (no source video) and 8 `loc_failed` crops. It
+   uses the job's own reads of the same `robot_id`, cut at activity gaps over
+   2 s. It is weaker, because identities re-associate every frame and log no
+   position.
+
+The rule: the top team needs at least 3 distinct frames, spanning at least
+1 s, and at least 75% of the deduplicated votes; a tie fails it. Widening from
+5 s to 10 s happens only for lack of votes, never for an impure or tied
+segment.
+
+**Validation.** Every GT-identified main-view read on qm8 was treated as a
+pseudo-crop: 403 anchors gave 174 decisions with 0 wrong. A single ±10 s span
+gave 132 decisions with 1 wrong. A 1 s exclusion was kept: at 0.5 s, a single
+job's Qwen reads 0.5–1 s away outvote the visible number on
+`2026cur_qm2_f03129_r156`.
+
+**Caveats.**
+
+- Coverage is low: 18 of 200 crops. Roster-matched reads are sparse, and they
+  cluster within 1 s of the moments the bench crops were sampled from.
+- Votes can't tell a robot from what hides it. A slot parked on a robot buried
+  in balls votes for that robot (`2026cur_qm10_f01006_r002`, `not_bumper`).
+- Readers: the bench jobs all predate Jev, Clef and the `vlm_model` knob, so
+  they used Qwen3-VL-4B. The cross-job votes also come from later re-runs of
+  the same videos: Jev (Nov), Clef (Oct) and local VLMs with no recorded model.
+  For Jev or Clef arms, use `local_only_team` or check `votes_by_reader`.
+  No votes come from Claude.
+
 ## Running the bench
 
 ```bash

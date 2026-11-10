@@ -349,6 +349,14 @@ PROFILES = {
         ("segments_strict_combo", {"identity_segment_resolve": True, "bumper_color_read": "strict",
                                    "alliance_by_territory": False, "dup_seed_guard_m": 1.0,
                                    "dup_reap_m": 0.7, "dup_reap_updates": 8})],
+    # Window labels (docs/superpowers/specs/2026-11-09-jev-window-labels-design.md):
+    # finalize-stage relabel from Jev reads on short track windows. Score each
+    # arm with scripts/score_ground_truth.py --replay <job_id> --score-shift
+    # 0.475 (this harness scores Manta auto only). Run with --full-match.
+    "window-labels": [
+        ("off", {}),
+        ("wl_08", {"window_labels": True}),
+        ("wl_065", {"window_labels": True, "window_labels_lineup_min_p": 0.65})],
     "bumper-colour": [("baseline_c1", {}),
                       ("colour_override_c1", {"bumper_color_read": "override"}),
                       ("colour_strict_tfree_c1", {"bumper_color_read": "strict",
@@ -678,6 +686,26 @@ def _replay_saved(job_id: str, tries: int = 10, delay: float = 0.5) -> bool:
     return False
 
 
+def _wait_window_labels(job_id: str, timeout_s: float = 420.0, delay: float = 2.0) -> bool:
+    """With window_labels on, the job reports "completed" before the finalize
+    stage runs, so the replay row and meta.json appear minutes later. Wait for
+    the replay and for its summary to carry the stage's stats. 420 s = the
+    stage's 360 s deadline plus a margin."""
+    meta = REPO / "web" / "replays" / job_id / "meta.json"
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if _replay_saved(job_id, tries=1, delay=0.0) and meta.exists():
+            try:
+                if "window_labels" in (json.loads(meta.read_text()).get("summary") or {}):
+                    return True
+            except (OSError, ValueError):
+                pass
+        time.sleep(delay)
+    print(f"  WARNING: replay {job_id} has no window_labels summary after {timeout_s:.0f}s",
+          flush=True)
+    return False
+
+
 # Per-stage wall-time keys copied from the replay's timings JSON into each
 # result row (prefix match for the stream_analysis "stream.*" stats).
 TIMING_KEYS = ("total", "sam2_tracking", "analysis_loop", "frame_export",
@@ -808,6 +836,8 @@ def main(args) -> None:
             status = asyncio.run(drive(jid))
             job_s = round(time.time() - t0)
             print(f"  status={status} in {job_s}s", flush=True)
+            if status == "completed" and cfg.get("window_labels"):
+                _wait_window_labels(jid)
             time.sleep(3)  # let the replay finish writing
             metrics = score(expect_replay=jid) if status == "completed" else {"error": status}
         except Exception as e:

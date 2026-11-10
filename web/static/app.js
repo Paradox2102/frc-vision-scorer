@@ -130,13 +130,22 @@ class VisionScorer {
         if (replayBackBtn) {
             replayBackBtn.addEventListener('click', () => {
                 if (this.replayVideo) this.replayVideo.pause();
+                clearTimeout(this._replayRenderPoll);
+                this._replayOpenId = null;
                 this.showReplayLibrary();
                 this.loadReplays();
             });
         }
         if (this.replayVideo) {
             this.replayVideo.addEventListener('timeupdate', () => this.onReplayTimeUpdate());
+            // No hud.mp4 yet (rendering, or a failed first render): no broken player.
+            this.replayVideo.addEventListener('error', () => { this.replayVideo.style.display = 'none'; });
+            this.replayVideo.addEventListener('loadeddata', () => { this.replayVideo.style.display = 'block'; });
         }
+        const rerenderBtn = document.getElementById('replayRerenderBtn');
+        if (rerenderBtn) rerenderBtn.addEventListener('click', () => this.requestReplayRender());
+        const retryBtn = document.getElementById('replayRenderRetryBtn');
+        if (retryBtn) retryBtn.addEventListener('click', () => this.requestReplayRender());
 
         // Gallery
         const galleryLoadBtn = document.getElementById('galleryLoadBtn');
@@ -2579,6 +2588,11 @@ class VisionScorer {
         const procTime = r.processing_sec != null ? this.formatDuration(r.processing_sec) : null;
         const partialBadge = r.status === 'partial'
             ? '<span class="replay-badge partial">PARTIAL</span>' : '';
+        const renderBadge = (r.render_status === 'queued' || r.render_status === 'rendering')
+            ? '<span class="replay-badge rendering">RENDERING</span>'
+            : r.render_status === 'render_failed'
+                ? `<span class="replay-badge failed" title="${this.escapeHtml(r.render_error || '')}">RENDER FAILED</span>`
+                : '';
         const thumb = r.thumb_url
             ? `<img class="replay-thumb" src="${this.escapeHtml(r.thumb_url)}" alt="${label} thumbnail" loading="lazy">`
             : '<div class="replay-thumb placeholder">No preview</div>';
@@ -2588,6 +2602,7 @@ class VisionScorer {
                 <div class="replay-thumb-wrap">
                     ${thumb}
                     ${partialBadge}
+                    ${renderBadge}
                 </div>
                 <div class="replay-card-body">
                     <div class="replay-card-title">${label}</div>
@@ -2834,9 +2849,12 @@ class VisionScorer {
                 }
             }
 
-            // Point the <video> at the range-aware stream (native scrub/seek/speed)
-            this.replayVideo.src = `/api/replays/${id}/video`;
-            this.replayVideo.load();
+            // Point the <video> at the range-aware stream (native scrub/seek/speed),
+            // unless the HUD video is still being rendered (hud_post_render).
+            this._replayOpenId = id;
+            const bar = document.getElementById('replayRenderBar');
+            if (bar) bar.style.display = 'none';
+            this.applyReplayRenderState(id, info);
 
             // Wire the export/download buttons (server sends Content-Disposition: attachment)
             const dlVideo = document.getElementById('replayDownloadVideo');
@@ -2983,11 +3001,97 @@ class VisionScorer {
             const data = await resp.json().catch(() => ({}));
             status.textContent = resp.ok
                 ? `✓ verified (${data.verified_exemplars || 0})` : `✗ ${data.error || ('HTTP ' + resp.status)}`;
+            if (resp.ok) {
+                // The video keeps its old labels until it is re-rendered.
+                const bar = document.getElementById('replayRenderBar');
+                if (bar) bar.style.display = 'flex';
+                const rc = data.render_correction;
+                if (rc && !rc.recorded) status.textContent += ` (video: ${rc.reason})`;
+            }
             return resp.ok;
         } catch (e) {
             status.textContent = '✗ ' + e.message;
             return false;
         }
+    }
+
+    // --- HUD post-render state (render_status) ---
+
+    applyReplayRenderState(id, info) {
+        clearTimeout(this._replayRenderPoll);
+        const st = info ? info.render_status : null;
+        const box = document.getElementById('replayRenderState');
+        const text = document.getElementById('replayRenderText');
+        const retry = document.getElementById('replayRenderRetryBtn');
+        const pending = st === 'queued' || st === 'rendering';
+        if (pending) {
+            this.replayVideo.pause();
+            this.replayVideo.removeAttribute('src');
+            this.replayVideo.style.display = 'none';
+            text.textContent = st === 'queued' ? 'Rendering video… (queued)' : 'Rendering video…';
+            retry.style.display = 'none';
+            box.style.display = 'flex';
+            this._replayRenderPoll = setTimeout(() => this.pollReplayRender(id), 4000);
+        } else {
+            box.style.display = st === 'render_failed' ? 'flex' : 'none';
+            if (st === 'render_failed') {
+                text.textContent = `Render failed: ${info.render_error || 'unknown error'} —`;
+                retry.style.display = 'inline-block';
+            }
+            // Cache-bust: a re-render replaces hud.mp4 under the same URL.
+            this.replayVideo.src = `/api/replays/${id}/video?v=${Date.now()}`;
+            this.replayVideo.load();
+        }
+        this.renderReplayRenderStats(info ? info.render_stats : null);
+    }
+
+    async pollReplayRender(id) {
+        if (this._replayOpenId !== id) return;
+        try {
+            const resp = await fetch(`/api/replays/${id}`);
+            if (!resp.ok || this._replayOpenId !== id) return;
+            const meta = await resp.json();
+            this.applyReplayRenderState(id, meta.replay_info || {});
+        } catch (e) {
+            this._replayRenderPoll = setTimeout(() => this.pollReplayRender(id), 8000);
+        }
+    }
+
+    async requestReplayRender() {
+        const id = this._replayOpenId;
+        if (!id) return;
+        const status = document.getElementById('replayRerenderStatus');
+        if (status) status.textContent = '…';
+        try {
+            const resp = await fetch(`/api/replays/${id}/render`, { method: 'POST' });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok || resp.status === 409) {
+                if (status) status.textContent = resp.ok ? 'queued' : 'already rendering';
+                this.applyReplayRenderState(id, { render_status: 'queued' });
+            } else if (status) {
+                status.textContent = `✗ ${data.error || ('HTTP ' + resp.status)}`;
+            }
+        } catch (e) {
+            if (status) status.textContent = '✗ ' + e.message;
+        }
+    }
+
+    renderReplayRenderStats(stats) {
+        const el = document.getElementById('replayRenderStats');
+        if (!el) return;
+        if (!stats) { el.style.display = 'none'; el.innerHTML = ''; return; }
+        const parts = [];
+        const corr = stats.corrections || {};
+        for (const [slot, c] of Object.entries(corr)) {
+            const n = c.frames_relabelled || 0;
+            const line = `${this.escapeHtml(slot)} ${this.escapeHtml(c.old || 'no #')} → ${this.escapeHtml(c.new || 'no #')}: ${n} frames relabelled`;
+            parts.push(n === 0 ? `<span class="warn">${line} (matched no frames)</span>` : line);
+        }
+        if (stats.corrections_note) parts.push(this.escapeHtml(stats.corrections_note));
+        const when = stats.rendered_at ? new Date(stats.rendered_at).toLocaleString() : '';
+        const src = stats.source === 'approx' ? ' (approximate boxes)' : '';
+        el.innerHTML = `Video rendered ${this.escapeHtml(when)}${src}` + (parts.length ? ` — ${parts.join('; ')}` : '');
+        el.style.display = 'block';
     }
 
     renderReplayFrame(idx) {

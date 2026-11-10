@@ -476,6 +476,10 @@
                             </div>
                             <div class="video-container">
                                 <video id="replayVideo" controls playsinline preload="metadata" style="width:100%;display:block;height:auto;"></video>
+                                <div class="replay-render-state" id="replayRenderState" style="display:none;">
+                                    <span id="replayRenderText"></span>
+                                    <button class="btn-small" id="replayRenderRetryBtn" style="display:none;">Retry</button>
+                                </div>
                             </div>
                             <div class="replay-timing-card debug-only" id="replayTimingCard" style="display:none;">
                                 <div class="timeline-header">PROCESSING TIME</div>
@@ -526,6 +530,11 @@
                     <div id="replayReviewCard" class="card" style="display:none">
                         <h3>Review &amp; correct identities</h3>
                         <div id="replayReviewGrid" class="review-grid"></div>
+                        <div class="replay-render-bar" id="replayRenderBar" style="display:none;">
+                            <button class="btn-small" id="replayRerenderBtn">Re-render video</button>
+                            <span class="review-status" id="replayRerenderStatus"></span>
+                        </div>
+                        <div class="replay-render-stats" id="replayRenderStats" style="display:none;"></div>
                     </div>
                 </div>
             </section>

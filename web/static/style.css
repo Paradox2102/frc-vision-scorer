@@ -1326,6 +1326,17 @@ body[data-mode="debug"] .mode-toggle-btn[data-mode="debug"] {
     letter-spacing: 0.05em;
 }
 .replay-badge.partial { background: var(--orange); color: #1a1300; }
+/* HUD post-render state (render_status): top-left, so PARTIAL keeps the right. */
+.replay-badge.rendering, .replay-badge.failed { left: 8px; right: auto; }
+.replay-badge.rendering { background: var(--bg-tertiary); color: var(--text-primary); }
+.replay-badge.failed { background: var(--red-alliance); color: #fff; }
+.replay-render-state {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 10px;
+    min-height: 240px; color: var(--text-secondary); font-size: 0.95rem;
+}
+.replay-render-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.replay-render-stats { margin-top: 8px; font-size: 0.8rem; color: var(--text-secondary); }
+.replay-render-stats .warn { color: var(--orange); }
 
 .replay-card-body { padding: 0.7rem; display: flex; flex-direction: column; gap: 0.35rem; }
 .replay-card-title { font-weight: 600; font-size: 0.95rem; }

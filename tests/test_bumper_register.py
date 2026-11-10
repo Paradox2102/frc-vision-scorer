@@ -9,6 +9,7 @@ import pytest
 
 from web.bumper_register import (
     comb_ratio,
+    deinterlace_crop,
     psnr,
     register_and_fuse,
     register_pair,
@@ -200,6 +201,72 @@ def test_auto_deinterlace_beats_woven_anchor():
     plain, dn = register_and_fuse(woven, 0, UP, deinterlace="none")
     assert not dn["split_fields"]
     assert comb_ratio(out) < comb_ratio(plain)
+
+
+def test_deinterlace_crop_combed_gets_closer_to_clean():
+    rng = np.random.default_rng(11)
+    woven = _woven(2.5, rng)
+    clean = _degrade(0, 0, np.random.default_rng(11), noise=2)
+    out = deinterlace_crop(woven)
+    assert out.shape == woven.shape and out.dtype == np.uint8
+    assert comb_ratio(out) < comb_ratio(woven)
+    assert psnr(out, clean) > psnr(woven, clean)
+
+
+def test_deinterlace_crop_clean_is_untouched():
+    rng = np.random.default_rng(12)
+    prog = _degrade(0, 0, rng, noise=2)
+    assert comb_ratio(prog) < 0.9
+    out = deinterlace_crop(prog)
+    assert np.array_equal(out, prog)
+    tiny = np.zeros((3, 3, 3), np.uint8)
+    assert deinterlace_crop(tiny) is tiny
+
+
+def test_deinterlace_crop_fast():
+    import time
+    woven = _woven(2.5, np.random.default_rng(13))
+    deinterlace_crop(woven)
+    t0 = time.perf_counter()
+    for _ in range(50):
+        deinterlace_crop(woven)
+    assert (time.perf_counter() - t0) / 50 < 0.02
+
+
+def _crop_job(on):
+    import types
+    from web.app import InferenceJob
+    from web.job_config import JobConfig
+    job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig({"bumper_deinterlace": True} if on else {})
+    job._current_frame = 0
+    job._stage = lambda name: __import__("contextlib").nullcontext()
+    return job
+
+
+def _frame_with_woven_band():
+    rng = np.random.default_rng(14)
+    frame = np.full((200, 300, 3), 90, np.uint8)
+    frame[60:96, 100:184] = _woven(2.5, rng)
+    return frame
+
+
+def test_bumper_deinterlace_knob_off_is_byte_identical():
+    from web.app import InferenceJob
+    from web.job_config import JobConfig
+    assert JobConfig({}).bumper_deinterlace is False
+    frame = _frame_with_woven_band()
+    box = (100, 60, 184, 96)
+    off = _crop_job(False)._bumper_crop_b64(frame, box, enforce_floor=False, box_is_bumper=True)
+    # reference: the pre-knob encoding, written out
+    crop = frame[60:96, 100:184]
+    sc = max(2, int(np.ceil(384 / crop.shape[0])))
+    ref = cv2.resize(crop, None, fx=sc, fy=sc, interpolation=cv2.INTER_LINEAR)
+    import base64
+    ref_b64 = base64.b64encode(cv2.imencode('.jpg', ref, [cv2.IMWRITE_JPEG_QUALITY, 90])[1]).decode()
+    assert off[0] == ref_b64
+    on = _crop_job(True)._bumper_crop_b64(frame, box, enforce_floor=False, box_is_bumper=True)
+    assert on[0] != off[0] and on[1] == off[1]
 
 
 # --------------------------------------------------------------------------- #

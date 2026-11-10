@@ -730,6 +730,12 @@ KNOBS = [
     # matches (qm22/14/13/7 vs Manta auto).
     Knob("identity_segment_resolve", "IDENTITY_SEGMENT_RESOLVE", bool, True,
          section="Identity & votes"),
+    # Deinterlace bumper crops before the reader upscale: crops of moving robots
+    # from interlaced source show comb teeth that blur the digits. When a crop
+    # combs, keep its sharper field (web/bumper_register.deinterlace_crop);
+    # un-combed crops are untouched. Clef-flash bench: 30 -> 35 / 48, 0 wrong.
+    # DEFAULT OFF pending the live A/B (ab_qm8 profile "deinterlace").
+    Knob("bumper_deinterlace", "BUMPER_DEINTERLACE", bool, False, section="VLM reader"),
     # Window labels: finalize-stage relabel of the replay from Jev reads on
     # short track windows (digit pass, then a lineup pass on unread windows;
     # one team per frame; unread windows stay unlabelled). Spec:

@@ -361,6 +361,8 @@ PROFILES = {
     # finalize-stage relabel from Jev reads on short track windows. Score each
     # arm with scripts/score_ground_truth.py --replay <job_id> --score-shift
     # 0.475 (this harness scores Manta auto only). Run with --full-match.
+    # Deinterlace bumper crops before the reader upscale (bumper_register.deinterlace_crop).
+    "deinterlace": [("baseline", {}), ("deinterlace", {"bumper_deinterlace": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

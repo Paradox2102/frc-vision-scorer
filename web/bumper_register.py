@@ -400,6 +400,23 @@ def split_fields(img: np.ndarray) -> list[np.ndarray]:
     return out
 
 
+def deinterlace_crop(img: np.ndarray, comb_thr: float = 0.9, unsharp_amount: float = 0.6,
+                     unsharp_sigma: float = 0.7) -> np.ndarray:
+    """Single-crop deinterlace for the read path ("anchor" mode of
+    ``register_and_fuse`` without the extra frames): when ``img`` combs
+    (``comb_ratio`` > ``comb_thr``), return the sharper of its two fields
+    resampled to full height, lightly unsharped; otherwise return ``img``
+    itself, untouched. Native resolution in and out (upscale afterwards)."""
+    if img is None or img.ndim < 2 or img.shape[0] < 8 or img.shape[1] < 4:
+        return img
+    if comb_ratio(img) <= comb_thr:
+        return img
+    fields = split_fields(img)
+    best = max(fields, key=laplacian_sharpness)
+    out = unsharp(best.astype(np.float32), unsharp_sigma, unsharp_amount)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #

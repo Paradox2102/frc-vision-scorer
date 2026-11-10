@@ -56,6 +56,7 @@ from web import clef_reader
 from web import jev_reader
 from web import job_config as job_config_registry
 from web.legibility import legibility_score
+from web.bumper_register import deinterlace_crop
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
@@ -1245,7 +1246,7 @@ def _resolve_crop(crop):
     return crop() if callable(crop) else crop
 
 
-def _band_crop_for_buffer(src):
+def _band_crop_for_buffer(src, deinterlace: bool = False):
     """(raw band crop, legibility) from a _LazyCrop ``src`` — the same pixels
     _bumper_crop_b64 would encode, BEFORE its upscale/JPEG — or None for a
     degenerate box. The crop is a view into the frame; CropBuffer.push copies
@@ -1265,7 +1266,10 @@ def _band_crop_for_buffer(src):
         crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None
-    return crop, legibility_score(crop)
+    score = legibility_score(crop)
+    if deinterlace:
+        crop = deinterlace_crop(crop)   # bumper_deinterlace; after the legibility score
+    return crop, score
 
 
 def _encode_band_crop_b64(crop) -> Optional[str]:
@@ -1843,6 +1847,12 @@ class InferenceJob:
                         reason="below_legibility_floor",
                     )
                 return None
+
+            # bumper_deinterlace: native-res comb removal BEFORE the upscale
+            # (no-op unless the crop combs; the legibility score above is of
+            # the raw crop so the floor gate is unchanged).
+            if getattr(getattr(self, "config", None), "bumper_deinterlace", False):
+                crop = deinterlace_crop(crop)
 
             # Upscale so the bumper crop is at least ~384px tall (existing behavior).
             if crop.shape[0] < 384:
@@ -3088,7 +3098,8 @@ class InferenceJob:
                         miss = vote_ray_cross_m(center, cam_pos, obs.detection.pos)
                         if miss is not None and miss > cfg.vote_ray_cross_m:
                             continue
-                cut = _band_crop_for_buffer(src)
+                cut = _band_crop_for_buffer(
+                    src, bool(getattr(cfg, "bumper_deinterlace", False)))
                 if cut is not None:
                     crops.append((cam, cut[0], cut[1]))
             if crops:

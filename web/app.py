@@ -6930,6 +6930,91 @@ class InferenceJob:
             ev["robot_label"] = team or ev.get("slot")
         return changed
 
+    def _window_label_session(self):
+        """A JevSession used only by the window-label stage. Not the job's
+        reader session: that one is a Clef session when team_reader is not
+        jev, and its usage was already folded into the timings."""
+        cfg = getattr(self, "config", None)
+        return jev_reader.JevSession(getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
+                                     timeout_s=60.0)
+
+    async def _apply_window_labels(self, rec, summary: dict, timings: dict) -> None:
+        """window_labels knob: relabel the finished replay from Jev reads on
+        short track windows (web/field/window_labels.py). Runs only for a
+        completed job. On success it rewrites ``rec.frames`` team labels,
+        re-stamps ``rec.events`` and sets ``self._window_segments`` for the
+        segments table. On any abort or error the replay is left exactly as
+        it was. Usage goes to ``summary["window_labels"]`` and
+        ``timings["window_labels.*"]`` (the reader usage summary has already
+        run by now)."""
+        cfg = getattr(self, "config", None)
+        self._window_segments = None
+        if not getattr(cfg, "window_labels", False) or getattr(self, "status", None) != "completed":
+            return
+        from web.field import window_labels as wl
+        import zlib
+        t0 = time.perf_counter()
+        stats = {"aborted": None}
+        try:
+            view = self._bumper_colour_main_view()
+            cal = getattr(self, "calib", None)
+            if view is None or cal is None or not getattr(self, "video_path", None):
+                raise wl.StageAbort("no main calibration or source video")
+            params = wl.Params(
+                fps=float(getattr(self, "video_fps", 0) or 0),
+                red=[str(t) for t in getattr(self, "match_red_teams", [])],
+                blue=[str(t) for t in getattr(self, "match_blue_teams", [])],
+                view=tuple(view.crop),
+                ground_center_offset_m=float(getattr(cfg, "ground_center_offset_m", 0.0) or 0.0),
+                lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
+                deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
+                seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
+                model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL)
+            result = await asyncio.to_thread(
+                wl.run_window_labels, rec.frames, str(self.video_path), cal,
+                self._window_label_session(), params)
+            stats = dict(result["stats"])
+            if result["aborted"] is None:
+                # Snapshot the fields the writes touch, so a failure part-way
+                # through leaves the replay exactly as it was.
+                events = getattr(rec, "events", None) or []
+                row_keys, ev_keys = ("team_number", "confirmed"), ("team_number", "robot_label")
+                row_snap = [[{k: r[k] for k in row_keys if k in r} for r in f.get("robots") or []]
+                            for f in rec.frames]
+                ev_snap = [{k: ev[k] for k in ev_keys if k in ev} for ev in events]
+                try:
+                    wl.apply_labels(rec.frames, result["labels"])
+                    wl.restamp_events(rec.frames, events)
+                except Exception:
+                    for f, rows in zip(rec.frames, row_snap):
+                        for r, old in zip(f.get("robots") or [], rows):
+                            for k in row_keys:
+                                r.pop(k, None)
+                            r.update(old)
+                    for ev, old in zip(events, ev_snap):
+                        for k in ev_keys:
+                            ev.pop(k, None)
+                        ev.update(old)
+                    raise
+                self._window_segments = result["segments"]
+        except Exception as e:
+            stats["aborted"] = (str(e) if isinstance(e, wl.StageAbort)
+                                else f"error: {type(e).__name__}: {e}")
+        stats["seconds"] = round(time.perf_counter() - t0, 2)
+        summary["window_labels"] = stats
+        for k in ("requests", "input_tokens", "cost_cents", "seconds", "digit_named",
+                  "lineup_named", "unlabelled"):
+            if isinstance(stats.get(k), (int, float)):
+                timings[f"window_labels.{k}"] = stats[k]
+        if stats.get("aborted"):
+            timings["window_labels.aborted"] = 1
+            print(f"[window-labels] aborted, labels unchanged: {stats['aborted']}")
+        else:
+            print(f"[window-labels] {stats.get('windows')} windows: {stats.get('digit_named')} by "
+                  f"digits, {stats.get('lineup_named')} by lineup, {stats.get('unlabelled')} "
+                  f"unlabelled; {stats.get('requests')} requests, ~{stats.get('cost_cents')}c, "
+                  f"{stats['seconds']}s")
+
     def _apply_track_verdicts(self) -> None:
         """Slice 2: after the whole match is processed, classify each track from the
         accumulated evidence and retroactively drop human/static-track rows from the
@@ -9835,6 +9920,12 @@ class InferenceJob:
                                     for s in range(6)]
                         except Exception as e:
                             print(f"[backward-confirm] re-resolution skipped: {e}")
+                    # window_labels knob: its own guard, so a failure here is
+                    # never reported as (or undoes) the re-resolve above.
+                    try:
+                        await self._apply_window_labels(rec, summary, timings)
+                    except Exception as e:
+                        print(f"[window-labels] skipped: {e}")
                     if TRACKER_TRACE and getattr(self, "_tracker_trace", None):
                         try:
                             Path("/tmp/frc-tracker-trace.json").write_text(
@@ -9920,7 +10011,10 @@ class InferenceJob:
                 await database.insert_match_robot_crops(crop_rows)
             except Exception as e:
                 print(f"  Match-identity capture failed ({e})")
-            segs = getattr(self, "_slot_segments", None)
+            # window_labels (when it ran) replaces the segment-resolve rows;
+            # its rows are contiguous, with source window_digits /
+            # window_lineup / window_none.
+            segs = getattr(self, "_window_segments", None) or getattr(self, "_slot_segments", None)
             if segs:
                 # identity_swap_resolve / identity_segment_resolve: per-slot
                 # team segments (the whole-match match_robot_identity rows

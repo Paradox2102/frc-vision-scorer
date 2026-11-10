@@ -6950,18 +6950,44 @@ class InferenceJob:
         return jev_reader.JevSession(getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
                                      timeout_s=30.0, retries=1)
 
+    def _replay_provenance(self) -> dict:
+        """Replay-summary fields the offline tools read (event-lineup spec
+        section 5b): the job's non-default knobs, whether the user stopped
+        it, and the main calibration version it ran with."""
+        cfg = getattr(self, "config", None)
+        try:
+            config = dict(cfg.non_defaults()) if cfg is not None else {}
+        except Exception:
+            config = {}
+        return {"config": config, "stopped": bool(getattr(self, "_stopped", False)),
+                "calibration_version": getattr(self, "_calib_version_id", None)}
+
     async def _apply_window_labels(self, rec, summary: dict, timings: dict) -> None:
         """window_labels knob: relabel the finished replay from Jev reads on
         short track windows (web/field/window_labels.py). Runs only for a
         completed job. On success it rewrites ``rec.frames`` team labels,
-        re-stamps ``rec.events`` and sets ``self._window_segments`` for the
-        segments table. On any abort or error the replay is left exactly as
-        it was. Usage goes to ``summary["window_labels"]`` and
-        ``timings["window_labels.*"]`` (the reader usage summary has already
-        run by now)."""
+        re-stamps ``rec.events``, sets ``self._window_segments`` for the
+        segments table and stores the digit calls it used in
+        ``summary["window_labels_digit_calls"]``. On any abort or error the
+        replay is left exactly as it was. Usage goes to
+        ``summary["window_labels"]`` and ``timings["window_labels.*"]`` (the
+        reader usage summary has already run by now).
+
+        event_lineup knob (needs window_labels): borrowed lineup rows are
+        fetched from the event anchor store (namespace "live") before the
+        stage runs, and this match's anchors replace its rows there after the
+        labels are applied. A failed fetch or write is logged, recorded in
+        the stats and never fails the stage."""
+        from web.field import event_anchors as ea
         cfg = getattr(self, "config", None)
         self._window_segments = None
-        if not getattr(cfg, "window_labels", False) or getattr(self, "status", None) != "completed":
+        event_on = bool(getattr(cfg, "event_lineup", False))
+        if not getattr(cfg, "window_labels", False):
+            if event_on:
+                print("[event-lineup] needs window_labels, which is off: "
+                      "no borrowing, no anchors written")
+            return
+        if getattr(self, "status", None) != "completed":
             return
         if getattr(self, "_stopped", False):     # user STOP: "completed" on a partial match
             return
@@ -6969,6 +6995,21 @@ class InferenceJob:
         import zlib
         t0 = time.perf_counter()
         stats = {"aborted": None}
+        red = [str(t) for t in getattr(self, "match_red_teams", [])]
+        blue = [str(t) for t in getattr(self, "match_blue_teams", [])]
+        event_key = getattr(self, "event_key", None)
+        match_key = getattr(self, "match_key", None)
+        borrowed, fetch_error = {}, None
+        written = {ea.KIND_DIGITS: 0, ea.KIND_ELIM: 0}
+        if event_on and not (event_key and match_key):
+            fetch_error = "no event_key or match_key"
+        elif event_on:
+            try:
+                borrowed = await database.fetch_event_anchors(ea.LIVE, event_key, red + blue,
+                                                              match_key)
+            except Exception as e:
+                fetch_error = f"{type(e).__name__}: {e}"
+                print(f"[event-lineup] borrow fetch failed, no borrowed rows: {fetch_error}")
         try:
             view = self._bumper_colour_main_view()
             cal = getattr(self, "calib", None)
@@ -6976,14 +7017,17 @@ class InferenceJob:
                 raise wl.StageAbort("no main calibration or source video")
             params = wl.Params(
                 fps=float(getattr(self, "video_fps", 0) or 0),
-                red=[str(t) for t in getattr(self, "match_red_teams", [])],
-                blue=[str(t) for t in getattr(self, "match_blue_teams", [])],
+                red=red,
+                blue=blue,
                 view=tuple(view.crop),
                 ground_center_offset_m=float(getattr(cfg, "ground_center_offset_m", 0.0) or 0.0),
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
-                model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL)
+                model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
+                event_lineup=event_on,
+                borrowed=borrowed,
+                this_colors={**{t: "red" for t in red}, **{t: "blue" for t in blue}})
             try:
                 result = await asyncio.to_thread(
                     wl.run_window_labels, rec.frames, str(self.video_path), cal,
@@ -7018,9 +7062,27 @@ class InferenceJob:
                         ev.update(old)
                     raise
                 self._window_segments = result["segments"]
+                # Digit-call cache for the offline tools (spec section 5),
+                # knob on or off.
+                summary["window_labels_digit_calls"] = result.get("digit_calls")
+                if event_on and event_key and match_key:
+                    anchors = list(result.get("anchors_out") or [])
+                    try:
+                        await database.replace_event_anchors(
+                            ea.LIVE, event_key, match_key, anchors,
+                            replay_id=getattr(self, "job_id", None))
+                        for a in anchors:
+                            written[a.kind] = written.get(a.kind, 0) + 1
+                    except Exception as e:
+                        print(f"[event-lineup] anchor write failed, labels kept: "
+                              f"{type(e).__name__}: {e}")
         except Exception as e:
             stats["aborted"] = (str(e) if isinstance(e, wl.StageAbort)
                                 else f"error: {type(e).__name__}: {e}")
+        if event_on:
+            stats.update(anchors_written=written[ea.KIND_DIGITS],
+                         elim_anchors_written=written[ea.KIND_ELIM],
+                         borrow_fetch_error=fetch_error)
         stats["seconds"] = round(time.perf_counter() - t0, 2)
         summary["window_labels"] = stats
         for k in ("requests", "input_tokens", "cost_cents", "seconds", "digit_named",
@@ -7035,6 +7097,11 @@ class InferenceJob:
                   f"digits, {stats.get('lineup_named')} by lineup, {stats.get('unlabelled')} "
                   f"unlabelled; {stats.get('requests')} requests, ~{stats.get('cost_cents')}c, "
                   f"{stats['seconds']}s")
+            if event_on:
+                print(f"[event-lineup] rows own {stats.get('rows_own')} / borrowed "
+                      f"{stats.get('rows_borrowed')} / elim {stats.get('rows_elim')}; anchors "
+                      f"written {stats['anchors_written']} + {stats['elim_anchors_written']} elim"
+                      + (f"; fetch error: {fetch_error}" if fetch_error else ""))
 
     def _apply_track_verdicts(self) -> None:
         """Slice 2: after the whole match is processed, classify each track from the
@@ -9906,6 +9973,9 @@ class InferenceJob:
                         "timer_gate_fallback": self.timer_gate_fallback,
                         "timer_gate_fallback_reason": self.timer_gate_fallback_reason,
                         "autonomous_paths": dict(self.autonomous_paths),
+                        # Provenance for the offline tools (event-lineup spec 5b):
+                        # config = non-default knobs, stopped, calibration_version.
+                        **self._replay_provenance(),
                     }
                     self.identity_diagnostics.gauge(
                         "identity_count", len(self.identity_registry.identities)

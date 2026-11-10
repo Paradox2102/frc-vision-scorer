@@ -3,6 +3,7 @@ what it writes, and that every failure leaves the replay untouched. The stage
 itself (web/field/window_labels.run_window_labels) is stubbed."""
 import asyncio
 import copy
+import json
 import threading
 from types import SimpleNamespace
 
@@ -186,3 +187,175 @@ def test_window_label_session_is_a_dedicated_jev_session(monkeypatch):
     s = InferenceJob._window_label_session(job)
     assert isinstance(s, app_mod.jev_reader.JevSession) and s.timeout_s == 30.0
     assert s.retries == 1
+
+
+from web.field import event_anchors as ea
+
+
+def _anchor(kind="digits", team="3128"):
+    return ea.Anchor(team=team, kind=kind, p=0.9, frame_num=420, alliance_color="blue",
+                     tile=b"\xff\xd8x")
+
+
+def _event_job(on=True, event=True):
+    job, rec = _job()
+    job.config.event_lineup = on
+    job.event_key, job.match_key = ("2026cur", "2026cur_qm8") if event else (None, None)
+    return job, rec
+
+
+def _store(monkeypatch, order, fetched=None, fetch_exc=None, write_exc=None):
+    seen = {}
+
+    async def fetch(namespace, event_key, teams, exclude_match_key, max_match_number=None, **kw):
+        order.append("fetch")
+        seen["fetch"] = (namespace, event_key, list(teams), exclude_match_key, max_match_number)
+        if fetch_exc:
+            raise fetch_exc
+        return fetched or {}
+
+    async def replace(namespace, event_key, match_key, anchors, *, replay_id=None, **kw):
+        order.append("replace")
+        seen["replace"] = (namespace, event_key, match_key, list(anchors), replay_id)
+        if write_exc:
+            raise write_exc
+        return len(anchors)
+
+    monkeypatch.setattr(app_mod.database, "fetch_event_anchors", fetch)
+    monkeypatch.setattr(app_mod.database, "replace_event_anchors", replace)
+    return seen
+
+
+def _stage(monkeypatch, order, result):
+    seen = {}
+
+    def fake(frames, video_path, cal, session, params, **kw):
+        order.append("stage")
+        seen["params"] = params
+        return result
+
+    monkeypatch.setattr(wl, "run_window_labels", fake)
+    return seen
+
+
+def _ok_event_result():
+    res = _ok_result()
+    res.update(anchors_out=[_anchor(), _anchor("elimination", "9066")],
+               digit_calls={"calls": {0: [{"3128": 0.9}]}, "wide_p": {}, "fingerprints": {}},
+               row_sources={}, lineup_jpeg_blue=None)
+    res["stats"] = {**res["stats"], "rows_own": 1, "rows_borrowed": 1, "rows_elim": 0}
+    return res
+
+
+def test_digit_calls_go_into_the_summary_with_the_knob_off(monkeypatch):
+    order = []
+    _store(monkeypatch, order)
+    res = _ok_event_result()
+    _stage(monkeypatch, order, res)
+    job, rec = _event_job(on=False)
+    summary, _ = _apply(job, rec)
+    assert summary["window_labels_digit_calls"] == res["digit_calls"]
+    assert order == ["stage"]                                # no store access
+    assert set(summary["window_labels"]) == set(res["stats"]) | {"seconds"}
+
+
+def test_event_lineup_fetches_before_the_stage_and_writes_after_the_labels(monkeypatch):
+    order = []
+    borrowed = {"9066": [_anchor(team="9066")]}
+    seen = _store(monkeypatch, order, fetched=borrowed)
+    st = _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job()
+    fake_replace = app_mod.database.replace_event_anchors
+
+    async def check_then_replace(*a, **kw):
+        # the labels are already applied when the anchors are written
+        assert {r["slot"]: r for r in rec.frames[4]["robots"]}["B1"]["team_number"] == "3128"
+        return await fake_replace(*a, **kw)
+
+    monkeypatch.setattr(app_mod.database, "replace_event_anchors", check_then_replace)
+    summary, _ = _apply(job, rec)
+    assert order == ["fetch", "stage", "replace"]
+    assert seen["fetch"] == ("live", "2026cur", job.match_red_teams + job.match_blue_teams,
+                             "2026cur_qm8", None)
+    p = st["params"]
+    assert p.event_lineup is True and p.borrowed == borrowed
+    assert p.this_colors["2637"] == "red" and p.this_colors["9066"] == "blue"
+    ns, ev, mk, anchors, rid = seen["replace"]
+    assert (ns, ev, mk, rid) == ("live", "2026cur", "2026cur_qm8", "wl_test")
+    assert len(anchors) == 2
+    s = summary["window_labels"]
+    assert (s["anchors_written"], s["elim_anchors_written"], s["borrow_fetch_error"]) == (1, 1, None)
+    assert s["rows_borrowed"] == 1 and "window_labels_digit_calls" in summary
+
+
+def test_a_failed_fetch_runs_the_stage_without_borrowed_rows(monkeypatch):
+    order = []
+    _store(monkeypatch, order, fetch_exc=RuntimeError("db locked"))
+    st = _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job()
+    summary, _ = _apply(job, rec)
+    assert st["params"].borrowed == {} and order == ["fetch", "stage", "replace"]
+    assert "db locked" in summary["window_labels"]["borrow_fetch_error"]
+    assert summary["window_labels"]["aborted"] is None
+
+
+def test_a_failed_write_keeps_the_labels(monkeypatch):
+    order = []
+    _store(monkeypatch, order, write_exc=OSError("disk full"))
+    _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job()
+    summary, _ = _apply(job, rec)
+    assert {r["slot"]: r for r in rec.frames[4]["robots"]}["B1"]["team_number"] == "3128"
+    assert job._window_segments is not None and summary["window_labels"]["aborted"] is None
+    assert summary["window_labels"]["anchors_written"] == 0
+
+
+def test_an_abort_writes_no_anchors_and_no_digit_calls(monkeypatch):
+    order = []
+    _store(monkeypatch, order)
+    res = {**_ok_event_result(), "aborted": "deadline passed in the lineup pass",
+           "labels": None, "segments": None, "digit_calls": None, "anchors_out": []}
+    res["stats"] = {**res["stats"], "aborted": res["aborted"]}
+    _stage(monkeypatch, order, res)
+    job, rec = _event_job()
+    summary, _ = _apply(job, rec)
+    assert order == ["fetch", "stage"] and "window_labels_digit_calls" not in summary
+    assert summary["window_labels"]["anchors_written"] == 0 and rec.frames == FRAMES
+
+
+def test_no_match_key_means_no_store_access(monkeypatch):
+    order = []
+    _store(monkeypatch, order)
+    _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job(event=False)
+    summary, _ = _apply(job, rec)
+    assert order == ["stage"]
+    assert summary["window_labels"]["borrow_fetch_error"] == "no event_key or match_key"
+
+
+def test_event_lineup_without_window_labels_does_nothing_and_says_so(monkeypatch, capsys):
+    order = []
+    _store(monkeypatch, order)
+    _stage(monkeypatch, order, _ok_event_result())
+    job, rec = _event_job()
+    job.config.window_labels = False
+    summary, _ = _apply(job, rec)
+    assert order == [] and "window_labels" not in summary and rec.frames == FRAMES
+    assert "[event-lineup]" in capsys.readouterr().out
+
+
+def test_replay_provenance_records_config_stop_and_calibration():
+    from web.job_config import JobConfig
+    job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig({"window_labels": True, "ground_center_offset_m": 0.2})
+    job._stopped = True
+    job._calib_version_id = "20260630-210916-570400"
+    prov = InferenceJob._replay_provenance(job)
+    assert prov == {"config": job.config.non_defaults(), "stopped": True,
+                    "calibration_version": "20260630-210916-570400"}
+    assert prov["config"]["window_labels"] is True
+    assert prov["config"]["ground_center_offset_m"] == 0.2
+    json.dumps(prov)                                        # goes into meta.json
+    bare = InferenceJob.__new__(InferenceJob)
+    assert InferenceJob._replay_provenance(bare) == {"config": {}, "stopped": False,
+                                                     "calibration_version": None}

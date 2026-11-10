@@ -2,12 +2,15 @@
 SQLite database for persisting match results and per-robot scoring data.
 """
 
+import asyncio
+
 import aiosqlite
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from web.embedder import ACTIVE_MODEL
+from web.field import event_anchors as _event_anchors
 
 DB_PATH = Path(__file__).parent.parent / "frc_scorer.db"
 
@@ -261,6 +264,8 @@ async def init_db():
     """Initialize the database and create tables if they don't exist."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Event lineup anchor store (web/field/event_anchors.py).
+        await db.executescript(_event_anchors.DDL)
         # Lightweight migrations: add columns to a pre-existing replays table.
         for col_def in ("processing_sec REAL", "timings TEXT"):
             try:
@@ -1096,3 +1101,57 @@ async def get_match_bindings(job_id) -> List[Dict]:
         cur = await db.execute(
             "SELECT * FROM match_robot_binding WHERE job_id = ? ORDER BY id", (job_id,))
         return [dict(r) for r in await cur.fetchall()]
+
+
+# --- Event lineup anchor store (web/field/event_anchors.py; spec 2026-11-10 section 1) ---
+
+async def fetch_event_anchors(namespace: str, event_key: str, teams,
+                              exclude_match_key: Optional[str],
+                              max_match_number: Optional[int] = None, *,
+                              root=None) -> Dict[str, list]:
+    """Async twin of event_anchors.fetch: team -> [Anchor] for ``teams`` from
+    every other match of the event in ``namespace`` (only match_number <=
+    ``max_match_number`` when given). Tile files are read off the event loop."""
+    ea = _event_anchors
+    teams = [str(t) for t in teams]
+    if not teams:
+        return {}
+    sql, args = ea.select_query(namespace, event_key, teams, exclude_match_key,
+                                max_match_number)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(sql, args)
+        rows = await cur.fetchall()
+    return await asyncio.to_thread(ea.rows_to_anchors, rows, root or ea.ANCHOR_ROOT)
+
+
+async def replace_event_anchors(namespace: str, event_key: str, match_key: str, anchors, *,
+                                replay_id: Optional[str] = None,
+                                match_number: Optional[int] = None, root=None) -> int:
+    """Async twin of event_anchors.replace (same transaction and file order:
+    delete the match's rows, insert, write tiles, commit, then delete the old
+    tiles; a failure before the commit changes nothing). Returns the count."""
+    ea = _event_anchors
+    anchors = list(anchors)
+    ea.validate(namespace, event_key, anchors)
+    root = Path(root or ea.ANCHOR_ROOT)
+    mn = ea.schedule_rank(match_key) if match_number is None else int(match_number)
+    new_files: list = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            cur = await db.execute(ea.OLD_PATHS_SQL, (namespace, event_key, match_key))
+            old = [r[0] for r in await cur.fetchall()]
+            await db.execute(ea.DELETE_SQL, (namespace, event_key, match_key))
+            for a in anchors:
+                cur = await db.execute(ea.INSERT_SQL, ea.insert_args(
+                    namespace, event_key, match_key, mn, replay_id, a))
+                rel = ea.tile_relpath(namespace, event_key, cur.lastrowid)
+                await db.execute(ea.SET_PATH_SQL, (rel, cur.lastrowid))
+                await asyncio.to_thread(ea.write_tile, root, rel, a.tile)
+                new_files.append(root / rel)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            await asyncio.to_thread(ea.remove_files, new_files)
+            raise
+    await asyncio.to_thread(ea.remove_files, [root / r for r in old])
+    return len(anchors)

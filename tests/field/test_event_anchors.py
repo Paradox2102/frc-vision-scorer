@@ -127,3 +127,46 @@ def test_clear_removes_one_namespace_of_one_event(store):
     assert ea.fetch("eval-full", "2026cur", ["3128"], "x", **store) == {}
     assert ea.fetch("eval-full", "2026hop", ["3128"], "x", **store)
     assert _files(store, "eval-full", "2026cur") == []
+
+@pytest.fixture()
+def adb(tmp_path, monkeypatch):
+    import web.database as database
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "app.db")
+    asyncio.run(database.init_db())
+    return database
+
+
+def test_init_db_creates_the_table_and_its_index(adb):
+    con = sqlite3.connect(str(adb.DB_PATH))
+    cols = {r[1] for r in con.execute("PRAGMA table_info(event_anchors)")}
+    idx = {r[1] for r in con.execute("PRAGMA index_list(event_anchors)")}
+    con.close()
+    assert {"id", "namespace", "event_key", "team", "match_key", "match_number", "replay_id",
+            "frame_num", "alliance_color", "kind", "p", "tile_path", "created_at"} <= cols
+    assert "idx_event_anchors_team" in idx
+
+
+def test_async_path_round_trips_and_agrees_with_the_sync_path(adb, tmp_path):
+    root = tmp_path / "tiles"
+    n = asyncio.run(adb.replace_event_anchors("live", "2026cur", "2026cur_qm3",
+                                              [_a(), _a(frame_num=9)], replay_id="r3", root=root))
+    assert n == 2
+    got = asyncio.run(adb.fetch_event_anchors("live", "2026cur", ["3128"], "2026cur_qm8",
+                                              root=root))
+    assert [a.frame_num for a in got["3128"]] == [420, 9] and got["3128"][0].replay_id == "r3"
+    assert ea.fetch("live", "2026cur", ["3128"], "2026cur_qm8", db_path=adb.DB_PATH,
+                    root=root) == got
+    asyncio.run(adb.replace_event_anchors("live", "2026cur", "2026cur_qm3", [_a(frame_num=1)],
+                                          root=root))
+    again = asyncio.run(adb.fetch_event_anchors("live", "2026cur", ["3128"], "x", root=root))
+    assert [a.frame_num for a in again["3128"]] == [1]
+    assert len(list((root / "live" / "2026cur").glob("*.jpg"))) == 1
+    assert asyncio.run(adb.fetch_event_anchors("live", "2026cur", ["3128"], "x",
+                                               max_match_number=2, root=root)) == {}
+    assert asyncio.run(adb.fetch_event_anchors("live", "2026cur", [], "x", root=root)) == {}
+
+
+def test_async_write_refuses_bad_names(adb, tmp_path):
+    with pytest.raises(ValueError):
+        asyncio.run(adb.replace_event_anchors("../up", "2026cur", "2026cur_qm3", [_a()],
+                                              root=tmp_path / "tiles"))

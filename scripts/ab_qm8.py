@@ -87,6 +87,14 @@ PROFILES = {
         ("qwen3-vl-8b", {"vlm_model": "qwen3-vl-8b"}),
         ("lfm2.5-vl", {"vlm_model": "lfm2.5-vl"}),
     ],
+    # Contenders only (LFM eliminated by the crop bench: 2 confident misreads).
+    # Use with --full-match for read-rich comparisons — auto-only windows on
+    # qm8/qm12 yielded 0-2 bindings for every model (too few legible moments).
+    "vlm-abc": [
+        ("qwen3-vl-4b", {}),
+        ("glm-4.6v-flash", {"vlm_model": "glm-4.6v-flash"}),
+        ("qwen3-vl-8b", {"vlm_model": "qwen3-vl-8b"}),
+    ],
     "relink": [
         ("baseline", {}),
         ("relink-gate", {"relink_max_dist_m": 3.0}),

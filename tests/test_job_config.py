@@ -618,3 +618,15 @@ def test_window_labels_knobs_env_override_and_range(monkeypatch):
         JobConfig({"window_labels_lineup_min_p": 1.5})
     with pytest.raises(ValueError):
         JobConfig({"window_labels_lineup_min_p": -0.1})
+
+
+def test_event_lineup_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.event_lineup is False and "event_lineup" not in cfg.non_defaults()
+    assert JobConfig({"event_lineup": True}).non_defaults() == {"event_lineup": True}
+    assert JobConfig({"event_lineup": "false"}).event_lineup is False
+    monkeypatch.setenv("EVENT_LINEUP", "1")
+    assert JobConfig().event_lineup is True
+    assert next(k for k in KNOBS if k.name == "event_lineup").section == "Identity & votes"

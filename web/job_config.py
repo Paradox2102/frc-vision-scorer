@@ -750,6 +750,15 @@ KNOBS = [
     # / 21 s misID offline). A value above 1 disables the lineup pass.
     Knob("window_labels_lineup_min_p", "WINDOW_LABELS_LINEUP_MIN_P", float, 0.8,
          min=0.0, max=1.01, section="Identity & votes"),
+    # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
+    # window_labels' lineup card borrows rows, for teams this match did not
+    # read at p >= 0.85 twice, from the anchors earlier matches of the event
+    # stored (frc_scorer.db event_anchors, namespace "live", tiles under
+    # data/event_anchors/), and this match's anchors are written back after
+    # its labels are applied. Needs window_labels (alone it does nothing and
+    # logs once). Adds the colour bar and the colour sentence to the card.
+    # DEFAULT OFF pending the offline evaluation (spec section 8).
+    Knob("event_lineup", "EVENT_LINEUP", bool, False, section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
     # expiry / coasting re-acquisition / feed change / identity birth /

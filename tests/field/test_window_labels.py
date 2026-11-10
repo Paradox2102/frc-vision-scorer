@@ -73,3 +73,53 @@ def test_two_sample_window_uses_both_as_samples_and_no_frames_gives_no_windows()
     ws = wl.build_windows(_frames({"B1": _still([0, 1])}, 2), FPS)
     assert ws[0].samples == [0, 1]
     assert wl.build_windows([], FPS) == []
+
+
+ROSTER = ["2637", "2724", "6497", "3128", "6773", "9066"]
+
+
+def _p(**kw):
+    """A reader answer: team/escape probabilities."""
+    base = {"not_robot": 0.0, "unreadable": 0.0}
+    base.update({k.lstrip("t"): v for k, v in kw.items()})
+    return base
+
+
+def test_digit_label_needs_p_half_no_conflict_and_two_top_calls():
+    good = [_p(t2724=0.9, unreadable=0.05), _p(t2724=0.6, unreadable=0.3), _p(unreadable=0.9)]
+    assert wl.digit_decision(good, ROSTER) == ("2724", 0.9)
+    # best team below 0.5
+    assert wl.digit_decision([_p(t2724=0.45, unreadable=0.5)] * 3, ROSTER) is None
+    # a second team at 0.4 or more blocks the label
+    conflict = [_p(t2724=0.9), _p(t2724=0.8), _p(t6497=0.4, unreadable=0.5)]
+    assert wl.digit_decision(conflict, ROSTER) is None
+    # team is the top option in only one call
+    once = [_p(t2724=0.9), _p(t2724=0.3, unreadable=0.6), _p(unreadable=0.9)]
+    assert wl.digit_decision(once, ROSTER) is None
+
+
+def test_digit_decision_ignores_failed_calls_and_empty_input():
+    calls = [None, {}, _p(t3128=0.7), _p(t3128=0.55, unreadable=0.4)]
+    assert wl.digit_decision(calls, ROSTER) == ("3128", 0.7)
+    assert wl.digit_decision([], ROSTER) is None
+    assert wl.digit_decision([None], ROSTER) is None
+
+
+def test_anchors_need_085_two_per_team_and_spread_in_time():
+    labels = {i: ("2724", 0.9) for i in range(10)}
+    labels.update({20: ("6497", 0.95), 21: ("3128", 0.9), 22: ("3128", 0.86), 23: ("2724", 0.84)})
+    t0 = {i: float(i) for i in labels}
+    a = wl.pick_anchors(labels, t0)
+    assert a["2724"] == [0, 2, 4, 5, 7, 9]          # 6 of 10, first and last kept
+    assert a["3128"] == [21, 22]
+    assert "6497" not in a                          # only one anchor
+    assert 23 not in a["2724"]                      # 0.84 is below the anchor floor
+
+
+def test_lineup_decision_takes_best_letter_at_or_above_the_floor():
+    letters = {"A": "2724", "B": "6497"}
+    assert wl.lineup_decision({"A": 0.82, "B": 0.1, "unsure": 0.08}, letters, 0.8) == ("2724", 0.82)
+    assert wl.lineup_decision({"A": 0.7, "B": 0.1, "unsure": 0.2}, letters, 0.8) is None
+    assert wl.lineup_decision({"A": 0.7, "B": 0.1, "unsure": 0.2}, letters, 0.65) == ("2724", 0.7)
+    assert wl.lineup_decision(None, letters, 0.8) is None
+    assert wl.lineup_decision({"none": 1.0}, letters, 0.8) is None

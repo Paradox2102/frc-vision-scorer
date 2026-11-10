@@ -114,3 +114,60 @@ def build_windows(frames: list, fps: float) -> list:
                 out.append(Window(len(out), slot, run_id, idx,
                                   [idx[j] for j in _even_picks(len(idx), SAMPLES_PER_WINDOW)]))
     return out
+
+
+def digit_decision(calls: list, roster: list) -> Optional[tuple]:
+    """``calls``: one probability dict per request sent for a window (None or
+    {} for a failed request). Returns (team, p) when the best team reaches
+    DIGIT_MIN_P, no other team reaches DIGIT_CONFLICT_P and the team is the
+    top option in at least DIGIT_MIN_TOP_CALLS calls; else None."""
+    roster = [str(t) for t in roster]
+    best = {t: 0.0 for t in roster}
+    tops = {t: 0 for t in roster}
+    for p in calls:
+        if not p:
+            continue
+        for t in roster:
+            best[t] = max(best[t], float(p.get(t, 0.0)))
+        top = max(p, key=p.get)
+        if top in tops:
+            tops[top] += 1
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    if not ranked:
+        return None
+    team, p = ranked[0]
+    if p < DIGIT_MIN_P:
+        return None
+    if len(ranked) > 1 and ranked[1][1] >= DIGIT_CONFLICT_P:
+        return None
+    if tops[team] < DIGIT_MIN_TOP_CALLS:
+        return None
+    return team, p
+
+
+def pick_anchors(labels: dict, t0: dict) -> dict:
+    """``labels``: window id -> (team, p) digit labels; ``t0``: window id ->
+    start seconds. Returns team -> up to ANCHORS_PER_TEAM window ids spread
+    evenly in time, for teams with at least MIN_ANCHORS windows at
+    ANCHOR_MIN_P or above."""
+    by: dict = {}
+    for wid, (team, p) in labels.items():
+        if p >= ANCHOR_MIN_P:
+            by.setdefault(team, []).append((t0[wid], wid))
+    out = {}
+    for team, cands in by.items():
+        if len(cands) < MIN_ANCHORS:
+            continue
+        cands.sort()
+        out[team] = [cands[j][1] for j in _even_picks(len(cands), ANCHORS_PER_TEAM)]
+    return out
+
+
+def lineup_decision(probs: Optional[dict], letters: dict, min_p: float) -> Optional[tuple]:
+    """``letters``: row letter -> team. Returns (team, p) when the most likely
+    letter reaches ``min_p``; else None."""
+    if not probs or not letters:
+        return None
+    letter = max(letters, key=lambda l: float(probs.get(l, 0.0)))
+    p = float(probs.get(letter, 0.0))
+    return (letters[letter], p) if p >= min_p else None

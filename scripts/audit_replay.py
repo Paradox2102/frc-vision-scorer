@@ -540,7 +540,8 @@ def load_replay_inputs(replay_id: str, meta_path: Optional[str] = None) -> dict:
         if not meta_p.exists():
             meta_p = _resolve(row.get("meta_path"))
     if meta_p is None or not meta_p.exists():
-        raise SystemExit(f"meta.json missing for replay {row['id']}")
+        raise SystemExit(f"meta.json missing for replay {row['id']}"
+                         + (f" (--meta {meta_path})" if meta_path else ""))
     video = _resolve(row.get("source_video_path"))
     meta = json.loads(meta_p.read_text())
     mk = row["match_key"]

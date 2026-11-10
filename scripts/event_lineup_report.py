@@ -33,6 +33,7 @@ QM8_MISID_MAX_S = 5.0          # arm 3 vs arm 1 on qm8: mis-ID at most +5 s
 QM8_WRONG_MAX = 0.01           # ... and wrong share at most +1 pt
 UNLABELLED_MIN_DROP = 0.05     # mean unlabelled slot-time down by at least 5 pts
 FABLE_WRONG_MAX = 0.10         # no team's borrowed-row labels more than 10% wrong
+FABLE_MIN_ITEMS = 5            # fewer judged items than this: inconclusive, not counted
 MIN_ANCHORS = 2                # a team with fewer own anchors had no own row
 
 
@@ -49,19 +50,32 @@ def _pct(v) -> str:
     return "-" if v is None else f"{v:.1%}"
 
 
+def _same_path(a, b) -> bool:
+    return a is not None and b is not None and Path(a).resolve() == Path(b).resolve()
+
+
 def load_arm(dirs) -> dict:
     dirs = [Path(d) for d in dirs]
     rows = _read_jsonl(dirs[0] / "results.jsonl")
     qm8 = [r["score"]["full"] for d in dirs for r in _read_jsonl(d / "results.jsonl")
            if str(r.get("match_key", "")).endswith("_qm8") and r.get("score")]
-    audit = {}
+    meta_out = {r["match_key"]: r.get("meta_out") for r in rows}
+    audit, audit_s, seen = {}, {}, {}
     for p in sorted((dirs[0] / "audit").glob("*/score.json")):
         s = json.loads(p.read_text())
-        audit[s["match_key"]] = s.get("misid")
+        mk = s["match_key"]
+        if mk in seen:
+            raise SystemExit(f"duplicate score.json for {mk}: {seen[mk]} and {p}")
+        seen[mk] = p
+        if not _same_path(s.get("meta"), meta_out.get(mk)):
+            raise SystemExit(f"{p}: scored meta {s.get('meta')!r} is not this arm's "
+                             f"relabelled meta {meta_out.get(mk)!r} for {mk}")
+        audit[mk] = s.get("misid")
+        audit_s[mk] = s.get("misid_s")
     return {"dirs": [str(d) for d in dirs], "rows": rows,
             "unlabelled": {r["match_key"]: r.get("unlabelled_share")
                            for r in rows if not r.get("error")},
-            "qm8": qm8, "audit": audit}
+            "qm8": qm8, "audit": audit, "audit_s": audit_s}
 
 
 def paired_ci(diffs: list, reps: int = 10000, seed: int = 0, alpha: float = 0.05):
@@ -88,26 +102,43 @@ def criteria(base: dict, target: dict, fable_worst: Optional[float]) -> list:
     d = None if bw is None or tw is None else tw - bw
     out.append({"name": "qm8 wrong", "pass": None if d is None else d <= QM8_WRONG_MAX + 1e-9,
                 "value": "-" if d is None else f"{d * 100:+.1f} pt (limit +1 pt)"})
+    sel = set(base["unlabelled"]) | set(target["unlabelled"])
     common = sorted(m for m, v in base["unlabelled"].items()
                     if v is not None and target["unlabelled"].get(m) is not None)
     drop = (None if not common else _mean(base["unlabelled"][m] for m in common)
             - _mean(target["unlabelled"][m] for m in common))
     out.append({"name": "unlabelled drop",
-                "pass": None if drop is None else drop >= UNLABELLED_MIN_DROP - 1e-9,
+                "pass": (None if drop is None or len(common) < len(sel)
+                         else drop >= UNLABELLED_MIN_DROP - 1e-9),
                 "value": "-" if drop is None else
-                f"{drop * 100:.1f} pt over {len(common)} matches (need >= 5 pt)"})
+                f"{drop * 100:.1f} pt over {len(common)}/{len(sel)} matches (need >= 5 pt)"})
     diffs = [target["audit"][m] - base["audit"][m] for m in sorted(base["audit"])
              if base["audit"][m] is not None and target["audit"].get(m) is not None]
     ci = paired_ci(diffs)
-    out.append({"name": "audit misID paired", "pass": None if ci is None else ci[1] <= 1e-12,
+    asel = set(base["audit"]) | set(target["audit"])
+    sdiffs = [target["audit_s"][m] - base["audit_s"][m] for m in sorted(base["audit_s"])
+              if base["audit_s"][m] is not None and target["audit_s"].get(m) is not None]
+    out.append({"name": "audit misID paired",
+                "pass": (None if ci is None or len(diffs) < len(asel)
+                         else ci[1] <= 1e-12),
                 "value": "-" if ci is None else
                 f"{ci[0] * 100:+.1f} pt [{ci[1] * 100:+.1f}, {ci[2] * 100:+.1f}] over "
-                f"{len(diffs)} matches (lower bound <= 0)"})
+                f"{len(diffs)}/{len(asel)} matches (lower bound <= 0)",
+                "info": None if not sdiffs else
+                f"paired misID {sum(sdiffs) / len(sdiffs):+.1f} slot-s per match "
+                f"over {len(sdiffs)} matches"})
     out.append({"name": "Fable borrowed-row wrong",
                 "pass": None if fable_worst is None else fable_worst <= FABLE_WRONG_MAX + 1e-9,
                 "value": "not run" if fable_worst is None else
                 f"worst team {fable_worst:.0%} (limit 10%)"})
     return out
+
+
+def fable_summary(counts: dict):
+    """(worst wrong share over teams with >= FABLE_MIN_ITEMS judged items or
+    None, sorted inconclusive teams)."""
+    worst = max((w / n for n, w in counts.values() if n >= FABLE_MIN_ITEMS), default=None)
+    return worst, sorted(t for t, (n, w) in counts.items() if n < FABLE_MIN_ITEMS)
 
 
 def borrowed_label_counts(audit_dir, answers_path, meta: dict, row_sources: dict,
@@ -154,14 +185,23 @@ def main(argv=None) -> None:
         if need not in arms:
             ap.error(f"--arm {need}=DIR is required")
 
-    print(f"{'arm':<16}{'matches':>8}{'unlabelled':>12}{'qm8 misID':>11}{'qm8 wrong':>11}"
+    all_mk = set().union(*(set(a["unlabelled"]) for a in arms.values()))
+    common_all = sorted(all_mk - set().union(*(
+        {m for m in all_mk if a["unlabelled"].get(m) is None} for a in arms.values())))
+    print(f"{'arm':<16}{'matches':>8}{'unl(common)':>12}{'qm8 misID':>11}{'qm8 wrong':>11}"
           f"{'audit misID':>13}")
     for name, a in arms.items():
         m = _mean(q.get("misid_s") for q in a["qm8"])
-        print(f"{name:<16}{len(a['rows']):>8}{_pct(_mean(a['unlabelled'].values())):>12}"
+        print(f"{name:<16}{len(a['rows']):>8}"
+              f"{_pct(_mean(a['unlabelled'][k] for k in common_all)):>12}"
               f"{'-' if m is None else f'{m:.0f} s':>11}"
               f"{_pct(_mean(q.get('wrong') for q in a['qm8'])):>11}"
               f"{_pct(_mean(a['audit'].values())):>13}")
+    print(f"unl(common): the {len(common_all)} matches every arm has an unlabelled share for")
+    for name, a in arms.items():
+        lack = sorted(all_mk - {m for m, v in a["unlabelled"].items() if v is not None})
+        if lack:
+            print(f"  {name} lacks: {', '.join(lack)}")
 
     target = arms[args.target]
     by_mk = {r["match_key"]: r for r in target["rows"]}
@@ -170,7 +210,16 @@ def main(argv=None) -> None:
         adir, _, ans = spec.partition("=")
         adir = Path(adir)
         mk = json.loads((adir / "audit.json").read_text())["match_key"]
-        r = by_mk[mk]
+        r = by_mk.get(mk)
+        if r is None:
+            raise SystemExit(f"--fable {adir}: {mk} is not in the {args.target} arm")
+        if r.get("error") or not r.get("meta_out"):
+            raise SystemExit(f"--fable {adir}: {mk} has no relabelled meta in the "
+                             f"{args.target} arm (error: {r.get('error')})")
+        if not _same_path(json.loads((adir / "audit.json").read_text()).get("meta"),
+                          r["meta_out"]):
+            raise SystemExit(f"--fable {adir}: audit.json meta is not the {args.target} "
+                             f"arm's relabelled meta {r['meta_out']}")
         meta = json.loads(Path(r["meta_out"]).read_text())
         ans_p = Path(ans) if Path(ans).exists() else adir / ans
         for t, (n, w) in borrowed_label_counts(adir, ans_p, meta, r.get("row_sources") or {},
@@ -186,16 +235,23 @@ def main(argv=None) -> None:
           "Fable verdicts on its borrowed-row labels")
     for t in sorted(set(no_own) | set(counts), key=lambda x: (len(x), x)):
         n, w = counts.get(t, (0, 0))
+        tag = (" (inconclusive)" if 0 < n < FABLE_MIN_ITEMS else "")
         print(f"  {t:>6}  {len(no_own.get(t, [])):>2} matches {','.join(no_own.get(t, [])):<40}"
-              f"  Fable {f'{w}/{n} wrong' if n else '-'}")
-    worst = (max((w / n for n, w in counts.values() if n), default=None)
-             if args.fable else None)
+              f"  Fable {f'{w}/{n} wrong{tag}' if n else '-'}")
+    worst, inconc = fable_summary(counts)
+    if not args.fable:
+        worst = None
+    elif inconc:
+        print(f"  inconclusive (< {FABLE_MIN_ITEMS} judged items, not counted): "
+              f"{', '.join(inconc)}")
 
     print(f"\npass criteria: {args.target} vs {args.baseline}")
     rows = criteria(arms[args.baseline], target, worst)
     for c in rows:
         flag = "PASS" if c["pass"] else "n/a" if c["pass"] is None else "FAIL"
         print(f"  {c['name']:<26} {c['value']:<62} {flag}")
+        if c.get("info"):
+            print(f"  {'':<26} {c['info']}")
     verdict = ("PASS" if all(c["pass"] for c in rows) else
                "FAIL" if any(c["pass"] is False for c in rows) else "INCOMPLETE")
     print(f"verdict: {verdict}")

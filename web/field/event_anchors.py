@@ -30,7 +30,7 @@ ANCHOR_ROOT = REPO / "data" / "event_anchors"
 LIVE = "live"
 KIND_DIGITS, KIND_ELIM = "digits", "elimination"
 KINDS = (KIND_DIGITS, KIND_ELIM)
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS event_anchors (
@@ -89,7 +89,7 @@ def schedule_rank(match_key) -> Optional[int]:
 
 
 def check_name(name, what: str) -> None:
-    if not isinstance(name, str) or not _NAME.match(name):
+    if not isinstance(name, str) or not _NAME.fullmatch(name):
         raise ValueError(f"bad {what} {name!r}")
 
 
@@ -185,6 +185,7 @@ def replace(namespace: str, event_key: str, match_key: str, anchors, *, replay_i
     new_files: list = []
     try:
         con.executescript(DDL)
+        con.execute("BEGIN IMMEDIATE")
         old = [r[0] for r in con.execute(OLD_PATHS_SQL, (namespace, event_key, match_key))]
         con.execute(DELETE_SQL, (namespace, event_key, match_key))
         for a in anchors:

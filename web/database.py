@@ -1138,6 +1138,7 @@ async def replace_event_anchors(namespace: str, event_key: str, match_key: str, 
     new_files: list = []
     async with aiosqlite.connect(DB_PATH) as db:
         try:
+            await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(ea.OLD_PATHS_SQL, (namespace, event_key, match_key))
             old = [r[0] for r in await cur.fetchall()]
             await db.execute(ea.DELETE_SQL, (namespace, event_key, match_key))

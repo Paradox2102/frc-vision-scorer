@@ -104,6 +104,11 @@ def test_a_failed_write_leaves_the_old_rows_and_no_new_files(store, monkeypatch)
     assert len(_files(store)) == 1
 
 
+def test_check_name_rejects_a_trailing_newline():
+    with pytest.raises(ValueError):
+        ea.check_name('live\n', 'namespace')
+
+
 def test_bad_names_and_kinds_are_refused_before_anything_is_written(store):
     for ns in ("../x", "", "a/b"):
         with pytest.raises(ValueError):
@@ -127,6 +132,7 @@ def test_clear_removes_one_namespace_of_one_event(store):
     assert ea.fetch("eval-full", "2026cur", ["3128"], "x", **store) == {}
     assert ea.fetch("eval-full", "2026hop", ["3128"], "x", **store)
     assert _files(store, "eval-full", "2026cur") == []
+
 
 @pytest.fixture()
 def adb(tmp_path, monkeypatch):

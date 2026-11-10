@@ -7064,7 +7064,10 @@ class InferenceJob:
                 self._window_segments = result["segments"]
                 # Digit-call cache for the offline tools (spec section 5),
                 # knob on or off.
-                summary["window_labels_digit_calls"] = result.get("digit_calls")
+                # wide_p is rebuilt from calls on load: don't double meta.json with it
+                summary["window_labels_digit_calls"] = {
+                    k: v for k, v in (result.get("digit_calls") or {}).items() if k != "wide_p"
+                } or None
                 if event_on and event_key and match_key:
                     anchors = list(result.get("anchors_out") or [])
                     try:

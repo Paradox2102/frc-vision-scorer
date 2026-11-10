@@ -254,7 +254,9 @@ def test_digit_calls_go_into_the_summary_with_the_knob_off(monkeypatch):
     _stage(monkeypatch, order, res)
     job, rec = _event_job(on=False)
     summary, _ = _apply(job, rec)
-    assert summary["window_labels_digit_calls"] == res["digit_calls"]
+    saved = summary["window_labels_digit_calls"]
+    assert "wide_p" not in saved                             # rebuilt from calls on load
+    assert saved == {k: v for k, v in res["digit_calls"].items() if k != "wide_p"}
     assert order == ["stage"]                                # no store access
     assert set(summary["window_labels"]) == set(res["stats"]) | {"seconds"}
 

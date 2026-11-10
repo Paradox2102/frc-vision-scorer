@@ -210,7 +210,7 @@ def relabel_match(item: dict, args, out_dir) -> dict:
     if rec.get("aborted"):
         rec["error"] = f"stage aborted: {rec['aborted']}"
     st = rec.get("stats") or {}
-    print(f"[{mk}] {row['id'][:8]} {rec.get('seconds', 0):.0f}s cache {rec.get('cache_origin')} "
+    print(f"[{mk}] {row['id'][:8]} {rec.get('seconds', 0):.0f}s cache {rec.get('cache_origin')} req {st.get('requests')} "
           f"digits {st.get('digit_named')} lineup {st.get('lineup_named')} rows "
           f"{st.get('lineup_rows')} (own {st.get('rows_own')} / borrowed {st.get('rows_borrowed')}"
           f" / elim {st.get('rows_elim')}) unlabelled {rec.get('unlabelled_share')}"

@@ -268,7 +268,8 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
                      elim_anchors_written=written[ea.KIND_ELIM], borrow_fetch_error=fetch_error)
     summary = relabelled.setdefault("summary", {})
     summary["window_labels"] = stats
-    summary["window_labels_digit_calls"] = result["digit_calls"]
+    summary["window_labels_digit_calls"] = {          # wide_p is rebuilt from calls on load
+        k: v for k, v in (result["digit_calls"] or {}).items() if k != "wide_p"} or None
     out["relabelled"] = relabelled
     return out
 

@@ -30,8 +30,9 @@ ANCHORS_PER_TEAM = 6
 MIN_ANCHORS = 2
 MIN_LINEUP_ROWS = 2
 MAX_ERROR_FRACTION = 0.10
+MIN_ERRORS_TO_ABORT_EARLY = 20
 STAGE_TIMEOUT_S = 360.0
-REQUEST_BATCH = 200
+REQUEST_BATCH = 32
 RANK_DIGITS, RANK_LINEUP = 2, 1
 SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup"}
 SOURCE_NONE = "window_none"
@@ -367,9 +368,11 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
                  stats: dict, where: str) -> list:
     """Send ``specs`` in batches of REQUEST_BATCH, checking the deadline and
     the session before each. Returns one result per spec (probs dict or
-    None). Aborts when more than MAX_ERROR_FRACTION of the pass failed, when
-    the reader latched off during a batch, or when a batch's answer count
-    does not match what was sent."""
+    None). Aborts when more than MAX_ERROR_FRACTION of the pass failed (checked
+    early after every batch against what was sent so far, with a floor of
+    MIN_ERRORS_TO_ABORT_EARLY, and against the whole pass after the last
+    batch), when the reader latched off during a batch, or when a batch's
+    answer count does not match what was sent."""
     results: list = []
     errors = 0
     for start in range(0, len(specs), REQUEST_BATCH):
@@ -391,7 +394,12 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
             else:
                 results.append(None)
                 errors += 1
-        if errors > MAX_ERROR_FRACTION * len(specs):
+        sent = start + len(batch)
+        if errors > max(MIN_ERRORS_TO_ABORT_EARLY, MAX_ERROR_FRACTION * sent):
+            stats["request_errors"] += errors
+            raise StageAbort(f"request errors: {errors} of {sent} sent so far "
+                             f"(pass of {len(specs)}) {where}")
+        if sent >= len(specs) and errors > MAX_ERROR_FRACTION * len(specs):
             stats["request_errors"] += errors
             raise StageAbort(f"request errors: {errors} of {len(specs)} {where}")
     stats["request_errors"] += errors
@@ -411,6 +419,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
         raise StageAbort("no windows")
     if not session.available:                    # e.g. no token: fail before decoding video
         raise StageAbort(f"reader unavailable: {session.disabled_reason}")
+    if not roster:                               # only escape options: nothing could be named
+        raise StageAbort("no roster: the match has no red or blue teams")
 
     # 1. where each sample is in the main view
     view_wh = (params.view[2], params.view[3])

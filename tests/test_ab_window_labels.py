@@ -31,6 +31,21 @@ def test_wait_returns_once_the_replay_has_the_stage_summary(tmp_path, monkeypatc
     assert polls["n"] == 3
 
 
+def test_wait_warns_when_the_stage_aborted(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ab, "REPO", tmp_path)
+    meta = tmp_path / "web" / "replays" / "job3" / "meta.json"
+    meta.parent.mkdir(parents=True)
+    meta.write_text(json.dumps({"summary": {"window_labels": {"aborted": "no roster"}}}))
+    monkeypatch.setattr(ab, "_replay_saved", lambda job_id, tries=1, delay=0.0: True)
+    assert ab._wait_window_labels("job3", timeout_s=5.0, delay=0.0) is True
+    assert "  WARNING: window_labels aborted for job3: no roster" in capsys.readouterr().out
+
+
+def test_wait_default_timeout_covers_the_stage_and_the_encode():
+    import inspect
+    assert inspect.signature(ab._wait_window_labels).parameters["timeout_s"].default == 600.0
+
+
 def test_wait_gives_up_after_the_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(ab, "REPO", tmp_path)
     monkeypatch.setattr(ab, "_replay_saved", lambda job_id, tries=1, delay=0.0: False)

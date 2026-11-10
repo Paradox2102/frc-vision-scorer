@@ -88,6 +88,17 @@ def test_incomplete_jobs_make_no_reader_calls(monkeypatch, status):
     assert not seen and rec.frames == FRAMES and "window_labels" not in summary
 
 
+def test_a_user_stop_makes_no_reader_calls(monkeypatch):
+    # a STOP ends the analysis loop early but the status still becomes "completed"
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    job._stopped = True
+    summary, timings = _apply(job, rec)
+    assert not seen and rec.frames == FRAMES
+    assert "window_labels" not in summary and timings == {"total": 100.0}
+    assert job._window_segments is None
+
+
 def test_success_rewrites_frames_events_segments_and_reports(monkeypatch):
     seen = _stub(monkeypatch, _ok_result())
     job, rec = _job()
@@ -173,4 +184,5 @@ def test_window_label_session_is_a_dedicated_jev_session(monkeypatch):
     job, _rec = _job()
     del job._window_label_session
     s = InferenceJob._window_label_session(job)
-    assert isinstance(s, app_mod.jev_reader.JevSession) and s.timeout_s == 60.0
+    assert isinstance(s, app_mod.jev_reader.JevSession) and s.timeout_s == 30.0
+    assert s.retries == 1

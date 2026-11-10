@@ -1526,6 +1526,7 @@ class InferenceJob:
         # the replay per-frame labels, the replay events and
         # match_robot_identity_segment.
         self._slot_segments: Optional[dict] = None
+        self._window_segments: Optional[dict] = None   # window_labels stage rows
         # Exact per-(frame, slot) discontinuity rows (web/field/slot_boundaries.py);
         # collected only with slot_boundary_log / identity_segment_resolve.
         self._slot_boundaries: list[dict] = []
@@ -6936,7 +6937,7 @@ class InferenceJob:
         jev, and its usage was already folded into the timings."""
         cfg = getattr(self, "config", None)
         return jev_reader.JevSession(getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
-                                     timeout_s=60.0)
+                                     timeout_s=30.0, retries=1)
 
     async def _apply_window_labels(self, rec, summary: dict, timings: dict) -> None:
         """window_labels knob: relabel the finished replay from Jev reads on
@@ -6950,6 +6951,8 @@ class InferenceJob:
         cfg = getattr(self, "config", None)
         self._window_segments = None
         if not getattr(cfg, "window_labels", False) or getattr(self, "status", None) != "completed":
+            return
+        if getattr(self, "_stopped", False):     # user STOP: "completed" on a partial match
             return
         from web.field import window_labels as wl
         import zlib

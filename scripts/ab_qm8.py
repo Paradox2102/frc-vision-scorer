@@ -686,17 +686,24 @@ def _replay_saved(job_id: str, tries: int = 10, delay: float = 0.5) -> bool:
     return False
 
 
-def _wait_window_labels(job_id: str, timeout_s: float = 420.0, delay: float = 2.0) -> bool:
+def _wait_window_labels(job_id: str, timeout_s: float = 600.0, delay: float = 2.0) -> bool:
     """With window_labels on, the job reports "completed" before the finalize
     stage runs, so the replay row and meta.json appear minutes later. Wait for
-    the replay and for its summary to carry the stage's stats. 420 s = the
-    stage's 360 s deadline plus a margin."""
+    the replay and for its summary to carry the stage's stats. 600 s = the
+    stage's 360 s deadline plus the re-resolve, reader shutdown and the
+    replay's video encode. Warns (but still returns True) when the stage
+    aborted."""
     meta = REPO / "web" / "replays" / job_id / "meta.json"
     end = time.time() + timeout_s
     while time.time() < end:
         if _replay_saved(job_id, tries=1, delay=0.0) and meta.exists():
             try:
-                if "window_labels" in (json.loads(meta.read_text()).get("summary") or {}):
+                summary = json.loads(meta.read_text()).get("summary") or {}
+                if "window_labels" in summary:
+                    reason = (summary["window_labels"] or {}).get("aborted")
+                    if reason:
+                        print(f"  WARNING: window_labels aborted for {job_id}: {reason}",
+                              flush=True)
                     return True
             except (OSError, ValueError):
                 pass

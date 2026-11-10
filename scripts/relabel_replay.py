@@ -73,6 +73,27 @@ def load_inputs(replay_id: str, calibration_version: str | None):
     return row, json.loads(meta_p.read_text()), video, chosen["calibration"], roster
 
 
+def job_roster(match_key: str) -> tuple[list[str], list[str]]:
+    """(red, blue) team numbers in the order a job gets them: match_robots by
+    alliance then driver-station position, as database.get_match_by_key /
+    app._load_db_roster read them. Roster order sets the option order in every
+    request and the lineup-letter shuffle, so the tool must match the job.
+    Read-only."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{REPO / 'frc_scorer.db'}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT r.alliance, r.team_number FROM match_robots r "
+            "JOIN matches m ON m.id = r.match_id "
+            "WHERE m.tba_match_key = ? ORDER BY r.alliance, r.position",
+            (match_key,)).fetchall()
+    finally:
+        con.close()
+    red = [str(t) for a, t in rows if a == "red" and t is not None]
+    blue = [str(t) for a, t in rows if a == "blue" and t is not None]
+    return red, blue
+
+
 def score_lines(meta: dict, row: dict, video: Path) -> list[str]:
     """Identity metrics vs hand ground truth, full match and auto."""
     match_key = row["match_key"]
@@ -109,17 +130,20 @@ def main() -> None:
     ap.add_argument("--save-lineup", default=None, help="write the lineup card JPEG here")
     args = ap.parse_args()
 
-    row, meta, video, cal, roster = load_inputs(args.replay, args.calibration_version)
+    row, meta, video, cal, _roster = load_inputs(args.replay, args.calibration_version)
     fps = _probe_fps(video)
     if not fps:
         raise SystemExit(f"cannot read fps from {video}")
-    session = jev_reader.JevSession(jev_reader.DEFAULT_MODEL, timeout_s=60.0)
+    red, blue = job_roster(row["match_key"])
+    if not red and not blue:
+        raise SystemExit(f"no roster rows in match_robots for {row['match_key']}")
+    session = jev_reader.JevSession(jev_reader.DEFAULT_MODEL, timeout_s=30.0, retries=1)
     if not session.available:
         raise SystemExit(f"Jev unavailable: {session.disabled_reason}")
     params = wl.Params(
         fps=fps,
-        red=sorted(t for t, a in roster.items() if a == "red"),
-        blue=sorted(t for t, a in roster.items() if a == "blue"),
+        red=red,
+        blue=blue,
         view=tuple(load_layout()["main"].crop),
         ground_center_offset_m=args.ground_center_offset,
         lineup_min_p=args.lineup_min_p,

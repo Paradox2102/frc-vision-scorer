@@ -542,6 +542,42 @@ def test_one_failure_in_nine_aborts_and_one_in_eighteen_does_not():
     assert res["aborted"] is None and res["stats"]["request_errors"] == 1
 
 
+def test_batches_are_small_so_checks_run_often():
+    assert wl.REQUEST_BATCH == 32
+    assert wl.MIN_ERRORS_TO_ABORT_EARLY == 20
+
+
+def test_a_pass_where_every_request_fails_stops_after_the_first_batch():
+    frames = _frames({"B1": _still(range(300))}, 300)    # 15 windows -> 135 digit requests
+    s = FakeSession(team_p={"3128": 0.9}, fail=10_000)
+    res = _run(frames, s)
+    assert res["aborted"] and "request errors: 32 of 32 sent so far" in res["aborted"]
+    assert "digit pass" in res["aborted"]
+    assert s.asked == [("team", 32)]                     # not all 5 batches
+    assert res["labels"] is None and res["stats"]["request_errors"] == 32
+
+
+def test_a_few_early_errors_do_not_abort_before_the_pass_ends():
+    # 3 errors in the first batch of 32 is 9% of what was sent but under the floor of 20
+    frames = _frames({"B1": _still(range(300))}, 300)    # 135 requests, 14 allowed
+    res = _run(frames, FakeSession(team_p={"3128": 0.9}, fail=3))
+    assert res["aborted"] is None and res["stats"]["request_errors"] == 3
+
+
+def test_no_roster_aborts_before_decoding_video_or_sending_requests():
+    calls = []
+
+    def source(video_path, frame_nums, view):
+        calls.append(1)
+        yield from _source(video_path, frame_nums, view)
+
+    s = FakeSession(team_p={"3128": 0.9})
+    res = _run_clocked(_frames({"B1": _still(range(20))}, 20), s, _Clock(), source,
+                       red=[], blue=[])
+    assert res["aborted"] and "no roster" in res["aborted"]
+    assert calls == [] and s.asked == [] and res["labels"] is None
+
+
 def test_an_unavailable_reader_aborts_before_decoding_video():
     calls = []
 

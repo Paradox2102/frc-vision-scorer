@@ -13068,6 +13068,9 @@ async def correct_replay_identity(job_id: str, request: Request):
     if resolved_identity_id is None:
         resolved_identity_id = rec["slot"]
     resolved_slot = rec.get("slot")
+    # The HUD renderer relabels the video from recorded corrections; read the
+    # slot's label BEFORE the identity row below is updated.
+    render_correction = await _record_slot_correction(job_id, rec, team)
         
     alliance = rec["alliance"]
     # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence).
@@ -13122,7 +13125,37 @@ async def correct_replay_identity(job_id: str, request: Request):
                 minted += 1
     return {"status": "ok", "slot": resolved_slot if resolved_slot is not None else -1,
             "identity_id": resolved_identity_id, "team_number": team,
-            "verified_exemplars": minted}
+            "verified_exemplars": minted, "render_correction": render_correction}
+
+
+async def _record_slot_correction(job_id: str, rec: dict, team: str) -> dict:
+    """Append {slot, old, new} to replay_slot_corrections (HUD post-render
+    spec section 2). ``old`` is the slot's label just before this correction:
+    the latest recorded correction's new team, else the finalize label
+    (meta.summary.slot_labels, AMBIGUOUS -> None), else the identity row's
+    team. An identity row without a slot is not recorded."""
+    from web import hud_labels
+    slot = rec.get("slot")
+    if slot is None:
+        return {"recorded": False,
+                "reason": "this identity has no slot, so the video cannot be relabelled"}
+    slot = int(slot)
+    prior = [c for c in await database.get_slot_corrections(job_id) if c["slot"] == slot]
+    if prior:
+        old = hud_labels.norm_team(prior[-1]["new_team"])
+    else:
+        summary = None
+        replay = await database.get_replay(job_id)
+        meta_path = Path(replay["meta_path"]) if replay and replay.get("meta_path") else None
+        if meta_path is not None and meta_path.exists():
+            try:
+                meta = await asyncio.to_thread(lambda: json.loads(meta_path.read_text()))
+                summary = meta.get("summary")
+            except Exception as e:
+                print(f"[correct] meta.json unreadable, old label from the identity row: {e}")
+        old = hud_labels.label_before_correction(summary, slot, rec.get("team_number"))
+    await database.insert_slot_correction(job_id, slot, old, team)
+    return {"recorded": True, "slot": slot, "old": old, "new": team}
 
 
 @app.get("/api/gallery")

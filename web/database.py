@@ -182,6 +182,19 @@ CREATE TABLE IF NOT EXISTS match_robot_crop (
     image BLOB,
     embed_model TEXT
 );
+-- Manual slot corrections (POST /api/replays/{id}/correct), in order (id).
+-- The HUD renderer relabels the video from them: old = the slot's label just
+-- before the correction (NULL = unlabelled / AMBIGUOUS), new = the team typed.
+CREATE TABLE IF NOT EXISTS replay_slot_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    replay_id TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    old_team TEXT,
+    new_team TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_replay_slot_corrections
+    ON replay_slot_corrections(replay_id, slot, id);
 """
 
 
@@ -730,9 +743,49 @@ async def get_replay(replay_id: str) -> Optional[Dict]:
 
 
 async def delete_replay(replay_id: str) -> None:
+    """Delete a replay row and its recorded slot corrections."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM replays WHERE id = ?", (replay_id,))
+        await db.execute("DELETE FROM replay_slot_corrections WHERE replay_id = ?",
+                         (replay_id,))
         await db.commit()
+
+
+async def insert_slot_correction(replay_id: str, slot: int, old_team, new_team) -> None:
+    """Append one manual slot correction (HUD post-render spec section 2)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO replay_slot_corrections (replay_id, slot, old_team, new_team) "
+            "VALUES (?, ?, ?, ?)", (replay_id, int(slot), old_team, new_team))
+        await db.commit()
+
+
+async def get_slot_corrections(replay_id: str) -> List[Dict]:
+    """A replay's slot corrections, oldest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM replay_slot_corrections WHERE replay_id = ? ORDER BY id",
+            (replay_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+def get_slot_corrections_sync(replay_id: str, db_path=None) -> List[Dict]:
+    """get_slot_corrections for the render subprocess and scripts (plain
+    sqlite3). A DB without the table (older file) has no corrections."""
+    import sqlite3
+    con = sqlite3.connect(str(db_path or DB_PATH), timeout=30)
+    try:
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "SELECT * FROM replay_slot_corrections WHERE replay_id = ? ORDER BY id",
+                (replay_id,)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
 
 
 async def update_replay_teams(replay_id: str, key: str, value: str) -> None:

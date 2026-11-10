@@ -13267,7 +13267,12 @@ async def correct_replay_identity(job_id: str, request: Request):
     resolved_slot = rec.get("slot")
     # The HUD renderer relabels the video from recorded corrections; read the
     # slot's label BEFORE the identity row below is updated.
-    render_correction = await _record_slot_correction(job_id, rec, team)
+    # Recording must never block the correction itself (e.g. a locked DB).
+    try:
+        render_correction = await _record_slot_correction(job_id, rec, team)
+    except Exception as e:
+        print(f"[correct] slot-correction record failed for {job_id}: {e}")
+        render_correction = {"recorded": False, "reason": f"record failed: {e}"}
         
     alliance = rec["alliance"]
     # 1. update identity (preserve slot_label/alliance/confirmed/source/confidence).

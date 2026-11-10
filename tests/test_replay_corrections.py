@@ -101,3 +101,22 @@ def test_recorded_old_is_what_the_renderer_compares_frames_against(client):
     corr = hud_labels.effective_corrections(rows)
     assert corr == {0: ("111", "999")}
     assert hud_labels.relabel_counts(frames, corr, slot_label) == {"B1": 3}
+
+
+
+def test_a_failed_correction_record_never_blocks_the_correction(client, monkeypatch):
+    """A DB error while recording the correction must not stop the identity update."""
+    from web import app as app_mod
+
+    async def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(app_mod, "_record_slot_correction", boom)
+    c, tmp = client
+    _seed(tmp, summary={})
+    r = c.post("/api/replays/job-1/correct", json={"slot": 0, "team_number": "999"})
+    assert r.status_code == 200, r.text
+    assert r.json()["render_correction"] == {"recorded": False,
+                                             "reason": "record failed: database is locked"}
+    ident = asyncio.run(database.get_match_identities("job-1"))
+    assert [row["team_number"] for row in ident] == ["999"]

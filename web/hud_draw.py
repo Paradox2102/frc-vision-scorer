@@ -67,8 +67,13 @@ def draw_flags(env=None) -> HudFlags:
                        for f, name, d in FLAG_ENV})
 
 
+def flags_to_dict(flags: HudFlags) -> dict:
+    """JSON-ready snapshot (meta.summary.hud_static.flags)."""
+    return dataclasses.asdict(flags)
+
+
 def flags_from_dict(d: Optional[dict]) -> HudFlags:
-    """HudFlags from a recorded ``dataclasses.asdict`` snapshot (unknown keys
+    """HudFlags from a flags_to_dict() snapshot (unknown keys
     ignored, missing ones default)."""
     names = {f.name for f in dataclasses.fields(HudFlags)}
     return HudFlags(**{k: bool(v) for k, v in (d or {}).items() if k in names})

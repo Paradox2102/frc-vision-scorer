@@ -1,7 +1,5 @@
 """web/hud_draw.py helpers that the golden image does not pin: flag snapshots,
 the view crop, aHash, and the mask polygon round trip."""
-import dataclasses
-
 import cv2
 import numpy as np
 
@@ -18,7 +16,7 @@ def test_draw_flags_reads_env_with_the_app_defaults():
 
 def test_flags_round_trip_through_a_dict():
     f = hud_draw.HudFlags(robot_box=True, coasting_ghost=False)
-    assert hud_draw.flags_from_dict(dataclasses.asdict(f)) == f
+    assert hud_draw.flags_from_dict(hud_draw.flags_to_dict(f)) == f
     assert hud_draw.flags_from_dict({"robot_box": 1, "unknown": True}) == hud_draw.HudFlags(robot_box=True)
     assert hud_draw.flags_from_dict(None) == hud_draw.HudFlags()
 

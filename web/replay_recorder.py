@@ -3,9 +3,14 @@
 Knows nothing about FastAPI, jobs, or the database: it consumes composited frames
 and plain-dict metadata records and produces hud.mp4 + meta.json + thumb.jpg in a
 given output directory.  The caller owns DB insertion.
+
+``record_video=False`` (the hud_post_render knob) is metadata-only: no ffmpeg,
+the same meta.json, a provisional thumb.jpg, and the per-frame draw list
+(``draw.jsonl.gz``) that web/hud_render.py renders the video from later.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import shutil
 import subprocess
@@ -25,7 +30,11 @@ class ReplayRecorder:
     ``mp4v`` (MPEG-4 Part 2), which browsers cannot decode.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, record_video: bool = True, video_name: str = "hud.mp4") -> None:
+        self.record_video = bool(record_video)
+        self.video_name = video_name
+        self._meta_open = False          # record_video=False: opened, no encoder
+        self._draw_fh = None             # draw.jsonl.gz, opened on the first draw line
         self._writer: Optional[cv2.VideoWriter] = None
         self._proc: Optional[subprocess.Popen] = None
         self._out_dir: Optional[Path] = None
@@ -39,7 +48,7 @@ class ReplayRecorder:
 
     @property
     def is_open(self) -> bool:
-        return self._writer is not None or self._proc is not None
+        return self._writer is not None or self._proc is not None or self._meta_open
 
     def open_lazy(self, first_frame: np.ndarray, fps: float, out_dir) -> None:
         if self.is_open:
@@ -50,7 +59,10 @@ class ReplayRecorder:
         h, w = first_frame.shape[:2]
         # libx264 + yuv420p require even dimensions; lock to even and resize frames to match.
         self.height, self.width = h - (h % 2), w - (w % 2)
-        path = str(self._out_dir / "hud.mp4")
+        if not self.record_video:
+            self._meta_open = True
+            return
+        path = str(self._out_dir / self.video_name)
 
         if shutil.which("ffmpeg"):
             self._proc = subprocess.Popen(
@@ -79,12 +91,17 @@ class ReplayRecorder:
             writer.release()
         raise RuntimeError("Could not open ffmpeg or an OpenCV VideoWriter (avc1/mp4v)")
 
-    def add_frame(self, frame: np.ndarray, record: dict) -> None:
+    def add_frame(self, frame: np.ndarray, record: dict, draw: Optional[dict] = None) -> None:
+        """Encode ``frame`` (unless metadata-only), append ``record`` to the
+        meta frames and, when given, ``draw`` as this frame's draw-list line
+        (its ``"i"`` is set to the replay frame index)."""
         if not self.is_open:
             raise RuntimeError("add_frame called before open_lazy")
         if frame.shape[:2] != (self.height, self.width):
             frame = cv2.resize(frame, (self.width, self.height))
-        if self._proc is not None:
+        if not self.record_video:
+            pass
+        elif self._proc is not None:
             try:
                 self._proc.stdin.write(np.ascontiguousarray(frame).tobytes())
             except (BrokenPipeError, ValueError):
@@ -98,11 +115,17 @@ class ReplayRecorder:
         self.frames.append(rec)
         if self._mid_frame is None or i == len(self.frames) // 2:
             self._mid_frame = frame.copy()
+        if draw is not None:
+            if self._draw_fh is None:
+                self._draw_fh = gzip.open(self._out_dir / "draw.jsonl.gz", "wt",
+                                          encoding="utf-8")
+            self._draw_fh.write(json.dumps({**draw, "i": i}, separators=(",", ":")) + "\n")
 
     def add_event(self, event: dict) -> None:
         self.events.append(dict(event))
 
-    def finalize(self, status: str, summary: dict, diagnostics: Optional[Any] = None) -> dict:
+    def close_video(self) -> None:
+        """Finish the encoder (and the draw list); safe to call twice."""
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
@@ -113,6 +136,12 @@ class ReplayRecorder:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
+        if self._draw_fh is not None:
+            self._draw_fh.close()
+            self._draw_fh = None
+
+    def finalize(self, status: str, summary: dict, diagnostics: Optional[Any] = None) -> dict:
+        self.close_video()
         frame_count = len(self.frames)
         duration = round(frame_count / self.fps, 4) if self.fps else 0.0
 
@@ -142,7 +171,7 @@ class ReplayRecorder:
             "thumb_path": str(self._out_dir / "thumb.jpg"),
             "fps": self.fps, "frame_count": frame_count, "duration_sec": duration,
             "width": self.width, "height": self.height,
-            "codec": self.codec, "status": status,
+            "codec": self.codec if self.record_video else None, "status": status,
         }
         if diagnostics is not None:
             res["diagnostics_path"] = str(self._out_dir / "diagnostics.jsonl")

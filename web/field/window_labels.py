@@ -604,6 +604,27 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
     return results
 
 
+def window_fingerprint(frames: list, w: Window, requests: list) -> dict:
+    """What a cached digit-call list must match to be reused (spec section 5):
+    the slot, the window's first source frame, its sample frames and the
+    (kind, k) requests the stage would send now. Window ids are positional
+    and the in-view filter depends on calibration and offset, so a mismatch
+    means the cached calls belong to a different window."""
+    return {"slot": w.slot, "first_frame": int(frames[w.idx[0]]["frame_num"]),
+            "samples": [int(frames[i]["frame_num"]) for i in w.samples],
+            "requests": [[kind, int(k)] for kind, k in requests]}
+
+
+def load_digit_calls(obj) -> dict:
+    """A digit-call cache as JSON gives it back (string keys) -> int window
+    ids and sample numbers. An already-converted cache passes unchanged."""
+    obj = obj or {}
+    return {"calls": {int(w): list(c) for w, c in (obj.get("calls") or {}).items()},
+            "wide_p": {int(w): {int(k): p for k, p in (d or {}).items()}
+                       for w, d in (obj.get("wide_p") or {}).items()},
+            "fingerprints": {int(w): fp for w, fp in (obj.get("fingerprints") or {}).items()}}
+
+
 def _requests(windows: list, tiles: dict) -> dict:
     """wid -> the digit requests for that window, in send order: wide and
     zoom per tile (by sample number), then one grid."""
@@ -622,16 +643,31 @@ def _wide_p(requests: dict, calls: dict) -> dict:
 
 
 def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats) -> dict:
-    """Digit calls for every window with tiles. Returns {"calls": wid ->
-    [probs or None] in request order, "wide_p": wid -> {k: probs}}."""
+    """Digit calls for every window with tiles. A window's calls come from
+    ``params.digit_calls`` when its fingerprint matches and the call count
+    fits (cached failures stay failures); every other window is requested.
+    Returns the cache for exactly the calls used: {"calls": wid -> [probs or
+    None] in request order, "wide_p": wid -> {k: probs}, "fingerprints"}."""
     requests = _requests(windows, tiles)
-    specs = [(wid, kind, k) for wid, reqs in requests.items() for kind, k in reqs]
+    by_wid = {w.wid: w for w in windows}
+    fingerprints = {wid: window_fingerprint(frames, by_wid[wid], reqs)
+                    for wid, reqs in requests.items()}
+    cache = load_digit_calls(params.digit_calls) if params.digit_calls else None
+    calls: dict = {}
+    specs = []
+    for wid, reqs in requests.items():
+        old = cache["calls"].get(wid) if cache else None
+        if (old is not None and len(old) == len(reqs)
+                and cache["fingerprints"].get(wid) == fingerprints[wid]):
+            calls[wid] = list(old)
+        else:
+            specs += [(wid, kind, k) for kind, k in reqs]
     answers = _ask_batched(session, specs, digit_item, "team", params, clock, stats,
                            "in the digit pass")
-    calls: dict = {}
     for (wid, _kind, _k), probs in zip(specs, answers):
         calls.setdefault(wid, []).append(probs)
-    return {"calls": calls, "wide_p": _wide_p(requests, calls)}
+    calls = {wid: calls[wid] for wid in requests}           # window order
+    return {"calls": calls, "wide_p": _wide_p(requests, calls), "fingerprints": fingerprints}
 
 
 def _lineup_rows(digit, start_s, tiles, wide_p, roster, colours, params, crops) -> tuple:

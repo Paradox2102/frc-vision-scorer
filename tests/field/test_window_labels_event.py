@@ -448,3 +448,68 @@ def test_an_abort_returns_no_anchors_no_calls_and_no_cards():
     assert res["lineup_jpeg"] is None and res["lineup_jpeg_blue"] is None
     assert res["row_sources"] == {}
     assert {"rows_own", "rows_borrowed", "rows_elim"} <= set(res["stats"])
+
+
+class NoDigits(FakeSession):
+    """Fails the test if a digit request is sent; lineup answers from who_p."""
+
+    def ask(self, items, question):
+        assert question != "team", "digit request sent although every window was cached"
+        return super().ask(items, question)
+
+
+def test_digit_calls_round_trip_through_json_and_skip_every_request():
+    frames = _lineup_frames()
+    first = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), seed=1)
+    cache = json.loads(json.dumps(first["digit_calls"]))           # string keys, as stored
+    assert set(cache) == {"calls", "wide_p", "fingerprints"}
+    s = NoDigits(who_p={"B": 0.9})
+    again = _run(frames, s, seed=1, digit_calls=cache)
+    assert again["labels"] == first["labels"] and again["lineup_jpeg"] == first["lineup_jpeg"]
+    assert again["stats"]["digit_named"] == first["stats"]["digit_named"] == 8
+    assert [q for q, _n in s.asked] == ["who"]
+    assert again["digit_calls"] == first["digit_calls"]
+
+
+def test_fingerprint_names_slot_first_frame_samples_and_requests():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    res = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    fp = res["digit_calls"]["fingerprints"][0]
+    w = wl.build_windows(frames, FPS)[0]
+    assert fp == {"slot": "B1", "first_frame": 420,
+                  "samples": [frames[i]["frame_num"] for i in w.samples],
+                  "requests": [["wide", 1], ["zoom", 1], ["wide", 2], ["zoom", 2], ["wide", 3],
+                               ["zoom", 3], ["wide", 4], ["zoom", 4], ["grid", 0]]}
+
+
+def test_a_window_whose_fingerprint_changed_is_requested_fresh_and_the_rest_reused():
+    frames = _frames({"B1": _still(range(20)), "B2": _still(range(20), (9.0, 6.0))}, 20)
+    first = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    cache = json.loads(json.dumps(first["digit_calls"]))
+    b2 = next(w.wid for w in wl.build_windows(frames, FPS) if w.slot == "B2")
+    cache["fingerprints"][str(b2)]["samples"][0] += 1     # e.g. another calibration's samples
+    s = FakeSession(team_p={"6773": 0.9})
+    res = _run(frames, s, digit_calls=cache)
+    assert s.asked == [("team", 9)]                       # B2 only: 4 wide + 4 zoom + 1 grid
+    assert res["labels"][(0, "B1")][0] == "3128" and res["labels"][(0, "B2")][0] == "6773"
+    assert res["digit_calls"]["fingerprints"][b2] == first["digit_calls"]["fingerprints"][b2]
+
+
+def test_a_cached_window_with_the_wrong_number_of_calls_is_requested_fresh():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    first = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    cache = json.loads(json.dumps(first["digit_calls"]))
+    cache["calls"]["0"] = cache["calls"]["0"][:-1]
+    s = FakeSession(team_p={"3128": 0.9})
+    _run(frames, s, digit_calls=cache)
+    assert s.asked == [("team", 9)]
+
+
+def test_cached_failed_calls_are_reused_as_failures():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    first = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    cache = json.loads(json.dumps(first["digit_calls"]))
+    cache["calls"]["0"][0] = None
+    res = _run(frames, NoDigits(), digit_calls=cache)
+    assert res["aborted"] is None and res["digit_calls"]["calls"][0][0] is None
+    assert res["stats"]["request_errors"] == 0 and res["labels"][(0, "B1")][0] == "3128"

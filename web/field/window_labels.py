@@ -286,3 +286,216 @@ def restamp_events(frames: list, events: list) -> int:
         ev["team_number"] = team
         ev["robot_label"] = team or ev.get("slot")
     return changed
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Params:
+    fps: float                                 # source video fps
+    red: list
+    blue: list
+    view: tuple = (0, 0, 1920, 723)            # main camera's crop of the composite
+    ground_center_offset_m: float = 0.0        # the job's knob (positions already pushed)
+    lineup_min_p: float = 0.8                  # > 1 disables the lineup pass
+    deadline: Optional[float] = None           # time.monotonic() value; None = no limit
+    seed: int = 0                              # lineup letter order
+    model_key: str = "jev-1.14.0"
+    ball_note: Optional[str] = None            # None = jev_reader.BALL_NOTE_2026
+
+
+class StageAbort(Exception):
+    """The stage cannot finish; the caller keeps the labels it had."""
+
+
+def _stats() -> dict:
+    return {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
+            "unlabelled": 0, "lineup_rows": 0, "requests": 0, "input_tokens": 0,
+            "cost_cents": 0.0, "request_errors": 0, "aborted": None}
+
+
+def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
+                      frame_source=None, clock=time.monotonic) -> dict:
+    """Run the whole stage. Blocking; reads ``frames`` but never changes them.
+
+    ``session``: a ``JevSession`` (anything with ``ask``, ``available``,
+    ``disabled_reason`` and ``stats``). ``frame_source(video_path, frame_nums,
+    view)`` yields (frame_num, main-view image); defaults to
+    ``window_crops.iter_view_frames``.
+
+    Returns {"aborted": reason or None, "labels": lab or None, "segments":
+    {slot id: rows} or None, "stats": {...}, "lineup_jpeg": bytes or None}.
+    On abort, labels and segments are None and nothing should be applied."""
+    stats = _stats()
+    before = _usage(session)
+    try:
+        out = _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats)
+    except StageAbort as e:
+        stats["aborted"] = str(e)
+        out = None
+    except Exception as e:                       # never let the stage break a job
+        stats["aborted"] = f"error: {type(e).__name__}: {e}"
+        out = None
+    after = _usage(session)
+    stats["requests"] = after[0] - before[0]
+    stats["input_tokens"] = after[1] - before[1]
+    stats["cost_cents"] = round((after[2] - before[2]) * 100.0, 2)
+    if out is None:
+        return {"aborted": stats["aborted"], "labels": None, "segments": None,
+                "stats": stats, "lineup_jpeg": None}
+    return {"aborted": None, "stats": stats, **out}
+
+
+def _usage(session) -> tuple:
+    try:
+        st = session.stats()
+        return (int(st.get("requests", 0)), int(st.get("input_tokens", 0)),
+                float(st.get("cost_usd", 0.0)))
+    except Exception:
+        return (0, 0, 0.0)
+
+
+def _check(params: Params, clock, where: str) -> None:
+    if params.deadline is not None and clock() > params.deadline:
+        raise StageAbort(f"deadline passed {where}")
+
+
+def _ask_batched(session, specs: list, build, question: str, params: Params, clock,
+                 stats: dict, where: str) -> list:
+    """Send ``specs`` in batches of REQUEST_BATCH, checking the deadline and
+    the session before each. Returns one result per spec (probs dict or
+    None). Aborts when more than MAX_ERROR_FRACTION of the pass failed."""
+    results: list = []
+    errors = 0
+    for start in range(0, len(specs), REQUEST_BATCH):
+        _check(params, clock, where)
+        if not session.available:
+            raise StageAbort(f"reader unavailable: {session.disabled_reason}")
+        batch = specs[start:start + REQUEST_BATCH]
+        for res in session.ask([build(s) for s in batch], question):
+            if "probs" in res:
+                results.append(res["probs"])
+            else:
+                results.append(None)
+                errors += 1
+        if errors > MAX_ERROR_FRACTION * len(specs):
+            stats["request_errors"] += errors
+            raise StageAbort(f"request errors: {errors} of {len(specs)} {where}")
+    stats["request_errors"] += errors
+    return results
+
+
+def _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats) -> dict:
+    from web import jev_reader
+    from web.field import window_crops as crops
+
+    _check(params, clock, "before start")
+    red, blue = [str(t) for t in params.red], [str(t) for t in params.blue]
+    roster = red + blue
+    windows = build_windows(frames, params.fps)
+    stats["windows"] = len(windows)
+    if not windows:
+        raise StageAbort("no windows")
+
+    # 1. where each sample is in the main view
+    view_wh = (params.view[2], params.view[3])
+    want: dict = {}                                  # frame_num -> [(wid, k, u, v, side)]
+    for w in windows:
+        for k, i in enumerate(w.samples, 1):
+            row = next(r for r in frames[i]["robots"] if r.get("slot") == w.slot)
+            tg = crops.target(cal, row["field_pos"], params.ground_center_offset_m)
+            if tg is None or not crops.in_view(tg[0], tg[1], view_wh):
+                continue
+            want.setdefault(int(frames[i]["frame_num"]), []).append((w.wid, k) + tg)
+
+    # 2. one sequential video pass; keep only the tiles
+    tiles: dict = {}                                 # wid -> {k: tile}
+    source = frame_source or crops.iter_view_frames
+    for n, (frame_num, img) in enumerate(source(video_path, list(want), params.view), 1):
+        for wid, k, u, v, side in want.get(frame_num, ()):
+            tiles.setdefault(wid, {})[k] = crops.wide_tile(img, u, v, side)[0]
+        if n % 50 == 0:
+            _check(params, clock, "during the video pass")
+    if not tiles:
+        raise StageAbort("no frames decoded from the source video")
+    _check(params, clock, "after the video pass")
+
+    # 3. digit pass: wide + zoom per tile, one grid per window
+    specs = []
+    for w in windows:
+        t = tiles.get(w.wid)
+        if not t:
+            continue
+        for k in sorted(t):
+            specs += [(w.wid, "wide", k), (w.wid, "zoom", k)]
+        specs.append((w.wid, "grid", 0))
+
+    def digit_item(spec):
+        wid, kind, k = spec
+        t = tiles[wid]
+        img = (crops.send_wide(t[k]) if kind == "wide" else crops.zoom_tile(t[k])
+               if kind == "zoom" else crops.grid_image([t[j] for j in sorted(t)]))
+        return jev_reader.build_jev_window_payload(params.model_key, crops.jpeg(img), kind,
+                                                   red, blue)
+
+    answers = _ask_batched(session, specs, digit_item, "team", params, clock, stats,
+                           "in the digit pass")
+    calls: dict = {}                                 # wid -> [probs or None]
+    wide_p: dict = {}                                # wid -> {k: probs}
+    for (wid, kind, k), probs in zip(specs, answers):
+        calls.setdefault(wid, []).append(probs)
+        if kind == "wide" and probs:
+            wide_p.setdefault(wid, {})[k] = probs
+    digit = {}
+    for wid, c in calls.items():
+        d = digit_decision(c, roster)
+        if d:
+            digit[wid] = d
+    stats["digit_named"] = len(digit)
+
+    # 4. lineup card from the most confident digit labels
+    start_s = {w.wid: frames[w.idx[0]]["frame_num"] / float(params.fps) for w in windows}
+    anchors = pick_anchors(digit, start_s)
+    order = [t for t in roster if t in anchors]
+    random.Random(params.seed).shuffle(order)
+    letters = {LETTERS[j]: t for j, t in enumerate(order[:len(LETTERS)])}
+    stats["lineup_rows"] = len(letters)
+    lineup = {}
+    lineup_jpeg = None
+    if len(letters) >= MIN_LINEUP_ROWS and params.lineup_min_p <= 1.0:
+        rows = []
+        for letter, team in letters.items():
+            row_tiles = []
+            for wid in anchors[team]:
+                per_k = wide_p.get(wid) or {}
+                k = (max(per_k, key=lambda j: per_k[j].get(team, 0.0)) if per_k
+                     else min(tiles[wid]))
+                row_tiles.append(tiles[wid][k])
+            rows.append((letter, row_tiles))
+        lineup_jpeg = crops.jpeg(crops.lineup_card(rows, ANCHORS_PER_TEAM))
+        todo = [w.wid for w in windows if w.wid not in digit and tiles.get(w.wid)]
+        note = params.ball_note if params.ball_note is not None else jev_reader.BALL_NOTE_2026
+
+        def lineup_item(wid):
+            t = tiles[wid]
+            grid = crops.jpeg(crops.grid_image([t[j] for j in sorted(t)]))
+            return jev_reader.build_jev_lineup_payload(params.model_key, lineup_jpeg, grid,
+                                                       list(letters), note)
+
+        # 5. lineup pass on the windows the digit pass did not name
+        for wid, probs in zip(todo, _ask_batched(session, todo, lineup_item, "who", params,
+                                                 clock, stats, "in the lineup pass")):
+            d = lineup_decision(probs, letters, params.lineup_min_p)
+            if d:
+                lineup[wid] = d
+    stats["lineup_named"] = len(lineup)
+
+    # 6. assemble
+    evidence = {wid: (t, RANK_DIGITS, p) for wid, (t, p) in digit.items()}
+    evidence.update({wid: (t, RANK_LINEUP, p) for wid, (t, p) in lineup.items()})
+    lab, cleared = assemble_labels(windows, evidence)
+    stats["cleared_by_uniqueness"] = cleared
+    stats["unlabelled"] = len(windows) - len(evidence)
+    return {"labels": lab, "segments": window_segments(frames, lab), "lineup_jpeg": lineup_jpeg}

@@ -249,3 +249,159 @@ def test_unknown_slot_labels_and_missing_frame_numbers_are_skipped():
     lab, _ = wl.assemble_labels(ws, {w.wid: ("3128", wl.RANK_DIGITS, 0.9) for w in ws})
     assert lab[(0, "B1")][0] == "3128" and lab[(0, "X9")] is None      # the known slot keeps it
     assert list(wl.window_segments(frames, lab)) == [0]
+
+
+# --------------------------------------------------------------------------- #
+# run_window_labels with a fake reader and a fake frame source
+# --------------------------------------------------------------------------- #
+import numpy as np
+
+
+class _Cal:
+    camera_center = np.array([8.0, -5.0, 3.0])
+
+    def field_to_image(self, p):
+        return (100.0 * p[0], 700.0 - 60.0 * p[1])
+
+
+def _source(video_path, frame_nums, view):
+    for n in sorted({int(x) for x in frame_nums}):
+        yield n, np.zeros((view[3], view[2], 3), np.uint8)
+
+
+class FakeSession:
+    """Answers by slot position: the test maps a frame's target x to a team."""
+
+    def __init__(self, team_p=None, who_p=None, fail=0, available=True):
+        self.team_p, self.who_p = team_p or {}, who_p or {}
+        self.fail, self.available, self.disabled_reason = fail, available, "auth"
+        self.asked = []
+
+    def ask(self, items, question):
+        self.asked.append((question, len(items)))
+        out = []
+        for payload, _sizes in items:
+            if self.fail:
+                self.fail -= 1
+                out.append({"error": "boom"})
+            elif question == "team":
+                out.append({"probs": dict(self.team_p)})
+            else:
+                out.append({"probs": dict(self.who_p)})
+        return out
+
+    def stats(self):
+        n = sum(k for _q, k in self.asked)
+        return {"requests": n, "input_tokens": 1000 * n, "cost_usd": 0.0001 * n, "errors": 0}
+
+
+def _params(**kw):
+    kw.setdefault("fps", FPS)
+    kw.setdefault("red", ["2637", "2724", "6497"])
+    kw.setdefault("blue", ["3128", "6773", "9066"])
+    return wl.Params(**kw)
+
+
+def _run(frames, session, **kw):
+    return wl.run_window_labels(frames, "video.mp4", _Cal(), session, _params(**kw),
+                                frame_source=_source)
+
+
+def test_run_names_windows_from_digits_and_reports_stats():
+    frames = _frames({"B1": _still(range(20), (3.0, 2.0))}, 20)
+    snapshot = [dict(r) for f in frames for r in f["robots"]]
+    s = FakeSession(team_p={"3128": 0.9, "unreadable": 0.1})
+    res = _run(frames, s)
+    assert res["aborted"] is None
+    assert res["labels"][(0, "B1")][:2] == ("3128", wl.RANK_DIGITS)
+    assert res["segments"][0][0]["source"] == "window_digits"
+    st = res["stats"]
+    assert st["windows"] == 1 and st["digit_named"] == 1 and st["lineup_named"] == 0
+    assert st["unlabelled"] == 0 and st["requests"] == 9 and st["input_tokens"] == 9000
+    assert st["cost_cents"] == pytest.approx(0.09) and st["aborted"] is None
+    assert s.asked == [("team", 9)]                      # 4 wide + 4 zoom + 1 grid
+    assert [dict(r) for f in frames for r in f["robots"]] == snapshot   # input not mutated
+
+
+def test_run_lineup_pass_names_unread_windows():
+    # 3128 is read on B1 and 6773 on B2 in four runs each (anchors). The R1 window is unread
+    # and the lineup names it. R1 is on screen only while B1/B2 are absent (frames 10-14), so
+    # the one-team-per-frame rule has nothing to clear.
+    b1 = _still([i for i in range(60) if i % 15 < 10], (3.0, 2.0))     # four 10-frame runs
+    b2 = _still([i for i in range(60) if i % 15 < 10], (5.0, 6.0))
+    frames = _frames({"B1": b1, "B2": b2, "R1": _still(range(10, 15), (12.0, 3.0))}, 60)
+
+    class BySlot(FakeSession):
+        def ask(self, items, question):
+            if question == "team":
+                self.asked.append((question, len(items)))
+                out = []
+                for payload, _sizes in items:
+                    self.n = getattr(self, "n", 0) + 1
+                    out.append({"probs": dict(self.plan.pop(0))})
+                return out
+            return super().ask(items, question)
+
+    s = BySlot(who_p={"A": 0.1, "B": 0.85, "unsure": 0.05})
+    ws = wl.build_windows(frames, FPS)
+    plan = []
+    for w in ws:                                        # request order = window order
+        probs = ({"3128": 0.9} if w.slot == "B1" else {"6773": 0.9} if w.slot == "B2"
+                 else {"unreadable": 0.9})
+        plan += [probs] * (2 * len(w.samples) + 1)
+    s.plan = plan
+    res = _run(frames, s, seed=1)
+    assert res["aborted"] is None
+    st = res["stats"]
+    assert st["digit_named"] == 8 and st["lineup_rows"] == 2 and st["lineup_named"] == 1
+    r1 = next(w for w in ws if w.slot == "R1")
+    team = res["labels"][(r1.idx[0], "R1")][0]
+    assert team in ("3128", "6773") and res["labels"][(r1.idx[0], "R1")][1] == wl.RANK_LINEUP
+    assert ("who", 1) in s.asked
+    assert res["lineup_jpeg"][:2] == b"\xff\xd8"
+
+
+def test_lineup_pass_is_skipped_below_two_rows_or_when_disabled():
+    frames = _frames({"B1": _still(range(20)), "R1": _still(range(10), (12.0, 3.0))}, 20)
+    s = FakeSession(team_p={"unreadable": 0.9})
+    res = _run(frames, s)
+    assert res["aborted"] is None and res["stats"]["lineup_rows"] == 0
+    assert all(q == "team" for q, _n in s.asked) and res["stats"]["unlabelled"] == 2
+
+
+@pytest.mark.parametrize("kw,reason", [
+    (dict(session=FakeSession(available=False)), "reader unavailable"),
+    (dict(session=FakeSession(fail=5)), "request errors"),
+    (dict(deadline=-1.0), "deadline"),
+])
+def test_run_aborts_cleanly(kw, reason):
+    frames = _frames({"B1": _still(range(20))}, 20)
+    session = kw.pop("session", None) or FakeSession(team_p={"3128": 0.9})
+    res = _run(frames, session, **kw)
+    assert res["aborted"] and reason in res["aborted"]
+    assert res["labels"] is None and res["segments"] is None
+    assert res["stats"]["aborted"] == res["aborted"]
+
+
+def test_a_passed_deadline_sends_no_requests():
+    s = FakeSession(team_p={"3128": 0.9})
+    _run(_frames({"B1": _still(range(20))}, 20), s, deadline=-1.0)
+    assert s.asked == []
+
+
+def test_run_aborts_when_there_is_nothing_to_do_or_no_video():
+    assert "no windows" in _run([], FakeSession())["aborted"]
+
+    def empty(video_path, frame_nums, view):
+        return iter(())
+
+    res = wl.run_window_labels(_frames({"B1": _still(range(20))}, 20), "v.mp4", _Cal(),
+                               FakeSession(), _params(), frame_source=empty)
+    assert "no frames decoded" in res["aborted"]
+
+    def broken(video_path, frame_nums, view):
+        raise OSError("cannot open video")
+
+    res = wl.run_window_labels(_frames({"B1": _still(range(20))}, 20), "v.mp4", _Cal(),
+                               FakeSession(), _params(), frame_source=broken)
+    assert res["aborted"].startswith("error: OSError")

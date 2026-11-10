@@ -2199,7 +2199,9 @@ def apply_label_file(manifest: dict[str, dict], spec: Optional[str], bench_dir: 
     ``tracklet`` (tracklet_labels.jsonl), ``truth`` (track_truth.jsonl) or a
     path. Each row's label_status / label_team / label_alliance (or status /
     team / alliance) replace the manifest row's IN PLACE; manifest rows the file
-    does not cover become unlabelled, so one run never mixes two truths.
+    does not cover become unlabelled, so one run never mixes two truths. A
+    track_truth row ({"truth_team": ...}, identity not legibility) becomes
+    legible + that team, or unlabelled when truth_team is null.
     Returns the number of rows overlaid."""
     if not spec or spec == "manifest":
         return 0
@@ -2213,6 +2215,14 @@ def apply_label_file(manifest: dict[str, dict], spec: Optional[str], bench_dir: 
         r = by_id.get(cid)
         if r is None:
             mrow.update({"label_status": "unlabelled", "label_team": None})
+            continue
+        if "truth_team" in r and not ("label_status" in r or "status" in r):
+            # track_truth.jsonl: robot IDENTITY, not legibility. A crop with a
+            # truth team scores as legible-with-that-team (asserts are right or
+            # wrong by identity; abstains stay abstains); no truth -> unlabelled.
+            mrow["label_status"] = "legible" if r["truth_team"] else "unlabelled"
+            mrow["label_team"] = r["truth_team"]
+            n += 1
             continue
         for k in LABEL_KEYS:
             alt = k.replace("label_", "")

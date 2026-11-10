@@ -271,3 +271,10 @@ def test_apply_label_file(tmp_path):
     assert manifest["a"]["label_alliance"] == "red"
     assert manifest["b"]["label_status"] == "unlabelled"     # not covered -> not scored
     assert apply_label_file(manifest, "manifest", tmp_path) == 0
+    # track_truth rows: identity only
+    q = tmp_path / "track_truth.jsonl"
+    q.write_text(json.dumps({"id": "a", "truth_team": "1477", "truth_source": "gt"}) + "\n"
+                 + json.dumps({"id": "b", "truth_team": None}) + "\n")
+    assert apply_label_file(manifest, "truth", tmp_path) == 2
+    assert (manifest["a"]["label_status"], manifest["a"]["label_team"]) == ("legible", "1477")
+    assert manifest["b"]["label_status"] == "unlabelled"

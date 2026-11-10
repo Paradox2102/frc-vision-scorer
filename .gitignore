@@ -156,3 +156,9 @@ blog-post-*.md
 
 # Replay-audit crop images (regenerate with: scripts/audit_replay.py sample)
 data/eval/audit/*/items/*/*.jpg
+
+# Event lineup store tiles (data/event_anchors/<namespace>/<event>/<id>.jpg) and
+# event-lineup eval runs / digit caches. No trailing slash: in a worktree these
+# are symlinks to the main checkout, and "dir/" patterns do not match symlinks.
+data/event_anchors
+data/eval/event_lineup

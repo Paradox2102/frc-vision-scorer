@@ -96,6 +96,48 @@ Other flags: `--limit N` takes a stable-hash subset that spans matches,
 `--only-labelled`, `--concurrency` (default 4), `--hint-source baseline|label|none`
 and `--permutations K`.
 
+`--labels manifest|tracklet|truth|<path>` (run and `score`) scores against
+another label file instead of the manifest's crop labels: `tracklet` is
+`tracklet_labels.jsonl`, `truth` is `track_truth.jsonl`. Crops the file does
+not cover count as unlabelled. `--subset tracklet` restricts a run (or `score`)
+to the crops whose tracklet has at least 3 frames.
+
+**Frame modes (`--frames`).** Tracklets (`tracklets.jsonl`,
+`tracklets/<id>/<offset>.jpg`, built by `scripts/build_tracklet_bench.py`)
+follow each crop's bumper for +-1.5 s at native resolution. A crop without a
+tracklet always falls back to the single bench crop.
+
+- `single` (default): the bench crop.
+- `multi4` / `multi8`: the bench crop plus 3 (7) tracklet frames as separate
+  images. Clef arms and `freeread` take `multi4`; only `freeread` takes `multi8`.
+- `video`: every tracklet frame as an H.264 clip (`clef-omni` only).
+- `registered`: the tracklet registered and fused into ONE image by
+  `web/bumper_register.py`, then prepped like the app's crops (integer upscale
+  to at least 384 px tall, JPEG q90). Every arm reads it as its single image.
+  The source video is interlaced, so combed frames are split into their two
+  fields first; each field is a separate sample. Samples are aligned to the
+  anchor (offset 0) with ECC (affine, phase-correlation init). A sample is
+  dropped when its ECC correlation is low, its warp is implausible, or its
+  post-warp NCC is low. Survivors are merged with a per-pixel anti-ghost
+  weighted mean, then a mild unsharp mask is applied. Classical only: no
+  learned super-resolution.
+- `anchor`: the same deinterlace, upscale, unsharp and app prep applied to the
+  anchor frame alone. This is the no-fusion control: `single` vs `anchor`
+  measures the prep, and `anchor` vs `registered` measures the fusion.
+
+Rows record `frames_used` (distinct source frames fused), `reg_fused`,
+`reg_samples`, `reg_rejected` and `reg_fallback`. `--reg-opts '<json>'`
+overrides `register_and_fuse` keyword arguments, e.g.
+`{"deinterlace": "fields", "fuse": "median"}`.
+`scripts/build_registered_bench.py` writes every fused image to
+`registered/<id>.jpg` with `registered/diagnostics.jsonl`, and with
+`--sheet DIR` it also renders contact sheets. `registered/` is gitignored.
+
+```bash
+.venv/bin/python scripts/bench_bumper_readers.py --arms jev --frames registered --subset tracklet --labels tracklet --score
+.venv/bin/python scripts/build_registered_bench.py --sheet /tmp/reg_sheets
+```
+
 **Arms.** `freeread` calls `web.app._vllm_read_bumpers` itself: the real prompt,
 the `_BUMPER_READ_SCHEMA` guided JSON, roster matching and blended confidence.
 `vllm-choice` scores lettered options with the same model: `max_tokens=1`,

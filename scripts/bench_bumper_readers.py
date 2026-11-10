@@ -89,6 +89,20 @@ video    clef-omni only: every tracklet frame, letterboxed to a fixed canvas
          rate clef-omni samples video at, so each crop is one sampled frame -
          sent as ``videos: ["data:video/mp4;base64,..."]``; no image unless
          ``--video-with-still``.
+registered  every arm: the tracklet registered + fused into ONE image
+         (web/bumper_register.py: interlaced frames split into fields, ECC
+         affine alignment to the offset-0 anchor with bad alignments dropped,
+         per-pixel anti-ghost merge, mild unsharp), then the app's crop prep
+         (integer upscale to >= 384 px tall, JPEG q90 - _bumper_crop_b64) and
+         read as the arm's single crop. ``--reg-opts '<json>'`` overrides
+         register_and_fuse kwargs. Rows carry reg_fused / reg_samples /
+         reg_rejected / reg_fallback.
+anchor   every arm: the same pipeline on the anchor frame alone (deinterlace +
+         upscale + unsharp + app prep, no fusion) - the control that separates
+         the prep's effect (single vs anchor) from the fusion's (anchor vs
+         registered).
+--labels tracklet|truth|<path> scores against tracklet_labels.jsonl /
+track_truth.jsonl / a file instead of the manifest's crop labels.
 A crop without a usable tracklet (no source video, not localised, < 2 frames)
 falls back to the single-frame request. Every row records ``frames_used`` and
 ``tracklet_frames``; ``score --subset tracklet`` restricts every file to the
@@ -239,7 +253,13 @@ CLEF_MAX_IMAGE_BYTES = 4 * 1024 * 1024
 # max 2 videos, 16 MiB and 60 s each, data URL "data:video/mp4;base64,..." (or
 # {"content_type", "base64"}), sampled at 2 frames per second, up to 256 input
 # tokens per second of video (~15,400/min at max resolution; 480p ~144/s).
-FRAME_MODES = ("single", "multi4", "multi8", "video")
+FRAME_MODES = ("single", "multi4", "multi8", "video", "registered", "anchor")
+# registered: the tracklet registered + fused into ONE image (web/bumper_register.py)
+# that every arm reads as its single crop; anchor: the same upscale + unsharp + app
+# prep on the anchor frame alone (the no-fusion control).
+REGISTERED_MODES = ("registered", "anchor")
+REG_DEFAULTS: dict = {}         # register_and_fuse overrides (its defaults otherwise)
+APP_CROP_MIN_H = 384            # web/app.py _bumper_crop_b64 upscale floor
 MULTI_IMAGES = {"multi4": 4, "multi8": 8}   # images per request incl. the bench crop
 FREEREAD_FRAME_MODES = ("single", "multi4", "multi8")
 VIDEO_ARMS = ("clef-omni",)
@@ -1251,7 +1271,78 @@ def build_frame_media(frames_mode: str, crop_jpg: bytes, trk: Optional[dict],
     raise ValueError(f"unknown frames mode {frames_mode!r}")
 
 
-_BUMPER_DESC = ("a solid RED or BLUE fabric band around the robot's base with the team number "
+# ---- registered: multi-frame registration + fusion -> one image ------------
+
+def app_bumper_jpeg(img) -> bytes:
+    """Mirror web/app.py _bumper_crop_b64's reader prep: a crop under 384 px tall
+    is upscaled by the integer factor max(2, ceil(384 / h)) with INTER_LINEAR,
+    then JPEG q90."""
+    import cv2
+    h = img.shape[0]
+    if h < APP_CROP_MIN_H:
+        k = max(2, int(math.ceil(APP_CROP_MIN_H / max(1, h))))
+        img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise ArmError("imencode failed")
+    return buf.tobytes()
+
+
+def fuse_tracklet(trk: dict, bench_dir: Path, anchor_only: bool = False, **kw):
+    """web.bumper_register.register_and_fuse over a tracklet's native frames,
+    anchored on offset 0 (the bench crop's source frame; else the nearest).
+    ``anchor_only`` runs the same upscale + unsharp path on the anchor alone
+    (the no-fusion control). Returns (BGR uint8 image, diagnostics)."""
+    import cv2
+    from web.bumper_register import wants_fields, register_and_fuse
+    frames = sorted(trk["frames"], key=lambda f: f["offset"])
+    a = min(range(len(frames)), key=lambda i: abs(frames[i]["offset"]))
+    imgs = []
+    for f in frames:
+        im = cv2.imread(str(Path(bench_dir) / f["file"]), cv2.IMREAD_COLOR)
+        if im is None:
+            raise ArmError(f"unreadable tracklet frame {f['file']}")
+        imgs.append(im)
+    opts = dict(REG_DEFAULTS)
+    opts.update(kw)
+    if anchor_only:
+        # the control gets the full tracklet's interlace decision, then only its anchor
+        if opts.get("deinterlace", "auto") == "auto":
+            opts["deinterlace"] = ("fields" if wants_fields(
+                imgs, a, times=[f["offset"] for f in frames]) else "none")
+        frames, imgs, a = [frames[a]], [imgs[a]], 0
+    # sharpness is left to register_and_fuse: the tracklet's Laplacian variance
+    # is inflated by interlace combing; it measures each (field) sample itself.
+    out, diag = register_and_fuse(
+        imgs, a, opts.pop("upscale", None), times=[f["offset"] for f in frames],
+        match_scores=[f.get("match_score") for f in frames], **opts)
+    diag["offsets_used"] = [frames[i]["offset"] for i in diag["used"]]
+    diag["anchor_offset"] = frames[a]["offset"]
+    return out, diag
+
+
+def registered_media(frames_mode: str, crop_jpg: bytes, trk: Optional[dict],
+                     bench_dir: Path) -> tuple[bytes, dict]:
+    """(reader-ready JPEG, info) for --frames registered | anchor. A crop with no
+    usable tracklet falls back to the bench crop bytes (``reg_fallback``)."""
+    n_trk = len((trk or {}).get("frames") or []) if (trk or {}).get("status") == "ok" else 0
+    info = {"frames_used": 1, "tracklet_frames": n_trk, "media_kind": "single",
+            "reg_fused": False, "reg_fallback": None}
+    if not (trk and trk.get("status") == "ok" and trk.get("frames")):
+        info["reg_fallback"] = "no_tracklet"
+        return crop_jpg, info
+    img, diag = fuse_tracklet(trk, bench_dir, anchor_only=(frames_mode == "anchor"))
+    info.update({"media_kind": frames_mode, "frames_used": diag["n_used"],
+                 "reg_fused": diag["fused"], "reg_samples": diag["n_samples"],
+                 "reg_fields": diag["split_fields"],
+                 "frame_offsets": diag["offsets_used"],
+                 "reg_rejected": [[i, r] for i, r in diag["rejected"]],
+                 "reg_ecc": {str(k): v for k, v in diag["ecc"].items()},
+                 "reg_ms": diag["ms"], "image_native_wh": list(trk["box"][2:4])})
+    return app_bumper_jpeg(img), info
+
+
+_BUMPER_DESC =("a solid RED or BLUE fabric band around the robot's base with the team number "
                 "in WHITE digits. Field structures (crates, bins, signs) can also carry printed "
                 "numbers. ")
 
@@ -1442,7 +1533,35 @@ class Ctx:
         return int(k) if k is not None else DEFAULT_PERMS.get(arm, 1)
 
     def crop(self, row: dict) -> bytes:
+        """The image every single-image arm reads: the bench crop, or under
+        --frames registered|anchor the fused / anchor-control image (bench crop
+        when the crop has no tracklet; see media_info)."""
+        if self.frames_mode() in REGISTERED_MODES:
+            return self._registered(row)[0]
         return (self.bench_dir / row["file"]).read_bytes()
+
+    def frames_mode(self) -> str:
+        return getattr(self.args, "frames", "single") or "single"
+
+    def _registered(self, row: dict) -> tuple[bytes, dict]:
+        if getattr(self, "_reg_cache", None) is None:
+            self._reg_cache, self._reg_lock = {}, threading.Lock()
+        with self._reg_lock:
+            hit = self._reg_cache.get(row["id"])
+        if hit is None:
+            crop = (self.bench_dir / row["file"]).read_bytes()
+            hit = registered_media(self.frames_mode(), crop, self.tracklet(row["id"]),
+                                   self.bench_dir)
+            with self._reg_lock:
+                self._reg_cache[row["id"]] = hit
+        return hit
+
+    def media_info(self, row: dict) -> dict:
+        """Prediction-row fields for a single-image read: frames_mode plus, under
+        --frames registered|anchor, what the registration used."""
+        if self.frames_mode() not in REGISTERED_MODES:
+            return {"frames_mode": "single", "frames_used": 1, "media_kind": "single"}
+        return {"frames_mode": self.frames_mode(), **self._registered(row)[1]}
 
     def tracklet(self, crop_id: str) -> Optional[dict]:
         if getattr(self, "_tracklets", None) is None:
@@ -1480,15 +1599,16 @@ class FreeRead:
         orig = appmod._post_vlm_chat
         self.orig_post = orig  # multi-frame reads post directly (no capture keying)
         self.frames = getattr(ctx.args, "frames", "single") or "single"
-        if self.frames not in FREEREAD_FRAME_MODES:
+        if self.frames not in FREEREAD_FRAME_MODES + REGISTERED_MODES:
             raise ArmError(f"freeread: --frames {self.frames} not supported "
                            f"({', '.join(FREEREAD_FRAME_MODES)})")
         self.prompt = getattr(ctx.args, "prompt", "incumbent") or "incumbent"
         if self.prompt not in PROMPT_VARIANTS:
             raise ArmError(f"freeread: --prompt {self.prompt} not supported "
                            f"({', '.join(PROMPT_VARIANTS)})")
-        if self.prompt == "escape" and self.frames != "single":
-            raise ArmError("--prompt escape supports --frames single only")
+        if self.prompt == "escape" and self.frames not in ("single",) + REGISTERED_MODES:
+            raise ArmError("--prompt escape supports --frames single only "
+                           "(or the single fused image of registered / anchor)")
         ctx.tracklet("")  # load tracklets.jsonl before the worker threads start
 
         def wrapped(payload: dict) -> dict:
@@ -1540,6 +1660,8 @@ class FreeRead:
         trk = self.ctx.tracklet(row["id"])
         pred.update({"frames_mode": self.frames, "frames_used": 1,
                      "tracklet_frames": len(trk["frames"]) if trk else 0, "media_kind": "single"})
+        if self.frames in REGISTERED_MODES:
+            pred.update(self.ctx.media_info(row))
         if self.prompt == "escape":
             return self._predict_escape(pred, jpg, red, blue, hint)
         if self.frames in MULTI_IMAGES and usable_tracklet(trk):
@@ -1711,6 +1833,8 @@ class VllmChoice:
         pred["permutations"] = self.k
         pred["blank_calibrated"] = self.blank
         jpg = self.ctx.crop(row)
+        if (getattr(self.ctx.args, "frames", "single") or "single") in REGISTERED_MODES:
+            pred.update(self.ctx.media_info(row))
         uri = app_style_data_uri(jpg)
         blank_uri = app_style_data_uri(gray_jpeg_like(jpg)) if self.blank else None
         first_payload = None
@@ -1762,8 +1886,8 @@ class Clef:
         if self.frames == "video" and model_key not in VIDEO_ARMS:
             raise ArmError(f"{model_key}: --frames video needs a model with a videos input "
                            f"({', '.join(VIDEO_ARMS)})")
-        if self.frames != "single" and self.blank:
-            raise ArmError("--blank-calibrate-clef is only implemented for --frames single")
+        if self.frames not in ("single",) + REGISTERED_MODES and self.blank:
+            raise ArmError("--blank-calibrate-clef is only implemented for single-image --frames")
         ctx.tracklet("")  # load tracklets.jsonl once, before the worker threads start
         self.env_loaded = load_env_file(ENV_FILE)
         self.account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
@@ -1827,9 +1951,11 @@ class Clef:
         pred["frames_mode"] = self.frames
         pred["frames_used"] = 1
         pred["tracklet_frames"] = len(trk["frames"]) if trk else 0
+        if self.frames in REGISTERED_MODES:
+            pred.update(self.ctx.media_info(row))
         media = None
         try:
-            if self.frames != "single":
+            if self.frames in MULTI_IMAGES or self.frames == "video":
                 media = build_frame_media(self.frames, jpg, trk, self.ctx.bench_dir,
                                           self.with_still)
                 if media["kind"] == "single":
@@ -1842,7 +1968,8 @@ class Clef:
                     if media["video"] is not None:
                         pred["video_wh"] = list(media["video_wh"])
                         pred["video_bytes"] = len(media["video"])
-            pred["media_kind"] = media["kind"] if media else "single"
+            if self.frames not in REGISTERED_MODES:
+                pred["media_kind"] = media["kind"] if media else "single"
             for order in orders:
                 if media is None:
                     payload = clef_payload(self.key, row, img, order, a.options, hint)
@@ -1892,9 +2019,10 @@ class Jev:
         self.ctx = ctx
         self.dry = dry_run
         self.k = ctx.perms_for("jev")
-        frames = getattr(ctx.args, "frames", "single") or "single"
-        if frames != "single":
-            raise ArmError(f"jev: --frames {frames} is not supported (single frame only)")
+        frames = self.frames = getattr(ctx.args, "frames", "single") or "single"
+        if frames not in ("single",) + REGISTERED_MODES:
+            raise ArmError(f"jev: --frames {frames} is not supported (single frame only, "
+                           f"or the single fused image of {' / '.join(REGISTERED_MODES)})")
         if getattr(ctx.args, "blank_calibrate_clef", False):
             raise ArmError("jev: blank calibration is not implemented")
         self.env_loaded = load_env_file(ENV_FILE, keys=JEV_ENV_KEYS)
@@ -1946,6 +2074,8 @@ class Jev:
         pred["image_padded"] = padded
         pred["frames_mode"] = "single"
         pred["frames_used"] = 1
+        if self.frames in REGISTERED_MODES:
+            pred.update(self.ctx.media_info(row))
         first_payload = None
         est = 0
         perms, usages, subjects = [], [], []
@@ -2060,6 +2190,42 @@ def _file_label(preds: list[dict]) -> str:
     return _label(next((p for p in preds if "options_mode" in p), preds[0]))
 
 
+LABEL_FILES = {"tracklet": "tracklet_labels.jsonl", "truth": "track_truth.jsonl"}
+LABEL_KEYS = ("label_status", "label_team", "label_alliance")
+
+
+def apply_label_file(manifest: dict[str, dict], spec: Optional[str], bench_dir: Path) -> int:
+    """Score against another label file instead of the manifest's crop labels:
+    ``tracklet`` (tracklet_labels.jsonl), ``truth`` (track_truth.jsonl) or a
+    path. Each row's label_status / label_team / label_alliance (or status /
+    team / alliance) replace the manifest row's IN PLACE; manifest rows the file
+    does not cover become unlabelled, so one run never mixes two truths.
+    Returns the number of rows overlaid."""
+    if not spec or spec == "manifest":
+        return 0
+    path = Path(bench_dir) / LABEL_FILES[spec] if spec in LABEL_FILES else Path(spec)
+    if not path.exists():
+        sys.exit(f"--labels {spec}: {path} does not exist")
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    by_id = {r["id"]: r for r in rows if r.get("id")}
+    n = 0
+    for cid, mrow in manifest.items():
+        r = by_id.get(cid)
+        if r is None:
+            mrow.update({"label_status": "unlabelled", "label_team": None})
+            continue
+        for k in LABEL_KEYS:
+            alt = k.replace("label_", "")
+            if k in r:
+                mrow[k] = r[k]
+            elif alt in r:
+                mrow[k] = r[alt]
+        if mrow.get("label_team") is not None:
+            mrow["label_team"] = str(mrow["label_team"])
+        n += 1
+    return n
+
+
 def filter_subset(preds: list[dict], ids: Optional[set]) -> list[dict]:
     """Rows whose crop id is in ``ids`` (None = no filter)."""
     return list(preds) if ids is None else [p for p in preds if p.get("id") in ids]
@@ -2145,7 +2311,7 @@ def cmd_run(args) -> None:
     for a in arm_names:
         if a not in ARMS:
             sys.exit(f"unknown arm {a!r}; valid: {', '.join(ARMS)}")
-    if args.frames != "single":
+    if args.frames not in ("single",) + REGISTERED_MODES:
         def _ok(arm: str) -> bool:
             if arm == "freeread":
                 return args.frames in FREEREAD_FRAME_MODES
@@ -2159,8 +2325,12 @@ def cmd_run(args) -> None:
             sys.exit(f"--frames {args.frames} is not supported by {', '.join(bad)} "
                      f"(multi4: clef arms + freeread; multi8: freeread; "
                      f"video: {', '.join(VIDEO_ARMS)}; jev: single only)")
-    if getattr(args, "prompt", "incumbent") == "escape" and args.frames != "single":
-        sys.exit("--prompt escape supports --frames single only")
+    if (getattr(args, "prompt", "incumbent") == "escape"
+            and args.frames not in ("single",) + REGISTERED_MODES):
+        sys.exit("--prompt escape supports --frames single only "
+                 "(or the single fused image of registered / anchor)")
+    if args.reg_opts:
+        REG_DEFAULTS.update(json.loads(args.reg_opts))
     ctx = Ctx(args, bench_dir)
     if args.dry_run:
         dry_run(arm_names, ctx, rows)
@@ -2169,11 +2339,14 @@ def cmd_run(args) -> None:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     res_dir = bench_dir / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {r["id"]: r for r in manifest_rows}
+    # scoring copy: --labels may overlay another truth (the run itself never sees it)
+    manifest = {r["id"]: dict(r) for r in manifest_rows}
+    apply_label_file(manifest, args.labels, bench_dir)
     summary = {"timestamp": stamp, "argv": sys.argv[1:], "n_rows": len(rows),
                "options": args.options, "hint_source": args.hint_source,
                "frames": args.frames, "prompt": getattr(args, "prompt", "incumbent"),
-               "subset": args.subset, "arms": {}}
+               "reg_opts": dict(REG_DEFAULTS) if args.frames in REGISTERED_MODES else None,
+               "labels": args.labels, "subset": args.subset, "arms": {}}
     scored = []
     for name in arm_names:
         try:
@@ -2217,6 +2390,7 @@ def latest_results(res_dir: Path) -> list[Path]:
 def cmd_score(args) -> None:
     bench_dir = Path(args.bench)
     manifest = {r["id"]: r for r in load_manifest(bench_dir)}
+    n_over = apply_label_file(manifest, args.labels, bench_dir)
     files = [Path(f) for f in args.files] or latest_results(bench_dir / "results")
     if not files:
         sys.exit("no results files")
@@ -2234,12 +2408,20 @@ def cmd_score(args) -> None:
             label = f"{_file_label(preds)} {f.stem[-15:]}"
             scored.extend(score_file_variants(preds, manifest, label))
             multi = sum(1 for p in preds if (p.get("frames_used") or 1) > 1)
-            if multi:
+            reg = [p for p in preds if p.get("frames_mode") in REGISTERED_MODES]
+            if reg:
+                fb = sum(1 for p in reg if p.get("reg_fallback"))
+                fused = sum(1 for p in reg if p.get("reg_fused"))
+                ge3 = sum(1 for p in reg if p.get("reg_fused") and (p.get("frames_used") or 1) >= 3)
+                media_notes.append(f"  {label}: {fused}/{len(reg)} fused (>=3 frames {ge3}), "
+                                   f"{fb} fell back to the bench crop (no tracklet)")
+            elif multi:
                 fu = [p["frames_used"] for p in preds if (p.get("frames_used") or 1) > 1]
                 media_notes.append(f"  {label}: {multi}/{len(preds)} crops multi-frame "
                                    f"(median {statistics.median(fu):g} frames)")
     n_lab = sum(1 for r in manifest.values() if (r.get("label_status") or "unlabelled") != "unlabelled")
-    print(f"manifest: {len(manifest)} crops, {n_lab} labelled")
+    print(f"manifest: {len(manifest)} crops, {n_lab} labelled"
+          + (f" (labels: {args.labels}, {n_over} rows)" if n_over else ""))
     if subset is not None:
         print(f"subset: tracklet - {len(subset)} crop ids with >= {SUBSET_MIN_FRAMES} tracklet "
               f"frames (every arm restricted to them)")
@@ -2283,8 +2465,17 @@ def build_parser() -> argparse.ArgumentParser:
                      help="single = the bench crop (default); multi4 = the bench crop + the 3 "
                           "sharpest other tracklet frames, one per time third (clef arms, "
                           "freeread); multi8 = up to 8 images (freeread); video = all tracklet "
-                          "frames as an H.264 clip at 2 fps (clef-omni). "
+                          "frames as an H.264 clip at 2 fps (clef-omni); registered = the "
+                          "tracklet registered + fused into ONE image (web/bumper_register.py, "
+                          "every arm); anchor = the same upscale/deinterlace/unsharp on the "
+                          "anchor frame alone (the no-fusion control, every arm). "
                           "Crops without a tracklet fall back to single (frames_used=1).")
+    run.add_argument("--reg-opts", default=None,
+                     help="--frames registered|anchor: JSON overrides for register_and_fuse, "
+                          "e.g. '{\"deinterlace\": \"fields\", \"fuse\": \"median\"}'")
+    run.add_argument("--labels", default="manifest",
+                     help="score against: manifest (crop labels, default), tracklet "
+                          "(tracklet_labels.jsonl), truth (track_truth.jsonl) or a path")
     run.add_argument("--prompt", choices=PROMPT_VARIANTS, default="incumbent",
                      help="freeread prompt: incumbent = web.app's prompt + _BUMPER_READ_SCHEMA "
                           "(default, unchanged); escape = detector-junk-aware prompt with an "
@@ -2302,6 +2493,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "frames (identical crops for single vs multi-frame comparisons)")
     sc.add_argument("files", nargs="*", help="results/*.jsonl (default: latest per arm)")
     sc.add_argument("--json", default=None, help="also dump metrics as JSON here")
+    sc.add_argument("--labels", default="manifest",
+                    help="manifest (crop labels, default), tracklet (tracklet_labels.jsonl), "
+                         "truth (track_truth.jsonl) or a path to a jsonl with id + label_*")
     sc.add_argument("--bench", default=str(BENCH_DIR))
     return ap
 

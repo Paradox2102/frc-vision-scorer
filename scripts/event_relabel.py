@@ -124,7 +124,12 @@ def select_replays(event: str, matches: Optional[str], *, db_path, replays_dir) 
 
 def before_match_for(mode: str, match_key: str) -> Optional[int]:
     """incremental: borrow only from matches numbered below this one."""
-    return ea.schedule_rank(match_key) if mode == "incremental" else None
+    if mode != "incremental":
+        return None
+    rank = ea.schedule_rank(match_key)
+    if rank is None:                # no cutoff would mean borrow-everything
+        raise ValueError(f"cannot order {match_key!r} in the schedule (incremental needs it)")
+    return rank
 
 
 def run_all(items: list, fn, mode: str, workers: int, stop_on_error: bool = False) -> list:
@@ -164,7 +169,10 @@ def result_row(item: dict, out: dict, out_dir, score: bool, seconds: float) -> d
         rec["meta_out"] = str(p)
         rec["unlabelled_share"] = unlabelled_share(out["relabelled"].get("frames") or [])
         if score:
-            rec["score"] = rr.score_numbers(out["relabelled"], row, item["video"])
+            try:
+                rec["score"] = rr.score_numbers(out["relabelled"], row, item["video"])
+            except Exception as e:      # a scoring failure is not a stage failure
+                rec["score_error"] = f"{type(e).__name__}: {e}"
     return rec
 
 
@@ -195,6 +203,8 @@ def relabel_match(item: dict, args, out_dir) -> dict:
         out = rr.relabel_one(row, meta, item["video"], chosen["calibration"], red, blue, opts,
                              session, fps=fps, view=load_layout()["main"].crop)
         rec = result_row(item, out, out_dir, args.score, time.time() - t0)
+        if out.get("borrow_fetch_error"):   # would silently turn this arm into arm 1
+            rec["error"] = f"borrow fetch failed: {out['borrow_fetch_error']}"
     except (Exception, SystemExit) as e:
         rec = {"match_key": mk, "replay_id": row["id"], "error": f"{type(e).__name__}: {e}"}
     if rec.get("aborted"):
@@ -204,8 +214,19 @@ def relabel_match(item: dict, args, out_dir) -> dict:
           f"digits {st.get('digit_named')} lineup {st.get('lineup_named')} rows "
           f"{st.get('lineup_rows')} (own {st.get('rows_own')} / borrowed {st.get('rows_borrowed')}"
           f" / elim {st.get('rows_elim')}) unlabelled {rec.get('unlabelled_share')}"
+          + (f"  SCORE ERROR {rec['score_error']}" if rec.get("score_error") else "")
           + (f"  ERROR {rec['error']}" if rec.get("error") else ""), flush=True)
     return rec
+
+
+def arm_tag(args) -> str:
+    """own (no event lineup) / event, plus noelim / alliance ablations."""
+    tag = ["own" if args.no_event_lineup else "event"]
+    if args.no_elim:
+        tag.append("noelim")
+    if args.alliance_rows:
+        tag.append("alliance")
+    return "-".join(tag)
 
 
 def main(argv=None) -> None:
@@ -239,6 +260,10 @@ def main(argv=None) -> None:
         ap.error("--store-write needs the event lineup (drop --no-event-lineup)")
     if args.reset and args.namespace == ea.LIVE:
         ap.error("--reset never clears the live namespace")
+    try:
+        ea.check_name(args.namespace, "namespace")
+    except ValueError as e:
+        ap.error(str(e))
 
     chosen, skipped = select_replays(args.event, args.matches, db_path=rr.DB_PATH,
                                      replays_dir=REPLAYS_DIR)
@@ -251,12 +276,17 @@ def main(argv=None) -> None:
         return
     if args.store_write and args.namespace == ea.LIVE:
         print("WARNING: writing the live namespace")
+    out_dir = Path(args.out_dir or EVAL_ROOT / "runs" /
+                   f"{args.namespace}_{args.mode}_{arm_tag(args)}_{time.strftime('%Y%m%d-%H%M%S')}")
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise SystemExit(f"--out-dir {out_dir} is not empty")
     if args.reset:
         n = ea.clear(args.namespace, args.event)
         print(f"reset: removed {n} anchors from {args.namespace}/{args.event}")
-    out_dir = Path(args.out_dir or EVAL_ROOT / "runs" /
-                   f"{args.namespace}_{args.mode}_{time.strftime('%Y%m%d-%H%M%S')}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.mode == "full" and args.store_write and args.workers > 1:
+        print("NOTE: full mode with --store-write runs one match at a time (--workers 1)")
+        args.workers = 1
     (out_dir / "run.json").write_text(json.dumps({
         "args": vars(args), "skipped": skipped,
         "selected": [{"match_key": it["match_key"], "replay_id": it["row"]["id"],
@@ -276,8 +306,9 @@ def main(argv=None) -> None:
     for r in rows:
         if r.get("score"):
             f = r["score"]["full"]
-            print(f"  {r['match_key']} vs GT (full): right {f['right']:.0%} wrong "
-                  f"{f['wrong']:.0%} unlabelled {f['unlabelled']:.0%} misID {f['misid_s']:.0f}s")
+            print(f"  {r['match_key']} vs GT (full): right {rr.pct(f['right'])} wrong "
+                  f"{rr.pct(f['wrong'])} unlabelled {rr.pct(f['unlabelled'])} "
+                  f"misID {f['misid_s']:.0f}s")
 
 
 if __name__ == "__main__":

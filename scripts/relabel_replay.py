@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import sys
 import time
 import zlib
@@ -69,6 +70,16 @@ FULL_MATCH_MIN_S = 150.0
 DB_PATH = REPO / "frc_scorer.db"
 
 
+def _knob_defaults() -> dict:
+    from web.job_config import KNOBS
+    return {k.name: k.default for k in KNOBS}
+
+
+def pct(v) -> str:
+    """A rate as a percentage; "-" when its period has no samples (None)."""
+    return "-" if v is None else f"{v:.0%}"
+
+
 def provenance(summary) -> dict:
     """What a replay records about its job (spec section 5b), with the
     fallbacks for replays made before the app recorded it: window_labels on
@@ -81,9 +92,12 @@ def provenance(summary) -> dict:
     cfg = s.get("config")
     fallbacks = []
     if isinstance(cfg, dict):
-        wl_on = bool(cfg.get("window_labels", False))
-        auto_only = bool(cfg.get("auto_period_only", False))
-        gco = float(cfg.get("ground_center_offset_m", 0.0) or 0.0)
+        # summary.config holds only the non-default knobs: a missing key is
+        # the knob's code default, not False / 0.0
+        d = _knob_defaults()
+        wl_on = bool(cfg.get("window_labels", d.get("window_labels", False)))
+        auto_only = bool(cfg.get("auto_period_only", d.get("auto_period_only", False)))
+        gco = float(cfg.get("ground_center_offset_m", d.get("ground_center_offset_m", 0.0)) or 0.0)
     else:
         fallbacks.append("config")
         wl_on, auto_only, gco = "window_labels" in s, False, 0.0
@@ -235,7 +249,9 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
     if opts.digit_cache and not Path(opts.digit_cache).exists():
         p = Path(opts.digit_cache)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(result["digit_calls"]))
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(result["digit_calls"]))
+        os.replace(tmp, p)
     relabelled = copy.deepcopy(meta)
     wl.apply_labels(relabelled["frames"], result["labels"])
     wl.restamp_events(relabelled["frames"], relabelled.get("events") or [])
@@ -286,9 +302,6 @@ def score_lines(meta: dict, row: dict, video) -> list[str]:
     if nums is None:
         return [f"no ground truth for {row['match_key']}"]
 
-    def pct(v):                      # a rate is None when its period has no samples
-        return "-" if v is None else f"{v:.0%}"
-
     return [f"{period}: right {pct(n['right'])}  wrong {pct(n['wrong'])}  "
             f"unlabelled {pct(n['unlabelled'])}  misID {n['misid_s']:.0f}s "
             f"(cross {n['misid_cross_s']:.0f} / same {n['misid_same_s']:.0f})  "
@@ -323,6 +336,10 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")
+    try:
+        ea.check_name(args.namespace, "namespace")
+    except ValueError as e:
+        ap.error(str(e))
 
     row, meta, video, cal = load_inputs(args.replay, args.calibration_version)
     fps = _probe_fps(video)

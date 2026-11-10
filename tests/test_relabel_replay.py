@@ -152,3 +152,46 @@ def test_the_digit_cache_file_is_created_once_and_reused(store, tmp_path):
 def test_store_write_needs_the_event_lineup():
     with pytest.raises(SystemExit):
         rr.main(["--replay", "x", "--store-write"])
+
+
+def test_knob_defaults_cover_every_knob():
+    from web.job_config import KNOBS
+    assert set(rr._knob_defaults()) == {k.name for k in KNOBS}
+
+
+def test_provenance_missing_config_keys_fall_back_to_the_knob_defaults(monkeypatch):
+    monkeypatch.setattr(rr, "_knob_defaults",
+                        lambda: {"window_labels": True, "ground_center_offset_m": 0.3})
+    p = rr.provenance({"config": {"sam2_track_fps": 5}, "duration_sec": 168.8})
+    assert p["window_labels_on"] is True and p["ground_center_offset_m"] == 0.3
+    assert rr.provenance({"config": {"window_labels": False},
+                          "duration_sec": 168.8})["window_labels_on"] is False
+
+
+def test_pct_is_none_safe():
+    assert rr.pct(None) == "-" and rr.pct(0.5) == "50%"
+
+
+def test_an_aborted_stage_writes_no_cache_and_no_store_rows(store, tmp_path):
+    cache = tmp_path / "cache" / "x.json"
+    out = rr.relabel_one(ROW, _meta(_lineup_frames()), "video.mp4", _Cal(), [], [],
+                         rr.Options(event_lineup=True, namespace="eval-x", store_write=True,
+                                    digit_cache=str(cache)),
+                         FakeSession(), fps=FPS, view=(0, 0, 1920, 723),
+                         frame_source=_source, **store)
+    assert out["result"]["aborted"] and out["relabelled"] is None
+    assert not cache.exists() and not cache.with_name("x.json.tmp").exists()
+    assert not store["db_path"].exists()
+
+
+def test_the_digit_cache_write_leaves_no_temp_file(store, tmp_path):
+    frames = _lineup_frames()
+    cache = tmp_path / "c" / "r.json"
+    _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
+        rr.Options(digit_cache=str(cache)), store)
+    assert [p.name for p in cache.parent.iterdir()] == ["r.json"]
+
+
+def test_a_bad_namespace_is_refused_before_anything_runs():
+    with pytest.raises(SystemExit):
+        rr.main(["--replay", "x", "--event-lineup", "--namespace", "../evil"])

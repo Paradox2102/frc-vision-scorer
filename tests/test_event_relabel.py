@@ -151,3 +151,144 @@ def test_no_write_back_flag_and_reset_never_clears_live():
         er.main(["--event", "2026cur", "--reset"])            # namespace defaults to live
     with pytest.raises(SystemExit):
         er.main(["--event", "2026cur", "--store-write", "--no-event-lineup"])
+
+
+# ---- end to end with fakes -------------------------------------------------
+import argparse  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import scripts.relabel_replay as rr  # noqa: E402
+from web.field import event_anchors as ea  # noqa: E402
+from tests.field.test_window_labels import (  # noqa: E402
+    FPS, _Cal, _lineup_frames, _lineup_session, _source)
+
+RED, BLUE = ["2637", "2724", "6497"], ["3128", "6773", "9066"]
+
+
+def _args(tmp_path, **kw):
+    d = dict(lineup_min_p=0.8, no_event_lineup=False, namespace="eval-x", mode="incremental",
+             store_write=True, digit_cache_dir=str(tmp_path / "dc"), no_elim=False,
+             alliance_rows=False, score=False)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _item(tmp_path, mk):
+    frames = _lineup_frames()
+    mp = tmp_path / f"{mk}.json"
+    mp.write_text(json.dumps({"summary": {"duration_sec": 168.8}, "frames": frames,
+                              "events": []}))
+    return {"match_key": mk, "row": {"id": f"id-{mk}", "match_key": mk, "created_at": "t"}, "meta_path": mp,
+            "video": tmp_path / "v.mp4"}, frames
+
+
+@pytest.fixture()
+def fakes(tmp_path, monkeypatch):
+    real_one, real_fetch = rr.relabel_one, ea.fetch
+    fetched = {}
+    state = {"frames": None}
+    monkeypatch.setattr(rr, "calibration_for", lambda mk, meta: ({"calibration": _Cal()}, None))
+    monkeypatch.setattr(rr, "job_roster", lambda mk: (RED, BLUE))
+    monkeypatch.setattr(er, "_probe_fps", lambda v: FPS)
+    monkeypatch.setattr(er, "load_layout",
+                        lambda: {"main": SimpleNamespace(crop=(0, 0, 1920, 723))})
+    monkeypatch.setattr(er.jev_reader, "JevSession",
+                        lambda *a, **k: _lineup_session(state["frames"], who_p={"B": 0.9}))
+    monkeypatch.setattr(rr, "relabel_one", lambda *a, **k: real_one(
+        *a, frame_source=_source, db_path=tmp_path / "s.db", anchor_root=tmp_path / "tiles", **k))
+
+    def spy_fetch(*a, **k):
+        out = real_fetch(*a, **k)
+        fetched[a[3]] = out
+        return out
+    monkeypatch.setattr(ea, "fetch", spy_fetch)
+    return SimpleNamespace(fetched=fetched, state=state, tmp=tmp_path)
+
+
+def test_incremental_match_borrows_what_the_previous_match_just_wrote(tmp_path, fakes):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    recs = []
+    for mk in ("2026cur_qm3", "2026cur_qm8"):
+        item, fakes.state["frames"] = _item(tmp_path, mk)
+        recs.append(er.relabel_match(item, _args(tmp_path), out_dir))
+    assert not any(r.get("error") for r in recs), recs
+    assert fakes.fetched["2026cur_qm3"] == {}
+    borrowed = fakes.fetched["2026cur_qm8"]
+    assert borrowed and all(a.match_key == "2026cur_qm3" for v in borrowed.values() for a in v)
+    assert recs[0]["stats"]["anchors_written"] == 8 and recs[1]["stats"]["rows_borrowed"] >= 0
+
+
+def test_a_failed_borrow_fetch_is_an_error_not_a_silent_arm_1(tmp_path, fakes, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("db locked")
+    monkeypatch.setattr(ea, "fetch", boom)
+    item, fakes.state["frames"] = _item(tmp_path, "2026cur_qm8")
+    rec = er.relabel_match(item, _args(tmp_path), tmp_path)
+    assert rec["error"].startswith("borrow fetch failed") and "db locked" in rec["error"]
+    out = er.run_all([item, item], lambda it: er.relabel_match(it, _args(tmp_path), tmp_path),
+                     "incremental", workers=1, stop_on_error=True)
+    assert len(out) == 1
+
+
+def test_incremental_refuses_a_match_it_cannot_order():
+    with pytest.raises(ValueError):
+        er.before_match_for("incremental", "garbage")
+    assert er.before_match_for("full", "garbage") is None
+
+
+def test_a_scoring_failure_keeps_the_stats_and_is_not_a_stage_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(rr, "score_numbers", lambda *a: (_ for _ in ()).throw(KeyError("gt")))
+    item = {"match_key": "2026cur_qm8", "row": {"id": "abcdef123456"}, "video": tmp_path}
+    out = {"result": {"aborted": None, "stats": {"windows": 1}, "row_sources": {}},
+           "relabelled": {"summary": {}, "frames": [], "events": []}, "stats": {"windows": 1}}
+    rec = er.result_row(item, out, tmp_path, score=True, seconds=1.0)
+    assert "error" not in rec and "KeyError" in rec["score_error"] and rec["stats"] == {"windows": 1}
+    assert rec["meta_out"]
+
+
+def test_arm_tag_names_the_arm():
+    ns = argparse.Namespace
+    assert er.arm_tag(ns(no_event_lineup=True, no_elim=False, alliance_rows=False)) == "own"
+    assert er.arm_tag(ns(no_event_lineup=False, no_elim=True, alliance_rows=True)) == \
+        "event-noelim-alliance"
+
+
+def _main_with_one_item(tmp_path, monkeypatch, extra):
+    item, _ = _item(tmp_path, "2026cur_qm8")
+    cleared = []
+    monkeypatch.setattr(er, "select_replays", lambda *a, **k: ([item], []))
+    monkeypatch.setattr(er, "relabel_match", lambda it, args, od: {"match_key": it["match_key"]})
+    monkeypatch.setattr(er.ea, "clear", lambda ns, ev, **k: cleared.append((ns, ev)) or 5)
+    return cleared, er.main(["--event", "2026cur", "--namespace", "eval-x", *extra])
+
+
+def test_reset_clears_a_non_live_namespace(tmp_path, monkeypatch):
+    cleared, _ = _main_with_one_item(tmp_path, monkeypatch,
+                                     ["--reset", "--out-dir", str(tmp_path / "o")])
+    assert cleared == [("eval-x", "2026cur")]
+
+
+def test_a_non_empty_out_dir_is_refused_before_a_reset(tmp_path, monkeypatch):
+    od = tmp_path / "o"
+    od.mkdir()
+    (od / "old.json").write_text("{}")
+    with pytest.raises(SystemExit):
+        _main_with_one_item(tmp_path, monkeypatch, ["--reset", "--out-dir", str(od)])
+    # (the clear spy is local to the helper; the refusal comes before any clear call)
+
+
+def test_bad_namespace_is_a_usage_error():
+    with pytest.raises(SystemExit):
+        er.main(["--event", "2026cur", "--namespace", "a/b"])
+
+
+def test_full_store_write_runs_one_worker(tmp_path, monkeypatch):
+    seen = {}
+    item, _ = _item(tmp_path, "2026cur_qm8")
+    monkeypatch.setattr(er, "select_replays", lambda *a, **k: ([item], []))
+    monkeypatch.setattr(er, "run_all", lambda items, fn, mode, workers, stop_on_error=False:
+                        (seen.setdefault("w", workers), [{"match_key": "2026cur_qm8"}])[1])
+    er.main(["--event", "2026cur", "--namespace", "eval-x", "--mode", "full", "--store-write",
+             "--workers", "4", "--out-dir", str(tmp_path / "o")])
+    assert seen["w"] == 1

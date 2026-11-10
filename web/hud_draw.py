@@ -88,6 +88,14 @@ def slot_label(slot_id: int) -> str:
     return f"{'B' if slot_id < 3 else 'R'}{slot_id % 3 + 1}"
 
 
+def slot_id_from_label(label) -> Optional[int]:
+    """Inverse of slot_label ("B1" -> 0 ... "R3" -> 5); None when not a slot."""
+    if not isinstance(label, str) or len(label) != 2 or label[0] not in "BR" \
+            or label[1] not in "123":
+        return None
+    return (0 if label[0] == "B" else 3) + int(label[1]) - 1
+
+
 def draw_robot(img: np.ndarray, box, alliance: str, label: str, flags: HudFlags,
                slot_id: Optional[int] = None, cal=None, field_pos=None, vel=None,
                mask: Optional[np.ndarray] = None) -> None:
@@ -300,8 +308,12 @@ def camera_panel(name: str, panel: np.ndarray, entries, flags: HudFlags,
     """One corner-camera panel: ``panel`` (the view's working frame, drawn on
     in place) with each entry's robot evidence, scaled to ``max_width`` and
     given a name header. Entry keys: box, alliance, label, and optional
-    slot_id / cal / field_pos / vel (as for draw_robot)."""
+    slot_id / cal / field_pos / vel (as for draw_robot); an entry with
+    ``phantom`` set is drawn with draw_phantom (renderer only)."""
     for e in entries:
+        if e.get("phantom"):
+            draw_phantom(panel, e["box"], e["label"])
+            continue
         draw_robot(panel, e["box"], e["alliance"], e["label"], flags,
                    slot_id=e.get("slot_id"), cal=e.get("cal"),
                    field_pos=e.get("field_pos"), vel=e.get("vel"))

@@ -742,6 +742,18 @@ async def get_replay(replay_id: str) -> Optional[Dict]:
         return dict(row) if row else None
 
 
+def get_replay_sync(replay_id: str, db_path=None) -> Optional[Dict]:
+    """get_replay for the render subprocess and scripts (plain sqlite3)."""
+    import sqlite3
+    con = sqlite3.connect(str(db_path or DB_PATH), timeout=30)
+    try:
+        con.row_factory = sqlite3.Row
+        r = con.execute("SELECT * FROM replays WHERE id = ?", (replay_id,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        con.close()
+
+
 async def delete_replay(replay_id: str) -> None:
     """Delete a replay row and its recorded slot corrections."""
     async with aiosqlite.connect(DB_PATH) as db:

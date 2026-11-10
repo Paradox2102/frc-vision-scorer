@@ -67,3 +67,9 @@ def test_mask_poly_none_and_empty():
     assert hud_draw.mask_poly(None) is None
     assert hud_draw.mask_poly(np.zeros((5, 5), bool)) is None
     assert hud_draw.poly_mask(None, (5, 5)) is None
+
+
+def test_slot_id_from_label_inverts_slot_label():
+    assert [hud_draw.slot_id_from_label(hud_draw.slot_label(i)) for i in range(6)] == list(range(6))
+    assert hud_draw.slot_id_from_label(None) is None
+    assert hud_draw.slot_id_from_label("X1") is None and hud_draw.slot_id_from_label("B4") is None

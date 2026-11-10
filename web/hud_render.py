@@ -1,0 +1,350 @@
+"""Render a replay's HUD video after finalize, with the FINAL labels
+(docs/superpowers/specs/2026-11-10-hud-post-render-design.md sections 5-6).
+
+    python -m web.hud_render <replay_id> [--db PATH]
+
+Inputs: the replay row (source video, meta.json), ``meta.summary.hud_static``,
+the per-frame draw list ``draw.jsonl.gz`` recorded live (hud_post_render knob),
+or, for a replay without one, an approximate draw list built from
+``meta.frames`` (back-fill), and the slot corrections in the DB. The source is
+decoded exactly as the analysis loop does (one seek to the first processing
+frame, then sequential reads), every recorded frame's main-view aHash is
+checked, one frame is emitted per ``meta.frames`` entry, and the result
+replaces ``hud.mp4`` atomically (a live-encoded original is kept once as
+``hud.live.mp4``). Stats go to ``render.json`` next to the video.
+
+Import-light on purpose: never imports web.app (no torch, no models).
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import shutil
+import sys
+import time
+import zlib
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Optional
+
+import cv2
+import numpy as np
+
+from web import hud_draw, hud_labels
+
+OVERHEAD_CROP_RATIO = 0.67          # = web.app.OVERHEAD_CROP_RATIO (pinned by a test)
+DEFAULT_FIELD_SEASON = "2026-rebuilt-welded"
+AHASH_MAX_BITS = 4                  # more differing bits than this = a mismatch
+MISALIGNED_FRAC = 0.02              # more mismatches than this share aborts
+APPROX_NOTE = "approx boxes"
+RENDER_VIDEO = "hud.render.mp4"
+LIVE_VIDEO = "hud.live.mp4"
+STATS_FILE = "render.json"
+
+
+class RenderError(Exception):
+    """A render that cannot finish; the message is the render_error."""
+
+
+def load_draw_list(path) -> dict:
+    """{replay frame index: line}. A truncated file (job killed mid-write)
+    keeps the lines read before the damage."""
+    out = {}
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    line = json.loads(raw)
+                except ValueError:
+                    break
+                out[int(line["i"])] = line
+    except (EOFError, OSError, zlib.error):
+        pass
+    return out
+
+
+def _main_calibration(event_key, camera, version_id, match_key, warnings: list):
+    """The main CameraCalibration of ``version_id``; when that version is gone
+    (or unknown), the epoch covering ``match_key``, with a warning."""
+    if not event_key:
+        return None
+    from web.field import store as field_store
+    from web.field.match_order import select_epoch
+    versions = field_store.load_versions(event_key, camera or "main")
+    chosen = next((v for v in versions if v["version_id"] == version_id), None) \
+        if version_id else None
+    if chosen is None:
+        chosen = select_epoch(versions, match_key)
+        if chosen is not None:
+            warnings.append(f"calibration version {version_id!r} not found: using epoch "
+                            f"{chosen['version_id']} for {match_key}")
+    return chosen["calibration"] if chosen else None
+
+
+def draw_frame(img: np.ndarray, line: Optional[dict], rows_by_slot: dict,
+               corr_by_label: dict, ctx: SimpleNamespace) -> np.ndarray:
+    """One composed HUD frame from a decoded source frame, its draw-list line
+    (None = static layers only) and the final labels."""
+    line = line or {}
+    flags = ctx.flags
+    annotated = img[:ctx.overhead_height, :].copy()
+    if ctx.wire_cal is not None:
+        try:
+            hud_draw.draw_field_wireframe(annotated, ctx.wire_cal, ctx.field_model)
+        except Exception:
+            pass
+    for b in line.get("hub_boxes") or []:
+        hud_draw.draw_hub_box(annotated, b[:4])
+    if flags.ball_boxes:
+        for b in line.get("ball_boxes") or []:
+            hud_draw.draw_ball_box(annotated, b[:4])
+    for e in line.get("main") or []:
+        kind, text = hud_labels.entry_text(e, rows_by_slot, corr_by_label)
+        if kind == "phantom":
+            ctx.phantoms += 1
+            hud_draw.draw_phantom(annotated, e["box"], text)
+        elif kind == "ghost":
+            if flags.coasting_ghost:
+                hud_draw.draw_ghost(annotated, e["box"], e.get("alliance"), text)
+        else:
+            sid = e.get("slot_id")
+            sid = hud_draw.slot_id_from_label(e.get("slot")) if sid is None else int(sid)
+            hud_draw.draw_robot(annotated, e["box"], e.get("alliance"), text, flags,
+                                slot_id=sid,
+                                mask=hud_draw.poly_mask(e.get("mask_poly"), annotated.shape))
+    for hb in line.get("hubs") or []:
+        hud_draw.draw_hub(annotated, hb["x"], hb["y"], hb.get("alliance"))
+    if ctx.ocr_regions:
+        hud_draw.draw_ocr_regions(annotated, ctx.ocr_regions)
+
+    from web.field.radar import RadarTrack
+    tracks = []
+    for r in line.get("radar") or []:
+        has_row, label = hud_labels.radar_text(r, rows_by_slot, corr_by_label)
+        tracks.append(RadarTrack(
+            pos=tuple(r["pos"]), alliance=r.get("alliance") if has_row else None,
+            team=label, slot_id=hud_draw.slot_id_from_label(r.get("slot")),
+            state=r.get("state") or "visible", corner_only=bool(r.get("corner_only")),
+            trail=tuple(tuple(p) for p in r.get("trail") or ())))
+    radar_img = ctx.radar.render(tracks)
+
+    panels = []
+    corners = line.get("corners") or {}
+    for v in ctx.views:
+        entries = []
+        for e in corners.get(v["name"]) or []:
+            kind, text = hud_labels.entry_text(e, rows_by_slot, corr_by_label)
+            entries.append({"box": e["box"], "alliance": e.get("alliance"), "label": text,
+                            "phantom": kind == "phantom",
+                            "slot_id": (hud_draw.slot_id_from_label(e.get("slot"))
+                                        if kind == "robot" else None)})
+            ctx.phantoms += kind == "phantom"
+        panel = hud_draw.extract_view(img, v["crop"], v.get("masks") or ())
+        panels.append(hud_draw.camera_panel(v["name"], panel, entries, flags,
+                                            max_width=ctx.panel_max_width))
+    out = hud_draw.compose(annotated, radar_img, panels)
+    if ctx.approx:
+        hud_draw.draw_note(out, APPROX_NOTE)
+    return out
+
+
+def _write_json_atomic(path: Path, obj) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, path)
+
+
+def render_replay(replay_id: str, db_path=None) -> dict:
+    """Render ``replay_id`` and replace its hud.mp4; returns the render stats
+    (also written to render.json). Raises RenderError with the reason."""
+    from web import database
+    from web.field.field_model import FieldModel
+    from web.field.radar import Radar
+    from web.replay_recorder import ReplayRecorder
+
+    t0 = time.perf_counter()
+    row = database.get_replay_sync(replay_id, db_path)
+    if row is None:
+        raise RenderError("replay not found")
+    meta_path = Path(row.get("meta_path") or "")
+    if not meta_path.is_file():
+        raise RenderError(f"meta.json missing: {meta_path}")
+    out_dir = meta_path.parent
+    meta = json.loads(meta_path.read_text())
+    summary, frames = meta.get("summary") or {}, meta.get("frames") or []
+    if not frames:
+        raise RenderError("replay has no frames")
+    src = row.get("source_video_path")
+    if not src or not Path(src).is_file():
+        raise RenderError(f"source video missing: {src}")
+    corr_rows = database.get_slot_corrections_sync(replay_id, db_path)
+    corrections = hud_labels.effective_corrections(corr_rows)
+    corr_by_label = {hud_draw.slot_label(s): c for s, c in corrections.items()}
+
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise RenderError(f"cannot open source video: {src}")
+    vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    warnings: list = []
+    static = summary.get("hud_static")
+    draw_path = out_dir / "draw.jsonl.gz"
+    if static and draw_path.is_file():
+        approx = False
+        lines = load_draw_list(draw_path)
+        flags = hud_draw.flags_from_dict(static.get("flags"))
+        overhead_height = int(static.get("overhead_height") or int(vh * OVERHEAD_CROP_RATIO))
+        views = static.get("views") or []
+        ocr_regions = static.get("ocr_regions") or {}
+        refs = static.get("reference_paths") or []
+        season = static.get("field_season")
+        wire_cal = None
+        if static.get("field_wireframe_overlay"):
+            wire_cal = _main_calibration(row.get("event_key") or static.get("event_key"),
+                                         static.get("camera"), static.get("calibration_version"),
+                                         row.get("match_key"), warnings)
+            if wire_cal is None:
+                warnings.append("field wireframe skipped: main calibration not found")
+    else:
+        cap.release()
+        raise RenderError("no draw list (back-fill: Task 7)")
+    field_model = FieldModel.load(season or DEFAULT_FIELD_SEASON)
+    radar = Radar(field_model.length_m, field_model.width_m, field_model=field_model)
+    if refs:
+        radar.set_reference_paths([SimpleNamespace(**r) for r in refs])
+    ctx = SimpleNamespace(flags=flags, overhead_height=overhead_height, views=views,
+                          ocr_regions=ocr_regions, wire_cal=wire_cal, field_model=field_model,
+                          radar=radar, approx=approx, phantoms=0,
+                          panel_max_width=int((static or {}).get("panel_max_width")
+                                              or hud_draw.PANEL_MAX_WIDTH))
+
+    ranges = summary.get("processing_ranges") or []
+    if ranges:
+        first = int(ranges[0][0])
+    else:
+        first = 0
+        warnings.append("no processing_ranges: decoding from frame 0")
+    hashed = sum(1 for ln in lines.values() if ln.get("main_hash"))
+    allowed = int(MISALIGNED_FRAC * hashed)
+    checked = mismatches = missing = 0
+    fps = float(summary.get("fps") or row.get("fps") or 8.0)
+    rec = ReplayRecorder(video_name=RENDER_VIDEO)
+    tmp_video = out_dir / RENDER_VIDEO
+    thumb = None
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+        fn = first
+        for idx, mf in enumerate(frames):
+            target = mf.get("frame_num")
+            if target is None or int(target) < fn:
+                raise RenderError(f"decode misaligned: meta frame {idx} has frame_num {target} "
+                                  f"but the decoder is at {fn}")
+            target = int(target)
+            while fn < target:
+                if not cap.grab():
+                    raise RenderError(f"source video ended at frame {fn}, before {target}")
+                fn += 1
+            ok, img = cap.read()
+            if not ok:
+                raise RenderError(f"source video ended at frame {fn}")
+            fn += 1
+            line = lines.get(int(mf.get("i", idx)))
+            if line is not None and line.get("frame_num") not in (None, target):
+                line = None
+            if line is None:
+                missing += 1
+            elif line.get("main_hash"):
+                checked += 1
+                if hud_draw.ahash_distance(hud_draw.ahash(img[:overhead_height, :]),
+                                           line["main_hash"]) > AHASH_MAX_BITS:
+                    mismatches += 1
+                    if mismatches > allowed:
+                        raise RenderError(f"decode misaligned: {mismatches} of {hashed} "
+                                          f"frames fail the main-view hash check")
+            rows_by_slot = {r.get("slot"): r for r in mf.get("robots") or []}
+            composed = draw_frame(img, line, rows_by_slot, corr_by_label, ctx)
+            if not rec.is_open:
+                rec.open_lazy(composed, fps, out_dir)
+            rec.add_frame(composed, {})
+            if idx == len(frames) // 2:
+                thumb = composed.copy()
+        rec.close_video()
+    except BaseException:
+        cap.release()
+        rec.close_video()
+        tmp_video.unlink(missing_ok=True)
+        raise
+    cap.release()
+    if not tmp_video.is_file() or tmp_video.stat().st_size == 0:
+        raise RenderError("encoder produced no video")
+
+    final = out_dir / "hud.mp4"
+    live = out_dir / LIVE_VIDEO
+    stats_path = out_dir / STATS_FILE
+    kept_live = False
+    if final.exists() and not live.exists() and not stats_path.exists():
+        try:
+            os.link(final, live)            # keep the live-encoded original, once
+        except OSError:
+            shutil.copy2(final, live)
+        kept_live = True
+    os.replace(tmp_video, final)
+    if thumb is not None:
+        if thumb.shape[:2] != (rec.height, rec.width):
+            thumb = cv2.resize(thumb, (rec.width, rec.height))
+        tmp_thumb = out_dir / "thumb.render.jpg"
+        cv2.imwrite(str(tmp_thumb), thumb, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        os.replace(tmp_thumb, out_dir / "thumb.jpg")
+
+    relabelled = hud_labels.relabel_counts(frames, corrections, hud_draw.slot_label)
+    stats = {
+        "replay_id": replay_id,
+        "rendered_at": datetime.now().isoformat(timespec="seconds"),
+        "seconds": round(time.perf_counter() - t0, 2),
+        "frames": len(frames),
+        "source": "approx" if approx else "draw_list",
+        "decode_checked": checked, "decode_mismatches": mismatches,
+        "draw_lines_missing": missing if not approx else 0,
+        "phantom_boxes": ctx.phantoms,
+        "corrections": {lab: {"old": corr_by_label[lab][0], "new": corr_by_label[lab][1],
+                              "frames_relabelled": n} for lab, n in relabelled.items()},
+        "corrections_note": None if corr_rows else "no recorded corrections",
+        "kept_live_video": kept_live,
+        "width": rec.width, "height": rec.height, "codec": rec.codec or None,
+        "video_path": str(final), "thumb_path": str(out_dir / "thumb.jpg"),
+        "warnings": warnings,
+    }
+    _write_json_atomic(stats_path, stats)
+    return stats
+
+
+def read_stats(out_dir) -> Optional[dict]:
+    """The last render's stats (render.json), or None."""
+    try:
+        return json.loads((Path(out_dir) / STATS_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Render a replay's HUD video with the final labels.")
+    ap.add_argument("replay_id")
+    ap.add_argument("--db", default=None, help="SQLite DB (default: web.database.DB_PATH)")
+    args = ap.parse_args(argv)
+    try:
+        stats = render_replay(args.replay_id, args.db)
+    except RenderError as e:
+        print(json.dumps({"replay_id": args.replay_id, "error": str(e)}))
+        return 1
+    print(json.dumps(stats))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from web.field.track_evidence import slot_label_to_id
+from web.field.event_anchors import KIND_DIGITS, KIND_ELIM, Anchor
 
 MAX_WINDOW_S = 4.0
 GAP_FRAME_PERIODS = 2.5
@@ -37,6 +38,7 @@ RANK_DIGITS, RANK_LINEUP = 2, 1
 SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup"}
 SOURCE_NONE = "window_none"
 LETTERS = "ABCDEF"
+BORROW_PER_MATCH = 2              # borrowed anchors from any one source match, per row
 
 
 @dataclass
@@ -197,6 +199,44 @@ def lineup_decision(probs: Optional[dict], letters: dict, min_p: float) -> Optio
     letter = max(letters, key=lambda l: float(probs.get(l, 0.0)))
     p = float(probs.get(letter, 0.0))
     return (letters[letter], p) if p >= min_p else None
+
+
+def borrow_key(a: Anchor, colour: Optional[str]) -> tuple:
+    """Rank of a borrowed anchor for a row (spec section 3): digits before
+    elimination, then this match's bumper colour, then p descending, then
+    the most recent match, then the earliest frame; match key last, so the
+    order never depends on the input order."""
+    return (a.kind != KIND_DIGITS, a.alliance_color != colour, -float(a.p),
+            -int(a.match_number or 0), int(a.frame_num or 0), str(a.match_key or ""))
+
+
+def fill_row(n_own: int, borrowed: list, colour: Optional[str],
+             use_elimination: bool = True) -> list:
+    """Borrowed anchors for one team's lineup row, in card order. ``n_own``:
+    the team's own digit anchors in this match. Fills toward ANCHORS_PER_TEAM
+    by borrow_key, at most BORROW_PER_MATCH from any one source match (both
+    kinds together). Elimination anchors are used only when own plus
+    borrowed digit anchors are fewer than MIN_ANCHORS."""
+    need = ANCHORS_PER_TEAM - n_own
+    if need <= 0:
+        return []
+    ranked = sorted(borrowed, key=lambda a: borrow_key(a, colour))
+    picked: list = []
+    per_match: dict = {}
+
+    def take(kind):
+        for a in ranked:
+            if len(picked) >= need:
+                return
+            if a.kind != kind or per_match.get(a.match_key, 0) >= BORROW_PER_MATCH:
+                continue
+            picked.append(a)
+            per_match[a.match_key] = per_match.get(a.match_key, 0) + 1
+
+    take(KIND_DIGITS)
+    if use_elimination and n_own + len(picked) < MIN_ANCHORS:
+        take(KIND_ELIM)
+    return picked
 
 
 def assemble_labels(windows: list, evidence: dict) -> tuple:

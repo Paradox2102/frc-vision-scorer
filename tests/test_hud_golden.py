@@ -4,7 +4,8 @@ ghost, 2 hubs, a hub box, a skipped ball and robot detection, OCR regions, the
 wireframe off, a radar with a trail and a scouted route, and 2 corner views (one
 detection near a slot, one not). tests/data/hud_live_golden.png was captured from
 the analysis loop's inline drawing code BEFORE the hud_draw refactor; the live
-HUD must keep matching it byte for byte."""
+HUD (InferenceJob._live_hud, which the loop calls) must keep matching it byte
+for byte."""
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,38 +118,17 @@ def scene():
     return job, kwargs
 
 
-def _live_block_source() -> str:
-    """The analysis loop's inline HUD drawing (web/app.py, inside
-    ``with self._stage("loop.hud"):``), dedented. Only valid BEFORE the
-    hud_draw refactor (Task 2 replaces it with InferenceJob._live_hud)."""
-    import textwrap
-    lines = Path(app_mod.__file__).read_text().splitlines()
-    start = next(i for i, l in enumerate(lines)
-                 if l.strip() == "annotated_frame = overhead_frame.copy()")
-    end = next(i for i in range(start, len(lines)) if lines[i].strip()
-               == "annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)")
-    return textwrap.dedent("\n".join(lines[start:end + 1]))
-
-
-def exec_live_block(job, kw) -> np.ndarray:
-    ns = dict(vars(app_mod))
-    ns.update(DEFAULT_FLAGS)
-    ns.update(kw, self=job)
-    exec(compile(_live_block_source(), "<web/app.py live HUD block>", "exec"), ns)
-    return ns["annotated_frame"]
-
-
 def golden() -> np.ndarray:
     img = cv2.imread(str(GOLDEN), cv2.IMREAD_UNCHANGED)
     assert img is not None, f"missing {GOLDEN}"
     return img
 
 
-def test_live_block_matches_the_golden_image(monkeypatch):
+def test_live_hud_matches_the_golden_image(monkeypatch):
     for k, v in DEFAULT_FLAGS.items():
         monkeypatch.setattr(app_mod, k, v)
     job, kw = scene()
-    out = exec_live_block(job, kw)
+    out = job._live_hud(**kw)
     want = golden()
     assert out.shape == want.shape and out.dtype == want.dtype
     assert np.array_equal(out, want)

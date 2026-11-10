@@ -125,6 +125,7 @@ from web.field.fusion import fuse_detections, merge_same_id_observations
 from web.field.fused_track_id import FusedTrackRegistry
 from web.field.crop_buffer import CropBuffer
 from web.hud_util import select_coasting_ghosts, draw_dashed_box
+from web import hud_draw
 from web.field.bumper import bumper_band_box, bumper_crop
 from web.field.zones import (
     inflate_zones,
@@ -895,6 +896,15 @@ HUD_DRAW_GROUND_PLANE   = _hud_flag("HUD_DRAW_GROUND_PLANE", "0")    # bumper gr
 HUD_DRAW_VELOCITY_ARROW = _hud_flag("HUD_DRAW_VELOCITY_ARROW", "0")  # motion-direction arrow
 HUD_DRAW_BALL_BOXES     = _hud_flag("HUD_DRAW_BALL_BOXES", "0")      # per-ball detection boxes (hundreds = noise)
 HUD_DRAW_COASTING_GHOST = _hud_flag("HUD_DRAW_COASTING_GHOST", "1")  # dashed last-known box for coasting tracks
+
+
+def _live_hud_flags() -> "hud_draw.HudFlags":
+    """The HUD_DRAW_* flags above as a hud_draw.HudFlags, read at call time."""
+    return hud_draw.HudFlags(
+        robot_mask=HUD_DRAW_ROBOT_MASK, bumper_band=HUD_DRAW_BUMPER_BAND,
+        robot_label=HUD_DRAW_ROBOT_LABEL, robot_box=HUD_DRAW_ROBOT_BOX,
+        ground_plane=HUD_DRAW_GROUND_PLANE, velocity_arrow=HUD_DRAW_VELOCITY_ARROW,
+        ball_boxes=HUD_DRAW_BALL_BOXES, coasting_ghost=HUD_DRAW_COASTING_GHOST)
 
 # Bumper-number reading VLM. Loaded via AutoModelForImageTextToText, so any
 # transformers-supported image-text-to-text model works.  Override via VLM_MODEL_NAME
@@ -5310,126 +5320,45 @@ class InferenceJob:
     def _draw_bumper_hud(self, img: np.ndarray, box, alliance: str, label: str,
                          slot_id: Optional[int] = None, cal=None, field_pos=None,
                          vel=None, mask: Optional[np.ndarray] = None) -> None:
-        """Draw bumper-specific evidence over a camera view."""
-        color = (255, 80, 20) if alliance == "blue" else (30, 30, 255) if alliance == "red" else (190, 190, 190)
-
-        SLOT_COLORS = {
-            0: (0, 220, 0),       # slot 0 (B1): Green
-            1: (255, 220, 0),     # slot 1 (B2): Cyan/Light Blue
-            2: (0, 220, 220),     # slot 2 (B3): Yellow
-            3: (30, 30, 255),     # slot 3 (R1): Red
-            4: (225, 50, 225),    # slot 4 (R2): Magenta/Pink
-            5: (0, 165, 255),     # slot 5 (R3): Orange
-        }
-        mask_color = SLOT_COLORS.get(slot_id, color) if slot_id is not None else color
-
-        x1, y1, x2, y2 = map(int, box)
-        
-        # Draw SAM2 mask overlay if present
-        if mask is not None and HUD_DRAW_ROBOT_MASK:
-            overlay = img.copy()
-            overlay[mask] = mask_color
-            cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
-
-        if HUD_DRAW_BUMPER_BAND:
-            band = bumper_band_box(img, box)
-            if band is not None:
-                bx1, by1, bx2, by2 = band
-                overlay = img.copy()
-                cv2.rectangle(overlay, (bx1, by1), (bx2, by2), color, -1)
-                cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
-                cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
-                cv2.line(img, (bx1, by2), (bx2, by2), (255, 255, 255), 2)
-
-        if HUD_DRAW_ROBOT_BOX:
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-
-        if HUD_DRAW_ROBOT_LABEL:
-            text = f"{self._slot_label(slot_id)} {label}" if slot_id is not None else label
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            cv2.rectangle(img, (x1, max(0, y1 - th - 9)), (x1 + tw + 7, y1), (0, 0, 0), -1)
-            cv2.putText(img, text, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, color, 2, cv2.LINE_AA)
-
-        if cal is not None and field_pos is not None and (HUD_DRAW_GROUND_PLANE or HUD_DRAW_VELOCITY_ARROW):
-            self._draw_projected_robot_plane(img, cal, field_pos, vel, color, box)
+        """Draw bumper-specific evidence over a camera view (hud_draw.draw_robot
+        with the live flags)."""
+        hud_draw.draw_robot(img, box, alliance, label, _live_hud_flags(), slot_id=slot_id,
+                            cal=cal, field_pos=field_pos, vel=vel, mask=mask)
 
     def _draw_projected_robot_plane(self, img: np.ndarray, cal, field_pos, vel, color, box=None) -> None:
-        """Draw bumper-ground evidence and a separate motion vector.
+        """Bumper-ground strip + motion arrow (hud_draw.draw_projected_robot_plane)."""
+        hud_draw.draw_projected_robot_plane(img, cal, field_pos, vel, color,
+                                            _live_hud_flags(), box)
 
-        Robot bumper/chassis orientation and robot travel direction are different
-        signals. The debug plane is anchored to the detected bumper bottom edge
-        in image space so it visualizes the measurement instead of a potentially
-        lagged/smoothed track center.
-        """
-        try:
-            x, y = float(field_pos[0]), float(field_pos[1])
-            vx, vy = (float(vel[0]), float(vel[1])) if vel is not None else (0.0, 0.0)
-
-            if box is not None and HUD_DRAW_GROUND_PLANE:
-                band = bumper_band_box(img, box)
-                if band is not None:
-                    bx1, by1, bx2, by2 = band
-                    bottom_y = by2
-                    # A visual ground contact strip: lower edge is the bumper
-                    # bottom, upper edge is just above it. This stays attached to
-                    # the detected robot even when the field track is smoothed.
-                    height = max(10, int((by2 - by1) * 0.45))
-                    skew = int((bx2 - bx1) * 0.12)
-                    poly = np.array([
-                        (bx1, bottom_y),
-                        (bx2, bottom_y),
-                        (bx2 - skew, bottom_y + height),
-                        (bx1 + skew, bottom_y + height),
-                    ], np.int32)
-                    h, w = img.shape[:2]
-                    poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
-                    poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
-                    overlay = img.copy()
-                    cv2.fillPoly(overlay, [poly], color)
-                    cv2.addWeighted(overlay, 0.18, img, 0.82, 0, img)
-                    cv2.polylines(img, [poly], True, color, 2)
-
-            speed = float(np.hypot(vx, vy))
-            center = cal.field_to_image((x, y, 0.0))
-            if HUD_DRAW_VELOCITY_ARROW and speed >= 0.15 and center is not None:
-                n = max(speed, 1e-6)
-                arrow_len = min(1.0, 0.35 + speed * 0.20)
-                tip = cal.field_to_image((x + arrow_len * vx / n, y + arrow_len * vy / n, 0.0))
-                if tip is None:
-                    return
-                cv2.arrowedLine(img, (int(center[0]), int(center[1])),
-                                (int(tip[0]), int(tip[1])), (255, 255, 255), 2,
-                                tipLength=0.35)
-        except Exception:
-            return
-
-    def _camera_panel(self, view, composite_frame, paired, track_outs=None, max_width=720) -> np.ndarray:
-        panel = view.extract(composite_frame)
+    def _camera_panel(self, view, composite_frame, paired, track_outs=None, max_width=720,
+                      record: Optional[list] = None) -> np.ndarray:
+        """One corner-camera panel with live labels. ``record`` (a list, or
+        None) receives the draw-list entry of every detection drawn."""
         track_outs = track_outs or []
+        entries = []
         for det, _crop_b64 in paired:
             t = self._nearest_track_for_detection(det, track_outs)
             robot = self._get_or_create_slot_track(t.slot_id) if t is not None else None
             fallback = f"{det.color} bumper" if det.color != "unknown" else "bumper?"
             label, _confirmed = self._team_hud_label(robot, fallback)
             alliance = robot.alliance if robot is not None else det.color
-            self._draw_bumper_hud(
-                panel, det.box, alliance, label,
-                slot_id=t.slot_id if t is not None else None,
-                cal=view.calibration,
-                field_pos=t.pos if t is not None else det.pos,
-                vel=t.vel if t is not None else None,
-            )
-        h, w = panel.shape[:2]
-        if w > max_width:
-            scale = max_width / float(w)
-            panel = cv2.resize(panel, (max_width, int(h * scale)))
-        header_h = 26
-        out = np.full((panel.shape[0] + header_h, panel.shape[1], 3), 18, np.uint8)
-        out[header_h:, :] = panel
-        cv2.putText(out, view.name, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (230, 230, 230), 1, cv2.LINE_AA)
-        return out
+            entries.append({
+                "box": det.box, "alliance": alliance, "label": label,
+                "slot_id": t.slot_id if t is not None else None,
+                "cal": view.calibration,
+                "field_pos": t.pos if t is not None else det.pos,
+                "vel": t.vel if t is not None else None,
+                "score": robot.scores if robot is not None else None,
+            })
+        if record is not None:
+            record.extend({
+                "slot": self._slot_label(e["slot_id"]) if e["slot_id"] is not None else None,
+                "alliance": e["alliance"] if e["alliance"] in ("red", "blue") else None,
+                "box": [float(v) for v in e["box"][:4]],
+                "score": int(e["score"]) if e["score"] is not None else None,
+                "live_text": e["label"]} for e in entries)
+        return hud_draw.camera_panel(view.name, view.extract(composite_frame), entries,
+                                     _live_hud_flags(), max_width=max_width)
 
     def _maybe_draw_field_wireframe(self, frame) -> None:
         """When the field_wireframe_overlay knob is on, draw the reprojected field
@@ -5448,46 +5377,126 @@ class InferenceJob:
 
     def _compose_hud_frame(self, annotated_frame, radar_img, camera_panels) -> np.ndarray:
         """Stack a larger field/corner-camera dashboard below the main view."""
-        ah, aw = annotated_frame.shape[:2]
-        dash_h = max(300, min(560, int(ah * 0.48)))
-        dash = np.full((dash_h, aw, 3), 16, np.uint8)
-        pad = 12
-        title_h = 30
-        body_y = pad + title_h
-        body_h = dash_h - body_y - pad
+        return hud_draw.compose(annotated_frame, radar_img, camera_panels)
 
-        def paste_fit(dst, src, x, y, w, h, max_upscale=1.8):
-            sh, sw = src.shape[:2]
-            if sh <= 0 or sw <= 0 or w <= 0 or h <= 0:
-                return
-            scale = min(w / sw, h / sh, max_upscale)
-            out = cv2.resize(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
-            ox = x + max(0, (w - out.shape[1]) // 2)
-            oy = y + max(0, (h - out.shape[0]) // 2)
-            dst[oy:oy + out.shape[0], ox:ox + out.shape[1]] = out
+    def _live_main_mask(self, slot_id, frame_num, fused, view_shape) -> Optional[np.ndarray]:
+        """The slot's SAM mask in main-view pixels this frame, or None."""
+        local_idx = self.sam2_source_to_local.get(frame_num)
+        registry_track_id = next(
+            (track_id for track_id, mapped_slot in self.field_tracker._id_to_slot.items()
+             if mapped_slot == slot_id),
+            None,
+        )
+        if registry_track_id is None:
+            return None
+        obs = next((item for item in fused if item.track_id == registry_track_id), None)
+        if obs is None:
+            return None
+        mask = None
+        for camera, det_id in obs.members:
+            if camera != "main" or "main" not in self.sam2_raw:
+                continue
+            entry = self.sam2_raw["main"].get(local_idx, {}).get(det_id)
+            if entry is not None:
+                mask2d = entry.get("mask")
+                if mask2d is not None:
+                    main_view = next((view for view in self.views if view.name == "main"), None)
+                    top_offset_px = 0
+                    if main_view is not None:
+                        top_crop_frac = (
+                            getattr(main_view.calibration, "robot_track_top_crop", 0.0) or 0.0
+                        ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
+                        top_offset_px = int(view_shape[0] * top_crop_frac)
+                    mask = _restore_sam2_mask_to_view(mask2d, view_shape, top_offset_px)
+            break
+        return mask
 
-        map_w = int(aw * 0.34) if camera_panels else aw - 2 * pad
-        cv2.putText(dash, "FIELD MAP", (pad, pad + 21), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (235, 235, 235), 1, cv2.LINE_AA)
-        paste_fit(dash, radar_img, pad, body_y, map_w - pad, body_h, max_upscale=2.0)
+    def _live_hud(self, overhead_frame, frame, detections, tracked_robot_boxes, track_outs,
+                  per_camera, fused, frame_num) -> np.ndarray:
+        """The live HUD frame: main view (wireframe, hub/ball boxes, robots,
+        coasting ghosts, hubs, OCR regions) + field map + corner panels, all
+        through web/hud_draw.py with live labels and the live flags."""
+        flags = _live_hud_flags()
+        annotated_frame = overhead_frame.copy()
+        # Optional verification pass: lay the reprojected field wireframe down
+        # first so robot/ball/hub HUD draws on top of it (and it's baked into
+        # both the live stream and the recorded replay).
+        self._maybe_draw_field_wireframe(annotated_frame)
+        track_by_slot = {t.slot_id: t for t in track_outs}
 
-        if camera_panels:
-            cams_x = map_w + pad
-            cams_w = aw - cams_x - pad
-            cv2.putText(dash, "CORNER CAMERA HUD", (cams_x, pad + 21),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (235, 235, 235), 1, cv2.LINE_AA)
-            n = len(camera_panels)
-            gap = 10
-            cell_w = max(1, (cams_w - gap * (n - 1)) // n)
-            for i, panel in enumerate(camera_panels):
-                x = cams_x + i * (cell_w + gap)
-                cv2.rectangle(dash, (x, body_y), (x + cell_w, body_y + body_h),
-                              (55, 55, 55), 1)
-                paste_fit(dash, panel, x + 4, body_y + 4, cell_w - 8, body_h - 8,
-                          max_upscale=1.7)
+        # Ball / hub detection boxes. Robots come from the tracker slots below.
+        # Per-ball boxes are visual noise (hundreds per frame): only with the flag.
+        for i in range(len(detections)):
+            class_id = detections.class_id[i]
+            if class_id == 1 or (class_id == 0 and not flags.ball_boxes):
+                continue
+            box = detections.xyxy[i]
+            if class_id == 0:
+                hud_draw.draw_ball_box(annotated_frame, box)
+            else:
+                hud_draw.draw_hub_box(annotated_frame, box)
 
-        cv2.line(dash, (0, 0), (aw, 0), (80, 80, 80), 1)
-        return np.vstack([annotated_frame, dash])
+        # Robots are drawn from visible tracker slots. Their boxes and
+        # alliance colors originate from the bumper-model path.
+        for slot_id, box in tracked_robot_boxes:
+            robot = self._get_slot_track_if_exists(slot_id)
+            if robot is None:
+                continue
+            label, _confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
+            track = track_by_slot.get(slot_id)
+            mask = (self._live_main_mask(slot_id, frame_num, fused, overhead_frame.shape)
+                    if self.use_sam2 else None)
+            hud_draw.draw_robot(
+                annotated_frame, box, robot.alliance, label, flags, slot_id=slot_id,
+                cal=self.calib, field_pos=(track.pos if track else robot.field_position),
+                vel=track.vel if track else None, mask=mask)
+
+        # Coasting tracks: position alive, mask gone. Without a ghost
+        # they are indistinguishable from never-seen robots in the
+        # camera view (they only show on the field map).
+        if flags.coasting_ghost:
+            drawn_slots = {sid for sid, _ in tracked_robot_boxes}
+            for slot_id, gbox in select_coasting_ghosts(track_outs):
+                if slot_id in drawn_slots:
+                    continue
+                robot = self._get_slot_track_if_exists(slot_id)
+                if robot is None:
+                    continue
+                label, _ = self._team_hud_label(robot, self._slot_label(slot_id))
+                hud_draw.draw_ghost(annotated_frame, gbox, robot.alliance, label)
+
+        for hub in self.hubs:
+            hud_draw.draw_hub(annotated_frame, hub.x, hub.y, hub.alliance)
+
+        # OCR score regions, so the user can verify placement.
+        hud_draw.draw_ocr_regions(annotated_frame, self.ocr_regions)
+
+        # Radar + corner camera HUD panels live in a dashboard below the video.
+        radar_tracks = []
+        radar_seen_slots = set()
+        for t in track_outs:
+            if t.state == "empty":
+                continue
+            radar_seen_slots.add(t.slot_id)
+            trail = self._radar_trails.setdefault(t.slot_id, deque(maxlen=16))
+            trail.append(t.pos)
+            slot_track = self._get_slot_track_if_exists(t.slot_id)
+            team = slot_track.team_number if slot_track is not None else None
+            radar_tracks.append(RadarTrack(
+                pos=t.pos, alliance=t.alliance,
+                team=team or self._slot_label(t.slot_id),
+                slot_id=t.slot_id, state=t.state,
+                corner_only=t.corner_only, trail=tuple(trail)))
+        # A slot that vanished re-seeds its trail from scratch.
+        for sid in list(self._radar_trails):
+            if sid not in radar_seen_slots:
+                del self._radar_trails[sid]
+        radar_img = self.radar.render(radar_tracks)
+        camera_panels = [
+            self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
+            for v in self.views if v.name != "main"
+        ]
+        return hud_draw.compose(annotated_frame, radar_img, camera_panels)
 
     def detect_hub_alliance(self, frame: np.ndarray) -> None:
         """Detect hub alliance colors from the surrounding field area.
@@ -9485,193 +9494,9 @@ class InferenceJob:
                                         print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (corrected down)")
                 
                 with self._stage("loop.hud"):
-                    # Draw annotations
-                    annotated_frame = overhead_frame.copy()
-                    # Optional verification pass: lay the reprojected field wireframe down
-                    # first so robot/ball/hub HUD draws on top of it (and it's baked into
-                    # both the live stream and the recorded replay).
-                    self._maybe_draw_field_wireframe(annotated_frame)
-                    track_by_slot = {t.slot_id: t for t in track_outs}
-                
-                    # Draw detections
-                    for i in range(len(detections)):
-                        box = detections.xyxy[i]
-                        class_id = detections.class_id[i]
-                    
-                        x1, y1, x2, y2 = map(int, box)
-                    
-                        if class_id == 0:  # fuel_ball
-                            color = (0, 255, 255)  # Yellow
-                            label = "ball"
-                        elif class_id == 1:  # robot
-                            continue
-                        else:  # hub_opening
-                            color = (0, 255, 0)  # Green
-                            label = "hub"
-
-                        # Per-ball boxes are visual noise (hundreds of balls per frame); skip
-                        # when disabled.  Hub boxes (class_id 2) are kept regardless.
-                        if class_id == 0 and not HUD_DRAW_BALL_BOXES:
-                            continue
-
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                        # Label with background for readability
-                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                        cv2.rectangle(annotated_frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 0, 0), -1)
-                        cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                    # Robots are drawn from visible tracker slots. Their boxes and
-                    # alliance colors originate from the bumper-model path.
-                    for slot_id, box in tracked_robot_boxes:
-                        robot = self._get_slot_track_if_exists(slot_id)
-                        if robot is None:
-                            continue
-                        label, _confirmed = self._team_hud_label(
-                            robot, self._slot_label(slot_id)
-                        )
-                        track = track_by_slot.get(slot_id)
-                        mask = None
-                        if self.use_sam2:
-                            local_idx = self.sam2_source_to_local.get(frame_num)
-                            registry_track_id = next(
-                                (
-                                    track_id
-                                    for track_id, mapped_slot in
-                                    self.field_tracker._id_to_slot.items()
-                                    if mapped_slot == slot_id
-                                ),
-                                None,
-                            )
-                            if registry_track_id is not None:
-                                obs = next(
-                                    (
-                                        item for item in fused
-                                        if item.track_id == registry_track_id
-                                    ),
-                                    None,
-                                )
-                                if obs is not None:
-                                    for camera, det_id in obs.members:
-                                        if camera != "main" or "main" not in self.sam2_raw:
-                                            continue
-                                        entry = self.sam2_raw["main"].get(
-                                            local_idx, {}
-                                        ).get(det_id)
-                                        if entry is not None:
-                                            mask2d = entry.get("mask")
-                                            if mask2d is not None:
-                                                main_view = next(
-                                                    (
-                                                        view
-                                                        for view in self.views
-                                                        if view.name == "main"
-                                                    ),
-                                                    None,
-                                                )
-                                                top_offset_px = 0
-                                                if main_view is not None:
-                                                    top_crop_frac = (
-                                                        getattr(
-                                                            main_view.calibration,
-                                                            "robot_track_top_crop",
-                                                            0.0,
-                                                        )
-                                                        or 0.0
-                                                    ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                                                    top_offset_px = int(
-                                                        overhead_frame.shape[0]
-                                                        * top_crop_frac
-                                                    )
-                                                mask = _restore_sam2_mask_to_view(
-                                                    mask2d,
-                                                    overhead_frame.shape,
-                                                    top_offset_px,
-                                                )
-                                        break
-                        self._draw_bumper_hud(
-                            annotated_frame,
-                            box,
-                            robot.alliance,
-                            label,
-                            slot_id=slot_id,
-                            cal=self.calib,
-                            field_pos=(
-                                track.pos if track else robot.field_position
-                            ),
-                            vel=track.vel if track else None,
-                            mask=mask,
-                        )
-
-                    # Coasting tracks: position alive, mask gone. Without a ghost
-                    # they are indistinguishable from never-seen robots in the
-                    # camera view (they only show on the field map).
-                    if HUD_DRAW_COASTING_GHOST:
-                        drawn_slots = {sid for sid, _ in tracked_robot_boxes}
-                        for slot_id, gbox in select_coasting_ghosts(track_outs):
-                            if slot_id in drawn_slots:
-                                continue
-                            robot = self._get_slot_track_if_exists(slot_id)
-                            if robot is None:
-                                continue
-                            label, _ = self._team_hud_label(
-                                robot, self._slot_label(slot_id))
-                            gcolor = ((153, 60, 0) if robot.alliance == "blue"
-                                      else (0, 30, 153))
-                            draw_dashed_box(annotated_frame, gbox, gcolor, thickness=2)
-                            gx1, gy1 = int(gbox[0]), int(gbox[1])
-                            cv2.putText(annotated_frame, f"{label} coast",
-                                        (gx1, max(12, gy1 - 5)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, gcolor, 1,
-                                        cv2.LINE_AA)
-
-                    # Draw hubs
-                    for hub in self.hubs:
-                        color = (255, 0, 0) if hub.alliance == "blue" else (0, 0, 255)
-                        cv2.circle(annotated_frame, (int(hub.x), int(hub.y)), 20, color, 3)
-                        cv2.putText(annotated_frame, f"{hub.alliance} hub",
-                                   (int(hub.x) - 30, int(hub.y) - 25),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-                    # Draw OCR score regions so user can verify placement
-                    for region_key, (rx, ry, rw, rh) in self.ocr_regions.items():
-                        if "blue" in region_key:
-                            rect_color = (255, 0, 0)  # Blue in BGR
-                        elif "red" in region_key:
-                            rect_color = (0, 0, 255)  # Red in BGR
-                        else:
-                            rect_color = (0, 255, 255)  # Yellow in BGR
-                        cv2.rectangle(annotated_frame, (rx, ry), (rx + rw, ry + rh), rect_color, 2)
-                        cv2.putText(annotated_frame, region_key,
-                                   (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
-
-                    # Radar + corner camera HUD panels live in a right rail, not over the video.
-                    radar_tracks = []
-                    radar_seen_slots = set()
-                    for t in track_outs:
-                        if t.state == "empty":
-                            continue
-                        radar_seen_slots.add(t.slot_id)
-                        trail = self._radar_trails.setdefault(
-                            t.slot_id, deque(maxlen=16))
-                        trail.append(t.pos)
-                        slot_track = self._get_slot_track_if_exists(t.slot_id)
-                        team = slot_track.team_number if slot_track is not None else None
-                        radar_tracks.append(RadarTrack(
-                            pos=t.pos, alliance=t.alliance,
-                            team=team or self._slot_label(t.slot_id),
-                            slot_id=t.slot_id, state=t.state,
-                            corner_only=t.corner_only, trail=tuple(trail)))
-                    # A slot that vanished re-seeds its trail from scratch.
-                    for sid in list(self._radar_trails):
-                        if sid not in radar_seen_slots:
-                            del self._radar_trails[sid]
-                    radar_img = self.radar.render(radar_tracks)
-                    camera_panels = [
-                        self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
-                        for v in self.views if v.name != "main"
-                    ]
-                    annotated_frame = self._compose_hud_frame(annotated_frame, radar_img, camera_panels)
+                    annotated_frame = self._live_hud(
+                        overhead_frame, frame, detections, tracked_robot_boxes,
+                        track_outs, per_camera, fused, frame_num)
 
                 with self._stage("loop.replay"):
                     # --- Replay recording: capture the composited HUD frame + metadata
@@ -10908,61 +10733,8 @@ async def calibration_refine_tag(request: Request):
     return {"corners": corners.tolist() if corners is not None else None}
 
 
-def _draw_field_overlay(frame, cal, fm):
-    """Draw the reprojected field, hubs, and bumps using cal.field_to_image.
-    Field lines are SAMPLED into polylines (a straight field line projects to a curved
-    image line under lens distortion, so a 2-point segment can't trace it).
-    Returns fp(x,y)->(int,int) so callers can add their own markers."""
-    L, W = fm.length_m, fm.width_m
-    H, Wd = frame.shape[:2]
-    def fp(x, y):
-        u, v = cal.field_to_image((x, y, 0.0))
-        return (int(u), int(v))
-    def _ok(u, v):
-        # A poorly-conditioned calibration can project ground points to enormous
-        # (or non-finite) pixel coords — points near/behind the camera blow up.
-        # Keep only finite coords within a generous off-screen margin so the int32
-        # polyline conversion can't overflow (and we don't draw garbage segments).
-        return (np.isfinite(u) and np.isfinite(v)
-                and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
-    def seg3(p0, p1, color, thick, n=24):
-        x0, y0, z0 = p0
-        x1, y1, z1 = p1
-        run = []
-        def flush():
-            if len(run) >= 2:
-                cv2.polylines(frame, [np.array(run, np.int32)], False, color, thick)
-            run.clear()
-        for t in range(n + 1):
-            u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
-                                       y0 + (y1 - y0) * t / n,
-                                       z0 + (z1 - z0) * t / n))
-            if _ok(u, v):
-                run.append((int(u), int(v)))
-            else:
-                flush()   # break the polyline across the blown-up region
-        flush()
-    def seg(p0, p1, color, thick, n=24):
-        seg3((p0[0], p0[1], 0.0), (p1[0], p1[1], 0.0),
-             color, thick, n)
-    for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
-        seg(a, b, (0, 255, 0), 2)
-    x = 0.0
-    while x <= L + 1e-6:
-        seg((x, 0), (x, W), (0, 180, 0), 1); x += 2.0
-    y = 0.0
-    while y <= W + 1e-6:
-        seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
-    prisms = hub_prisms(fm)
-    for a, b in hub_wireframe_edges(prisms):
-        seg3(a, b, (255, 220, 0), 2, n=12)
-    for a, b in bump_wireframe_edges(prisms, W):
-        seg3(a, b, (0, 140, 255), 2, n=8)
-    for a, b in tower_wireframe_edges(fm):
-        seg3(a, b, (255, 0, 255), 2, n=8)
-    for a, b in trench_wireframe_edges(fm):
-        seg3(a, b, (180, 80, 255), 2, n=8)
-    return fp
+# The field wireframe lives in web/hud_draw.py (shared with the HUD renderer).
+_draw_field_overlay = hud_draw.draw_field_wireframe
 
 
 @app.post("/api/calibration/solve-homography")

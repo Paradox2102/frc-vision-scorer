@@ -17,6 +17,16 @@ vllm-choice  Closed-set "poor man's decision model" on the SAME vLLM model:
 clef-flash   Cloudflare Workers AI decision models (Jev-API compatible): one
 clef         request per crop (per permutation) answering `legible` (noul),
              `surface` (choice) and `team` (choice) jointly.
+jev          TypeSafe's Jev decision model (api.typesafe.ai/v1/systemone, image
+             capable): one request per crop (per permutation, default 1),
+             --frames single only. Asks `subject` (bumper / no_digits / printed /
+             not_robot) BEFORE `team`; the team options are the offered roster
+             plus four escapes (not_robot, unreadable, printed, other) instead
+             of none/other - rows carry escape_ids, scoring treats all four as
+             escapes. Scored as `jev:<opts>` and `jev:<opts>+subj` (team kept
+             only when the subject argmax is "bumper"). Crops are rescaled into
+             the API's 280-1568 px window (gray letterbox when the aspect ratio
+             needs it). Needs JEV_TYPESAFE_API_TOKEN (env, else repo-root .env).
 
 Option sets (``--options``)
 ---------------------------
@@ -48,6 +58,43 @@ Position bias / calibration (choice arms)
                    a blank image SHOULD pick "none", so calibration
                    systematically pushes mass away from the escapes.
 
+Multi-frame inputs (``--frames``, clef arms)
+------------------------------------------
+Tracklets (``tracklets.jsonl`` + ``tracklets/<id>/<offset>.jpg``, built by
+scripts/build_tracklet_bench.py) follow the cropped bumper +-1.5 s through the
+source video at ~12 fps.
+single   one image: the bench crop (default; byte-identical payloads).
+multi4   up to 4 images (the API max): the bench crop + the sharpest frame of
+         each third of the remaining tracklet frames, in time order, each
+         prepped like the single crop (clef_image); the state says they show
+         the SAME robot over ~N seconds.
+multi8   freeread only: up to 8 images (the bench crop + 7 frames, one per
+         time seventh).
+freeread multi4/multi8: ONE chat request carrying all the images (each with the
+         incumbent's 512-px LANCZOS prep), the incumbent prompt reworded for N
+         time-ordered moments of the same robot, and the incumbent's
+         _vlm_chat_payload settings (guided JSON _BUMPER_READ_SCHEMA, logprob
+         confidence, roster hint); the reply goes through the incumbent's
+         parse -> roster match -> confidence blend. The server must allow
+         several images per prompt (--limit-mm-per-prompt '{"image": 8}').
+--prompt escape (freeread, --frames single only; default ``incumbent``): replaces
+         the incumbent prompt with one that admits detector junk (balls, piles,
+         structures) and asks for "subject" (bumper / no_digits / printed /
+         not_robot) BEFORE the digits (ESCAPE_READ_SCHEMA, subject first), with a
+         neutral roster line ("Teams on the red alliance in this match: ...").
+         Any subject but "bumper" forces team=None. Rows carry prompt_variant and
+         freeread.subject; scores are labelled ``freeread+escape``.
+video    clef-omni only: every tracklet frame, letterboxed to a fixed canvas
+         (long side 512, even sides), encoded H.264 yuv420p at 2 fps - the
+         rate clef-omni samples video at, so each crop is one sampled frame -
+         sent as ``videos: ["data:video/mp4;base64,..."]``; no image unless
+         ``--video-with-still``.
+A crop without a usable tracklet (no source video, not localised, < 2 frames)
+falls back to the single-frame request. Every row records ``frames_used`` and
+``tracklet_frames``; ``score --subset tracklet`` restricts every file to the
+crop ids whose tracklet has >= 3 frames, so single and multi-frame runs are
+compared on identical crops.
+
 The alliance hint (``--hint-source``) stands in for the pipeline's CV
 bumper-colour hint: ``baseline`` = the incumbent's alliance_read (default),
 ``label`` = label_alliance (a perfect hint), ``none`` = never hinted.
@@ -61,8 +108,9 @@ coverage at 0.5/0.7/0.9, and mean probability mass on decoys. Label-free
 behaviour: assert rate, agreement with the baseline's matched team, assert rate
 on legibility-filtered crops, first-slot argmax rate.
 
-Credentials: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from the environment,
-else from the repo-root .env (never printed, never overriding the environment).
+Credentials: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN (clef arms) and
+JEV_TYPESAFE_API_TOKEN (jev) from the environment, else from the repo-root .env
+(never printed, never overriding the environment).
 
 Usage
 -----
@@ -70,6 +118,10 @@ Usage
     .venv/bin/python scripts/bench_bumper_readers.py --arms freeread,vllm-choice --limit 40 --score
     .venv/bin/python scripts/bench_bumper_readers.py --arms freeread,vllm-choice --options missing-true --score
     .venv/bin/python scripts/bench_bumper_readers.py --arms clef-flash --options decoy --score
+    .venv/bin/python scripts/bench_bumper_readers.py --arms clef-flash --frames multi4 --options decoy
+    .venv/bin/python scripts/bench_bumper_readers.py --arms clef-omni --frames video --dry-run
+    .venv/bin/python scripts/bench_bumper_readers.py --arms jev --options decoy --score
+    .venv/bin/python scripts/bench_bumper_readers.py score --subset tracklet results/clef-*.jsonl
     .venv/bin/python scripts/bench_bumper_readers.py score            # latest file per arm
     .venv/bin/python scripts/bench_bumper_readers.py score data/eval/bumper_crop_bench/results/clef-*.jsonl
 """
@@ -100,7 +152,7 @@ sys.path.insert(0, str(REPO))
 BENCH_DIR = REPO / "data" / "eval" / "bumper_crop_bench"
 ENV_FILE = REPO / ".env"
 
-ARMS = ("freeread", "vllm-choice", "clef-flash", "clef", "clef-omni")
+ARMS = ("freeread", "vllm-choice", "clef-flash", "clef", "clef-omni", "jev")
 OPTION_MODES = ("alliance", "decoy", "missing-true")
 HINT_SOURCES = ("baseline", "label", "none")
 ESCAPES = ("none", "other")
@@ -109,12 +161,23 @@ ESCAPE_TEXT = {
              "not a robot, or the only digits are printed on field equipment)"),
     "other": "A legible team number that is NOT any of the listed teams",
 }
+# jev arm escapes (replace none/other); the text rides on the option dict.
+JEV_ESCAPES = ("not_robot", "unreadable", "printed", "other")
+JEV_ESCAPE_TEXT = {
+    "not_robot": ("No robot bumper in the image: balls, field structures, signs, people or "
+                  "empty floor"),
+    "unreadable": ("A robot bumper, but the digits can't be read: blurred, cut off, turned "
+                   "away or too small"),
+    "printed": "The digits are printed on a crate, bin, sign or field structure, not a robot bumper",
+    "other": "Legible bumper digits that are NOT any of the listed teams",
+}
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 THRESHOLDS = (0.5, 0.7, 0.9)
 BLANK_EPS = 1e-3
 BLANK_GRAY = (128, 128, 128)
-DEFAULT_PERMS = {"vllm-choice": 3, "clef-flash": 1, "clef": 1, "clef-omni": 1}
+DEFAULT_PERMS = {"vllm-choice": 3, "clef-flash": 1, "clef": 1, "clef-omni": 1, "jev": 1}
 CF_ENV_KEYS = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")
+JEV_ENV_KEYS = ("JEV_TYPESAFE_API_TOKEN",)
 
 VLM_SERVER_URL = os.environ.get("VLM_SERVER_URL", "http://localhost:8006/v1")
 
@@ -150,9 +213,46 @@ CLEF_MODELS = {
                   "usd_per_m_input": 0.15},
 }
 CF_URL = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{route}"
+# TypeSafe Jev (verified live 2026-11-05): POST {"model", "state", "assets":
+# {ref: {"type": "image", "format": "jpg", "data_base64"}}, "questions"} with
+# `Authorization: Bearer` and (any image request) `TypeSafe-Danger-Zone-Images:
+# true`. Every asset ref must appear in the state or a question's instructions.
+# Images: JPEG/PNG, each side 280-1568 px, 78,400-2,458,624 px total; out-of-range
+# images are rejected, not resized. Answers: choice -> {"choice", "confidence",
+# "probabilities"}; response {"model": "jev-1.14.0", "answers", "usage"}.
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-latest"
+JEV_USD_PER_M_INPUT = 0.042
+JEV_MIN_SIDE = 280
+JEV_MAX_SIDE = 1568
+JEV_PAD_GRAY = (128, 128, 128)
+JEV_ASSET_REF = "crop_image"
+JEV_SUBJECTS = ("bumper", "no_digits", "printed", "not_robot")
 CLEF_MIN_SIDE = 256
 CLEF_MAX_IMAGE_TOKENS = 1024
 CLEF_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+# Multi-frame arms (--frames). Tracklets come from scripts/build_tracklet_bench.py
+# (<bench>/tracklets.jsonl + tracklets/<id>/<offset>.jpg).
+# clef-omni "videos" input, verified 2026-10-12 against
+#   https://developers.cloudflare.com/workers-ai/models/clef-omni/schema-input.json:
+# max 2 videos, 16 MiB and 60 s each, data URL "data:video/mp4;base64,..." (or
+# {"content_type", "base64"}), sampled at 2 frames per second, up to 256 input
+# tokens per second of video (~15,400/min at max resolution; 480p ~144/s).
+FRAME_MODES = ("single", "multi4", "multi8", "video")
+MULTI_IMAGES = {"multi4": 4, "multi8": 8}   # images per request incl. the bench crop
+FREEREAD_FRAME_MODES = ("single", "multi4", "multi8")
+VIDEO_ARMS = ("clef-omni",)
+TRACKLETS_FILE = "tracklets.jsonl"
+MULTI_MAX_IMAGES = 4          # API max images per request
+MIN_TRACKLET_FRAMES = 2       # fewer -> the crop falls back to single-frame
+SUBSET_MIN_FRAMES = 3         # `score --subset tracklet`
+VIDEO_FPS = 2                 # = Clef-omni's sampling rate: one crop per sampled frame
+VIDEO_LONG_SIDE = 512
+VIDEO_MAX_S = 60
+VIDEO_MAX_BYTES = 16 * 1024 * 1024
+VIDEO_TOKENS_PER_S = 256
+FFMPEG = os.environ.get("FFMPEG", "/usr/bin/ffmpeg")
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +351,7 @@ def blank_calibrate(p: dict, p_blank: dict, eps: float = BLANK_EPS) -> dict:
 def option_text(opt: dict) -> str:
     if opt["kind"] == "team":
         return f"Team {opt['team']} ({opt['alliance']} alliance)"
-    return ESCAPE_TEXT[opt["id"]]
+    return opt.get("text") or ESCAPE_TEXT[opt["id"]]
 
 
 def decoy_teams(row: dict, hint: str) -> list[str]:
@@ -348,12 +448,31 @@ def ece(confs: list[float], corrects: list[bool], n_bins: int = 10) -> Optional[
     return total
 
 
+def _escapes(pred: dict) -> tuple:
+    """Option ids that count as "no team asserted" for this row: the row's own
+    ``escape_ids`` (jev), else the classic none/other."""
+    return tuple(pred.get("escape_ids") or ESCAPES)
+
+
+def subject_gated_view(pred: dict) -> dict:
+    """The row with the team withheld unless the jev ``subject`` argmax is
+    "bumper" (the ``+subj`` variant). A blocked team top becomes the escape
+    "gated" so it scores as an abstention on legible crops and as a correct
+    escape on negatives."""
+    q = dict(pred)
+    esc = _escapes(pred)
+    if pred.get("subject_top") != "bumper" and pred.get("top") not in esc:
+        q["top"] = "gated"
+        q["escape_ids"] = list(esc) + ["gated"]
+    return q
+
+
 def calibrated_view(pred: dict) -> dict:
     """The same prediction row with the blank-calibrated distribution swapped in."""
     q = dict(pred)
     q["probs"] = pred.get("probs_cal")
     q["top"], q["top_p"] = top_choice(q["probs"])
-    q["pred_team"] = q["top"] if q["top"] not in ESCAPES else None
+    q["pred_team"] = q["top"] if q["top"] not in _escapes(pred) else None
     q["perms"] = [dict(pm, probs=pm.get("probs_cal")) for pm in pred.get("perms") or []]
     return q
 
@@ -361,7 +480,7 @@ def calibrated_view(pred: dict) -> dict:
 def _pred_team(pred: dict) -> Optional[str]:
     if pred.get("probs") is not None:
         top = pred.get("top")
-        return top if top is not None and top not in ESCAPES else None
+        return top if top is not None and top not in _escapes(pred) else None
     t = pred.get("pred_team")
     return str(t) if t else None
 
@@ -404,7 +523,7 @@ def score_predictions(preds: list[dict], manifest: dict[str, dict]) -> dict:
             filt_n += 1
             filt_assert += int(team is not None)
         if probs is not None:
-            listed_mass.append(sum(v for k, v in probs.items() if k not in ESCAPES))
+            listed_mass.append(sum(v for k, v in probs.items() if k not in _escapes(p)))
             dts = [t for t in decoy_teams(row, p.get("hint_alliance", "unknown")) if t in probs]
             if dts:
                 decoy_mass.append(sum(probs[t] for t in dts))
@@ -446,7 +565,7 @@ def score_predictions(preds: list[dict], manifest: dict[str, dict]) -> dict:
             confs.append(top_p)
             # A negative crop is answered correctly by EITHER escape: "other"
             # on an unreadable crop asserts no team, same as the fp metric.
-            corrects.append(p.get("top") in ESCAPES if st != "legible"
+            corrects.append(p.get("top") in _escapes(p) if st != "legible"
                             else p.get("top") == tgt)
             for t in THRESHOLDS:
                 asserted = team is not None and top_p >= t
@@ -492,6 +611,10 @@ def score_file_variants(preds: list[dict], manifest: dict, label: str) -> list[t
         out.append((label + "+cal", score_predictions(
             [calibrated_view(p) if p.get("probs_cal") is not None else p for p in preds],
             manifest)))
+    if any(p.get("subject_probs") is not None for p in preds):
+        out.append((label + "+subj", score_predictions(
+            [subject_gated_view(p) if p.get("subject_probs") is not None else p
+             for p in preds], manifest)))
     return out
 
 
@@ -721,6 +844,466 @@ def clef_estimate_tokens(payload: dict, w: int, h: int) -> int:
     return clef_image_tokens(w, h) + text // 4
 
 
+# ---- jev (TypeSafe) request builders ---------------------------------------
+
+def jev_image(jpg: bytes) -> tuple[bytes, int, int, bool]:
+    """Prep a crop for Jev: each side must land in 280..1568 px (the API rejects
+    rather than resizes). Scale (LANCZOS) so the short side reaches 280 and the
+    long side stays <= 1568; when the aspect ratio makes both impossible, shrink
+    the long side to 1568 and letterbox-pad the short side to 280 with neutral
+    gray. Unchanged JPEGs pass through byte-identical. Returns
+    (jpeg bytes, w, h, padded)."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(jpg))
+    w, h = img.size
+    scale = 1.0
+    if min(w, h) < JEV_MIN_SIDE:
+        scale = JEV_MIN_SIDE / min(w, h)
+    if max(w, h) * scale > JEV_MAX_SIDE:
+        scale = JEV_MAX_SIDE / max(w, h)
+    nw = min(JEV_MAX_SIDE, max(1, int(round(w * scale))))
+    nh = min(JEV_MAX_SIDE, max(1, int(round(h * scale))))
+    cw, ch = max(nw, JEV_MIN_SIDE), max(nh, JEV_MIN_SIDE)
+    if (cw, ch) == (w, h) and img.format == "JPEG":
+        return jpg, w, h, False
+    img = img.convert("RGB")
+    if (nw, nh) != (w, h):
+        img = img.resize((nw, nh), Image.LANCZOS)
+    padded = (cw, ch) != (nw, nh)
+    if padded:
+        canvas = Image.new("RGB", (cw, ch), JEV_PAD_GRAY)
+        canvas.paste(img, ((cw - nw) // 2, (ch - nh) // 2))
+        img = canvas
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue(), cw, ch, padded
+
+
+def jev_options(row: dict, mode: str, hint: str) -> list[dict]:
+    """Unshuffled jev option set: the offered roster teams + the four JEV_ESCAPES
+    (replacing the classic none/other)."""
+    opts = [o for o in build_options(row, mode, hint) if o["kind"] == "team"]
+    return opts + [{"id": e, "kind": "escape", "text": JEV_ESCAPE_TEXT[e]} for e in JEV_ESCAPES]
+
+
+def jev_roster_line(row: dict, mode: str, hint: str) -> str:
+    red, blue = offered_roster(row, mode)
+    expected = hint if mode in ("alliance", "missing-true") else "unknown"
+    return freeread_escape_hint_line(expected, red, blue, red + blue)
+
+
+def jev_state(row: dict, mode: str, hint: str, ref: str = JEV_ASSET_REF) -> dict:
+    """State: the asset ref + the escape prompt's framing (detector crop that may
+    not be a robot, what a bumper looks like, neutral roster line)."""
+    return {
+        "crop": ref,
+        "context": (
+            "`crop` is an automatic crop from a robot detector running on FRC match video. "
+            "It usually shows one FRC robot, but the detector makes mistakes: the crop may "
+            "instead show game pieces (balls), a pile of balls, field structures, signs, "
+            "people, or only part of a robot. An FRC robot bumper is a solid RED or BLUE "
+            "fabric band around the base of a robot with a WHITE team number (1 to 5 digits, "
+            "e.g. 294, 2485, 4322) printed on it. "
+            f"{jev_roster_line(row, mode, hint)} "
+            "The team list is only for matching partially visible digits. Never pick a team "
+            "unless you can see its digits on a bumper in `crop`."),
+    }
+
+
+def jev_questions(options: list[dict]) -> dict:
+    """``subject`` first, then ``team`` (dict order is the JSON order)."""
+    return {
+        "subject": {
+            "type": "choice",
+            "instructions": "What does `crop` show?",
+            "criteria": {
+                "bumper": "A robot bumper with white digits you can actually see",
+                "no_digits": ("A robot, but its bumper digits are not visible or not "
+                              "readable (blurred, cut off, turned away, too small)"),
+                "printed": ("Digits printed on a crate, bin, sign or field structure, "
+                            "not on a robot bumper"),
+                "not_robot": ("No robot at all (balls, field elements, people, empty "
+                              "floor)"),
+            },
+        },
+        "team": {
+            "type": "choice",
+            "instructions": ("Which option matches the white team-number digits on the "
+                             "robot bumper in `crop`? Choose an escape option unless you "
+                             "can actually see a listed team's digits on a bumper."),
+            "criteria": {o["id"]: option_text(o) for o in options},
+        },
+    }
+
+
+def jev_payload(row: dict, img_bytes: bytes, options: list[dict], mode: str, hint: str,
+                ref: str = JEV_ASSET_REF) -> dict:
+    return {
+        "model": JEV_MODEL,
+        "state": jev_state(row, mode, hint, ref),
+        "assets": {ref: {"type": "image", "format": "jpg",
+                         "data_base64": base64.b64encode(img_bytes).decode()}},
+        "questions": jev_questions(options),
+    }
+
+
+def jev_estimate_tokens(payload: dict, w: int, h: int) -> int:
+    """Rough input tokens, fitted to 5 live crops (2026-11-05): ~1 per 415 image
+    px + ~1.9 chars/token for state+questions (the JSON eats extra tokens)."""
+    text = len(json.dumps(payload["state"])) + len(json.dumps(payload["questions"]))
+    return int(w * h / 415 + text / 1.9)
+
+
+# --------------------------------------------------------------------------- #
+# Multi-frame inputs (--frames multi4 | video)
+# --------------------------------------------------------------------------- #
+
+def load_tracklets(bench_dir: Path) -> dict[str, dict]:
+    """crop id -> tracklets.jsonl row, for status == "ok" rows only."""
+    path = Path(bench_dir) / TRACKLETS_FILE
+    if not path.exists():
+        return {}
+    out = {}
+    for line in path.read_text().splitlines():
+        if line.strip():
+            t = json.loads(line)
+            if t.get("status") == "ok":
+                out[t["id"]] = t
+    return out
+
+
+def usable_tracklet(trk: Optional[dict], min_frames: int = MIN_TRACKLET_FRAMES) -> bool:
+    return bool(trk) and trk.get("status") == "ok" and len(trk.get("frames") or []) >= min_frames
+
+
+def tracklet_subset_ids(tracklets: dict[str, dict], min_frames: int = SUBSET_MIN_FRAMES) -> set:
+    """Crop ids whose tracklet has >= min_frames frames (`score --subset tracklet`)."""
+    return {i for i, t in tracklets.items() if usable_tracklet(t, min_frames)}
+
+
+def select_multi_frames(frames: list[dict], n_other: int = MULTI_MAX_IMAGES - 1) -> list[dict]:
+    """The ``n_other`` tracklet frames shown next to the bench crop: the centre
+    frame (offset 0, which IS the bench crop) is excluded, the remaining frames
+    are split into ``n_other`` contiguous time chunks of near-equal size, and the
+    sharpest (Laplacian variance; ties -> nearer the centre) of each chunk is
+    taken. Returned in time order."""
+    others = sorted((f for f in frames if f["offset"] != 0), key=lambda f: f["offset"])
+    if len(others) <= n_other:
+        return others
+    n = len(others)
+    picks = []
+    for i in range(n_other):
+        chunk = others[(i * n) // n_other:((i + 1) * n) // n_other]
+        picks.append(max(chunk, key=lambda f: (f.get("sharpness") or 0.0, -abs(f["offset"]))))
+    return sorted(picks, key=lambda f: f["offset"])
+
+
+def multi_frame_sequence(crop_jpg: bytes, trk: dict, bench_dir: Path,
+                         n_images: int) -> list[dict]:
+    """[{"offset", "bytes"}] in time order: the bench crop (offset 0) plus the
+    ``n_images - 1`` frames picked by select_multi_frames."""
+    picks = select_multi_frames(trk["frames"], n_images - 1)
+    return sorted([{"offset": 0, "bytes": crop_jpg}]
+                  + [{"offset": f["offset"], "bytes": (Path(bench_dir) / f["file"]).read_bytes()}
+                     for f in picks], key=lambda d: d["offset"])
+
+
+# ---- freeread multi-image read (the incumbent prompt, several moments) ------
+
+def freeread_hint_line(expected_alliance: str, red: list, blue: list, match_teams: list) -> str:
+    """The incumbent's roster-hint line (web/app.py _vllm_read_bumpers._read_one)."""
+    if expected_alliance in ("blue", "red"):
+        cand = ", ".join(red if expected_alliance == "red" else blue)
+        return (f"Computer vision sees {expected_alliance.upper()} bumper pixels, so partial or "
+                f"uncertain reads should be matched only against these {expected_alliance} "
+                f"alliance teams: {cand}.\n")
+    return f"Possible current-match teams are: {', '.join(match_teams)}.\n"
+
+
+def freeread_multi_prompt(n: int, span_s: float, hint_line: str) -> str:
+    """The incumbent bumper-read prompt reworded for ``n`` time-ordered images of
+    one robot; same reply instructions, so _BUMPER_READ_SCHEMA still applies."""
+    return (
+        f"These {n} images show the SAME FRC robot at {n} moments over about {span_s:.1f} "
+        "seconds, ordered in time, from a side or elevated camera angle. "
+        "Around the base of the robot is a bumper: a solid RED or BLUE band with a "
+        "WHITE team number printed on it. FRC team numbers are 1 to 5 digits "
+        "(for example 294, 2485, 4322). The digits may be readable in some images and "
+        "blurred, cut off or hidden in others.\n\n"
+        f"{hint_line}"
+        "Carefully read the WHITE digits on the bumper, left to right, using the images "
+        "where they are clearest, and give ONE reading for this robot. Report the "
+        "exact number you SEE. Do not use robot paint or mechanisms for alliance color; "
+        "only the bumper band matters. If the digits are clear, report them even if the "
+        "color looks surprising.\n\n"
+        'Reply with ONLY compact JSON and nothing else: '
+        '{"team": "<the digits, or null if you cannot read them>", '
+        '"color": "red" or "blue", '
+        '"surface": "bumper" if the digits are on a robot\'s bumper band, '
+        'or "printed" if they are printed on a crate, bin, sign, or other '
+        'field structure}.'
+    )
+
+
+def multi_image_payload(base_payload: dict, data_uris: list[str], prompt: str) -> dict:
+    """A web.app._vlm_chat_payload body with its user content swapped for
+    ``data_uris`` (one image_url each, in order) followed by ``prompt``. Model,
+    sampling, logprobs, response_format and extra body keys are kept."""
+    out = json.loads(json.dumps(base_payload))
+    out["messages"] = [{"role": "user", "content": (
+        [{"type": "image_url", "image_url": {"url": u}} for u in data_uris]
+        + [{"type": "text", "text": prompt}])}]
+    return out
+
+
+def parse_bumper_reply(text: str) -> tuple[Optional[str], str, Optional[str]]:
+    """(team, color, raw surface) from a reader reply - the incumbent's parse."""
+    team, color, surface = None, "unknown", None
+    try:
+        clean = (text or "").strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.strip()
+        start, end = clean.find("{"), clean.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(clean[start:end])
+            team = parsed.get("team")
+            color = parsed.get("color", "unknown")
+            surface = parsed.get("surface")
+            if team is not None:
+                team = str(team)
+    except Exception:
+        pass
+    return team, color, surface
+
+
+# ---- freeread --prompt escape (explicit "not a robot" option, decided first) --
+
+PROMPT_VARIANTS = ("incumbent", "escape")
+
+# Property order matters: under guided decoding the model emits "subject" BEFORE
+# any digits, so it decides "is there a bumper at all" first.
+ESCAPE_READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string", "enum": ["bumper", "no_digits", "printed", "not_robot"]},
+        "team": {"type": ["string", "null"]},
+        "color": {"type": "string", "enum": ["red", "blue", "none"]},
+    },
+    "required": ["subject", "team", "color"],
+}
+
+
+def freeread_escape_hint_line(expected_alliance: str, red: list, blue: list,
+                              match_teams: list) -> str:
+    """Roster line for the escape prompt: no 'computer vision sees ... pixels',
+    no 'should be matched only against' (both invite guessing)."""
+    if expected_alliance in ("blue", "red"):
+        cand = ", ".join(red if expected_alliance == "red" else blue)
+        return f"Teams on the {expected_alliance} alliance in this match: {cand}."
+    return f"Teams in this match: {', '.join(match_teams)}."
+
+
+def freeread_escape_prompt(hint_line: str) -> str:
+    """Single-image prompt for --prompt escape (reply shape: ESCAPE_READ_SCHEMA)."""
+    return (
+        "This image is an automatic crop from a robot detector running on FRC match video. "
+        "It usually shows one FRC robot, but the detector makes mistakes: the crop may instead "
+        "show game pieces (balls), a pile of balls, field structures, signs, people, or only "
+        "part of a robot.\n\n"
+        "An FRC robot bumper is a solid RED or BLUE fabric band around the base of a robot "
+        "with a WHITE team number (1 to 5 digits, e.g. 294, 2485, 4322) printed on it.\n\n"
+        'First decide what the image shows ("subject"):\n'
+        '- "bumper": a robot bumper with white digits you can actually see\n'
+        '- "no_digits": a robot, but its bumper digits are not visible or not readable '
+        "(blurred, cut off, turned away, too small)\n"
+        '- "printed": digits printed on a crate, bin, sign or field structure, not on a robot '
+        "bumper\n"
+        '- "not_robot": no robot at all (balls, field elements, people, empty floor)\n\n'
+        'Only if subject is "bumper", read the WHITE digits left to right and report exactly '
+        "what you see. Use only the bumper band for color, not robot paint.\n"
+        f"{hint_line}\n"
+        "The team list is only for matching partially visible digits. Never answer with a team "
+        "from the list unless you can see its digits on a bumper in this image. If subject is "
+        'not "bumper", team must be null and color "none" is allowed.\n\n'
+        'Reply with ONLY compact JSON: {"subject": "...", "team": "<digits>" or null, '
+        '"color": "red" | "blue" | "none"}'
+    )
+
+
+def parse_escape_reply(text: str) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
+    """(team, color, surface, subject) from an escape-schema reply. Unless the
+    subject is "bumper" the team is forced to None (no roster matching on junk);
+    surface: bumper -> "bumper", printed -> "printed", anything else -> "unknown"."""
+    team, color, _surf = parse_bumper_reply(text)
+    subject = None
+    try:
+        clean = (text or "").strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.strip()
+        start, end = clean.find("{"), clean.rfind("}") + 1
+        if start >= 0 and end > start:
+            s = json.loads(clean[start:end]).get("subject")
+            subject = str(s).strip().lower() if s is not None else None
+    except Exception:
+        pass
+    if subject != "bumper":
+        team = None
+    surface = subject if subject in ("bumper", "printed") else "unknown"
+    return team, color, surface, subject
+
+
+def _even(x: float) -> int:
+    return max(2, 2 * int(round(x / 2.0)))
+
+
+def letterbox_dims(w: int, h: int, long_side: int = VIDEO_LONG_SIDE) -> tuple[int, int]:
+    """Video canvas (width, height) for a w x h tracklet box: long side
+    ``long_side``, aspect kept, both sides even (H.264 yuv420p)."""
+    s = long_side / max(w, h)
+    return _even(w * s), _even(h * s)
+
+
+def letterbox(img, cw: int, ch: int):
+    """PIL image scaled (LANCZOS) to fit cw x ch, centred on black."""
+    from PIL import Image
+    img = img.convert("RGB")
+    s = min(cw / img.width, ch / img.height)
+    nw, nh = max(1, int(round(img.width * s))), max(1, int(round(img.height * s)))
+    canvas = Image.new("RGB", (cw, ch), (0, 0, 0))
+    canvas.paste(img.resize((nw, nh), Image.LANCZOS), ((cw - nw) // 2, (ch - nh) // 2))
+    return canvas
+
+
+def encode_video(frames_jpg: list[bytes], cw: int, ch: int, fps: int = VIDEO_FPS,
+                 ffmpeg: str = FFMPEG) -> bytes:
+    """Letterbox each JPEG onto a cw x ch canvas and encode H.264 yuv420p mp4 at
+    ``fps`` (one input frame per output frame) with ffmpeg."""
+    import subprocess
+    import tempfile
+    from PIL import Image
+    with tempfile.TemporaryDirectory(prefix="bench_vid_") as td:
+        for i, b in enumerate(frames_jpg):
+            with Image.open(io.BytesIO(b)) as im:
+                letterbox(im, cw, ch).save(Path(td) / f"{i:04d}.png")
+        out = Path(td) / "out.mp4"
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-framerate", str(fps), "-i", str(Path(td) / "%04d.png"),
+               "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart", str(out)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0 or not out.exists():
+            raise ArmError(f"ffmpeg failed ({res.returncode}): {res.stderr[-300:]}")
+        return out.read_bytes()
+
+
+def video_token_estimate(n_frames: int, cw: int, ch: int, fps: int = VIDEO_FPS) -> int:
+    """Rough video input tokens: 32-px blocks per frame x fps, capped at
+    VIDEO_TOKENS_PER_S per second of video."""
+    per_frame = max(1, round(cw / 32)) * max(1, round(ch / 32))
+    return int(math.ceil(n_frames / fps * min(VIDEO_TOKENS_PER_S, per_frame * fps)))
+
+
+def _span_s(offsets: list[int], fps: Optional[float]) -> float:
+    return (max(offsets) - min(offsets)) / (fps or 60.0) if offsets else 0.0
+
+
+def build_frame_media(frames_mode: str, crop_jpg: bytes, trk: Optional[dict],
+                      bench_dir: Path, with_still: bool = False) -> dict:
+    """Images / video for one crop under ``frames_mode``.
+
+    Returns {"kind": "single"|"multi"|"video", "images": [(bytes, w, h)],
+    "video": bytes|None, "video_wh", "frames_used", "tracklet_frames", "offsets",
+    "span_s"}. A crop without a usable tracklet (or ``single`` mode) is the
+    single-frame bench crop, prepared exactly as the single-frame arm does."""
+    n_trk = len((trk or {}).get("frames") or []) if (trk or {}).get("status") == "ok" else 0
+    single = {"kind": "single", "images": [clef_image(crop_jpg)], "video": None,
+              "video_wh": None, "frames_used": 1, "tracklet_frames": n_trk,
+              "offsets": [0], "span_s": 0.0}
+    if frames_mode == "single" or not usable_tracklet(trk):
+        return single
+    bench_dir = Path(bench_dir)
+    fps = trk.get("fps")
+    if frames_mode == "multi4":
+        seq = multi_frame_sequence(crop_jpg, trk, bench_dir, MULTI_IMAGES["multi4"])
+        offsets = [d["offset"] for d in seq]
+        return {"kind": "multi", "images": [clef_image(d["bytes"]) for d in seq],
+                "video": None, "video_wh": None, "frames_used": len(seq),
+                "tracklet_frames": n_trk, "offsets": offsets, "span_s": _span_s(offsets, fps)}
+    if frames_mode == "video":
+        seq = sorted(trk["frames"], key=lambda f: f["offset"])
+        if len(seq) / VIDEO_FPS > VIDEO_MAX_S:  # keep the centre-most frames
+            keep = int(VIDEO_MAX_S * VIDEO_FPS)
+            seq = sorted(sorted(seq, key=lambda f: abs(f["offset"]))[:keep], key=lambda f: f["offset"])
+        cw, ch = letterbox_dims(*trk["box"][2:4])
+        video = encode_video([(bench_dir / f["file"]).read_bytes() for f in seq], cw, ch)
+        if len(video) > VIDEO_MAX_BYTES:
+            raise ArmError(f"video {len(video)} bytes > {VIDEO_MAX_BYTES}")
+        offsets = [f["offset"] for f in seq]
+        return {"kind": "video", "images": [clef_image(crop_jpg)] if with_still else [],
+                "video": video, "video_wh": (cw, ch), "frames_used": len(seq),
+                "tracklet_frames": n_trk, "offsets": offsets, "span_s": _span_s(offsets, fps)}
+    raise ValueError(f"unknown frames mode {frames_mode!r}")
+
+
+_BUMPER_DESC = ("a solid RED or BLUE fabric band around the robot's base with the team number "
+                "in WHITE digits. Field structures (crates, bins, signs) can also carry printed "
+                "numbers. ")
+
+
+def clef_media_state(row: dict, mode: str, hint: str, media: dict) -> str:
+    """State text for a multi-image / video request (the single-frame state is
+    clef_state, unchanged)."""
+    red, blue = offered_roster(row, mode)
+    n, span = media["frames_used"], media["span_s"]
+    if media["kind"] == "multi":
+        s = (f"{n} images of the SAME robot: crops from FRC robotics match video taken at "
+             f"{n} moments over about {span:.1f} seconds, ordered in time, each around ONE "
+             f"robot's bumper, " + _BUMPER_DESC
+             + "The digits may be readable in some images and blurred or hidden in others. ")
+    else:
+        s = (f"A short video of the SAME robot: {n} crops from FRC robotics match video, "
+             f"one per video frame, ordered in time, covering about {span:.1f} seconds of the "
+             f"match, each around ONE robot's bumper, " + _BUMPER_DESC
+             + "The digits may be readable in some frames and blurred or hidden in others. ")
+        if media["images"]:
+            s += "The still image is the middle moment of the video. "
+    s += _roster_line(red, blue)
+    if mode in ("alliance", "missing-true") and hint in ("red", "blue"):
+        s += f" Computer vision sees {hint.upper()} bumper pixels."
+    return s
+
+
+def clef_media_payload(model_key: str, row: dict, media: dict, options: list[dict],
+                       mode: str, hint: str) -> dict:
+    """Request body for a multi-image or video crop (``media`` from
+    build_frame_media with kind != "single")."""
+    payload = {
+        "model": CLEF_MODELS[model_key]["model"],
+        "state": clef_media_state(row, mode, hint, media),
+        "questions": clef_questions(options),
+    }
+    if media["images"]:
+        payload["images"] = ["data:image/jpeg;base64," + base64.b64encode(b).decode()
+                             for b, _w, _h in media["images"]]
+    if media["video"] is not None:
+        payload["videos"] = ["data:video/mp4;base64," + base64.b64encode(media["video"]).decode()]
+    return payload
+
+
+def clef_media_estimate_tokens(payload: dict, media: dict) -> int:
+    text = len(json.dumps(payload["state"])) + len(json.dumps(payload["questions"]))
+    tok = sum(clef_image_tokens(w, h) for _b, w, h in media["images"]) + text // 4
+    if media["video"] is not None:
+        tok += video_token_estimate(media["frames_used"], *media["video_wh"])
+    return tok
+
+
 def truncate_payload(obj, keep: int = 60):
     """Copy of a payload with data-URI / base64 strings cut down for printing."""
     if isinstance(obj, dict):
@@ -738,6 +1321,20 @@ def truncate_payload(obj, keep: int = 60):
 
 class ArmError(RuntimeError):
     pass
+
+
+class QuotaExhausted(ArmError):
+    """Workers AI daily free allocation used up: retrying is pointless."""
+
+
+# Set once any request hits the daily-quota 429; later crops are skipped
+# without a request instead of each burning the full retry/backoff budget.
+QUOTA_EXHAUSTED = threading.Event()
+_QUOTA_MARKERS = ("daily free allocation", "upgrade to Cloudflare's Workers Paid")
+
+
+def is_quota_error(status: int, text: str) -> bool:
+    return status == 429 and any(m in (text or "") for m in _QUOTA_MARKERS)
 
 
 def post_json(url: str, payload: dict, headers: Optional[dict] = None,
@@ -759,6 +1356,9 @@ def post_json(url: str, payload: dict, headers: Optional[dict] = None,
             if r.status_code == 200:
                 return r.json(), lat, attempt + 1
             last = f"HTTP {r.status_code}: {r.text[:300]}"
+            if is_quota_error(r.status_code, r.text):
+                QUOTA_EXHAUSTED.set()
+                raise QuotaExhausted(last)
             if r.status_code != 429 and r.status_code < 500:
                 raise ArmError(last)
             ra = r.headers.get("Retry-After")
@@ -844,6 +1444,11 @@ class Ctx:
     def crop(self, row: dict) -> bytes:
         return (self.bench_dir / row["file"]).read_bytes()
 
+    def tracklet(self, crop_id: str) -> Optional[dict]:
+        if getattr(self, "_tracklets", None) is None:
+            self._tracklets = load_tracklets(self.bench_dir)
+        return self._tracklets.get(crop_id)
+
 
 def _base_pred(arm: str, row: dict, ctx: Ctx, hint: str, model: str,
                mode: Optional[str]) -> dict:
@@ -873,6 +1478,18 @@ class FreeRead:
         self.captured: dict[str, dict] = {}
         self.lock = threading.Lock()
         orig = appmod._post_vlm_chat
+        self.orig_post = orig  # multi-frame reads post directly (no capture keying)
+        self.frames = getattr(ctx.args, "frames", "single") or "single"
+        if self.frames not in FREEREAD_FRAME_MODES:
+            raise ArmError(f"freeread: --frames {self.frames} not supported "
+                           f"({', '.join(FREEREAD_FRAME_MODES)})")
+        self.prompt = getattr(ctx.args, "prompt", "incumbent") or "incumbent"
+        if self.prompt not in PROMPT_VARIANTS:
+            raise ArmError(f"freeread: --prompt {self.prompt} not supported "
+                           f"({', '.join(PROMPT_VARIANTS)})")
+        if self.prompt == "escape" and self.frames != "single":
+            raise ArmError("--prompt escape supports --frames single only")
+        ctx.tracklet("")  # load tracklets.jsonl before the worker threads start
 
         def wrapped(payload: dict) -> dict:
             key = hashlib.sha1(
@@ -914,11 +1531,20 @@ class FreeRead:
         hint = hint_alliance(row, a.hint_source)
         mode = "missing-true" if a.options == "missing-true" else None
         pred = _base_pred("freeread", row, self.ctx, hint, self.ctx.vlm_model, mode)
+        pred["prompt_variant"] = self.prompt
         red, blue = offered_roster(row, a.options if mode else "alliance")
         if mode:
             pred["roster_offered"] = red + blue
             pred["removed_team"] = true_team(row)
         jpg = self.ctx.crop(row)
+        trk = self.ctx.tracklet(row["id"])
+        pred.update({"frames_mode": self.frames, "frames_used": 1,
+                     "tracklet_frames": len(trk["frames"]) if trk else 0, "media_kind": "single"})
+        if self.prompt == "escape":
+            return self._predict_escape(pred, jpg, red, blue, hint)
+        if self.frames in MULTI_IMAGES and usable_tracklet(trk):
+            return self._predict_multi(row, pred, jpg, trk, red, blue, hint,
+                                       MULTI_IMAGES[self.frames])
         key = hashlib.sha1(app_style_data_uri(jpg).encode()).hexdigest()
         # stdout (the app's per-read prints) is silenced once per arm by the
         # caller: redirect_stdout per call is not thread-safe.
@@ -945,16 +1571,105 @@ class FreeRead:
             pred["error"] = "payload capture missed (image key mismatch)"
         return pred, (cap or {}).get("payload")
 
+    def build_multi_payload(self, jpg: bytes, trk: dict, red: list, blue: list, hint: str,
+                            n_images: int) -> tuple[dict, list[int], float]:
+        """ONE chat request with the bench crop + the picked tracklet frames
+        (time order, each prepped exactly like the single crop), the incumbent
+        prompt reworded for several moments, and the incumbent's
+        _vlm_chat_payload settings (guided JSON _BUMPER_READ_SCHEMA, logprobs)."""
+        app = self.app
+        seq = multi_frame_sequence(jpg, trk, self.ctx.bench_dir, n_images)
+        offsets = [d["offset"] for d in seq]
+        span = _span_s(offsets, trk.get("fps"))
+        uris = [app_style_data_uri(d["bytes"]) for d in seq]
+        expected = hint if hint in ("red", "blue") else "unknown"
+        prompt = freeread_multi_prompt(len(seq), span,
+                                       freeread_hint_line(expected, red, blue, red + blue))
+        base = app._vlm_chat_payload(
+            uris[0], prompt, max_tokens=64, logprobs=app.VLM_LOGPROB_CONFIDENCE,
+            schema_name="bumper_read", schema=app._BUMPER_READ_SCHEMA)
+        return multi_image_payload(base, uris, prompt), offsets, span
+
+    def _predict_escape(self, pred: dict, jpg: bytes, red: list, blue: list,
+                        hint: str) -> tuple[dict, dict]:
+        """--prompt escape, single image: the escape prompt + ESCAPE_READ_SCHEMA
+        (subject decided before the digits), posted directly (no incumbent
+        _vllm_read_bumpers). _vlm_chat_payload merges appmod._active_vlm_extra_body
+        (set from Ctx in __init__), so --no-thinking still applies."""
+        app = self.app
+        expected = hint if hint in ("red", "blue") else "unknown"
+        prompt = freeread_escape_prompt(
+            freeread_escape_hint_line(expected, red, blue, red + blue))
+        payload = app._vlm_chat_payload(
+            app_style_data_uri(jpg), prompt, max_tokens=64,
+            logprobs=app.VLM_LOGPROB_CONFIDENCE, schema_name="bumper_read_escape",
+            schema=ESCAPE_READ_SCHEMA)
+        pred["prompt_variant"] = "escape"
+        return self._post_and_read(pred, payload, red, blue, expected, escape=True), payload
+
+    def _post_and_read(self, pred: dict, payload: dict, red: list, blue: list,
+                       expected: str, escape: bool = False) -> dict:
+        """Shared by the multi-frame and escape paths: post -> logprob digit
+        confidence -> parse -> roster match -> confidence blend -> pred fields."""
+        app = self.app
+        try:
+            t0 = time.monotonic()
+            if self.dry:
+                content = ('{"subject": "not_robot", "team": null, "color": "none"}'
+                           if escape else '{"team": null, "color": "red"}')
+                body = {"choices": [{"message": {"content": content}, "logprobs": None}]}
+            else:
+                body = self.orig_post(payload)
+            lat = time.monotonic() - t0
+            choice = body["choices"][0]
+            text = (choice["message"]["content"] or "").strip()
+            digit_prob = None
+            lp = ((choice.get("logprobs") or {}).get("content")) or []
+            if app.VLM_LOGPROB_CONFIDENCE and lp:
+                digit_prob = app.digit_token_conf([math.exp(t["logprob"]) for t in lp],
+                                                  [t.get("token", "") for t in lp])
+            subject = None
+            if escape:
+                team, color, surf, subject = parse_escape_reply(text)
+            else:
+                team, color, surf = parse_bumper_reply(text)
+            read = "".join(ch for ch in team if ch.isdigit()) if team else ""
+            model_color = color if color in ("blue", "red") else "unknown"
+            matched, alliance, conf = app._match_bumper_read_to_roster(
+                read, model_color, expected, red + blue, blue, red)
+            conf = app.blend_read_confidence(conf, digit_prob)
+            fr = {"team_number": matched, "alliance": alliance, "confidence": conf,
+                  "raw_read": read, "digit_prob": digit_prob,
+                  "surface": app.normalize_surface(surf), "raw_text": text}
+            if escape:
+                fr["subject"] = subject
+            pred.update({
+                "pred_team": matched, "freeread": fr,
+                "latency_s": round(lat, 3), "latencies_s": [round(lat, 3)],
+                "usage": body.get("usage"), "attempts": 1})
+        except Exception as e:
+            pred["error"] = f"{type(e).__name__}: {e}"
+        return pred
+
+    def _predict_multi(self, row: dict, pred: dict, jpg: bytes, trk: dict, red: list,
+                       blue: list, hint: str, n_images: int) -> tuple[dict, dict]:
+        expected = hint if hint in ("red", "blue") else "unknown"
+        payload, offsets, span = self.build_multi_payload(jpg, trk, red, blue, hint, n_images)
+        pred.update({"frames_used": len(offsets), "frame_offsets": offsets,
+                     "span_s": round(span, 3), "media_kind": "multi"})
+        return self._post_and_read(pred, payload, red, blue, expected), payload
+
 
 # ---- shared choice-arm plumbing ----------------------------------------------
 
-def _finish_choice_pred(pred: dict, perms: list[dict], blank: bool) -> None:
+def _finish_choice_pred(pred: dict, perms: list[dict], blank: bool,
+                        escapes: tuple = ESCAPES) -> None:
     """Average per-permutation distributions (raw and calibrated) into the row."""
     pred["perms"] = perms
     probs = average_distributions([pm.get("probs") for pm in perms])
     top, top_p = top_choice(probs)
     pred.update({"probs": probs, "top": top, "top_p": top_p,
-                 "pred_team": top if top is not None and top not in ESCAPES else None})
+                 "pred_team": top if top is not None and top not in escapes else None})
     if blank:
         cal = average_distributions([pm.get("probs_cal") for pm in perms])
         pred["probs_cal"] = cal
@@ -1040,6 +1755,16 @@ class Clef:
         self.dry = dry_run
         self.k = ctx.perms_for(model_key)
         self.blank = bool(ctx.args.blank_calibrate_clef)
+        self.frames = getattr(ctx.args, "frames", "single") or "single"
+        self.with_still = bool(getattr(ctx.args, "video_with_still", False))
+        if self.frames == "multi8":
+            raise ArmError(f"{model_key}: --frames multi8 exceeds the 4-image API limit")
+        if self.frames == "video" and model_key not in VIDEO_ARMS:
+            raise ArmError(f"{model_key}: --frames video needs a model with a videos input "
+                           f"({', '.join(VIDEO_ARMS)})")
+        if self.frames != "single" and self.blank:
+            raise ArmError("--blank-calibrate-clef is only implemented for --frames single")
+        ctx.tracklet("")  # load tracklets.jsonl once, before the worker threads start
         self.env_loaded = load_env_file(ENV_FILE)
         self.account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
         self.token = os.environ.get("CLOUDFLARE_API_TOKEN")
@@ -1064,6 +1789,9 @@ class Clef:
         return hint, base, jpg, img, w, h
 
     def _post(self, payload: dict, pred: dict, usages: list) -> dict:
+        if QUOTA_EXHAUSTED.is_set():
+            raise QuotaExhausted("skipped: Workers AI daily free allocation exhausted earlier "
+                                 "in this run (upgrade to Workers Paid or wait for the 00:00 UTC reset)")
         body, lat, attempts = post_json(
             self.url(), payload, headers={"Authorization": f"Bearer {self.token}"},
             retries=self.ctx.args.retries)
@@ -1095,11 +1823,34 @@ class Clef:
         first_payload = None
         est = 0
         perms, usages, legible, surfaces = [], [], [], []
+        trk = self.ctx.tracklet(row["id"])
+        pred["frames_mode"] = self.frames
+        pred["frames_used"] = 1
+        pred["tracklet_frames"] = len(trk["frames"]) if trk else 0
+        media = None
         try:
+            if self.frames != "single":
+                media = build_frame_media(self.frames, jpg, trk, self.ctx.bench_dir,
+                                          self.with_still)
+                if media["kind"] == "single":
+                    media = None  # no usable tracklet: the plain single-frame request
+                else:
+                    pred.update({"frames_used": media["frames_used"],
+                                 "frame_offsets": media["offsets"],
+                                 "span_s": round(media["span_s"], 3),
+                                 "image_wh": [[iw, ih] for _b, iw, ih in media["images"]]})
+                    if media["video"] is not None:
+                        pred["video_wh"] = list(media["video_wh"])
+                        pred["video_bytes"] = len(media["video"])
+            pred["media_kind"] = media["kind"] if media else "single"
             for order in orders:
-                payload = clef_payload(self.key, row, img, order, a.options, hint)
+                if media is None:
+                    payload = clef_payload(self.key, row, img, order, a.options, hint)
+                    est += clef_estimate_tokens(payload, w, h) * (2 if self.blank else 1)
+                else:
+                    payload = clef_media_payload(self.key, row, media, order, a.options, hint)
+                    est += clef_media_estimate_tokens(payload, media)
                 first_payload = first_payload or payload
-                est += clef_estimate_tokens(payload, w, h) * (2 if self.blank else 1)
                 if self.dry:
                     continue
                 pm = {"option_ids": [o["id"] for o in order]}
@@ -1131,6 +1882,105 @@ class Clef:
         return pred, first_payload
 
 
+# ---- jev (TypeSafe) ---------------------------------------------------------
+
+class Jev:
+    """TypeSafe Jev decision model, single frame: `subject` then `team` with
+    four escape options (JEV_ESCAPES)."""
+
+    def __init__(self, ctx: Ctx, dry_run: bool):
+        self.ctx = ctx
+        self.dry = dry_run
+        self.k = ctx.perms_for("jev")
+        frames = getattr(ctx.args, "frames", "single") or "single"
+        if frames != "single":
+            raise ArmError(f"jev: --frames {frames} is not supported (single frame only)")
+        if getattr(ctx.args, "blank_calibrate_clef", False):
+            raise ArmError("jev: blank calibration is not implemented")
+        self.env_loaded = load_env_file(ENV_FILE, keys=JEV_ENV_KEYS)
+        self.token = os.environ.get("JEV_TYPESAFE_API_TOKEN")
+        self.missing = [] if self.token else list(JEV_ENV_KEYS)
+        if self.missing and not dry_run:
+            raise ArmError(f"jev: missing {', '.join(self.missing)} "
+                           "(set in the environment or the repo-root .env)")
+
+    @staticmethod
+    def url() -> str:
+        return JEV_URL
+
+    def requests_per_crop(self, n_options: int) -> int:
+        return max(1, min(self.k, n_options))
+
+    @staticmethod
+    def _probs(ans: dict, name: str) -> dict:
+        probs = (ans.get(name) or {}).get("probabilities")
+        if not probs:
+            raise ArmError(f"no {name} probabilities in answers: {str(ans)[:300]}")
+        return {str(k): float(v) for k, v in probs.items()}
+
+    def _post(self, payload: dict, pred: dict, usages: list) -> dict:
+        body, lat, attempts = post_json(
+            JEV_URL, payload,
+            headers={"Authorization": f"Bearer {self.token}",
+                     "TypeSafe-Danger-Zone-Images": "true"},
+            retries=self.ctx.args.retries)
+        pred["attempts"] = (pred["attempts"] or 0) + attempts
+        pred["latencies_s"].append(round(lat, 3))
+        if not isinstance(body, dict):
+            raise ArmError(f"unexpected response: {str(body)[:300]}")
+        if body.get("model"):
+            pred["model"] = body["model"]  # versioned id, e.g. jev-1.14.0
+        usages.append(body.get("usage"))
+        return body.get("answers") or {}
+
+    def predict(self, row: dict) -> tuple[dict, dict]:
+        a = self.ctx.args
+        hint = hint_alliance(row, a.hint_source)
+        base = shuffle_options(jev_options(row, a.options, hint), row["id"], a.option_seed)
+        img, w, h, padded = jev_image(self.ctx.crop(row))
+        pred = _base_pred("jev", row, self.ctx, hint, JEV_MODEL, a.options)
+        pred["option_ids"] = [o["id"] for o in base]
+        pred["escape_ids"] = list(JEV_ESCAPES)
+        pred["permutations"] = self.k
+        pred["image_wh"] = [w, h]
+        pred["image_padded"] = padded
+        pred["frames_mode"] = "single"
+        pred["frames_used"] = 1
+        first_payload = None
+        est = 0
+        perms, usages, subjects = [], [], []
+        try:
+            for order in permutation_orders(base, self.k):
+                payload = jev_payload(row, img, order, a.options, hint)
+                est += jev_estimate_tokens(payload, w, h)
+                first_payload = first_payload or payload
+                if self.dry:
+                    continue
+                pm = {"option_ids": [o["id"] for o in order]}
+                ans = self._post(payload, pred, usages)
+                pm["probs"] = self._probs(ans, "team")
+                pm["api_choice"] = (ans.get("team") or {}).get("choice")
+                pm["api_confidence"] = (ans.get("team") or {}).get("confidence")
+                if (ans.get("subject") or {}).get("probabilities"):
+                    pm["subject_probs"] = self._probs(ans, "subject")
+                    subjects.append(pm["subject_probs"])
+                perms.append(pm)
+        except ArmError as e:
+            pred["error"] = str(e)
+        pred["est_input_tokens"] = est
+        pred["est_cost_usd"] = est * JEV_USD_PER_M_INPUT / 1e6
+        pred["usage"] = _sum_usage(usages)
+        if pred["usage"] and pred["usage"].get("input_tokens") is not None:
+            pred["est_cost_usd"] = pred["usage"]["input_tokens"] * JEV_USD_PER_M_INPUT / 1e6
+        if not self.dry:
+            _finish_choice_pred(pred, perms, False, escapes=JEV_ESCAPES)
+            sp = average_distributions(subjects)
+            pred["subject_probs"] = sp
+            pred["subject_top"], pred["subject_top_p"] = top_choice(sp)
+        pred["requests_per_crop"] = self.requests_per_crop(len(base))
+        return pred, first_payload
+
+
 def make_arm(name: str, ctx: Ctx, dry_run: bool):
     if name in ("freeread", "vllm-choice"):
         ctx.resolve_vllm(dry_run)
@@ -1140,6 +1990,8 @@ def make_arm(name: str, ctx: Ctx, dry_run: bool):
         return VllmChoice(ctx, dry_run)
     if name in CLEF_MODELS:
         return Clef(ctx, name, dry_run)
+    if name == "jev":
+        return Jev(ctx, dry_run)
     raise ArmError(f"unknown arm {name!r}; valid: {', '.join(ARMS)}")
 
 
@@ -1155,7 +2007,9 @@ def load_manifest(bench_dir: Path) -> list[dict]:
 
 
 def select_rows(rows: list[dict], only_labelled: bool, limit: Optional[int],
-                mode: str = "alliance") -> list[dict]:
+                mode: str = "alliance", ids: Optional[set] = None) -> list[dict]:
+    if ids is not None:
+        rows = [r for r in rows if r["id"] in ids]
     if only_labelled:
         rows = [r for r in rows if (r.get("label_status") or "unlabelled") != "unlabelled"]
     if mode == "missing-true":
@@ -1192,7 +2046,23 @@ def run_arm(name: str, arm, rows: list[dict], out_path: Path, concurrency: int) 
 
 def _label(pred: dict) -> str:
     arm, mode = pred.get("arm"), pred.get("options_mode")
-    return f"{arm}:{mode}" if mode else str(arm)
+    out = f"{arm}:{mode}" if mode else str(arm)
+    if pred.get("frames_mode") not in (None, "single"):
+        out += f"+{pred['frames_mode']}"
+    if pred.get("prompt_variant") not in (None, "incumbent"):
+        out += f"+{pred['prompt_variant']}"
+    return out
+
+
+def _file_label(preds: list[dict]) -> str:
+    """Label from the first row that carries the arm's fields (an arm-crash row
+    from run_arm carries only id/arm/error)."""
+    return _label(next((p for p in preds if "options_mode" in p), preds[0]))
+
+
+def filter_subset(preds: list[dict], ids: Optional[set]) -> list[dict]:
+    """Rows whose crop id is in ``ids`` (None = no filter)."""
+    return list(preds) if ids is None else [p for p in preds if p.get("id") in ids]
 
 
 def dry_run(arm_names: list[str], ctx: Ctx, rows: list[dict]) -> None:
@@ -1213,12 +2083,41 @@ def dry_run(arm_names: list[str], ctx: Ctx, rows: list[dict]) -> None:
                   + (f"; loaded from .env: {', '.join(arm.env_loaded)}" if arm.env_loaded else "")
                   + "]")
             total = 0.0
+            kinds: dict = {}
             for r in rows:
                 rp, _ = arm.predict(r)
                 total += rp["est_cost_usd"]
-            print(f"permutations={arm.k} blank={arm.blank} -> {pred['requests_per_crop']} "
-                  f"request(s)/crop; est. input tokens this crop: {pred['est_input_tokens']} "
-                  f"(image {pred['image_wh'][0]}x{pred['image_wh'][1]}); "
+                kinds[rp.get("media_kind")] = kinds.get(rp.get("media_kind"), 0) + 1
+                if rp.get("error"):
+                    print(f"  {r['id']}: ERROR {rp['error']}")
+            wh = pred["image_wh"]
+            img_desc = (f"image {wh[0]}x{wh[1]}" if wh and not isinstance(wh[0], list)
+                        else f"images {', '.join(f'{a}x{b}' for a, b in wh) or '-'}")
+            if pred.get("video_wh"):
+                img_desc += (f"; video {pred['video_wh'][0]}x{pred['video_wh'][1]} "
+                             f"{pred['frames_used']} frames @{VIDEO_FPS}fps "
+                             f"{pred['video_bytes']} bytes")
+            print(f"frames={arm.frames} permutations={arm.k} blank={arm.blank} -> "
+                  f"{pred['requests_per_crop']} request(s)/crop; est. input tokens this crop: "
+                  f"{pred['est_input_tokens']} ({img_desc}); media per crop: {kinds}; "
+                  f"est. cost for {len(rows)} crops: ${total:.4f}")
+        elif isinstance(arm, Jev):
+            print(f"POST {arm.url()}")
+            print("Authorization: Bearer <JEV_TYPESAFE_API_TOKEN>   "
+                  "TypeSafe-Danger-Zone-Images: true   [credentials: "
+                  + ("missing " + ", ".join(arm.missing) if arm.missing else "present")
+                  + (f"; loaded from .env: {', '.join(arm.env_loaded)}" if arm.env_loaded else "")
+                  + "]")
+            total = 0.0
+            for r in rows:
+                rp, _ = arm.predict(r)
+                total += rp["est_cost_usd"]
+                if rp.get("error"):
+                    print(f"  {r['id']}: ERROR {rp['error']}")
+            wh = pred["image_wh"]
+            print(f"permutations={arm.k} -> {pred['requests_per_crop']} request(s)/crop; "
+                  f"est. input tokens this crop: {pred['est_input_tokens']} "
+                  f"(image {wh[0]}x{wh[1]}{', letterboxed' if pred['image_padded'] else ''}); "
                   f"est. cost for {len(rows)} crops: ${total:.4f}")
         else:
             print(f"POST {a.server_url}/chat/completions   model={ctx.vlm_model}{ctx.vlm_model_note}")
@@ -1236,13 +2135,32 @@ def dry_run(arm_names: list[str], ctx: Ctx, rows: list[dict]) -> None:
 def cmd_run(args) -> None:
     bench_dir = Path(args.bench)
     manifest_rows = load_manifest(bench_dir)
-    rows = select_rows(manifest_rows, args.only_labelled, args.limit, args.options)
+    subset = None
+    if args.subset == "tracklet":
+        subset = tracklet_subset_ids(load_tracklets(bench_dir))
+    rows = select_rows(manifest_rows, args.only_labelled, args.limit, args.options, subset)
     if not rows:
         sys.exit("no rows selected (labelled-only with no labels yet?)")
     arm_names = [a.strip() for a in args.arms.split(",") if a.strip()]
     for a in arm_names:
         if a not in ARMS:
             sys.exit(f"unknown arm {a!r}; valid: {', '.join(ARMS)}")
+    if args.frames != "single":
+        def _ok(arm: str) -> bool:
+            if arm == "freeread":
+                return args.frames in FREEREAD_FRAME_MODES
+            if arm == "jev":
+                return False
+            if arm in CLEF_MODELS:
+                return args.frames == "multi4" or (args.frames == "video" and arm in VIDEO_ARMS)
+            return False
+        bad = [a for a in arm_names if not _ok(a)]
+        if bad:
+            sys.exit(f"--frames {args.frames} is not supported by {', '.join(bad)} "
+                     f"(multi4: clef arms + freeread; multi8: freeread; "
+                     f"video: {', '.join(VIDEO_ARMS)}; jev: single only)")
+    if getattr(args, "prompt", "incumbent") == "escape" and args.frames != "single":
+        sys.exit("--prompt escape supports --frames single only")
     ctx = Ctx(args, bench_dir)
     if args.dry_run:
         dry_run(arm_names, ctx, rows)
@@ -1253,7 +2171,9 @@ def cmd_run(args) -> None:
     res_dir.mkdir(parents=True, exist_ok=True)
     manifest = {r["id"]: r for r in manifest_rows}
     summary = {"timestamp": stamp, "argv": sys.argv[1:], "n_rows": len(rows),
-               "options": args.options, "hint_source": args.hint_source, "arms": {}}
+               "options": args.options, "hint_source": args.hint_source,
+               "frames": args.frames, "prompt": getattr(args, "prompt", "incumbent"),
+               "subset": args.subset, "arms": {}}
     scored = []
     for name in arm_names:
         try:
@@ -1265,8 +2185,13 @@ def cmd_run(args) -> None:
         out_path = res_dir / f"{name}-{stamp}.jsonl"
         print(f"[{name}] {len(rows)} crops -> {out_path}", file=sys.stderr)
         preds = run_arm(name, arm, rows, out_path, args.concurrency)
-        variants = score_file_variants(preds, manifest, _label(preds[0]) if preds else name)
-        model = ctx.vlm_model if name in ("freeread", "vllm-choice") else CLEF_MODELS[name]["route"]
+        if QUOTA_EXHAUSTED.is_set():
+            print(f"[{name}] ABORTED: Workers AI daily free allocation exhausted; "
+                  f"{sum(1 for p in preds if p.get('error'))}/{len(preds)} rows are errors. "
+                  "Upgrade to Workers Paid or re-run after 00:00 UTC.", file=sys.stderr)
+        variants = score_file_variants(preds, manifest, _file_label(preds) if preds else name)
+        model = (ctx.vlm_model if name in ("freeread", "vllm-choice")
+                 else JEV_MODEL if name == "jev" else CLEF_MODELS[name]["route"])
         summary["arms"][name] = {"file": out_path.name, "model": model,
                                  "scores": dict(variants)}
         scored.extend(variants)
@@ -1295,14 +2220,32 @@ def cmd_score(args) -> None:
     files = [Path(f) for f in args.files] or latest_results(bench_dir / "results")
     if not files:
         sys.exit("no results files")
-    scored = []
+    subset = None
+    if args.subset == "tracklet":
+        subset = tracklet_subset_ids(load_tracklets(bench_dir))
+        if not subset:
+            sys.exit(f"--subset tracklet: no tracklets with >= {SUBSET_MIN_FRAMES} frames in "
+                     f"{bench_dir / TRACKLETS_FILE} (run scripts/build_tracklet_bench.py)")
+    scored, media_notes = [], []
     for f in files:
         preds = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+        preds = filter_subset(preds, subset)
         if preds:
-            scored.extend(score_file_variants(preds, manifest, f"{_label(preds[0])} {f.stem[-15:]}"))
+            label = f"{_file_label(preds)} {f.stem[-15:]}"
+            scored.extend(score_file_variants(preds, manifest, label))
+            multi = sum(1 for p in preds if (p.get("frames_used") or 1) > 1)
+            if multi:
+                fu = [p["frames_used"] for p in preds if (p.get("frames_used") or 1) > 1]
+                media_notes.append(f"  {label}: {multi}/{len(preds)} crops multi-frame "
+                                   f"(median {statistics.median(fu):g} frames)")
     n_lab = sum(1 for r in manifest.values() if (r.get("label_status") or "unlabelled") != "unlabelled")
     print(f"manifest: {len(manifest)} crops, {n_lab} labelled")
+    if subset is not None:
+        print(f"subset: tracklet - {len(subset)} crop ids with >= {SUBSET_MIN_FRAMES} tracklet "
+              f"frames (every arm restricted to them)")
     print(format_table(scored))
+    if media_notes:
+        print("frames used:\n" + "\n".join(media_notes))
     if args.json:
         Path(args.json).write_text(json.dumps(dict(scored), indent=2) + "\n")
 
@@ -1319,7 +2262,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--option-seed", type=int, default=0, help="per-crop option shuffle seed")
     run.add_argument("--permutations", type=int, default=None,
                      help="cyclic option orderings averaged per crop "
-                          "(default: 3 for vllm-choice, 1 for clef arms)")
+                          "(default: 3 for vllm-choice, 1 for clef and jev arms)")
     run.add_argument("--blank-calibrate", action="store_true",
                      help="vllm-choice: contextual calibration against a mid-gray crop")
     run.add_argument("--blank-calibrate-clef", action="store_true",
@@ -1336,8 +2279,27 @@ def build_parser() -> argparse.ArgumentParser:
                      help="served model id for the local arms (default: first id from GET /v1/models)")
     run.add_argument("--no-thinking", action="store_true",
                      help="inject chat_template_kwargs.enable_thinking=false (e.g. Qwen3.5-9B)")
+    run.add_argument("--frames", choices=FRAME_MODES, default="single",
+                     help="single = the bench crop (default); multi4 = the bench crop + the 3 "
+                          "sharpest other tracklet frames, one per time third (clef arms, "
+                          "freeread); multi8 = up to 8 images (freeread); video = all tracklet "
+                          "frames as an H.264 clip at 2 fps (clef-omni). "
+                          "Crops without a tracklet fall back to single (frames_used=1).")
+    run.add_argument("--prompt", choices=PROMPT_VARIANTS, default="incumbent",
+                     help="freeread prompt: incumbent = web.app's prompt + _BUMPER_READ_SCHEMA "
+                          "(default, unchanged); escape = detector-junk-aware prompt with an "
+                          "explicit not_robot/no_digits/printed subject decided BEFORE the "
+                          "digits (--frames single only)")
+    run.add_argument("--subset", choices=("all", "tracklet"), default="all",
+                     help=f"tracklet = only crops whose tracklet has >= {SUBSET_MIN_FRAMES} frames "
+                          "(the `score --subset tracklet` crops; about half the paid requests)")
+    run.add_argument("--video-with-still", action="store_true",
+                     help="--frames video: also send the bench crop as an image")
     run.add_argument("--bench", default=str(BENCH_DIR))
     sc = sub.add_parser("score", help="score results files against the manifest labels")
+    sc.add_argument("--subset", choices=("all", "tracklet"), default="all",
+                    help=f"tracklet = only crop ids whose tracklet has >= {SUBSET_MIN_FRAMES} "
+                         "frames (identical crops for single vs multi-frame comparisons)")
     sc.add_argument("files", nargs="*", help="results/*.jsonl (default: latest per arm)")
     sc.add_argument("--json", default=None, help="also dump metrics as JSON here")
     sc.add_argument("--bench", default=str(BENCH_DIR))

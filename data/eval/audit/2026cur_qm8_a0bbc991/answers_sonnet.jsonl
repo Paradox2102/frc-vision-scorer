@@ -1,0 +1,149 @@
+{"sample_id": "s000", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "floor, balls, crates at spot"}
+{"sample_id": "s001", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "ball crate and balls only"}
+{"sample_id": "s002", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, no digits legible"}
+{"sample_id": "s003", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "balls and floor only"}
+{"sample_id": "s004", "team": "2637", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main red bumper blurry; corner_left reads 2637 on same-looking red robot with balls, blue ramp at right"}
+{"sample_id": "s005", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s006", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits visible"}
+{"sample_id": "s007", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s008", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, motion blur, digits unreadable"}
+{"sample_id": "s009", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "blurry 2?24 on red bumper"}
+{"sample_id": "s010", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor and balls only"}
+{"sample_id": "s011", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "empty floor and balls"}
+{"sample_id": "s012", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot, blurred, no digits"}
+{"sample_id": "s013", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits skewed/unreadable"}
+{"sample_id": "s014", "team": "2637", "confidence": "medium", "views_used": ["main"], "note": "partial 2?37 / ?637 on red bumper faces"}
+{"sample_id": "s015", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor and balls only"}
+{"sample_id": "s016", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot, no digits visible"}
+{"sample_id": "s017", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s018", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s019", "team": "6497", "confidence": "medium", "views_used": ["main"], "note": "6?97 on red bumper, tilted"}
+{"sample_id": "s020", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s021", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "person at spot, no robot"}
+{"sample_id": "s022", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not visible"}
+{"sample_id": "s023", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "hub structure only"}
+{"sample_id": "s024", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot behind rail, bumper mostly hidden, no digits"}
+{"sample_id": "s025", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s026", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s027", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper partially occluded, no digits"}
+{"sample_id": "s028", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits unreadable"}
+{"sample_id": "s029", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor, balls, sensor only"}
+{"sample_id": "s030", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot with red bumper behind rail at spot, no digits"}
+{"sample_id": "s031", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s032", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor and hub structure"}
+{"sample_id": "s033", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "?773 on blue bumper"}
+{"sample_id": "s034", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s035", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s036", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurred"}
+{"sample_id": "s037", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper at spot, no digits; red robot adjacent at left"}
+{"sample_id": "s038", "team": "6773", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main ?773 blurry on blue bumper; corner_left reads 6773 on same black-bodied robot"}
+{"sample_id": "s039", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "red bumper, no digits in either view"}
+{"sample_id": "s040", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 on red bumper, both faces"}
+{"sample_id": "s041", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s042", "team": "3128", "confidence": "medium", "views_used": ["main"], "note": "skewed 3?28 on blue bumper"}
+{"sample_id": "s043", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue robot behind balls, bumper digits hidden"}
+{"sample_id": "s044", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot at floor/rail edge; only faint red behind rail left of spot"}
+{"sample_id": "s045", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "?773 on blue bumper"}
+{"sample_id": "s046", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red robot at right edge near spot, no digits"}
+{"sample_id": "s047", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "hub structure only"}
+{"sample_id": "s048", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot, digits unreadable"}
+{"sample_id": "s049", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s050", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s051", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper at spot"}
+{"sample_id": "s052", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits covered by balls"}
+{"sample_id": "s053", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits visible"}
+{"sample_id": "s054", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper reads 2?24, fits 2724"}
+{"sample_id": "s055", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s056", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits unreadable"}
+{"sample_id": "s057", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits cut off/unreadable"}
+{"sample_id": "s058", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits unreadable"}
+{"sample_id": "s059", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurry"}
+{"sample_id": "s060", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper side, no digits"}
+{"sample_id": "s061", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 on red bumper"}
+{"sample_id": "s062", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, no digits visible"}
+{"sample_id": "s063", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s064", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits blurry"}
+{"sample_id": "s065", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "cluttered, no legible digits"}
+{"sample_id": "s066", "team": "3128", "confidence": "medium", "views_used": ["main"], "note": "blue bumper reads 312? fits 3128"}
+{"sample_id": "s067", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper side, no digits"}
+{"sample_id": "s069", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits unreadable"}
+{"sample_id": "s070", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits unreadable"}
+{"sample_id": "s071", "team": "6497", "confidence": "medium", "views_used": ["main"], "note": "red bumper reads ?497, fits 6497"}
+{"sample_id": "s072", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red robot at edge, no digits visible"}
+{"sample_id": "s073", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "main red bumper no digits; corner shows 2637 but not plainly same robot"}
+{"sample_id": "s074", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "overlapping red/blue robots, person; no digits"}
+{"sample_id": "s075", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits"}
+{"sample_id": "s076", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s077", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot on floor with balls; robot only at bottom edge below spot, no bumper digits"}
+{"sample_id": "s078", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s079", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible"}
+{"sample_id": "s080", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible"}
+{"sample_id": "s081", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor and balls at spot; only edge fragments at corners"}
+{"sample_id": "s082", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, angled digits too blurry"}
+{"sample_id": "s083", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper side, no digits"}
+{"sample_id": "s084", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s085", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s086", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurry"}
+{"sample_id": "s087", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot body, no bumper digits visible"}
+{"sample_id": "s088", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits visible"}
+{"sample_id": "s089", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s090", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, no digits visible"}
+{"sample_id": "s091", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "only balls and floor"}
+{"sample_id": "s092", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main shows floor/balls only; corner robot is elsewhere, not shown at spot"}
+{"sample_id": "s093", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurry"}
+{"sample_id": "s094", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper end only, no digits"}
+{"sample_id": "s095", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits unreadable"}
+{"sample_id": "s096", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper side, no digits"}
+{"sample_id": "s097", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red robot beside blue robot, red digits unreadable"}
+{"sample_id": "s098", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurry"}
+{"sample_id": "s099", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits readable"}
+{"sample_id": "s100", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s101", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s102", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ...773 legible"}
+{"sample_id": "s103", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ..73 partly legible"}
+{"sample_id": "s104", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits illegible"}
+{"sample_id": "s105", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s106", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ..773 legible"}
+{"sample_id": "s107", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "spot at left edge, blue robot cut off, no digits"}
+{"sample_id": "s108", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ..73 partly legible"}
+{"sample_id": "s109", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits blurred, not decisive"}
+{"sample_id": "s110", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, only last digit ~7 readable, ambiguous"}
+{"sample_id": "s111", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible; corner view shows no robot"}
+{"sample_id": "s112", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits too blurred"}
+{"sample_id": "s113", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "referee at spot, possible robot hidden behind; no digits"}
+{"sample_id": "s114", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, motion-blurred, no digits"}
+{"sample_id": "s115", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ?773 legible"}
+{"sample_id": "s116", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s117", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "main shows blue structure/robot edge, no digits; corner shows different red robot"}
+{"sample_id": "s118", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot at right is floor/rail; no robot touching it"}
+{"sample_id": "s119", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot partly behind hub, no digits visible"}
+{"sample_id": "s120", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper side, digits not legible"}
+{"sample_id": "s121", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits blurred"}
+{"sample_id": "s122", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s123", "team": "3128", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, 312. legible, rest covered by tag"}
+{"sample_id": "s124", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot mostly hidden behind hub, no digits"}
+{"sample_id": "s125", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits illegible"}
+{"sample_id": "s126", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible"}
+{"sample_id": "s127", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s128", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 on red bumper"}
+{"sample_id": "s129", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main shows empty floor/balls at spot; corner robot is elsewhere"}
+{"sample_id": "s130", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper at spot"}
+{"sample_id": "s131", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, no digits visible, ref/tag in the way"}
+{"sample_id": "s132", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark blurred shape at spot, no digits"}
+{"sample_id": "s133", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper end, no digits visible"}
+{"sample_id": "s134", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s135", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits blurred"}
+{"sample_id": "s136", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper"}
+{"sample_id": "s137", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper"}
+{"sample_id": "s138", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red robot at right edge, no digits visible"}
+{"sample_id": "s139", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper, 27.. partly legible at lower left"}
+{"sample_id": "s140", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main shows only floor, balls, antenna pole"}
+{"sample_id": "s141", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot obscured by person, hint of red bumper, no digits"}
+{"sample_id": "s142", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot, blue bumper bits, no digits"}
+{"sample_id": "s143", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible"}
+{"sample_id": "s144", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main shows floor and balls at spot; corner robot not shown in main"}
+{"sample_id": "s145", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot on floor with balls; robots only at crop edges"}
+{"sample_id": "s146", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper"}
+{"sample_id": "s147", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper end, no digits"}
+{"sample_id": "s148", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ..73 partly legible at angle"}
+{"sample_id": "s149", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main shows only floor and balls at spot"}

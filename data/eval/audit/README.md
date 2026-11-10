@@ -148,3 +148,19 @@ the unannotated robot 9066, on phantom slots, or in GT gaps.
 qm13 (`0baf4625`, Nov 6, before the Nov 7 identity work): Jev flags about two
 thirds of its confident items as mislabelled, half of them cross-alliance.
 Spot checks confirm it: 8725 labelled 302, 589 labelled 8725, 6045 labelled 302.
+
+## Claude-judge calibration (Nov 10 2026)
+
+Claude Code subagents as blind judges (`JUDGE_BRIEF.md`, one item at a time), `--min-conf 0.7`:
+
+| audit | judge | coverage (labelled time) | judge right vs GT | audit mis-ID | GT mis-ID (same items) |
+|---|---|---|---|---|---|
+| qm8 a0bbc991 | Fable (`answers_fable.jsonl`) | 41% | 54/54 | 15.4% | 15.4% |
+| qm8 a0bbc991 | Sonnet (`answers_sonnet.jsonl`) | 39% | 50/51 | 14.3% | 16.3% |
+| qm8 a0bbc991 | Jev multi | 34% | 44/44 | 14.3% | 14.3% |
+| qm13 0baf4625 | Fable | 38% | (no GT) | 69.5% [58–80] | – |
+| qm13 0baf4625 | Jev multi | 34% | (no GT) | 69% [57–80] | – |
+
+- On qm13, Fable and Jev both named a team on 49 items and agree on 48, so the cheap Jev audit reproduces the Claude audit. Jev is the runtime auditor; Claude calibrates it.
+- All judges abstain on the hardest items, where the labels are wrong more often. On qm8, GT mis-ID is 20.1% over all GT-matched items but 15–16% on the judge-confident ones, so treat audit mis-ID as a lower bound (about 5 points low on qm8).
+- qm13 0baf4625 is a Nov 6 replay, before the Nov 7 identity defaults.

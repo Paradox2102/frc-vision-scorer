@@ -1,0 +1,149 @@
+{"sample_id": "s000", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot body near spot, motion blur, no bumper digits legible"}
+{"sample_id": "s001", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot with ball hopper at spot, bumper dark, no digits legible"}
+{"sample_id": "s002", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot at spot, digits not legible"}
+{"sample_id": "s003", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "floor, balls and field structure only at spot"}
+{"sample_id": "s004", "team": "2637", "confidence": "high", "views_used": ["main", "corner_left"], "note": "2637 on red bumper in corner_left; same red robot beside blue structure as main"}
+{"sample_id": "s005", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper, small digits read 2724 at right end of front face"}
+{"sample_id": "s006", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot at spot, no digits visible"}
+{"sample_id": "s007", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper, front face"}
+{"sample_id": "s008", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, motion blur, digits smeared"}
+{"sample_id": "s009", "team": "2724", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "red bumper, blurred digits ending 24 in main; corner_right shows trailing 24 beside overlay"}
+{"sample_id": "s010", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "spot on field edge rail/floor, only balls and blue ramp nearby"}
+{"sample_id": "s011", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "bare floor and balls at spot"}
+{"sample_id": "s012", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot, motion blur and person occluding, digits not legible"}
+{"sample_id": "s013", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper seen end-on, digits not legible; body panel text ignored"}
+{"sample_id": "s014", "team": "2637", "confidence": "medium", "views_used": ["main"], "note": "red bumper, 26_7 on right face (pole hides one digit), left face blurred ending 37"}
+{"sample_id": "s015", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "bare floor and balls at spot"}
+{"sample_id": "s016", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot at spot, no digits legible; second robot below"}
+{"sample_id": "s017", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, front face"}
+{"sample_id": "s018", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper in main; corner_left shows a different red robot, ignored"}
+{"sample_id": "s019", "team": "6497", "confidence": "high", "views_used": ["main", "corner_right"], "note": "red bumper: 6_97 in main, 649 clear in corner_right (same robot with ball pile)"}
+{"sample_id": "s020", "team": "3128", "confidence": "high", "views_used": ["main", "corner_left"], "note": "3128 on blue bumper in main; corner_left consistent"}
+{"sample_id": "s021", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "person crouching at field edge at spot, no robot"}
+{"sample_id": "s022", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper end-on, no bumper digits legible; body panel text ignored"}
+{"sample_id": "s023", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "field structure with tags at spot, no robot"}
+{"sample_id": "s024", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot against field wall, bumper hidden by rail, no digits"}
+{"sample_id": "s025", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, front face"}
+{"sample_id": "s026", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper, front face"}
+{"sample_id": "s027", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "blue bumper robot, occluded by structure in both views, no digits legible"}
+{"sample_id": "s028", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot, blurred, digits not legible"}
+{"sample_id": "s029", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "spot at right on bare floor, only balls and a monitor nearby"}
+{"sample_id": "s030", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot behind field rail at spot, referee in foreground, no digits legible"}
+{"sample_id": "s031", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper in main; corner_left occluded, not used"}
+{"sample_id": "s032", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "bare floor beside field structure at spot"}
+{"sample_id": "s033", "team": "6773", "confidence": "high", "views_used": ["main", "corner_left"], "note": "blue bumper: _773 in main, 6773 clear in corner_left, same dark mesh robot"}
+{"sample_id": "s034", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper in main; corner_left shows no digits"}
+{"sample_id": "s035", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper, blurred digits read 2724 (leading 27 and trailing 4 discernible)"}
+{"sample_id": "s036", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper partly behind structure, digits smeared by motion"}
+{"sample_id": "s037", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot at spot, digits blurred; adjacent red robot not the marked one"}
+{"sample_id": "s038", "team": "6773", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "blue bumper: foreshortened _77_ in main, small 6773 in corner_left on same dark mesh robot"}
+{"sample_id": "s039", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "red bumper seen end-on in main, no digits; corner_right occluded by structure"}
+{"sample_id": "s040", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 printed upside-down on red bumper front face in main; corner_right unusable"}
+{"sample_id": "s041", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, front face"}
+{"sample_id": "s042", "team": "3128", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, slanted blurred digits 312_ on right face, monitor stand partly occluding"}
+{"sample_id": "s043", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper robot with ball hopper, bumper face hidden by balls, no digits"}
+{"sample_id": "s044", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "spot at base of field wall, no robot at or touching it; referee and monitor nearby"}
+{"sample_id": "s045", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, small digits _773 on front face"}
+{"sample_id": "s046", "team": "unsure", "confidence": "medium", "views_used": ["main"], "note": "spot on floor beside red ramp; blurred robot-like mechanism with balls just right of spot, no bumper digits visible"}
+{"sample_id": "s047", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "main: spot on field structure, no robot visible (may be hidden behind it); corner_left marks a red robot with 2637 but cannot be tied to main view"}
+{"sample_id": "s048", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot at right edge at spot, digits blurred and not legible"}
+{"sample_id": "s049", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "blue bumper: _773 on front face and 67_3 on side face in main; corner_left motion-blurred, not used"}
+{"sample_id": "s050", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper, front face, main view"}
+{"sample_id": "s051", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, main view"}
+{"sample_id": "s052", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits hidden by balls / not legible"}
+{"sample_id": "s053", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper occluded by field structure/tag, digits not legible"}
+{"sample_id": "s054", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "blurry 2724 on red bumper, main view"}
+{"sample_id": "s055", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, two faces, main view"}
+{"sample_id": "s056", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits smeared and partly blocked by foreground structure"}
+{"sample_id": "s057", "team": "2724", "confidence": "low", "views_used": ["main"], "note": "red bumper mostly occluded; partial blurry 27.. at bumper edge, 6 vs 7 not certain"}
+{"sample_id": "s058", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper partly behind field structure, visible digit fragment too smeared to read"}
+{"sample_id": "s059", "team": "2637", "confidence": "medium", "views_used": ["main"], "note": "red bumper, motion-combed digits read 2?37 (first 2, last 7), main view"}
+{"sample_id": "s060", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, no bumper digits visible; side panel text only"}
+{"sample_id": "s061", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 on red bumper, main view"}
+{"sample_id": "s062", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper at spot, digits not legible; another red robot adjacent"}
+{"sample_id": "s063", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper, main view"}
+{"sample_id": "s064", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits motion-smeared, not legible"}
+{"sample_id": "s065", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "red bumper barely visible in main; corner view bumper covered by sponsor overlay, digits not legible"}
+{"sample_id": "s066", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper, slightly soft, main view"}
+{"sample_id": "s067", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits foreshortened/smeared, not legible"}
+{"sample_id": "s069", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits smeared and partly covered by balls"}
+{"sample_id": "s070", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits not legible (blurred, occluded)"}
+{"sample_id": "s071", "team": "6497", "confidence": "medium", "views_used": ["main"], "note": "red bumper reads ?497 (first digit unclear), main view"}
+{"sample_id": "s072", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper at spot, partly behind referee, no digits legible"}
+{"sample_id": "s073", "team": "2637", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main: red bumper smeared and partly behind structure; corner_left shows red robot beside same blue structure with clear 2637"}
+{"sample_id": "s074", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper at spot, occluded by person, no digits legible"}
+{"sample_id": "s075", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits visible (motion blur, foreground equipment)"}
+{"sample_id": "s076", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 on blue bumper, soft but readable, main view"}
+{"sample_id": "s077", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot on floor among balls; a robot (bumper out of crop) sits below the spot, not touching it"}
+{"sample_id": "s078", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper, main view"}
+{"sample_id": "s079", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits foreshortened on side face, not legible"}
+{"sample_id": "s080", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits smeared, not legible"}
+{"sample_id": "s081", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "spot on empty floor near AprilTag post and field wall; balls and referee only"}
+{"sample_id": "s082", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper, blurry digits on left face read 27?4, main view"}
+{"sample_id": "s083", "team": "6497", "confidence": "low", "views_used": ["main", "corner_right"], "note": "main: two red-bumper robots overlap at spot, no digits; corner_right shows ?497 on a red bumper under sponsor overlay but same-robot match not certain"}
+{"sample_id": "s084", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper (773 clear), main view"}
+{"sample_id": "s085", "team": "2724", "confidence": "medium", "views_used": ["main"], "note": "red bumper, soft digits read 2?24, main view"}
+{"sample_id": "s086", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits motion-smeared in main; corner_right shows a different-looking robot, digits cut off"}
+{"sample_id": "s087", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot at spot, bumper/digits not visible"}
+{"sample_id": "s088", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, no digits visible on facing sides"}
+{"sample_id": "s089", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 on red bumper, main view"}
+{"sample_id": "s090", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper mostly hidden by robot panel, no digits legible"}
+{"sample_id": "s091", "team": "no_robot", "confidence": "high", "views_used": ["main"], "note": "spot at field edge below rail; floor and balls only"}
+{"sample_id": "s092", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "main: spot on empty floor near balls, no robot; corner_right re-centred on a red robot reading 2724, not matched to anything in main"}
+{"sample_id": "s093", "team": "6497", "confidence": "medium", "views_used": ["main"], "note": "red bumper, smeared digits on left face end in 97 (9 with closed loop), main view"}
+{"sample_id": "s094", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot-like mechanism at spot near field edge, bumper/digits not visible"}
+{"sample_id": "s095", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits smeared, not legible"}
+{"sample_id": "s096", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper seen end-on, no bumper digits visible"}
+{"sample_id": "s097", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper at spot, digits smeared; adjacent blue robot (not marked) shows ..773"}
+{"sample_id": "s098", "team": "2637", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main: red bumper beside blue structure, digits smeared; corner_left same red robot beside blue structure reads 2637 (soft)"}
+{"sample_id": "s099", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, digits on side face foreshortened, not legible"}
+{"sample_id": "s100", "team": "6773", "confidence": "high", "views_used": ["main", "corner_left"], "note": "6773 on blue bumper in main; corner_left also reads 6773"}
+{"sample_id": "s101", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 on blue bumper (773 clear), main view"}
+{"sample_id": "s102", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, partial digits ~77x on left face, fits only 6773"}
+{"sample_id": "s103", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, trailing digits ~73 visible beside person head, fits only 6773"}
+{"sample_id": "s104", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot with blue-ish bumper at far wall, digits illegible; red robot adjacent"}
+{"sample_id": "s105", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 legible on blue bumper front face"}
+{"sample_id": "s106", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, ~x73 on left face and 67xx on right face, fits only 6773"}
+{"sample_id": "s107", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "spot at left image edge; only a sliver of blue bumper visible, no digits"}
+{"sample_id": "s108", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, blurred digits ending 73 on front face, fits only 6773"}
+{"sample_id": "s109", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits smeared; leading 2 only, cannot separate two roster teams"}
+{"sample_id": "s110", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, digits too blurred; trailing 7 only, fits two roster teams"}
+{"sample_id": "s111", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red-bumper robot with white panel at spot, digits not legible; corner view shows no robot bumper"}
+{"sample_id": "s112", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper mostly hidden by person; visible digits smeared, not readable"}
+{"sample_id": "s113", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_right"], "note": "main: referee covers the spot, robot barely visible; corner shows red bumper with only a 7 visible, cannot confirm same robot"}
+{"sample_id": "s114", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, motion-blurred, no digits visible"}
+{"sample_id": "s115", "team": "6773", "confidence": "high", "views_used": ["main", "corner_left"], "note": "6773 on blue bumper in main, clearly 6773 in corner_left"}
+{"sample_id": "s116", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 clearly legible on blue bumper front face in main"}
+{"sample_id": "s117", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "main: spot is on/behind field structure, no robot visible; corner_left shows red bumper reading 2637 but cannot confirm it is the robot at the main spot"}
+{"sample_id": "s118", "team": "no_robot", "confidence": "medium", "views_used": ["main"], "note": "spot at right edge on floor/rail near field border; nearest robot (ball-filled, behind tablet) is well left of the spot"}
+{"sample_id": "s119", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot with blue bumper mostly hidden behind field structure, no digits visible"}
+{"sample_id": "s120", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot at right edge, bumper text smeared and partly occluded, not readable"}
+{"sample_id": "s121", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "blue bumper, ball-filled hopper; digits present but smeared beyond reading"}
+{"sample_id": "s122", "team": "6773", "confidence": "high", "views_used": ["main"], "note": "6773 legible on blue bumper front face"}
+{"sample_id": "s123", "team": "3128", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, leading digits 31x visible before tag sign occludes rest; fits only 3128"}
+{"sample_id": "s124", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "spot at edge of field structure; robot behind it shows a sliver of red bumper, no digits"}
+{"sample_id": "s125", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot, blue bumper; digits on side face smeared, not readable"}
+{"sample_id": "s126", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, white digit smear on right face, not readable"}
+{"sample_id": "s127", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 legible on blue bumper front face"}
+{"sample_id": "s128", "team": "6497", "confidence": "high", "views_used": ["main"], "note": "6497 legible on red bumper left face"}
+{"sample_id": "s129", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main: spot is bare floor with balls, no robot nearby; corner_right is re-centred on a red robot reading 2724, not visible at the main spot"}
+{"sample_id": "s130", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 legible on blue bumper front face in main (another blue robot with x773 in background, not at spot)"}
+{"sample_id": "s131", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot with ball hopper behind tag sign and red field wall; bumper hidden, no digits"}
+{"sample_id": "s132", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark shape (possibly a dark robot behind foreground equipment) touching the spot; no bumper digits visible"}
+{"sample_id": "s133", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot with white side panel; bumper digits not readable (panel text is not a bumper number)"}
+{"sample_id": "s134", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 legible on red bumper front face in main"}
+{"sample_id": "s135", "team": "unsure", "confidence": "high", "views_used": ["main", "corner_left"], "note": "red bumper, digits smeared in main and blurred in corner_left"}
+{"sample_id": "s136", "team": "3128", "confidence": "high", "views_used": ["main"], "note": "3128 legible on blue bumper front face"}
+{"sample_id": "s137", "team": "2724", "confidence": "high", "views_used": ["main"], "note": "2724 readable on red bumper front face in main (slight motion blur)"}
+{"sample_id": "s138", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper robot cut off at right edge, no digits visible; no corner view"}
+{"sample_id": "s139", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "two red-bumper robots overlap near the spot (white-box robot in front, ball-filled one behind); cannot tell which is marked, digits at spot unreadable"}
+{"sample_id": "s140", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_left"], "note": "main: spot is floor behind foreground antenna gear, only balls; corner_left re-centred on a distant blue-bumper robot with unreadable digits"}
+{"sample_id": "s141", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "robot with ball hopper, bumper hidden by balls and a dark foreground shape; hint of red, no digits"}
+{"sample_id": "s142", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "dark robot at spot next to a tilted ball-filled blue-bumper robot; no digits readable on either"}
+{"sample_id": "s143", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "red bumper, white digit marks on left face too blurred to read"}
+{"sample_id": "s144", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main: spot is bare floor near a ball cluster, no robot; corner_right is re-centred on a red robot reading 2724 that is not at the main spot"}
+{"sample_id": "s145", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "spot on floor just left of a motion-blurred white-box red-bumper robot; its digits hidden behind tablet, not readable"}
+{"sample_id": "s146", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, x773 readable on left face in main, fits only 6773; corner_left shows a different (red) robot, ignored"}
+{"sample_id": "s147", "team": "unsure", "confidence": "high", "views_used": ["main"], "note": "white-box robot with red bumper, motion blurred, no bumper digits readable"}
+{"sample_id": "s148", "team": "6773", "confidence": "medium", "views_used": ["main"], "note": "blue bumper, blurred x73 on left face and 67 at start of adjacent face; fits only 6773"}
+{"sample_id": "s149", "team": "no_robot", "confidence": "medium", "views_used": ["main", "corner_right"], "note": "main: spot is floor with flying balls, no robot; corner_right is re-centred on a red-bumper robot (blurred ~2724) not at the main spot"}

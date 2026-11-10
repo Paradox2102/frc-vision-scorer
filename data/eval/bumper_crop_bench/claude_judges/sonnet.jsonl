@@ -1,0 +1,200 @@
+{"id": "2026cur_qm13_f01254_r062", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026cur_qm16_f05458_r431", "subject": "robot_bumper", "alliance": "red", "digits": "?7?0", "team": "none", "confidence": 0.2}
+{"id": "2026cur_qm5_f00482_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "????", "team": "none", "confidence": 0.2}
+{"id": "2026hop_qm1_f04110_r213", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm11_f04216_r328", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026hop_qm1_f04126_r005", "subject": "robot_bumper", "alliance": "red", "digits": "8?4?", "team": "8749", "confidence": 0.55}
+{"id": "2026cur_qm10_f01566_r070", "subject": "robot_bumper", "alliance": "blue", "digits": "40?7", "team": "4027", "confidence": 0.5}
+{"id": "2026cur_qm4_f00833_r030", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm7_f00000_r001", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm13_f01558_r002", "subject": "robot_bumper", "alliance": "red", "digits": "589", "team": "589", "confidence": 0.9}
+{"id": "2026cur_qm9_f01437_r021", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm14_f00360_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "?1?6", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm14_f00000_r003", "subject": "robot_bumper", "alliance": "red", "digits": "26?2", "team": "2682", "confidence": 0.55}
+{"id": "2026hop_qm115_f02372_r042", "subject": "robot_bumper", "alliance": "red", "digits": "1787", "team": "1787", "confidence": 0.92}
+{"id": "2026hop_qm84_f07094_r002", "subject": "robot_bumper", "alliance": "red", "digits": "1287", "team": "1287", "confidence": 0.88}
+{"id": "2026cur_qm9_f01290_r037", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm115_f05172_r082", "subject": "robot_bumper", "alliance": "red", "digits": "?", "team": "none", "confidence": 0.1}
+{"id": "2026hop_qm80_f00000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "1296", "team": "1296", "confidence": 0.95}
+{"id": "2026hop_qm72_f00000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "1014", "team": "1014", "confidence": 0.95}
+{"id": "2026cur_qm4_f00518_r019", "subject": "robot_bumper", "alliance": "blue", "digits": "6510", "team": "6510", "confidence": 0.85}
+{"id": "2026cur_qm16_f00425_r000", "subject": "robot_bumper", "alliance": "red", "digits": "2053", "team": "2053", "confidence": 0.95}
+{"id": "2026cur_qm10_f00000_r001", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm16_f08993_r872", "subject": "robot_bumper", "alliance": "red", "digits": "?", "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm5_f00834_r010", "subject": "robot_bumper", "alliance": "blue", "digits": "166", "team": "166", "confidence": 0.92}
+{"id": "2026cur_qm9_f01066_r020", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm1_f09902_r339", "subject": "robot_bumper", "alliance": "red", "digits": "????", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm8_f00670_r002", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026hop_qm24_f04564_r123", "subject": "robot_bumper", "alliance": "blue", "digits": "?513", "team": "8513", "confidence": 0.8}
+{"id": "2026hop_qm72_f03571_r003", "subject": "robot_bumper", "alliance": "red", "digits": "30?", "team": "3035", "confidence": 0.7}
+{"id": "2026cur_qm22_f00604_r005", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm30_f00000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "11493", "team": "11493", "confidence": 0.8}
+{"id": "2026hop_qm30_f03644_r085", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.8}
+{"id": "2026cur_qm2_f06986_r004", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm24_f09388_r227", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026cur_qm7_f01414_r003", "subject": "robot_bumper", "alliance": "red", "digits": "11304", "team": "11304", "confidence": 0.9}
+{"id": "2026cur_qm2_f04102_r268", "subject": "robot_bumper", "alliance": "red", "digits": "7?4?", "team": "7421", "confidence": 0.45}
+{"id": "2026cur_qm13_f01134_r062", "subject": "robot_bumper", "alliance": "blue", "digits": "???", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm7_f01246_r024", "subject": "robot_bumper", "alliance": "blue", "digits": "?023", "team": "9023", "confidence": 0.7}
+{"id": "2026hop_qm1_f01078_r051", "subject": "robot_bumper", "alliance": "blue", "digits": "?1?", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm22_f01290_r055", "subject": "robot_bumper", "alliance": "red", "digits": "125", "team": "125", "confidence": 0.8}
+{"id": "2026cur_qm8_f01334_r004", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm16_f02092_r004", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm1_f10446_r339", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.7}
+{"id": "2026cur_qm16_f03197_r168", "subject": "robot_bumper", "alliance": "blue", "digits": "5?1?", "team": "5712", "confidence": 0.6}
+{"id": "2026hop_qm1_f00000_r003", "subject": "robot_bumper", "alliance": "red", "digits": "4201", "team": "4201", "confidence": 0.9}
+{"id": "2026cur_qm6_f00486_r021", "subject": "robot_bumper", "alliance": "red", "digits": "7565", "team": "7565", "confidence": 0.92}
+{"id": "2026hop_qm28_f09236_r002", "subject": "robot_bumper", "alliance": "blue", "digits": "9449", "team": "9449", "confidence": 0.92}
+{"id": "2026cur_qm11_f00000_r000", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm80_f00000_r003", "subject": "robot_bumper", "alliance": "red", "digits": "4698", "team": "4698", "confidence": 0.9}
+{"id": "2026hop_qm6_f01000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm6_f02182_r049", "subject": "robot_bumper", "alliance": "blue", "digits": "1706", "team": "1706", "confidence": 0.95}
+{"id": "2026cur_qm6_f00444_r012", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.6}
+{"id": "2026cur_qm16_f04513_r387", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm30_f05436_r156", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm4_f00000_r001", "subject": "robot_bumper", "alliance": "blue", "digits": "6417", "team": "6417", "confidence": 0.75}
+{"id": "2026hop_qm1_f06494_r256", "subject": "robot_bumper", "alliance": "red", "digits": "?20?", "team": "4201", "confidence": 0.6}
+{"id": "2026cur_qm10_f01468_r066", "subject": "robot_bumper", "alliance": "red", "digits": "4611", "team": "4611", "confidence": 0.92}
+{"id": "2026hop_qm115_f08972_r125", "subject": "robot_bumper", "alliance": "blue", "digits": "?4?", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm16_f09448_r934", "subject": "robot_bumper", "alliance": "red", "digits": "2724", "team": "2724", "confidence": 0.9}
+{"id": "2026cur_qm12_f01164_r005", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm3_f00497_r010", "subject": "robot_bumper", "alliance": "blue", "digits": "????", "team": "none", "confidence": 0.1}
+{"id": "2026hop_qm72_f09381_r005", "subject": "robot_bumper", "alliance": "red", "digits": "1986", "team": "1986", "confidence": 0.88}
+{"id": "2026hop_qm28_f04140_r001", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm80_f00392_r005", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm115_f01140_r023", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.6}
+{"id": "2026cur_qm12_f01076_r011", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm24_f06836_r002", "subject": "robot_bumper", "alliance": "blue", "digits": "4174", "team": "4174", "confidence": 0.95}
+{"id": "2026cur_qm4_f01183_r048", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.6}
+{"id": "2026cur_qm9_f01563_r017", "subject": "robot_bumper", "alliance": "red", "digits": "?89", "team": "none", "confidence": 0.1}
+{"id": "2026cur_qm5_f00458_r007", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm14_f01797_r057", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026cur_qm2_f09730_r438", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.8}
+{"id": "2026hop_qm6_f05182_r119", "subject": "robot_bumper", "alliance": "red", "digits": "6639", "team": "6639", "confidence": 0.85}
+{"id": "2026hop_qm14_f04161_r130", "subject": "robot_bumper", "alliance": "red", "digits": "540", "team": "540", "confidence": 0.92}
+{"id": "2026cur_qm7_f00486_r016", "subject": "robot_bumper", "alliance": "red", "digits": "2?", "team": "none", "confidence": 0.1}
+{"id": "2026hop_qm28_f00000_r004", "subject": "robot_bumper", "alliance": "red", "digits": "7?5?", "team": "7451", "confidence": 0.55}
+{"id": "2026cur_qm13_f01014_r047", "subject": "robot_bumper", "alliance": "red", "digits": "1714", "team": "1714", "confidence": 0.9}
+{"id": "2026hop_qm16_f00628_r015", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm16_f02340_r063", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm14_f02670_r130", "subject": "robot_bumper", "alliance": "blue", "digits": "??12", "team": "none", "confidence": 0.25}
+{"id": "2026hop_qm72_f04432_r100", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm14_f00360_r002", "subject": "robot_bumper", "alliance": "red", "digits": "2682", "team": "2682", "confidence": 0.92}
+{"id": "2026cur_qm11_f01036_r001", "subject": "robot_bumper", "alliance": "blue", "digits": "3181", "team": "3181", "confidence": 0.92}
+{"id": "2026hop_qm84_f02782_r026", "subject": "robot_bumper", "alliance": "red", "digits": "6639", "team": "6639", "confidence": 0.92}
+{"id": "2026hop_qm6_f00000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "19?6", "team": "none", "confidence": 0.2}
+{"id": "2026hop_qm6_f07206_r005", "subject": "robot_bumper", "alliance": "red", "digits": "?4?", "team": "none", "confidence": 0.1}
+{"id": "2026hop_qm28_f04868_r086", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm22_f01087_r003", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm16_f01244_r040", "subject": "robot_bumper", "alliance": "blue", "digits": "3015", "team": "3015", "confidence": 0.95}
+{"id": "2026cur_qm8_f01630_r005", "subject": "robot_bumper", "alliance": "red", "digits": "2724", "team": "2724", "confidence": 0.9}
+{"id": "2026cur_qm12_f01396_r037", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm12_f00572_r010", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.9}
+{"id": "2026cur_qm9_f00758_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "11?7", "team": "11167", "confidence": 0.75}
+{"id": "2026cur_qm11_f00450_r003", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm115_f04180_r003", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026hop_qm24_f00000_r003", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm13_f00000_r000", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0.05}
+{"id": "2026cur_qm12_f00708_r006", "subject": "robot_bumper", "alliance": "blue", "digits": "?4?3", "team": "none", "confidence": 0.1}
+{"id": "2026hop_qm30_f03788_r101", "subject": "robot_bumper", "alliance": "red", "digits": "6200", "team": "6200", "confidence": 0.93}
+{"id": "2026cur_qm16_f01305_r035", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0.05}
+{"id":"2026cur_qm10_f01216_r045","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm30_f06684_r000","subject":"robot_bumper","alliance":"blue","digits":"11493","team":"11493","confidence":0.95}
+{"id":"2026cur_qm8_f00420_r003","subject":"unsure","alliance":"red","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm28_f00788_r021","subject":"robot_bumper","alliance":"red","digits":"?613","team":"4613","confidence":0.85}
+{"id":"2026cur_qm3_f00441_r000","subject":"unsure","alliance":"blue","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm6_f00000_r000","subject":"unsure","alliance":"blue","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm3_f00679_r018","subject":"robot_bumper","alliance":"red","digits":"1498","team":"1498","confidence":0.9}
+{"id":"2026cur_qm10_f01027_r005","subject":"unsure","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm8_f01198_r065","subject":"robot_bumper","alliance":"red","digits":"?49?","team":"6497","confidence":0.5}
+{"id":"2026hop_qm84_f04644_r043","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm13_f00918_r002","subject":"robot_bumper","alliance":"red","digits":"589","team":"589","confidence":0.97}
+{"id":"2026cur_qm10_f00000_r005","subject":"robot_bumper","alliance":"red","digits":"5572","team":"5572","confidence":0.95}
+{"id":"2026cur_qm3_f00644_r016","subject":"robot_bumper","alliance":"red","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm9_f01493_r020","subject":"unsure","alliance":"red","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm28_f02756_r062","subject":"robot_bumper","alliance":"blue","digits":"72??","team":"7287","confidence":0.6}
+{"id":"2026hop_qm72_f02220_r002","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm72_f01368_r002","subject":"robot_bumper","alliance":"blue","digits":"?174","team":"4174","confidence":0.9}
+{"id":"2026hop_qm115_f10948_r142","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm84_f02453_r028","subject":"robot_bumper","alliance":"blue","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm2_f01178_r037","subject":"unsure","alliance":"red","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm6_f08830_r274","subject":"unsure","alliance":"blue","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm14_f02733_r135","subject":"robot_bumper","alliance":"red","digits":"188","team":"188","confidence":0.95}
+{"id":"2026cur_qm3_f01533_r033","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm24_f03508_r093","subject":"not_bumper","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm9_f00555_r013","subject":"robot_bumper","alliance":"red","digits":"9068","team":"9068","confidence":0.75}
+{"id":"2026hop_qm30_f07900_r005","subject":"unsure","alliance":"red","digits":null,"team":"none","confidence":0.0}
+{"id":"2026hop_qm72_f08506_r169","subject":"unsure","alliance":"unknown","digits":null,"team":"none","confidence":0.0}
+{"id":"2026cur_qm5_f00000_r000","subject":"robot_bumper","alliance":"blue","digits":"????","team":"none","confidence":0.0}
+{"id":"2026cur_qm3_f00889_r014","subject":"robot_bumper","alliance":"blue","digits":"?87","team":"5987","confidence":0.5}
+{"id":"2026cur_qm7_f00974_r024","subject":"robot_bumper","alliance":"blue","digits":"7028","team":"7028","confidence":0.95}
+{"id": "2026cur_qm6_f01081_r036", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm14_f00360_r003", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm6_f01263_r039", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm11_f00524_r002", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm4_f00000_r000", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm6_f04454_r096", "subject": "robot_bumper", "alliance": "blue", "digits": "?706", "team": "1706", "confidence": 0.9}
+{"id": "2026cur_qm5_f01370_r019", "subject": "robot_bumper", "alliance": "red", "digits": "5907", "team": "5907", "confidence": 0.85}
+{"id": "2026hop_qm14_f01146_r042", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm80_f00384_r004", "subject": "robot_bumper", "alliance": "red", "digits": "4698", "team": "4698", "confidence": 0.92}
+{"id": "2026cur_qm2_f00000_r005", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm10_f01006_r002", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm2_f03528_r192", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm115_f00000_r001", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm84_f09488_r069", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm10_f01762_r106", "subject": "not_bumper", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm72_f06882_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "80??", "team": "8005", "confidence": 0.55}
+{"id": "2026cur_qm22_f01661_r071", "subject": "robot_bumper", "alliance": "red", "digits": "125", "team": "125", "confidence": 0.9}
+{"id": "2026hop_qm30_f02156_r047", "subject": "robot_bumper", "alliance": "red", "digits": "2102", "team": "2102", "confidence": 0.8}
+{"id": "2026cur_qm22_f01087_r037", "subject": "robot_bumper", "alliance": "blue", "digits": "8613", "team": "8613", "confidence": 0.9}
+{"id": "2026hop_qm14_f00000_r000", "subject": "robot_bumper", "alliance": "blue", "digits": "7451", "team": "7451", "confidence": 0.75}
+{"id": "2026cur_qm2_f00000_r000", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm24_f02116_r062", "subject": "robot_bumper", "alliance": "blue", "digits": "573", "team": "573", "confidence": 0.95}
+{"id": "2026cur_qm8_f00870_r006", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm4_f00553_r025", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm7_f00782_r000", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm5_f01570_r020", "subject": "robot_bumper", "alliance": "blue", "digits": "????", "team": "none", "confidence": 0}
+{"id": "2026hop_qm84_f02306_r002", "subject": "robot_bumper", "alliance": "blue", "digits": "4201", "team": "4201", "confidence": 0.97}
+{"id": "2026cur_qm12_f00924_r031", "subject": "robot_bumper", "alliance": "red", "digits": "9077", "team": "9077", "confidence": 0.85}
+{"id": "2026cur_qm7_f00606_r014", "subject": "robot_bumper", "alliance": "blue", "digits": "????", "team": "none", "confidence": 0}
+{"id": "2026cur_qm22_f00000_r002", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm24_f08220_r195", "subject": "robot_bumper", "alliance": "red", "digits": "4?1", "team": "401", "confidence": 0.7}
+{"id": "2026cur_qm4_f01330_r048", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm6_f02374_r059", "subject": "robot_bumper", "alliance": "red", "digits": "8?14", "team": "8214", "confidence": 0.85}
+{"id": "2026cur_qm6_f00388_r010", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm14_f00000_r001", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm3_f00000_r003", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm3_f00000_r004", "subject": "robot_bumper", "alliance": "red", "digits": "????", "team": "none", "confidence": 0}
+{"id": "2026cur_qm6_f01396_r048", "subject": "robot_bumper", "alliance": "blue", "digits": "?39", "team": "7539", "confidence": 0.5}
+{"id": "2026hop_qm1_f03486_r163", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm9_f00480_r003", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm115_f01468_r028", "subject": "robot_bumper", "alliance": "blue", "digits": "????", "team": "none", "confidence": 0}
+{"id": "2026hop_qm30_f09932_r229", "subject": "robot_bumper", "alliance": "red", "digits": "3539", "team": "3539", "confidence": 0.9}
+{"id": "2026cur_qm12_f00000_r000", "subject": "unsure", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm80_f00400_r004", "subject": "robot_bumper", "alliance": "red", "digits": "46?", "team": "4698", "confidence": 0.8}
+{"id": "2026cur_qm2_f03129_r156", "subject": "robot_bumper", "alliance": "blue", "digits": "6?15", "team": "6615", "confidence": 0.55}
+{"id": "2026hop_qm16_f09540_r005", "subject": "robot_bumper", "alliance": "red", "digits": "1986", "team": "1986", "confidence": 0.9}
+{"id": "2026cur_qm2_f00814_r001", "subject": "robot_bumper", "alliance": "blue", "digits": "6?15", "team": "6615", "confidence": 0.45}
+{"id": "2026cur_qm4_f01393_r053", "subject": "robot_bumper", "alliance": "blue", "digits": "6510", "team": "6510", "confidence": 0.95}
+{"id": "2026cur_qm13_f01830_r022", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm16_f00390_r004", "subject": "unsure", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm4_f00777_r013", "subject": "robot_bumper", "alliance": "red", "digits": "????", "team": "none", "confidence": 0}
+{"id": "2026hop_qm16_f00000_r000", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm22_f00604_r011", "subject": "robot_bumper", "alliance": "blue", "digits": "6800", "team": "6800", "confidence": 0.95}
+{"id": "2026hop_qm84_f05036_r001", "subject": "robot_bumper", "alliance": "blue", "digits": "1787", "team": "1787", "confidence": 0.97}
+{"id": "2026hop_qm16_f04956_r003", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026hop_qm80_f00384_r005", "subject": "robot_bumper", "alliance": "red", "digits": "?98", "team": "4698", "confidence": 0.8}
+{"id": "2026hop_qm28_f08524_r198", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm13_f01830_r086", "subject": "robot_bumper", "alliance": "blue", "digits": "8", "team": "none", "confidence": 0}
+{"id": "2026cur_qm11_f07432_r434", "subject": "robot_bumper", "alliance": "blue", "digits": "4?8?", "team": "4786", "confidence": 0.65}
+{"id": "2026hop_qm14_f04609_r004", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm3_f00000_r001", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm8_f01350_r037", "subject": "robot_bumper", "alliance": "blue", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm12_f01388_r034", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm22_f00000_r003", "subject": "robot_bumper", "alliance": "red", "digits": "702?", "team": "7028", "confidence": 0.85}
+{"id": "2026cur_qm11_f04768_r374", "subject": "robot_bumper", "alliance": "red", "digits": "6800", "team": "6800", "confidence": 0.85}
+{"id": "2026cur_qm6_f01410_r048", "subject": "robot_bumper", "alliance": "blue", "digits": "?39", "team": "7539", "confidence": 0.5}
+{"id": "2026hop_qm14_f01942_r005", "subject": "robot_bumper", "alliance": "red", "digits": "1259", "team": "1259", "confidence": 0.9}
+{"id": "2026cur_qm11_f01204_r068", "subject": "robot_bumper", "alliance": "red", "digits": "?77", "team": "1477", "confidence": 0.6}
+{"id": "2026cur_qm7_f01814_r004", "subject": "unsure", "alliance": "unknown", "digits": null, "team": "none", "confidence": 0}
+{"id": "2026cur_qm5_f00794_r011", "subject": "robot_bumper", "alliance": "red", "digits": null, "team": "none", "confidence": 0}

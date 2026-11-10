@@ -745,3 +745,17 @@ def test_ask_missing_question_is_an_error(monkeypatch):
     s = _session(concurrency=1)
     item = jev_reader.build_jev_window_payload("jev-1.14.0", _jpeg(480, 480), "wide", RED, BLUE)
     assert "error" in s.ask([item], "team")[0]
+
+
+def test_lineup_payload_colour_sentence_is_optional_and_off_by_default():
+    card, crops = _jpeg(1536, 1440), _jpeg(960, 960)
+    plain, _ = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops, ["A", "B"])
+    off, _ = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops, ["A", "B"],
+                                                 colour_note=False)
+    on, _ = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops, ["A", "B"],
+                                                colour_note=True)
+    assert plain == off and jev_reader.LINEUP_COLOUR_NOTE not in plain["state"]["context"]
+    ctx = on["state"]["context"]
+    assert jev_reader.LINEUP_COLOUR_NOTE in ctx
+    assert ctx.index(jev_reader.LINEUP_COLOUR_NOTE) < ctx.index("Yellow balls")
+    assert on["questions"] == plain["questions"] and on["assets"] == plain["assets"]

@@ -116,3 +116,25 @@ def test_iter_view_frames_reads_only_wanted_frames_in_order(tmp_path):
     assert list(wc.iter_view_frames(path, [], (0, 0, 64, 48))) == []
     with pytest.raises(OSError):
         list(wc.iter_view_frames(str(tmp_path / "missing.mp4"), [1], (0, 0, 64, 48)))
+
+
+def test_lineup_card_colour_bar_only_when_asked():
+    tile = np.full((240, 240, 3), 77, np.uint8)
+    rows = [("A", [tile] * 2), ("B", [tile])]
+    plain = wc.lineup_card(rows)
+    assert np.array_equal(plain, wc.lineup_card(rows, colors=None))
+    bar = wc.lineup_card(rows, colors=["red", "blue"])
+    y, x = (wc.BAR_ROWS[0] + wc.BAR_ROWS[1]) // 2, wc.LABEL_W // 2
+    assert tuple(int(c) for c in bar[y, x]) == wc.COLOUR_BGR["red"]
+    assert tuple(int(c) for c in bar[240 + y, x]) == wc.COLOUR_BGR["blue"]
+    assert tuple(int(c) for c in plain[y, x]) == wc._DARK
+    assert np.array_equal(bar[:, wc.LABEL_W:], plain[:, wc.LABEL_W:])   # only label cells change
+    one = wc.lineup_card(rows, colors=["red", None])                     # unknown colour: no bar
+    assert np.array_equal(one[240:], plain[240:])
+
+
+def test_decode_tile_round_trips_resizes_and_rejects_junk():
+    back = wc.decode_tile(wc.jpeg(np.full((240, 240, 3), 90, np.uint8)))
+    assert back.shape == (240, 240, 3) and abs(int(back[120, 120, 0]) - 90) <= 2
+    assert wc.decode_tile(wc.jpeg(np.zeros((100, 120, 3), np.uint8))).shape == (240, 240, 3)
+    assert wc.decode_tile(b"not a jpeg") is None and wc.decode_tile(b"") is None

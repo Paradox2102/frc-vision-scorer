@@ -29,6 +29,11 @@ ZOOM_ROWS, ZOOM_COLS = (44, 212), (36, 204)   # central 70% of a 240 px tile
 LABEL_W = 96
 _GREY, _DARK = (128, 128, 128), (30, 30, 30)
 
+# Event lineup: a bar under each row's letter in the team's bumper colour in
+# THIS match (borrowed photos may show the other colour). BGR.
+COLOUR_BGR = {"red": (0, 0, 255), "blue": (255, 0, 0)}
+BAR_ROWS = (TILE_PX - 60, TILE_PX - 16)          # y range of the bar in a label cell
+
 
 def target(cal, field_pos, ground_center_offset_m: float = 0.0) -> Optional[tuple]:
     """(u, v, crop side px) for a slot's ``field_pos``, or None when it cannot
@@ -102,13 +107,18 @@ def grid_image(tiles: list) -> np.ndarray:
     return np.vstack([np.hstack(cells[:2]), np.hstack(cells[2:4])])
 
 
-def lineup_card(rows: list, per_row: int = 6) -> np.ndarray:
-    """``rows``: [(letter, [tiles])]. One row per robot: letter, then tiles."""
+def lineup_card(rows: list, per_row: int = 6, colors: Optional[list] = None) -> np.ndarray:
+    """``rows``: [(letter, [tiles])]. One row per robot: letter, then tiles.
+    ``colors`` (event lineup): one "red" / "blue" / None per row; a known
+    colour draws a bar of it under the letter. None: the plain card."""
     out = []
-    for letter, tiles in rows:
+    for j, (letter, tiles) in enumerate(rows):
         lab = np.full((TILE_PX, LABEL_W, 3), _DARK, np.uint8)
         cv2.putText(lab, str(letter), (20, TILE_PX // 2 + 14), cv2.FONT_HERSHEY_SIMPLEX,
                     1.6, (255, 255, 255), 3)
+        bar = COLOUR_BGR.get(colors[j]) if colors else None
+        if bar is not None:
+            cv2.rectangle(lab, (12, BAR_ROWS[0]), (LABEL_W - 12, BAR_ROWS[1]), bar, -1)
         cells = list(tiles[:per_row])
         cells += [np.full((TILE_PX, TILE_PX, 3), _DARK, np.uint8)] * (per_row - len(cells))
         out.append(np.hstack([lab] + cells))
@@ -120,6 +130,20 @@ def jpeg(img: np.ndarray, quality: int = 92) -> bytes:
     if not ok:
         raise ValueError("JPEG encode failed")
     return buf.tobytes()
+
+
+def decode_tile(jpg: bytes) -> Optional[np.ndarray]:
+    """A stored anchor tile (JPEG) back to a TILE_PX x TILE_PX BGR image;
+    None when it does not decode."""
+    try:
+        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+    if img is None:
+        return None
+    if img.shape[:2] != (TILE_PX, TILE_PX):
+        img = cv2.resize(img, (TILE_PX, TILE_PX), interpolation=cv2.INTER_AREA)
+    return img
 
 
 def iter_view_frames(video_path, frame_nums: Iterable, view: tuple) -> Iterator[tuple]:

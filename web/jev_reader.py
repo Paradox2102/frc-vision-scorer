@@ -299,6 +299,13 @@ LINEUP_QUESTION = (
 # Game-specific sentence appended to the lineup context (2026 REBUILT fuel).
 BALL_NOTE_2026 = "Yellow balls are game pieces; ignore how many a robot carries. "
 
+# Event lineup (spec 2026-11-10 section 3): borrowed lineup photos may come
+# from other matches; the card's colour bar shows this match's bumper colour.
+LINEUP_COLOUR_NOTE = (
+    "Photos in a lineup row may come from other matches, so the robot's bumper colour in a "
+    "photo can differ from this match; the coloured bar under each row's letter shows the "
+    "robot's bumper colour in this match. ")
+
 
 def _window_teams_line(red: list, blue: list) -> str:
     return (f"Teams in this match: red alliance {', '.join(red)}; blue alliance "
@@ -336,11 +343,13 @@ def build_jev_window_payload(model_key: str, jpg: bytes, kind: str,
 
 def build_jev_lineup_payload(model_key: str, lineup_jpg: bytes, crops_jpg: bytes,
                              letters: Iterable, ball_note: str = BALL_NOTE_2026, *,
-                             lineup_asset: Optional[tuple] = None) -> tuple[dict, list]:
+                             lineup_asset: Optional[tuple] = None,
+                             colour_note: bool = False) -> tuple[dict, list]:
     """Lineup question: which row of the lineup card is at the marked spot in
     the window's 2x2 grid. Two image assets, both referenced from the state.
     ``lineup_asset``: the card's ``jev_asset(lineup_jpg)`` result, built once
     and shared by every payload (then ``lineup_jpg`` is not encoded again).
+    ``colour_note`` (event lineup) adds LINEUP_COLOUR_NOTE before the ball note.
     Returns (payload, [(w, h), (w, h)]) for ``JevSession.ask(..., "who")``."""
     letters = [str(l) for l in letters]
     lineup, lwh = lineup_asset if lineup_asset is not None else jev_asset(lineup_jpg)
@@ -352,7 +361,8 @@ def build_jev_lineup_payload(model_key: str, lineup_jpg: bytes, crops_jpg: bytes
         f"`lineup` shows {len(letters)} FRC robots, one per row, labelled A to {letters[-1]} at "
         "the left; each row shows the SAME robot at six different moments (its bumper colour and "
         "team number are often visible). `crops` is a 2x2 grid of up to four query crops of one "
-        "tracked spot, about a second apart. " + WINDOW_MARK + (ball_note or ""))
+        "tracked spot, about a second apart. " + WINDOW_MARK
+        + (LINEUP_COLOUR_NOTE if colour_note else "") + (ball_note or ""))
     return ({"model": JEV_MODELS[model_key]["model"],
              "state": {"lineup": "lineup_image", "crops": "crops_image", "context": context},
              "assets": {"lineup_image": lineup, "crops_image": crops},

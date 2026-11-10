@@ -7,7 +7,7 @@ jumps); a reader names each window from a few native-resolution crops; the
 window's team goes to every frame of that slot in the window. Unread windows
 stay unlabelled and a team sits on at most one slot per frame.
 
-Everything above ``run_window_labels`` is pure (no I/O)."""
+Everything above ``run_window_labels`` is pure (no I/O). Event-store access happens in the callers (web/app.py, scripts/relabel_replay.py)."""
 from __future__ import annotations
 
 import math
@@ -486,16 +486,27 @@ class Params:
     seed: int = 0                              # lineup letter order
     model_key: str = "jev-1.14.0"
     ball_note: Optional[str] = None            # None = jev_reader.BALL_NOTE_2026
+    # Event lineup (docs/superpowers/specs/2026-11-10-event-lineup-design.md).
+    # Every default keeps the stage exactly as it was.
+    event_lineup: bool = False                 # borrowed rows, colour bar, anchors_out
+    borrowed: dict = field(default_factory=dict)      # team -> [Anchor], fetched by the caller
+    this_colors: dict = field(default_factory=dict)   # team -> "red" / "blue" in this match
+    use_elimination: bool = True               # ablation: elimination anchors
+    rows_alliance_only: bool = False           # ablation: one card per alliance
+    digit_calls: Optional[dict] = None         # digit-call cache, reused per window fingerprint
 
 
 class StageAbort(Exception):
     """The stage cannot finish; the caller keeps the labels it had."""
 
 
-def _stats() -> dict:
-    return {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
-            "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
-            "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
+def _stats(event_lineup: bool = False) -> dict:
+    out = {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
+           "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
+           "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
+    if event_lineup:
+        out.update(rows_own=0, rows_borrowed=0, rows_elim=0)
+    return out
 
 
 def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
@@ -508,9 +519,14 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     ``window_crops.iter_view_frames``.
 
     Returns {"aborted": reason or None, "labels": lab or None, "segments":
-    {slot id: rows} or None, "stats": {...}, "lineup_jpeg": bytes or None}.
-    On abort, labels and segments are None and nothing should be applied."""
-    stats = _stats()
+    {slot id: rows} or None, "stats": {...}, "lineup_jpeg": the card (the red
+    card with rows_alliance_only) or None, "lineup_jpeg_blue": the blue card
+    with rows_alliance_only else None, "anchors_out": [Anchor] for the event
+    store (event_lineup only), "digit_calls": the digit-pass cache
+    {"calls", "wide_p", "fingerprints"} (None on abort), "row_sources": team
+    -> {"own", "borrowed", "elim", "from"} (event_lineup only)}. On abort,
+    labels and segments are None and nothing should be applied or stored."""
+    stats = _stats(params.event_lineup)
     before = _usage(session)
     try:
         out = _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats)
@@ -527,7 +543,8 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     stats["cost_cents"] = round((after[2] - before[2]) * 100.0, 2)
     if out is None:
         return {"aborted": stats["aborted"], "labels": None, "segments": None,
-                "stats": stats, "lineup_jpeg": None}
+                "stats": stats, "lineup_jpeg": None, "lineup_jpeg_blue": None,
+                "anchors_out": [], "digit_calls": None, "row_sources": {}}
     return {"aborted": None, "stats": stats, **out}
 
 
@@ -587,6 +604,90 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
     return results
 
 
+def _requests(windows: list, tiles: dict) -> dict:
+    """wid -> the digit requests for that window, in send order: wide and
+    zoom per tile (by sample number), then one grid."""
+    return {w.wid: [r for k in sorted(tiles[w.wid]) for r in (("wide", k), ("zoom", k))]
+            + [("grid", 0)] for w in windows if tiles.get(w.wid)}
+
+
+def _wide_p(requests: dict, calls: dict) -> dict:
+    """wid -> {k: probs} of the wide calls that returned."""
+    out: dict = {}
+    for wid, reqs in requests.items():
+        for (kind, k), probs in zip(reqs, calls.get(wid) or []):
+            if kind == "wide" and probs:
+                out.setdefault(wid, {})[k] = probs
+    return out
+
+
+def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats) -> dict:
+    """Digit calls for every window with tiles. Returns {"calls": wid ->
+    [probs or None] in request order, "wide_p": wid -> {k: probs}}."""
+    requests = _requests(windows, tiles)
+    specs = [(wid, kind, k) for wid, reqs in requests.items() for kind, k in reqs]
+    answers = _ask_batched(session, specs, digit_item, "team", params, clock, stats,
+                           "in the digit pass")
+    calls: dict = {}
+    for (wid, _kind, _k), probs in zip(specs, answers):
+        calls.setdefault(wid, []).append(probs)
+    return {"calls": calls, "wide_p": _wide_p(requests, calls)}
+
+
+def _lineup_rows(digit, start_s, tiles, wide_p, roster, colours, params, crops) -> tuple:
+    """(team -> row tiles, team -> row provenance, own anchors). Knob off:
+    pick_anchors rows exactly as before, no provenance, no own anchors. Knob
+    on: store_anchors windows (a single good read counts) filled with
+    borrowed anchors by fill_row; a row needs MIN_ANCHORS tiles in all. A
+    borrowed tile that does not decode is dropped."""
+    if not params.event_lineup:
+        anchors = pick_anchors(digit, start_s)
+        return ({t: [tiles[wid][best_tile_k(wide_p, tiles, wid, t)] for wid in wids]
+                 for t, wids in anchors.items()}, {}, {})
+    own = store_anchors(digit, start_s)
+    rows, sources = {}, {}
+    for t in roster:
+        mine = [tiles[wid][best_tile_k(wide_p, tiles, wid, t)] for wid in own.get(t, [])]
+        got = [(a, crops.decode_tile(a.tile))
+               for a in fill_row(len(mine), params.borrowed.get(t) or [], colours[t],
+                                 params.use_elimination)]
+        got = [(a, img) for a, img in got if img is not None]
+        if len(mine) + len(got) < MIN_ANCHORS:
+            continue
+        rows[t] = mine + [img for _a, img in got]
+        sources[t] = {"own": len(mine),
+                      "borrowed": sum(a.kind == KIND_DIGITS for a, _img in got),
+                      "elim": sum(a.kind == KIND_ELIM for a, _img in got),
+                      "from": sorted({a.match_key for a, _img in got if a.match_key})}
+    return rows, sources, own
+
+
+def _anchors_out(frames, windows, by_wid, digit, own, calls, wide_p, tiles, colours,
+                 red, blue, params, crops) -> list:
+    """This match's anchors for the event store: every own digit anchor
+    (store_anchors) and, unless disabled, the elimination anchors. The match
+    fields stay None; the store stamps them."""
+    out = []
+
+    def add(team, wid, k, kind, p):
+        w = by_wid[wid]
+        out.append(Anchor(team=team, kind=kind, p=round(float(p), 4),
+                          frame_num=int(frames[w.samples[k - 1]]["frame_num"]),
+                          alliance_color=colours.get(team), tile=crops.jpeg(tiles[wid][k])))
+
+    for team, wids in own.items():
+        for wid in wids:
+            add(team, wid, best_tile_k(wide_p, tiles, wid, team), KIND_DIGITS, digit[wid][1])
+    if params.use_elimination:
+        period = frame_period_s(frames, params.fps) or 0.0
+        for team, picks in elimination_anchors(windows, frames, digit, calls, wide_p,
+                                               red, blue, period).items():
+            for wid, k, p in picks:
+                if k in tiles.get(wid, {}):
+                    add(team, wid, k, KIND_ELIM, p)
+    return out
+
+
 def _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats) -> dict:
     from web import jev_reader
     from web.field import window_crops as crops
@@ -635,15 +736,6 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     _check(params, clock, "after the video pass")
 
     # 3. digit pass: wide + zoom per tile, one grid per window
-    specs = []
-    for w in windows:
-        t = tiles.get(w.wid)
-        if not t:
-            continue
-        for k in sorted(t):
-            specs += [(w.wid, "wide", k), (w.wid, "zoom", k)]
-        specs.append((w.wid, "grid", 0))
-
     def digit_item(spec):
         wid, kind, k = spec
         t = tiles[wid]
@@ -652,14 +744,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
         return jev_reader.build_jev_window_payload(params.model_key, crops.jpeg(img), kind,
                                                    red, blue)
 
-    answers = _ask_batched(session, specs, digit_item, "team", params, clock, stats,
-                           "in the digit pass")
-    calls: dict = {}                                 # wid -> [probs or None]
-    wide_p: dict = {}                                # wid -> {k: probs}
-    for (wid, kind, k), probs in zip(specs, answers):
-        calls.setdefault(wid, []).append(probs)
-        if kind == "wide" and probs:
-            wide_p.setdefault(wid, {})[k] = probs
+    dc = _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats)
+    calls, wide_p = dc["calls"], dc["wide_p"]
     digit = {}
     for wid, c in calls.items():
         d = digit_decision(c, roster)
@@ -667,33 +753,40 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
             digit[wid] = d
     stats["digit_named"] = len(digit)
 
-    # 4. lineup card from the most confident digit labels
+    # 4. lineup rows from the most confident digit labels (knob on: plus rows
+    # borrowed from the event store); one card, or one per alliance
+    by_wid = {w.wid: w for w in windows}
     start_s = {w.wid: frames[w.idx[0]]["frame_num"] / float(params.fps) for w in windows}
-    anchors = pick_anchors(digit, start_s)
-    order = [t for t in roster if t in anchors]
-    random.Random(params.seed).shuffle(order)
-    letters = {LETTERS[j]: t for j, t in enumerate(order[:len(LETTERS)])}
-    stats["lineup_rows"] = len(letters)
-    lineup = {}
-    lineup_jpeg = None
-    if len(letters) >= MIN_LINEUP_ROWS and params.lineup_min_p <= 1.0:
-        rows = []
-        for letter, team in letters.items():
-            row_tiles = []
-            for wid in anchors[team]:
-                row_tiles.append(tiles[wid][best_tile_k(wide_p, tiles, wid, team)])
-            rows.append((letter, row_tiles))
-        lineup_jpeg = crops.jpeg(crops.lineup_card(rows, ANCHORS_PER_TEAM))
-        card_asset = jev_reader.jev_asset(lineup_jpeg)   # encoded once, shared by every payload
-        todo = [w.wid for w in windows if w.wid not in digit and tiles.get(w.wid)]
-        note = params.ball_note if params.ball_note is not None else jev_reader.BALL_NOTE_2026
+    colours = {t: params.this_colors.get(t) or ("red" if t in red else "blue") for t in roster}
+    rows, row_sources, own = _lineup_rows(digit, start_s, tiles, wide_p, roster, colours,
+                                          params, crops)
+    cards = [("red", red), ("blue", blue)] if params.rows_alliance_only else [("all", roster)]
+    todo_all = [w.wid for w in windows if w.wid not in digit and tiles.get(w.wid)]
+    note = params.ball_note if params.ball_note is not None else jev_reader.BALL_NOTE_2026
+    lineup, jpegs, lettered = {}, {}, []
+    for name, teams in cards:
+        order = [t for t in teams if t in rows]
+        random.Random(params.seed).shuffle(order)
+        letters = {LETTERS[j]: t for j, t in enumerate(order[:len(LETTERS)])}
+        stats["lineup_rows"] += len(letters)
+        lettered += list(letters.values())
+        if len(letters) < MIN_LINEUP_ROWS or params.lineup_min_p > 1.0:
+            continue
+        colors = [colours[t] for t in letters.values()] if params.event_lineup else None
+        card_jpeg = crops.jpeg(crops.lineup_card([(l, rows[t]) for l, t in letters.items()],
+                                                 ANCHORS_PER_TEAM, colors=colors))
+        jpegs[name] = card_jpeg
+        card_asset = jev_reader.jev_asset(card_jpeg)   # encoded once, shared by every payload
+        todo = [wid for wid in todo_all
+                if name == "all" or slot_alliance(by_wid[wid].slot) == name]
 
-        def lineup_item(wid):
+        def lineup_item(wid, card_jpeg=card_jpeg, card_asset=card_asset, letters=letters):
             t = tiles[wid]
             grid = crops.jpeg(crops.grid_image([t[j] for j in sorted(t)]))
-            return jev_reader.build_jev_lineup_payload(params.model_key, lineup_jpeg, grid,
+            return jev_reader.build_jev_lineup_payload(params.model_key, card_jpeg, grid,
                                                        list(letters), note,
-                                                       lineup_asset=card_asset)
+                                                       lineup_asset=card_asset,
+                                                       colour_note=params.event_lineup)
 
         # 5. lineup pass on the windows the digit pass did not name
         for wid, probs in zip(todo, _ask_batched(session, todo, lineup_item, "who", params,
@@ -702,6 +795,14 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
             if d:
                 lineup[wid] = d
     stats["lineup_named"] = len(lineup)
+    anchors_out: list = []
+    if params.event_lineup:
+        src = [row_sources[t] for t in lettered]
+        stats["rows_own"] = sum(1 for s in src if not s["borrowed"] and not s["elim"])
+        stats["rows_borrowed"] = sum(1 for s in src if s["borrowed"] and not s["elim"])
+        stats["rows_elim"] = sum(1 for s in src if s["elim"])
+        anchors_out = _anchors_out(frames, windows, by_wid, digit, own, calls, wide_p, tiles,
+                                   colours, red, blue, params, crops)
 
     # 6. assemble
     evidence = {wid: (t, RANK_DIGITS, p) for wid, (t, p) in digit.items()}
@@ -709,4 +810,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     lab, cleared = assemble_labels(windows, evidence)
     stats["cleared_by_uniqueness"] = cleared
     stats["unlabelled"] = len(windows) - len(evidence)
-    return {"labels": lab, "segments": window_segments(frames, lab), "lineup_jpeg": lineup_jpeg}
+    return {"labels": lab, "segments": window_segments(frames, lab),
+            "lineup_jpeg": jpegs.get("all", jpegs.get("red")),
+            "lineup_jpeg_blue": jpegs.get("blue"),
+            "anchors_out": anchors_out, "digit_calls": dc, "row_sources": row_sources}

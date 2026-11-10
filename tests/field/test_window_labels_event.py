@@ -7,12 +7,17 @@ import json
 import random
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
+from web import jev_reader
+
 from web.field import event_anchors as ea
+from web.field import window_crops as wc
 from web.field import window_labels as wl
 from tests.field.test_window_labels import (
-    FPS, FakeSession, _frames, _lineup_frames, _lineup_session, _run, _still)
+    BySlot, FPS, FakeSession, _expected_letters, _frames, _lineup_frames, _lineup_session, _run, _still)
 
 GOLDEN = Path(__file__).parent / "data" / "window_labels_golden.json"
 
@@ -286,3 +291,160 @@ def test_guard_boundaries(case, passes):
     elif case == "partner_p_0.85":
         digit[w["R2"].wid] = ("2724", 0.85)
     assert bool(_elim(frames, ws, digit, calls, wide_p)) is passes
+
+
+def _reading_session(frames, read, who_p=None):
+    """Digit answers per window, one per request in request order: ``read``
+    is slot -> probs (other slots unreadable) or a function of the window.
+    Lineup answers are ``who_p``."""
+    s = BySlot(who_p=who_p or {})
+    plan = []
+    for w in wl.build_windows(frames, FPS):
+        probs = read(w) if callable(read) else read.get(w.slot, {"unreadable": 0.9})
+        plan += [probs] * (2 * len(w.samples) + 1)
+    s.plan = plan
+    return s
+
+
+def _borrow(team, n, mk="2026cur_qm3", colour="blue", kind="digits", shade=90):
+    tile = wc.jpeg(np.full((240, 240, 3), shade, np.uint8))
+    return [ea.Anchor(team=team, kind=kind, p=0.9, frame_num=100 + j, alliance_color=colour,
+                      tile=tile, match_key=mk, match_number=ea.schedule_rank(mk), replay_id="r")
+            for j in range(n)]
+
+
+def test_knob_off_ignores_event_inputs_and_adds_no_stats_keys():
+    kw = dict(borrowed={"2637": _borrow("2637", 2, colour="red")}, this_colors={"2637": "red"},
+              use_elimination=False)
+    assert _golden(**kw) == json.loads(GOLDEN.read_text())
+
+
+def test_knob_off_returns_no_anchors_and_no_row_sources_but_the_digit_calls():
+    frames = _lineup_frames()
+    res = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), seed=1)
+    assert res["anchors_out"] == [] and res["row_sources"] == {}
+    assert res["lineup_jpeg_blue"] is None
+    assert {"calls", "wide_p"} <= set(res["digit_calls"])
+
+
+def _letter_of(team, seed=1):
+    return next(l for l, t in _expected_letters(seed).items() if t == team)
+
+
+def test_a_team_never_read_borrows_a_row_and_the_lineup_pass_runs():
+    # 3128 is read on B1 in four runs; 6773 (B2) never. Knob off: one row and
+    # no lineup pass. Knob on with two borrowed 6773 anchors: two rows.
+    frames = _lineup_frames()
+    who = {_letter_of("6773"): 0.9}
+    off = _run(frames, _reading_session(frames, {"B1": {"3128": 0.9}}, who), seed=1)
+    assert off["stats"]["lineup_rows"] == 1 and off["stats"]["lineup_named"] == 0
+    s = _reading_session(frames, {"B1": {"3128": 0.9}}, who)
+    on = _run(frames, s, seed=1, event_lineup=True, borrowed={"6773": _borrow("6773", 2)})
+    st = on["stats"]
+    assert st["lineup_rows"] == 2 and (st["rows_own"], st["rows_borrowed"], st["rows_elim"]) == (1, 1, 0)
+    assert on["row_sources"]["6773"] == {"own": 0, "borrowed": 2, "elim": 0,
+                                         "from": ["2026cur_qm3"]}
+    assert on["row_sources"]["3128"]["own"] == 4
+    assert ("who", 5) in s.asked                         # four B2 windows + R1
+    b2 = [w for w in wl.build_windows(frames, FPS) if w.slot == "B2"]
+    assert {on["labels"][(w.idx[0], "B2")][:2] for w in b2} == {("6773", wl.RANK_LINEUP)}
+
+
+def test_a_borrowed_row_needs_two_anchors_counting_own():
+    frames = _lineup_frames()
+    res = _run(frames, _reading_session(frames, {"B1": {"3128": 0.9}}), seed=1,
+               event_lineup=True, borrowed={"6773": _borrow("6773", 1)})
+    assert res["stats"]["lineup_rows"] == 1 and "6773" not in res["row_sources"]
+
+
+def test_one_own_read_plus_one_borrowed_anchor_makes_a_row():
+    frames = _lineup_frames()
+    first_b2 = min(w.wid for w in wl.build_windows(frames, FPS) if w.slot == "B2")
+
+    def read(w):
+        if w.slot == "B1":
+            return {"3128": 0.9}
+        return {"6773": 0.9} if w.wid == first_b2 else {"unreadable": 0.9}
+
+    res = _run(frames, _reading_session(frames, read), seed=1, event_lineup=True,
+               borrowed={"6773": _borrow("6773", 1)})
+    assert res["row_sources"]["6773"] == {"own": 1, "borrowed": 1, "elim": 0,
+                                          "from": ["2026cur_qm3"]}
+    assert res["stats"]["lineup_rows"] == 2
+
+
+def test_anchors_out_are_this_matchs_confident_digit_windows():
+    frames = _lineup_frames()
+    res = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), seed=1, event_lineup=True)
+    out = res["anchors_out"]
+    ws = wl.build_windows(frames, FPS)
+    assert sorted(a.team for a in out) == ["3128"] * 4 + ["6773"] * 4
+    assert {(a.kind, a.alliance_color, a.p) for a in out} == {("digits", "blue", 0.9)}
+    b1_starts = sorted(frames[w.samples[0]]["frame_num"] for w in ws if w.slot == "B1")
+    assert sorted(a.frame_num for a in out if a.team == "3128") == b1_starts
+    assert all(a.tile[:2] == b"\xff\xd8" and a.match_key is None for a in out)
+    st = res["stats"]
+    assert (st["rows_own"], st["rows_borrowed"], st["rows_elim"]) == (2, 0, 0)
+
+
+def test_elimination_anchors_reach_anchors_out_and_obey_the_ablation():
+    frames = _frames({"R1": _still(range(20), (2.0, 2.0)), "R2": _still(range(20), (6.0, 2.0)),
+                      "R3": _still(range(20), (10.0, 2.0))}, 20)
+    read = {"R1": {"2637": 0.95}, "R2": {"2724": 0.9},
+            "R3": {"unreadable": 0.85, "not_robot": 0.05, "6497": 0.1}}
+    res = _run(frames, _reading_session(frames, read), event_lineup=True)
+    elim = [a for a in res["anchors_out"] if a.kind == "elimination"]
+    assert [a.team for a in elim] == ["6497"] * 3
+    assert all(a.p == 0.9 and a.alliance_color == "red" for a in elim)
+    off = _run(frames, _reading_session(frames, read), event_lineup=True, use_elimination=False)
+    assert [a.kind for a in off["anchors_out"]] == ["digits", "digits"]
+
+
+def test_alliance_rows_build_one_card_per_alliance_and_ask_only_the_slots_card():
+    frames = _lineup_frames()                       # 3128 / 6773 read; R1 unread
+    s = _lineup_session(frames, who_p={"A": 0.9})
+    red = {"2637": _borrow("2637", 2, colour="red"),
+           "2724": _borrow("2724", 2, mk="2026cur_qm4", colour="red")}
+    res = _run(frames, s, seed=1, event_lineup=True, borrowed=red, rows_alliance_only=True)
+    assert res["lineup_jpeg"][:2] == b"\xff\xd8" and res["lineup_jpeg_blue"][:2] == b"\xff\xd8"
+    assert res["stats"]["lineup_rows"] == 4
+    assert [n for q, n in s.asked if q == "who"] == [1]          # R1 only, on the red card
+    order = ["2637", "2724"]
+    random.Random(1).shuffle(order)
+    r1 = next(w for w in wl.build_windows(frames, FPS) if w.slot == "R1")
+    assert res["labels"][(r1.idx[0], "R1")][0] == order[0]       # letter A of the red card
+
+
+def test_default_card_has_every_teams_row_a_colour_bar_and_the_colour_sentence():
+    frames = _lineup_frames()
+    s = _lineup_session(frames, who_p={"A": 0.9})
+    sent = []
+    real_ask = s.ask
+
+    def ask(items, question):
+        if question == "who":
+            sent.extend(p for p, _sizes in items)
+        return real_ask(items, question)
+
+    s.ask = ask
+    res = _run(frames, s, seed=1, event_lineup=True,
+               borrowed={"2637": _borrow("2637", 2, colour="red")})
+    assert res["stats"]["lineup_rows"] == 3 and res["lineup_jpeg_blue"] is None
+    assert jev_reader.LINEUP_COLOUR_NOTE in sent[0]["state"]["context"]
+    assert list(sent[0]["questions"]["who"]["criteria"])[:3] == ["A", "B", "C"]
+    card = cv2.imdecode(np.frombuffer(res["lineup_jpeg"], np.uint8), cv2.IMREAD_COLOR)
+    order = ["2637", "3128", "6773"]
+    random.Random(1).shuffle(order)
+    y = (wc.BAR_ROWS[0] + wc.BAR_ROWS[1]) // 2
+    for j, team in enumerate(order):
+        b, _g, r = (int(v) for v in card[240 * j + y, wc.LABEL_W // 2])
+        assert (r > 180 and b < 80) if team == "2637" else (b > 180 and r < 80)
+
+
+def test_an_abort_returns_no_anchors_no_calls_and_no_cards():
+    res = _run(_frames({"B1": _still(range(20))}, 20), FakeSession(available=False),
+               event_lineup=True)
+    assert res["aborted"] and res["anchors_out"] == [] and res["digit_calls"] is None
+    assert res["lineup_jpeg"] is None and res["lineup_jpeg_blue"] is None
+    assert res["row_sources"] == {}
+    assert {"rows_own", "rows_borrowed", "rows_elim"} <= set(res["stats"])

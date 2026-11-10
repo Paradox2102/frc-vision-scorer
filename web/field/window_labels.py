@@ -171,3 +171,100 @@ def lineup_decision(probs: Optional[dict], letters: dict, min_p: float) -> Optio
     letter = max(letters, key=lambda l: float(probs.get(l, 0.0)))
     p = float(probs.get(letter, 0.0))
     return (letters[letter], p) if p >= min_p else None
+
+
+def assemble_labels(windows: list, evidence: dict) -> tuple:
+    """``evidence``: window id -> (team, rank, p). Returns (lab, cleared) where
+    ``lab[(frame index, slot)]`` is (team, rank, p, window length) or None for
+    an entry cleared by the one-team-per-frame rule. Keys that are absent are
+    unlabelled. Precedence when two slots carry one team in a frame: higher
+    rank, higher p, longer window, lower slot id."""
+    lab: dict = {}
+    for w in windows:
+        ev = evidence.get(w.wid)
+        if not ev:
+            continue
+        for i in w.idx:
+            lab[(i, w.slot)] = (ev[0], ev[1], float(ev[2]), len(w.idx))
+    by: dict = {}
+    for (i, slot), e in lab.items():
+        by.setdefault((i, e[0]), []).append(slot)
+    cleared = 0
+    for (i, _team), slots in by.items():
+        if len(slots) < 2:
+            continue
+
+        def strength(s, i=i):
+            e = lab[(i, s)]
+            sid = slot_label_to_id(s)
+            return (-e[1], -e[2], -e[3], 99 if sid is None else sid)
+
+        keep = min(slots, key=strength)
+        for s in slots:
+            if s != keep:
+                lab[(i, s)] = None
+                cleared += 1
+    return lab, cleared
+
+
+def apply_labels(frames: list, lab: dict) -> None:
+    """Write the assembled labels into replay frames, in place. Every robot
+    row is rewritten: a labelled entry gets its team, everything else None."""
+    for i, f in enumerate(frames):
+        for r in f.get("robots") or []:
+            e = lab.get((i, r.get("slot")))
+            r["team_number"] = e[0] if e else None
+            r["confirmed"] = bool(e and e[1] == RANK_DIGITS)
+
+
+def window_segments(frames: list, lab: dict) -> dict:
+    """Slot id -> contiguous segment rows for the match_robot_identity_segment
+    table. Readers of that table look a frame up by "last start at or before
+    it", so every unlabelled stretch gets its own row (team None, source
+    SOURCE_NONE) instead of being left as a gap."""
+    per: dict = {}
+    for i, f in enumerate(frames):
+        for r in f.get("robots") or []:
+            sid = slot_label_to_id(r.get("slot"))
+            if sid is None:
+                continue
+            per.setdefault(sid, []).append((int(f["frame_num"]), lab.get((i, r["slot"]))))
+    out = {}
+    for sid, seq in sorted(per.items()):
+        rows: list = []
+        for frame_num, e in seq:
+            team = e[0] if e else None
+            source = SOURCE[e[1]] if e else SOURCE_NONE
+            score = round(e[2], 4) if e else None
+            if rows and rows[-1]["team_number"] == team and rows[-1]["source"] == source:
+                rows[-1]["end_frame"] = frame_num
+                if score is not None:
+                    rows[-1]["score"] = max(rows[-1]["score"], score)
+            else:
+                rows.append({"start_frame": frame_num, "end_frame": frame_num,
+                             "team_number": team,
+                             "confirmed": bool(e and e[1] == RANK_DIGITS),
+                             "score": score, "source": source})
+        out[sid] = rows
+    return out
+
+
+def restamp_events(frames: list, events: list) -> int:
+    """Re-stamp each replay event's team from the frame labels: the team on
+    that slot's row in ``frames[event index]``, or None when the row is
+    absent or unlabelled. An event's ``frame_num`` is the processed-frame
+    index. An index outside the recording is left alone. Returns the number
+    of events whose team changed."""
+    changed = 0
+    for ev in events or []:
+        idx = ev.get("frame_num")
+        if not isinstance(idx, int) or not 0 <= idx < len(frames):
+            continue
+        row = next((r for r in frames[idx].get("robots") or []
+                    if r.get("slot") == ev.get("slot")), None)
+        team = row.get("team_number") if row else None
+        if ev.get("team_number") != team:
+            changed += 1
+        ev["team_number"] = team
+        ev["robot_label"] = team or ev.get("slot")
+    return changed

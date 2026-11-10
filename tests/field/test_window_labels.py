@@ -123,3 +123,87 @@ def test_lineup_decision_takes_best_letter_at_or_above_the_floor():
     assert wl.lineup_decision({"A": 0.7, "B": 0.1, "unsure": 0.2}, letters, 0.65) == ("2724", 0.7)
     assert wl.lineup_decision(None, letters, 0.8) is None
     assert wl.lineup_decision({"none": 1.0}, letters, 0.8) is None
+
+
+def _two_slot_frames():
+    # B1 and B2 both present for 20 frames; R1 for the first 10
+    return _frames({"B1": _still(range(20)), "B2": _still(range(20), (9.0, 6.0)),
+                    "R1": _still(range(10), (12.0, 3.0))}, 20)
+
+
+def test_window_label_goes_to_every_frame_and_the_rest_is_unlabelled():
+    frames = _two_slot_frames()
+    ws = wl.build_windows(frames, FPS)
+    b1 = next(w for w in ws if w.slot == "B1")
+    lab, cleared = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_DIGITS, 0.9)})
+    assert cleared == 0
+    wl.apply_labels(frames, lab)
+    for f in frames:
+        rows = {r["slot"]: r for r in f["robots"]}
+        assert rows["B1"]["team_number"] == "3128" and rows["B1"]["confirmed"] is True
+        assert rows["B2"]["team_number"] is None and rows["B2"]["confirmed"] is False
+        if "R1" in rows:
+            assert rows["R1"]["team_number"] is None
+
+
+def test_one_team_per_frame_digits_beat_lineup_then_higher_p_then_lower_slot():
+    frames = _two_slot_frames()
+    ws = wl.build_windows(frames, FPS)
+    b1, b2 = (next(w for w in ws if w.slot == s) for s in ("B1", "B2"))
+    # lineup with higher p loses to digits
+    lab, cleared = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_LINEUP, 0.99),
+                                           b2.wid: ("3128", wl.RANK_DIGITS, 0.6)})
+    assert cleared == 20 and lab[(0, "B1")] is None and lab[(0, "B2")][0] == "3128"
+    # same rank: higher p wins
+    lab, _ = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_DIGITS, 0.7),
+                                     b2.wid: ("3128", wl.RANK_DIGITS, 0.9)})
+    assert lab[(5, "B1")] is None and lab[(5, "B2")][0] == "3128"
+    # full tie: lower slot id keeps it
+    lab, _ = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_DIGITS, 0.9),
+                                     b2.wid: ("3128", wl.RANK_DIGITS, 0.9)})
+    assert lab[(5, "B1")][0] == "3128" and lab[(5, "B2")] is None
+    # different teams never collide
+    lab, cleared = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_DIGITS, 0.9),
+                                           b2.wid: ("6773", wl.RANK_LINEUP, 0.85)})
+    assert cleared == 0 and lab[(5, "B2")][0] == "6773"
+
+
+def test_segments_are_contiguous_with_explicit_unlabelled_rows():
+    frames = _frames({"B1": _still(range(50))}, 50)          # 3 windows: 17, 17, 16 frames
+    ws = wl.build_windows(frames, FPS)
+    lab, _ = wl.assemble_labels(ws, {ws[0].wid: ("3128", wl.RANK_DIGITS, 0.9),
+                                     ws[2].wid: ("3128", wl.RANK_LINEUP, 0.82)})
+    segs = wl.window_segments(frames, lab)
+    rows = segs[0]                                            # B1 -> slot id 0
+    assert [(r["team_number"], r["source"]) for r in rows] == [
+        ("3128", "window_digits"), (None, "window_none"), ("3128", "window_lineup")]
+    assert rows[0]["start_frame"] == 420 and rows[0]["end_frame"] == 420 + 16 * STEP
+    assert rows[1]["start_frame"] == 420 + 17 * STEP and rows[1]["score"] is None
+    assert rows[2]["end_frame"] == 420 + 49 * STEP and rows[2]["confirmed"] is False
+    assert rows[0]["confirmed"] is True and rows[0]["score"] == 0.9
+
+
+def test_consecutive_windows_with_the_same_team_and_source_merge():
+    frames = _frames({"R2": _still(range(50))}, 50)
+    ws = wl.build_windows(frames, FPS)
+    lab, _ = wl.assemble_labels(ws, {w.wid: ("2724", wl.RANK_DIGITS, 0.6 + 0.1 * k)
+                                     for k, w in enumerate(ws)})
+    rows = wl.window_segments(frames, lab)[4]                 # R2 -> slot id 4
+    assert len(rows) == 1 and rows[0]["team_number"] == "2724" and rows[0]["score"] == 0.8
+
+
+def test_events_are_restamped_from_frame_labels_and_gaps_become_none():
+    frames = _frames({"R1": _still(range(20))}, 20)
+    ws = wl.build_windows(frames, FPS)
+    lab, _ = wl.assemble_labels(ws, {})                       # nothing named
+    wl.apply_labels(frames, lab)
+    frames[3]["robots"][0]["team_number"] = "2637"
+    events = [{"frame_num": 3, "slot": "R1", "team_number": "9999", "robot_label": "9999"},
+              {"frame_num": 7, "slot": "R1", "team_number": "9999", "robot_label": "9999"},
+              {"frame_num": 99, "slot": "R1", "team_number": "9999", "robot_label": "9999"},
+              {"frame_num": 4, "slot": "B3", "team_number": "9999", "robot_label": "9999"}]
+    assert wl.restamp_events(frames, events) == 3
+    assert events[0]["team_number"] == "2637" and events[0]["robot_label"] == "2637"
+    assert events[1]["team_number"] is None and events[1]["robot_label"] == "R1"
+    assert events[2]["team_number"] == "9999"                 # index outside the recording
+    assert events[3]["team_number"] is None                   # slot absent in that frame

@@ -207,3 +207,45 @@ def test_events_are_restamped_from_frame_labels_and_gaps_become_none():
     assert events[1]["team_number"] is None and events[1]["robot_label"] == "R1"
     assert events[2]["team_number"] == "9999"                 # index outside the recording
     assert events[3]["team_number"] is None                   # slot absent in that frame
+
+
+def test_longer_window_wins_a_full_tie_on_rank_and_p():
+    # B2 is on screen for 20 frames (one long window), B1 only for the first 10
+    frames = _frames({"B1": _still(range(10)), "B2": _still(range(20), (9.0, 6.0))}, 20)
+    ws = wl.build_windows(frames, FPS)
+    b1, b2 = (next(w for w in ws if w.slot == s) for s in ("B1", "B2"))
+    lab, cleared = wl.assemble_labels(ws, {b1.wid: ("3128", wl.RANK_DIGITS, 0.9),
+                                           b2.wid: ("3128", wl.RANK_DIGITS, 0.9)})
+    assert cleared == 10
+    assert lab[(3, "B1")] is None and lab[(3, "B2")][0] == "3128"   # longer beats lower slot id
+
+
+def test_absent_stretches_and_cleared_frames_get_window_none_rows():
+    present = list(range(10)) + list(range(20, 30))               # absent in frames 10..19
+    frames = _frames({"B1": _still(present)}, 30)
+    ws = wl.build_windows(frames, FPS)
+    lab, _ = wl.assemble_labels(ws, {w.wid: ("3128", wl.RANK_DIGITS, 0.9) for w in ws})
+    rows = wl.window_segments(frames, lab)[0]
+    assert [(r["team_number"], r["source"], r["start_frame"], r["end_frame"]) for r in rows] == [
+        ("3128", "window_digits", 420, 420 + 9 * STEP),
+        (None, "window_none", 420 + 10 * STEP, 420 + 19 * STEP),
+        ("3128", "window_digits", 420 + 20 * STEP, 420 + 29 * STEP)]
+    # a slot whose label was cleared by the one-team-per-frame rule is an unlabelled row
+    frames2 = _two_slot_frames()
+    ws2 = wl.build_windows(frames2, FPS)
+    b1, b2 = (next(w for w in ws2 if w.slot == s) for s in ("B1", "B2"))
+    lab2, _ = wl.assemble_labels(ws2, {b1.wid: ("3128", wl.RANK_LINEUP, 0.9),
+                                       b2.wid: ("3128", wl.RANK_DIGITS, 0.9)})
+    segs2 = wl.window_segments(frames2, lab2)
+    assert [r["source"] for r in segs2[0]] == ["window_none"]
+    assert [r["source"] for r in segs2[1]] == ["window_digits"]
+
+
+def test_unknown_slot_labels_and_missing_frame_numbers_are_skipped():
+    frames = _frames({"B1": _still(range(6)), "X9": _still(range(6), (5.0, 5.0))}, 6)
+    frames.append({"frame_num": None, "robots": [{"slot": "B1", "field_pos": [3.0, 2.0]}]})
+    ws = wl.build_windows(frames, FPS)
+    assert {w.slot for w in ws} == {"B1", "X9"} and all(6 not in w.idx for w in ws)
+    lab, _ = wl.assemble_labels(ws, {w.wid: ("3128", wl.RANK_DIGITS, 0.9) for w in ws})
+    assert lab[(0, "B1")][0] == "3128" and lab[(0, "X9")] is None      # the known slot keeps it
+    assert list(wl.window_segments(frames, lab)) == [0]

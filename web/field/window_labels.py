@@ -84,6 +84,8 @@ def build_windows(frames: list, fps: float) -> list:
         return []
     tracks: dict = {}
     for i, f in enumerate(frames):
+        if f.get("frame_num") is None:
+            continue
         for r in f.get("robots") or []:
             pos = r.get("field_pos")
             if (not r.get("slot") or not pos or len(pos) < 2
@@ -217,34 +219,50 @@ def apply_labels(frames: list, lab: dict) -> None:
             r["confirmed"] = bool(e and e[1] == RANK_DIGITS)
 
 
+def _extend_rows(rows: list, start: int, end: int, e) -> None:
+    """Append frames [start, end] to the segment rows: extend the last row
+    when team and source match, else start a new one. ``e`` is a label
+    entry (team, rank, p, ...) or None for unlabelled."""
+    team = e[0] if e else None
+    source = SOURCE[e[1]] if e else SOURCE_NONE
+    score = round(e[2], 4) if e else None
+    if rows and rows[-1]["team_number"] == team and rows[-1]["source"] == source:
+        rows[-1]["end_frame"] = end
+        if score is not None:
+            rows[-1]["score"] = max(rows[-1]["score"], score)
+    else:
+        rows.append({"start_frame": start, "end_frame": end, "team_number": team,
+                     "confirmed": bool(e and e[1] == RANK_DIGITS),
+                     "score": score, "source": source})
+
+
 def window_segments(frames: list, lab: dict) -> dict:
     """Slot id -> contiguous segment rows for the match_robot_identity_segment
     table. Readers of that table look a frame up by "last start at or before
     it", so every unlabelled stretch gets its own row (team None, source
-    SOURCE_NONE) instead of being left as a gap."""
+    SOURCE_NONE): unnamed windows, frames cleared by the one-team-per-frame
+    rule, and frames where the slot is absent between two of its runs."""
+    nums = [f.get("frame_num") for f in frames]
     per: dict = {}
     for i, f in enumerate(frames):
+        if nums[i] is None:
+            continue
         for r in f.get("robots") or []:
             sid = slot_label_to_id(r.get("slot"))
             if sid is None:
                 continue
-            per.setdefault(sid, []).append((int(f["frame_num"]), lab.get((i, r["slot"]))))
+            per.setdefault(sid, []).append((i, int(nums[i]), lab.get((i, r["slot"]))))
     out = {}
     for sid, seq in sorted(per.items()):
         rows: list = []
-        for frame_num, e in seq:
-            team = e[0] if e else None
-            source = SOURCE[e[1]] if e else SOURCE_NONE
-            score = round(e[2], 4) if e else None
-            if rows and rows[-1]["team_number"] == team and rows[-1]["source"] == source:
-                rows[-1]["end_frame"] = frame_num
-                if score is not None:
-                    rows[-1]["score"] = max(rows[-1]["score"], score)
-            else:
-                rows.append({"start_frame": frame_num, "end_frame": frame_num,
-                             "team_number": team,
-                             "confirmed": bool(e and e[1] == RANK_DIGITS),
-                             "score": score, "source": source})
+        prev_i = None
+        for i, frame_num, e in seq:
+            if prev_i is not None and i > prev_i + 1:
+                absent = [nums[j] for j in range(prev_i + 1, i) if nums[j] is not None]
+                if absent:
+                    _extend_rows(rows, int(absent[0]), int(absent[-1]), None)
+            _extend_rows(rows, frame_num, frame_num, e)
+            prev_i = i
         out[sid] = rows
     return out
 

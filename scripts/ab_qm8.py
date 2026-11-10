@@ -363,6 +363,8 @@ PROFILES = {
     # 0.475 (this harness scores Manta auto only). Run with --full-match.
     # Deinterlace bumper crops before the reader upscale (bumper_register.deinterlace_crop).
     "deinterlace": [("baseline", {}), ("deinterlace", {"bumper_deinterlace": True})],
+    # Treatment arm alone (pair with existing baseline runs of the same code).
+    "deinterlace-on": [("deinterlace", {"bumper_deinterlace": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

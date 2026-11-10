@@ -1424,6 +1424,10 @@ class InferenceJob:
         self.event_key = (current_event or {}).get('event_key')
         self.match_key = match_key
         self.camera = "main"
+        # hud_post_render: record a draw list (no live encode); scouted routes
+        # drawn on the field map, kept for meta.summary.hud_static.
+        self._replay_draw_list = False
+        self._radar_reference_paths: list = []
         self.calib = None
         self.field_model = None
         self.hub_prisms = []
@@ -5412,11 +5416,20 @@ class InferenceJob:
         return mask
 
     def _live_hud(self, overhead_frame, frame, detections, tracked_robot_boxes, track_outs,
-                  per_camera, fused, frame_num) -> np.ndarray:
+                  per_camera, fused, frame_num, draw_line: Optional[dict] = None) -> np.ndarray:
         """The live HUD frame: main view (wireframe, hub/ball boxes, robots,
         coasting ghosts, hubs, OCR regions) + field map + corner panels, all
-        through web/hud_draw.py with live labels and the live flags."""
+        through web/hud_draw.py with live labels and the live flags.
+
+        ``draw_line`` (hud_post_render): a dict filled with what was drawn
+        this frame, the draw-list line of spec section 3 (without ``"i"``)."""
         flags = _live_hud_flags()
+        rec = draw_line
+        if rec is not None:
+            rec.update(frame_num=int(frame_num), main_hash=hud_draw.ahash(overhead_frame),
+                       main=[], corners={}, hubs=[], hub_boxes=[], radar=[])
+            if flags.ball_boxes:
+                rec["ball_boxes"] = []
         annotated_frame = overhead_frame.copy()
         # Optional verification pass: lay the reprojected field wireframe down
         # first so robot/ball/hub HUD draws on top of it (and it's baked into
@@ -5426,6 +5439,7 @@ class InferenceJob:
 
         # Ball / hub detection boxes. Robots come from the tracker slots below.
         # Per-ball boxes are visual noise (hundreds per frame): only with the flag.
+        conf = getattr(detections, "confidence", None)
         for i in range(len(detections)):
             class_id = detections.class_id[i]
             if class_id == 1 or (class_id == 0 and not flags.ball_boxes):
@@ -5435,6 +5449,10 @@ class InferenceJob:
                 hud_draw.draw_ball_box(annotated_frame, box)
             else:
                 hud_draw.draw_hub_box(annotated_frame, box)
+            if rec is not None:
+                rec["ball_boxes" if class_id == 0 else "hub_boxes"].append(
+                    [float(v) for v in box[:4]]
+                    + [float(conf[i]) if conf is not None else None])
 
         # Robots are drawn from visible tracker slots. Their boxes and
         # alliance colors originate from the bumper-model path.
@@ -5450,6 +5468,12 @@ class InferenceJob:
                 annotated_frame, box, robot.alliance, label, flags, slot_id=slot_id,
                 cal=self.calib, field_pos=(track.pos if track else robot.field_position),
                 vel=track.vel if track else None, mask=mask)
+            if rec is not None:
+                rec["main"].append({
+                    "slot": self._slot_label(slot_id), "slot_id": int(slot_id),
+                    "alliance": robot.alliance, "box": [float(v) for v in box[:4]],
+                    "ghost": False, "score": int(robot.scores),
+                    "mask_poly": hud_draw.mask_poly(mask)})
 
         # Coasting tracks: position alive, mask gone. Without a ghost
         # they are indistinguishable from never-seen robots in the
@@ -5464,9 +5488,17 @@ class InferenceJob:
                     continue
                 label, _ = self._team_hud_label(robot, self._slot_label(slot_id))
                 hud_draw.draw_ghost(annotated_frame, gbox, robot.alliance, label)
+                if rec is not None:
+                    rec["main"].append({
+                        "slot": self._slot_label(slot_id), "slot_id": int(slot_id),
+                        "alliance": robot.alliance, "box": [float(v) for v in gbox[:4]],
+                        "ghost": True, "score": int(robot.scores), "mask_poly": None})
 
         for hub in self.hubs:
             hud_draw.draw_hub(annotated_frame, hub.x, hub.y, hub.alliance)
+            if rec is not None:
+                rec["hubs"].append({"alliance": hub.alliance, "x": float(hub.x),
+                                    "y": float(hub.y)})
 
         # OCR score regions, so the user can verify placement.
         hud_draw.draw_ocr_regions(annotated_frame, self.ocr_regions)
@@ -5487,13 +5519,21 @@ class InferenceJob:
                 team=team or self._slot_label(t.slot_id),
                 slot_id=t.slot_id, state=t.state,
                 corner_only=t.corner_only, trail=tuple(trail)))
+            if rec is not None:
+                rec["radar"].append({
+                    "slot": self._slot_label(t.slot_id), "alliance": t.alliance,
+                    "pos": [float(t.pos[0]), float(t.pos[1])], "state": t.state,
+                    "corner_only": bool(t.corner_only),
+                    "trail": [[float(p[0]), float(p[1])] for p in trail]})
         # A slot that vanished re-seeds its trail from scratch.
         for sid in list(self._radar_trails):
             if sid not in radar_seen_slots:
                 del self._radar_trails[sid]
         radar_img = self.radar.render(radar_tracks)
         camera_panels = [
-            self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs)
+            self._camera_panel(v, frame, per_camera.get(v.name, []), track_outs,
+                               record=(rec["corners"].setdefault(v.name, [])
+                                       if rec is not None else None))
             for v in self.views if v.name != "main"
         ]
         return hud_draw.compose(annotated_frame, radar_img, camera_panels)
@@ -6860,6 +6900,11 @@ class InferenceJob:
             manta_ref = overlay_paths_for_job(self.config.auto_period_only, self.match_key)
             if manta_ref:
                 self.radar.set_reference_paths(manta_ref)
+                self._radar_reference_paths = [
+                    {"alliance": getattr(p, "alliance", None),
+                     "team_number": getattr(p, "team_number", None),
+                     "path_m": [[float(x), float(y)] for x, y in getattr(p, "path_m", ())]}
+                    for p in manta_ref]
                 print(f"  [manta] overlaying {len(manta_ref)} scouted auto paths "
                       f"for {self.match_key}")
             elif self.config.auto_period_only and self.match_key:
@@ -6970,6 +7015,34 @@ class InferenceJob:
             config = {}
         return {"config": config, "stopped": bool(getattr(self, "_stopped", False)),
                 "calibration_version": getattr(self, "_calib_version_id", None)}
+
+    def _new_replay_recorder(self) -> ReplayRecorder:
+        """hud_post_render on: metadata-only recorder + draw list (the video is
+        rendered after finalize). Off: today's live-encoding recorder."""
+        self._replay_draw_list = bool(getattr(self.config, "hud_post_render", False))
+        return ReplayRecorder(record_video=not self._replay_draw_list)
+
+    def _hud_static(self) -> dict:
+        """What the HUD renderer needs that does not change per frame
+        (meta.summary.hud_static, HUD post-render spec section 3)."""
+        cfg = getattr(self, "config", None)
+        return {
+            "flags": hud_draw.flags_to_dict(_live_hud_flags()),
+            "ocr_regions": {k: [int(v) for v in r] for k, r in (self.ocr_regions or {}).items()},
+            "field_wireframe_overlay": bool(getattr(cfg, "field_wireframe_overlay", False)
+                                            and self.calib is not None
+                                            and self.field_model is not None),
+            "overhead_height": int(self.overhead_height),
+            "views": [{"name": v.name, "crop": [int(c) for c in v.crop],
+                       "masks": [[int(c) for c in m] for m in v.masks]}
+                      for v in self.views if v.name != "main"],
+            "panel_max_width": hud_draw.PANEL_MAX_WIDTH,
+            "reference_paths": list(self._radar_reference_paths),
+            "event_key": self.event_key,
+            "camera": self.camera,
+            "calibration_version": getattr(self, "_calib_version_id", None),
+            "field_season": getattr(self.calib, "field_season", None),
+        }
 
     async def _apply_window_labels(self, rec, summary: dict, timings: dict) -> None:
         """window_labels knob: relabel the finished replay from Jev reads on
@@ -7620,7 +7693,7 @@ class InferenceJob:
             self.sam2_raw = {}
             self._view_mine_info = {}
             self.sam2_obj_color = {}
-            self._replay = ReplayRecorder()
+            self._replay = self._new_replay_recorder()
             self.robot_embedder = None
             
             active_frame_count = sum(
@@ -9494,9 +9567,11 @@ class InferenceJob:
                                         print(f"  OCR authoritative [{alliance}]: {current} -> {ocr_val} (corrected down)")
                 
                 with self._stage("loop.hud"):
+                    # hud_post_render: what is drawn is also recorded (draw list).
+                    _draw_line = {} if self._replay_draw_list else None
                     annotated_frame = self._live_hud(
                         overhead_frame, frame, detections, tracked_robot_boxes,
-                        track_outs, per_camera, fused, frame_num)
+                        track_outs, per_camera, fused, frame_num, draw_line=_draw_line)
 
                 with self._stage("loop.replay"):
                     # --- Replay recording: capture the composited HUD frame + metadata
@@ -9517,7 +9592,7 @@ class InferenceJob:
                                 }
                                 for t in track_outs if t.state != "empty"
                             ],
-                        })
+                        }, draw=_draw_line)
                     except Exception as e:
                         print(f"[replay] frame record error: {e}")
 
@@ -9805,6 +9880,11 @@ class InferenceJob:
                         # config = non-default knobs, stopped, calibration_version.
                         **self._replay_provenance(),
                     }
+                    if self._replay_draw_list:
+                        try:
+                            summary["hud_static"] = self._hud_static()
+                        except Exception as e:
+                            print(f"[hud-render] hud_static not recorded: {e}")
                     self.identity_diagnostics.gauge(
                         "identity_count", len(self.identity_registry.identities)
                     )

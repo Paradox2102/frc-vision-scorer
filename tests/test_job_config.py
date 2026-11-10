@@ -630,3 +630,14 @@ def test_event_lineup_knob_default_off(monkeypatch):
     monkeypatch.setenv("EVENT_LINEUP", "1")
     assert JobConfig().event_lineup is True
     assert next(k for k in KNOBS if k.name == "event_lineup").section == "Identity & votes"
+
+
+def test_hud_post_render_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.hud_post_render is False and "hud_post_render" not in cfg.non_defaults()
+    assert JobConfig({"hud_post_render": "1"}).hud_post_render is True
+    monkeypatch.setenv("HUD_POST_RENDER", "1")
+    assert JobConfig().hud_post_render is True
+    assert next(k for k in KNOBS if k.name == "hud_post_render").section == "Streaming & output"

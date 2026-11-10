@@ -980,6 +980,12 @@ KNOBS = [
     # real field. Off by default (it's a visual-check pass, not a scoring change).
     Knob("field_wireframe_overlay", "FIELD_WIREFRAME_OVERLAY", bool, False,
          section="Streaming & output"),
+    # HUD video rendered after finalize (docs/superpowers/specs/
+    # 2026-11-10-hud-post-render-design.md): the job records a draw list instead
+    # of encoding hud.mp4 live, and a render subprocess burns the FINAL labels
+    # into the video once the replay is saved. The live preview is unchanged.
+    Knob("hud_post_render", "HUD_POST_RENDER", bool, False,
+         section="Streaming & output"),
 ]
 
 _BY_NAME = {k.name: k for k in KNOBS}

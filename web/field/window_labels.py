@@ -166,6 +166,29 @@ def pick_anchors(labels: dict, t0: dict) -> dict:
     return out
 
 
+def store_anchors(labels: dict, t0: dict) -> dict:
+    """Like pick_anchors without the MIN_ANCHORS floor: team -> up to
+    ANCHORS_PER_TEAM window ids at ANCHOR_MIN_P or above, spread evenly in
+    time. A team's single good read is kept: it goes to the event store and,
+    with event_lineup on, counts toward its own row."""
+    by: dict = {}
+    for wid, (team, p) in labels.items():
+        if p >= ANCHOR_MIN_P:
+            by.setdefault(team, []).append((t0[wid], wid))
+    out = {}
+    for team, cands in by.items():
+        cands.sort()
+        out[team] = [cands[j][1] for j in _even_picks(len(cands), ANCHORS_PER_TEAM)]
+    return out
+
+
+def best_tile_k(wide_p: dict, tiles: dict, wid: int, team: str) -> int:
+    """The sample whose wide call gave ``team`` the highest p (the first of
+    a tie); the lowest sample number when no wide call returned."""
+    per_k = wide_p.get(wid) or {}
+    return max(per_k, key=lambda j: per_k[j].get(team, 0.0)) if per_k else min(tiles[wid])
+
+
 def lineup_decision(probs: Optional[dict], letters: dict, min_p: float) -> Optional[tuple]:
     """``letters``: row letter -> team. Returns (team, p) when the most likely
     letter reaches ``min_p``; else None."""
@@ -500,10 +523,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
         for letter, team in letters.items():
             row_tiles = []
             for wid in anchors[team]:
-                per_k = wide_p.get(wid) or {}
-                k = (max(per_k, key=lambda j: per_k[j].get(team, 0.0)) if per_k
-                     else min(tiles[wid]))
-                row_tiles.append(tiles[wid][k])
+                row_tiles.append(tiles[wid][best_tile_k(wide_p, tiles, wid, team)])
             rows.append((letter, row_tiles))
         lineup_jpeg = crops.jpeg(crops.lineup_card(rows, ANCHORS_PER_TEAM))
         card_asset = jev_reader.jev_asset(lineup_jpeg)   # encoded once, shared by every payload

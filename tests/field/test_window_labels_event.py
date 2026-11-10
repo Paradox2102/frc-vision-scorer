@@ -49,3 +49,22 @@ def _golden(**kw):
 
 def test_knob_off_matches_the_golden_snapshot():
     assert _golden() == json.loads(GOLDEN.read_text())
+
+
+def test_store_anchors_keeps_single_good_reads_and_spreads_in_time():
+    labels = {i: ("2724", 0.9) for i in range(10)}
+    labels.update({20: ("6497", 0.95), 21: ("3128", 0.9), 22: ("3128", 0.86), 23: ("2724", 0.84)})
+    t0 = {i: float(i) for i in labels}
+    s = wl.store_anchors(labels, t0)
+    assert s["6497"] == [20]                       # one good read is kept for the store
+    assert s["3128"] == [21, 22] and s["2724"] == [0, 2, 4, 5, 7, 9]
+    assert 23 not in s["2724"]                     # 0.84 is below the anchor floor
+    # pick_anchors (the knob-off card) is unchanged: it still needs two
+    assert wl.pick_anchors(labels, t0) == {t: w for t, w in s.items() if len(w) >= wl.MIN_ANCHORS}
+
+
+def test_best_tile_k_is_the_sample_whose_wide_call_rated_the_team_highest():
+    tiles = {7: {1: "t1", 2: "t2", 3: "t3"}}
+    wide_p = {7: {1: {"3128": 0.6}, 2: {"3128": 0.9}, 3: {"3128": 0.9}}}
+    assert wl.best_tile_k(wide_p, tiles, 7, "3128") == 2      # first of the tied best
+    assert wl.best_tile_k({}, {7: {3: "a", 2: "b"}}, 7, "3128") == 2   # no wide call: lowest k

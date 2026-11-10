@@ -1,5 +1,8 @@
 """Window labels: pure logic (windows, decisions, assembly) and the
 orchestration with a fake reader and a fake frame source. No network."""
+import copy
+import random
+
 import pytest
 
 from web.field import window_labels as wl
@@ -309,7 +312,7 @@ def _run(frames, session, **kw):
 
 def test_run_names_windows_from_digits_and_reports_stats():
     frames = _frames({"B1": _still(range(20), (3.0, 2.0))}, 20)
-    snapshot = [dict(r) for f in frames for r in f["robots"]]
+    snapshot = copy.deepcopy(frames)
     s = FakeSession(team_p={"3128": 0.9, "unreadable": 0.1})
     res = _run(frames, s)
     assert res["aborted"] is None
@@ -320,45 +323,90 @@ def test_run_names_windows_from_digits_and_reports_stats():
     assert st["unlabelled"] == 0 and st["requests"] == 9 and st["input_tokens"] == 9000
     assert st["cost_cents"] == pytest.approx(0.09) and st["aborted"] is None
     assert s.asked == [("team", 9)]                      # 4 wide + 4 zoom + 1 grid
-    assert [dict(r) for f in frames for r in f["robots"]] == snapshot   # input not mutated
+    assert frames == snapshot                            # input not mutated
+    assert st["samples"] == 4 and st["tiles"] == 4
 
 
-def test_run_lineup_pass_names_unread_windows():
+class BySlot(FakeSession):
+    """Digit answers from ``plan`` (one per request, in request order); lineup
+    answers from FakeSession."""
+
+    def ask(self, items, question):
+        if question == "team":
+            self.asked.append((question, len(items)))
+            return [{"probs": dict(self.plan.pop(0))} for _item in items]
+        return super().ask(items, question)
+
+
+def _lineup_frames(second_unread=False):
     # 3128 is read on B1 and 6773 on B2 in four runs each (anchors). The R1 window is unread
     # and the lineup names it. R1 is on screen only while B1/B2 are absent (frames 10-14), so
-    # the one-team-per-frame rule has nothing to clear.
+    # the one-team-per-frame rule has nothing to clear. ``second_unread`` adds an unread R2
+    # window in the next gap (frames 25-29).
     b1 = _still([i for i in range(60) if i % 15 < 10], (3.0, 2.0))     # four 10-frame runs
     b2 = _still([i for i in range(60) if i % 15 < 10], (5.0, 6.0))
-    frames = _frames({"B1": b1, "B2": b2, "R1": _still(range(10, 15), (12.0, 3.0))}, 60)
+    tracks = {"B1": b1, "B2": b2, "R1": _still(range(10, 15), (12.0, 3.0))}
+    if second_unread:
+        tracks["R2"] = _still(range(25, 30), (10.0, 4.0))
+    return _frames(tracks, 60)
 
-    class BySlot(FakeSession):
-        def ask(self, items, question):
-            if question == "team":
-                self.asked.append((question, len(items)))
-                out = []
-                for payload, _sizes in items:
-                    self.n = getattr(self, "n", 0) + 1
-                    out.append({"probs": dict(self.plan.pop(0))})
-                return out
-            return super().ask(items, question)
 
-    s = BySlot(who_p={"A": 0.1, "B": 0.85, "unsure": 0.05})
-    ws = wl.build_windows(frames, FPS)
+def _lineup_session(frames, **kw):
+    s = BySlot(**kw)
     plan = []
-    for w in ws:                                        # request order = window order
+    for w in wl.build_windows(frames, FPS):             # request order = window order
         probs = ({"3128": 0.9} if w.slot == "B1" else {"6773": 0.9} if w.slot == "B2"
                  else {"unreadable": 0.9})
         plan += [probs] * (2 * len(w.samples) + 1)
     s.plan = plan
+    return s
+
+
+def _expected_letters(seed):
+    """The letter -> team map the stage builds: anchored teams in roster order,
+    shuffled by Random(seed)."""
+    roster = ["2637", "2724", "6497", "3128", "6773", "9066"]
+    order = [t for t in roster if t in ("3128", "6773")]
+    random.Random(seed).shuffle(order)
+    return {wl.LETTERS[j]: t for j, t in enumerate(order)}
+
+
+def test_run_lineup_pass_names_unread_windows():
+    frames = _lineup_frames()
+    s = _lineup_session(frames, who_p={"A": 0.1, "B": 0.85, "unsure": 0.05})
+    ws = wl.build_windows(frames, FPS)
     res = _run(frames, s, seed=1)
     assert res["aborted"] is None
     st = res["stats"]
     assert st["digit_named"] == 8 and st["lineup_rows"] == 2 and st["lineup_named"] == 1
     r1 = next(w for w in ws if w.slot == "R1")
     team = res["labels"][(r1.idx[0], "R1")][0]
-    assert team in ("3128", "6773") and res["labels"][(r1.idx[0], "R1")][1] == wl.RANK_LINEUP
+    assert team == _expected_letters(1)["B"]
+    assert res["labels"][(r1.idx[0], "R1")][1] == wl.RANK_LINEUP
     assert ("who", 1) in s.asked
     assert res["lineup_jpeg"][:2] == b"\xff\xd8"
+
+
+def test_lineup_disabled_sends_no_who_request_and_keeps_digit_labels():
+    frames = _lineup_frames()
+    s = _lineup_session(frames, who_p={"A": 0.1, "B": 0.85, "unsure": 0.05})
+    res = _run(frames, s, seed=1, lineup_min_p=1.01)
+    assert res["aborted"] is None
+    assert all(q == "team" for q, _n in s.asked)
+    st = res["stats"]
+    assert st["digit_named"] == 8 and st["lineup_named"] == 0 and st["unlabelled"] == 1
+    b1 = next(w for w in wl.build_windows(frames, FPS) if w.slot == "B1")
+    assert res["labels"][(b1.idx[0], "B1")][:2] == ("3128", wl.RANK_DIGITS)
+    assert res["lineup_jpeg"] is None
+
+
+def test_lineup_pass_errors_abort_with_no_labels():
+    frames = _lineup_frames()
+    s = _lineup_session(frames, who_p={"B": 0.9}, fail=1)       # the one "who" request fails
+    res = _run(frames, s, seed=1)
+    assert res["aborted"] and "request errors" in res["aborted"]
+    assert "lineup pass" in res["aborted"]
+    assert res["labels"] is None and res["segments"] is None
 
 
 def test_lineup_pass_is_skipped_below_two_rows_or_when_disabled():
@@ -405,3 +453,180 @@ def test_run_aborts_when_there_is_nothing_to_do_or_no_video():
     res = wl.run_window_labels(_frames({"B1": _still(range(20))}, 20), "v.mp4", _Cal(),
                                FakeSession(), _params(), frame_source=broken)
     assert res["aborted"].startswith("error: OSError")
+
+
+# --------------------------------------------------------------------------- #
+# Deadlines between stages, lockouts, thresholds, guards
+# --------------------------------------------------------------------------- #
+
+class _Clock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _run_clocked(frames, session, clock, frame_source=_source, **kw):
+    return wl.run_window_labels(frames, "video.mp4", _Cal(), session, _params(**kw),
+                                frame_source=frame_source, clock=clock)
+
+
+def test_deadline_passing_during_the_video_pass_sends_no_requests():
+    clock = _Clock()
+
+    def source(video_path, frame_nums, view):
+        yield from _source(video_path, frame_nums, view)
+        clock.now = 100.0                                # the decode took too long
+
+    s = FakeSession(team_p={"3128": 0.9})
+    res = _run_clocked(_frames({"B1": _still(range(20))}, 20), s, clock, source, deadline=10.0)
+    assert res["aborted"] and "deadline" in res["aborted"] and "video pass" in res["aborted"]
+    assert s.asked == [] and res["labels"] is None
+
+
+def test_deadline_passing_after_the_first_digit_batch_stops_the_digit_pass(monkeypatch):
+    monkeypatch.setattr(wl, "REQUEST_BATCH", 4)
+    clock = _Clock()
+
+    class Slow(FakeSession):
+        def ask(self, items, question):
+            clock.now = 100.0
+            return super().ask(items, question)
+
+    s = Slow(team_p={"3128": 0.9})
+    res = _run_clocked(_frames({"B1": _still(range(20))}, 20), s, clock, deadline=10.0)
+    assert res["aborted"] and "deadline" in res["aborted"] and "digit pass" in res["aborted"]
+    assert s.asked == [("team", 4)] and res["labels"] is None
+
+
+def test_deadline_passing_after_the_first_lineup_batch_stops_the_lineup_pass(monkeypatch):
+    monkeypatch.setattr(wl, "REQUEST_BATCH", 1)
+    clock = _Clock()
+    frames = _lineup_frames(second_unread=True)
+    s = _lineup_session(frames, who_p={"B": 0.9})
+    real_ask = s.ask
+
+    def ask(items, question):
+        out = real_ask(items, question)
+        if question == "who":
+            clock.now = 100.0
+        return out
+
+    s.ask = ask
+    res = _run_clocked(frames, s, clock, seed=1, deadline=10.0)
+    assert res["aborted"] and "deadline" in res["aborted"] and "lineup pass" in res["aborted"]
+    assert [q for q, _n in s.asked].count("who") == 1 and res["labels"] is None
+
+
+def test_a_mid_batch_lockout_aborts_even_under_the_error_threshold():
+    class Lockout(FakeSession):
+        def ask(self, items, question):
+            out = super().ask(items, question)
+            self.available = False                       # 401 latched during this batch
+            out[-1] = {"error": "auth"}
+            return out
+
+    frames = _frames({"B1": _still(range(20)), "B2": _still(range(20), (9.0, 6.0))}, 20)
+    s = Lockout(team_p={"3128": 0.9})                    # 1 error of 18 requests
+    res = _run(frames, s)
+    assert res["aborted"] and "reader unavailable" in res["aborted"]
+    assert res["labels"] is None and res["stats"]["request_errors"] == 1
+
+
+def test_one_failure_in_nine_aborts_and_one_in_eighteen_does_not():
+    res = _run(_frames({"B1": _still(range(20))}, 20), FakeSession(team_p={"3128": 0.9}, fail=1))
+    assert res["aborted"] and "request errors: 1 of 9" in res["aborted"]
+    frames = _frames({"B1": _still(range(20)), "B2": _still(range(20), (9.0, 6.0))}, 20)
+    res = _run(frames, FakeSession(team_p={"3128": 0.9}, fail=1))
+    assert res["aborted"] is None and res["stats"]["request_errors"] == 1
+
+
+def test_an_unavailable_reader_aborts_before_decoding_video():
+    calls = []
+
+    def source(video_path, frame_nums, view):
+        calls.append(1)
+        yield from _source(video_path, frame_nums, view)
+
+    res = _run_clocked(_frames({"B1": _still(range(20))}, 20), FakeSession(available=False),
+                       _Clock(), source)
+    assert res["aborted"] == "reader unavailable: auth" and calls == []
+
+
+def test_no_sample_in_view_aborts_with_that_reason_before_decoding_video():
+    calls = []
+
+    def source(video_path, frame_nums, view):
+        calls.append(1)
+        yield from _source(video_path, frame_nums, view)
+
+    frames = _frames({"B1": _still(range(20), (-5.0, 2.0))}, 20)        # u = -500 px
+    res = _run_clocked(frames, FakeSession(team_p={"3128": 0.9}), _Clock(), source)
+    assert "no window sample is in the main view" in res["aborted"]
+    assert calls == [] and res["stats"]["samples"] == 0
+
+
+def test_a_short_answer_list_aborts_instead_of_misaligning():
+    class Short(FakeSession):
+        def ask(self, items, question):
+            return super().ask(items, question)[:-1]
+
+    res = _run(_frames({"B1": _still(range(20))}, 20), Short(team_p={"3128": 0.9}))
+    assert res["aborted"] and "reader returned" in res["aborted"]
+    assert res["labels"] is None
+
+
+def test_the_frame_source_is_closed_when_the_video_pass_aborts():
+    clock = _Clock()
+
+    class Source:
+        closed = False
+
+        def __init__(self, video_path, frame_nums, view):
+            self.it = _source(video_path, frame_nums, view)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            clock.now = 100.0                            # past the deadline from frame 1
+            return next(self.it)
+
+        def close(self):
+            Source.closed = True
+
+    frames = _frames({"B1": _still(range(300))}, 300)    # 15 windows -> 60 sample frames
+    res = _run_clocked(frames, FakeSession(team_p={"3128": 0.9}), clock, Source, deadline=10.0)
+    assert res["aborted"] == "deadline passed during the video pass"
+    assert Source.closed
+
+
+def test_stats_report_samples_and_tiles_so_a_truncated_video_shows():
+    assert wl._stats()["samples"] == 0 and wl._stats()["tiles"] == 0
+
+    def truncated(video_path, frame_nums, view):
+        yield from list(_source(video_path, frame_nums, view))[:2]
+
+    res = _run_clocked(_frames({"B1": _still(range(20))}, 20), FakeSession(team_p={"3128": 0.9}),
+                       _Clock(), truncated)
+    st = res["stats"]
+    assert st["samples"] == 4 and st["tiles"] == 2
+
+
+def test_lineup_payloads_share_one_encoded_card_asset():
+    frames = _lineup_frames(second_unread=True)
+    s = _lineup_session(frames, who_p={"B": 0.9})
+    sent = []
+    real_ask = s.ask
+
+    def ask(items, question):
+        if question == "who":
+            sent.extend(items)
+        return real_ask(items, question)
+
+    s.ask = ask
+    res = _run(frames, s, seed=1)
+    assert res["aborted"] is None and len(sent) == 2
+    assert sent[0][0]["assets"]["lineup_image"] is sent[1][0]["assets"]["lineup_image"]
+    assert sent[0][0]["assets"]["crops_image"] is not sent[1][0]["assets"]["crops_image"]

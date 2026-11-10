@@ -250,8 +250,8 @@ def jev_estimate_tokens(payload: dict, image_wh) -> int:
     image px + ~1.9 chars/token for state+questions. ``image_wh`` is one
     (w, h) or a list of them (multi-asset requests)."""
     text = len(json.dumps(payload.get("state", ""))) + len(json.dumps(payload.get("questions", {})))
-    sizes = list(image_wh or [])
-    if sizes and isinstance(sizes[0], (int, float)):
+    sizes = list(image_wh if image_wh is not None else [])
+    if sizes and not isinstance(sizes[0], (tuple, list)):
         sizes = [tuple(sizes)]
     return int(sum(w * h for w, h in sizes) / 415 + text / 1.9)
 
@@ -307,7 +307,8 @@ def _window_teams_line(red: list, blue: list) -> str:
             "marked spot.")
 
 
-def _jev_asset(jpg: bytes) -> tuple[dict, tuple]:
+def jev_asset(jpg: bytes) -> tuple[dict, tuple]:
+    """(asset dict, (w, h)) for one image, prepped by ``jev_image``."""
     img, w, h, _padded = jev_image(jpg)
     return ({"type": "image", "format": "jpg",
              "data_base64": base64.b64encode(img).decode()}, (w, h))
@@ -320,7 +321,7 @@ def build_jev_window_payload(model_key: str, jpg: bytes, kind: str,
     (payload, [(w, h)]) ready for ``JevSession.ask(..., "team")``."""
     red, blue = [str(t) for t in red], [str(t) for t in blue]
     key, ref, opening, mark = _WINDOW_KINDS[kind]
-    asset, wh = _jev_asset(jpg)
+    asset, wh = jev_asset(jpg)
     criteria = {t: f"Team {t} (red bumper)" for t in red}
     criteria.update({t: f"Team {t} (blue bumper)" for t in blue})
     criteria["not_robot"] = WINDOW_NOT_ROBOT
@@ -334,13 +335,16 @@ def build_jev_window_payload(model_key: str, jpg: bytes, kind: str,
 
 
 def build_jev_lineup_payload(model_key: str, lineup_jpg: bytes, crops_jpg: bytes,
-                             letters: Iterable, ball_note: str = BALL_NOTE_2026) -> tuple[dict, list]:
+                             letters: Iterable, ball_note: str = BALL_NOTE_2026, *,
+                             lineup_asset: Optional[tuple] = None) -> tuple[dict, list]:
     """Lineup question: which row of the lineup card is at the marked spot in
     the window's 2x2 grid. Two image assets, both referenced from the state.
+    ``lineup_asset``: the card's ``jev_asset(lineup_jpg)`` result, built once
+    and shared by every payload (then ``lineup_jpg`` is not encoded again).
     Returns (payload, [(w, h), (w, h)]) for ``JevSession.ask(..., "who")``."""
     letters = [str(l) for l in letters]
-    lineup, lwh = _jev_asset(lineup_jpg)
-    crops, cwh = _jev_asset(crops_jpg)
+    lineup, lwh = lineup_asset if lineup_asset is not None else jev_asset(lineup_jpg)
+    crops, cwh = jev_asset(crops_jpg)
     criteria = {l: f"The robot in lineup row {l}" for l in letters}
     criteria["none"] = "No robot at the marked spot, or a robot that is not in the lineup"
     criteria["unsure"] = "A lineup robot may be there but it is not clear which one"
@@ -520,8 +524,8 @@ class JevSession(ClefSession):
         {"error": message}. Never raises; retries, the auth latch, concurrency
         and usage accounting are the shared session ones."""
         def _one(_i: int, item) -> dict:
-            payload, sizes = item
             try:
+                payload, sizes = item
                 answers = self._request(payload, sizes)
                 probs = _choice_probs(answers.get(question))
                 if not probs:

@@ -678,6 +678,31 @@ def test_estimate_tokens_accepts_one_size_or_a_list():
     assert two - one == 200
 
 
+def test_estimate_tokens_one_size_numpy_size_and_one_element_list_agree():
+    payload = {"state": {"context": "x" * 190}, "questions": {"q": "y" * 40}}
+    w, h = 830, 300
+    plain = jev_reader.jev_estimate_tokens(payload, (w, h))
+    numpy_pair = jev_reader.jev_estimate_tokens(payload, (np.int64(w), np.int64(h)))
+    listed = jev_reader.jev_estimate_tokens(payload, [(w, h)])
+    text = len(json.dumps(payload["state"])) + len(json.dumps(payload["questions"]))
+    assert plain == numpy_pair == listed == int(w * h / 415 + text / 1.9)
+
+
+def test_jev_asset_is_public_and_lineup_payload_can_share_one_card_asset():
+    card, crops = _jpeg(1536, 1440), _jpeg(960, 960)
+    asset = jev_reader.jev_asset(card)
+    assert asset[1] == (1536, 1440) and asset[0]["type"] == "image"
+    p1, s1 = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops, ["A", "B"],
+                                                 lineup_asset=asset)
+    p2, _s2 = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops, ["A", "B"],
+                                                  lineup_asset=asset)
+    assert p1["assets"]["lineup_image"] is asset[0]
+    assert p1["assets"]["lineup_image"] is p2["assets"]["lineup_image"]
+    plain, plain_sizes = jev_reader.build_jev_lineup_payload("jev-1.14.0", card, crops,
+                                                             ["A", "B"])
+    assert p1 == plain and s1 == plain_sizes
+
+
 def test_ask_returns_probabilities_in_order_and_counts_usage(monkeypatch):
     fake = _install(monkeypatch, FakeJev(_ok(_who({"A": 0.9, "unsure": 0.1}), 4000)))
     s = _session(concurrency=1)
@@ -692,17 +717,27 @@ def test_ask_returns_probabilities_in_order_and_counts_usage(monkeypatch):
 
 
 def test_ask_reports_errors_without_raising_and_latches_on_auth(monkeypatch):
-    _install(monkeypatch, FakeJev((400, "bad payload")))
+    _install(monkeypatch, FakeJev((400, f"bad payload, token {TOKEN}")))
     s = _session(concurrency=1)
     item = jev_reader.build_jev_window_payload("jev-1.14.0", _jpeg(480, 480), "wide", RED, BLUE)
     out = s.ask([item, item], "team")
     assert all("error" in o for o in out) and s.stats()["errors"] == 2 and s.available
+    assert TOKEN not in json.dumps(out)
 
-    _install(monkeypatch, FakeJev((401, "nope")))
+    _install(monkeypatch, FakeJev((401, f"bad token {TOKEN}")))
     s2 = _session(concurrency=1)
     out2 = s2.ask([item, item], "team")
     assert all("error" in o for o in out2) and not s2.available
     assert TOKEN not in json.dumps(out2)
+
+
+def test_ask_turns_a_malformed_item_into_an_error_entry(monkeypatch):
+    _install(monkeypatch, FakeJev(_ok(_answers({"2992": 0.9, "unreadable": 0.1}))))
+    s = _session(concurrency=1)
+    item = jev_reader.build_jev_window_payload("jev-1.14.0", _jpeg(480, 480), "wide", RED, BLUE)
+    out = s.ask([item, "not-a-pair", None], "team")
+    assert len(out) == 3 and out[0]["probs"]["2992"] == 0.9
+    assert "error" in out[1] and "error" in out[2]
 
 
 def test_ask_missing_question_is_an_error(monkeypatch):

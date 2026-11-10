@@ -312,8 +312,8 @@ class StageAbort(Exception):
 
 def _stats() -> dict:
     return {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
-            "unlabelled": 0, "lineup_rows": 0, "requests": 0, "input_tokens": 0,
-            "cost_cents": 0.0, "request_errors": 0, "aborted": None}
+            "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
+            "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
 
 
 def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
@@ -339,6 +339,7 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
         stats["aborted"] = f"error: {type(e).__name__}: {e}"
         out = None
     after = _usage(session)
+    # HTTP attempts (retries included), not payloads
     stats["requests"] = after[0] - before[0]
     stats["input_tokens"] = after[1] - before[1]
     stats["cost_cents"] = round((after[2] - before[2]) * 100.0, 2)
@@ -366,7 +367,9 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
                  stats: dict, where: str) -> list:
     """Send ``specs`` in batches of REQUEST_BATCH, checking the deadline and
     the session before each. Returns one result per spec (probs dict or
-    None). Aborts when more than MAX_ERROR_FRACTION of the pass failed."""
+    None). Aborts when more than MAX_ERROR_FRACTION of the pass failed, when
+    the reader latched off during a batch, or when a batch's answer count
+    does not match what was sent."""
     results: list = []
     errors = 0
     for start in range(0, len(specs), REQUEST_BATCH):
@@ -374,7 +377,15 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
         if not session.available:
             raise StageAbort(f"reader unavailable: {session.disabled_reason}")
         batch = specs[start:start + REQUEST_BATCH]
-        for res in session.ask([build(s) for s in batch], question):
+        answers = session.ask([build(s) for s in batch], question)
+        if not session.available:                # latched off (401/403) mid-batch
+            stats["request_errors"] += errors + sum(1 for r in answers if "probs" not in r)
+            raise StageAbort(f"reader unavailable: {session.disabled_reason}")
+        if len(answers) != len(batch):
+            stats["request_errors"] += errors
+            raise StageAbort(f"reader returned {len(answers)} answers for {len(batch)} "
+                             f"requests {where}")
+        for res in answers:
             if "probs" in res:
                 results.append(res["probs"])
             else:
@@ -398,6 +409,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     stats["windows"] = len(windows)
     if not windows:
         raise StageAbort("no windows")
+    if not session.available:                    # e.g. no token: fail before decoding video
+        raise StageAbort(f"reader unavailable: {session.disabled_reason}")
 
     # 1. where each sample is in the main view
     view_wh = (params.view[2], params.view[3])
@@ -409,15 +422,23 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
             if tg is None or not crops.in_view(tg[0], tg[1], view_wh):
                 continue
             want.setdefault(int(frames[i]["frame_num"]), []).append((w.wid, k) + tg)
+    stats["samples"] = sum(len(v) for v in want.values())
+    if not want:
+        raise StageAbort("no window sample is in the main view")
 
     # 2. one sequential video pass; keep only the tiles
     tiles: dict = {}                                 # wid -> {k: tile}
-    source = frame_source or crops.iter_view_frames
-    for n, (frame_num, img) in enumerate(source(video_path, list(want), params.view), 1):
-        for wid, k, u, v, side in want.get(frame_num, ()):
-            tiles.setdefault(wid, {})[k] = crops.wide_tile(img, u, v, side)[0]
-        if n % 50 == 0:
-            _check(params, clock, "during the video pass")
+    source = (frame_source or crops.iter_view_frames)(video_path, list(want), params.view)
+    try:
+        for n, (frame_num, img) in enumerate(source, 1):
+            for wid, k, u, v, side in want.get(frame_num, ()):
+                tiles.setdefault(wid, {})[k] = crops.wide_tile(img, u, v, side)[0]
+                stats["tiles"] += 1
+            if n % 50 == 0:
+                _check(params, clock, "during the video pass")
+    finally:
+        if hasattr(source, "close"):             # release the video capture promptly
+            source.close()
     if not tiles:
         raise StageAbort("no frames decoded from the source video")
     _check(params, clock, "after the video pass")
@@ -475,6 +496,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
                 row_tiles.append(tiles[wid][k])
             rows.append((letter, row_tiles))
         lineup_jpeg = crops.jpeg(crops.lineup_card(rows, ANCHORS_PER_TEAM))
+        card_asset = jev_reader.jev_asset(lineup_jpeg)   # encoded once, shared by every payload
         todo = [w.wid for w in windows if w.wid not in digit and tiles.get(w.wid)]
         note = params.ball_note if params.ball_note is not None else jev_reader.BALL_NOTE_2026
 
@@ -482,7 +504,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
             t = tiles[wid]
             grid = crops.jpeg(crops.grid_image([t[j] for j in sorted(t)]))
             return jev_reader.build_jev_lineup_payload(params.model_key, lineup_jpeg, grid,
-                                                       list(letters), note)
+                                                       list(letters), note,
+                                                       lineup_asset=card_asset)
 
         # 5. lineup pass on the windows the digit pass did not name
         for wid, probs in zip(todo, _ask_batched(session, todo, lineup_item, "who", params,

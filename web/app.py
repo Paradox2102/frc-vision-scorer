@@ -6970,9 +6970,16 @@ class InferenceJob:
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
                 model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL)
-            result = await asyncio.to_thread(
-                wl.run_window_labels, rec.frames, str(self.video_path), cal,
-                self._window_label_session(), params)
+            try:
+                result = await asyncio.to_thread(
+                    wl.run_window_labels, rec.frames, str(self.video_path), cal,
+                    self._window_label_session(), params)
+            except asyncio.CancelledError:
+                # The worker thread outlives the cancelled await; it checks
+                # params.deadline cooperatively, so stop it from paying for
+                # more reader calls. Not an Exception: re-raised untouched.
+                params.deadline = 0.0
+                raise
             stats = dict(result["stats"])
             if result["aborted"] is None:
                 # Snapshot the fields the writes touch, so a failure part-way

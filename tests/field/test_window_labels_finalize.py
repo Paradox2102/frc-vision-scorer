@@ -3,6 +3,7 @@ what it writes, and that every failure leaves the replay untouched. The stage
 itself (web/field/window_labels.run_window_labels) is stubbed."""
 import asyncio
 import copy
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -134,6 +135,37 @@ def test_exception_and_missing_inputs_leave_the_replay_untouched(monkeypatch):
     summary, _ = _apply(job, rec)
     assert not seen and rec.frames == FRAMES
     assert "calibration" in summary["window_labels"]["aborted"]
+
+
+def test_cancelling_the_job_zeroes_the_deadline_the_worker_thread_holds(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    seen = {}
+
+    def blocking(frames, video_path, cal, session, params, **kw):
+        seen["params"] = params
+        started.set()
+        release.wait(5.0)
+        return _ok_result()
+
+    monkeypatch.setattr(wl, "run_window_labels", blocking)
+    job, rec = _job()
+
+    async def main():
+        task = asyncio.create_task(job._apply_window_labels(rec, {}, {"total": 100.0}))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        deadline = seen["params"].deadline
+        release.set()                       # let the worker exit before the loop shuts down
+        return deadline
+
+    try:
+        assert asyncio.run(main()) == 0.0
+        assert rec.frames == FRAMES
+    finally:
+        release.set()
 
 
 def test_window_label_session_is_a_dedicated_jev_session(monkeypatch):

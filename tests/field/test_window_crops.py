@@ -68,6 +68,26 @@ def test_wide_tile_clamps_at_the_view_edge_and_reports_the_shifted_target():
     assert ty == int((700 - (723 - 200)) / 200 * 240)         # crop ends at the view bottom
 
 
+def _white_ticks(tile, tx, ty):
+    """Which of the four ticks are drawn, probed just inside each edge at the
+    (clamped) tick coordinate."""
+    cx = min(max(tx, 0), 239)
+    cy = min(max(ty, 0), 239)
+    white = (255, 255, 255)
+    return {"top": tuple(tile[1, cx]) == white, "bottom": tuple(tile[238, cx]) == white,
+            "left": tuple(tile[cy, 1]) == white, "right": tuple(tile[cy, 238]) == white}
+
+
+@pytest.mark.parametrize("u,v", [(960.0, 723.0 + 30.0),    # 30 px below the view bottom
+                                 (1920.0, 400.0)])         # u equal to the view width
+def test_all_four_ticks_are_drawn_when_the_target_is_just_outside_the_view(u, v):
+    assert wc.in_view(u, v, (1920, 723))
+    tile, (tx, ty) = wc.wide_tile(_view(), u, v, 200)
+    assert tx >= 240 or ty >= 240                             # true target is off the tile
+    assert _white_ticks(tile, tx, ty) == {"top": True, "bottom": True,
+                                          "left": True, "right": True}
+
+
 def test_zoom_send_grid_and_lineup_sizes():
     tile = np.full((240, 240, 3), 77, np.uint8)
     assert wc.zoom_tile(tile).shape == (504, 504, 3)

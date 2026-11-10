@@ -59,6 +59,9 @@ def in_view(u: float, v: float, view_wh: tuple) -> bool:
 
 def _ticks(tile: np.ndarray, tx: int, ty: int) -> None:
     n = TILE_PX
+    # a target just outside the view (in_view's margins) lies off the tile:
+    # clamp so all four ticks are still drawn, pointing at the nearest edge
+    tx, ty = min(max(int(tx), 0), n - 1), min(max(int(ty), 0), n - 1)
     for px, py, dx, dy in ((tx, 0, 0, 1), (tx, n - 1, 0, -1), (0, ty, 1, 0), (n - 1, ty, -1, 0)):
         if 0 <= px < n and 0 <= py < n:
             tri = np.array([(px + dx * 12, py + dy * 12), (px - dy * 6, py - dx * 6),

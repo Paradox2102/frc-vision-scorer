@@ -647,12 +647,21 @@ def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stat
     ``params.digit_calls`` when its fingerprint matches and the call count
     fits (cached failures stay failures); every other window is requested.
     Returns the cache for exactly the calls used: {"calls": wid -> [probs or
-    None] in request order, "wide_p": wid -> {k: probs}, "fingerprints"}."""
+    None] in request order, "wide_p": wid -> {k: probs}, "fingerprints", plus
+    the "roster" and "model_key" it was made for; a cache made for another
+    roster or model, or one that fails to load, is ignored whole."""
     requests = _requests(windows, tiles)
     by_wid = {w.wid: w for w in windows}
     fingerprints = {wid: window_fingerprint(frames, by_wid[wid], reqs)
                     for wid, reqs in requests.items()}
-    cache = load_digit_calls(params.digit_calls) if params.digit_calls else None
+    roster = [str(t) for t in params.red] + [str(t) for t in params.blue]
+    cache = None
+    try:                    # a cache from another roster / model, or a broken one, is no cache
+        if (params.digit_calls and params.digit_calls.get("roster") == roster
+                and params.digit_calls.get("model_key") == params.model_key):
+            cache = load_digit_calls(params.digit_calls)
+    except Exception:
+        cache = None
     calls: dict = {}
     specs = []
     for wid, reqs in requests.items():
@@ -667,7 +676,8 @@ def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stat
     for (wid, _kind, _k), probs in zip(specs, answers):
         calls.setdefault(wid, []).append(probs)
     calls = {wid: calls[wid] for wid in requests}           # window order
-    return {"calls": calls, "wide_p": _wide_p(requests, calls), "fingerprints": fingerprints}
+    return {"calls": calls, "wide_p": _wide_p(requests, calls), "fingerprints": fingerprints,
+            "roster": roster, "model_key": params.model_key}
 
 
 def _lineup_rows(digit, start_s, tiles, wide_p, roster, colours, params, crops) -> tuple:

@@ -398,6 +398,7 @@ def test_elimination_anchors_reach_anchors_out_and_obey_the_ablation():
     assert all(a.p == 0.9 and a.alliance_color == "red" for a in elim)
     off = _run(frames, _reading_session(frames, read), event_lineup=True, use_elimination=False)
     assert [a.kind for a in off["anchors_out"]] == ["digits", "digits"]
+    assert "6497" not in res["row_sources"] and "6497" not in off["row_sources"]
 
 
 def test_alliance_rows_build_one_card_per_alliance_and_ask_only_the_slots_card():
@@ -413,6 +414,43 @@ def test_alliance_rows_build_one_card_per_alliance_and_ask_only_the_slots_card()
     random.Random(1).shuffle(order)
     r1 = next(w for w in wl.build_windows(frames, FPS) if w.slot == "R1")
     assert res["labels"][(r1.idx[0], "R1")][0] == order[0]       # letter A of the red card
+
+
+def test_an_unread_blue_window_resolves_through_the_blue_cards_letters():
+    b1 = _still([i for i in range(60) if i % 15 < 10], (3.0, 2.0))
+    b2 = _still([i for i in range(60) if i % 15 < 10], (5.0, 6.0))
+    frames = _frames({"B1": b1, "B2": b2, "R1": _still(range(10, 15), (12.0, 3.0)),
+                      "B3": _still(range(25, 30), (9.0, 6.0))}, 60)
+    s = _lineup_session(frames, who_p={"A": 0.9})
+    red = {"2637": _borrow("2637", 2, colour="red"),
+           "2724": _borrow("2724", 2, mk="2026cur_qm4", colour="red")}
+    res = _run(frames, s, seed=1, event_lineup=True, borrowed=red, rows_alliance_only=True)
+    assert [n for q, n in s.asked if q == "who"] == [1, 1]       # R1 on red, B3 on blue
+    blue_order = ["3128", "6773"]
+    random.Random(1).shuffle(blue_order)
+    b3 = next(w for w in wl.build_windows(frames, FPS) if w.slot == "B3")
+    assert res["labels"][(b3.idx[0], "B3")][:2] == (blue_order[0], wl.RANK_LINEUP)
+
+
+def _row_run(borrowed):
+    frames = _lineup_frames()
+    return _run(frames, _reading_session(frames, {"B1": {"3128": 0.9}}), seed=1,
+                event_lineup=True, borrowed={"6773": borrowed})
+
+
+def _corrupt(mk="2026cur_qm5"):
+    return [ea.Anchor(team="6773", kind="digits", p=0.99, frame_num=1, alliance_color="blue",
+                      tile=b"not a jpeg", match_key=mk, match_number=ea.schedule_rank(mk),
+                      replay_id="r")]
+
+
+def test_a_borrowed_tile_that_does_not_decode_is_dropped_and_the_row_rechecked():
+    res = _row_run(_borrow("6773", 1) + _corrupt())              # one good + one corrupt
+    assert "6773" not in res["row_sources"] and res["stats"]["lineup_rows"] == 1
+    res = _row_run(_borrow("6773", 2) + _corrupt())              # two good + one corrupt
+    assert res["row_sources"]["6773"] == {"own": 0, "borrowed": 2, "elim": 0,
+                                          "from": ["2026cur_qm3"]}
+    assert res["stats"]["lineup_rows"] == 2
 
 
 def test_default_card_has_every_teams_row_a_colour_bar_and_the_colour_sentence():
@@ -462,7 +500,7 @@ def test_digit_calls_round_trip_through_json_and_skip_every_request():
     frames = _lineup_frames()
     first = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), seed=1)
     cache = json.loads(json.dumps(first["digit_calls"]))           # string keys, as stored
-    assert set(cache) == {"calls", "wide_p", "fingerprints"}
+    assert set(cache) == {"calls", "wide_p", "fingerprints", "roster", "model_key"}
     s = NoDigits(who_p={"B": 0.9})
     again = _run(frames, s, seed=1, digit_calls=cache)
     assert again["labels"] == first["labels"] and again["lineup_jpeg"] == first["lineup_jpeg"]
@@ -513,3 +551,25 @@ def test_cached_failed_calls_are_reused_as_failures():
     res = _run(frames, NoDigits(), digit_calls=cache)
     assert res["aborted"] is None and res["digit_calls"]["calls"][0][0] is None
     assert res["stats"]["request_errors"] == 0 and res["labels"][(0, "B1")][0] == "3128"
+
+
+def test_a_cache_for_another_roster_or_model_is_ignored_whole():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    first = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    for key, val in (("roster", ["1", "2"]), ("model_key", "other-model"), ("roster", None)):
+        cache = json.loads(json.dumps(first["digit_calls"]))
+        cache[key] = val
+        s = FakeSession(team_p={"3128": 0.9})
+        _run(frames, s, digit_calls=cache)
+        assert s.asked == [("team", 9)], key
+
+
+def test_a_cache_that_fails_to_load_is_no_cache_not_a_stage_error():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    first = _run(frames, FakeSession(team_p={"3128": 0.9}))
+    cache = json.loads(json.dumps(first["digit_calls"]))
+    cache["calls"] = {"3": None}
+    s = FakeSession(team_p={"3128": 0.9})
+    res = _run(frames, s, digit_calls=cache)
+    assert res["aborted"] is None and s.asked == [("team", 9)]
+    assert res["labels"][(0, "B1")][0] == "3128"

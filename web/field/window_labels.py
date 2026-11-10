@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,6 +40,15 @@ SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup"}
 SOURCE_NONE = "window_none"
 LETTERS = "ABCDEF"
 BORROW_PER_MATCH = 2              # borrowed anchors from any one source match, per row
+
+# Elimination anchors (spec section 4)
+ELIM_OVERLAP_S = 1.0              # each partner window overlaps W3 by at least this
+ELIM_MAX_TEAM_P = 0.4             # no roster team at or above this in any W3 call
+ELIM_MIN_SEPARATION_M = 1.5       # W3's median distance to each partner
+ELIM_MIN_WIDE_CALLS = 3           # returned wide calls W3 needs
+ELIM_MAX_NOT_ROBOT_P = 0.3        # every returned wide call below this p(not_robot)
+ELIM_TILES_PER_WINDOW = 3
+ELIM_PER_TEAM = 3                 # per team per match
 
 
 @dataclass
@@ -237,6 +247,113 @@ def fill_row(n_own: int, borrowed: list, colour: Optional[str],
     if use_elimination and n_own + len(picked) < MIN_ANCHORS:
         take(KIND_ELIM)
     return picked
+
+
+def slot_alliance(slot) -> Optional[str]:
+    """"red" for an R slot, "blue" for a B slot, else None."""
+    s = str(slot or "")[:1]
+    return "red" if s == "R" else "blue" if s == "B" else None
+
+
+def _slot_xy(frames: list, i: int, slot: str) -> Optional[tuple]:
+    for r in frames[i].get("robots") or []:
+        pos = r.get("field_pos")
+        if (r.get("slot") == slot and pos and len(pos) >= 2
+                and pos[0] is not None and pos[1] is not None):
+            return float(pos[0]), float(pos[1])
+    return None
+
+
+def _median_gap_m(frames: list, shared, slot_a: str, slot_b: str) -> Optional[float]:
+    """Median distance between two slots' tracked positions over the
+    ``shared`` frame indices (None when no frame has both)."""
+    d = []
+    for i in shared:
+        a, b = _slot_xy(frames, i, slot_a), _slot_xy(frames, i, slot_b)
+        if a and b:
+            d.append(math.hypot(a[0] - b[0], a[1] - b[1]))
+    return statistics.median(d) if d else None
+
+
+def elimination_anchors(windows: list, frames: list, digit: dict, calls: dict, wide_p: dict,
+                        red: list, blue: list, period: float) -> dict:
+    """Spec section 4. A window W3 on alliance X, with no digit label, shows
+    the third X team T3 when every guard holds:
+      1. windows W1, W2 on X's other two slots each overlap W3 by at least
+         ELIM_OVERLAP_S and carry digit labels T1 != T2 of X at ANCHOR_MIN_P;
+      2. no roster team reaches ELIM_MAX_TEAM_P in any of W3's returned
+         calls, and X's teams' summed p is at least the other alliance's;
+      3. no other slot carries a digit label T3 at any frame of W3;
+      4. W3's median distance to W1 and to W2 over their shared frames is at
+         least ELIM_MIN_SEPARATION_M;
+      5. W3 has at least ELIM_MIN_WIDE_CALLS returned wide calls, each with
+         p(not_robot) below ELIM_MAX_NOT_ROBOT_P.
+    W3 is never labelled. Returns team -> [(wid, k, p)]: up to
+    ELIM_TILES_PER_WINDOW samples per window, at most ELIM_PER_TEAM per team
+    spread in time; p is the smaller of the two partner labels' p."""
+    teams = {"red": [str(t) for t in red], "blue": [str(t) for t in blue]}
+    roster = teams["red"] + teams["blue"]
+    idx = {w.wid: set(w.idx) for w in windows}
+    by_slot: dict = {}
+    for w in windows:
+        by_slot.setdefault(w.slot, []).append(w)
+    found: dict = {}
+    for w3 in windows:
+        x = slot_alliance(w3.slot)
+        if x is None or w3.wid in digit or len(teams[x]) != 3:
+            continue
+        wides = wide_p.get(w3.wid) or {}                                      # guard 5
+        if (len(wides) < ELIM_MIN_WIDE_CALLS
+                or any(float(p.get("not_robot", 0.0)) >= ELIM_MAX_NOT_ROBOT_P
+                       for p in wides.values())):
+            continue
+        returned = [p for p in calls.get(w3.wid) or [] if p]                    # guard 2
+        if any(float(p.get(t, 0.0)) >= ELIM_MAX_TEAM_P for p in returned for t in roster):
+            continue
+        other = "blue" if x == "red" else "red"
+        mass_x = sum(float(p.get(t, 0.0)) for p in returned for t in teams[x])
+        mass_o = sum(float(p.get(t, 0.0)) for p in returned for t in teams[other])
+        if mass_x < mass_o:
+            continue
+        partners = []                                                           # guard 1
+        for s in sorted({f"{w3.slot[0]}{n}" for n in (1, 2, 3)} - {w3.slot}):
+            best = None
+            for w in by_slot.get(s, ()):
+                d = digit.get(w.wid)
+                if not d or d[1] < ANCHOR_MIN_P or d[0] not in teams[x]:
+                    continue
+                shared = idx[w3.wid] & idx[w.wid]
+                if len(shared) * period < ELIM_OVERLAP_S - 1e-9:
+                    continue
+                if best is None or (len(shared), -w.wid) > (len(best[1]), -best[0].wid):
+                    best = (w, shared)
+            if best is None:
+                break
+            partners.append(best)
+        if len(partners) != 2:
+            continue
+        (w1, sh1), (w2, sh2) = partners
+        t1, t2 = digit[w1.wid][0], digit[w2.wid][0]
+        rest = [t for t in teams[x] if t not in (t1, t2)]
+        if t1 == t2 or len(rest) != 1:
+            continue
+        t3 = rest[0]
+        if any(w.slot != w3.slot and digit.get(w.wid, (None,))[0] == t3          # guard 3
+               and idx[w.wid] & idx[w3.wid] for w in windows):
+            continue
+        gaps = (_median_gap_m(frames, sh1, w3.slot, w1.slot),                   # guard 4
+                _median_gap_m(frames, sh2, w3.slot, w2.slot))
+        if any(g is None or g < ELIM_MIN_SEPARATION_M for g in gaps):
+            continue
+        p = min(digit[w1.wid][1], digit[w2.wid][1])
+        ks = sorted(wides)
+        for j in _even_picks(len(ks), ELIM_TILES_PER_WINDOW):
+            found.setdefault(t3, []).append((w3.samples[ks[j] - 1], w3.wid, ks[j], p))
+    out = {}
+    for team, cands in found.items():
+        cands.sort()
+        out[team] = [cands[j][1:] for j in _even_picks(len(cands), ELIM_PER_TEAM)]
+    return out
 
 
 def assemble_labels(windows: list, evidence: dict) -> tuple:

@@ -5,12 +5,14 @@ Fakes only: no network, no video, no GPU."""
 import hashlib
 import json
 import random
+
+import pytest
 from pathlib import Path
 
 from web.field import event_anchors as ea
 from web.field import window_labels as wl
 from tests.field.test_window_labels import (
-    FakeSession, _frames, _lineup_frames, _lineup_session, _run, _still)
+    FPS, FakeSession, _frames, _lineup_frames, _lineup_session, _run, _still)
 
 GOLDEN = Path(__file__).parent / "data" / "window_labels_golden.json"
 
@@ -127,3 +129,121 @@ def test_ranking_is_deterministic_whatever_the_input_order():
     for seed in range(5):
         random.Random(seed).shuffle(cands)
         assert _keys(wl.fill_row(0, cands, "red")) == want
+
+
+RED, BLUE = ["2637", "2724", "6497"], ["3128", "6773", "9066"]
+PERIOD = 0.2                                     # 12 source frames at 60 fps
+
+
+def _quiet(n=9, **extra):
+    """W3's calls: unreadable, no roster team near 0.4."""
+    p = {"unreadable": 0.85, "not_robot": 0.05, "6497": 0.1}
+    p.update(extra)
+    return [dict(p) for _ in range(n)]
+
+
+def _wides(not_robot=(0.05, 0.05, 0.05, 0.05)):
+    return {k: {"unreadable": 0.85, "not_robot": nr} for k, nr in enumerate(not_robot, 1)}
+
+
+def _base(r3_xy=(10.0, 2.0), r2_frames=range(20), b1=None):
+    """R1 reads 2637 and R2 reads 2724 (p 0.95 / 0.9) for 4 s; R3 is unread.
+    Returns frames, windows, {slot: window}, digit, calls, wide_p."""
+    tracks = {"R1": _still(range(20), (2.0, 2.0)), "R2": _still(r2_frames, (6.0, 2.0)),
+              "R3": _still(range(20), r3_xy)}
+    if b1 is not None:
+        tracks["B1"] = _still(b1, (4.0, 6.0))
+    frames = _frames(tracks, 20)
+    ws = wl.build_windows(frames, FPS)
+    w = {x.slot: x for x in ws}
+    digit = {w["R1"].wid: ("2637", 0.95), w["R2"].wid: ("2724", 0.9)}
+    return frames, ws, w, digit, {w["R3"].wid: _quiet()}, {w["R3"].wid: _wides()}
+
+
+def _elim(frames, ws, digit, calls, wide_p, red=RED):
+    return wl.elimination_anchors(ws, frames, digit, calls, wide_p, red, BLUE, PERIOD)
+
+
+def test_both_partners_named_gives_three_tiles_for_the_third_team():
+    frames, ws, w, digit, calls, wide_p = _base()
+    r3 = w["R3"].wid
+    assert _elim(frames, ws, digit, calls, wide_p) == {
+        "6497": [(r3, 1, 0.9), (r3, 3, 0.9), (r3, 4, 0.9)]}
+
+
+def test_guard_1_partner_overlap_under_one_second():
+    frames, ws, w, digit, calls, wide_p = _base(r2_frames=range(16, 20))   # 4 shared = 0.8 s
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+
+
+@pytest.mark.parametrize("change", ["partner_p", "same_team", "other_alliance", "w3_named"])
+def test_guard_1_and_2_partner_labels(change):
+    frames, ws, w, digit, calls, wide_p = _base()
+    if change == "partner_p":
+        digit[w["R2"].wid] = ("2724", 0.84)
+    elif change == "same_team":
+        digit[w["R2"].wid] = ("2637", 0.95)
+    elif change == "other_alliance":
+        digit[w["R2"].wid] = ("3128", 0.95)
+    else:
+        digit[w["R3"].wid] = ("6497", 0.6)
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+
+
+def test_guard_2_a_roster_team_at_0_4_in_any_call():
+    frames, ws, w, digit, calls, wide_p = _base()
+    calls[w["R3"].wid][4] = {"unreadable": 0.55, "6497": 0.4, "not_robot": 0.05}
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+
+
+def test_guard_2_cross_alliance_mass():
+    frames, ws, w, digit, calls, wide_p = _base()
+    r3 = w["R3"].wid
+    calls[r3] = _quiet(**{"6497": 0.05, "3128": 0.3})        # blue mass 2.7 > red 0.45
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+    calls[r3] = _quiet(**{"6497": 0.2, "3128": 0.15})        # red 1.8 >= blue 1.35
+    assert set(_elim(frames, ws, digit, calls, wide_p)) == {"6497"}
+
+
+def test_guard_3_the_third_team_read_on_another_slot_meanwhile():
+    frames, ws, w, digit, calls, wide_p = _base(b1=range(5, 15))
+    digit[w["B1"].wid] = ("6497", 0.7)
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+    del digit[w["B1"].wid]
+    assert set(_elim(frames, ws, digit, calls, wide_p)) == {"6497"}
+
+
+def test_guard_4_w3_too_close_to_a_partner():
+    frames, ws, w, digit, calls, wide_p = _base(r3_xy=(2.5, 2.4))          # 0.64 m from R1
+    assert _elim(frames, ws, digit, calls, wide_p) == {}
+
+
+@pytest.mark.parametrize("wides", [
+    {1: {"not_robot": 0.05}, 2: {"not_robot": 0.05}},                     # 2 returned calls
+    _wides((0.05, 0.31, 0.0, 0.0))])                                       # one says not_robot
+def test_guard_5_returned_wide_calls(wides):
+    frames, ws, w, digit, calls, _wide_p = _base()
+    assert _elim(frames, ws, digit, calls, {w["R3"].wid: wides}) == {}
+
+
+def test_an_alliance_without_three_roster_teams_gives_nothing():
+    frames, ws, w, digit, calls, wide_p = _base()
+    assert _elim(frames, ws, digit, calls, wide_p, red=RED[:2]) == {}
+
+
+def test_at_most_three_elimination_tiles_per_team_spread_in_time():
+    tracks = {"R1": _still(range(40), (2.0, 2.0)), "R2": _still(range(40), (6.0, 2.0)),
+              "R3": _still(range(40), (10.0, 2.0))}
+    frames = _frames(tracks, 40)                     # 8 s: two 4 s windows per slot
+    ws = wl.build_windows(frames, FPS)
+    digit, calls, wide_p = {}, {}, {}
+    for x in ws:
+        if x.slot == "R1":
+            digit[x.wid] = ("2637", 0.95)
+        elif x.slot == "R2":
+            digit[x.wid] = ("2724", 0.9)
+        else:
+            calls[x.wid], wide_p[x.wid] = _quiet(), _wides()
+    a, b = sorted(x.wid for x in ws if x.slot == "R3")
+    assert _elim(frames, ws, digit, calls, wide_p) == {
+        "6497": [(a, 1, 0.9), (a, 4, 0.9), (b, 4, 0.9)]}

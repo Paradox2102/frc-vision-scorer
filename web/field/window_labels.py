@@ -214,10 +214,11 @@ def lineup_decision(probs: Optional[dict], letters: dict, min_p: float) -> Optio
 def borrow_key(a: Anchor, colour: Optional[str]) -> tuple:
     """Rank of a borrowed anchor for a row (spec section 3): digits before
     elimination, then this match's bumper colour, then p descending, then
-    the most recent match, then the earliest frame; match key last, so the
+    the most recent match, then the earliest frame; match key and store id last, so the
     order never depends on the input order."""
     return (a.kind != KIND_DIGITS, a.alliance_color != colour, -float(a.p),
-            -int(a.match_number or 0), int(a.frame_num or 0), str(a.match_key or ""))
+            -int(a.match_number or 0), int(a.frame_num or 0), str(a.match_key or ""),
+            int(a.id or 0))
 
 
 def fill_row(n_own: int, borrowed: list, colour: Optional[str],

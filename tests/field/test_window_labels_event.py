@@ -5,9 +5,9 @@ Fakes only: no network, no video, no GPU."""
 import hashlib
 import json
 import random
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 from web.field import event_anchors as ea
 from web.field import window_labels as wl
@@ -247,3 +247,42 @@ def test_at_most_three_elimination_tiles_per_team_spread_in_time():
     a, b = sorted(x.wid for x in ws if x.slot == "R3")
     assert _elim(frames, ws, digit, calls, wide_p) == {
         "6497": [(a, 1, 0.9), (a, 4, 0.9), (b, 4, 0.9)]}
+
+
+def test_identical_anchors_rank_the_same_whatever_the_input_order():
+    a = ea.Anchor(team="6773", kind="digits", p=0.9, frame_num=100, alliance_color="blue",
+                  tile=b"", match_key="2026cur_qm3", match_number=3, id=11)
+    b = ea.Anchor(team="6773", kind="digits", p=0.9, frame_num=100, alliance_color="blue",
+                  tile=b"", match_key="2026cur_qm3", match_number=3, id=12)
+    assert wl.fill_row(5, [a, b], "blue") == wl.fill_row(5, [b, a], "blue") == [a]
+
+
+def test_guard_3_third_team_read_on_another_slot_after_w3_is_ignored():
+    tracks = {"R1": _still(range(20), (2.0, 2.0)), "R2": _still(range(20), (6.0, 2.0)),
+              "R3": _still(range(20), (10.0, 2.0)), "B1": _still(range(20, 30), (4.0, 6.0))}
+    frames = _frames(tracks, 30)
+    ws = wl.build_windows(frames, FPS)
+    w = {x.slot: x for x in ws}
+    assert not set(w["B1"].idx) & set(w["R3"].idx)
+    digit = {w["R1"].wid: ("2637", 0.95), w["R2"].wid: ("2724", 0.9),
+             w["B1"].wid: ("6497", 0.7)}
+    out = _elim(frames, ws, digit, {w["R3"].wid: _quiet()}, {w["R3"].wid: _wides()})
+    assert set(out) == {"6497"}
+
+
+@pytest.mark.parametrize("case, passes", [
+    ("mass_equal", True), ("not_robot_at_0.3", False), ("overlap_1s", True),
+    ("partner_p_0.85", True)])
+def test_guard_boundaries(case, passes):
+    kw = {}
+    if case == "overlap_1s":
+        kw["r2_frames"] = range(15, 20)                      # 5 shared frames x 0.2 s
+    frames, ws, w, digit, calls, wide_p = _base(**kw)
+    r3 = w["R3"].wid
+    if case == "mass_equal":
+        calls[r3] = _quiet(**{"6497": 0.1, "3128": 0.1})     # red == blue
+    elif case == "not_robot_at_0.3":
+        wide_p[r3] = _wides((0.05, 0.3, 0.05, 0.05))
+    elif case == "partner_p_0.85":
+        digit[w["R2"].wid] = ("2724", 0.85)
+    assert bool(_elim(frames, ws, digit, calls, wide_p)) is passes

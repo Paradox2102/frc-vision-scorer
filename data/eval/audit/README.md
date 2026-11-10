@@ -164,3 +164,23 @@ Claude Code subagents as blind judges (`JUDGE_BRIEF.md`, one item at a time), `-
 - On qm13, Fable and Jev both named a team on 49 items and agree on 48, so the cheap Jev audit reproduces the Claude audit. Jev is the runtime auditor; Claude calibrates it.
 - All judges abstain on the hardest items, where the labels are wrong more often. On qm8, GT mis-ID is 20.1% over all GT-matched items but 15–16% on the judge-confident ones, so treat audit mis-ID as a lower bound (about 5 points low on qm8).
 - qm13 0baf4625 is a Nov 6 replay, before the Nov 7 identity defaults.
+
+## Jev audit of every stored full-match replay (Nov 10 2026)
+
+`audit_replay.py sample --n 150 --seed 0` + `jev --mode multi`, scored at `--min-conf 0` (Jev's confidence is uninformative). Latest complete full-match replay per match (qm8: today's baseline 58fd3964, not the deinterlace arm). About 1¢ per match.
+
+| match | replay | date | defaults | Jev coverage | est. mis-ID [95% CI] | cross-alliance share | valid |
+|---|---|---|---|---|---|---|---|
+| cur qm8 | 58fd3964 | Nov 10 | current (Nov 7) | 34% | **10.9%** [2.5–20.9] | 2/5 | yes (hand GT 20% over all items; audit is a lower bound) |
+| cur qm7 | 7177b829 | Nov 6 | pre-Nov-7 | 32% | 57.9% [45–70] | 4/27 | yes |
+| cur qm11 | caa236ee | Nov 6 | pre-Nov-7 | 36% | 69.1% [57–80] | 5/35 | yes |
+| cur qm13 | 0baf4625 | Nov 6 | pre-Nov-7 | 34% | 68.9% [57–80] | 16/33 | yes (Fable agrees, 69.5%) |
+| cur qm14 | e12b09ae | Nov 6 | pre-Nov-7 | 34% | 64.3% [50–78] | 13/27 | yes |
+| cur qm22 | 99cfdd0a | Nov 6 | pre-Nov-7 | 41% | 61.1% [50–72] | 10/36 | yes |
+| cur qm2 | c7828ad6 | Jun 30 | old | 5% | – | – | **no**: crops miss the robots |
+| cur qm16 | 369c6a8f | Jul 22 | old | – | – | – | **no**: replay has 0 labelled slot-frames |
+| hop qm1/6/16/24/28/30/72/84/115 | various | Jun 8–12 | old | 4–46% | 0–83% | – | **no**: crops miss the robots (field edge, ball piles); likely calibration lookup for June jobs |
+
+- The Nov 6 replays ran before the Nov 7 identity defaults (identity_segment_resolve + strict tracking). The 58–69% mis-ID on those matches is the old pipeline's. Only qm8 has a replay on current defaults.
+- Jev answers `no_robot` on 34–47% of items even where Fable sees the robot (Fable: 12% on qm13), so coverage is Jev-limited.
+- Per-match logs and answers are in each audit directory (`answers_jev_multi.jsonl`). The invalid audit dirs are kept so the projection bug can be reproduced.

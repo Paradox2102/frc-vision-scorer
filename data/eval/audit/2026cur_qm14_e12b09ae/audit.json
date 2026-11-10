@@ -1,0 +1,92 @@
+{
+ "replay": "e12b09ae-4882-4cd6-8ca8-3012eb23cd29",
+ "match_key": "2026cur_qm14",
+ "replay_created_at": "2026-11-06T21:58:55",
+ "video": "video_8f52a3d4061ba77a84d0e16c2ccc8077.mp4",
+ "fps": 59.872,
+ "frame_period_s": 0.20042757883484769,
+ "n_requested": 150,
+ "seed": 0,
+ "unlabelled_frac": 0.1,
+ "auto_min_share": 0.2,
+ "ground_center_offset_m": 0.0,
+ "roster": {
+  "red": [
+   "5987",
+   "2682",
+   "3792"
+  ],
+  "blue": [
+   "6510",
+   "5166",
+   "9609"
+  ]
+ },
+ "strata": {
+  "auto|B1": {
+   "N": 55,
+   "n": 4
+  },
+  "auto|B2": {
+   "N": 104,
+   "n": 8
+  },
+  "auto|R1": {
+   "N": 118,
+   "n": 11
+  },
+  "auto|R2": {
+   "N": 57,
+   "n": 4
+  },
+  "teleop|B1": {
+   "N": 663,
+   "n": 32
+  },
+  "teleop|B2": {
+   "N": 572,
+   "n": 26
+  },
+  "teleop|R1": {
+   "N": 589,
+   "n": 27
+  },
+  "teleop|R2": {
+   "N": 498,
+   "n": 23
+  },
+  "unlabelled|auto": {
+   "N": 236,
+   "n": 3
+  },
+  "unlabelled|teleop": {
+   "N": 946,
+   "n": 12
+  }
+ },
+ "labelled_slot_s": 532.3,
+ "unlabelled_slot_s": 236.9,
+ "views": {
+  "main": [
+   0,
+   0,
+   1920,
+   723
+  ],
+  "corner_left": [
+   0,
+   703,
+   960,
+   377
+  ],
+  "corner_right": [
+   960,
+   703,
+   960,
+   377
+  ]
+ },
+ "out_px": 512,
+ "min_bumper_px": 16.0,
+ "created": "2026-11-10T12:23:39"
+}

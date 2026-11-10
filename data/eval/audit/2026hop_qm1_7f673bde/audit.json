@@ -1,0 +1,84 @@
+{
+ "replay": "7f673bde-fb37-49d8-83c8-6731d05841f1",
+ "match_key": "2026hop_qm1",
+ "replay_created_at": "2026-06-12T13:32:54",
+ "video": "7f673bde-fb37-49d8-83c8-6731d05841f1.mp4",
+ "fps": 60.0,
+ "frame_period_s": 0.13333333333333333,
+ "n_requested": 150,
+ "seed": 0,
+ "unlabelled_frac": 0.1,
+ "auto_min_share": 0.2,
+ "ground_center_offset_m": 0.0,
+ "roster": {
+  "red": [
+   "8749",
+   "2486",
+   "4201"
+  ],
+  "blue": [
+   "3175",
+   "1710",
+   "3512"
+  ]
+ },
+ "strata": {
+  "auto|B3": {
+   "N": 176,
+   "n": 8
+  },
+  "auto|R2": {
+   "N": 176,
+   "n": 8
+  },
+  "auto|R3": {
+   "N": 177,
+   "n": 11
+  },
+  "teleop|B3": {
+   "N": 1052,
+   "n": 38
+  },
+  "teleop|R2": {
+   "N": 1019,
+   "n": 35
+  },
+  "teleop|R3": {
+   "N": 1030,
+   "n": 35
+  },
+  "unlabelled|auto": {
+   "N": 527,
+   "n": 2
+  },
+  "unlabelled|teleop": {
+   "N": 3172,
+   "n": 13
+  }
+ },
+ "labelled_slot_s": 484.0,
+ "unlabelled_slot_s": 493.2,
+ "views": {
+  "main": [
+   0,
+   0,
+   1920,
+   723
+  ],
+  "corner_left": [
+   0,
+   703,
+   960,
+   377
+  ],
+  "corner_right": [
+   960,
+   703,
+   960,
+   377
+  ]
+ },
+ "out_px": 512,
+ "min_bumper_px": 16.0,
+ "created": "2026-11-10T12:24:52"
+}

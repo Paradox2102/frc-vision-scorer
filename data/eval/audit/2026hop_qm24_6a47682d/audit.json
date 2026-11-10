@@ -1,0 +1,84 @@
+{
+ "replay": "6a47682d-c727-4d2b-a379-814402a5d4f2",
+ "match_key": "2026hop_qm24",
+ "replay_created_at": "2026-06-12T07:22:35",
+ "video": "6a47682d-c727-4d2b-a379-814402a5d4f2_qm24_mapv2.mp4",
+ "fps": 60.0,
+ "frame_period_s": 0.13333333333333333,
+ "n_requested": 150,
+ "seed": 0,
+ "unlabelled_frac": 0.1,
+ "auto_min_share": 0.2,
+ "ground_center_offset_m": 0.0,
+ "roster": {
+  "red": [
+   "401",
+   "6328",
+   "3506"
+  ],
+  "blue": [
+   "8513",
+   "573",
+   "4174"
+  ]
+ },
+ "strata": {
+  "auto|B1": {
+   "N": 171,
+   "n": 9
+  },
+  "auto|B2": {
+   "N": 180,
+   "n": 11
+  },
+  "auto|R1": {
+   "N": 144,
+   "n": 7
+  },
+  "teleop|B1": {
+   "N": 999,
+   "n": 35
+  },
+  "teleop|B2": {
+   "N": 984,
+   "n": 35
+  },
+  "teleop|R1": {
+   "N": 1047,
+   "n": 38
+  },
+  "unlabelled|auto": {
+   "N": 495,
+   "n": 2
+  },
+  "unlabelled|teleop": {
+   "N": 2954,
+   "n": 13
+  }
+ },
+ "labelled_slot_s": 470.0,
+ "unlabelled_slot_s": 459.9,
+ "views": {
+  "main": [
+   0,
+   0,
+   1920,
+   723
+  ],
+  "corner_left": [
+   0,
+   703,
+   960,
+   377
+  ],
+  "corner_right": [
+   960,
+   703,
+   960,
+   377
+  ]
+ },
+ "out_px": 512,
+ "min_bumper_px": 16.0,
+ "created": "2026-11-10T12:25:29"
+}

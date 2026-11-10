@@ -1,0 +1,56 @@
+{
+ "replay": "369c6a8f-03ef-41c5-93d2-0d0c26b0859b",
+ "match_key": "2026cur_qm16",
+ "replay_created_at": "2026-07-22T00:34:26",
+ "video": "video_d0d181874f881a5e997783890b5b2eb4.mp4",
+ "fps": 59.902,
+ "frame_period_s": 0.11685753397215452,
+ "n_requested": 150,
+ "seed": 0,
+ "unlabelled_frac": 0.1,
+ "auto_min_share": 0.2,
+ "ground_center_offset_m": 0.0,
+ "roster": {
+  "red": [
+   "8280",
+   "2724",
+   "2053"
+  ],
+  "blue": [
+   "5712",
+   "7539",
+   "166"
+  ]
+ },
+ "strata": {
+  "unlabelled|auto": {
+   "N": 696,
+   "n": 15
+  }
+ },
+ "labelled_slot_s": 0.0,
+ "unlabelled_slot_s": 81.3,
+ "views": {
+  "main": [
+   0,
+   0,
+   1920,
+   723
+  ],
+  "corner_left": [
+   0,
+   703,
+   960,
+   377
+  ],
+  "corner_right": [
+   960,
+   703,
+   960,
+   377
+  ]
+ },
+ "out_px": 512,
+ "min_bumper_px": 16.0,
+ "created": "2026-11-10T12:23:50"
+}

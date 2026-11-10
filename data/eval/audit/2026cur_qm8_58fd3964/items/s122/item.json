@@ -1,0 +1,66 @@
+{
+ "sample_id": "s122",
+ "replay": "58fd3964-85d6-4d68-aee8-ba46ba4adb6e",
+ "match_key": "2026cur_qm8",
+ "frame": 714,
+ "frame_idx": 27,
+ "t_s": 11.9,
+ "period": "auto",
+ "slot": "B2",
+ "slot_key": "B2",
+ "dup": 1,
+ "alliance": "blue",
+ "pipeline_label": null,
+ "stratum": "unlabelled|auto",
+ "field_pos": [
+  6.466,
+  3.99
+ ],
+ "centre_xy": [
+  6.365,
+  4.454
+ ],
+ "views": [
+  "main"
+ ],
+ "targets": {
+  "main": {
+   "u": 725.8,
+   "v": 442.9,
+   "bumper_px": 117.7,
+   "side": 209,
+   "ok": true,
+   "why": null
+  },
+  "corner_left": {
+   "u": 734.7,
+   "v": 271.1,
+   "bumper_px": 64.4,
+   "side": 182,
+   "ok": false,
+   "why": "no unique detection near projection"
+  },
+  "corner_right": {
+   "u": 90.8,
+   "v": 241.8,
+   "bumper_px": 47.7,
+   "side": 174,
+   "ok": false,
+   "why": "corner bumper < 60px"
+  }
+ },
+ "view_meta": {
+  "main": {
+   "x0": 621,
+   "y0": 313,
+   "side_px": 209,
+   "scale": 2.45,
+   "tick": [
+    257,
+    318
+   ],
+   "comb": 2.516,
+   "deinterlaced": true
+  }
+ }
+}

@@ -1,0 +1,15 @@
+{"sample_id": "s000", "images": {"main": "items/s000/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s001", "images": {"main": "items/s001/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s002", "images": {"main": "items/s002/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s003", "images": {"main": "items/s003/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s004", "images": {"main": "items/s004/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s005", "images": {"main": "items/s005/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s006", "images": {"main": "items/s006/main.jpg", "corner_right": "items/s006/corner_right.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s007", "images": {"main": "items/s007/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s008", "images": {"main": "items/s008/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s009", "images": {"main": "items/s009/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s010", "images": {"main": "items/s010/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s011", "images": {"main": "items/s011/main.jpg", "corner_right": "items/s011/corner_right.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s012", "images": {"main": "items/s012/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s013", "images": {"main": "items/s013/main.jpg", "corner_right": "items/s013/corner_right.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}
+{"sample_id": "s014", "images": {"main": "items/s014/main.jpg"}, "roster": {"red": ["8280", "2724", "2053"], "blue": ["5712", "7539", "166"]}}

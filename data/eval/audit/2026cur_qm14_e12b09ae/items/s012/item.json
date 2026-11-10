@@ -1,0 +1,82 @@
+{
+ "sample_id": "s012",
+ "replay": "e12b09ae-4882-4cd6-8ca8-3012eb23cd29",
+ "match_key": "2026cur_qm14",
+ "frame": 924,
+ "frame_idx": 47,
+ "t_s": 15.43,
+ "period": "auto",
+ "slot": "R1",
+ "slot_key": "R1",
+ "dup": 1,
+ "alliance": "red",
+ "pipeline_label": "2682",
+ "stratum": "auto|R1",
+ "field_pos": [
+  13.032,
+  3.68
+ ],
+ "centre_xy": [
+  13.251,
+  4.102
+ ],
+ "views": [
+  "main",
+  "corner_right"
+ ],
+ "targets": {
+  "main": {
+   "u": 1578.3,
+   "v": 457.2,
+   "bumper_px": 99.7,
+   "side": 200,
+   "ok": true,
+   "why": null
+  },
+  "corner_left": {
+   "u": 946.7,
+   "v": 222.0,
+   "bumper_px": 38.3,
+   "side": 169,
+   "ok": false,
+   "why": "corner bumper < 60px"
+  },
+  "corner_right": {
+   "u": 517.5,
+   "v": 235.9,
+   "bumper_px": 111.2,
+   "side": 206,
+   "ok": true,
+   "why": null,
+   "proj_u": 467.4,
+   "proj_v": 296.0,
+   "snapped_bw": 0.7
+  }
+ },
+ "view_meta": {
+  "main": {
+   "x0": 1478,
+   "y0": 333,
+   "side_px": 200,
+   "scale": 2.56,
+   "tick": [
+    257,
+    318
+   ],
+   "comb": 1.255,
+   "deinterlaced": true
+  },
+  "corner_right": {
+   "x0": 414,
+   "y0": 108,
+   "side_px": 206,
+   "scale": 2.485,
+   "tick": [
+    257,
+    318
+   ],
+   "comb": 3.026,
+   "deinterlaced": true
+  }
+ }
+}

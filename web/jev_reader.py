@@ -52,7 +52,7 @@ import os
 from typing import Iterable, Optional
 
 from web import clef_reader
-from web.clef_reader import ClefError, ClefSession, _choice_probs, _shuffled, _top
+from web.clef_reader import ClefError, ClefSession, ClefUnavailable, _choice_probs, _shuffled, _top
 
 # --------------------------------------------------------------------------- #
 # Models, limits, option text
@@ -247,10 +247,113 @@ def build_jev_classify_payload(model_key: str, img_bytes: bytes,
 
 def jev_estimate_tokens(payload: dict, image_wh) -> int:
     """Rough input tokens, fitted to 5 live crops (2026-11-05): ~1 per 415
-    image px + ~1.9 chars/token for state+questions."""
+    image px + ~1.9 chars/token for state+questions. ``image_wh`` is one
+    (w, h) or a list of them (multi-asset requests)."""
     text = len(json.dumps(payload.get("state", ""))) + len(json.dumps(payload.get("questions", {})))
-    w, h = image_wh
-    return int(w * h / 415 + text / 1.9)
+    sizes = list(image_wh or [])
+    if sizes and isinstance(sizes[0], (int, float)):
+        sizes = [tuple(sizes)]
+    return int(sum(w * h for w, h in sizes) / 415 + text / 1.9)
+
+
+# --------------------------------------------------------------------------- #
+# Window-label requests (web/field/window_labels.py)
+# --------------------------------------------------------------------------- #
+# Prompt text is the Nov 9 prototype's, word for word (spec Appendix A). The
+# option order is fixed (roster, then escapes): that is what was measured.
+
+WINDOW_MARK = (
+    "White triangular tick marks on the four edges of each crop point at the tracked spot: it is "
+    "where the line between the top and bottom ticks crosses the line between the left and right "
+    "ticks. Other robots, people, balls and field structures may also be visible; consider only "
+    "the robot at the marked spot, and there may be no robot there at all. ")
+WINDOW_BUMPER = (
+    "An FRC robot bumper is a solid RED or BLUE fabric band around the base of a robot with a "
+    "WHITE team number (1 to 5 digits) printed on it; the digits can appear rotated or upside "
+    "down. ")
+WINDOW_NOT_ROBOT = ("No robot at the marked spot: balls, field structures, signs, people or "
+                    "empty floor")
+WINDOW_QUESTION = (
+    "Which option matches the white team-number digits on the bumper of the robot at the marked "
+    "spot? Choose an escape option unless you can actually see a listed team's digits on that "
+    "bumper.")
+_WINDOW_KINDS = {
+    # kind: (state key, asset ref, context opening, include WINDOW_MARK)
+    "wide": ("crop", "crop_image",
+             "`crop` is cut from FRC (FIRST Robotics Competition) match video around a spot where "
+             "a tracker believes one robot is. ", True),
+    "zoom": ("crop", "crop_image",
+             "`crop` is cut from FRC (FIRST Robotics Competition) match video, centred on a spot "
+             "where a tracker believes one robot is. Consider only the robot nearest the centre "
+             "of the image (the marked spot); other robots, people, balls and field structures "
+             "may also be visible, and there may be no robot there at all. ", False),
+    "grid": ("crops", "crops_image",
+             "`crops` is a 2x2 grid of up to four crops cut from FRC (FIRST Robotics "
+             "Competition) match video, about one second apart, around a spot where a tracker "
+             "believes one robot is (grey cells are empty). ", True),
+}
+LINEUP_QUESTION = (
+    "Which lineup robot is at the marked spot in the query crops? Use bumper colour, any visible "
+    "digits and the robot's body. Choose `unsure` unless the evidence fits one lineup row and "
+    "not the others.")
+# Game-specific sentence appended to the lineup context (2026 REBUILT fuel).
+BALL_NOTE_2026 = "Yellow balls are game pieces; ignore how many a robot carries. "
+
+
+def _window_teams_line(red: list, blue: list) -> str:
+    return (f"Teams in this match: red alliance {', '.join(red)}; blue alliance "
+            f"{', '.join(blue)}. The team list is only for matching partially visible digits. "
+            "Never pick a team unless you can see its digits on the bumper of the robot at the "
+            "marked spot.")
+
+
+def _jev_asset(jpg: bytes) -> tuple[dict, tuple]:
+    img, w, h, _padded = jev_image(jpg)
+    return ({"type": "image", "format": "jpg",
+             "data_base64": base64.b64encode(img).decode()}, (w, h))
+
+
+def build_jev_window_payload(model_key: str, jpg: bytes, kind: str,
+                             red: Iterable, blue: Iterable) -> tuple[dict, list]:
+    """Digit question on one window image. ``kind`` is "wide" (a tile with
+    tick marks), "zoom" (centre crop) or "grid" (2x2 mosaic). Returns
+    (payload, [(w, h)]) ready for ``JevSession.ask(..., "team")``."""
+    red, blue = [str(t) for t in red], [str(t) for t in blue]
+    key, ref, opening, mark = _WINDOW_KINDS[kind]
+    asset, wh = _jev_asset(jpg)
+    criteria = {t: f"Team {t} (red bumper)" for t in red}
+    criteria.update({t: f"Team {t} (blue bumper)" for t in blue})
+    criteria["not_robot"] = WINDOW_NOT_ROBOT
+    criteria.update({e: JEV_ESCAPE_TEXT[e] for e in ("unreadable", "printed", "other")})
+    context = opening + (WINDOW_MARK if mark else "") + WINDOW_BUMPER + _window_teams_line(red, blue)
+    return ({"model": JEV_MODELS[model_key]["model"],
+             "state": {key: ref, "context": context},
+             "assets": {ref: asset},
+             "questions": {"team": {"type": "choice", "instructions": WINDOW_QUESTION,
+                                    "criteria": criteria}}}, [wh])
+
+
+def build_jev_lineup_payload(model_key: str, lineup_jpg: bytes, crops_jpg: bytes,
+                             letters: Iterable, ball_note: str = BALL_NOTE_2026) -> tuple[dict, list]:
+    """Lineup question: which row of the lineup card is at the marked spot in
+    the window's 2x2 grid. Two image assets, both referenced from the state.
+    Returns (payload, [(w, h), (w, h)]) for ``JevSession.ask(..., "who")``."""
+    letters = [str(l) for l in letters]
+    lineup, lwh = _jev_asset(lineup_jpg)
+    crops, cwh = _jev_asset(crops_jpg)
+    criteria = {l: f"The robot in lineup row {l}" for l in letters}
+    criteria["none"] = "No robot at the marked spot, or a robot that is not in the lineup"
+    criteria["unsure"] = "A lineup robot may be there but it is not clear which one"
+    context = (
+        f"`lineup` shows {len(letters)} FRC robots, one per row, labelled A to {letters[-1]} at "
+        "the left; each row shows the SAME robot at six different moments (its bumper colour and "
+        "team number are often visible). `crops` is a 2x2 grid of up to four query crops of one "
+        "tracked spot, about a second apart. " + WINDOW_MARK + (ball_note or ""))
+    return ({"model": JEV_MODELS[model_key]["model"],
+             "state": {"lineup": "lineup_image", "crops": "crops_image", "context": context},
+             "assets": {"lineup_image": lineup, "crops_image": crops},
+             "questions": {"who": {"type": "choice", "instructions": LINEUP_QUESTION,
+                                   "criteria": criteria}}}, [lwh, cwh])
 
 
 # --------------------------------------------------------------------------- #
@@ -408,3 +511,26 @@ class JevSession(ClefSession):
 
     def _read_multi(self, crops, meta, red, blue, expected, options, roster_alliance):
         return self._read_single(crops[0], red, blue, expected, options, roster_alliance)
+
+    def ask(self, items: list, question: str) -> list:
+        """Send prepared payloads and return each answer's option
+        probabilities. ``items``: [(payload, [(w, h), ...])] as returned by the
+        ``build_jev_window_payload`` / ``build_jev_lineup_payload`` builders.
+        One entry per item, in order: {"probs": {option: p}} or
+        {"error": message}. Never raises; retries, the auth latch, concurrency
+        and usage accounting are the shared session ones."""
+        def _one(_i: int, item) -> dict:
+            payload, sizes = item
+            try:
+                answers = self._request(payload, sizes)
+                probs = _choice_probs(answers.get(question))
+                if not probs:
+                    raise ClefError(f"no {question!r} probabilities in the answer")
+                return {"probs": probs}
+            except ClefUnavailable as e:
+                return {"error": str(e)}
+            except Exception as e:
+                self._bump("errors")
+                return {"error": self._redact(f"{self.name}: {e}")}
+
+        return self._run(list(items), _one)

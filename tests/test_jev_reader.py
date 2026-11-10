@@ -618,3 +618,95 @@ def test_confident_jev_reads_still_lock(monkeypatch, tmp_path):
     assert robot.team_number == "6800" and robot.team_number_confirmed
     rows = _rows(job, tmp_path)
     assert all("tentative" not in r and r["vote_weight"] == 1.0 for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# Window-label requests (web/field/window_labels.py)
+# --------------------------------------------------------------------------- #
+
+def _who(probs):
+    top = max(probs, key=probs.get)
+    return {"who": {"type": "choice", "choice": top, "probabilities": probs,
+                    "confidence": probs[top]}}
+
+
+@pytest.mark.parametrize("kind,name,ref", [("wide", "crop", "crop_image"),
+                                           ("zoom", "crop", "crop_image"),
+                                           ("grid", "crops", "crops_image")])
+def test_window_payload_shape(kind, name, ref):
+    payload, sizes = jev_reader.build_jev_window_payload(
+        "jev-1.14.0", _jpeg(480, 480), kind, RED, BLUE)
+    assert payload["model"] == "jev-1.14.0"
+    assert payload["state"][name] == ref and set(payload["assets"]) == {ref}
+    assert sizes == [(480, 480)]
+    crit = payload["questions"]["team"]["criteria"]
+    assert list(crit)[:6] == RED + BLUE
+    assert crit[RED[0]] == f"Team {RED[0]} (red bumper)"
+    assert crit[BLUE[0]] == f"Team {BLUE[0]} (blue bumper)"
+    assert set(crit) - set(RED + BLUE) == {"not_robot", "unreadable", "printed", "other"}
+    assert crit["not_robot"].startswith("No robot at the marked spot")
+    ctx = payload["state"]["context"]
+    assert f"red alliance {', '.join(RED)}; blue alliance {', '.join(BLUE)}" in ctx
+    assert ("tick marks" in ctx) == (kind != "zoom")
+    assert ("nearest the centre" in ctx) == (kind == "zoom")
+
+
+def test_window_payload_upscales_small_images_to_jevs_minimum():
+    _payload, sizes = jev_reader.build_jev_window_payload(
+        "jev-1.14.0", _jpeg(240, 240), "wide", RED, BLUE)
+    assert sizes == [(280, 280)]
+
+
+def test_lineup_payload_has_two_referenced_assets():
+    payload, sizes = jev_reader.build_jev_lineup_payload(
+        "jev-1.14.0", _jpeg(1536, 1440), _jpeg(960, 960), ["A", "B", "C"])
+    assert payload["state"]["lineup"] == "lineup_image"
+    assert payload["state"]["crops"] == "crops_image"
+    assert set(payload["assets"]) == {"lineup_image", "crops_image"}
+    assert sizes == [(1536, 1440), (960, 960)]
+    crit = payload["questions"]["who"]["criteria"]
+    assert list(crit) == ["A", "B", "C", "none", "unsure"]
+    ctx = payload["state"]["context"]
+    assert "shows 3 FRC robots" in ctx and "labelled A to C" in ctx
+    assert "Yellow balls" in ctx
+
+
+def test_estimate_tokens_accepts_one_size_or_a_list():
+    payload = {"state": {"context": "x" * 190}, "questions": {}}
+    one = jev_reader.jev_estimate_tokens(payload, (415, 100))
+    two = jev_reader.jev_estimate_tokens(payload, [(415, 100), (415, 200)])
+    assert two - one == 200
+
+
+def test_ask_returns_probabilities_in_order_and_counts_usage(monkeypatch):
+    fake = _install(monkeypatch, FakeJev(_ok(_who({"A": 0.9, "unsure": 0.1}), 4000)))
+    s = _session(concurrency=1)
+    items = [jev_reader.build_jev_lineup_payload("jev-1.14.0", _jpeg(400, 300), _jpeg(300, 300), ["A"])
+             for _ in range(3)]
+    out = s.ask(items, "who")
+    assert [o["probs"]["A"] for o in out] == [0.9, 0.9, 0.9]
+    assert len(fake.calls) == 3
+    assert fake.calls[0]["headers"]["TypeSafe-Danger-Zone-Images"] == "true"
+    st = s.stats()
+    assert st["requests"] == 3 and st["input_tokens"] == 12000 and st["errors"] == 0
+
+
+def test_ask_reports_errors_without_raising_and_latches_on_auth(monkeypatch):
+    _install(monkeypatch, FakeJev((400, "bad payload")))
+    s = _session(concurrency=1)
+    item = jev_reader.build_jev_window_payload("jev-1.14.0", _jpeg(480, 480), "wide", RED, BLUE)
+    out = s.ask([item, item], "team")
+    assert all("error" in o for o in out) and s.stats()["errors"] == 2 and s.available
+
+    _install(monkeypatch, FakeJev((401, "nope")))
+    s2 = _session(concurrency=1)
+    out2 = s2.ask([item, item], "team")
+    assert all("error" in o for o in out2) and not s2.available
+    assert TOKEN not in json.dumps(out2)
+
+
+def test_ask_missing_question_is_an_error(monkeypatch):
+    _install(monkeypatch, FakeJev(_ok(_who({"A": 1.0}))))
+    s = _session(concurrency=1)
+    item = jev_reader.build_jev_window_payload("jev-1.14.0", _jpeg(480, 480), "wide", RED, BLUE)
+    assert "error" in s.ask([item], "team")[0]

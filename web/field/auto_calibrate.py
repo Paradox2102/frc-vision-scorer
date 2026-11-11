@@ -79,6 +79,10 @@ class AutoCalibConfig:
     jev_verify: bool = True
     jev_min_p: float = 0.6
     locate_init_model: str = "pp_k1"
+    # A fresh full solve frees the lens; tags clustered on one structure (a hub
+    # corner spans ~0.6-0.9 m) fit perfectly yet extrapolate wildly (2026casnd
+    # corner_left). Below this field-space spread a full solve is never "ready".
+    min_full_solve_spread_m: float = 2.0
 
 
 @dataclass
@@ -174,6 +178,16 @@ def download_match_video(video_key: str, out_path: Path) -> Path:
     return out_path
 
 
+def tag_spread_m(fm, tag_ids) -> float:
+    """Largest field-plane (x, y) distance between any two of ``tag_ids`` (metres);
+    0 for fewer than two known tags. How much of the field the tags constrain."""
+    pts = [np.asarray(fm.tag_translation(t), float)[:2] for t in tag_ids if t in fm.tags]
+    if len(pts) < 2:
+        return 0.0
+    P = np.stack(pts)
+    return float(np.max(np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)))
+
+
 def later_reference_videos(event_key: str, matches, after_key: str, dirs=None,
                            download_dir=None, downloader: Callable = None, limit: int = 3):
     """Yield (match_key, video_path) for matches AFTER ``after_key`` (match order) to
@@ -243,8 +257,12 @@ def make_detect_fn():
 
     def detect(frame_bgr):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # quad_decimate=1: the default (2) halves the image before finding tag
+        # outlines, which erases the ~25 px tags of distant corner cameras
+        # (2026casnd corner_right: 0 tags at 2, tags 5/8/9/10 at 1). ~5 ms per
+        # corner crop, ~30 ms per main crop.
         return {int(d.tag_id): np.asarray(d.corners, float)
-                for d in thread_detector().detect(gray)}
+                for d in thread_detector(quad_decimate=1.0).detect(gray)}
     return detect
 
 
@@ -659,15 +677,51 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                           f"only {len(corr)} known tags found across {match_key} "
                           f"(need >= {cfg.min_tags}) — calibrate manually",
                           None, None, None)
-        try:
-            cal = Calibrator.solve_camera_from_tags(corr, image_size, cfg.field_season)
-        except CalibrationError as e:
-            return finish("failed", "full_solve", f"full solve failed: {e}",
+        # Start from the CONSTRAINED lens model (the locator's best extrapolator), not
+        # a fully free one: if the locator then finds nothing, the free model would
+        # be kept — perfect on a tight cluster of tags, wild everywhere else.
+        from web.field import tag_locator as tl
+        cal, err = None, None
+        for model in (cfg.locate_init_model, "pp_k0"):
+            try:
+                cal = tl.solve_model(corr, image_size, cfg.field_season, model)
+                break
+            except CalibrationError as e:
+                err = e
+        if cal is None:
+            return finish("failed", "full_solve", f"full solve failed: {err}",
                           None, None, None)
         how = f"full solve from {len(corr)} tags"
         if cfg.locate_undecoded and background is not None:
             cal, how = _grow_with_locator(cal, how, background, fm, corners, image_size,
                                           cfg, roi_detect_fn, judge, base, extra)
+        used = set(int(t) for t in corr) | {int(d["id"]) for d in extra.get("located") or []}
+        spread = tag_spread_m(fm, used)
+        if not extra.get("located") and spread >= cfg.min_full_solve_spread_m:
+            # The locator adds nothing but the decoded tags themselves are numerous and
+            # spread: free the lens as the locator would (k1, then full), keeping a
+            # freer model only if it fits clearly better without distortion fold-back.
+            for model in ("k1", "full"):
+                if len(corr) < tl.MODEL_MIN_TAGS[model]:
+                    break
+                try:
+                    c = tl.solve_model(corr, image_size, cfg.field_season, model, prev=cal)
+                except CalibrationError:
+                    continue
+                pts = np.vstack([np.asarray(i, float).reshape(-1, 2) for i, _ in corr.values()])
+                if (c.rms_error < 0.8 * cal.rms_error
+                        and tl.distortion_monotonic(c, image_size, pts)):
+                    cal = c
+                    how = f"{how}, model {model}"
+        extra["notes"].append(f"tags span {spread:.1f} m of the field")
+        if spread < cfg.min_full_solve_spread_m:
+            val = validate(cal)
+            return finish("failed", "full_solve",
+                          f"{how}: the tags only span {spread:.1f} m of the field (one "
+                          f"structure) — that can't determine the lens (needs >= "
+                          f"{cfg.min_full_solve_spread_m:.1f} m); correct manually by "
+                          f"clicking a few far tags",
+                          cal, val, cal)
         val = validate(cal)
         gate = val["gate_best_m"]
         if gate is None or gate >= cfg.drift_max_m:

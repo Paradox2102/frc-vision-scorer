@@ -204,6 +204,7 @@ class Options:
     digit_cache: Optional[str] = None               # file: read, or created on first run
     use_elimination: bool = True
     alliance_rows: bool = False
+    deinterlace: bool = False                       # window_labels_deinterlace
 
 
 def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: Options,
@@ -239,7 +240,7 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
         event_lineup=opts.event_lineup, borrowed=borrowed,
         this_colors={**{t: "red" for t in red}, **{t: "blue" for t in blue}},
         use_elimination=opts.use_elimination, rows_alliance_only=opts.alliance_rows,
-        digit_calls=cache)
+        digit_calls=cache, deinterlace=opts.deinterlace)
     result = wl.run_window_labels(meta["frames"], str(video), cal, session, params,
                                   frame_source=frame_source)
     out = {"result": result, "relabelled": None, "stats": dict(result["stats"]),
@@ -334,6 +335,9 @@ def main(argv=None) -> None:
     ap.add_argument("--no-elim", action="store_true", help="ablation: no elimination anchors")
     ap.add_argument("--alliance-rows", action="store_true",
                     help="ablation: one lineup card per alliance")
+    ap.add_argument("--deinterlace", action="store_true",
+                    help="deinterlace combed tiles (the window_labels_deinterlace knob); "
+                         "digit calls cached without it are not reused")
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")
@@ -358,7 +362,7 @@ def main(argv=None) -> None:
                    event_lineup=args.event_lineup, namespace=args.namespace,
                    before_match=args.before_match, store_write=args.store_write,
                    digit_cache=args.digit_cache, use_elimination=not args.no_elim,
-                   alliance_rows=args.alliance_rows)
+                   alliance_rows=args.alliance_rows, deinterlace=args.deinterlace)
     print(f"replay {row['id'][:8]}  {row['match_key']}  video {video.name}")
     t0 = time.time()
     out = relabel_one(row, meta, video, cal, red, blue, opts, session, fps=fps,

@@ -195,3 +195,13 @@ def test_the_digit_cache_write_leaves_no_temp_file(store, tmp_path):
 def test_a_bad_namespace_is_refused_before_anything_runs():
     with pytest.raises(SystemExit):
         rr.main(["--replay", "x", "--event-lineup", "--namespace", "../evil"])
+
+
+def test_deinterlace_option_reaches_the_stage(store):
+    frames = _lineup_frames()
+    on = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
+             rr.Options(deinterlace=True), store)
+    assert on["stats"]["tiles_deinterlaced"] == 0          # blank fake video: nothing combs
+    assert on["result"]["digit_calls"]["fingerprints"][0]["deinterlace"] is True
+    off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(), store)
+    assert "tiles_deinterlaced" not in off["stats"]

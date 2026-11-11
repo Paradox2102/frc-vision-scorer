@@ -249,7 +249,7 @@ def calibration_selection(event_key: str, match_key: Optional[str]) -> dict:
     """{camera: version_id} — the epoch the pipeline uses for this match
     (web/app.py uses select_epoch(load_versions(...), match_key))."""
     sel = {}
-    for name in load_layout():
+    for name in load_layout(event_key=event_key):
         chosen = select_epoch(field_store.load_versions(event_key, name), match_key)
         if chosen is not None:
             sel[name] = chosen["version_id"]

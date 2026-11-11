@@ -25,6 +25,7 @@ import re
 import shutil
 from PIL import Image
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -67,6 +68,7 @@ from web.field.calibration import (CameraCalibration, Calibrator, CalibrationErr
                                    holdout_field_error, tag_alignment_error, MIN_POSE_TAGS,
                                    push_from_camera)
 from web.field.pose_autofix import resolve_pose_from_video, PoseFixConfig
+from web.field import auto_calibrate
 from web.field.apriltag_detect import detect_tags
 from web.field.drift_monitor import DriftMonitor
 from web.field.composite_layout import load_layout
@@ -983,6 +985,11 @@ CALIB_CHECK_SAMPLE_FRAMES = int(os.environ.get("CALIB_CHECK_SAMPLE_FRAMES", "5")
 # operator approves (promotes to a new epoch) or rejects (falls back to today's
 # manual recalibration). Set to 0 to keep the old abort-straight-to-manual behavior.
 CALIB_AUTOFIX_ENABLED = os.environ.get("CALIB_AUTOFIX_ENABLED", "1") not in ("0", "false", "False")
+# Auto-calibration on event load (docs/superpowers/specs/2026-11-10-auto-calibration-
+# review-design.md): loading an event schedules a background solve/verify per camera
+# whose result waits for operator confirmation on /calibrate. 0 disables the hook
+# (the /api/calibration/auto/run route still works).
+AUTO_CALIB_ON_LOAD = os.environ.get("AUTO_CALIB_ON_LOAD", "1") not in ("0", "false", "False")
 
 # Mid-match drift monitor: low-cadence AprilTag re-checks on frames the main
 # loop already decoded. Sustained drift WARNS and records (never aborts — the
@@ -6812,8 +6819,15 @@ class InferenceJob:
             return False
         versions = field_store.load_versions(self.event_key, self.camera)
         if not versions:
+            _auto = field_store.load_auto_record(self.event_key, self.camera) or {}
+            if _auto.get("status") == "ready":
+                _hint = "auto-calibration is awaiting confirmation at /calibrate."
+            elif _auto.get("status") == "running":
+                _hint = "auto-calibration is still running — check /calibrate."
+            else:
+                _hint = "Calibrate the camera first."
             self.error = (f"No calibration found for event '{self.event_key}' "
-                          f"camera '{self.camera}'. Calibrate the camera first.")
+                          f"camera '{self.camera}'. {_hint}")
             print(f"  FIELD TRACKING DISABLED: {self.error}")
             return False
         chosen = select_epoch(versions, self.match_key)
@@ -6912,12 +6926,13 @@ class InferenceJob:
             elif self.config.auto_period_only and self.match_key:
                 print(f"  [manta] auto-only run but no cached Manta paths for {self.match_key}")
             selection = {}
-            for _name in load_layout().keys():
+            for _name in load_layout(event_key=self.event_key).keys():
                 _vs = field_store.load_versions(self.event_key, _name)
                 _pick = select_epoch(_vs, self.match_key)
                 if _pick is not None:
                     selection[_name] = _pick["version_id"]
             self.views = load_views(self.event_key, selection=selection)  # main first; corners if calibrated
+            self._view_selection = dict(selection)
             print(f"  Cameras active: {[v.name for v in self.views]}")
             # Per-camera ground position, for the vote ray-consistency gate
             # (identity_confidence.vote_ray_cross_m): a bumper crop's own
@@ -6927,11 +6942,7 @@ class InferenceJob:
             # so those cameras are simply absent from the map and the gate
             # no-ops for their evidence (see call site's `center is not None`
             # guard).
-            self._camera_centers_xy = {}
-            for v in self.views:
-                cc = v.calibration.camera_center if v.calibration else None
-                if cc is not None:
-                    self._camera_centers_xy[v.name] = (float(cc[0]), float(cc[1]))
+            self._refresh_camera_centers()
         except Exception as e:
             self.error = f"Failed to initialize field tracking: {e}"
             print(f"  FIELD TRACKING DISABLED: {self.error}")
@@ -6945,6 +6956,111 @@ class InferenceJob:
         print(f"  Field tracking ENABLED: event={self.event_key} camera={self.camera} "
               f"season={cal.field_season} mode={cal.mode}")
         return True
+
+    def _refresh_camera_centers(self) -> None:
+        self._camera_centers_xy = {}
+        for v in self.views:
+            cc = v.calibration.camera_center if v.calibration else None
+            if cc is not None:
+                self._camera_centers_xy[v.name] = (float(cc[0]), float(cc[1]))
+
+    def _corner_per_match_step(self) -> dict:
+        """corner_per_match_calib: decide each CORNER view's calibration for THIS
+        match before tracking (web/field/corner_per_match.py) — keep the covering
+        epoch when it checks out, else re-solve from this match's footage and adopt
+        it as a new version anchored at the match (used immediately), else drop the
+        corner view from this job (corner_drop_on_fail). Main is untouched (it has
+        the drift check + staged autofix). Logs every outcome per (event, camera,
+        match) for the calibrate page. Returns {camera: outcome summary}."""
+        self._corner_calib_outcomes = {}
+        cfg = getattr(self, "config", None)
+        if (not getattr(cfg, "corner_per_match_calib", False) or not self.match_key
+                or not self.event_key or not self.processing_ranges
+                or self.field_model is None):
+            return self._corner_calib_outcomes
+        corners = [v for v in self.views if v.name != "main"]
+        if not corners:
+            return self._corner_calib_outcomes
+        from web.field import corner_per_match as cpm
+        t0 = time.perf_counter()
+        frange = (int(self.processing_ranges[0][0]), int(self.processing_ranges[-1][1]))
+        fps = float(self.video_fps or 30.0)
+        ccfg = cpm.CornerStepConfig(check_max_m=float(cfg.corner_check_max_m),
+                                    resolve_max_m=float(cfg.corner_resolve_max_m))
+        drop = bool(cfg.corner_drop_on_fail)
+        judge = _auto_calib_judge()
+        sel = getattr(self, "_view_selection", None) or {}
+        for v in corners:
+            versions = field_store.load_versions(self.event_key, v.name)
+            epoch = (next((x for x in versions if x["version_id"] == sel.get(v.name)), None)
+                     or select_epoch(versions, self.match_key))
+            if epoch is None:
+                continue
+            prior = field_store.load_permatch_log(self.event_key, v.name).get(self.match_key) or {}
+            rejected = prior.get("status") == "rejected"
+            # Fallback lens: the covering NON-per-match version (operator / event
+            # auto-calibration), in case a chain of per-match adoptions carries a
+            # poorly conditioned lens.
+            base = select_epoch([x for x in versions
+                                 if (x.get("source") or {}).get("method") != "auto_per_match"],
+                                self.match_key)
+            alts = [base] if base is not None and base["version_id"] != epoch["version_id"] else []
+            try:
+                out = cpm.corner_step(self.video_path, self.match_key, v.name, v.crop,
+                                      v.masks, self.field_model, epoch, frange, fps, ccfg,
+                                      judge=judge, rejected=rejected, drop_on_fail=drop,
+                                      alt_epochs=alts)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                out = cpm.CornerOutcome("dropped" if drop else "failed_kept",
+                                        f"corner step error: {type(e).__name__}: {e}",
+                                        epoch["version_id"])
+            new_vid = None
+            if out.status == "adopted":
+                new_vid = field_store.save_version(
+                    self.event_key, v.name, out.calibration, start_match=self.match_key,
+                    label=cpm.LABEL,
+                    source=_version_source(self.event_key, v.name, {
+                        "method": "auto_per_match", "crop": [int(c) for c in v.crop],
+                        "auto_tags": out.auto_tags, "manual_tags": out.manual_tags,
+                        "metrics": out.metrics, "match_key": self.match_key,
+                        "base_epoch": epoch["version_id"]}))
+                v.calibration = out.calibration
+                sel[v.name] = new_vid
+            elif out.status == "dropped":
+                self.views = [x for x in self.views if x is not v]
+            preview = None
+            if out.overlay is not None:
+                try:
+                    preview = field_store.save_permatch_preview(
+                        self.event_key, v.name, self.match_key,
+                        auto_calibrate.encode_jpeg(out.overlay, 85))
+                except Exception as e:
+                    print(f"  [corner-calib] {v.name}: preview not saved: {e}")
+            entry = {"status": "rejected" if rejected else out.status,
+                     "job_outcome": out.status,
+                     "version_id": new_vid, "epoch_checked": out.epoch_checked,
+                     "metrics": out.metrics, "reason": out.reason, "preview": preview,
+                     "seconds": round(out.seconds, 1),
+                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            if rejected:       # the operator's decision persists across re-runs
+                entry["rejected_version"] = prior.get("rejected_version") or prior.get("version_id")
+                entry["prev_status"] = prior.get("prev_status")
+                entry["rejected_at"] = prior.get("rejected_at")
+            field_store.save_permatch_entry(self.event_key, v.name, self.match_key, entry)
+            self._corner_calib_outcomes[v.name] = {
+                "status": out.status, "version_id": new_vid or (
+                    out.epoch_checked if out.status in ("kept", "failed_kept") else None),
+                "epoch_checked": out.epoch_checked, "reason": out.reason,
+                "metrics": out.metrics, "seconds": round(out.seconds, 1)}
+            print(f"  [corner-calib] {v.name} {self.match_key}: {out.status.upper()} "
+                  f"({out.seconds:.0f}s) — {out.reason}")
+        self._view_selection = sel
+        self._refresh_camera_centers()
+        self.timings["corner_calib"] = round(time.perf_counter() - t0, 2)
+        print(f"  Cameras active after corner step: {[v.name for v in self.views]}")
+        return self._corner_calib_outcomes
 
     def _mirror_event_to_replay(self) -> None:
         """Mirror the most recently appended scoring event into the replay recorder."""
@@ -7015,8 +7131,12 @@ class InferenceJob:
             config = dict(cfg.non_defaults()) if cfg is not None else {}
         except Exception:
             config = {}
-        return {"config": config, "stopped": bool(getattr(self, "_stopped", False)),
-                "calibration_version": getattr(self, "_calib_version_id", None)}
+        out = {"config": config, "stopped": bool(getattr(self, "_stopped", False)),
+               "calibration_version": getattr(self, "_calib_version_id", None)}
+        corners = getattr(self, "_corner_calib_outcomes", None)
+        if corners:          # per-match corner step outcome (kept / adopted / dropped)
+            out["corner_calibration"] = corners
+        return out
 
     def _new_replay_recorder(self) -> ReplayRecorder:
         """hud_post_render on: metadata-only recorder + draw list (the video is
@@ -7704,6 +7824,10 @@ class InferenceJob:
                         pass
                 return
             self._raise_if_stopped()  # phase boundary: after calibration check
+            # Per-match corner calibration (knob corner_per_match_calib): keep /
+            # re-solve+adopt / drop each corner view before tracking uses it.
+            await asyncio.to_thread(self._corner_per_match_step)
+            self._raise_if_stopped()  # phase boundary: after corner calibration
             # ----- SAM2 PRE-COMPUTATION PASS -----
             self.use_sam2 = False
             self.sam2_raw = {}
@@ -9754,6 +9878,7 @@ class InferenceJob:
                 "degradation_warnings": getattr(self, "degradation_warnings", []),
                 # A/B provenance: every knob that differed from the code default.
                 "config": self.config.non_defaults(),
+                "corner_calibration": getattr(self, "_corner_calib_outcomes", {}),
             }))
         
         except (JobStopped, TrackStopped):
@@ -10555,7 +10680,8 @@ async def save_calibration_masks(request: Request):
         # "no calibration -> default" branch).
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
         cal.masks = [tuple(m) for m in masks]
-        field_store.save_version(event, camera, cal, start_match=None)
+        field_store.save_version(event, camera, cal, start_match=None,
+                                 source=_version_source(event, camera))
         return {"status": "ok", "masks": cal.masks}
     target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
     if target is None:
@@ -10584,7 +10710,8 @@ async def save_robot_track_top_crop(request: Request):
     if not versions:
         cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
         cal.robot_track_top_crop = crop
-        field_store.save_version(event, camera, cal, start_match=None)
+        field_store.save_version(event, camera, cal, start_match=None,
+                                 source=_version_source(event, camera))
         return {"status": "ok", "robot_track_top_crop": cal.robot_track_top_crop}
     target = next((v for v in versions if v["version_id"] == version_id), None) if version_id else None
     if target is None:
@@ -10635,7 +10762,8 @@ async def calibration_manual(request: Request):
     if existing is not None:
         cal.masks = existing.masks
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label,
+                             source=_version_source(event, camera, {"method": "manual"}))
     return {"status": "ok", "rms_error": cal.rms_error}
 
 
@@ -10683,7 +10811,8 @@ async def calibration_auto(request: Request):
     if prev is not None:
         cal.masks = prev["calibration"].masks
         cal.robot_track_top_crop = prev["calibration"].robot_track_top_crop
-    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label,
+                             source=_version_source(event, camera, {"method": "pose_auto"}))
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr)}
 
 
@@ -10730,16 +10859,26 @@ def _match_stream_url(match_key: str):
         return None, f"Stream resolve failed: {e}"
 
 
-def _read_composite_frame(body: dict):
+def _read_composite_frame(body: dict, info: Optional[dict] = None):
     """Read the full composite frame a calibration request refers to.
     Source precedence: match_key (the loaded event's YouTube video for that
     match, single-frame ffmpeg extract — needed when recalibrating a moved
     camera against footage from that match) > video_path (local file restricted
-    to data/test_footage/) > CALIB_TEST_VIDEO.
+    to data/test_footage/) > CALIB_TEST_VIDEO. Local match footage
+    (data/test_footage|videos/<match_key>.mp4) is preferred over the stream.
+    ``body.aggregate`` (local sources only): return the temporal median of the frames
+    at 1 s steps within ts +/- 15 s instead of one frame; ``info["aggregated"]`` is
+    set when that happened.
     Returns (frame_bgr, None) on success or (None, error_message)."""
+    aggregate = bool(body.get("aggregate"))
     import subprocess
     ts = float(body.get("timestamp", 75))
     match_key = body.get("match_key")
+    # Local footage for the match (data/test_footage/<key>.mp4 or data/videos/<key>.mp4)
+    # wins over resolving a YouTube stream: same timestamps, no yt-dlp (which 403s).
+    local = auto_calibrate.local_video_for(match_key) if match_key else None
+    if local is not None:
+        return _read_local_video_frame(local, ts, aggregate, info)
     if match_key:
         stream_url, err = _match_stream_url(match_key)
         if err:
@@ -10774,6 +10913,63 @@ def _read_composite_frame(body: dict):
         path = candidate
     if not path.exists():
         return None, "video not found"
+    return _read_local_video_frame(path, ts, aggregate, info)
+
+
+_calib_median_cache: dict = {}
+_calib_median_lock = threading.Lock()
+CALIB_MEDIAN_TTL_S = 600.0
+CALIB_MEDIAN_HALF_S = 15.0
+
+
+def _median_local_frame(path, ts: float):
+    """Temporal median of the FULL composite frame over 1 s steps in [ts-15, ts+15]
+    (clamped to the video) — robots/balls/people in front of a tag vanish. Cached
+    ~10 min per (file, ts) so refine-tag reuses the frame /frame returned (the cache
+    is per source, not per camera: every camera crops the same composite)."""
+    key = (str(Path(path).resolve()), round(float(ts), 2))
+    now = time.time()
+    with _calib_median_lock:
+        for k in [k for k, v in _calib_median_cache.items() if v[0] < now]:
+            _calib_median_cache.pop(k, None)
+        hit = _calib_median_cache.get(key)
+        if hit is not None:
+            return hit[1], None
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    dur = n / fps if n > 0 else ts
+    frames = []
+    try:
+        t = max(0.0, ts - CALIB_MEDIAN_HALF_S)
+        t_end = min(dur, ts + CALIB_MEDIAN_HALF_S)
+        while t <= t_end + 1e-6:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+            ok, fr = cap.read()
+            if ok and fr is not None and (not frames or fr.shape == frames[0].shape):
+                frames.append(fr)
+            t += 1.0
+    finally:
+        cap.release()
+    if not frames:
+        return None, "could not read frames for the median"
+    med = auto_calibrate.median_of_frames(frames)
+    with _calib_median_lock:
+        if len(_calib_median_cache) >= 8:
+            _calib_median_cache.pop(min(_calib_median_cache,
+                                        key=lambda k: _calib_median_cache[k][0]), None)
+        _calib_median_cache[key] = (now + CALIB_MEDIAN_TTL_S, med)
+    return med, None
+
+
+def _read_local_video_frame(path, ts: float, aggregate: bool = False, info=None):
+    """(frame_bgr, None) at ``ts`` seconds of a local video, or (None, error).
+    ``aggregate``: the temporal median of nearby frames instead (``_median_local_frame``)."""
+    if aggregate:
+        frame, err = _median_local_frame(path, ts)
+        if frame is not None and info is not None:
+            info["aggregated"] = True
+        return frame, err
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
@@ -10866,7 +11062,7 @@ async def calibration_autofix_preview(request: Request):
     frame, err = await asyncio.to_thread(_read_composite_frame, frame_body)
     if err:
         return JSONResponse(status_code=400, content={"error": err})
-    cl = load_layout().get(camera)
+    cl = _auto_calib_layout(event).get(camera)
     if cl is None:
         return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
     cx, cy, cw, ch = cl.crop
@@ -10920,8 +11116,9 @@ async def calibration_autofix_approve(request: Request):
     version_id = field_store.save_version(
         event, camera, cal, start_match=match_key,
         label=body.get("label") or "auto-fix (pose re-solve)",
-        source={"autofix": True, "base_epoch": pending.get("base_epoch"),
-                "summary": pending.get("summary")})
+        source=_version_source(event, camera, {
+            "autofix": True, "base_epoch": pending.get("base_epoch"),
+            "summary": pending.get("summary")}))
     if match_key:
         field_store.clear_drift(event, camera, match_key)
         field_store.clear_pending_autofix(event, camera, match_key)
@@ -10941,6 +11138,571 @@ async def calibration_autofix_reject(request: Request):
     field_store.clear_pending_autofix(event, camera, match_key)
     q = f"?match={match_key}&camera={camera}" if match_key else f"?camera={camera}"
     return {"status": "ok", "redirect": f"/calibrate{q}"}
+
+
+# --- Auto-calibration on event load ------------------------------------------
+# Spec: docs/superpowers/specs/2026-11-10-auto-calibration-review-design.md.
+# One background asyncio task per event; the heavy per-camera work runs in a worker
+# thread. Results are REVIEW records (field_store.*_auto_record) — nothing becomes a
+# calibration version until the operator confirms it (or saves a manual solve).
+
+_auto_calib_tasks: Dict[str, "asyncio.Task"] = {}
+_AUTO_CALIB_SEASON = "2026-rebuilt-welded"
+
+
+def _auto_calib_layout(event: Optional[str]):
+    """The composite layout for ``event``: its own record when usable (status
+    auto/confirmed — layouts differ between events), else the global default."""
+    return load_layout(event_key=event) if event else load_layout()
+
+
+def _version_source(event: Optional[str], camera: str, source: Optional[dict] = None) -> dict:
+    """``source`` for a new calibration version plus ``crop``: the crop (composite
+    px) it was solved in. Calibrations are crop-local pixels, so the crop origin is
+    part of every calibration — the layout step refuses to move it under them."""
+    out = dict(source or {})
+    cl = _auto_calib_layout(event).get(camera)
+    if cl is not None and not out.get("crop"):
+        out["crop"] = [int(v) for v in cl.crop]
+    return out
+
+
+_layout_locks: Dict[str, "asyncio.Lock"] = {}
+
+
+def _layout_lock(event: str) -> "asyncio.Lock":
+    """Serialises writes of an event's layout record (detection, manual save)."""
+    lock = _layout_locks.get(event)
+    if lock is None:
+        lock = _layout_locks[event] = asyncio.Lock()
+    return lock
+
+
+def _auto_calib_running(event: str) -> bool:
+    t = _auto_calib_tasks.get(event)
+    return t is not None and not t.done()
+
+
+def _auto_calib_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _auto_calib_mark_manual(event: str, camera: str, version_id: str) -> None:
+    """A manual solve-tags save resolves a ready/failed auto record for the camera."""
+    try:
+        rec = field_store.load_auto_record(event, camera)
+        if rec and rec.get("status") in ("ready", "failed"):
+            field_store.update_auto_record(
+                event, camera, status="confirmed", reason="corrected manually",
+                resolved_version=version_id, resolved_at=_auto_calib_now())
+    except Exception as e:
+        print(f"[auto-calib] could not mark {event}/{camera} corrected: {e}")
+
+
+def _auto_calib_judge():
+    """Jev tag-kind judge for the undecoded-tag locator, or None when the Jev token
+    is not configured (the locator then keeps ROI decodes only and says so)."""
+    if not os.environ.get("JEV_TYPESAFE_API_TOKEN"):
+        return None
+    try:
+        from web.field import tag_locator
+        return tag_locator.make_jev_judge(jev_reader.JevSession())
+    except Exception as e:
+        print(f"[auto-calib] Jev judge unavailable: {e}")
+        return None
+
+
+def _auto_calib_pick_steady(event: str, camera: str, match_key: str, video, cl, cfg,
+                            matches=()):
+    """(match_key, video, moved_notes) for this camera: the reference match unless the
+    camera was re-aimed DURING it — one calibration cannot fit both framings — in
+    which case the first later match (local footage first, then a download) where it
+    held still. ``moved_notes`` lists every match it moved on."""
+    from web.field import camera_motion
+    detect = auto_calibrate.make_detect_fn()
+    notes = []
+    cands = auto_calibrate.later_reference_videos(
+        event, matches, match_key, downloader=auto_calibrate.download_match_video)
+    for mk, path in [(match_key, video), *cands]:
+        try:
+            mot = camera_motion.detect_camera_move(path, cl.crop, cfg.window, detect)
+        except Exception as e:
+            print(f"[auto-calib] {event}/{camera}: motion check on {mk} failed: {e}")
+            return mk, path, notes
+        if not mot["moved"]:
+            return mk, path, notes
+        notes.append({"match": mk, "t_s": mot["t_s"], "shift_px": mot["shift_px"]})
+        print(f"[auto-calib] {event}/{camera}: {camera_motion.describe(mot)} on {mk} — "
+              f"trying a later match")
+    return match_key, video, notes        # no steady match found: report on the reference
+
+
+def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
+                           cl, fm, matches=()) -> dict:
+    """Worker-thread body for one camera: solve/verify, persist record + overlay."""
+    # Corners are held to the same gate as the job-time per-match corner check
+    # (corner_check_max_m), not main's looser drift gate: a corner "verified" at
+    # 0.48 m (2026hop qm4) is not usable.
+    gate = (CALIB_DRIFT_MAX_M if camera == "main"
+            else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
+    cfg = auto_calibrate.AutoCalibConfig(
+        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
+        field_season=_AUTO_CALIB_SEASON)
+    ref_key = match_key
+    match_key, video, moved = _auto_calib_pick_steady(event, camera, match_key, video,
+                                                      cl, cfg, matches)
+    versions = field_store.load_versions(event, camera)
+    epoch = select_epoch(versions, match_key) if versions else None
+    masks = (epoch["calibration"].masks if epoch is not None and epoch["calibration"].masks
+             else cl.masks)
+    res = auto_calibrate.run_camera(video, match_key, camera, cl.crop, fm, versions,
+                                    cfg=cfg, masks=masks, judge=_auto_calib_judge())
+    rec = res.record
+    if moved:
+        rec["moved_mid_match"] = moved
+        where = ", ".join(f"{n['match']} (~{n['t_s']:.0f} s, {n['shift_px']:.0f} px)"
+                          for n in moved)
+        if match_key != ref_key:
+            note = f"camera moved mid-match on {where} — calibrated on {match_key} instead"
+        else:
+            note = (f"camera moved mid-match on {where} and no steady later match was "
+                    f"found — check carefully")
+            if rec.get("status") in ("ready", "verified"):
+                rec["status"] = "failed"
+        rec["reason"] = f"{note}; {rec.get('reason', '')}"
+    rec["crop"] = [int(v) for v in cl.crop]      # the crop this candidate is solved in
+    rec["preview"] = None
+    rec["frame"] = None
+    if res.overlay is not None:
+        rec["preview"] = field_store.save_auto_preview(
+            event, camera, auto_calibrate.encode_jpeg(res.overlay))
+    if res.median is not None:
+        rec["frame"] = field_store.save_auto_frame(
+            event, camera, auto_calibrate.encode_jpeg(res.median))
+    field_store.save_auto_record(event, camera, rec)
+    return rec
+
+
+async def _run_auto_calibrate(event: str, matches: list, cameras=None,
+                              force: bool = False) -> None:
+    """Auto-calibrate every (or the given) layout camera of ``event`` sequentially.
+    Skips cameras whose record is ready/verified/confirmed unless ``force``. One
+    camera failing never stops the others; every failure lands in its record."""
+    layout = _auto_calib_layout(event)
+    # Every camera the default OR the event layout knows: one the event's broadcast
+    # turns out not to have still gets a (failed) record saying so.
+    names = list(cameras or dict.fromkeys(list(layout) + list(load_layout())))
+    todo = []
+    for cam in names:
+        why = auto_calibrate.skip_reason(field_store.load_auto_record(event, cam), force)
+        if why:
+            print(f"[auto-calib] {event}/{cam}: {why} — skipped")
+            continue
+        todo.append(cam)
+    if not todo:
+        return
+    for cam in todo:
+        field_store.save_auto_record(event, cam, auto_calibrate.new_record(
+            "running", "queued — finding reference footage"))
+    print(f"[auto-calib] {event}: cameras {todo} (force={force})")
+    try:
+        match_key, video = await asyncio.to_thread(
+            auto_calibrate.resolve_reference_video, event, matches,
+            downloader=auto_calibrate.download_match_video)
+    except Exception as e:
+        reason = (str(e) if isinstance(e, auto_calibrate.AutoCalibError)
+                  else f"reference footage failed: {e}")
+        print(f"[auto-calib] {event}: {reason}")
+        for cam in todo:
+            field_store.save_auto_record(event, cam,
+                                         auto_calibrate.new_record("failed", reason))
+        return
+    print(f"[auto-calib] {event}: reference match {match_key} ({video})")
+    # Layout step (once per event, before any camera): detect this broadcast's
+    # composite tiling unless the event already has a layout record.
+    try:
+        async with _layout_lock(event):
+            await asyncio.to_thread(auto_calibrate.ensure_event_layout, event, video)
+    except Exception as e:
+        print(f"[auto-calib] {event}: layout detection failed ({e}) — using the "
+              f"existing/default layout")
+    layout = _auto_calib_layout(event)
+    fm = FieldModel.load(_AUTO_CALIB_SEASON)
+    for cam in todo:
+        if cam not in layout:
+            field_store.save_auto_record(event, cam, auto_calibrate.new_record(
+                "failed", "camera not present in this event's broadcast layout",
+                match_key=match_key))
+            print(f"[auto-calib] {event}/{cam}: not in the event layout — skipped")
+            continue
+        field_store.save_auto_record(event, cam, auto_calibrate.new_record(
+            "running", f"aggregating AprilTags on {match_key}", match_key=match_key))
+        t0 = time.time()
+        try:
+            rec = await asyncio.to_thread(_auto_calibrate_camera, event, cam,
+                                          match_key, video, layout[cam], fm, matches)
+            print(f"[auto-calib] {event}/{cam}: {rec['status']} ({rec.get('method')}) "
+                  f"in {time.time() - t0:.0f}s — {rec.get('reason')}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            reason = (str(e) if isinstance(e, auto_calibrate.AutoCalibError)
+                      else f"{type(e).__name__}: {e}")
+            print(f"[auto-calib] {event}/{cam}: failed — {reason}")
+            field_store.save_auto_record(event, cam, auto_calibrate.new_record(
+                "failed", reason, match_key=match_key))
+
+
+def _auto_calib_task_done(event: str, task) -> None:
+    if _auto_calib_tasks.get(event) is task:
+        _auto_calib_tasks.pop(event, None)
+    if not task.cancelled() and task.exception() is not None:
+        print(f"[auto-calib] {event}: run crashed: {task.exception()!r}")
+
+
+def _schedule_auto_calibrate(event: str, matches, cameras=None,
+                             force: bool = False) -> bool:
+    """Start the background run for ``event``. Returns False (and starts nothing) if
+    one is already in progress. Must be called from the event loop."""
+    if _auto_calib_running(event):
+        return False
+    task = asyncio.get_running_loop().create_task(
+        _run_auto_calibrate(event, list(matches or []), cameras, force))
+    _auto_calib_tasks[event] = task
+    task.add_done_callback(lambda t, e=event: _auto_calib_task_done(e, t))
+    return True
+
+
+def _auto_calib_public(rec: dict) -> dict:
+    return {k: v for k, v in rec.items() if k != "calibration"}
+
+
+@app.get("/api/calibration/auto/status")
+async def calibration_auto_status(event: str):
+    """{event, running, cameras: {cam: record-without-calibration}}; cameras with no
+    record are omitted. A ``running`` record with no live task (server restarted
+    mid-run) is reported — and persisted — as failed so the page stops polling."""
+    running = _auto_calib_running(event)
+    cams = {}
+    for cam in _auto_calib_layout(event):
+        rec = field_store.load_auto_record(event, cam)
+        if rec is None:
+            continue
+        if rec.get("status") == "running" and not running:
+            rec = field_store.update_auto_record(
+                event, cam, status="failed",
+                reason="interrupted (server restarted mid-run) — re-run") or rec
+        cams[cam] = _auto_calib_public(rec)
+    return {"event": event, "running": running, "cameras": cams}
+
+
+@app.get("/api/calibration/auto/preview")
+async def calibration_auto_preview(event: str, camera: str = "main"):
+    """The auto-calibration overlay JPEG for (event, camera); 404 if none."""
+    rec = field_store.load_auto_record(event, camera)
+    path = field_store.auto_preview_path(event, camera)
+    if not rec or not rec.get("preview") or not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "no auto-calibration preview"})
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/calibration/auto/frame")
+async def calibration_auto_frame(event: str, camera: str = "main"):
+    """The raw temporal-median camera frame (no overlay) for (event, camera); 404 if none."""
+    rec = field_store.load_auto_record(event, camera)
+    path = field_store.auto_frame_path(event, camera)
+    if not rec or not rec.get("frame") or not path.is_file():
+        return JSONResponse(status_code=404, content={"error": "no auto-calibration frame"})
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/calibration/auto/run")
+async def calibration_auto_run(request: Request):
+    """(Re)start auto-calibration. Body: {event, camera?, force?}. ``force`` also
+    re-runs ready/verified/confirmed records. 409 while a run is in progress."""
+    body = await request.json()
+    event = body.get("event")
+    if not event:
+        return JSONResponse(status_code=400, content={"error": "event is required"})
+    camera = body.get("camera")
+    layout = _auto_calib_layout(event)
+    if camera and camera not in layout:
+        return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
+    if _auto_calib_running(event):
+        return JSONResponse(status_code=409, content={
+            "error": f"auto-calibration already running for {event}"})
+    matches = (current_event.get("matches") or []
+               if current_event and current_event.get("event_key") == event else [])
+    cameras = [camera] if camera else list(layout)
+    _schedule_auto_calibrate(event, matches, cameras, bool(body.get("force")))
+    return {"status": "started", "event": event, "cameras": cameras,
+            "force": bool(body.get("force"))}
+
+
+@app.post("/api/calibration/auto/confirm")
+async def calibration_auto_confirm(request: Request):
+    """Promote a ``ready`` auto-calibration to a new version. start_match is None if
+    the camera had no versions, else the reference match; masks + top crop carry
+    from the covering epoch. Body: {event, camera}."""
+    body = await request.json()
+    event = body.get("event"); camera = body.get("camera", "main")
+    rec = field_store.load_auto_record(event, camera) if event else None
+    if rec is None:
+        return JSONResponse(status_code=404, content={"error": "no auto-calibration record"})
+    if rec.get("status") != "ready" or not rec.get("calibration"):
+        return JSONResponse(status_code=400, content={
+            "error": f"only a ready auto-calibration can be confirmed "
+                     f"(status: {rec.get('status')})"})
+    cur = _auto_calib_layout(event).get(camera)
+    run_crop = rec.get("crop")
+    if run_crop and (cur is None or max(abs(int(run_crop[0]) - cur.crop[0]),
+                                        abs(int(run_crop[1]) - cur.crop[1]))
+                     > auto_calibrate.LAYOUT_ORIGIN_TOL_PX):
+        now = list(cur.crop) if cur is not None else None
+        return JSONResponse(status_code=409, content={
+            "error": f"the broadcast layout changed since this run (solved in crop "
+                     f"{list(run_crop)}, now {now}) — re-run auto-calibration"})
+    cal = CameraCalibration.from_json(rec["calibration"])
+    match_key = rec.get("match_key")
+    versions = field_store.load_versions(event, camera)
+    start_match = match_key if versions else None
+    prev = select_epoch(versions, match_key) if versions else None
+    if prev is not None:
+        cal.masks = prev["calibration"].masks
+        cal.robot_track_top_crop = prev["calibration"].robot_track_top_crop
+    version_id = field_store.save_version(
+        event, camera, cal, start_match=start_match, label="auto (confirmed)",
+        source=_version_source(event, camera, {
+            "auto_tags": rec.get("auto_tags") or {},
+            "manual_tags": rec.get("manual_tags") or [],
+            "holdout_ids": [], "timestamp": rec.get("timestamp"),
+            "match_key": match_key, "method": "auto",
+            "metrics": rec.get("metrics"),
+            "crop": list(run_crop) if run_crop else (list(cur.crop) if cur else None)}))
+    rec = field_store.update_auto_record(
+        event, camera, status="confirmed",
+        reason=f"confirmed ({rec.get('method')}) — version {version_id}",
+        resolved_version=version_id, resolved_at=_auto_calib_now())
+    print(f"[auto-calib] {event}/{camera}: confirmed -> version {version_id} "
+          f"(start_match={start_match})")
+    try:   # confirming a calibration also confirms the layout it was solved in
+        from web.field import composite_layout as _cl
+        lrec = _cl.load_event_layout_record(event)
+        if lrec and lrec.get("status") == "auto":
+            _cl.save_event_layout(event, lrec, status="confirmed",
+                                  source=lrec.get("source") or "detect",
+                                  **{k: lrec[k] for k in ("reason", "detected") if k in lrec})
+    except Exception as e:
+        print(f"[auto-calib] {event}: could not promote the layout record: {e}")
+    return {"status": "ok", "version_id": version_id, "start_match": start_match,
+            "record": _auto_calib_public(rec)}
+
+
+@app.post("/api/calibration/auto/dismiss")
+async def calibration_auto_dismiss(request: Request):
+    """Mark the auto record failed ("dismissed — calibrate manually"). Body: {event, camera}."""
+    body = await request.json()
+    event = body.get("event"); camera = body.get("camera", "main")
+    rec = field_store.load_auto_record(event, camera) if event else None
+    if rec is None:
+        return JSONResponse(status_code=404, content={"error": "no auto-calibration record"})
+    if rec.get("status") == "running" and _auto_calib_running(event):
+        return JSONResponse(status_code=409, content={
+            "error": "auto-calibration is still running for this camera"})
+    rec = field_store.update_auto_record(event, camera, status="failed",
+                                         reason="dismissed — calibrate manually")
+    return {"status": "ok", "record": _auto_calib_public(rec)}
+
+
+# --- Per-match corner calibration log ----------------------------------------
+
+@app.get("/api/calibration/per-match")
+async def calibration_per_match(event: str):
+    """{event, cameras: {camera: {match_key: entry}}} — what the job-time corner step
+    did per match (kept / adopted / dropped / failed_kept / rejected)."""
+    cams = {}
+    for cam in dict.fromkeys(list(_auto_calib_layout(event)) + list(load_layout())):
+        log = field_store.load_permatch_log(event, cam)
+        if log:
+            cams[cam] = log
+    return {"event": event, "cameras": cams}
+
+
+@app.get("/api/calibration/per-match/preview")
+async def calibration_per_match_preview(event: str, camera: str, match: str):
+    """Overlay JPEG (on the match's median frame) for one per-match entry; 404 if none."""
+    e = field_store.load_permatch_log(event, camera).get(match)
+    p = field_store.permatch_preview_path(event, camera, match)
+    if not e or not e.get("preview") or not p.is_file():
+        return JSONResponse(status_code=404, content={"error": "no per-match preview"})
+    return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/calibration/per-match/reject")
+async def calibration_per_match_reject(request: Request):
+    """Operator rejects a match's per-match corner result. An adopted version is
+    flagged rejected (load_versions / select_epoch then ignore it) and later jobs on
+    this match never re-adopt (the corner is dropped unless its covering epoch
+    checks out). Body: {event, camera, match}."""
+    body = await request.json()
+    event, camera, match = body.get("event"), body.get("camera"), body.get("match")
+    e = field_store.load_permatch_log(event, camera).get(match) if event and camera else None
+    if not e:
+        return JSONResponse(status_code=404, content={"error": "no per-match entry"})
+    if e.get("status") == "rejected":
+        return {"status": "ok", "entry": e}
+    vid = e.get("version_id")
+    if vid:
+        field_store.set_version_rejected(event, camera, vid, True)
+    e = field_store.update_permatch_entry(
+        event, camera, match, status="rejected", prev_status=e.get("status"),
+        rejected_version=vid, rejected_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    print(f"[corner-calib] {event}/{camera} {match}: rejected by operator (version {vid})")
+    return {"status": "ok", "entry": e}
+
+
+@app.post("/api/calibration/per-match/restore")
+async def calibration_per_match_restore(request: Request):
+    """Undo a reject: un-flag the version and restore the entry's previous status.
+    Body: {event, camera, match}."""
+    body = await request.json()
+    event, camera, match = body.get("event"), body.get("camera"), body.get("match")
+    e = field_store.load_permatch_log(event, camera).get(match) if event and camera else None
+    if not e:
+        return JSONResponse(status_code=404, content={"error": "no per-match entry"})
+    if e.get("status") != "rejected":
+        return {"status": "ok", "entry": e}
+    vid = e.get("rejected_version")
+    if vid:
+        field_store.set_version_rejected(event, camera, vid, False)
+    prev = e.get("prev_status") or ("adopted" if vid else e.get("job_outcome") or "kept")
+    e = field_store.update_permatch_entry(event, camera, match, status=prev,
+                                          version_id=vid or e.get("version_id"),
+                                          rejected_at=None)
+    return {"status": "ok", "entry": e}
+
+
+# --- Per-event broadcast layout ----------------------------------------------
+
+def _layout_payload(event: str) -> dict:
+    from web.field import composite_layout as _cl
+    rec = _cl.load_event_layout_record(event)
+    eff = _auto_calib_layout(event)
+    frame_size = (rec or {}).get("frame_size") or [1920, 1080]
+    if rec is not None:
+        rec = {k: v for k, v in rec.items() if k != "diag"}
+    return {"event": event, "record": rec,
+            "effective": {"cameras": {n: {"crop": list(c.crop),
+                                          "masks": [list(m) for m in c.masks]}
+                                      for n, c in eff.items()}},
+            "frame_size": frame_size,
+            "has_preview": _cl.event_layout_preview_path(event).is_file()}
+
+
+@app.get("/api/calibration/layout")
+async def calibration_layout(event: str):
+    """{event, record (event layout record without diag, or null), effective
+    layout (cameras with crop + masks, what load_layout(event_key) returns),
+    frame_size, has_preview}."""
+    return _layout_payload(event)
+
+
+@app.get("/api/calibration/layout/preview")
+async def calibration_layout_preview(event: str):
+    """JPEG of the composite median frame with the layout's crops + masks; 404 if none."""
+    from web.field import composite_layout as _cl
+    p = _cl.event_layout_preview_path(event)
+    if not p.is_file():
+        return JSONResponse(status_code=404, content={"error": "no layout preview"})
+    return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/calibration/layout")
+async def calibration_layout_save(request: Request):
+    """Manual layout correction. Body: {event, cameras: {name: {crop, masks?}},
+    frame_size?, force?} -> saved with status "confirmed". Refused (409) when it
+    would move the crop ORIGIN of a camera that has calibration versions (they are
+    crop-local pixels) unless ``force``."""
+    from web.field import composite_layout as _cl
+    body = await request.json()
+    event = body.get("event")
+    cams_in = body.get("cameras") or {}
+    if not event or not cams_in:
+        return JSONResponse(status_code=400, content={"error": "event and cameras are required"})
+    try:
+        new = _cl.layout_to_cameras({"cameras": {
+            n: {"crop": v["crop"], "masks": v.get("masks") or []} for n, v in cams_in.items()}})
+    except (KeyError, TypeError, ValueError) as e:
+        return JSONResponse(status_code=400, content={"error": f"bad layout: {e}"})
+    if "main" not in new:
+        return JSONResponse(status_code=400, content={"error": "a layout needs a main camera"})
+    if not "".join(c for c in str(event) if c.isalnum() or c in "_-"):
+        return JSONResponse(status_code=400, content={"error": f"bad event key {event!r}"})
+    if _auto_calib_running(event) or _layout_lock(event).locked():
+        return JSONResponse(status_code=409, content={
+            "error": f"auto-calibration or layout detection is running for {event}"})
+    default = load_layout()
+    versions = {c: field_store.load_versions(event, c) for c in set(default) | set(new)}
+    conflicts = auto_calibrate.layout_conflicts(new, versions, default)
+    if conflicts and not body.get("force"):
+        return JSONResponse(status_code=409, content={
+            "error": "this would move the crop origin under existing calibrations: "
+                     + "; ".join(conflicts) + " (resend with force to override)",
+            "conflicts": conflicts})
+    old = _cl.load_event_layout_record(event) or {}
+    frame_size = body.get("frame_size") or old.get("frame_size") or [1920, 1080]
+    extra = {"reason": "edited manually" + (" (forced over: " + "; ".join(conflicts) + ")"
+                                            if conflicts else "")}
+    if old.get("detected"):
+        extra["detected"] = old["detected"]
+    before = _auto_calib_layout(event)
+    async with _layout_lock(event):
+        try:
+            _cl.save_event_layout(event, dict(auto_calibrate.cameras_to_dict(new, frame_size),
+                                              diag=old.get("diag") or {},
+                                              confidence=old.get("confidence") or {}),
+                                  status="confirmed", source="manual", **extra)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+    stale = auto_calibrate.invalidate_stale_auto_records(event, before, new)
+    if stale:
+        print(f"[auto-calib] {event}: layout edit invalidated ready results for {stale}")
+    try:
+        auto_calibrate.refresh_layout_preview(event)
+    except Exception as e:
+        print(f"[auto-calib] {event}: layout preview refresh failed: {e}")
+    print(f"[auto-calib] {event}: layout confirmed manually ({sorted(new)})")
+    return {"status": "ok", **_layout_payload(event)}
+
+
+@app.post("/api/calibration/layout/redetect")
+async def calibration_layout_redetect(request: Request):
+    """Re-run broadcast layout detection on the event's reference footage (same
+    adopt / keep rules as the auto-calibration layout step; a confirmed layout is
+    only replaced with ``replace_confirmed``). Body: {event, replace_confirmed?}.
+    409 while a run or another layout write is in progress."""
+    body = await request.json()
+    event = body.get("event")
+    if not event:
+        return JSONResponse(status_code=400, content={"error": "event is required"})
+    if _auto_calib_running(event) or _layout_lock(event).locked():
+        return JSONResponse(status_code=409, content={
+            "error": f"auto-calibration or layout detection is running for {event}"})
+    matches = (current_event.get("matches") or []
+               if current_event and current_event.get("event_key") == event else [])
+    try:
+        async with _layout_lock(event):
+            _mk, video = await asyncio.to_thread(
+                auto_calibrate.resolve_reference_video, event, matches,
+                downloader=auto_calibrate.download_match_video)
+            await asyncio.to_thread(auto_calibrate.ensure_event_layout, event, video,
+                                    force=True,
+                                    replace_confirmed=bool(body.get("replace_confirmed")))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"layout detection failed: {e}"})
+    return {"status": "ok", **_layout_payload(event)}
 
 
 @app.get("/api/calibration/epoch")
@@ -10965,16 +11727,19 @@ async def get_calibration_epoch(event: str, camera: str = "main",
 async def calibration_frame(request: Request):
     """Grab a frame cropped to the requested camera's region from the composite
     layout (masks applied). Body: {timestamp?: seconds (default 75), match_key?,
-    video_path?, camera?} — match_key reads the loaded event's video for that
-    match (see _read_composite_frame for source precedence).
+    video_path?, camera?, aggregate?} — match_key reads the loaded event's video for
+    that match (see _read_composite_frame for source precedence); aggregate returns
+    the median of nearby frames (local footage only; ``aggregated`` in the response
+    says whether it was applied).
     Returns {frame: b64 jpeg, width, height} where width/height are the CROPPED size.
     Pixel coords are crop-local (origin at the camera crop's top-left)."""
     body = await request.json()
-    frame, err = await asyncio.to_thread(_read_composite_frame, body)
+    info: dict = {}
+    frame, err = await asyncio.to_thread(_read_composite_frame, body, info)
     if err:
         return JSONResponse(status_code=400, content={"error": err})
     camera = body.get("camera", "main")
-    layout = load_layout()
+    layout = _auto_calib_layout(body.get("event"))
     cl = layout.get(camera)
     if cl is None:
         return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
@@ -10990,12 +11755,13 @@ async def calibration_frame(request: Request):
         return JSONResponse(status_code=500, content={"error": "jpeg encode failed"})
     b64 = base64.b64encode(buf.tobytes()).decode()
     return {"frame": b64, "width": int(main.shape[1]), "height": int(main.shape[0]),
-            "detected_tags": detected}
+            "detected_tags": detected, "aggregated": bool(info.get("aggregated"))}
 
 
 @app.post("/api/calibration/refine-tag")
 async def calibration_refine_tag(request: Request):
-    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key?, u, v, id}.
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key?, aggregate?,
+    u, v, id} (aggregate reuses the cached median frame /frame returned).
     Reads the same source frame the page grabbed (match video / video_path /
     CALIB_TEST_VIDEO), crops to the camera's composite region, runs tag detection
     in an upscaled ROI around (u,v), and returns {corners: [[u,v]x4]} in
@@ -11007,7 +11773,7 @@ async def calibration_refine_tag(request: Request):
     frame, err = await asyncio.to_thread(_read_composite_frame, body)
     if err:
         return JSONResponse(status_code=400, content={"error": err})
-    cl = load_layout().get(camera)
+    cl = _auto_calib_layout(body.get("event")).get(camera)
     if cl is None:
         return JSONResponse(status_code=400, content={"error": f"unknown camera '{camera}'"})
     cx, cy, cw, ch = cl.crop
@@ -11046,13 +11812,14 @@ async def calibration_solve_homography(request: Request):
     if existing is not None:
         cal.masks = existing.masks
         cal.robot_track_top_crop = existing.robot_track_top_crop
-    field_store.save_version(event, camera, cal, start_match=start_match, label=label)
+    field_store.save_version(event, camera, cal, start_match=start_match, label=label,
+                             source=_version_source(event, camera, {"method": "homography"}))
 
     # Build overlay on the same frame/timestamp (and same source video).
     fm = FieldModel.load("2026-rebuilt-welded")
     frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     overlay_b64 = None
-    cl = load_layout().get(camera)
+    cl = _auto_calib_layout(event).get(camera)
     if frame is not None and cl is not None:
         cx, cy, cw, ch = cl.crop
         main = frame[cy:cy + ch, cx:cx + cw].copy()
@@ -11116,19 +11883,21 @@ async def calibration_solve_tags(request: Request):
     # dry_run solves + renders the overlay without persisting — used by the
     # calibrate page to re-preview a saved epoch's stored correspondences.
     if not body.get("dry_run"):
-        field_store.save_version(
+        new_vid = field_store.save_version(
             event, camera, cal, start_match=start_match, label=label,
-            source={"auto_tags": auto, "manual_tags": manual,
-                    "holdout_ids": sorted(holdout_ids),
-                    "timestamp": float(body.get("timestamp", 75)),
-                    "match_key": body.get("match_key")})
+            source=_version_source(event, camera, {
+                "auto_tags": auto, "manual_tags": manual,
+                "holdout_ids": sorted(holdout_ids),
+                "timestamp": float(body.get("timestamp", 75)),
+                "match_key": body.get("match_key")}))
+        _auto_calib_mark_manual(event, camera, new_vid)
     holdout_err = holdout_field_error(cal, held) if held else None
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
     overlay_b64 = None
     frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
-    cl = load_layout().get(camera)
+    cl = _auto_calib_layout(event).get(camera)
     # Overlay is a best-effort visualization. A poorly-conditioned calibration can
     # make projection blow up; never let drawing failures sink the solve result
     # (the caller still needs rms_error + holdout_error_m to judge the calibration).
@@ -12649,6 +13418,16 @@ async def load_event(request: Request):
         saved_hubs = await db_get_hub_positions(event_data['event_key'])
         if saved_hubs:
             event_hub_positions = saved_hubs
+
+        # Kick off automatic camera calibration in the background. Never blocks or
+        # fails the load: scheduling is a create_task, and errors are only logged.
+        if AUTO_CALIB_ON_LOAD:
+            try:
+                _schedule_auto_calibrate(event_data['event_key'],
+                                         event_data.get('matches') or [])
+            except Exception as e:
+                print(f"[auto-calib] could not schedule for "
+                      f"{event_data.get('event_key')}: {e}")
 
         return {
             "event_key": event_data['event_key'],

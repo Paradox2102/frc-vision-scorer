@@ -51,49 +51,115 @@
   .overlay-section h2 { font-size:1em; color:#a0c4ff; margin-bottom:8px; }
   #overlayImg { max-width:100%; border:1px solid #334; display:none; background:#0a0a14; }
   .hint { color:#7a86a0; font-size:12px; margin-top:4px; }
+  button:disabled { opacity:.45; cursor:default; }
+  button:disabled:hover { background:#0f3460; }
+
+  /* ---- Automatic calibration review panel ---- */
+  .auto-panel { border:1px solid #2a4a78; border-radius:8px; background:#141c34;
+                padding:12px 14px; margin-bottom:16px; }
+  .auto-head { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:4px; }
+  .auto-head h2 { font-size:1.05em; color:#a0c4ff; margin:0; }
+  .auto-cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(330px, 1fr));
+                gap:12px; margin-top:10px; }
+  .auto-card { background:#16213e; border:1px solid #2a3550; border-radius:6px;
+               padding:10px 12px; display:flex; flex-direction:column; gap:5px; min-width:0; }
+  .auto-card.expanded { grid-column:1 / -1; }
+  .auto-card.auto-empty { opacity:.7; }
+  .auto-card-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .auto-cam { font-family:monospace; font-weight:bold; color:#d0dcf0; }
+  .auto-badge { font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid;
+                white-space:nowrap; }
+  .st-running { color:#9cc8ff; background:#10284a; border-color:#2f6fb8;
+                animation:autoPulse 1.6s ease-in-out infinite; }
+  .st-ready { color:#ffd27a; background:#3a2a08; border-color:#a07418; }
+  .st-verified, .st-confirmed { color:#80ffb4; background:#123a22; border-color:#1e7040; }
+  .st-failed { color:#ff9090; background:#3a0e0e; border-color:#8a2020; }
+  .st-none { color:#7a86a0; background:#1a2035; border-color:#2f3b5c; }
+  @keyframes autoPulse { 0%,100% { opacity:1; } 50% { opacity:.55; } }
+  .auto-line { font-size:12.5px; color:#c0cadc; overflow-wrap:anywhere; }
+  .auto-method { color:#e0e8f8; }
+  .auto-metrics { font-family:monospace; font-size:12px; color:#bfe; }
+  .auto-reason { font-size:12px; color:#98a4bc; font-style:italic; overflow-wrap:anywhere; }
+  .auto-warn { font-size:12px; color:#ffb070; background:#2e1d0c; border:1px solid #6a4416;
+               border-radius:4px; padding:4px 8px; }
+  .auto-preview { max-width:100%; border:1px solid #234; border-radius:4px; cursor:zoom-in;
+                  background:#0a0a14; display:block;
+                  /* keep the frame's aspect ratio: flex/grid cards stretch children
+                     to full width, which squashed a max-height-capped preview */
+                  width:auto; height:auto; align-self:flex-start; object-fit:contain; }
+  .auto-card.expanded .auto-preview { cursor:zoom-out; }
+  .auto-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:2px; }
+  .auto-actions button { padding:4px 10px; font-size:12px; }
+  .layout-card { margin-top:10px; }
+  .layout-card.expanded .auto-preview { cursor:zoom-out; }
+  .layout-crops { font-family:monospace; font-size:12px; color:#bfe; }
+  .layout-edit { display:grid; grid-template-columns:max-content repeat(4, 64px); gap:4px 6px;
+                 align-items:center; font-size:12px; }
+  .layout-edit input { width:60px; font-family:monospace; font-size:12px; }
+  .auto-msg { font-size:12px; color:#a0c4ff; }
+  .auto-msg.err { color:#ff8080; }
+  /* ---- Per-match corner calibrations ---- */
+  .pm-section { margin-top:12px; border-top:1px solid #2a3550; padding-top:8px; }
+  .pm-section > summary { cursor:pointer; color:#a0c4ff; font-weight:600; font-size:.95em; }
+  .pm-cam { margin-top:8px; }
+  .pm-cam-head { font-family:monospace; color:#d0dcf0; font-size:12.5px; margin-bottom:4px; }
+  .pm-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:6px; }
+  .pm-tile { background:#16213e; border:1px solid #2a3550; border-radius:5px; padding:4px 5px;
+             display:flex; flex-direction:column; gap:3px; min-width:0; font-size:11.5px; }
+  .pm-tile.big { grid-column:1 / -1; }
+  .pm-tile img { width:100%; height:auto; border-radius:3px; cursor:zoom-in; background:#0a0a14; }
+  .pm-tile.big img { cursor:zoom-out; }
+  .pm-row { display:flex; align-items:center; justify-content:space-between; gap:4px; }
+  .pm-match { font-family:monospace; color:#e0e8f8; }
+  .pm-metric { font-family:monospace; color:#bfe; overflow-wrap:anywhere; }
+  .pm-tile button { padding:1px 6px; font-size:11px; }
+  .pm-kept > summary { cursor:pointer; color:#7a86a0; font-size:12px; margin:4px 0; }
+  .st-adopted { color:#80ffb4; background:#123a22; border-color:#1e7040; }
+  .st-kept { color:#9cc8ff; background:#10284a; border-color:#2f6fb8; }
+  .st-dropped, .st-rejected { color:#ff9090; background:#3a0e0e; border-color:#8a2020; }
+  .st-failed_kept { color:#ffd27a; background:#3a2a08; border-color:#a07418; }
+
+  /* ---- Collapsible sections (manual editor, zones & masks) ---- */
+  details.section-details { border:1px solid #2a3550; border-radius:8px; background:#151d33;
+                            margin-bottom:14px; }
+  details.section-details > summary { cursor:pointer; padding:9px 14px; color:#a0c4ff;
+                                      font-size:1.02em; font-weight:600; user-select:none; }
+  details.section-details > summary .summary-note { font-weight:normal; color:#7a86a0;
+                                                    font-size:.85em; }
+  details.section-details[open] > summary { border-bottom:1px solid #2a3550; margin-bottom:12px; }
+  details.section-details > .details-body { padding:0 14px 6px; }
 </style>
 </head>
 <body>
 
 <h1>Field Calibration — AprilTags</h1>
-<p class="instructions">
-  Grab a frame. Detected tags are outlined in <span style="color:#80ffb4">green</span>.
-  For a tag you can see but that wasn't detected: <b>click it on the left frame</b>, then
-  <b>click the matching tag on the right map</b>. The map is oriented to match the
-  camera's view (blue end left, red end right). Add several spread-out tags, then Solve. Need &ge; 8 points
-  (each detected tag = 4 points, each manual tag = 1).
-</p>
 
-<div class="controls">
-  <label>Timestamp (s): <input type="number" id="timestamp" value="75" min="0" step="1"></label>
-  <button onclick="grabFrame()">Grab frame</button>
-  <label>Event: <input type="text" id="event" value="test"></label>
-  <label>Camera:
-    <select id="camera">
-      <option value="main">main</option>
-      <option value="corner_left">corner_left</option>
-      <option value="corner_right">corner_right</option>
-    </select>
-  </label>
-  <label>Applies from match:
-    <select id="matchSel">
-      <option value="">event start (test video)</option>
-    </select>
-  </label>
-</div>
-<p class="hint" style="margin:-8px 0 14px;">
-  Pick a match when the camera moved mid-event: frames are grabbed from <b>that match's
-  video</b>, and the solved calibration is saved as a new version applying from that match
-  onward (earlier matches keep their old calibration). Matches without a ▶ have no
-  TBA-linked video, so frames fall back to the default test video. ❌ marks matches
-  where the drift check failed for this camera — recalibrate from there. 🔧 marks
-  matches with an <b>auto-fix awaiting your approval</b> (panel appears below).
-</p>
+<!-- Automatic calibration review: one card per camera, filled from
+     /api/calibration/auto/status. The server calibrates every camera in the
+     background when an event loads; the operator confirms or corrects here. -->
+<section id="autoPanel" class="auto-panel">
+  <div class="auto-head">
+    <h2>Automatic calibration</h2>
+    <button id="autoRerunAllBtn" onclick="rerunAuto()">Re-run all</button>
+    <span id="autoPanelStatus" class="auto-msg"></span>
+  </div>
+  <p class="hint" style="margin:0;">Calibration runs automatically when an event loads. Check the
+    overlay, then <b>Confirm</b> — or <b>Correct manually</b>.</p>
+  <div id="layoutCard" class="auto-card layout-card" style="display:none;"></div>
+  <div id="autoCards" class="auto-cards"></div>
+  <details id="permatchSection" class="pm-section" style="display:none;" open>
+    <summary>Per-match corner calibrations <span id="pmSummary" class="auto-msg"></span></summary>
+    <p class="hint" style="margin:4px 0;">Each job checks the corner cameras on its own match and
+      re-solves (and adopts) them when they moved; a corner that can't be verified is dropped from
+      that job. Spot-check the overlays; <b>Reject</b> stops a match's result from being used.</p>
+    <div id="permatchBody"></div>
+  </details>
+</section>
 
 <!-- Auto-fix approval: shown only when the selected match has a staged pose re-solve.
      The pose was re-derived from AprilTags against the SAME (unchanged) lens; the
      operator eyeballs the reprojected wireframe over the frame, then approves (adopts
-     it as a new epoch) or rejects (falls back to manual calibration below). -->
+     it as a new epoch) or rejects (falls back to the Manual correction section below). -->
 <div id="autofixPanel" style="display:none; border:2px solid #80ffb4; border-radius:8px;
      background:#12241a; padding:14px 16px; margin-bottom:16px;">
   <h2 style="margin:0 0 6px; color:#80ffb4; font-size:1.05em;">🔧 Auto-fix available — camera pose re-solved</h2>
@@ -116,6 +182,46 @@
   <img id="autofixImg" src="" alt="" style="display:none; max-width:760px; border:1px solid #234; border-radius:4px;">
 </div>
 
+<!-- Manual correction: the click-a-tag editor. Collapsed by default; opens on
+     "Correct manually", on a ?match= deep link, or when no auto record exists. -->
+<details id="manualDetails" class="section-details">
+<summary>Manual correction <span class="summary-note">— click tags on a frame, solve, and save a version</span></summary>
+<div class="details-body">
+<p class="instructions">
+  Grab a frame. Detected tags are outlined in <span style="color:#80ffb4">green</span>.
+  For a tag you can see but that wasn't detected: <b>click it on the left frame</b>, then
+  <b>click the matching tag on the right map</b>. The map is oriented to match the
+  camera's view (blue end left, red end right). Add several spread-out tags, then Solve. Need &ge; 8 points
+  (each detected tag = 4 points, each manual tag = 1).
+</p>
+
+<div class="controls">
+  <label>Timestamp (s): <input type="number" id="timestamp" value="75" min="0" step="1"></label>
+  <button onclick="grabFrame()">Grab frame</button>
+  <label title="Median of the frames ±15 s around the timestamp (local footage only): robots, balls and people in front of a tag disappear"><input type="checkbox" id="aggregateFrames" checked> Median of nearby frames (removes robots)</label>
+  <label>Event: <input type="text" id="event" value="test"></label>
+  <label>Camera:
+    <select id="camera">
+      <option value="main">main</option>
+      <option value="corner_left">corner_left</option>
+      <option value="corner_right">corner_right</option>
+    </select>
+  </label>
+  <label>Applies from match:
+    <select id="matchSel">
+      <option value="">event start (test video)</option>
+    </select>
+  </label>
+</div>
+<p class="hint" style="margin:-8px 0 14px;">
+  Pick a match when the camera moved mid-event: frames are grabbed from <b>that match's
+  video</b>, and the solved calibration is saved as a new version applying from that match
+  onward (earlier matches keep their old calibration). Matches without a ▶ have no
+  TBA-linked video, so frames fall back to the default test video. ❌ marks matches
+  where the drift check failed for this camera — recalibrate from there. 🔧 marks
+  matches with an <b>auto-fix awaiting your approval</b> (panel appears above).
+</p>
+
 <div class="canvases">
   <div class="canvas-col">
     <h2>Broadcast frame</h2>
@@ -134,6 +240,42 @@
   </div>
 </div>
 
+<div class="points-section">
+  <h2>Correspondences</h2>
+  <table>
+    <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th>Hold out</th><th></th></tr></thead>
+    <tbody id="rowsBody"><tr><td colspan="6" style="color:#556;font-style:italic;padding:12px 10px;">
+      Grab a frame to begin.</td></tr></tbody>
+  </table>
+</div>
+
+<div class="solve-row">
+  <button class="primary" onclick="solve()">Solve &amp; preview</button>
+  <span id="statusLine" class="rms-info">—</span>
+</div>
+
+<div class="points-section">
+  <h2>Saved calibration versions <span style="font-weight:normal;color:#889;font-size:.8em;">— this event &amp; camera</span></h2>
+  <p class="hint">Each version applies from its start match until the next version's start
+    match (in qual→playoff order). “event start” covers everything before the earliest
+    anchored version.</p>
+  <ul id="versionList" style="margin:0;padding-left:18px;color:#bcd;font-family:monospace;font-size:.85em;"></ul>
+</div>
+
+<div class="overlay-section">
+  <h2>Overlay (field structures + tags)</h2>
+  <p class="hint">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
+  <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
+  <img id="overlayImg" src="" alt="">
+</div>
+</div>
+</details>
+
+<details id="zonesDetails" class="section-details">
+<summary>Zones &amp; masks <span class="summary-note">— static-element zones, camera exclusion masks, top crop</span></summary>
+<div class="details-body">
+<p class="hint" style="margin:0 0 10px;">Zones are drawn on the top-down map and masks on the
+  broadcast frame — both live in <b>Manual correction</b>, which opens when you tick a draw box.</p>
 <div class="points-section">
   <h2>Static-element zones <span style="font-weight:normal;color:#889;font-size:.8em;">— block robot false-positives</span></h2>
   <p class="hint">
@@ -183,35 +325,8 @@
     <span id="topCropStatus" class="hint"></span>
   </div>
 </div>
-
-<div class="points-section">
-  <h2>Correspondences</h2>
-  <table>
-    <thead><tr><th>Tag</th><th>Source</th><th>Pixel (u,v)</th><th>Field (x,y)</th><th>Hold out</th><th></th></tr></thead>
-    <tbody id="rowsBody"><tr><td colspan="6" style="color:#556;font-style:italic;padding:12px 10px;">
-      Grab a frame to begin.</td></tr></tbody>
-  </table>
 </div>
-
-<div class="solve-row">
-  <button class="primary" onclick="solve()">Solve &amp; preview</button>
-  <span id="statusLine" class="rms-info">—</span>
-</div>
-
-<div class="points-section">
-  <h2>Saved calibration versions <span style="font-weight:normal;color:#889;font-size:.8em;">— this event &amp; camera</span></h2>
-  <p class="hint">Each version applies from its start match until the next version's start
-    match (in qual→playoff order). “event start” covers everything before the earliest
-    anchored version.</p>
-  <ul id="versionList" style="margin:0;padding-left:18px;color:#bcd;font-family:monospace;font-size:.85em;"></ul>
-</div>
-
-<div class="overlay-section">
-  <h2>Overlay (field structures + tags)</h2>
-  <p class="hint">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
-  <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
-  <img id="overlayImg" src="" alt="">
-</div>
+</details>
 
 <script>
 // ---- State ----
@@ -233,14 +348,87 @@ let frameMasks = [];      // [[x,y,w,h], ...] in actual cropped frame coordinate
 let frameDrag = null;      // {x0,y0,x1,y1} in canvas pixels while dragging
 let eventMatches = [];    // matches of the loaded event (from /api/event/current)
 let driftMap = {};        // {camera: {match_key: {error_m, epoch, recalibrated}}}
+// Automatic-calibration review state (/api/calibration/auto/status).
+let autoRecords = {};     // {camera: auto record (without calibration)}
+let autoRunning = false;  // event-level "a run is in progress"
+let autoPollTimer = null;
+let autoExpanded = new Set();  // cameras whose preview is shown large
+let autoCardMsg = {};     // {camera: {text, err}} — survives the 3 s re-render
+let autoPreviewFailed = new Set();  // preview URLs that 404'd
+// The manual editor's frame/epoch restore is deferred while its <details> is
+// closed (it grabs a video frame — slow, and pointless when nobody looks at it).
+// manualStale = a restore is owed the next time the section opens.
+let manualStale = false;
+// Every frame load (grab / epoch restore / "Correct manually") takes a ticket;
+// a load whose ticket is no longer current drops its result, so a slow earlier
+// restore can never overwrite a newer one (e.g. the auto_tags preload).
+let frameLoadSeq = 0;
+// ?match= / ?camera= are applied once, on first load — not on every
+// populateMatchSelector() call (which used to snap the camera select back to
+// the URL's camera whenever the user picked another one).
+let urlCameraApplied = false, urlMatchApplied = false;
 
-(async function init(){ await fetchCurrentEvent(); await loadDrift(); populateMatchSelector(); await fetchTagMap(); drawMap(); await loadZones(); await refreshForSelection(); })();
+// The event field is auto-filled once from the server's loaded event. When the app
+// loads a different event later (main page, another tab), a page still showing the
+// old one would keep reviewing / re-running the OLD event — so whenever the page
+// regains focus, re-check and start over on the new event. A manually typed event
+// is left alone.
+let eventAutoFilled = null;   // the event key last auto-filled from /api/event/current
+document.getElementById('event').addEventListener('input', () => { eventAutoFilled = null; });
+async function syncEventFromServer(){
+  if (!eventAutoFilled || autoEvent() !== eventAutoFilled) return;
+  try {
+    const r = await fetch('/api/event/current');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.event_key && j.event_key !== eventAutoFilled) {
+      location.replace(location.pathname);   // drop ?match= — it was for the old event
+    }
+  } catch(e){ /* offline: keep the current page */ }
+}
+window.addEventListener('focus', syncEventFromServer);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') syncEventFromServer();
+});
+
+(async function init(){
+  await fetchCurrentEvent(); await loadDrift(); populateMatchSelector();
+  await fetchTagMap(); drawMap(); await loadZones();
+  await loadAutoStatus();
+  // Manual correction opens itself for the drift-abort deep link (?match=) and
+  // when the event has no auto record at all (nothing to review).
+  const hasMatchParam = !!new URLSearchParams(location.search).get('match');
+  const noAuto = !Object.keys(autoRecords).length && !autoAnyRunning();
+  if (hasMatchParam || noAuto) openManual();
+  await refreshForSelection();
+})();
 
 // Switching camera or match restores the covering epoch's saved correspondences
 // (or grabs a fresh frame when that epoch has none). Drift markers in the match
 // list are per camera, so a camera switch also relabels the options.
 document.getElementById('camera').addEventListener('change', function(){ populateMatchSelector(); refreshForSelection(); });
 document.getElementById('matchSel').addEventListener('change', function(){ refreshForSelection(); });
+
+// Opening the manual editor: run any restore deferred while it was closed, and
+// redraw both canvases. (Canvas sizes come from the frame's natural size and a
+// fixed map width, not from layout, so they're right even when drawn hidden —
+// the redraw is belt-and-braces.)
+document.getElementById('manualDetails').addEventListener('toggle', function(){
+  if (!this.open) return;
+  if (manualStale) refreshForSelection();
+  redrawFrame(); drawMap();
+});
+function openManual(){
+  const d = document.getElementById('manualDetails');
+  if (!d.open) d.open = true;
+}
+// Zones are drawn on the map and masks on the frame, both inside Manual
+// correction — ticking either draw box opens it.
+['zoneMode', 'maskMode'].forEach(id => {
+  document.getElementById(id).addEventListener('change', function(){
+    if (this.checked) openManual();
+  });
+});
 
 // The match a frame-grab/solve refers to ('' = none selected), and whether that
 // match has a TBA-linked video we can pull frames from.
@@ -302,11 +490,18 @@ function populateMatchSelector(){
   // Preselect from ?match= / ?camera= (the drift-check error names both) or
   // restore the previous selection across event refetches.
   const params = new URLSearchParams(location.search);
-  const want = keep || params.get('match');
-  if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
-  const cam = params.get('camera');
-  if (cam && [...document.getElementById('camera').options].some(o => o.value === cam))
-    document.getElementById('camera').value = cam;
+  const urlMatch = urlMatchApplied ? null : params.get('match');
+  const want = keep || urlMatch;
+  if (want && [...sel.options].some(o => o.value === want)){
+    sel.value = want;
+    if (want === urlMatch) urlMatchApplied = true;
+  }
+  if (!urlCameraApplied){
+    urlCameraApplied = true;
+    const cam = params.get('camera');
+    if (cam && [...document.getElementById('camera').options].some(o => o.value === cam))
+      document.getElementById('camera').value = cam;
+  }
 }
 
 async function fetchCurrentEvent(){
@@ -318,6 +513,7 @@ async function fetchCurrentEvent(){
       + document.getElementById('event').value + '". Load the event first.', 'rms-warn'); return; }
     const j = await r.json();
     if (j.event_key){
+      eventAutoFilled = j.event_key;
       document.getElementById('event').value = j.event_key;
       document.getElementById('event').title = 'Auto-filled from the loaded event ('
         + (j.event_name || j.event_key) + ')';
@@ -455,12 +651,20 @@ function usedIds(){
 // correspondences always line up with what the user is looking at.
 let currentFrameSource = {match_key: null, timestamp: 75};
 
+// Resolves true once the frame is on screen; false on error, cancel, or when a
+// newer frame load superseded this one (opts.seq = the caller's ticket; a
+// direct call takes its own).
+function aggregateFrames(){
+  const cb = document.getElementById('aggregateFrames');
+  return !!(cb && cb.checked);
+}
 async function grabFrame(opts){
   opts = opts || {};
   const ts = (opts.ts != null) ? opts.ts
            : (parseFloat(document.getElementById('timestamp').value) || 75);
   if (!opts.silent && manualTags.length &&
-      !confirm('Grabbing a new frame clears manual tags. Continue?')) return;
+      !confirm('Grabbing a new frame clears manual tags. Continue?')) return false;
+  const seq = (opts.seq != null) ? opts.seq : ++frameLoadSeq;
   // Only ask the server for the match's video when TBA actually has one;
   // otherwise fall back to the default source (the epoch anchor still applies).
   const mk = (opts.matchKey !== undefined) ? opts.matchKey
@@ -471,14 +675,16 @@ async function grabFrame(opts){
     const r = await fetch('/api/calibration/frame', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({timestamp:ts, camera: document.getElementById('camera').value,
-        match_key: mk})});
+        event: autoEvent(), match_key: mk, aggregate: aggregateFrames()})});
     const j = await r.json();
-    if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return; }
+    if (seq !== frameLoadSeq) return false;
+    if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return false; }
     autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null;
     currentFrameSource = {match_key: mk, timestamp: ts};
-    await new Promise(resolve => {
+    return await new Promise(resolve => {
       const img = new Image();
       img.onload = async function(){
+        if (seq !== frameLoadSeq){ resolve(false); return; }
         frameW = img.naturalWidth; frameH = img.naturalHeight;
         const canvas = document.getElementById('frameCanvas');
         const maxW = 760; fScale = Math.min(1, maxW / frameW);
@@ -488,12 +694,12 @@ async function grabFrame(opts){
         await loadTopCrop();
         redrawFrame(); drawMap(); renderRows();
         setStatus(`Frame grabbed. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
-        resolve();
+        resolve(true);
       };
-      img.onerror = resolve;
+      img.onerror = () => resolve(false);
       img.src = 'data:image/jpeg;base64,' + j.frame;
     });
-  } catch(e){ setStatus('Fetch error: '+e.message,'rms-err'); }
+  } catch(e){ setStatus('Fetch error: '+e.message,'rms-err'); return false; }
 }
 
 // On page load / camera switch / match switch: if the covering epoch stored its
@@ -502,6 +708,10 @@ async function grabFrame(opts){
 async function refreshForSelection(){
   loadVersions();
   refreshAutofix();
+  // Frame restore only while the manual editor is open; otherwise owe it.
+  if (!document.getElementById('manualDetails').open){ manualStale = true; return; }
+  manualStale = false;
+  const seq = ++frameLoadSeq;
   const event = document.getElementById('event').value.trim();
   const camera = document.getElementById('camera').value.trim();
   let epoch = null;
@@ -513,10 +723,12 @@ async function refreshForSelection(){
       if (r.ok) epoch = (await r.json()).version;
     } catch(e){ /* fall through to a fresh grab */ }
   }
+  if (seq !== frameLoadSeq) return;
   const src = epoch && epoch.source;
-  if (!src){ await grabFrame({silent:true}); return; }
+  if (!src){ await grabFrame({silent:true, seq}); return; }
   if (src.timestamp != null) document.getElementById('timestamp').value = src.timestamp;
-  await grabFrame({matchKey: src.match_key || null, ts: src.timestamp, silent: true});
+  await grabFrame({matchKey: src.match_key || null, ts: src.timestamp, silent: true, seq});
+  if (seq !== frameLoadSeq) return;
   autoTags = src.auto_tags || {};
   manualTags = src.manual_tags || [];
   heldOut = new Set(src.holdout_ids || []);
@@ -650,7 +862,7 @@ document.getElementById('mapCanvas').addEventListener('click', async function(e)
     const rr = await fetch('/api/calibration/refine-tag', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({camera, timestamp: currentFrameSource.timestamp,
-        u: px.u, v: px.v, id: best,
+        u: px.u, v: px.v, id: best, aggregate: aggregateFrames(), event: autoEvent(),
         match_key: currentFrameSource.match_key})});
     const jj = await rr.json();
     refined = jj.corners;   // [[u,v]x4] or null
@@ -735,6 +947,8 @@ async function solve(opts){
       loadVersions();
       // The new epoch may resolve recorded drift failures — refresh the ❌ marks.
       loadDrift().then(populateMatchSelector);
+      // A manual save marks this camera's ready/failed auto record confirmed.
+      loadAutoStatus();
     }
     setStatus(msg, cls);
     if (j.overlay){ const img=document.getElementById('overlayImg');
@@ -1089,9 +1303,541 @@ async function rejectAutofix(){
     if (!r.ok || j.error){ st.textContent = 'Reject failed: ' + (j.error || r.status); return; }
     document.getElementById('autofixPanel').style.display = 'none';
     await loadDrift(); populateMatchSelector();
-    setStatus('Auto-fix rejected — grab a frame and calibrate this match manually below.', 'rms-warn');
+    openManual();
     await refreshForSelection();
+    setStatus('Auto-fix rejected — grab a frame and calibrate this match manually below.', 'rms-warn');
   } catch(e){ st.textContent = 'Reject error: ' + e.message; }
+}
+
+// ---- Automatic calibration review -------------------------------------------
+// The server auto-calibrates every camera when an event loads and keeps one
+// record per (event, camera). Cards show the result; the operator Confirms a
+// `ready` candidate (saved as a new version), Re-runs, or corrects it manually
+// starting from the run's aggregated tag corners. A missing route (404) or no
+// records reads as "not run yet".
+const AUTO_STATUS_TEXT = {running: 'running…', ready: 'ready for review',
+  verified: 'verified', confirmed: 'confirmed', failed: 'failed'};
+
+function autoEvent(){ return document.getElementById('event').value.trim(); }
+function autoAnyRunning(){
+  return autoRunning || Object.values(autoRecords).some(r => r && r.status === 'running');
+}
+// Cameras to show: the page's camera list plus any extra camera with a record.
+function autoCameraList(){
+  const cams = [...document.getElementById('camera').options].map(o => o.value);
+  Object.keys(autoRecords).forEach(c => { if (!cams.includes(c)) cams.push(c); });
+  return cams;
+}
+
+async function loadAutoStatus(){
+  clearTimeout(autoPollTimer); autoPollTimer = null;
+  const event = autoEvent();
+  if (!event){ autoRecords = {}; autoRunning = false; renderAutoPanel(); return; }
+  try {
+    const r = await fetch('/api/calibration/auto/status?event=' + encodeURIComponent(event));
+    if (event !== autoEvent()) return;     // the event changed while we waited
+    if (r.ok){
+      const j = await r.json();
+      if (event !== autoEvent()) return;
+      autoRecords = (j && j.cameras) || {};
+      autoRunning = !!(j && j.running);
+    } else {            // 404 (route missing / unknown event) → no auto record
+      autoRecords = {}; autoRunning = false;
+    }
+  } catch(e){ /* network blip: keep the last records, and keep polling if running */ }
+  if (event !== autoEvent()) return;
+  renderAutoPanel();
+  loadLayout();
+  loadPerMatch();
+  if (autoAnyRunning()) autoPollTimer = setTimeout(loadAutoStatus, 3000);
+}
+
+// ---- Per-match corner calibrations (job-time corner step log) ----
+let pmData = null, pmBig = null, pmMsg = null;
+const PM_LEVEL = {qm: 0, ef: 1, qf: 2, sf: 3, f: 4};
+function pmSortKey(mk){
+  const m = /_(qm|ef|qf|sf|f)(\d+)(?:m(\d+))?$/.exec(mk || '');
+  if (!m) return [99, 0, 0];
+  return m[3] == null ? [PM_LEVEL[m[1]], 0, +m[2]] : [PM_LEVEL[m[1]], +m[2], +m[3]];
+}
+function pmCompare(a, b){
+  const ka = pmSortKey(a), kb = pmSortKey(b);
+  for (let i = 0; i < 3; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+  return 0;
+}
+async function loadPerMatch(){
+  const event = autoEvent();
+  if (!event){ pmData = null; renderPerMatch(); return; }
+  try {
+    const r = await fetch('/api/calibration/per-match?event=' + encodeURIComponent(event));
+    const j = r.ok ? await r.json() : null;
+    if (event !== autoEvent()) return;
+    pmData = j;
+  } catch(e){ /* keep the last one */ }
+  if (event !== autoEvent()) return;
+  renderPerMatch();
+}
+function pmMetricText(e){
+  const m = e.metrics || {};
+  const bits = [];
+  if (e.status === 'kept' || e.job_outcome === 'kept'){
+    if (m.check_best_m != null) bits.push(`check ${_num(m.check_best_m, 2)} m`);
+  } else {
+    if (m.val_best_m != null) bits.push(`val ${_num(m.val_best_m, 2)} m`);
+    else if (m.check_best_m != null) bits.push(`check ${_num(m.check_best_m, 2)} m`);
+  }
+  const nloc = (m.located_tags || []).length;
+  if (m.n_tags != null) bits.push(`${m.n_tags}${nloc ? '+' + nloc : ''} tags`);
+  else if (m.check_tags) bits.push(`${m.check_tags} tags`);
+  return bits.join(' · ');
+}
+function pmTile(cam, mk, e){
+  const t = _el('div', 'pm-tile');
+  const key = cam + '|' + mk;
+  if (pmBig === key) t.classList.add('big');
+  const row = _el('div', 'pm-row');
+  row.appendChild(_el('span', 'pm-match', mk.replace(/^[^_]*_/, '')));
+  row.appendChild(_el('span', 'auto-badge st-' + e.status, e.status.replace('_', ' ')));
+  t.appendChild(row);
+  if (e.preview){
+    const img = _el('img');
+    img.loading = 'lazy';
+    img.alt = mk;
+    img.src = '/api/calibration/per-match/preview?event=' + encodeURIComponent(pmData.event)
+      + '&camera=' + encodeURIComponent(cam) + '&match=' + encodeURIComponent(mk)
+      + '&t=' + encodeURIComponent(e.created_at || '');
+    img.onclick = () => { pmBig = (pmBig === key) ? null : key; renderPerMatch(); };
+    t.appendChild(img);
+  }
+  t.appendChild(_el('div', 'pm-metric', pmMetricText(e)));
+  if (pmBig === key && e.reason) t.appendChild(_el('div', 'auto-reason', e.reason));
+  const act = _el('div', 'pm-row');
+  if (e.status === 'rejected'){
+    const b = _el('button', null, 'Restore');
+    b.onclick = () => pmAction('restore', cam, mk);
+    act.appendChild(b);
+  } else {
+    const b = _el('button', null, 'Reject');
+    b.title = 'Stop this match\'s result from being used (an adopted version is ignored)';
+    b.onclick = () => pmAction('reject', cam, mk);
+    act.appendChild(b);
+  }
+  if (pmMsg && pmMsg.key === key) act.appendChild(_el('span', 'auto-msg' + (pmMsg.err ? ' err' : ''), pmMsg.text));
+  t.appendChild(act);
+  return t;
+}
+function renderPerMatch(){
+  const sec = document.getElementById('permatchSection');
+  const body = document.getElementById('permatchBody');
+  const cams = (pmData && pmData.cameras) || {};
+  if (!Object.keys(cams).length){ sec.style.display = 'none'; return; }
+  sec.style.display = '';
+  body.replaceChildren();
+  let nAd = 0, nDr = 0, nKe = 0;
+  for (const [cam, log] of Object.entries(cams)){
+    const box = _el('div', 'pm-cam');
+    const keys = Object.keys(log).sort(pmCompare);
+    const flagged = keys.filter(k => log[k].status !== 'kept');
+    const kept = keys.filter(k => log[k].status === 'kept');
+    const c = s => keys.filter(k => log[k].status === s).length;
+    nAd += c('adopted'); nDr += c('dropped'); nKe += kept.length;
+    box.appendChild(_el('div', 'pm-cam-head',
+      `${cam} — ${c('adopted')} adopted · ${c('dropped')} dropped · ${c('rejected')} rejected · ${kept.length} kept`));
+    if (flagged.length){
+      const g = _el('div', 'pm-grid');
+      flagged.forEach(k => g.appendChild(pmTile(cam, k, log[k])));
+      box.appendChild(g);
+    }
+    if (kept.length){
+      const d = _el('details', 'pm-kept');
+      if (kept.some(k => pmBig === cam + '|' + k)) d.open = true;
+      d.appendChild(_el('summary', null, `${kept.length} kept (epoch held)`));
+      const g = _el('div', 'pm-grid');
+      kept.forEach(k => g.appendChild(pmTile(cam, k, log[k])));
+      d.appendChild(g);
+      box.appendChild(d);
+    }
+    body.appendChild(box);
+  }
+  document.getElementById('pmSummary').textContent = `— ${nAd} adopted, ${nDr} dropped, ${nKe} kept`;
+}
+async function pmAction(kind, cam, mk){
+  const event = pmData && pmData.event;
+  if (!event || event !== autoEvent()) return;
+  const key = cam + '|' + mk;
+  try {
+    const r = await fetch('/api/calibration/per-match/' + kind, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({event, camera: cam, match: mk})});
+    const j = await r.json();
+    if (event !== autoEvent()) return;
+    if (!r.ok) pmMsg = {key, text: j.error || (kind + ' failed'), err: true};
+    else { pmMsg = {key, text: kind === 'reject' ? 'Rejected.' : 'Restored.'};
+           if (pmData.cameras[cam]) pmData.cameras[cam][mk] = j.entry; }
+  } catch(e){ pmMsg = {key, text: kind + ' failed: ' + e, err: true}; }
+  renderPerMatch();
+}
+
+// ---- Broadcast layout card (where each camera sits in the composite frame) ----
+let layoutData = null, layoutEditing = false, layoutExpanded = false, layoutMsg = null;
+async function loadLayout(){
+  const event = autoEvent();
+  if (!event){ layoutData = null; renderLayoutCard(); return; }
+  try {
+    const r = await fetch('/api/calibration/layout?event=' + encodeURIComponent(event));
+    const j = r.ok ? await r.json() : null;
+    if (event !== autoEvent()) return;     // stale response for a previous event
+    layoutData = j;
+  } catch(e){ /* keep the last one */ }
+  if (event !== autoEvent()) return;
+  if (!layoutEditing) renderLayoutCard();
+}
+function layoutBadge(rec){
+  const st = rec ? rec.status : null;
+  if (st === 'auto') return ['auto-detected', 'st-ready'];
+  if (st === 'confirmed') return ['confirmed', 'st-confirmed'];
+  if (st === 'kept_default') return ['default kept', 'st-none'];
+  if (st === 'rejected') return ['detection rejected', 'st-failed'];
+  return ['default', 'st-none'];
+}
+function renderLayoutCard(){
+  const card = document.getElementById('layoutCard');
+  if (!layoutData){ card.style.display = 'none'; return; }
+  card.style.display = '';
+  card.replaceChildren();
+  card.classList.toggle('expanded', layoutExpanded);
+  const rec = layoutData.record;
+  const head = _el('div', 'auto-card-head');
+  head.appendChild(_el('span', 'auto-cam', 'Broadcast layout'));
+  const [txt, cls] = layoutBadge(rec);
+  head.appendChild(_el('span', 'auto-badge ' + cls, txt));
+  card.appendChild(head);
+  if (rec && rec.reason) card.appendChild(_el('div', 'auto-reason', rec.reason));
+  const cams = (layoutData.effective && layoutData.effective.cameras) || {};
+  card.appendChild(_el('div', 'layout-crops', Object.entries(cams).map(([n, c]) =>
+    `${n} [${c.crop.join(', ')}]` + (c.masks && c.masks.length ? ` +${c.masks.length} mask(s)` : '')
+  ).join(' · ')));
+  if (layoutData.has_preview){
+    const img = _el('img', 'auto-preview');
+    img.src = '/api/calibration/layout/preview?event=' + encodeURIComponent(layoutData.event)
+              + '&t=' + encodeURIComponent((rec && rec.saved_at) || '');
+    img.alt = 'composite layout';
+    img.style.maxHeight = layoutExpanded ? 'none' : '170px';
+    img.onclick = () => { layoutExpanded = !layoutExpanded; renderLayoutCard(); };
+    card.appendChild(img);
+  }
+  if (layoutEditing){
+    const grid = _el('div', 'layout-edit');
+    ['camera', 'x', 'y', 'w', 'h'].forEach(h => grid.appendChild(_el('span', 'hint', h)));
+    for (const [n, c] of Object.entries(cams)){
+      grid.appendChild(_el('span', 'auto-cam', n));
+      c.crop.forEach((v, i) => {
+        const inp = document.createElement('input');
+        inp.type = 'number'; inp.value = v; inp.dataset.cam = n; inp.dataset.idx = i;
+        grid.appendChild(inp);
+      });
+    }
+    card.appendChild(grid);
+  }
+  const act = _el('div', 'auto-actions');
+  const edit = _el('button', null, layoutEditing ? 'Cancel' : 'Edit');
+  edit.onclick = () => { layoutEditing = !layoutEditing; layoutMsg = null; renderLayoutCard(); };
+  act.appendChild(edit);
+  if (layoutEditing){
+    const save = _el('button', null, 'Save');
+    save.onclick = () => saveLayout(false);
+    act.appendChild(save);
+  }
+  const redet = _el('button', null, 'Re-detect');
+  redet.disabled = autoAnyRunning();
+  redet.onclick = redetectLayout;
+  act.appendChild(redet);
+  if (layoutMsg) act.appendChild(_el('span', 'auto-msg' + (layoutMsg.err ? ' err' : ''), layoutMsg.text));
+  card.appendChild(act);
+}
+async function saveLayout(force){
+  const event = layoutData && layoutData.event;
+  if (!event || event !== autoEvent()){     // never post one event's cameras to another
+    layoutMsg = {text: 'The event changed — reload the layout before saving.', err: true};
+    layoutEditing = false; renderLayoutCard(); loadLayout(); return;
+  }
+  const cams = JSON.parse(JSON.stringify((layoutData.effective || {}).cameras || {}));
+  document.querySelectorAll('#layoutCard .layout-edit input').forEach(inp => {
+    cams[inp.dataset.cam].crop[Number(inp.dataset.idx)] = parseInt(inp.value, 10);
+  });
+  layoutMsg = {text: 'Saving…'}; renderLayoutCard();
+  try {
+    const r = await fetch('/api/calibration/layout', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({event, cameras: cams, force: !!force})});
+    const j = await r.json();
+    if (event !== autoEvent()) return;
+    if (r.status === 409 && !force){
+      if (confirm(j.error + '\n\nSave anyway? Existing calibrations for those cameras will no longer line up.'))
+        return saveLayout(true);
+      layoutMsg = {text: 'Not saved.', err: true};
+    } else if (!r.ok){
+      layoutMsg = {text: j.error || 'Save failed', err: true};
+    } else {
+      layoutData = j; layoutEditing = false; layoutMsg = {text: 'Layout saved (confirmed).'};
+    }
+  } catch(e){ layoutMsg = {text: 'Save failed: ' + e, err: true}; }
+  renderLayoutCard();
+}
+async function redetectLayout(){
+  const event = autoEvent();
+  layoutMsg = {text: 'Detecting layout… (~10 s)'}; renderLayoutCard();
+  try {
+    const r = await fetch('/api/calibration/layout/redetect', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({event})});
+    const j = await r.json();
+    if (event !== autoEvent()) return;
+    if (!r.ok) layoutMsg = {text: j.error || 'Re-detect failed', err: true};
+    else { layoutData = j; layoutEditing = false; layoutMsg = {text: 'Layout re-detected.'}; }
+  } catch(e){ layoutMsg = {text: 'Re-detect failed: ' + e, err: true}; }
+  renderLayoutCard();
+}
+
+function _el(tag, cls, text){
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function _num(v, d){ return (v == null || isNaN(Number(v))) ? '—' : Number(v).toFixed(d); }
+
+function autoMethodText(rec){
+  const n = rec.metrics && rec.metrics.n_tags;
+  switch (rec.method){
+    case 'full_solve':   return `Full solve from ${n != null ? n : '?'} tags`;
+    case 'verify':       return 'Existing calibration verified';
+    case 'pose_resolve': return "Pose re-solved against the event's lens";
+    default:             return rec.status === 'running' ? 'Calibrating…' : '';
+  }
+}
+function autoMetricsText(m){
+  if (!m) return '';
+  const bits = [];
+  if (m.n_tags != null) bits.push(`${m.n_tags} tags`);
+  if (m.rms_px != null) bits.push(`rms ${_num(m.rms_px, 2)} px`);
+  if (m.val_best_m != null || m.val_median_m != null || m.val_worst_m != null){
+    bits.push(`validation best/median/worst ${_num(m.val_best_m, 2)} / ${_num(m.val_median_m, 2)}`
+      + ` / ${_num(m.val_worst_m, 2)} m` + (m.val_frames ? ` over ${m.val_frames} frames` : ''));
+  }
+  if (m.center_shift_m != null) bits.push(`centre shift ${_num(m.center_shift_m, 2)} m`);
+  if (m.rotation_delta_deg != null) bits.push(`rotation ${_num(m.rotation_delta_deg, 1)}°`);
+  if (m.located_tags && m.located_tags.length) bits.push(`${m.located_tags.length} located`);
+  return bits.join(' · ');
+}
+function setAutoCardMsg(cam, text, err){
+  if (text) autoCardMsg[cam] = {text, err: !!err}; else delete autoCardMsg[cam];
+  renderAutoPanel();
+}
+
+function renderAutoPanel(){
+  const wrap = document.getElementById('autoCards');
+  wrap.replaceChildren();
+  const event = autoEvent();
+  const running = autoAnyRunning();
+  document.getElementById('autoRerunAllBtn').disabled = !event || running;
+  const ps = document.getElementById('autoPanelStatus');
+  if (!ps.dataset.sticky){
+    ps.className = 'auto-msg';
+    ps.textContent = !event ? 'No event loaded.'
+      : running ? 'Calibrating cameras… (this page refreshes every 3 s)'
+      : (!Object.keys(autoRecords).length ? 'No automatic calibration for this event yet.' : '');
+  }
+  for (const cam of autoCameraList()) wrap.appendChild(renderAutoCard(cam, autoRecords[cam]));
+}
+
+function renderAutoCard(cam, rec){
+  const card = _el('div', 'auto-card');
+  const head = _el('div', 'auto-card-head');
+  head.appendChild(_el('span', 'auto-cam', cam));
+  const st = rec && rec.status;
+  head.appendChild(_el('span', 'auto-badge ' + (st ? 'st-' + st : 'st-none'),
+                       st ? (AUTO_STATUS_TEXT[st] || st) : 'not run yet'));
+  card.appendChild(head);
+
+  const actions = _el('div', 'auto-actions');
+  if (!rec){
+    card.classList.add('auto-empty');
+    card.appendChild(_el('div', 'auto-reason', 'Not run yet for this event.'));
+    const run = _el('button', null, 'Run');
+    run.disabled = !autoEvent() || autoAnyRunning();
+    run.onclick = () => rerunAuto(cam);
+    const man = _el('button', null, 'Correct manually');
+    man.onclick = () => correctManually(cam);
+    actions.append(run, man);
+  } else {
+    if (autoExpanded.has(cam)) card.classList.add('expanded');
+    const method = autoMethodText(rec);
+    if (method) card.appendChild(_el('div', 'auto-line auto-method', method));
+    if (rec.match_key){
+      let ref = `Reference ${rec.match_key}`;
+      if (rec.timestamp != null) ref += ` @ ${_num(rec.timestamp, 0)} s`;
+      if (rec.epoch) ref += ` · epoch ${rec.epoch}`;
+      if (rec.resolved_version) ref += ` · saved as ${rec.resolved_version}`;
+      card.appendChild(_el('div', 'auto-line', ref));
+    }
+    const metrics = autoMetricsText(rec.metrics);
+    if (metrics) card.appendChild(_el('div', 'auto-metrics', metrics));
+    if (rec.reason) card.appendChild(_el('div', 'auto-reason', rec.reason));
+    const unused = (rec.metrics && rec.metrics.unused_visible_tags) || [];
+    if (unused.length){
+      card.appendChild(_el('div', 'auto-warn',
+        `Edge lens unverified: tag${unused.length > 1 ? 's' : ''} ${unused.join(', ')}`
+        + ` ${unused.length > 1 ? "weren't" : "wasn't"} decoded — check their orange labels sit on the tags`));
+    }
+    const previewUrl = `/api/calibration/auto/preview?event=${encodeURIComponent(autoEvent())}`
+      + `&camera=${encodeURIComponent(cam)}&t=${encodeURIComponent(rec.created_at || '')}`;
+    if (rec.preview && st !== 'running' && autoPreviewFailed.has(previewUrl)){
+      card.appendChild(_el('div', 'hint', 'Overlay preview unavailable.'));
+    } else if (rec.preview && st !== 'running'){
+      const img = _el('img', 'auto-preview');
+      img.alt = `${cam} auto-calibration overlay`;
+      img.title = 'Click to enlarge / shrink';
+      img.src = previewUrl;
+      img.onerror = () => {
+        autoPreviewFailed.add(previewUrl);   // don't re-request it on every re-render
+        img.replaceWith(_el('div', 'hint', 'Overlay preview unavailable.'));
+      };
+      img.onclick = () => {
+        if (autoExpanded.has(cam)) autoExpanded.delete(cam); else autoExpanded.add(cam);
+        card.classList.toggle('expanded', autoExpanded.has(cam));
+      };
+      card.appendChild(img);
+    }
+    if (st === 'ready'){
+      const ok = _el('button', 'primary', 'Confirm');
+      ok.title = 'Save this calibration as a new version';
+      ok.onclick = () => confirmAuto(cam);
+      actions.appendChild(ok);
+    }
+    const man = _el('button', null, 'Correct manually');
+    man.onclick = () => correctManually(cam);
+    const rerun = _el('button', null, 'Re-run');
+    rerun.disabled = st === 'running' || autoAnyRunning();
+    rerun.onclick = () => rerunAuto(cam);
+    actions.append(man, rerun);
+  }
+  const msg = autoCardMsg[cam];
+  if (msg) actions.appendChild(_el('span', 'auto-msg' + (msg.err ? ' err' : ''), msg.text));
+  card.appendChild(actions);
+  return card;
+}
+
+async function _postJson(url, body){
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body)});
+  let j = {};
+  try { j = await r.json(); } catch(e){ /* non-JSON error body */ }
+  return {r, j, err: (!r.ok || j.error) ? (j.error || j.detail || `HTTP ${r.status}`) : null};
+}
+
+async function confirmAuto(cam){
+  const event = autoEvent();
+  setAutoCardMsg(cam, 'Saving…');
+  try {
+    const {j, err} = await _postJson('/api/calibration/auto/confirm', {event, camera: cam});
+    if (err){ setAutoCardMsg(cam, 'Confirm failed: ' + err, true); return; }
+    setAutoCardMsg(cam, j.version_id ? `Saved as version ${j.version_id} ✓` : 'Confirmed ✓');
+    await loadAutoStatus();
+    // A new version exists now: refresh the versions list / drift marks, and
+    // re-restore the manual editor for this camera (now, or when it next opens).
+    loadVersions();
+    loadDrift().then(populateMatchSelector);
+    if (cam === document.getElementById('camera').value){
+      if (document.getElementById('manualDetails').open) refreshForSelection();
+      else manualStale = true;
+    }
+  } catch(e){ setAutoCardMsg(cam, 'Confirm error: ' + e.message, true); }
+}
+
+// Re-run one camera (cam) or all of them (no cam). force re-runs ready /
+// verified / confirmed records too.
+async function rerunAuto(cam){
+  const event = autoEvent();
+  if (!event) return;
+  const body = {event, force: true};
+  if (cam) body.camera = cam;
+  const ps = document.getElementById('autoPanelStatus');
+  const say = (text, err) => {
+    if (cam){ setAutoCardMsg(cam, text, err); return; }
+    ps.dataset.sticky = '1'; ps.textContent = text; ps.className = 'auto-msg' + (err ? ' err' : '');
+    setTimeout(() => { delete ps.dataset.sticky; renderAutoPanel(); }, 6000);
+  };
+  try {
+    const {r, err} = await _postJson('/api/calibration/auto/run', body);
+    if (r.status === 409){ say('A run is already in progress for this event.', true); }
+    else if (r.status === 404){ say("Auto-calibration isn't available on this server.", true); }
+    else if (err){ say('Re-run failed: ' + err, true); }
+    else { say(cam ? 'Re-run started…' : 'Re-running all cameras…'); }
+  } catch(e){ say('Re-run error: ' + e.message, true); }
+  await loadAutoStatus();
+  // The run may not have flipped to "running" by the first status read — poll once more.
+  if (!autoPollTimer) autoPollTimer = setTimeout(loadAutoStatus, 3000);
+}
+
+// Open the manual editor on camera `cam`, starting from the auto run's frame and
+// aggregated tag corners, so the operator only adds the undecoded tags and Solves.
+async function correctManually(cam){
+  const rec = autoRecords[cam] || null;
+  const seq = ++frameLoadSeq;          // supersedes any in-flight restore
+  manualStale = false;                 // ...and the open below must not start another
+  openManual();
+  document.getElementById('camera').value = cam;
+  // Version anchor: like Confirm — event start when this camera has no versions
+  // yet, else the reference match (when it is in the selector).
+  let hasVersions = true;
+  try {
+    const r = await fetch(`/api/calibration/versions?event=${encodeURIComponent(autoEvent())}`
+      + `&camera=${encodeURIComponent(cam)}`);
+    if (r.ok) hasVersions = ((await r.json()).versions || []).length > 0;
+  } catch(e){ /* assume versions exist → anchor at the reference match */ }
+  if (seq !== frameLoadSeq) return;
+  populateMatchSelector();             // drift markers are per camera
+  const sel = document.getElementById('matchSel');
+  const mk = rec && rec.match_key;
+  sel.value = (hasVersions && mk && [...sel.options].some(o => o.value === mk)) ? mk : '';
+  if (rec && rec.timestamp != null) document.getElementById('timestamp').value = rec.timestamp;
+  loadVersions();
+  refreshAutofix();
+  document.getElementById('manualDetails').scrollIntoView({behavior: 'smooth', block: 'start'});
+
+  if (!rec || !rec.match_key){
+    // Nothing to start from (no record, or the run never got footage): plain grab.
+    await grabFrame({silent: true, seq});
+    if (seq !== frameLoadSeq) return;
+    setStatus(`${cam}: no automatic result to start from — grab a frame, click tags, then Solve.`, 'rms-warn');
+    return;
+  }
+  // The auto_tags are crop pixels of THIS match's footage at THIS timestamp, so
+  // grab exactly that frame (explicit match_key: the server reads local footage).
+  const ts = (rec.timestamp != null) ? Number(rec.timestamp)
+           : (parseFloat(document.getElementById('timestamp').value) || 75);
+  const grabbed = await grabFrame({matchKey: rec.match_key, ts, silent: true, seq});
+  if (seq !== frameLoadSeq) return;
+  // Preload AFTER the grab (which sets autoTags to the single-frame detections).
+  const tags = rec.auto_tags || {};
+  autoTags = JSON.parse(JSON.stringify(tags));
+  // Centre points the automatic locator found for undecoded tags.
+  manualTags = (rec.manual_tags || []).map(m => ({id: m.id, u: m.u, v: m.v}));
+  heldOut = new Set(); pendingPixel = null;
+  currentFrameSource = {match_key: rec.match_key, timestamp: ts};
+  redrawFrame(); drawMap(); renderRows();
+  const n = Object.keys(autoTags).length;
+  const unused = (rec.metrics && rec.metrics.unused_visible_tags) || [];
+  const extra = unused.length ? ` (the overlay above flags ${unused.join(', ')})` : '';
+  if (!grabbed){
+    const why = document.getElementById('statusLine').textContent;
+    setStatus(`Loaded ${n} tags from the automatic run, but the frame from ${rec.match_key} `
+      + `@ ${ts} s couldn't be grabbed (${why}) — fix that before solving.`, 'rms-err');
+    return;
+  }
+  setStatus(`Loaded ${n} tags from the automatic run (${rec.match_key} @ ${ts} s). Click any `
+    + `orange-labelled (undecoded) tag${extra} on the frame, then its marker on the map, `
+    + `then Solve & preview.`, 'rms-info');
 }
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');

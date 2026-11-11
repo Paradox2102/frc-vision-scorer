@@ -13,6 +13,13 @@ class CalibrationError(Exception):
 MIN_POSE_TAGS = 2          # >=2 tags so points are non-coplanar across the field
 MIN_CALIB_POINTS = 8       # single-view calibrateCamera: ~10 free params
 
+# Physical plausibility of a solved pose (pose_plausibility). Stored calibrations
+# (2026cur/2026hop, Nov 2026): corner cameras sit at z 0.67-0.70 m, main 3.3-3.9 m,
+# rolls within +-2 deg (one bad hop corner_right version: 26 deg). The band and roll
+# limit are loose on purpose — they only have to reject mirror/flip solutions.
+POSE_Z_BAND_M = (0.3, 15.0)
+POSE_MAX_ROLL_DEG = 45.0
+
 
 @dataclass
 class CameraCalibration:
@@ -232,17 +239,24 @@ class Calibrator:
                 (w, h), K0.copy(), np.zeros(5), flags=flags)
         except cv2.error as e:
             raise CalibrationError(f"calibrateCamera failed: {str(e)[:120]}")
-        return CameraCalibration(
+        cal = CameraCalibration(
             mode="pinhole", K=np.asarray(K, float),
             D=np.asarray(D, float).reshape(-1),
             rvec=np.asarray(rvecs[0], float).reshape(3, 1),
             tvec=np.asarray(tvecs[0], float).reshape(3, 1),
             image_size=(w, h), crop_region=(0, 0, w, h),
             field_season=field_season, rms_error=float(rms))
+        why = check_solve_plausible(cal, correspondences, field_season)
+        if why is not None:
+            raise CalibrationError(
+                f"the camera solve is physically implausible ({why}) — check the "
+                f"tag correspondences / calibrate manually")
+        return cal
 
     @staticmethod
     def solve_pose(correspondences: dict, K, D, image_size: tuple,
-                   field_season: str, mode: str = "camera") -> "CameraCalibration":
+                   field_season: str, mode: str = "camera", init=None,
+                   check_plausible: bool = True) -> "CameraCalibration":
         """Solve camera POSE against KNOWN intrinsics K, D (the per-event auto step).
         correspondences: {tag_id: (corners_2d (N,2), corners_3d (N,3))}.
 
@@ -250,7 +264,13 @@ class Calibrator:
         model they were solved under: "camera" (fisheye, 4-coeff D) or "pinhole"
         (5-coeff radial/tangential D). Undistorting with the wrong model silently
         yields a wrong pose — the two undistort routines are not interchangeable. The
-        returned calibration carries the same mode so downstream projection matches."""
+        returned calibration carries the same mode so downstream projection matches.
+
+        Multi-start (``_pose_multistart``): the plain solve, ``init`` (rvec, tvec),
+        SQPnP and both IPPE solutions of every tag are refined on all points; the
+        lowest-reprojection candidate that passes ``pose_plausibility`` wins. When
+        no candidate is plausible (only mirrored / behind-camera / upside-down poses
+        fit) it raises CalibrationError with that reason."""
         if len(correspondences) < MIN_POSE_TAGS:
             raise CalibrationError(
                 f"need >= {MIN_POSE_TAGS} tags for pose, got {len(correspondences)}")
@@ -258,36 +278,182 @@ class Calibrator:
             raise CalibrationError(f"solve_pose needs a projective mode, got '{mode}'")
         K = np.asarray(K, float)
         D = np.asarray(D, float).reshape(-1)
-        obj = np.vstack([c3d for (_, c3d) in correspondences.values()]).astype(np.float64)
-        img = np.vstack([c2d for (c2d, _) in correspondences.values()]).astype(np.float64)
-        # Recover pose against the correct lens model. The two models take different
-        # PnP paths — mixing them is the classic wrong-pose bug:
-        #   pinhole: DLT-init on undistorted points, then LM-refine against the true
-        #     5-coeff Brown model. Passing distortion straight to solvePnP's ITERATIVE
-        #     init is fragile for oblique views — its DLT seed ignores distortion and
-        #     can diverge by hundreds of px — while undistort-only init leaves residual
-        #     at moderate k1. Init-then-refine is both robust and sub-pixel accurate.
-        #   fisheye: solvePnP can't ingest the 4-coeff equidistant D, so undistort to a
-        #     pinhole frame (P=K) first, then PnP with no further distortion.
-        img_pnp = img.reshape(-1, 1, 2)
-        if mode == "pinhole":
-            Dp = D.reshape(-1, 1)
-            undist = cv2.undistortPoints(img_pnp, K, Dp, P=K)
-            ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
-                                          flags=cv2.SOLVEPNP_ITERATIVE)
-            if ok:
-                rvec, tvec = cv2.solvePnPRefineLM(obj, img_pnp, K, Dp, rvec, tvec)
-        else:
-            undist = cv2.fisheye.undistortPoints(img_pnp, K, D, P=K)
-            ok, rvec, tvec = cv2.solvePnP(obj, undist.reshape(-1, 1, 2), K, None,
-                                          flags=cv2.SOLVEPNP_ITERATIVE)
-        if not ok:
+        cands = _pose_multistart(correspondences, K, D, mode, init)
+        if not cands:
             raise CalibrationError("solvePnP failed")
-        cal = CameraCalibration(K=K, D=D, rvec=rvec, tvec=tvec,
-                                image_size=image_size, crop_region=None,
-                                field_season=field_season, mode=mode)
-        cal.rms_error = _reprojection_rms(cal, correspondences)
-        return cal
+        first_why = None
+        best_rms = cands[0][0]
+        for rms, rvec, tvec in cands:
+            # A plausible pose that fits far worse than the best (implausible) one
+            # is not an answer either — only a mirror of the real problem.
+            if rms > max(2.0 * best_rms, best_rms + 3.0):
+                break
+            cal = CameraCalibration(K=K, D=D, rvec=rvec, tvec=tvec,
+                                    image_size=image_size, crop_region=None,
+                                    field_season=field_season, mode=mode)
+            why = check_solve_plausible(cal, correspondences, field_season) \
+                if check_plausible else None
+            if why is None:
+                cal.rms_error = _reprojection_rms(cal, correspondences)
+                return cal
+            first_why = first_why or f"{why} (rms {rms:.1f} px)"
+        raise CalibrationError(
+            "only physically implausible poses fit these tags (upside-down / mirrored / "
+            f"behind the camera): {first_why} — calibrate manually")
+
+
+def _tag_id_of_key(key) -> Optional[int]:
+    """Tag id of a correspondence key: 6, "6", "a6" (auto), "m6" (manual centre),
+    "r6" (ROI decode). None when it is not a tag."""
+    if isinstance(key, (int, np.integer)):
+        return int(key)
+    k = str(key)
+    if k[:1] in ("a", "m", "r"):
+        k = k[1:]
+    return int(k) if k.isdigit() else None
+
+
+_FM_CACHE: dict = {}
+
+
+def _field_model(season: str):
+    if not season:
+        return None
+    fm = _FM_CACHE.get(season)
+    if fm is None:
+        try:
+            from web.field.field_model import FieldModel
+            fm = _FM_CACHE[season] = FieldModel.load(season)
+        except Exception:
+            return None
+    return fm
+
+
+def pose_plausibility(cal: "CameraCalibration", obj_points=None, fm=None, tag_ids=(),
+                      z_band=POSE_Z_BAND_M, max_roll_deg=POSE_MAX_ROLL_DEG) -> Optional[str]:
+    """None when ``cal``'s pose is physically plausible for a broadcast camera, else a
+    one-line reason. A hard gate against mirror / flipped PnP minima:
+      * camera centre height within ``z_band`` metres;
+      * camera upright — world +z points UP in the image (roll within max_roll_deg);
+      * every correspondence point (``obj_points``) in front of the camera;
+      * with a field model: the field centre in front of the camera, and the used
+        tags (``tag_ids``) facing it — a decoded tag cannot be seen from behind. A
+        MAJORITY must face (synthetic fixtures include tags seen edge-on/from behind).
+    Pose-free (homography) calibrations are always plausible."""
+    if cal is None or cal.rvec is None or cal.tvec is None:
+        return None
+    R, _ = cv2.Rodrigues(np.asarray(cal.rvec, float))
+    t = np.asarray(cal.tvec, float).reshape(3)
+    c = (-R.T @ t).reshape(3)
+    if not np.all(np.isfinite(c)):
+        return "non-finite camera centre"
+    if not (z_band[0] <= c[2] <= z_band[1]):
+        return (f"camera height {c[2]:.2f} m is outside {z_band[0]:g}-{z_band[1]:g} m "
+                f"(below the floor / implausible)")
+    up = R @ np.array([0.0, 0.0, 1.0])            # world up, camera frame (y = down)
+    if abs(up[0]) + abs(up[1]) > 0.2:             # not looking straight down
+        if up[1] >= 0:
+            return "camera is upside down (world up points down in the image)"
+        roll = float(np.degrees(np.arctan2(up[0], -up[1])))
+        if abs(roll) > max_roll_deg:
+            return f"camera roll {roll:.0f} deg exceeds +-{max_roll_deg:g} deg"
+    if obj_points is not None and len(obj_points):
+        P = np.asarray(obj_points, float).reshape(-1, 3)
+        zc = (P @ R.T + t)[:, 2]
+        if np.any(zc <= 0):
+            return f"{int(np.sum(zc <= 0))} of {len(zc)} tag points are behind the camera"
+    if fm is not None:
+        ctr = np.array([fm.length_m / 2.0, fm.width_m / 2.0, 0.0])
+        if (R @ ctr + t)[2] <= 0:
+            return "the field centre is behind the camera"
+        ids = [i for i in dict.fromkeys(tag_ids) if i is not None and i in fm.tags]
+        if ids:
+            from web.field.field_model import _quat_to_matrix
+            away = [i for i in ids
+                    if float((_quat_to_matrix(fm.tag_quaternion(i)) @ [1.0, 0.0, 0.0])
+                             @ (c - fm.tag_translation(i))) <= 0]
+            if len(away) * 2 > len(ids):
+                return f"tags {away} would be seen from behind"
+    return None
+
+
+def check_solve_plausible(cal: "CameraCalibration", correspondences: dict,
+                          season: Optional[str] = None) -> Optional[str]:
+    """pose_plausibility for a solve from ``correspondences`` ({key: (img, obj)})."""
+    obj = np.vstack([np.asarray(o, float).reshape(-1, 3) for _, o in correspondences.values()])
+    ids = [_tag_id_of_key(k) for k in correspondences]
+    return pose_plausibility(cal, obj, _field_model(season or cal.field_season), ids)
+
+
+def _pose_rms(obj, img, rvec, tvec, K, D, mode) -> float:
+    if mode == "pinhole":
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, K, np.asarray(D, float).reshape(-1, 1))
+    else:
+        proj, _ = cv2.fisheye.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, K, D)
+    d = proj.reshape(-1, 2) - img.reshape(-1, 2)
+    return float(np.sqrt(np.mean(np.sum(d * d, axis=1))))
+
+
+def _pose_multistart(correspondences: dict, K, D, mode: str, init=None):
+    """Candidate poses for the PnP problem, each refined on ALL points: the plain
+    DLT/iterative solve, the caller's initial pose, SQPnP, and BOTH IPPE solutions of
+    every 4-corner tag (planar targets have a two-fold ambiguity, and points on one
+    or two hub faces are close to planar — the iterative solve alone can land in the
+    mirrored minimum). Returns [(rms_px, rvec, tvec)], best first."""
+    obj = np.vstack([np.asarray(o, np.float64).reshape(-1, 3)
+                     for _, o in correspondences.values()])
+    img = np.vstack([np.asarray(i, np.float64).reshape(-1, 2)
+                     for i, _ in correspondences.values()])
+    img_pnp = img.reshape(-1, 1, 2)
+    if mode == "pinhole":
+        Dp = D.reshape(-1, 1)
+        und = cv2.undistortPoints(img_pnp, K, Dp, P=K).reshape(-1, 1, 2)
+    else:
+        und = cv2.fisheye.undistortPoints(img_pnp, K, D, P=K).reshape(-1, 1, 2)
+    seeds = []
+    try:
+        ok, r, t = cv2.solvePnP(obj, und, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+        if ok:
+            seeds.append((r, t))
+    except cv2.error:
+        pass
+    if init is not None:
+        seeds.append((np.asarray(init[0], float).reshape(3, 1),
+                      np.asarray(init[1], float).reshape(3, 1)))
+    if len(obj) >= 4:
+        try:
+            ok, r, t = cv2.solvePnP(obj, und, K, None, flags=cv2.SOLVEPNP_SQPNP)
+            if ok:
+                seeds.append((r, t))
+        except cv2.error:
+            pass
+    off = 0
+    for i2d, o3d in correspondences.values():
+        n = len(np.asarray(o3d).reshape(-1, 3))
+        if n == 4:
+            try:
+                k, rs, ts, _ = cv2.solvePnPGeneric(obj[off:off + 4], und[off:off + 4], K, None,
+                                                   flags=cv2.SOLVEPNP_IPPE)
+                seeds.extend(zip(rs[:k], ts[:k]))
+            except cv2.error:
+                pass
+        off += n
+    out = []
+    for r, t in seeds:
+        r = np.asarray(r, float).reshape(3, 1).copy()
+        t = np.asarray(t, float).reshape(3, 1).copy()
+        try:
+            if mode == "pinhole":
+                r, t = cv2.solvePnPRefineLM(obj, img_pnp, K, D.reshape(-1, 1), r, t)
+            else:
+                r, t = cv2.solvePnPRefineLM(obj, und, K, None, r, t)
+            rms = _pose_rms(obj, img, r, t, K, D, mode)
+        except cv2.error:
+            continue
+        if np.isfinite(rms):
+            out.append((rms, r, t))
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 def holdout_field_error(cal: "CameraCalibration", held: dict) -> float:

@@ -66,18 +66,25 @@ def _read_version_file(p: Path) -> dict:
     return {"calibration": CameraCalibration.from_json(d["calibration"]),
             "start_match": d.get("start_match"), "label": d.get("label"),
             "created_at": d.get("created_at"), "version_id": d["version_id"],
-            "source": d.get("source")}
+            "source": d.get("source"), "rejected": bool(d.get("rejected"))}
 
 
-def load_versions(event_key, camera) -> list[dict]:
+def load_versions(event_key, camera, include_rejected: bool = False) -> list[dict]:
     """All calibration versions for (event,camera): versioned files + the legacy
-    single file (as a start_match=None version). Sorted by created_at."""
+    single file (as a start_match=None version). Sorted by created_at.
+
+    Versions an operator REJECTED (``set_version_rejected``) are left out unless
+    ``include_rejected`` — so select_epoch, the job and every other consumer
+    ignore them; listing UIs can opt back in."""
     out = []
     for fp in glob.glob(_version_glob(event_key, camera)):
         try:
-            out.append(_read_version_file(Path(fp)))
+            v = _read_version_file(Path(fp))
         except Exception:
-            pass
+            continue
+        if v["rejected"] and not include_rejected:
+            continue
+        out.append(v)
     legacy = _path(event_key, camera)
     if legacy.exists():
         cal = CameraCalibration.from_json(json.loads(legacy.read_text()))
@@ -85,6 +92,20 @@ def load_versions(event_key, camera) -> list[dict]:
                     "created_at": "", "version_id": "legacy", "source": None})
     out.sort(key=lambda v: v.get("created_at") or "")
     return out
+
+
+def set_version_rejected(event_key, camera, version_id, rejected: bool = True) -> bool:
+    """Flag (or un-flag) a version as rejected by an operator. The file is kept —
+    rejection is reversible. Returns False if the version does not exist."""
+    if version_id == "legacy":
+        return False
+    p = _version_path(event_key, camera, version_id)
+    if not p.exists():
+        return False
+    d = json.loads(p.read_text())
+    d["rejected"] = bool(rejected)
+    _atomic_write(p, json.dumps(d, indent=2).encode())
+    return True
 
 
 def _drift_path(event_key: str) -> Path:
@@ -163,6 +184,89 @@ def clear_pending_autofix(event_key, camera, match_key) -> None:
         p.write_text(json.dumps(d, indent=2))
 
 
+def _auto_safe(event_key: str, camera: str) -> str:
+    return "".join(c for c in f"{event_key}_{camera}" if c.isalnum() or c in "_-")
+
+
+def auto_record_path(event_key: str, camera: str) -> Path:
+    return UPLOAD_DIR / f"calibration_auto_{_auto_safe(event_key, camera)}.json"
+
+
+def auto_preview_name(event_key: str, camera: str) -> str:
+    """File name (not path) of the auto-calibration overlay JPEG; it lives in
+    UPLOAD_DIR next to the record."""
+    return f"calibration_auto_{_auto_safe(event_key, camera)}.jpg"
+
+
+def auto_preview_path(event_key: str, camera: str) -> Path:
+    return UPLOAD_DIR / auto_preview_name(event_key, camera)
+
+
+def auto_frame_name(event_key: str, camera: str) -> str:
+    """File name of the raw temporal-median camera frame (no overlay)."""
+    return f"calibration_auto_{_auto_safe(event_key, camera)}_frame.jpg"
+
+
+def auto_frame_path(event_key: str, camera: str) -> Path:
+    return UPLOAD_DIR / auto_frame_name(event_key, camera)
+
+
+def _atomic_write(p: Path, data: bytes) -> None:
+    # The calibrate page polls the record while the runner rewrites it — write to a
+    # sibling temp file and rename so a reader never sees a half-written file.
+    import os
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:      # unique temp name: concurrent writers
+            f.write(data)                   # never share (or clobber) one temp file
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_auto_record(event_key, camera, record: dict) -> None:
+    """Persist the automatic-calibration record for (event, camera). One record per
+    pair, overwritten on each run. It is a REVIEW artifact: nothing here is ever
+    read by ``load_versions``/``select_epoch`` — confirming promotes the candidate
+    to a real version via ``save_version``."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(auto_record_path(event_key, camera),
+                  json.dumps(record, indent=2).encode())
+
+
+def load_auto_record(event_key, camera) -> dict | None:
+    p = auto_record_path(event_key, camera)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def update_auto_record(event_key, camera, **fields) -> dict | None:
+    """Merge ``fields`` into the existing record and persist it. Returns the updated
+    record, or None if there is no record to update."""
+    rec = load_auto_record(event_key, camera)
+    if rec is None:
+        return None
+    rec.update(fields)
+    save_auto_record(event_key, camera, rec)
+    return rec
+
+
+def save_auto_preview(event_key, camera, jpeg_bytes: bytes) -> str:
+    """Write the overlay JPEG next to the record; returns its file name."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(auto_preview_path(event_key, camera), jpeg_bytes)
+    return auto_preview_name(event_key, camera)
+
+
 def update_version(event_key, camera, version_id, cal) -> None:
     """Overwrite an existing version's calibration in place (property edits), keeping
     its start_match/label/created_at. 'legacy' updates the legacy single file."""
@@ -173,3 +277,62 @@ def update_version(event_key, camera, version_id, cal) -> None:
     d = json.loads(p.read_text())
     d["calibration"] = cal.to_json()
     p.write_text(json.dumps(d, indent=2))
+
+
+def save_auto_frame(event_key, camera, jpeg_bytes: bytes) -> str:
+    """Write the raw median frame JPEG next to the record; returns its file name."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(auto_frame_path(event_key, camera), jpeg_bytes)
+    return auto_frame_name(event_key, camera)
+
+
+# ---- per-match corner calibration log ------------------------------------------
+
+def permatch_log_path(event_key: str, camera: str) -> Path:
+    return UPLOAD_DIR / f"calibration_permatch_{_auto_safe(event_key, camera)}.json"
+
+
+def permatch_preview_name(event_key: str, camera: str, match_key: str) -> str:
+    safe_m = "".join(c for c in str(match_key) if c.isalnum() or c in "_-")
+    return f"calibration_permatch_{_auto_safe(event_key, camera)}__{safe_m}.jpg"
+
+
+def permatch_preview_path(event_key: str, camera: str, match_key: str) -> Path:
+    return UPLOAD_DIR / permatch_preview_name(event_key, camera, match_key)
+
+
+def load_permatch_log(event_key, camera) -> dict:
+    """{match_key: entry} for one camera; {} when none."""
+    p = permatch_log_path(event_key, camera)
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_permatch_entry(event_key, camera, match_key, entry: dict) -> dict:
+    """Write (replace) one match's entry; returns it."""
+    d = load_permatch_log(event_key, camera)
+    d[str(match_key)] = entry
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(permatch_log_path(event_key, camera), json.dumps(d, indent=2).encode())
+    return entry
+
+
+def update_permatch_entry(event_key, camera, match_key, **fields) -> dict | None:
+    d = load_permatch_log(event_key, camera)
+    e = d.get(str(match_key))
+    if e is None:
+        return None
+    e.update(fields)
+    _atomic_write(permatch_log_path(event_key, camera), json.dumps(d, indent=2).encode())
+    return e
+
+
+def save_permatch_preview(event_key, camera, match_key, jpeg_bytes: bytes) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(permatch_preview_path(event_key, camera, match_key), jpeg_bytes)
+    return permatch_preview_name(event_key, camera, match_key)

@@ -374,7 +374,7 @@ def main(argv=None) -> None:
     print(f"replay {row['id'][:8]}  {row['match_key']}  video {video.name}")
     t0 = time.time()
     out = relabel_one(row, meta, video, cal, red, blue, opts, session, fps=fps,
-                      view=load_layout()["main"].crop)
+                      view=load_layout(event_key=row["match_key"].split("_")[0])["main"].crop)
     result = out["result"]
     print(f"stage: {json.dumps(out['stats'])}  ({time.time() - t0:.0f}s, digit cache "
           f"{out['cache_origin']}, ground_center_offset_m {out['gco']})")

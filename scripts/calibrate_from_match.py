@@ -72,7 +72,7 @@ def main():
     ap.add_argument("--save", action="store_true", help="persist a calibration version (default: dry-run)")
     args = ap.parse_args()
 
-    layout = load_layout()
+    layout = load_layout(event_key=args.event)
     if args.camera not in layout:
         raise SystemExit(f"unknown camera '{args.camera}'; known: {list(layout)}")
     crop = layout[args.camera].crop
@@ -108,7 +108,8 @@ def main():
             cal.robot_track_top_crop = prev.robot_track_top_crop
         source = {"auto_tags": {str(t): c.tolist() for t, c in corners.items()},
                   "match_key": args.match_key, "method": "aggregate_from_match",
-                  "window": args.window, "stride_sec": args.stride_sec}
+                  "window": args.window, "stride_sec": args.stride_sec,
+                  "crop": [int(v) for v in crop]}   # crop-local calibration: record its origin
         vid = field_store.save_version(args.event, args.camera, cal,
                                        start_match=args.match_key,
                                        label="aggregated in-match tags", source=source)

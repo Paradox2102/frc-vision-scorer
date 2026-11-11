@@ -243,11 +243,16 @@ class VisionScorer {
             // params query string forces a reload (deep-link recovery flow
             // wants that specific match/camera targeted); otherwise leave an
             // already-loaded iframe alone so in-progress state isn't reset.
+            // The page reads the loaded event once at startup, so an iframe loaded
+            // for a DIFFERENT event than the current one is stale — reload it.
             const iframe = document.getElementById('calibrationFrame');
+            const evKey = (this.eventData && this.eventData.event_key) || null;
             if (params) {
                 iframe.src = '/static/calibrate.html' + params;
-            } else if (!iframe.src) {
+                this._calibFrameEvent = evKey;
+            } else if (!iframe.src || this._calibFrameEvent !== evKey) {
                 iframe.src = '/static/calibrate.html';
+                this._calibFrameEvent = evKey;
             }
         }
 
@@ -632,7 +637,10 @@ class VisionScorer {
 
             this.eventData = data;
             statusEl.style.display = 'none';
-            
+
+            // A fresh load schedules auto-calibration server-side; its records may
+            // not exist on the first status read, so the chip polls a little longer.
+            this._calibChipFreshLoad = true;
             // Always go to match setup — calibration happens per-match before inference
             this.showMatchSetup();
         } catch (err) {
@@ -968,6 +976,66 @@ class VisionScorer {
         }
     }
 
+    // --- Auto-calibration chip (event banner) ---
+    // Loading an event auto-calibrates every camera server-side. The chip shows
+    // where that stands (/api/calibration/auto/status) and opens the calibration
+    // view. It polls every 3 s while a run is in progress; `grace` extra polls
+    // cover a fresh load whose records don't exist yet. A 404 / no records hides it.
+
+    startCalibChip(grace = 0) {
+        this.stopCalibChip();
+        this._calibChipGrace = grace;
+        this.refreshCalibChip(this._calibChipGen);
+    }
+
+    stopCalibChip() {
+        this._calibChipGen = (this._calibChipGen || 0) + 1;   // orphan any in-flight poll
+        clearTimeout(this._calibChipTimer);
+        this._calibChipTimer = null;
+    }
+
+    async refreshCalibChip(gen) {
+        if (gen !== this._calibChipGen) return;
+        const chip = document.getElementById('calibChip');
+        const key = this.eventData && this.eventData.event_key;
+        if (!chip || !key) return;
+        let data = null;
+        try {
+            const resp = await fetch(`/api/calibration/auto/status?event=${encodeURIComponent(key)}`);
+            if (resp.ok) data = await resp.json();
+        } catch (e) { /* treat as no record */ }
+        if (gen !== this._calibChipGen) return;
+        const cams = Object.values((data && data.cameras) || {}).filter(Boolean);
+        const running = !!(data && data.running) || cams.some(c => c.status === 'running');
+        let text = null, state = '';
+        if (running) { text = 'Calibrating cameras…'; state = 'running'; }
+        else if (cams.some(c => c.status === 'failed')) { text = 'Calibration needs attention ▸'; state = 'failed'; }
+        else if (cams.some(c => c.status === 'ready')) { text = 'Calibration ready — review ▸'; state = 'ready'; }
+        else if (cams.length) { text = 'Calibration ✓'; state = 'ok'; }
+        if (text) {
+            chip.textContent = text;
+            chip.className = `calib-chip calib-chip--${state}`;
+            chip.style.display = '';
+        } else {
+            chip.style.display = 'none';
+        }
+        let again = running;
+        if (!running && !cams.length && this._calibChipGrace > 0) {
+            this._calibChipGrace--;
+            again = true;
+        }
+        if (again) this._calibChipTimer = setTimeout(() => this.refreshCalibChip(gen), 3000);
+    }
+
+    openCalibrationReview() {
+        this.switchView('calibration');
+        // An iframe loaded earlier keeps its old cards; nudge it to re-read status.
+        try {
+            const win = document.getElementById('calibrationFrame').contentWindow;
+            if (win && typeof win.loadAutoStatus === 'function') win.loadAutoStatus();
+        } catch (e) { /* not loaded yet — it reads status on load */ }
+    }
+
     showMatchSetup() {
         this.eventSection.style.display = 'none';
         this.matchSetupSection.style.display = 'block';
@@ -977,15 +1045,20 @@ class VisionScorer {
         banner.innerHTML = `
             <strong>${this.eventData.event_name}</strong>
             <span class="event-meta">${this.eventData.team_count || Object.keys(this.eventData.teams).length} teams &middot; ${this.eventData.match_count || this.eventData.matches.length} matches</span>
+            <button type="button" class="calib-chip" id="calibChip" style="display:none;" title="Open camera calibration"></button>
             <button class="btn-small" id="recalibrateBtn">Recalibrate Scoreboard</button>
             <button class="btn-small" id="changeEventBtn">Change Event</button>
         `;
+        document.getElementById('calibChip').addEventListener('click', () => this.openCalibrationReview());
+        this.startCalibChip(this._calibChipFreshLoad ? 5 : 0);
+        this._calibChipFreshLoad = false;
         document.getElementById('recalibrateBtn').addEventListener('click', () => {
             this._postCalibrationTarget = null;
             this.matchSetupSection.style.display = 'none';
             this.showOcrSetup();
         });
         document.getElementById('changeEventBtn').addEventListener('click', () => {
+            this.stopCalibChip();
             this.eventData = null;
             this.matchSetupSection.style.display = 'none';
             this.eventSection.style.display = 'block';

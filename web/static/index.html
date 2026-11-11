@@ -5,6 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRC Vision Scorer</title>
     <link rel="stylesheet" href="/static/style.css?v=20260707b">
+    <style>
+        /* Auto-calibration status chip in the event banner (see app.js startCalibChip). */
+        .calib-chip {
+            margin-left: auto;
+            font-size: 0.8rem;
+            padding: 0.2rem 0.7rem;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .calib-chip:hover { filter: brightness(1.2); }
+        .calib-chip--running { color: #9cc8ff; border-color: rgba(59, 130, 246, 0.6);
+                               background: rgba(59, 130, 246, 0.12);
+                               animation: calibChipPulse 1.6s ease-in-out infinite; }
+        .calib-chip--ready { color: #fcd34d; border-color: rgba(245, 158, 11, 0.6);
+                             background: rgba(245, 158, 11, 0.12); }
+        .calib-chip--ok { color: #86efac; border-color: rgba(34, 197, 94, 0.55);
+                          background: rgba(34, 197, 94, 0.1); }
+        .calib-chip--failed { color: #fca5a5; border-color: rgba(239, 68, 68, 0.6);
+                              background: rgba(239, 68, 68, 0.12); }
+        @keyframes calibChipPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+    </style>
 </head>
 <body data-mode="standard">
     <div class="container">

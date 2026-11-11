@@ -57,6 +57,10 @@ if str(REPO) not in sys.path:
 
 from scripts.teacher.events import GT_EXCLUDE, TEST_EVENTS, split_of  # noqa: E402
 from scripts.teacher.students import features as F  # noqa: E402
+# runtime inference pieces (moved to web/ so the pipeline never imports scripts.*)
+from web.students.s4_embedder import (  # noqa: E402,F401
+    S4Embedder, S4RobotEmbedder, build_net, letterbox, load_net, model_tag,
+)
 
 MODELS = F.MAIN / "data/teacher/models"
 DEFAULT_CKPT = MODELS / "s4_embedder.pt"
@@ -261,34 +265,7 @@ class CropDataset:
 
 # ----------------------------------------------------------------------------- model + loss
 
-def build_net(pretrained: bool = True, train_blocks: int = 4, dim: int = EMB_DIM, hidden: int = 512):
-    import timm
-    import torch.nn as nn
-    import torch.nn.functional as tF
-
-    class S4Net(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.backbone = timm.create_model(F.MODEL_NAME, pretrained=pretrained, num_classes=0)
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-            n = len(self.backbone.blocks)
-            for b in self.backbone.blocks[max(0, n - train_blocks):]:
-                for p in b.parameters():
-                    p.requires_grad = True
-            if train_blocks > 0:
-                for p in self.backbone.norm.parameters():
-                    p.requires_grad = True
-            d = self.backbone.num_features
-            self.proj = nn.Sequential(nn.Linear(d, hidden), nn.GELU(), nn.Linear(hidden, dim))
-
-        def cls(self, x):
-            return self.backbone.forward_features(x)[:, 0]  # explicit CLS
-
-        def forward(self, x):
-            return tF.normalize(self.proj(self.cls(x)).float(), dim=1)
-
-    return S4Net()
+# build_net lives in web.students.s4_embedder (runtime inference); re-exported above.
 
 
 def supcon_loss(z, labels, tau: float = 0.1):
@@ -539,48 +516,7 @@ def _save_ckpt(net, cfg: TrainCfg, path: Path, extra: dict) -> None:
                           "cls": "forward_features[:,0]"}, **extra}, path)
 
 
-def load_net(path: Path, device: str = "cuda"):
-    import torch
-    ck = torch.load(path, map_location="cpu", weights_only=True)
-    cfg = ck["cfg"]
-    net = build_net(pretrained=False, train_blocks=cfg["train_blocks"], dim=cfg["dim"])
-    net.load_state_dict({k: v.float() if v.is_floating_point() else v for k, v in ck["state_dict"].items()})
-    return net.to(device).eval(), ck
-
-
-class S4Embedder:
-    """Inference wrapper: BGR crops (or frame + robot boxes) -> [N, 128] L2-normalised."""
-
-    def __init__(self, ckpt: Path = DEFAULT_CKPT, device: Optional[str] = None, half: bool = True):
-        import torch
-        self.torch = torch
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.net, self.ck = load_net(Path(ckpt), self.device)
-        self.half = half and self.device.startswith("cuda")
-        if self.half:
-            self.net.half()
-
-    def embed_crops(self, crops_bgr: Sequence[np.ndarray], batch: int = 64) -> np.ndarray:
-        torch = self.torch
-        out = []
-        for i in range(0, len(crops_bgr), batch):
-            x = np.stack([F.preprocess(c, "letterbox", F.DEFAULT_SIZE) for c in crops_bgr[i:i + batch]])
-            x = torch.from_numpy(x).to(self.device, torch.float16 if self.half else torch.float32)
-            with torch.inference_mode():
-                out.append(self.net(x).float().cpu().numpy())
-        return np.concatenate(out) if out else np.zeros((0, self.ck["dim"]), np.float32)
-
-    def embed_boxes(self, frame_bgr: np.ndarray, boxes) -> np.ndarray:
-        """Cut robot boxes the way the checkpoint was trained (harvester 10% pad, or the
-        production 8% inset when ``cfg.inset``) and embed them."""
-        from scripts.teacher.harvest import pad_box
-        h, w = frame_bgr.shape[:2]
-        crops = []
-        for b in boxes:
-            x0, y0, x1, y1 = pad_box(b, ROBOT_PAD, w, h)
-            c = frame_bgr[y0:y1, x0:x1]
-            crops.append(prod_crop(c, b) if self.ck["cfg"].get("inset") else c)
-        return self.embed_crops(crops)
+# load_net / S4Embedder live in web.students.s4_embedder (runtime inference); re-exported above.
 
 
 # ----------------------------------------------------------------------------- commands

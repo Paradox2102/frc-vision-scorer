@@ -243,11 +243,16 @@ class VisionScorer {
             // params query string forces a reload (deep-link recovery flow
             // wants that specific match/camera targeted); otherwise leave an
             // already-loaded iframe alone so in-progress state isn't reset.
+            // The page reads the loaded event once at startup, so an iframe loaded
+            // for a DIFFERENT event than the current one is stale — reload it.
             const iframe = document.getElementById('calibrationFrame');
+            const evKey = (this.eventData && this.eventData.event_key) || null;
             if (params) {
                 iframe.src = '/static/calibrate.html' + params;
-            } else if (!iframe.src) {
+                this._calibFrameEvent = evKey;
+            } else if (!iframe.src || this._calibFrameEvent !== evKey) {
                 iframe.src = '/static/calibrate.html';
+                this._calibFrameEvent = evKey;
             }
         }
 

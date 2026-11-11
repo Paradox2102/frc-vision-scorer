@@ -368,6 +368,29 @@ let frameLoadSeq = 0;
 // the URL's camera whenever the user picked another one).
 let urlCameraApplied = false, urlMatchApplied = false;
 
+// The event field is auto-filled once from the server's loaded event. When the app
+// loads a different event later (main page, another tab), a page still showing the
+// old one would keep reviewing / re-running the OLD event — so whenever the page
+// regains focus, re-check and start over on the new event. A manually typed event
+// is left alone.
+let eventAutoFilled = null;   // the event key last auto-filled from /api/event/current
+document.getElementById('event').addEventListener('input', () => { eventAutoFilled = null; });
+async function syncEventFromServer(){
+  if (!eventAutoFilled || autoEvent() !== eventAutoFilled) return;
+  try {
+    const r = await fetch('/api/event/current');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.event_key && j.event_key !== eventAutoFilled) {
+      location.replace(location.pathname);   // drop ?match= — it was for the old event
+    }
+  } catch(e){ /* offline: keep the current page */ }
+}
+window.addEventListener('focus', syncEventFromServer);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') syncEventFromServer();
+});
+
 (async function init(){
   await fetchCurrentEvent(); await loadDrift(); populateMatchSelector();
   await fetchTagMap(); drawMap(); await loadZones();
@@ -490,6 +513,7 @@ async function fetchCurrentEvent(){
       + document.getElementById('event').value + '". Load the event first.', 'rms-warn'); return; }
     const j = await r.json();
     if (j.event_key){
+      eventAutoFilled = j.event_key;
       document.getElementById('event').value = j.event_key;
       document.getElementById('event').title = 'Auto-filled from the loaded event ('
         + (j.event_name || j.event_key) + ')';

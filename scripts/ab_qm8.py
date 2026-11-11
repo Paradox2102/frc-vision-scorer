@@ -24,6 +24,7 @@ HOST = "localhost:8004"
 AUTO_ONLY = True  # module global; --full-match sets False (per-arm cfg still wins, see post_job)
 # Defaults target qm8; override via CLI for other matches.
 MATCH_KEY = "2026cur_qm8"
+EVENT_KEY = "2026cur"
 VIDEO = REPO / "web/uploads/ff4be1d9-b8e5-49ff-ac78-4a6a0e77a697.mp4"  # cached qm8
 MATCH = 8
 RESULTS = Path("/tmp/frc-ab-qm8.json")
@@ -666,11 +667,11 @@ CONFIGS = PROFILES["full"]
 
 
 def load_event() -> None:
-    """Load 2026cur so the server has a calibrated event (jobs read event_key
+    """Load EVENT_KEY (default 2026cur) so the server has a calibrated event (jobs read event_key
     from the global current_event); without it inference aborts immediately."""
     out = subprocess.run(
         ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
-         "-d", '{"event_key":"2026cur"}', f"http://{HOST}/api/event/load"],
+         "-d", json.dumps({"event_key": EVENT_KEY}), f"http://{HOST}/api/event/load"],
         capture_output=True, text=True, timeout=180).stdout
     if '"event_key"' not in out:
         raise RuntimeError(f"event load failed: {out[:200]}")
@@ -916,6 +917,7 @@ if __name__ == "__main__":
     ap.add_argument("--match", type=int, default=MATCH)
     ap.add_argument("--video", default=str(VIDEO))
     ap.add_argument("--results", default=str(RESULTS))
+    ap.add_argument("--event", default=EVENT_KEY, help="event loaded before the jobs (default 2026cur)")
     ap.add_argument("--host", default=HOST, help="app server host:port (default localhost:8004)")
     ap.add_argument("--profile", choices=list(PROFILES), default="full")
     ap.add_argument("--full-match", action="store_true",
@@ -925,6 +927,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     MATCH_KEY, MATCH, VIDEO, RESULTS = a.match_key, a.match, Path(a.video), Path(a.results)
     HOST = a.host
+    EVENT_KEY = a.event
     if a.restart_between and HOST != "localhost:8004":
         sys.exit("--restart-between restarts the :8004 server via web/*_all.sh; not allowed with --host")
     CONFIGS = PROFILES[a.profile]

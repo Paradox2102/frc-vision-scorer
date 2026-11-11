@@ -494,10 +494,15 @@ class Params:
     use_elimination: bool = True               # ablation: elimination anchors
     rows_alliance_only: bool = False           # ablation: one card per alliance
     digit_calls: Optional[dict] = None         # digit-call cache, reused per window fingerprint
+    cancelled: bool = False                    # a user stop: aborts at the next check, never partial
 
 
 class StageAbort(Exception):
     """The stage cannot finish; the caller keeps the labels it had."""
+
+
+class DeadlinePassed(StageAbort):
+    """The stage's time budget ran out (a stop is a plain StageAbort)."""
 
 
 def _stats(event_lineup: bool = False) -> dict:
@@ -558,23 +563,32 @@ def _usage(session) -> tuple:
 
 
 def _check(params: Params, clock, where: str) -> None:
+    if params.cancelled:
+        raise StageAbort(f"cancelled {where}")
     if params.deadline is not None and clock() > params.deadline:
-        raise StageAbort(f"deadline passed {where}")
+        raise DeadlinePassed(f"deadline passed {where}")
 
 
 def _ask_batched(session, specs: list, build, question: str, params: Params, clock,
-                 stats: dict, where: str) -> list:
+                 stats: dict, where: str, partial_ok: bool = False) -> list:
     """Send ``specs`` in batches of REQUEST_BATCH, checking the deadline and
     the session before each. Returns one result per spec (probs dict or
     None). Aborts when more than MAX_ERROR_FRACTION of the pass failed (checked
     early after every batch against what was sent so far, with a floor of
     MIN_ERRORS_TO_ABORT_EARLY, and against the whole pass after the last
     batch), when the reader latched off during a batch, or when a batch's
-    answer count does not match what was sent."""
+    answer count does not match what was sent. With ``partial_ok`` a deadline
+    (not a stop) ends the pass early instead of aborting: the answers so far are
+    returned, so the result is shorter than ``specs``."""
     results: list = []
     errors = 0
     for start in range(0, len(specs), REQUEST_BATCH):
-        _check(params, clock, where)
+        try:
+            _check(params, clock, where)
+        except DeadlinePassed:
+            if not partial_ok:
+                raise
+            break
         if not session.available:
             raise StageAbort(f"reader unavailable: {session.disabled_reason}")
         batch = specs[start:start + REQUEST_BATCH]
@@ -835,8 +849,12 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
                                                        colour_note=params.event_lineup)
 
         # 5. lineup pass on the windows the digit pass did not name
-        for wid, probs in zip(todo, _ask_batched(session, todo, lineup_item, "who", params,
-                                                 clock, stats, "in the lineup pass")):
+        answered = _ask_batched(session, todo, lineup_item, "who", params, clock, stats,
+                                "in the lineup pass", partial_ok=True)
+        if len(answered) < len(todo):            # deadline mid-pass: keep what we have
+            stats["deadline_partial"] = "lineup"
+            stats["lineup_skipped"] = stats.get("lineup_skipped", 0) + len(todo) - len(answered)
+        for wid, probs in zip(todo, answered):
             d = lineup_decision(probs, letters, params.lineup_min_p)
             if d:
                 lineup[wid] = d

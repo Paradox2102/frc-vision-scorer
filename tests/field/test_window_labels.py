@@ -500,23 +500,43 @@ def test_deadline_passing_after_the_first_digit_batch_stops_the_digit_pass(monke
     assert s.asked == [("team", 4)] and res["labels"] is None
 
 
-def test_deadline_passing_after_the_first_lineup_batch_stops_the_lineup_pass(monkeypatch):
+def _lineup_mid_run(monkeypatch, stop_attr):
     monkeypatch.setattr(wl, "REQUEST_BATCH", 1)
     clock = _Clock()
     frames = _lineup_frames(second_unread=True)
     s = _lineup_session(frames, who_p={"B": 0.9})
     real_ask = s.ask
+    params = _params(seed=1, deadline=10.0)
 
     def ask(items, question):
         out = real_ask(items, question)
         if question == "who":
+            if stop_attr == "cancelled":
+                params.cancelled = True
             clock.now = 100.0
         return out
 
     s.ask = ask
-    res = _run_clocked(frames, s, clock, seed=1, deadline=10.0)
-    assert res["aborted"] and "deadline" in res["aborted"] and "lineup pass" in res["aborted"]
-    assert [q for q, _n in s.asked].count("who") == 1 and res["labels"] is None
+    res = wl.run_window_labels(frames, "video.mp4", _Cal(), s, params,
+                               frame_source=_source, clock=clock)
+    return res, s
+
+
+def test_deadline_mid_lineup_keeps_digit_labels_and_received_answers(monkeypatch):
+    res, s = _lineup_mid_run(monkeypatch, "deadline")
+    assert res["aborted"] is None and res["labels"] is not None
+    st = res["stats"]
+    assert st["deadline_partial"] == "lineup" and st["lineup_skipped"] == 1
+    assert [q for q, _n in s.asked].count("who") == 1      # R2 never asked
+    assert st["digit_named"] == 8 and st["lineup_named"] == 1 and st["unlabelled"] == 1
+    assert res["labels"][(0, "B1")][:2] == ("3128", wl.RANK_DIGITS)
+    assert res["digit_calls"] is not None and res["segments"] is not None
+
+
+def test_stop_mid_lineup_still_aborts(monkeypatch):
+    res, s = _lineup_mid_run(monkeypatch, "cancelled")
+    assert res["aborted"] and "cancelled" in res["aborted"] and res["labels"] is None
+    assert [q for q, _n in s.asked].count("who") == 1
 
 
 def test_a_mid_batch_lockout_aborts_even_under_the_error_threshold():

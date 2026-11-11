@@ -7120,6 +7120,7 @@ class InferenceJob:
                 # The worker thread outlives the cancelled await; it checks
                 # params.deadline cooperatively, so stop it from paying for
                 # more reader calls. Not an Exception: re-raised untouched.
+                params.cancelled = True
                 params.deadline = 0.0
                 raise
             stats = dict(result["stats"])

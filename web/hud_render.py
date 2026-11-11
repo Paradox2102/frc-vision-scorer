@@ -18,6 +18,7 @@ Import-light on purpose: never imports web.app (no torch, no models).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import gzip
 import json
 import os
@@ -50,8 +51,8 @@ ROBOT_HEIGHT_M = 0.5
 ROBOT_CENTRE_OFFSET_M = 0.475       # = window_crops.ROBOT_CENTRE_OFFSET_M
 TRAIL_LEN = 16
 LOCK_FILE = "render.lock"
-LOCK_GRACE_S = 10.0                 # an empty lock file this young is still being written
 RENDER_VIDEO = "hud.render.mp4"
+RENDER_THUMB = "thumb.render.jpg"
 LIVE_VIDEO = "hud.live.mp4"
 STATS_FILE = "render.json"
 
@@ -417,7 +418,7 @@ def render_replay(replay_id: str, db_path=None) -> dict:
     if thumb is not None:
         if thumb.shape[:2] != (rec.height, rec.width):
             thumb = cv2.resize(thumb, (rec.width, rec.height))
-        tmp_thumb = out_dir / "thumb.render.jpg"
+        tmp_thumb = out_dir / RENDER_THUMB
         cv2.imwrite(str(tmp_thumb), thumb, [cv2.IMWRITE_JPEG_QUALITY, 80])
         os.replace(tmp_thumb, out_dir / "thumb.jpg")
 
@@ -443,59 +444,82 @@ def render_replay(replay_id: str, db_path=None) -> dict:
     return stats
 
 
-def _pid_alive(pid: int) -> bool:
+class RenderLock:
+    """An open, flock(LOCK_EX)-held ``render.lock``. The kernel drops the
+    flock when the holder dies, so a lock file left behind is no obstacle;
+    the pid written into it is only for messages."""
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path, self.fd = path, fd
+
+
+def _read_pid(path: Path) -> int:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return -1
 
 
 def lock_holder(out_dir) -> Optional[int]:
-    """The live pid named by ``<out_dir>/render.lock``, or None (no lock, a
-    dead pid, or an unreadable lock older than LOCK_GRACE_S). An unreadable
-    lock still being written reports -1."""
+    """The pid holding ``<out_dir>/render.lock`` (-1 when it holds the lock
+    but has not written its pid yet), or None when no process holds it.
+    Probes with a non-blocking shared flock, never creating the file; a probe
+    can make an acquirer racing it in that same instant see "locked"."""
     p = Path(out_dir) / LOCK_FILE
     try:
-        text = p.read_text().strip()
-        age = time.time() - p.stat().st_mtime
+        fd = os.open(p, os.O_RDONLY)
     except OSError:
         return None
     try:
-        pid = int(text)
-    except ValueError:
-        return -1 if age < LOCK_GRACE_S else None
-    return pid if pid > 0 and _pid_alive(pid) else None
-
-
-def acquire_lock(out_dir) -> bool:
-    """Create ``render.lock`` (O_EXCL) naming this pid; a stale lock (dead
-    pid) is replaced. False when a live process holds it."""
-    p = Path(out_dir) / LOCK_FILE
-    for _ in range(2):
         try:
-            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            if lock_holder(out_dir) is not None:
-                return False
-            p.unlink(missing_ok=True)
-            continue
-        with os.fdopen(fd, "w") as fh:
-            fh.write(str(os.getpid()))
-        return True
-    return False
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _read_pid(p)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
 
 
-def release_lock(out_dir) -> None:
-    """Remove ``render.lock`` if this process holds it."""
+def acquire_lock(out_dir) -> Optional[RenderLock]:
+    """Take ``<out_dir>/render.lock`` (flock LOCK_EX|LOCK_NB, held until
+    release_lock or this process dies) and write this pid into it. None when
+    another holder has it."""
     p = Path(out_dir) / LOCK_FILE
+    for _ in range(5):
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        try:
+            same = os.fstat(fd).st_ino == os.stat(p).st_ino
+        except FileNotFoundError:
+            same = False
+        if not same:                # a releaser unlinked it under us: lock the new file
+            os.close(fd)
+            continue
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        return RenderLock(p, fd)
+    return None
+
+
+def release_lock(lock: Optional[RenderLock]) -> None:
+    """Remove the lock file (while still holding it) and drop the flock."""
+    if lock is None:
+        return
     try:
-        if int(p.read_text().strip()) == os.getpid():
-            p.unlink()
-    except (OSError, ValueError):
-        pass
+        lock.path.unlink(missing_ok=True)
+    finally:
+        os.close(lock.fd)
+
+
+def _remove_leftovers(out_dir: Path) -> None:
+    """A killed render's temp files (only ever touched under the lock)."""
+    for name in (RENDER_VIDEO, RENDER_THUMB, STATS_FILE + ".tmp"):
+        (out_dir / name).unlink(missing_ok=True)
 
 
 def run(replay_id: str, db_path=None) -> tuple:
@@ -507,28 +531,33 @@ def run(replay_id: str, db_path=None) -> tuple:
     row = database.get_replay_sync(replay_id, db_path)
     if row is None:
         return 1, {"replay_id": replay_id, "error": "replay not found"}
-    out_dir = Path(row.get("meta_path") or "").parent
+
+    def failed(msg):
+        database.set_render_status_sync(replay_id, "render_failed", msg, db_path=db_path)
+        return 1, {"replay_id": replay_id, "error": msg}
+
+    if not row.get("meta_path"):
+        return failed("meta.json missing")
+    out_dir = Path(row["meta_path"]).parent
     if not out_dir.is_dir():
-        database.set_render_status_sync(replay_id, "render_failed", "replay directory missing",
-                                        db_path=db_path)
-        return 1, {"replay_id": replay_id, "error": "replay directory missing"}
-    if not acquire_lock(out_dir):
+        return failed("replay directory missing")
+    lock = acquire_lock(out_dir)
+    if lock is None:
         return 3, {"replay_id": replay_id, "error": f"locked by pid {lock_holder(out_dir)}"}
     try:
+        _remove_leftovers(out_dir)
         database.set_render_status_sync(replay_id, "rendering", None, db_path=db_path)
         try:
             stats = render_replay(replay_id, db_path)
         except Exception as e:
-            msg = str(e) if isinstance(e, RenderError) else f"{type(e).__name__}: {e}"
-            database.set_render_status_sync(replay_id, "render_failed", msg, db_path=db_path)
-            return 1, {"replay_id": replay_id, "error": msg}
+            return failed(str(e) if isinstance(e, RenderError) else f"{type(e).__name__}: {e}")
         database.set_render_status_sync(
             replay_id, "rendered", None, db_path=db_path, codec=stats["codec"],
             width=stats["width"], height=stats["height"], video_path=stats["video_path"],
             thumb_path=stats["thumb_path"])
         return 0, stats
     finally:
-        release_lock(out_dir)
+        release_lock(lock)
 
 
 def read_stats(out_dir) -> Optional[dict]:

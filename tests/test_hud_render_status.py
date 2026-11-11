@@ -37,6 +37,28 @@ def _dead_pid() -> int:
     return p.pid
 
 
+_HOLDER = ("import fcntl, os, sys, time\n"
+           "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n"
+           "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+           "os.ftruncate(fd, 0); os.write(fd, str(os.getpid()).encode())\n"
+           "print('held', flush=True)\n"
+           "time.sleep(120)\n")
+
+
+def hold_lock_in_subprocess(d):
+    """Another process holding ``d/render.lock`` (flock) until killed."""
+    p = subprocess.Popen([sys.executable, "-c", _HOLDER, str(d / "render.lock")],
+                         stdout=subprocess.PIPE, text=True)
+    assert p.stdout.readline().strip() == "held"
+    return p
+
+
+def kill(p):
+    p.kill()
+    p.wait()
+    p.stdout.close()
+
+
 # --- columns ---
 
 def test_migration_adds_the_render_columns(tmp_path, monkeypatch):
@@ -106,13 +128,72 @@ def test_run_records_the_failure_reason(db, tmp_path):
 
 def test_a_live_lock_blocks_and_a_stale_one_is_taken_over(db, tmp_path):
     rid, d, _ = make_replay(tmp_path)
-    (d / "render.lock").write_text(str(__import__("os").getpid()))      # held by a live pid
-    code, out = hud_render.run(rid)
-    assert code == 3 and "locked" in out["error"] and _row(rid)["render_status"] is None
-    (d / "render.lock").write_text(str(_dead_pid()))                    # stale
-    code, _ = hud_render.run(rid)
+    holder = hold_lock_in_subprocess(d)
+    try:
+        code, out = hud_render.run(rid)
+        assert code == 3 and out["error"] == f"locked by pid {holder.pid}"
+        assert _row(rid)["render_status"] is None
+    finally:
+        kill(holder)                                   # the kernel drops its flock
+    assert (d / "render.lock").exists()                # the file is left behind ...
+    code, _ = hud_render.run(rid)                      # ... and is no obstacle
     assert code == 0 and _row(rid)["render_status"] == "rendered"
     assert not (d / "render.lock").exists()
+
+
+def test_two_acquirers_one_wins(tmp_path):
+    import os
+    first = hud_render.acquire_lock(tmp_path)
+    assert first is not None
+    assert hud_render.acquire_lock(tmp_path) is None
+    assert hud_render.lock_holder(tmp_path) == os.getpid()
+    hud_render.release_lock(first)
+    assert hud_render.lock_holder(tmp_path) is None
+    again = hud_render.acquire_lock(tmp_path)
+    assert again is not None
+    hud_render.release_lock(again)
+
+
+def test_a_lock_file_left_by_a_dead_process_is_acquirable(tmp_path):
+    holder = hold_lock_in_subprocess(tmp_path)
+    assert hud_render.lock_holder(tmp_path) == holder.pid
+    assert hud_render.acquire_lock(tmp_path) is None
+    kill(holder)
+    assert hud_render.lock_holder(tmp_path) is None
+    lock = hud_render.acquire_lock(tmp_path)
+    assert lock is not None
+    hud_render.release_lock(lock)
+
+
+def test_liveness_is_the_flock_not_the_pid(tmp_path):
+    import os
+    (tmp_path / "render.lock").write_text(str(os.getpid()))   # a live pid, but no flock
+    assert hud_render.lock_holder(tmp_path) is None
+    lock = hud_render.acquire_lock(tmp_path)
+    assert lock is not None
+    hud_render.release_lock(lock)
+    assert hud_render.lock_holder(tmp_path / "nowhere") is None
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_run_without_a_meta_path_fails_before_locking(db, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    asyncio.run(database.insert_replay({"id": "nometa", "created_at": "2026-11-10T00:00:00",
+                                        "label": "x", "meta_path": None, "status": "complete"}))
+    code, out = hud_render.run("nometa")
+    assert code == 1 and out["error"] == "meta.json missing"
+    assert _row("nometa")["render_status"] == "render_failed"
+    assert not (tmp_path / "render.lock").exists()
+
+
+def test_run_removes_render_leftovers_first(db, tmp_path):
+    from pathlib import Path
+    rid, d, _ = make_replay(tmp_path)
+    (d / "hud.render.mp4").write_bytes(b"half a video")
+    (d / "thumb.render.jpg").write_bytes(b"half a thumb")
+    Path(_row(rid)["source_video_path"]).unlink()      # fails before encoding
+    assert hud_render.run(rid)[0] == 1
+    assert not (d / "hud.render.mp4").exists() and not (d / "thumb.render.jpg").exists()
 
 
 # --- the queue ---
@@ -173,8 +254,11 @@ def test_startup_sweep(db, tmp_path):
                         ("done", "rendered")):
         rows[rid] = make_replay(tmp_path, rid=rid, n_meta=2)[1]
         database.set_render_status_sync(rid, status)
-    (rows["held"] / "render.lock").write_text(str(os.getpid()))
-    assert asyncio.run(app_mod._sweep_stale_renders()) == 2
+    holder = hold_lock_in_subprocess(rows["held"])
+    try:
+        assert asyncio.run(app_mod._sweep_stale_renders()) == 2
+    finally:
+        kill(holder)
     assert (_row("q")["render_status"], _row("q")["render_error"]) == ("render_failed",
                                                                        "server restarted")
     assert _row("r")["render_status"] == "render_failed"
@@ -209,10 +293,12 @@ def test_render_endpoint_409s_while_the_script_holds_the_lock(db, tmp_path, monk
     rid, d, _ = make_replay(tmp_path)
     monkeypatch.setattr(app_mod, "_render_queue_get", lambda: _FakeQueue())
     database.set_render_status_sync(rid, "rendering")
-    (d / "render.lock").write_text(str(os.getpid()))
+    holder = hold_lock_in_subprocess(d)
     c = TestClient(app_mod.app)
-    assert c.post(f"/api/replays/{rid}/render").status_code == 409
-    (d / "render.lock").write_text(str(_dead_pid()))                    # script died
+    try:
+        assert c.post(f"/api/replays/{rid}/render").status_code == 409
+    finally:
+        kill(holder)                                                    # script died
     assert c.post(f"/api/replays/{rid}/render").status_code == 200
 
 

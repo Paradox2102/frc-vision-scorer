@@ -51,9 +51,13 @@ def test_renders_in_order_and_records_status(db, tmp_path, capsys):
 
 def test_a_replay_locked_by_the_server_is_skipped(db, tmp_path, capsys):
     _, d, _ = make_replay(tmp_path, rid="a", n_meta=2)
-    (d / "render.lock").write_text(str(os.getpid()))
-    assert rr.main(["--replays", "a", "--db", str(db)]) == 0
-    assert "skipped (locked by pid" in capsys.readouterr().out
+    from tests.test_hud_render_status import hold_lock_in_subprocess, kill
+    holder = hold_lock_in_subprocess(d)
+    try:
+        assert rr.main(["--replays", "a", "--db", str(db)]) == 0
+    finally:
+        kill(holder)
+    assert f"skipped (locked by pid {holder.pid}" in capsys.readouterr().out
     assert _status("a") is None and (d / "render.lock").exists()
 
 

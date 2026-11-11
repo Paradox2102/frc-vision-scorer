@@ -162,3 +162,7 @@ data/eval/audit/*/items/*/*.jpg
 # are symlinks to the main checkout, and "dir/" patterns do not match symlinks.
 data/event_anchors
 data/eval/event_lineup
+
+# Teacher-distillation harvest: downloaded prior-season videos + crops/manifests (local only)
+data/prior_years/
+data/teacher/

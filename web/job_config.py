@@ -771,8 +771,10 @@ KNOBS = [
     # "student_only" never asks Jev in the digit pass. The lineup pass is Jev
     # in every mode. No CUDA / missing models: falls back to "jev" with a
     # warning. Digit-call caches are not shared between modes. Needs
-    # window_labels. DEFAULT "jev" pending the A/B.
-    Knob("window_labels_reader", "WINDOW_LABELS_READER", str, "jev",
+    # window_labels. DEFAULT "student_only" since Nov 11: live qm8 A/B x2
+    # (spec section 15) quality-neutral vs jev (misID 11-16 vs 10-15 s, wrong
+    # 1.4-2.1 vs 1.3-2.0%) at ~40 s vs 163 s stage time and ~4 vs ~20 cents.
+    Knob("window_labels_reader", "WINDOW_LABELS_READER", str, "student_only",
          choices=("jev", "student", "student_only"), section="Identity & votes"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not

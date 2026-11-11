@@ -654,14 +654,14 @@ def test_window_labels_deinterlace_knob_default_on(monkeypatch):
     assert JobConfig().window_labels_deinterlace is False
 
 
-def test_window_labels_reader_knob_default_jev(monkeypatch):
+def test_window_labels_reader_knob_default_student_only(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.window_labels_reader == "jev"
+    assert cfg.window_labels_reader == "student_only"
     assert "window_labels_reader" not in cfg.non_defaults()
-    assert JobConfig({"window_labels_reader": "student"}).window_labels_reader == "student"
+    assert JobConfig({"window_labels_reader": "jev"}).window_labels_reader == "jev"
     knob = next(k for k in KNOBS if k.name == "window_labels_reader")
     assert knob.choices == ("jev", "student", "student_only")
-    monkeypatch.setenv("WINDOW_LABELS_READER", "student_only")
-    assert JobConfig().window_labels_reader == "student_only"
+    monkeypatch.setenv("WINDOW_LABELS_READER", "jev")
+    assert JobConfig().window_labels_reader == "jev"

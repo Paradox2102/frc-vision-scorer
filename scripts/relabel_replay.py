@@ -207,7 +207,7 @@ class Options:
     use_elimination: bool = True
     alliance_rows: bool = False
     deinterlace: bool = False                       # window_labels_deinterlace
-    reader: str = "jev"                             # window_labels_reader
+    reader: str = "student_only"                    # window_labels_reader (live default)
 
 
 def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: Options,
@@ -341,10 +341,10 @@ def main(argv=None) -> None:
     ap.add_argument("--deinterlace", action="store_true",
                     help="deinterlace combed tiles (the window_labels_deinterlace knob); "
                          "digit calls cached without it are not reused")
-    ap.add_argument("--reader", choices=wl.READERS, default="jev",
+    ap.add_argument("--reader", choices=wl.READERS, default="student_only",
                     help="digit reader (the window_labels_reader knob): jev, student (S1 first, "
                          "Jev only for windows S1 leaves undecided) or student_only (no Jev "
-                         "digit calls); the lineup pass is Jev in every mode")
+                         "digit calls; the live default); the lineup pass is Jev in every mode")
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")

@@ -104,7 +104,7 @@ def test_relabel_one_never_touches_its_input_and_is_read_only_by_default(store):
     frames = _lineup_frames()
     meta = _meta(frames)
     snapshot = json.dumps(meta)
-    out = _go(meta, _lineup_session(frames, who_p={"B": 0.9}), rr.Options(), store)
+    out = _go(meta, _lineup_session(frames, who_p={"B": 0.9}), rr.Options(reader="jev"), store)
     assert json.dumps(meta) == snapshot
     s = out["relabelled"]["summary"]
     assert s["window_labels"]["digit_named"] == 8 and "anchors_written" not in s["window_labels"]
@@ -118,7 +118,7 @@ def test_before_match_n_borrows_from_matches_numbered_below_n(store, monkeypatch
     monkeypatch.setattr(ea, "fetch", lambda *a, **kw: seen.append(a) or {})
     frames = _lineup_frames()
     _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
-        rr.Options(event_lineup=True, namespace="eval-x", before_match=8), store)
+        rr.Options(reader="jev", event_lineup=True, namespace="eval-x", before_match=8), store)
     assert seen == [("eval-x", "2026cur", RED + BLUE, "2026cur_qm8", 7)]
 
 
@@ -126,7 +126,7 @@ def test_store_write_puts_this_replays_anchors_in_its_namespace_only(store):
     frames = _lineup_frames()
     qm3 = {"id": "replay-qm3", "match_key": "2026cur_qm3"}
     out = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
-              rr.Options(event_lineup=True, namespace="eval-x", store_write=True), store, row=qm3)
+              rr.Options(reader="jev", event_lineup=True, namespace="eval-x", store_write=True), store, row=qm3)
     st = out["relabelled"]["summary"]["window_labels"]
     assert (st["anchors_written"], st["elim_anchors_written"], st["borrow_fetch_error"]) == (8, 0, None)
     got = ea.fetch("eval-x", "2026cur", ["3128", "6773"], "2026cur_qm8",
@@ -141,10 +141,10 @@ def test_the_digit_cache_file_is_created_once_and_reused(store, tmp_path):
     frames = _lineup_frames()
     cache = tmp_path / "cache" / "replay-qm8.json"
     first = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
-                rr.Options(digit_cache=str(cache)), store)
+                rr.Options(reader="jev", digit_cache=str(cache)), store)
     assert cache.exists() and first["cache_origin"] == "none"
     s = FakeSession(who_p={"B": 0.9})
-    again = _go(_meta(frames), s, rr.Options(digit_cache=str(cache)), store)
+    again = _go(_meta(frames), s, rr.Options(reader="jev", digit_cache=str(cache)), store)
     assert again["cache_origin"] == "file" and [q for q, _n in s.asked] == ["who"]
     assert again["result"]["labels"] == first["result"]["labels"]
 
@@ -175,7 +175,7 @@ def test_pct_is_none_safe():
 def test_an_aborted_stage_writes_no_cache_and_no_store_rows(store, tmp_path):
     cache = tmp_path / "cache" / "x.json"
     out = rr.relabel_one(ROW, _meta(_lineup_frames()), "video.mp4", _Cal(), [], [],
-                         rr.Options(event_lineup=True, namespace="eval-x", store_write=True,
+                         rr.Options(reader="jev", event_lineup=True, namespace="eval-x", store_write=True,
                                     digit_cache=str(cache)),
                          FakeSession(), fps=FPS, view=(0, 0, 1920, 723),
                          frame_source=_source, **store)
@@ -188,7 +188,7 @@ def test_the_digit_cache_write_leaves_no_temp_file(store, tmp_path):
     frames = _lineup_frames()
     cache = tmp_path / "c" / "r.json"
     _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
-        rr.Options(digit_cache=str(cache)), store)
+        rr.Options(reader="jev", digit_cache=str(cache)), store)
     assert [p.name for p in cache.parent.iterdir()] == ["r.json"]
 
 
@@ -200,10 +200,10 @@ def test_a_bad_namespace_is_refused_before_anything_runs():
 def test_deinterlace_option_reaches_the_stage(store):
     frames = _lineup_frames()
     on = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
-             rr.Options(deinterlace=True), store)
+             rr.Options(reader="jev", deinterlace=True), store)
     assert on["stats"]["tiles_deinterlaced"] == 0          # blank fake video: nothing combs
     assert on["result"]["digit_calls"]["fingerprints"][0]["deinterlace"] is True
-    off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(), store)
+    off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(reader="jev"), store)
     assert "tiles_deinterlaced" not in off["stats"]
 
 
@@ -216,4 +216,4 @@ def test_reader_option_reaches_the_stage(store):
                          student=FakeStudent(slots=()), **store)
     assert out["stats"]["student"]["reader"] == "student_only"
     assert out["relabelled"]["summary"]["window_labels_digit_calls"]["reader"] == "student_only"
-    assert rr.Options().reader == "jev"
+    assert rr.Options().reader == "student_only"          # matches the live knob default

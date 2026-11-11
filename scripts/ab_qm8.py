@@ -376,7 +376,7 @@ PROFILES = {
     # Window-label digit reader: Jev (default) vs the local S1 student first
     # (Jev only for windows S1 leaves undecided) vs S1 alone in the digit pass
     # (window_labels_reader; teacher-distillation spec section 14).
-    "wl-student": [("wl_08", {"window_labels": True}),
+    "wl-student": [("wl_08", {"window_labels": True, "window_labels_reader": "jev"}),
                    ("wl_08_s1", {"window_labels": True, "window_labels_reader": "student"}),
                    ("wl_08_s1only", {"window_labels": True,
                                      "window_labels_reader": "student_only"})],

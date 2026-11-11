@@ -49,6 +49,17 @@ def test_renders_in_order_and_records_status(db, tmp_path, capsys):
     assert _status("a") == _status("b") == "rendered"
 
 
+def test_each_render_gets_the_clamped_deadline(db, tmp_path, monkeypatch, capsys):
+    from web import hud_render
+    make_replay(tmp_path, rid="a", n_meta=3)
+    seen = []
+    real = hud_render.run
+    monkeypatch.setattr(hud_render, "run", lambda r, p=None, deadline_s=None: (
+        seen.append(deadline_s), real(r, p, deadline_s=deadline_s))[1])
+    assert rr.main(["--replays", "a", "--db", str(db)]) == 0
+    assert seen == [600]                  # max(600, 0.5 s x 3 frames), clamped
+
+
 def test_a_replay_locked_by_the_server_is_skipped(db, tmp_path, capsys):
     _, d, _ = make_replay(tmp_path, rid="a", n_meta=2)
     from tests.test_hud_render_status import hold_lock_in_subprocess, kill

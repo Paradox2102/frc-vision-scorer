@@ -196,6 +196,74 @@ def test_run_removes_render_leftovers_first(db, tmp_path):
     assert not (d / "hud.render.mp4").exists() and not (d / "thumb.render.jpg").exists()
 
 
+def test_run_enforces_its_own_deadline(db, tmp_path, monkeypatch):
+    import signal
+    import time
+    rid, d, _ = make_replay(tmp_path, live_video=True)
+    real = hud_render.draw_frame
+
+    def slow(*a, **kw):                                # a slow decode / draw
+        time.sleep(0.1)
+        return real(*a, **kw)
+    monkeypatch.setattr(hud_render, "draw_frame", slow)
+    code, out = hud_render.run(rid, deadline_s=0.35)
+    assert code == 1 and out["error"] == "timeout after 0.35 s"
+    row = _row(rid)
+    assert (row["render_status"], row["render_error"]) == ("render_failed", "timeout after 0.35 s")
+    assert not (d / "render.lock").exists() and not (d / "hud.render.mp4").exists()
+    assert (d / "hud.mp4").read_bytes() == b"LIVE-ENCODED"
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)          # timer cleared
+    monkeypatch.setattr(hud_render, "draw_frame", real)
+    assert hud_render.run(rid, deadline_s=60)[0] == 0                   # a roomy one is fine
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_cli_takes_a_deadline_and_defaults_to_the_clamp(db, tmp_path, monkeypatch):
+    rid, d, dbp = make_replay(tmp_path)
+    seen = []
+    monkeypatch.setattr(hud_render, "run",
+                        lambda r, p=None, deadline_s=None: (seen.append(deadline_s), (0, {}))[1])
+    assert hud_render.main([rid, "--db", str(dbp), "--deadline-s", "12.5"]) == 0
+    assert hud_render.main([rid, "--db", str(dbp)]) == 0
+    assert seen == [12.5, hud_render.render_timeout_s(_row(rid))] and seen[1] == 600
+
+
+def test_the_worker_passes_the_deadline_to_the_renderer(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    monkeypatch.setattr(app_mod, "_render_command", lambda r: [
+        sys.executable, "-c", "import sys; print(' '.join(sys.argv[1:])); sys.exit(7)"])
+
+    async def go():
+        await app_mod.enqueue_render(rid)
+        await app_mod._render_queue.join()
+
+    asyncio.run(go())
+    assert _row(rid)["render_error"] == "renderer exited 7: --deadline-s 600"
+
+
+def test_a_db_error_reading_the_timeout_does_not_strand_the_row(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    monkeypatch.setattr(app_mod, "_render_command",
+                        lambda r: [sys.executable, "-c", "import sys; print('boom'); sys.exit(7)"])
+    real_get, calls = database.get_replay, []
+
+    async def flaky(r):
+        calls.append(r)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return await real_get(r)
+    monkeypatch.setattr(database, "get_replay", flaky)
+
+    async def go():
+        await app_mod.enqueue_render(rid)
+        await app_mod._render_queue.join()
+
+    asyncio.run(go())
+    assert len(calls) >= 2
+    assert (_row(rid)["render_status"], _row(rid)["render_error"]) == (
+        "render_failed", "renderer exited 7: boom")
+
+
 # --- the queue ---
 
 def test_queue_lifecycle_runs_the_subprocess(db, tmp_path):
@@ -335,6 +403,7 @@ def test_worker_kills_a_render_that_times_out(db, tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "_render_command",
                         lambda r: [sys.executable, "-c", "import time; time.sleep(60)"])
     monkeypatch.setattr(app_mod, "_render_timeout_s", lambda row: 0.5)
+    monkeypatch.setattr(app_mod, "RENDER_KILL_GRACE_S", 0.0)
 
     async def go():
         await app_mod.enqueue_render(rid)

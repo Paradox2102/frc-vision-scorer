@@ -10078,23 +10078,14 @@ def _render_command(replay_id: str) -> list:
     return [sys.executable, "-m", "web.hud_render", replay_id, "--db", str(database.DB_PATH)]
 
 
-RENDER_TIMEOUT_PER_FRAME_S = 0.5    # ~10x a measured render's per-frame cost
-RENDER_TIMEOUT_MIN_S = 600.0
-RENDER_TIMEOUT_DEFAULT_S = 1800.0   # a row without a usable frame_count
-RENDER_TIMEOUT_MAX_S = 3600.0
+RENDER_KILL_GRACE_S = 60.0          # the renderer's own deadline normally ends it first
 
 
 def _render_timeout_s(row) -> float:
-    """How long the worker lets one render subprocess run before killing it:
-    0.5 s x the replay's frame_count clamped to [600 s, 3600 s]; 1800 s when
-    the count is missing, non-numeric, non-finite or <= 0."""
-    try:
-        n = float((row or {}).get("frame_count"))
-    except (TypeError, ValueError):
-        return RENDER_TIMEOUT_DEFAULT_S
-    if not math.isfinite(n) or n <= 0:
-        return RENDER_TIMEOUT_DEFAULT_S
-    return min(RENDER_TIMEOUT_MAX_S, max(RENDER_TIMEOUT_MIN_S, RENDER_TIMEOUT_PER_FRAME_S * n))
+    """The render deadline: hud_render.render_timeout_s (0.5 s x frame_count
+    clamped to [600, 3600] s; 1800 s for a missing / bad count). Passed to the
+    renderer as --deadline-s; the worker kills it RENDER_KILL_GRACE_S later."""
+    return hud_render.render_timeout_s(row)
 
 
 def _render_pgid(proc) -> Optional[int]:
@@ -10126,15 +10117,21 @@ def _kill_render(proc, pgid: Optional[int]) -> None:
 
 
 async def _run_render(replay_id: str) -> None:
-    timeout = _render_timeout_s(await database.get_replay(replay_id))
+    try:
+        timeout = _render_timeout_s(await database.get_replay(replay_id))
+    except Exception as e:          # a DB error must not strand the row at queued
+        print(f"[hud-render] {replay_id}: could not read the row for its timeout ({e})")
+        timeout = hud_render.RENDER_TIMEOUT_DEFAULT_S
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_render_command(replay_id), cwd=str(PROJECT_ROOT),
+            *_render_command(replay_id), "--deadline-s", f"{timeout:g}",
+            cwd=str(PROJECT_ROOT),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True)
         pgid = _render_pgid(proc)
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+            out, _ = await asyncio.wait_for(proc.communicate(),
+                                            timeout + RENDER_KILL_GRACE_S)
         except asyncio.TimeoutError:
             _kill_render(proc, pgid)
             await proc.wait()

@@ -27,13 +27,13 @@ from web import database, hud_render  # noqa: E402
 
 
 def select(db_path, ids=None, since=None) -> list:
-    """Replay rows (id, created_at, label, match_key, render_status), oldest
-    first: the given ``ids`` (in that order), or every replay created at or
-    after ``since`` (an ISO date or datetime)."""
+    """Replay rows (id, created_at, label, match_key, render_status,
+    frame_count), oldest first: the given ``ids`` (in that order), or every
+    replay created at or after ``since`` (an ISO date or datetime)."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
         con.row_factory = sqlite3.Row
-        cols = "id, created_at, label, match_key, render_status"
+        cols = "id, created_at, label, match_key, render_status, frame_count"
         if ids:
             rows = []
             for rid in ids:
@@ -70,7 +70,8 @@ def main(argv=None) -> int:
         return 0
     done = skipped = failed = 0
     for r in rows:
-        code, out = hud_render.run(r["id"], db_path)
+        # The same deadline the server gives a render (0.5 s/frame, 600-3600 s).
+        code, out = hud_render.run(r["id"], db_path, deadline_s=hud_render.render_timeout_s(r))
         name = r["match_key"] or r["label"]
         if code == 0:
             done += 1

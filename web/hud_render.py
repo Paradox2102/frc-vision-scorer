@@ -21,9 +21,12 @@ import argparse
 import fcntl
 import gzip
 import json
+import math
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
 import zlib
 from collections import deque
@@ -40,8 +43,11 @@ from web import hud_draw, hud_labels
 OVERHEAD_CROP_RATIO = 0.67          # = web.app.OVERHEAD_CROP_RATIO (pinned by a test)
 DEFAULT_FIELD_SEASON = "2026-rebuilt-welded"
 # A recorded main_thumb (hud_draw) is aligned when no thumbnail pixel differs
-# by more than this. The same decode gives 0; a 1-frame offset of a fixed
-# 60 fps camera moves a robot enough for 10+ (tests/test_hud_draw.py).
+# by more than this. The same decode gives 0. A 1-frame offset is not caught
+# on every frame: on real 60 fps broadcast files with duplicated frames (~30 fps
+# content) it stays <= 2 on ~50% of frames. Detection still works because that
+# far exceeds the 2% abort budget (MISALIGNED_FRAC); on a synthetic near-static
+# video every offset frame differs by 10+ (tests/test_hud_draw.py).
 THUMB_MAX_DIFF = 2
 MISALIGNED_FRAC = 0.02              # more mismatches than this share aborts
 APPROX_NOTE = "approx boxes"
@@ -59,6 +65,55 @@ STATS_FILE = "render.json"
 
 class RenderError(Exception):
     """A render that cannot finish; the message is the render_error."""
+
+
+# How long one render may run (the app's worker and this module's own
+# deadline): 0.5 s x frame_count clamped to [600 s, 3600 s]; 1800 s when the
+# count is missing, non-numeric, non-finite or <= 0.
+RENDER_TIMEOUT_PER_FRAME_S = 0.5    # ~10x a measured render's per-frame cost
+RENDER_TIMEOUT_MIN_S = 600.0
+RENDER_TIMEOUT_MAX_S = 3600.0
+RENDER_TIMEOUT_DEFAULT_S = 1800.0
+
+
+def render_timeout_s(row) -> float:
+    """The render deadline for a replay row (see the constants above)."""
+    try:
+        n = float((row or {}).get("frame_count"))
+    except (TypeError, ValueError):
+        return RENDER_TIMEOUT_DEFAULT_S
+    if not math.isfinite(n) or n <= 0:
+        return RENDER_TIMEOUT_DEFAULT_S
+    return min(RENDER_TIMEOUT_MAX_S, max(RENDER_TIMEOUT_MIN_S, RENDER_TIMEOUT_PER_FRAME_S * n))
+
+
+class _Deadline:
+    """SIGALRM (ITIMER_REAL) that raises RenderError("timeout after N s") in
+    the main thread. A no-op without a deadline or off the main thread. The
+    render's own cleanup (temp file) and run()'s lock release still run."""
+
+    def __init__(self, seconds: Optional[float]) -> None:
+        self.seconds = seconds
+        self._armed = False
+        self._old = None
+
+    def _fire(self, signum, frame):
+        raise RenderError(f"timeout after {self.seconds:g} s")
+
+    def __enter__(self):
+        if self.seconds is None or threading.current_thread() is not threading.main_thread():
+            return self
+        self._old = signal.signal(signal.SIGALRM, self._fire)
+        signal.setitimer(signal.ITIMER_REAL, max(float(self.seconds), 1e-3))
+        self._armed = True
+        return self
+
+    def __exit__(self, *exc):
+        if self._armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._old)
+            self._armed = False
+        return False
 
 
 def load_draw_list(path) -> dict:
@@ -522,11 +577,13 @@ def _remove_leftovers(out_dir: Path) -> None:
         (out_dir / name).unlink(missing_ok=True)
 
 
-def run(replay_id: str, db_path=None) -> tuple:
+def run(replay_id: str, db_path=None, deadline_s: Optional[float] = None) -> tuple:
     """Lock, render and record the outcome in the DB (render_status
     rendering -> rendered | render_failed + render_error, and the new video
     columns). Returns (exit code, result): 0 rendered (result = stats), 1
-    failed, 3 locked by another live process (status left alone)."""
+    failed, 3 locked by another live process (status left alone).
+    ``deadline_s``: the render fails as "timeout after N s" past it (main
+    thread only), so a renderer that outlives the server still ends."""
     from web import database
     row = database.get_replay_sync(replay_id, db_path)
     if row is None:
@@ -548,7 +605,8 @@ def run(replay_id: str, db_path=None) -> tuple:
         _remove_leftovers(out_dir)
         database.set_render_status_sync(replay_id, "rendering", None, db_path=db_path)
         try:
-            stats = render_replay(replay_id, db_path)
+            with _Deadline(deadline_s):
+                stats = render_replay(replay_id, db_path)
         except Exception as e:
             return failed(str(e) if isinstance(e, RenderError) else f"{type(e).__name__}: {e}")
         database.set_render_status_sync(
@@ -572,12 +630,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Render a replay's HUD video with the final labels.")
     ap.add_argument("replay_id")
     ap.add_argument("--db", default=None, help="SQLite DB (default: web.database.DB_PATH)")
+    ap.add_argument("--deadline-s", type=float, default=None,
+                    help="fail the render past this many seconds (default: render_timeout_s "
+                         "of the replay, i.e. 0.5 s/frame clamped to 600-3600 s)")
     args = ap.parse_args(argv)
     try:
         os.nice(10)                 # yield CPU to the next job's analysis loop
     except OSError:
         pass
-    code, result = run(args.replay_id, args.db)
+    deadline = args.deadline_s
+    if deadline is None:
+        from web import database
+        deadline = render_timeout_s(database.get_replay_sync(args.replay_id, args.db))
+    code, result = run(args.replay_id, args.db, deadline_s=deadline)
     print(json.dumps(result))
     return code
 

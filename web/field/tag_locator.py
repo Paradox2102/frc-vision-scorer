@@ -115,6 +115,9 @@ class LocatorConfig:
     max_half_px: float = 150.0
     ncc_min: float = 0.6              # template-match floor for a geometric candidate
     ambiguity_margin: float = 0.06    # peak must beat the next-best spot by this
+    judged_peaks: int = 3             # distinct peaks the judge rates when ambiguous
+    min_stability: Optional[float] = 0.9    # patch_stability floor: real tags 0.95-0.998,
+                                            # a spectator shirt "tag" 0.82 (2026casnd)
 
 
 @dataclass
@@ -458,7 +461,7 @@ def _disk(r: int):
 
 
 def match_group(img, pcs, half: float, upscale: int = 4, side: float = 10.0,
-                 tol: float = 4.0, anchor_shift=None) -> dict:
+                 tol: float = 4.0, anchor_shift=None, max_peaks: int = 4) -> dict:
     """Locate one tag or a PAIR (pcs = predicted quads) near its prediction.
 
     Each tag gets its own template NCC map; a pair's score at shift s is
@@ -500,10 +503,70 @@ def match_group(img, pcs, half: float, upscale: int = 4, side: float = 10.0,
         bi, bj = np.unravel_index(int(np.argmax(b)), b.shape)
         shifts = [to_shift((i, j)), to_shift((bi, bj))]
     sup = comb.copy()
-    cv2.circle(sup, (int(j), int(i)), max(2, int(round(0.8 * side * upscale))), -1.0, -1)
+    srad = max(2, int(round(0.8 * side * upscale)))
+    cv2.circle(sup, (int(j), int(i)), srad, -1.0, -1)
     second = float(sup.max()) if np.any(sup > -1.0) else None
-    return {"ncc": score, "shifts": [(float(x), float(y)) for x, y in shifts],
-            "second": second}
+    shifts = [(float(x), float(y)) for x, y in shifts]
+    # Top distinct peaks (>= ~one tag side apart) for the judge to choose between
+    # when the best one is ambiguous (fence mesh / the pair's own repeat).
+    peaks = [{"ncc": score, "shifts": shifts}]
+    if anchor_shift is None:
+        for _ in range(max_peaks - 1):
+            if not np.any(sup > -1.0):
+                break
+            pi, pj = np.unravel_index(int(np.argmax(sup)), sup.shape)
+            ps = float(sup[pi, pj])
+            if ps <= -1.0:
+                break
+            if len(maps) == 1:
+                psh = [to_shift((pi, pj))]
+            else:
+                b = np.full(maps[1].shape, -1.0, np.float32)
+                keep = np.zeros(b.shape, np.uint8)
+                cv2.circle(keep, (int(pj), int(pi)), rad, 1, -1)
+                b[keep > 0] = maps[1][keep > 0]
+                bi, bj = np.unravel_index(int(np.argmax(b)), b.shape)
+                psh = [to_shift((pi, pj)), to_shift((bi, bj))]
+            peaks.append({"ncc": ps, "shifts": [(float(x), float(y)) for x, y in psh]})
+            cv2.circle(sup, (int(pj), int(pi)), srad, -1.0, -1)
+    return {"ncc": score, "shifts": shifts, "second": second, "peaks": peaks}
+
+
+def patch_stability(stack, median, center, size_px, pct: float = 70.0) -> Optional[float]:
+    """How STATIC the patch around ``center`` is across the sampled frames ``stack``:
+    the ``pct`` percentile of each frame's zero-mean normalised correlation with the
+    median frame's patch. AprilTags are bolted to the field, so (where nothing is in
+    front of them) every frame matches the median (~0.9+); a spectator's white shirt
+    with a logo — which can look exactly like a tag to the judge on one frame — moves
+    and changes. The percentile tolerates robots briefly blocking a real tag. Gain /
+    offset invariant (auto exposure). None when there are too few frames."""
+    if stack is None or len(stack) < 5 or median is None:
+        return None
+    half = max(6, int(round(size_px / 2.0)))
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    h, w = median.shape[:2]
+    x0, y0, x1, y1 = max(0, cx - half), max(0, cy - half), min(w, cx + half), min(h, cy + half)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+
+    def z(a):
+        a = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32) if a.ndim == 3 else \
+            a.astype(np.float32)
+        a = a - a.mean()
+        n = float(np.linalg.norm(a))
+        return a / n if n > 1e-6 else None
+
+    ref = z(median[y0:y1, x0:x1])
+    if ref is None:
+        return None
+    scores = []
+    for f in stack:
+        if f is None or f.shape[:2] != median.shape[:2]:
+            continue
+        p = z(f[y0:y1, x0:x1])
+        if p is not None:
+            scores.append(float((ref * p).sum()))
+    return float(np.percentile(scores, pct)) if len(scores) >= 5 else None
 
 
 def judge_crop(img, center, size_px, out_px: int = 320) -> bytes:
@@ -631,8 +694,11 @@ def _resolve_points(corr, image_size, season, n_tags, cfg, prev, prev_model, dec
 def locate_undecoded(img, fm, decoded: dict, image_size, season: str,
                      cfg: Optional[LocatorConfig] = None, detect_fn=None,
                      judge: Optional[Callable] = None, log: Callable = print,
-                     lens: Optional[CameraCalibration] = None) -> LocateResult:
+                     lens: Optional[CameraCalibration] = None,
+                     stack=None) -> LocateResult:
     """Grow a calibration outward from the decoded tags (see module docstring).
+    ``stack``: the sampled frames ``img`` (their temporal median) was built from —
+    template candidates must be STATIC across them (``patch_stability``).
 
     img: the camera crop to search (ideally the temporal median). decoded:
     {tag_id: corners (4,2)} (known tags only). detect_fn: detector for upscaled-ROI
@@ -703,6 +769,8 @@ def locate_undecoded(img, fm, decoded: dict, image_size, season: str,
         near = min(np.linalg.norm(ctr - c) for c in centre_of.values()) if centre_of else 500
         half = float(np.clip(1.5 * side + 0.12 * near, cfg.min_half_px, cfg.max_half_px))
         new, found = {}, {}
+        options = []          # template candidates [(cand {tag: (u, v)}, judge p)], best first
+        stab_log = []         # patch_stability of each judged candidate
         # 1. upscaled-ROI decode: the right id gives 4 corners, no judge needed
         if detect_fn is not None:
             span = max(np.linalg.norm(preds[t][0] - ctr) for t in g)
@@ -729,57 +797,104 @@ def locate_undecoded(img, fm, decoded: dict, image_size, season: str,
                     [found[ak]["u"], found[ak]["v"]])
                 anchor_shift = tuple(kpos - preds[ak][0])
             mt = match_group(img, [preds[t][1] for t in order], half, cfg.roi_upscale,
-                             side, tol=tol, anchor_shift=anchor_shift)
-            cand = {t: (float(preds[t][0][0] + sh[0]), float(preds[t][0][1] + sh[1]))
-                    for t, sh in zip(order, mt["shifts"])}
-            dx, dy = mt["shifts"][0]
-            jc = np.mean([cand[t] for t in g], axis=0)
+                             side, tol=tol, anchor_shift=anchor_shift,
+                             max_peaks=max(4, cfg.judged_peaks))
             jsize = ((float(np.linalg.norm(preds[g[0]][0] - preds[g[1]][0])) + 3.0 * side)
                      if len(g) == 2 else 6.0 * side)   # wider context reads better (Jev bench)
+
+            def _cand(shifts):
+                return {t: (float(preds[t][0][0] + sh[0]), float(preds[t][0][1] + sh[1]))
+                        for t, sh in zip(order, shifts)}
+
+            def _ask(cand):
+                """(p or None, probs or None, verdict) of the judge on one candidate."""
+                jc_ = np.mean([cand[t] for t in g], axis=0)
+                stab = [patch_stability(stack, img, cand[t], 2.5 * side) for t in order]
+                stab = [x for x in stab if x is not None]
+                smin = min(stab) if stab else None
+                stab_log.append(None if smin is None else round(smin, 3))
+                if (cfg.min_stability is not None and smin is not None
+                        and smin < cfg.min_stability):
+                    return None, None, (f"rejected: not static across the match "
+                                        f"(stability {smin:.2f} < {cfg.min_stability:.2f})")
+                res = judge(judge_crop(img, jc_, max(jsize, 12.0)))
+                if "error" in res:
+                    return None, None, f"judge error: {res['error']}"
+                probs = {k: round(float(v), 3) for k, v in res["probs"].items()}
+                pk_ = judge_p(res["probs"], kind)
+                return pk_, probs, ("accepted" if pk_ >= cfg.jev_min_p
+                                    else f"rejected by judge (p={pk_:.2f})")
+
+            cand = _cand(mt["shifts"])
+            dx, dy = mt["shifts"][0]
+            jc = np.mean([cand[t] for t in g], axis=0)
             entry = {"ids": sorted(rest), "group": list(g), "kind": kind,
                      "center": [float(jc[0]), float(jc[1])], "size": float(jsize),
                      "ncc": round(mt["ncc"], 3),
                      "second": None if mt["second"] is None else round(mt["second"], 3),
                      "shift": [round(dx, 1), round(dy, 1)], "tol_px": round(tol, 1),
                      "anchored": bool(anchors), "probs": None}
-            geo_ok, why = True, ""
+            ambiguous = (mt["second"] is not None
+                         and mt["second"] > mt["ncc"] - cfg.ambiguity_margin)
             if mt["ncc"] < cfg.ncc_min:
-                geo_ok, why = False, f"template ncc {mt['ncc']:.2f} < {cfg.ncc_min}"
-            elif mt["second"] is not None and mt["second"] > mt["ncc"] - cfg.ambiguity_margin:
-                geo_ok, why = False, (f"ambiguous template peak ({mt['ncc']:.2f} vs "
-                                      f"{mt['second']:.2f})")
-            if not geo_ok:
-                entry["verdict"] = f"no candidate: {why}"
+                entry["verdict"] = f"no candidate: template ncc {mt['ncc']:.2f} < {cfg.ncc_min}"
             elif not cfg.jev_verify:
-                entry["verdict"] = "accepted (no judge)"
+                entry["verdict"] = ("no candidate: ambiguous template peak "
+                                    f"({mt['ncc']:.2f} vs {mt['second']:.2f})" if ambiguous
+                                    else "accepted (no judge)")
+                if not ambiguous:
+                    options.append((cand, None))
+            elif not ambiguous:
+                pk, entry["probs"], entry["verdict"] = _ask(cand)
+                if entry["verdict"] == "accepted":
+                    options.append((cand, pk))
             else:
-                res = judge(judge_crop(img, jc, max(jsize, 12.0)))
-                if "error" in res:
-                    entry["verdict"] = f"judge error: {res['error']}"
-                else:
-                    entry["probs"] = {k: round(float(v), 3) for k, v in res["probs"].items()}
-                    pk = judge_p(res["probs"], kind)
-                    entry["verdict"] = ("accepted" if pk >= cfg.jev_min_p
-                                        else f"rejected by judge (p={pk:.2f})")
+                # Several lookalike peaks (fence mesh, the pair's own repeat): let the
+                # judge rate each distinct peak, then try the accepted ones in the
+                # re-solve, best first — a wrong lookalike will not fit the geometry.
+                peak_log = []
+                for pkk in [p for p in mt["peaks"] if p["ncc"] >= cfg.ncc_min][:cfg.judged_peaks]:
+                    c_ = _cand(pkk["shifts"])
+                    p_, probs_, v_ = _ask(c_)
+                    peak_log.append({"center": [round(float(v), 1) for v in
+                                                np.mean([c_[t] for t in g], axis=0)],
+                                     "ncc": round(pkk["ncc"], 3), "p": None if p_ is None
+                                  else round(p_, 3), "verdict": v_})
+                    if v_ == "accepted":
+                        options.append((c_, p_))
+                options.sort(key=lambda o: -(o[1] or 0.0))
+                entry["peaks"] = peak_log
+                entry["verdict"] = (f"ambiguous peaks: {len(options)} of {len(peak_log)} "
+                                    f"accepted by judge" if options else
+                                    "no candidate: ambiguous peaks all rejected by judge")
+            entry["stability"] = list(stab_log)
             cands_log.append(entry)
-            if entry["verdict"].startswith("accepted"):
-                pk = (None if entry["probs"] is None else judge_p(entry["probs"], kind))
+        if not new and not options:
+            continue
+        committed = False
+        for cand_opt in (options or [None]):
+            trial_new, trial_found = dict(new), dict(found)
+            if cand_opt is not None:
+                cand, pk = cand_opt
                 for t in rest:
                     c3 = fm.tag_corners_3d(t).mean(axis=0).reshape(1, 3)
-                    new[f"m{t}"] = (np.array([cand[t]], float), c3)
-                    found[t] = {"method": "quad_jev" if cfg.jev_verify else "quad",
-                                "jev_p": pk, "u": cand[t][0], "v": cand[t][1]}
-        if not new:
-            continue
-        trial = dict(corr)
-        trial.update(new)
-        n_tags = len({_tag_of(k) for k in trial})
-        ncal, nmodel = _resolve_points(trial, image_size, season, n_tags, cfg, cal, model,
-                                       dec_keys, base_dec_rms, list(new), lens)
-        if ncal is None:
-            notes.append(f"tags {sorted(found)} rejected: {nmodel}")
-            if cands_log and cands_log[-1]["verdict"].startswith("accepted"):
-                cands_log[-1]["verdict"] += f"; re-solve rejected ({nmodel})"
+                    trial_new[f"m{t}"] = (np.array([cand[t]], float), c3)
+                    trial_found[t] = {"method": "quad_jev" if cfg.jev_verify else "quad",
+                                      "jev_p": pk, "u": cand[t][0], "v": cand[t][1]}
+            trial = dict(corr)
+            trial.update(trial_new)
+            n_tags = len({_tag_of(k) for k in trial})
+            ncal, nmodel = _resolve_points(trial, image_size, season, n_tags, cfg, cal,
+                                           model, dec_keys, base_dec_rms, list(trial_new),
+                                           lens)
+            if ncal is None:
+                notes.append(f"tags {sorted(trial_found)} rejected: {nmodel}")
+                if cands_log and cand_opt is not None:
+                    cands_log[-1]["verdict"] += f"; a re-solve was rejected ({nmodel})"
+                continue
+            new, found, committed = trial_new, trial_found, True
+            break
+        if not committed:
             continue
         cal, model, corr = ncal, nmodel, trial
         for t, f in found.items():

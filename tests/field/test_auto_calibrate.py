@@ -457,3 +457,19 @@ def test_tag_spread_m():
     assert ac.tag_spread_m(FM, [5]) == 0.0
     assert ac.tag_spread_m(FM, [5, 8, 9, 10]) < 1.0
     assert ac.tag_spread_m(FM, [5, 25]) > 5.0
+
+
+def test_patch_stability_static_vs_moving():
+    """A tag is bolted to the field; a spectator's shirt moves. 2026casnd: a shirt
+    with a logo fooled the judge (p 0.86) but scored 0.82 here vs >= 0.95 for tags."""
+    from web.field.tag_locator import patch_stability
+    rng = np.random.default_rng(3)
+    base = rng.integers(0, 255, (60, 60, 3)).astype(np.uint8)
+    static = [np.clip(base.astype(int) + rng.integers(-3, 4, base.shape), 0, 255)
+              .astype(np.uint8) for _ in range(15)]
+    moving = [np.roll(base, (int(rng.integers(-6, 7)), int(rng.integers(-6, 7))), (0, 1))
+              for _ in range(15)]
+    med = np.median(np.stack(static), 0).astype(np.uint8)
+    assert patch_stability(static, med, (30, 30), 20) > 0.95
+    assert patch_stability(moving, med, (30, 30), 20) < 0.9
+    assert patch_stability(static[:3], med, (30, 30), 20) is None    # too few frames

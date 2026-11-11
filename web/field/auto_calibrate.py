@@ -302,15 +302,18 @@ def median_of_frames(frames: list):
     return np.partition(st, k, axis=0)[k]
 
 
-def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31):
+def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31,
+                 return_stack: bool = False):
     """Temporal median of the camera crop over ``n`` frames evenly spaced in
-    [t_lo, t_hi] seconds (clamped to the video). None if nothing could be read."""
+    [t_lo, t_hi] seconds (clamped to the video). None if nothing could be read.
+    ``return_stack``: return (median, frames) — the frames let the tag locator test
+    that a candidate is STATIC (bolted to the field) rather than a spectator."""
     cap = cv2.VideoCapture(str(video))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if n_frames <= 0 or n <= 0:
         cap.release()
-        return None
+        return (None, []) if return_stack else None
     x, y, w, h = (int(c) for c in crop)
     lo, hi = _window_frame_range(n_frames, fps, t_lo, t_hi)
     idxs = sorted({int(round(lo + (hi - lo) * i / max(1, n - 1))) for i in range(n)})
@@ -325,7 +328,8 @@ def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31):
                     frames.append(sub.copy())
     finally:
         cap.release()
-    return median_of_frames(frames)
+    med = median_of_frames(frames)
+    return (med, frames) if return_stack else med
 
 
 def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn):
@@ -530,7 +534,7 @@ def median_decodes(median, detect_fn, roi_detect_fn=None, scales=(2, 3)) -> dict
 
 
 def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_fn, judge,
-                       base, extra, lens=None):
+                       base, extra, lens=None, stack=None):
     """Run the undecoded-tag locator; adopt its calibration when it located anything.
     Fills base["auto_tags"] (ROI decodes, 4 corners) / base["manual_tags"] (centre
     points) and extra["located"/"candidates"/"notes"]. Returns (cal, description)."""
@@ -539,7 +543,8 @@ def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_f
                             jev_verify=cfg.jev_verify, jev_min_p=cfg.jev_min_p)
     try:
         res = tl.locate_undecoded(img, fm, corners, image_size, cfg.field_season, lcfg,
-                                  detect_fn=roi_detect_fn, judge=judge, lens=lens)
+                                  detect_fn=roi_detect_fn, judge=judge, lens=lens,
+                                  stack=stack)
     except Exception as e:
         extra["notes"].append(f"tag locator failed: {type(e).__name__}: {e}")
         return cal, how
@@ -600,9 +605,12 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     # Temporal median of the crop: robots/balls blocking a tag vanish. A tag decoded
     # ONLY there joins the set (the multi-frame aggregate wins when both have it).
     median = None
+    stack = None
     med_dec = {}
     if cfg.median_frames > 0:
-        median = median_frame(video, crop, cfg.window[0], cfg.window[1], cfg.median_frames)
+        mf = median_frame(video, crop, cfg.window[0], cfg.window[1],
+                          cfg.median_frames, return_stack=True)
+        median, stack = mf if isinstance(mf, tuple) else (mf, None)
     if median is not None:
         med_dec = {t: c for t, c in median_decodes(median, detect_fn, roi_detect_fn).items()
                    if t in fm.tags}
@@ -612,6 +620,7 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                 per_tag[str(int(tid))] = {"inliers": 0, "seen": 0, "std_px": None,
                                           "source": "median"}
     background = median if median is not None else agg["best_frame"]
+    loc_stack = stack if median is not None else None
     corr = {tid: (c, fm.tag_corners_3d(tid)) for tid, c in corners.items()}
     base = dict(
         match_key=match_key,
@@ -694,7 +703,8 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         how = f"full solve from {len(corr)} tags"
         if cfg.locate_undecoded and background is not None:
             cal, how = _grow_with_locator(cal, how, background, fm, corners, image_size,
-                                          cfg, roi_detect_fn, judge, base, extra)
+                                          cfg, roi_detect_fn, judge, base, extra,
+                                          stack=loc_stack)
         used = set(int(t) for t in corr) | {int(d["id"]) for d in extra.get("located") or []}
         spread = tag_spread_m(fm, used)
         if not extra.get("located") and spread >= cfg.min_full_solve_spread_m:
@@ -775,7 +785,8 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         # Few decoded tags (often one structure) condition a pose badly: grow it
         # outward from the epoch's lens ("pose" -> "f_lens" -> ... ladder).
         cand, how = _grow_with_locator(cand, "", background, fm, corners, image_size, cfg,
-                                       roi_detect_fn, judge, base, extra, lens=ecal)
+                                       roi_detect_fn, judge, base, extra, lens=ecal,
+                                       stack=loc_stack)
         how = f" [{how.strip(' +')}]" if how else ""
     cval = validate(cand)
     pcfg = PoseFixConfig(min_tags=cfg.min_tags, drift_max_m=cfg.drift_max_m,

@@ -259,6 +259,38 @@ def test_an_encoded_frame_count_short_of_meta_is_a_render_error(db, tmp_path, mo
     assert not (d / "hud.render.mp4").exists()
 
 
+def _rewrite_meta(d: Path, fn):
+    meta = json.loads((d / "meta.json").read_text())
+    fn(meta)
+    (d / "meta.json").write_text(json.dumps(meta))
+
+
+@pytest.mark.parametrize("bad", [None, "behind"])
+def test_a_frame_num_behind_the_decoder_aborts(db, tmp_path, bad):
+    rid, d, _ = make_replay(tmp_path, live_video=True)
+
+    def edit(meta):                          # frame 6 repeats frame 5's number (or none)
+        meta["frames"][6]["frame_num"] = (meta["frames"][5]["frame_num"]
+                                          if bad == "behind" else None)
+    _rewrite_meta(d, edit)
+    with pytest.raises(hud_render.RenderError,
+                       match="decode misaligned: meta frame 6 has frame_num"):
+        hud_render.render_replay(rid)
+    assert (d / "hud.mp4").read_bytes() == b"LIVE-ENCODED"
+    assert not (d / "hud.render.mp4").exists()
+
+
+@pytest.mark.parametrize("skip", [1, 2])      # 1: read() runs out; 2: grab() does
+def test_a_source_that_ends_early_aborts(db, tmp_path, skip):
+    rid, d, _ = make_replay(tmp_path, n_meta=12, first=5, skip=skip, live_video=True)
+    src = Path(database.get_replay_sync(rid)["source_video_path"])
+    write_source(src, n=5 + skip * 6)        # only 6 of the 12 meta frames exist
+    with pytest.raises(hud_render.RenderError, match="source video ended at frame"):
+        hud_render.render_replay(rid)
+    assert (d / "hud.mp4").read_bytes() == b"LIVE-ENCODED"
+    assert not (d / "hud.render.mp4").exists()
+
+
 def test_a_missing_draw_list_line_still_emits_a_frame(db, tmp_path):
     rid, d, _ = make_replay(tmp_path)
     lines = [json.loads(l) for l in gzip.open(d / "draw.jsonl.gz", "rt")]

@@ -21,7 +21,7 @@ Optional bumper-colour prior multiplies off-alliance teams by ``colour_eps``. Th
 on val for <=0.5% wrong of named Jev-read crops and <=1% wrong vs the tracklet label on val crops
 Jev never read (propagated labels are ~99% pure; evaluation only, never training).
 
-  python -m scripts.teacher.students.digits train --out s1_digits.pt          # train + val tune
+  python -m scripts.teacher.students.digits train --out s1_digits.pt          # train + val tune (v1: trim 0.1, synth 0.3)
   python -m scripts.teacher.students.digits train --synth 0 --out s1_nosynth.pt     # ablation
   python -m scripts.teacher.students.digits retune --ckpt s1_digits.pt         # re-pick rule on val
   python -m scripts.teacher.students.digits test --ckpt s1_digits.pt          # TEST, run once
@@ -750,7 +750,7 @@ def main() -> None:
     t.add_argument("--wd", type=float, default=0.01)
     t.add_argument("--workers", type=int, default=8)
     t.add_argument("--colour-eps", type=float, default=0.05)
-    t.add_argument("--trim", type=float, default=0.0, help="fraction cut off each side of the padded crop")
+    t.add_argument("--trim", type=float, default=0.1, help="fraction cut off each side of the padded crop (val: 0.1 best)")
     t.add_argument("--limit", type=int, default=0)
     t.add_argument("--val-limit", type=int, default=0)
     t.add_argument("--seed", type=int, default=0)

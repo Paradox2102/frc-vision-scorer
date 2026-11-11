@@ -67,7 +67,7 @@ def test_lines_have_boxes_trails_and_no_score():
     assert len(lines[6]["radar"][0]["trail"]) == 1             # re-seeded after the gap
     assert len(lines[19]["radar"][0]["trail"]) == 14
     assert len(lines[19]["radar"][1]["trail"]) == 16           # capped
-    assert all("main_hash" not in ln and ln["hubs"] == [] and ln["corners"] == {}
+    assert all("main_thumb" not in ln and ln["hubs"] == [] and ln["corners"] == {}
                for ln in lines.values())
 
 

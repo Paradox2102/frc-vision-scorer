@@ -9,6 +9,7 @@ without booting web.app.
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
 import os
 from typing import Optional
@@ -373,17 +374,36 @@ def compose(annotated_frame, radar_img, camera_panels) -> np.ndarray:
     return np.vstack([annotated_frame, dash])
 
 
-def ahash(img: np.ndarray) -> str:
-    """8x8 grey average hash of ``img`` as 16 hex digits."""
+THUMB_W, THUMB_H = 32, 18
+
+
+def main_thumb(img: np.ndarray) -> str:
+    """The decode-alignment fingerprint of a main view: a 32x18 grey
+    (INTER_AREA) uint8 thumbnail, base64. The same decode of the same frame
+    gives the same string; see thumb_diff."""
     grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    small = cv2.resize(grey, (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
-    bits = (small > small.mean()).flatten()
-    return f"{int(''.join('1' if b else '0' for b in bits), 2):016x}"
+    small = cv2.resize(grey, (THUMB_W, THUMB_H), interpolation=cv2.INTER_AREA)
+    return base64.b64encode(np.ascontiguousarray(small, np.uint8).tobytes()).decode("ascii")
 
 
-def ahash_distance(a: str, b: str) -> int:
-    """Hamming distance between two ahash() strings."""
-    return bin(int(a, 16) ^ int(b, 16)).count("1")
+def thumb_array(thumb: str) -> np.ndarray:
+    """main_thumb() back to an (18, 32) uint8 array; ValueError when malformed."""
+    raw = base64.b64decode(thumb, validate=True)
+    if len(raw) != THUMB_W * THUMB_H:
+        raise ValueError(f"thumbnail is {len(raw)} bytes, not {THUMB_W * THUMB_H}")
+    return np.frombuffer(raw, np.uint8).reshape(THUMB_H, THUMB_W)
+
+
+def thumb_diff(a, b) -> int:
+    """The largest per-pixel difference between two main_thumb() strings
+    (0-255); 255 when either is missing or malformed. The max, not the mean:
+    on a fixed camera one robot moving a few pixels changes a handful of
+    thumbnail pixels by 10+ levels while the mean barely moves."""
+    try:
+        return int(np.abs(thumb_array(a).astype(np.int16)
+                          - thumb_array(b).astype(np.int16)).max())
+    except (TypeError, ValueError):
+        return 255
 
 
 MASK_POLY_EPS_PX = 1.5

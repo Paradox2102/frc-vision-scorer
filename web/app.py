@@ -5428,7 +5428,7 @@ class InferenceJob:
         flags = _live_hud_flags()
         rec = draw_line
         if rec is not None:
-            rec.update(frame_num=int(frame_num), main_hash=hud_draw.ahash(overhead_frame),
+            rec.update(frame_num=int(frame_num), main_thumb=hud_draw.main_thumb(overhead_frame),
                        main=[], corners={}, hubs=[], hub_boxes=[], radar=[])
             if flags.ball_boxes:
                 rec["ball_boxes"] = []

@@ -8,10 +8,10 @@ the per-frame draw list ``draw.jsonl.gz`` recorded live (hud_post_render knob),
 or, for a replay without one, an approximate draw list built from
 ``meta.frames`` (back-fill), and the slot corrections in the DB. The source is
 decoded exactly as the analysis loop does (one seek to the first processing
-frame, then sequential reads), every recorded frame's main-view aHash is
-checked, one frame is emitted per ``meta.frames`` entry, and the result
-replaces ``hud.mp4`` atomically (a live-encoded original is kept once as
-``hud.live.mp4``). Stats go to ``render.json`` next to the video.
+frame, then sequential reads), every recorded frame's main view is checked
+against its recorded thumbnail (hud_draw.main_thumb), one frame is emitted
+per ``meta.frames`` entry, and the result replaces ``hud.mp4`` atomically (a
+live-encoded original is kept once as ``hud.live.mp4``). Stats go to ``render.json`` next to the video.
 
 Import-light on purpose: never imports web.app (no torch, no models).
 """
@@ -38,7 +38,10 @@ from web import hud_draw, hud_labels
 
 OVERHEAD_CROP_RATIO = 0.67          # = web.app.OVERHEAD_CROP_RATIO (pinned by a test)
 DEFAULT_FIELD_SEASON = "2026-rebuilt-welded"
-AHASH_MAX_BITS = 4                  # more differing bits than this = a mismatch
+# A recorded main_thumb (hud_draw) is aligned when no thumbnail pixel differs
+# by more than this. The same decode gives 0; a 1-frame offset of a fixed
+# 60 fps camera moves a robot enough for 10+ (tests/test_hud_draw.py).
+THUMB_MAX_DIFF = 2
 MISALIGNED_FRAC = 0.02              # more mismatches than this share aborts
 APPROX_NOTE = "approx boxes"
 # Back-fill robot volume (spec section 6): 0.95 m x 0.95 m x 0.5 m.
@@ -332,7 +335,7 @@ def render_replay(replay_id: str, db_path=None) -> dict:
     else:
         first = 0
         warnings.append("no processing_ranges: decoding from frame 0")
-    hashed = sum(1 for ln in lines.values() if ln.get("main_hash"))
+    hashed = sum(1 for ln in lines.values() if ln.get("main_thumb"))
     allowed = int(MISALIGNED_FRAC * hashed)
     checked = mismatches = missing = 0
     fps = float(summary.get("fps") or row.get("fps") or 8.0)
@@ -361,14 +364,14 @@ def render_replay(replay_id: str, db_path=None) -> dict:
                 line = None
             if line is None:
                 missing += 1
-            elif line.get("main_hash"):
+            elif line.get("main_thumb"):
                 checked += 1
-                if hud_draw.ahash_distance(hud_draw.ahash(img[:overhead_height, :]),
-                                           line["main_hash"]) > AHASH_MAX_BITS:
+                if hud_draw.thumb_diff(hud_draw.main_thumb(img[:overhead_height, :]),
+                                       line["main_thumb"]) > THUMB_MAX_DIFF:
                     mismatches += 1
                     if mismatches > allowed:
                         raise RenderError(f"decode misaligned: {mismatches} of {hashed} "
-                                          f"frames fail the main-view hash check")
+                                          f"frames fail the main-view thumbnail check")
             rows_by_slot = {r.get("slot"): r for r in mf.get("robots") or []}
             composed = draw_frame(img, line, rows_by_slot, corr_by_label, ctx)
             if not rec.is_open:

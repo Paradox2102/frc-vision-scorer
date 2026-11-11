@@ -1,5 +1,5 @@
 """HUD renderer (web/hud_render.py; spec section 5) on a synthetic source video:
-one frame per meta frame, final labels, the aHash decode check, missing
+one frame per meta frame, final labels, the thumbnail decode check, missing
 draw-list lines, the atomic replace and hud.live.mp4 kept once, and the CLI."""
 import asyncio
 import gzip
@@ -21,9 +21,20 @@ VIEWS = [{"name": "corner_left", "crop": [0, 150, 160, 90], "masks": []},
          {"name": "corner_right", "crop": [160, 150, 160, 90], "masks": [[0, 0, 20, 10]]}]
 
 
-def write_source(path: Path, n: int = 40, fps: float = 30.0) -> None:
-    """A tiny mp4 whose every frame differs (a bar sweeping across)."""
+def write_source(path: Path, n: int = 40, fps: float = 30.0, near_static: bool = False) -> None:
+    """A tiny mp4 whose every frame differs (a bar sweeping across), or, with
+    ``near_static``, a static background with one small blob moving 1 px a
+    frame (a fixed camera at 60 fps)."""
     vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    if near_static:
+        rng = np.random.default_rng(0)
+        bg = cv2.GaussianBlur(rng.integers(60, 120, (H, W, 3), dtype=np.uint8), (7, 7), 0)
+        for i in range(n):
+            f = bg.copy()
+            cv2.circle(f, (40 + i, 80), 8, (230, 230, 230), -1)
+            vw.write(f)
+        vw.release()
+        return
     yy, xx = np.mgrid[0:H, 0:W]
     base = np.stack([(xx // 2) % 256, (yy // 2) % 256, ((xx + yy) // 4) % 256],
                     -1).astype(np.uint8)
@@ -36,8 +47,8 @@ def write_source(path: Path, n: int = 40, fps: float = 30.0) -> None:
     vw.release()
 
 
-def decoded_hashes(src: Path, first: int, frame_nums) -> dict:
-    """main-view aHash per frame, decoded as the live loop does."""
+def decoded_thumbs(src: Path, first: int, frame_nums) -> dict:
+    """main-view thumbnail per frame, decoded as the live loop does."""
     cap = cv2.VideoCapture(str(src))
     cap.set(cv2.CAP_PROP_POS_FRAMES, first)
     out, fn, want = {}, first, set(frame_nums)
@@ -45,21 +56,21 @@ def decoded_hashes(src: Path, first: int, frame_nums) -> dict:
         ok, img = cap.read()
         assert ok
         if fn in want:
-            out[fn] = hud_draw.ahash(img[:OVERHEAD, :])
+            out[fn] = hud_draw.main_thumb(img[:OVERHEAD, :])
         fn += 1
     cap.release()
     return out
 
 
 def make_replay(tmp_path, rid="r1", n_meta=12, first=5, skip=2, draw=True, live_video=False,
-                robots=None, n_src=40):
+                robots=None, n_src=40, near_static=False, thumb_offset=0):
     """A replay dir + DB row: meta.json (+ hud_static and draw.jsonl.gz when
     ``draw``), a synthetic source video. Returns (rid, dir, db_path)."""
     db = database.DB_PATH
     d = tmp_path / rid
     d.mkdir()
     src = tmp_path / f"{rid}_src.mp4"
-    write_source(src, n=n_src)
+    write_source(src, n=n_src, near_static=near_static)
     frame_nums = [first + skip * k for k in range(n_meta)]
     robots = robots or [
         {"slot": "B1", "alliance": "blue", "team_number": "111", "confirmed": True,
@@ -76,11 +87,12 @@ def make_replay(tmp_path, rid="r1", n_meta=12, first=5, skip=2, draw=True, live_
             "overhead_height": OVERHEAD, "views": VIEWS, "panel_max_width": 720,
             "reference_paths": [], "event_key": None, "camera": "main",
             "calibration_version": None, "field_season": "2026-rebuilt-welded"}
-        hashes = decoded_hashes(src, first, frame_nums)
+        thumbs = decoded_thumbs(src, first + thumb_offset,
+                                [fn + thumb_offset for fn in frame_nums])
         with gzip.open(d / "draw.jsonl.gz", "wt") as fh:
             for i, fn in enumerate(frame_nums):
                 fh.write(json.dumps({
-                    "i": i, "frame_num": fn, "main_hash": hashes[fn],
+                    "i": i, "frame_num": fn, "main_thumb": thumbs[fn + thumb_offset],
                     "main": [{"slot": "B1", "slot_id": 0, "alliance": "blue",
                               "box": [40, 40, 90, 100], "ghost": False, "score": 2,
                               "mask_poly": [[45, 45], [85, 45], [85, 95], [45, 95]]},
@@ -178,24 +190,41 @@ def test_corrections_relabel_frames_and_are_counted(db, tmp_path, monkeypatch):
     assert stats["corrections_note"] is None
 
 
-def _rewrite_hashes(d: Path, bad_indices):
+def _rewrite_thumbs(d: Path, bad_indices):
+    import base64
     lines = [json.loads(l) for l in gzip.open(d / "draw.jsonl.gz", "rt")]
     for ln in lines:
         if ln["i"] in bad_indices:
-            ln["main_hash"] = f"{int(ln['main_hash'], 16) ^ (2**64 - 1):016x}"
+            raw = bytes(255 - b for b in base64.b64decode(ln["main_thumb"]))
+            ln["main_thumb"] = base64.b64encode(raw).decode()
     with gzip.open(d / "draw.jsonl.gz", "wt") as fh:
         fh.writelines(json.dumps(ln) + "\n" for ln in lines)
 
 
-def test_hash_mismatches_beyond_two_percent_abort(db, tmp_path):
+def test_thumb_mismatches_beyond_two_percent_abort(db, tmp_path):
     rid, d, _ = make_replay(tmp_path, n_meta=60, first=3, skip=1, n_src=70)
-    _rewrite_hashes(d, {10})                     # 1 of 60 = 1.7%: tolerated
+    _rewrite_thumbs(d, {10})                     # 1 of 60 = 1.7%: tolerated
     assert hud_render.render_replay(rid)["decode_mismatches"] == 1
-    _rewrite_hashes(d, {20})                     # 2 of 60 = 3.3%: abort
+    _rewrite_thumbs(d, {20})                     # 2 of 60 = 3.3%: abort
     before = (d / "hud.mp4").read_bytes()
     with pytest.raises(hud_render.RenderError, match="decode misaligned"):
         hud_render.render_replay(rid)
     assert (d / "hud.mp4").read_bytes() == before and not (d / "hud.render.mp4").exists()
+
+
+@pytest.mark.parametrize("offset", [1, 2])
+def test_a_near_static_video_off_by_one_or_two_frames_aborts(db, tmp_path, offset):
+    rid, d, _ = make_replay(tmp_path, n_meta=30, first=3, skip=1, n_src=40,
+                            near_static=True, thumb_offset=offset)
+    with pytest.raises(hud_render.RenderError, match="decode misaligned"):
+        hud_render.render_replay(rid)
+    assert not (d / "hud.mp4").exists() and not (d / "hud.render.mp4").exists()
+
+
+def test_a_near_static_video_aligned_has_no_mismatches(db, tmp_path):
+    rid, d, _ = make_replay(tmp_path, n_meta=30, first=3, skip=1, n_src=40, near_static=True)
+    stats = hud_render.render_replay(rid)
+    assert stats["decode_checked"] == 30 and stats["decode_mismatches"] == 0
 
 
 def test_a_missing_draw_list_line_still_emits_a_frame(db, tmp_path):

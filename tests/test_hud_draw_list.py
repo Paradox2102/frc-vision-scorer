@@ -36,7 +36,8 @@ def test_line_holds_what_was_drawn():
     job, kw = scene()
     _, line = _line(job, kw)
     assert line["frame_num"] == kw["frame_num"]
-    assert line["main_hash"] == hud_draw.ahash(kw["overhead_frame"])
+    assert line["main_thumb"] == hud_draw.main_thumb(kw["overhead_frame"])
+    assert "main_hash" not in line
     main = {e["slot"]: e for e in line["main"]}
     assert set(main) == {"B1", "R2", "B3"}
     assert main["B1"]["box"] == [100.0, 80.0, 160.0, 150.0] and main["B1"]["score"] == 2

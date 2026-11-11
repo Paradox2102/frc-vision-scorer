@@ -1,5 +1,5 @@
 """web/hud_draw.py helpers that the golden image does not pin: flag snapshots,
-the view crop, aHash, and the mask polygon round trip."""
+the view crop, the main-view thumbnail, and the mask polygon round trip."""
 import cv2
 import numpy as np
 
@@ -32,15 +32,58 @@ def test_extract_view_matches_camera_view_extract():
     assert np.array_equal(hud_draw.extract_view(img, v.crop, v.masks), v.extract(img))
 
 
-def test_ahash_is_16_hex_and_tracks_the_image():
-    a = np.zeros((40, 40, 3), np.uint8)
-    a[:, :20] = 255
+def test_main_thumb_is_a_32x18_grey_thumbnail_and_tracks_the_image():
+    a = np.zeros((40, 64, 3), np.uint8)
+    a[:, :32] = 255
     b = a[:, ::-1].copy()
-    ha, hb = hud_draw.ahash(a), hud_draw.ahash(b)
-    assert len(ha) == 16 and int(ha, 16) >= 0
-    assert hud_draw.ahash(a.copy()) == ha
-    assert hud_draw.ahash_distance(ha, ha) == 0
-    assert hud_draw.ahash_distance(ha, hb) == 64
+    ta, tb = hud_draw.main_thumb(a), hud_draw.main_thumb(b)
+    assert hud_draw.thumb_array(ta).shape == (18, 32)
+    assert hud_draw.main_thumb(a.copy()) == ta
+    assert hud_draw.thumb_diff(ta, ta) == 0
+    assert hud_draw.thumb_diff(ta, tb) == 255
+    assert hud_draw.thumb_diff(ta, "not base64!") == 255      # malformed = mismatch
+    assert hud_draw.thumb_diff(ta, None) == 255
+
+
+def _near_static_video(path, n=40, step=1):
+    """A static textured background with one small blob moving ``step`` px
+    per frame: the hard case for an alignment check (fixed camera)."""
+    rng = np.random.default_rng(0)
+    base = cv2.GaussianBlur(rng.integers(60, 120, (240, 320, 3), dtype=np.uint8), (7, 7), 0)
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 60.0, (320, 240))
+    for i in range(n):
+        f = base.copy()
+        cv2.circle(f, (40 + step * i, 80), 8, (230, 230, 230), -1)
+        vw.write(f)
+    vw.release()
+
+
+def _decode_thumbs(path):
+    cap = cv2.VideoCapture(str(path))
+    out = []
+    while True:
+        ok, img = cap.read()
+        if not ok:
+            break
+        out.append(hud_draw.main_thumb(img[:160, :]))
+    cap.release()
+    return out
+
+
+def test_thumb_check_flags_one_and_two_frame_offsets_on_a_near_static_video(tmp_path):
+    from web.hud_render import THUMB_MAX_DIFF
+    p = tmp_path / "near_static.mp4"
+    _near_static_video(p)
+    live, again = _decode_thumbs(p), _decode_thumbs(p)
+    n = len(live) - 2
+
+    def mismatch_share(off):
+        return sum(hud_draw.thumb_diff(live[i], again[i + off]) > THUMB_MAX_DIFF
+                   for i in range(n)) / n
+
+    assert mismatch_share(0) == 0.0          # the same decode is bit-identical
+    assert mismatch_share(1) > 0.5           # far above the 2% abort budget
+    assert mismatch_share(2) > 0.5
 
 
 def test_mask_poly_round_trip_keeps_the_largest_component():

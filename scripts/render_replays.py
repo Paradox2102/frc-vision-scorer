@@ -77,7 +77,7 @@ def main(argv=None) -> int:
             notes = [f"{n['frames_relabelled']} frames relabelled on {lab}"
                      for lab, n in out["corrections"].items()]
             print(f"  {r['id'][:8]} {name}: rendered {out['frames']} frames in "
-                  f"{out['seconds']}s ({out['source']}; hash mismatches "
+                  f"{out['seconds']}s ({out['source']}; thumbnail mismatches "
                   f"{out['decode_mismatches']}/{out['decode_checked']}"
                   + (f"; {'; '.join(notes)}" if notes else "") + ")")
             for w in out.get("warnings") or []:

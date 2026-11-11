@@ -9,6 +9,11 @@ frame (``pad_crop``). Features: frozen DINOv3-S explicit CLS, letterbox 224 (fea
   out = st.predict(crops_bgr)           # {"s2": [N,3] (legible, illegible, not_bumper), "s3": [N]}
   keep = out["s2"][:, 0] >= st.s2_threshold      # S2 gate (keeps ~95% of legible on b1 CV)
   robot = out["s3"] >= st.s3_threshold           # S3 (>= 99.5% robot recall on b1 CV)
+
+S1 digit reader (data/teacher/models/s1_digits.pt, loaded on first use; PARSeq on the raw bumper crop):
+
+  res = st.read_digits(crops_bgr, rosters, colours)   # rosters: [{"red": [...], "blue": [...]}, ...]
+  res[i] -> {"probs": {team: p, ..., "other": p}, "team": "254" | None, "p": .., "abstain": bool, "read": "254"}
 """
 from __future__ import annotations
 
@@ -48,6 +53,7 @@ class Students:
         self.s2_threshold = float(self.ck2["threshold_keep95"])
         self.s3_threshold = float(self.ck3["threshold_recall995"])
         self.bb = backbone or F.Backbone(device=device)
+        self.models_dir, self.device, self._s1 = Path(models_dir), device, None
 
     def features(self, crops_bgr: Sequence[np.ndarray]) -> np.ndarray:
         return self.bb.embed_crops(list(crops_bgr))
@@ -63,6 +69,15 @@ class Students:
         p2 = self.s2.predict_proba(self._x(X, wh, self.ck2["use_size"]))
         p3 = self.s3.predict_proba(self._x(X, wh, self.ck3["use_size"]))[:, 1]
         return {"s2": p2.astype(np.float32), "s3": p3.astype(np.float32)}
+
+
+    def read_digits(self, crops_bgr: Sequence[np.ndarray], rosters: Sequence, colours: Optional[Sequence] = None,
+                    use_colour: Optional[bool] = None) -> list:
+        """S1 roster-constrained team read per bumper crop (see ``digits.DigitReader.read``)."""
+        if self._s1 is None:
+            from scripts.teacher.students.digits import DigitReader
+            self._s1 = DigitReader(self.models_dir / "s1_digits.pt", device=self.device)
+        return self._s1.read(crops_bgr, rosters, colours, use_colour)
 
 
 def predict(crops_bgr: Sequence[np.ndarray], _cache={}) -> dict:  # noqa: B006

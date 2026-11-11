@@ -758,8 +758,10 @@ KNOBS = [
     # Offline qm8 (relabel_replay a0bbc991, lineup 0.8, 2 runs per arm, Nov 10):
     # 701/964 tiles comb; digit-named windows 93-94 -> 111-114, full right
     # 46-47% -> 51-52%, wrong 1-2% -> 2%, misID 10-13 s -> 12-14 s, same cost.
-    # DEFAULT OFF pending a live A/B (ab_qm8 profile "wl-deinterlace").
-    Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, False,
+    # Live qm8 full match x2 (ab_qm8 "wl-deinterlace", identical tracks): right
+    # 47-50% -> 53%, wrong 1-2%, misID 11-16 s either way. DEFAULT ON (Nov 10);
+    # only acts when window_labels is on. WINDOW_LABELS_DEINTERLACE=0 to disable.
+    Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, True,
          section="Identity & votes"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not

@@ -541,7 +541,8 @@ def val_report(model, dev, colour_eps: float, seen: set, cache: dict) -> tuple:
 # ----------------------------------------------------------------------------- training
 def cmd_train(a) -> None:
     import torch
-    from web.students.parseq import BASE_CFG, PARSeq, plm_loss
+    from web.students.parseq import BASE_CFG, PARSeq
+    from scripts.teacher.students.parseq_plm import plm_loss
     _, _, MODELS = _paths()
     torch.manual_seed(a.seed)
     dev = a.device

@@ -97,7 +97,9 @@ def provenance(summary) -> dict:
         # summary.config holds only the non-default knobs: a missing key is
         # the knob's code default, not False / 0.0
         d = _knob_defaults()
-        wl_on = bool(cfg.get("window_labels", d.get("window_labels", False)))
+        # window_labels' default changed (OFF -> ON, Nov 11), so a missing key
+        # is decided by evidence: the stage leaves summary.window_labels.
+        wl_on = bool(cfg["window_labels"]) if "window_labels" in cfg else "window_labels" in s
         auto_only = bool(cfg.get("auto_period_only", d.get("auto_period_only", False)))
         gco = float(cfg.get("ground_center_offset_m", d.get("ground_center_offset_m", 0.0)) or 0.0)
     else:

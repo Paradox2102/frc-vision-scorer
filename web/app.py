@@ -1350,6 +1350,10 @@ class JobStopped(Exception):
     """
 
 
+_PROVENANCE_KNOBS = ("window_labels", "window_labels_reader", "auto_period_only",
+                     "ground_center_offset_m")
+
+
 class InferenceJob:
     """Manages a single video inference job"""
 
@@ -7131,6 +7135,12 @@ class InferenceJob:
             config = dict(cfg.non_defaults()) if cfg is not None else {}
         except Exception:
             config = {}
+        # Knobs the offline tools key on are recorded even at their default:
+        # a missing key would otherwise be read with whatever the default is
+        # when the replay is READ (window_labels flipped ON Nov 11).
+        for k in _PROVENANCE_KNOBS:
+            if cfg is not None and k not in config and hasattr(cfg, k):
+                config[k] = getattr(cfg, k)
         out = {"config": config, "stopped": bool(getattr(self, "_stopped", False)),
                "calibration_version": getattr(self, "_calib_version_id", None)}
         corners = getattr(self, "_corner_calib_outcomes", None)

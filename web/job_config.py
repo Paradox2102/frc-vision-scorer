@@ -743,8 +743,10 @@ KNOBS = [
     # docs/superpowers/specs/2026-11-09-jev-window-labels-design.md. qm8 GT,
     # replay a0bbc991, offline: right 37% -> 46%, wrong 9% -> 2%, misID 69 s
     # -> 17 s at lineup 0.8. Adds ~2-4 min and ~$0.26 of Jev calls per match.
-    # DEFAULT OFF pending the live A/B (ab_qm8 profile "window-labels").
-    Knob("window_labels", "WINDOW_LABELS", bool, False, section="Identity & votes"),
+    # Live qm8 A/B: misID 40-68 s -> 12-20 s. DEFAULT ON since Nov 11 (Nick),
+    # with window_labels_reader=student_only (local S1 digit reads, ~40 s and
+    # ~4 cents of Jev lineup calls per match). WINDOW_LABELS=0 to disable.
+    Knob("window_labels", "WINDOW_LABELS", bool, True, section="Identity & votes"),
     # Lowest probability at which a lineup answer names a window. 0.8 is the
     # conservative setting from qm8; 0.65 is the A/B arm (53% right / 3% wrong
     # / 21 s misID offline). A value above 1 disables the lineup pass.
@@ -1029,7 +1031,9 @@ KNOBS = [
     # 2026-11-10-hud-post-render-design.md): the job records a draw list instead
     # of encoding hud.mp4 live, and a render subprocess burns the FINAL labels
     # into the video once the replay is saved. The live preview is unchanged.
-    Knob("hud_post_render", "HUD_POST_RENDER", bool, False,
+    # DEFAULT ON since Nov 11 with window_labels, so replay videos show the
+    # final (window) labels, not the live ones. HUD_POST_RENDER=0 to disable.
+    Knob("hud_post_render", "HUD_POST_RENDER", bool, True,
          section="Streaming & output"),
 ]
 

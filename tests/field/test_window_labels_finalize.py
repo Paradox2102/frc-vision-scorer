@@ -385,8 +385,10 @@ def test_replay_provenance_records_config_stop_and_calibration():
     job._stopped = True
     job._calib_version_id = "20260630-210916-570400"
     prov = InferenceJob._replay_provenance(job)
-    assert prov == {"config": job.config.non_defaults(), "stopped": True,
-                    "calibration_version": "20260630-210916-570400"}
+    assert prov == {"config": {**job.config.non_defaults(), "window_labels": True,
+                               "window_labels_reader": job.config.window_labels_reader,
+                               "auto_period_only": job.config.auto_period_only},
+                    "stopped": True, "calibration_version": "20260630-210916-570400"}
     assert prov["config"]["window_labels"] is True
     assert prov["config"]["ground_center_offset_m"] == 0.2
     json.dumps(prov)                                        # goes into meta.json

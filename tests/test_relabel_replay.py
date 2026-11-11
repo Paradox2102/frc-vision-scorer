@@ -163,7 +163,12 @@ def test_provenance_missing_config_keys_fall_back_to_the_knob_defaults(monkeypat
     monkeypatch.setattr(rr, "_knob_defaults",
                         lambda: {"window_labels": True, "ground_center_offset_m": 0.3})
     p = rr.provenance({"config": {"sam2_track_fps": 5}, "duration_sec": 168.8})
-    assert p["window_labels_on"] is True and p["ground_center_offset_m"] == 0.3
+    assert p["ground_center_offset_m"] == 0.3
+    # window_labels is the exception: decided by summary.window_labels evidence
+    # (its default flipped), see the evidence test below
+    assert p["window_labels_on"] is False
+    assert rr.provenance({"config": {"sam2_track_fps": 5}, "duration_sec": 168.8,
+                          "window_labels": {}})["window_labels_on"] is True
     assert rr.provenance({"config": {"window_labels": False},
                           "duration_sec": 168.8})["window_labels_on"] is False
 
@@ -217,3 +222,15 @@ def test_reader_option_reaches_the_stage(store):
     assert out["stats"]["student"]["reader"] == "student_only"
     assert out["relabelled"]["summary"]["window_labels_digit_calls"]["reader"] == "student_only"
     assert rr.Options().reader == "student_only"          # matches the live knob default
+
+
+def test_provenance_reads_window_labels_from_evidence_when_the_key_is_missing():
+    # summary.config holds only non-default knobs, and window_labels' default
+    # flipped OFF -> ON (Nov 11): a missing key must not be read as today's
+    # default. The stage's own summary.window_labels entry decides.
+    base = {"duration_sec": 168.8, "stopped": False, "calibration_version": "v"}
+    assert rr.provenance({**base, "config": {}})["window_labels_on"] is False
+    assert rr.provenance({**base, "config": {}, "window_labels": {"aborted": None}})["window_labels_on"] is True
+    assert rr.provenance({**base, "config": {"window_labels": True}})["window_labels_on"] is True
+    assert rr.provenance({**base, "config": {"window_labels": False},
+                          "window_labels": {"aborted": None}})["window_labels_on"] is False

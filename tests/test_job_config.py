@@ -597,11 +597,11 @@ def test_tracker_reacquire_knobs_env_override_and_range(monkeypatch):
         JobConfig({"phys_reach_mps": 0.5})
 
 
-def test_window_labels_knobs_default_off(monkeypatch):
+def test_window_labels_knobs_default_on(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.window_labels is False
+    assert cfg.window_labels is True
     assert cfg.window_labels_lineup_min_p == 0.8
     assert "window_labels" not in cfg.non_defaults()
     assert "window_labels_lineup_min_p" not in cfg.non_defaults()
@@ -632,14 +632,14 @@ def test_event_lineup_knob_default_off(monkeypatch):
     assert next(k for k in KNOBS if k.name == "event_lineup").section == "Identity & votes"
 
 
-def test_hud_post_render_knob_default_off(monkeypatch):
+def test_hud_post_render_knob_default_on(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.hud_post_render is False and "hud_post_render" not in cfg.non_defaults()
-    assert JobConfig({"hud_post_render": "1"}).hud_post_render is True
-    monkeypatch.setenv("HUD_POST_RENDER", "1")
-    assert JobConfig().hud_post_render is True
+    assert cfg.hud_post_render is True and "hud_post_render" not in cfg.non_defaults()
+    assert JobConfig({"hud_post_render": "0"}).hud_post_render is False
+    monkeypatch.setenv("HUD_POST_RENDER", "0")
+    assert JobConfig().hud_post_render is False
     assert next(k for k in KNOBS if k.name == "hud_post_render").section == "Streaming & output"
 
 

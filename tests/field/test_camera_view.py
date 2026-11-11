@@ -32,7 +32,7 @@ def test_load_views_includes_only_calibrated(monkeypatch):
         "main": CameraLayout("main", (0, 0, 1920, 723), ()),
         "corner_left": CameraLayout("corner_left", (0, 648, 960, 432), ()),
     }
-    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    monkeypatch.setattr(cv_mod, "load_layout", lambda **kw: layout)
     # main calibrated, corner_left not
     monkeypatch.setattr(cv_mod.field_store, "load",
                         lambda ek, cam: object() if cam == "main" else None)
@@ -45,7 +45,7 @@ def test_load_views_orders_main_first(monkeypatch):
         "corner_left": CameraLayout("corner_left", (0, 648, 960, 432), ()),
         "main": CameraLayout("main", (0, 0, 1920, 723), ()),
     }
-    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    monkeypatch.setattr(cv_mod, "load_layout", lambda **kw: layout)
     monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: object())
     views = cv_mod.load_views("evt")
     assert views[0].name == "main"
@@ -57,7 +57,7 @@ def test_load_views_uses_calibration_masks(monkeypatch):
     layout = {
         "main": CameraLayout("main", (0, 0, 1920, 723), ((1, 2, 3, 4),)),
     }
-    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    monkeypatch.setattr(cv_mod, "load_layout", lambda **kw: layout)
     
     cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole", masks=[(5, 6, 7, 8)])
     monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: cal)
@@ -73,7 +73,7 @@ def test_load_views_falls_back_to_layout_masks(monkeypatch):
     layout = {
         "main": CameraLayout("main", (0, 0, 1920, 723), ((1, 2, 3, 4),)),
     }
-    monkeypatch.setattr(cv_mod, "load_layout", lambda: layout)
+    monkeypatch.setattr(cv_mod, "load_layout", lambda **kw: layout)
     
     cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole", masks=[])
     monkeypatch.setattr(cv_mod.field_store, "load", lambda ek, cam: cal)

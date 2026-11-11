@@ -191,7 +191,7 @@ def fakes(tmp_path, monkeypatch):
     monkeypatch.setattr(rr, "job_roster", lambda mk: (RED, BLUE))
     monkeypatch.setattr(er, "_probe_fps", lambda v: FPS)
     monkeypatch.setattr(er, "load_layout",
-                        lambda: {"main": SimpleNamespace(crop=(0, 0, 1920, 723))})
+                        lambda **kw: {"main": SimpleNamespace(crop=(0, 0, 1920, 723))})
     monkeypatch.setattr(er.jev_reader, "JevSession",
                         lambda *a, **k: _lineup_session(state["frames"], who_p={"B": 0.9}))
     monkeypatch.setattr(rr, "relabel_one", lambda *a, **k: real_one(

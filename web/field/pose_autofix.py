@@ -130,14 +130,21 @@ def evaluate_fix(base_cal: CameraCalibration, cand_cal: CameraCalibration,
 
 
 def aggregate_tag_corners(video: str, crop: tuple, t_min: float, t_max: float,
-                          stride_sec: float, mad_px: float):
+                          stride_sec: float, mad_px: float, *, detect_fn=None,
+                          on_frame=None):
     """Robustly aggregate each tag's corner pixels over a time window.
 
     A tag need only be unobscured in SOME sampled frames — we median its corners
     across all detections, then MAD-filter frames whose worst corner strays > mad_px
     from that median (rejecting a minority of off-framing/occluded frames) and median
     again. Returns ({tag_id: median_corners(4,2)}, {tag_id: (n_inliers, n_seen, std_px)},
-    fps, n_frames)."""
+    fps, n_frames).
+
+    Optional: ``detect_fn(crop_bgr) -> {tag_id: (4,2)}`` replaces the shared
+    module-level detector (e.g. a private Detector for a background thread), and
+    ``on_frame(t, crop_bgr, detections)`` is called for every sampled frame (e.g. to
+    keep the frame with the most tags)."""
+    detect_fn = detect_fn or detect_tags
     cap = cv2.VideoCapture(video)
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -153,7 +160,10 @@ def aggregate_tag_corners(video: str, crop: tuple, t_min: float, t_max: float,
         if not ok:
             continue
         sub = frame[y:y + h, x:x + w]
-        for tid, corners in detect_tags(sub).items():
+        dets = detect_fn(sub)
+        if on_frame is not None:
+            on_frame(t, sub, dets)
+        for tid, corners in dets.items():
             raw[tid].append(np.asarray(corners, float))
     cap.release()
 

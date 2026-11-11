@@ -36,8 +36,11 @@ def load_views(event_key: str, selection: dict | None = None) -> list["CameraVie
 
     Falls back to the legacy field_store.load() when no versioned records exist,
     for backward compatibility with the single-file calibration format.
+
+    Crops come from the event's own composite layout when it has one
+    (web.field.composite_layout.load_layout(event_key=...)), else the global one.
     """
-    layout = load_layout()
+    layout = load_layout(event_key=event_key)   # per-event layout, else global
     views = []
     for name, cl in layout.items():
         versions = field_store.load_versions(event_key, name)

@@ -358,7 +358,7 @@ def job_views(event_key: str, match_key: str, created_at: str) -> list:
     from web.field.composite_layout import load_layout
     from web.field.match_order import select_epoch
     out = []
-    for name, cl in load_layout().items():
+    for name, cl in load_layout(event_key=event_key).items():
         vs = [v for v in field_store.load_versions(event_key, name)
               if (v.get("created_at") or "") <= (created_at or "9999")]
         v = select_epoch(vs, match_key) if vs else None

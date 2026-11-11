@@ -164,7 +164,7 @@ def _corner_views(event_key, match_key) -> list:
     from web.field.composite_layout import load_layout
     from web.field.match_order import select_epoch
     selection = {}
-    for name in load_layout():
+    for name in load_layout(event_key=event_key):
         pick = select_epoch(field_store.load_versions(event_key, name), match_key)
         if pick is not None:
             selection[name] = pick["version_id"]

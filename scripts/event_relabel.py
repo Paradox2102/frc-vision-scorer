@@ -201,7 +201,8 @@ def relabel_match(item: dict, args, out_dir) -> dict:
                           digit_cache=str(Path(args.digit_cache_dir) / f"{row['id']}.json"),
                           use_elimination=not args.no_elim, alliance_rows=args.alliance_rows)
         out = rr.relabel_one(row, meta, item["video"], chosen["calibration"], red, blue, opts,
-                             session, fps=fps, view=load_layout()["main"].crop)
+                             session, fps=fps,
+                             view=load_layout(event_key=mk.split("_")[0])["main"].crop)
         rec = result_row(item, out, out_dir, args.score, time.time() - t0)
         if out.get("borrow_fetch_error"):   # would silently turn this arm into arm 1
             rec["error"] = f"borrow fetch failed: {out['borrow_fetch_error']}"

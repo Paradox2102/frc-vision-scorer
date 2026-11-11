@@ -763,6 +763,25 @@ KNOBS = [
     # only acts when window_labels is on. WINDOW_LABELS_DEINTERLACE=0 to disable.
     Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, True,
          section="Identity & votes"),
+    # Per-match corner calibration (web/field/corner_per_match.py). Broadcast
+    # corner cameras are re-aimed/zoomed between matches (2026cur June corner
+    # versions are 1.5-2.1 m off on every match) and the drift check covers only
+    # main. Before tracking, each corner view's covering epoch is checked on ~6
+    # in-match frames (<= corner_check_max_m with >= 3 tags, else >= 2 if that is
+    # all the corner shows); failing that it is re-solved from THIS match's
+    # footage (tags + median + locator + Jev) from the epoch's lens and, when it
+    # validates within the match (<= corner_resolve_max_m), saved as a new
+    # version anchored at the match and used immediately. Otherwise the corner
+    # view is dropped from the job (corner_drop_on_fail). DEFAULT ON (user
+    # decision Nov 11; operator spot-checks on /calibrate). Off = old behaviour.
+    Knob("corner_per_match_calib", "CORNER_PER_MATCH_CALIB", bool, True,
+         section="Fusion & field position"),
+    Knob("corner_drop_on_fail", "CORNER_DROP_ON_FAIL", bool, True,
+         section="Fusion & field position"),
+    Knob("corner_check_max_m", "CORNER_CHECK_MAX_M", float, 0.25, min=0.01, max=5.0,
+         section="Fusion & field position"),
+    Knob("corner_resolve_max_m", "CORNER_RESOLVE_MAX_M", float, 0.15, min=0.01, max=5.0,
+         section="Fusion & field position"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not
     # read at p >= 0.85 twice, from the anchors earlier matches of the event

@@ -3007,6 +3007,12 @@ class VisionScorer {
                 if (bar) bar.style.display = 'flex';
                 const rc = data.render_correction;
                 if (rc && !rc.recorded) status.textContent += ` (video: ${rc.reason})`;
+                // A render already running read the corrections when it started.
+                const rr = document.getElementById('replayRerenderStatus');
+                if (rr && (this._replayRenderStatus === 'queued'
+                           || this._replayRenderStatus === 'rendering')) {
+                    rr.textContent = 'a render is running — re-render again when it finishes';
+                }
             }
             return resp.ok;
         } catch (e) {
@@ -3020,6 +3026,7 @@ class VisionScorer {
     applyReplayRenderState(id, info) {
         clearTimeout(this._replayRenderPoll);
         const st = info ? info.render_status : null;
+        this._replayRenderStatus = st;
         const box = document.getElementById('replayRenderState');
         const text = document.getElementById('replayRenderText');
         const retry = document.getElementById('replayRenderRetryBtn');
@@ -3027,33 +3034,56 @@ class VisionScorer {
         if (pending) {
             this.replayVideo.pause();
             this.replayVideo.removeAttribute('src');
+            this.replayVideo.load();
             this.replayVideo.style.display = 'none';
             text.textContent = st === 'queued' ? 'Rendering video… (queued)' : 'Rendering video…';
             retry.style.display = 'none';
             box.style.display = 'flex';
-            this._replayRenderPoll = setTimeout(() => this.pollReplayRender(id), 4000);
+            this._replayRenderBackoff = 0;
+            this.scheduleReplayRenderPoll(id);
         } else {
             box.style.display = st === 'render_failed' ? 'flex' : 'none';
             if (st === 'render_failed') {
                 text.textContent = `Render failed: ${info.render_error || 'unknown error'} —`;
                 retry.style.display = 'inline-block';
             }
-            // Cache-bust: a re-render replaces hud.mp4 under the same URL.
-            this.replayVideo.src = `/api/replays/${id}/video?v=${Date.now()}`;
-            this.replayVideo.load();
+            // Cache-bust per render (a re-render replaces hud.mp4 under the
+            // same URL); the same render keeps one URL so the browser caches it.
+            const stats = info ? info.render_stats : null;
+            const v = (stats && stats.rendered_at) || st || 'live';
+            const src = `/api/replays/${id}/video?v=${encodeURIComponent(v)}`;
+            if (this.replayVideo.getAttribute('src') !== src) {
+                this.replayVideo.src = src;
+                this.replayVideo.load();
+            }
         }
         this.renderReplayRenderStats(info ? info.render_stats : null);
+    }
+
+    scheduleReplayRenderPoll(id) {
+        // 4 s while things go well; doubling up to 60 s while the server
+        // errors or is unreachable (a restart), back to 4 s on the next OK.
+        clearTimeout(this._replayRenderPoll);
+        const delay = Math.min(60000, 4000 * Math.pow(2, this._replayRenderBackoff || 0));
+        this._replayRenderPoll = setTimeout(() => this.pollReplayRender(id), delay);
     }
 
     async pollReplayRender(id) {
         if (this._replayOpenId !== id) return;
         try {
             const resp = await fetch(`/api/replays/${id}`);
-            if (!resp.ok || this._replayOpenId !== id) return;
+            if (this._replayOpenId !== id) return;
+            if (!resp.ok) {
+                this._replayRenderBackoff = (this._replayRenderBackoff || 0) + 1;
+                this.scheduleReplayRenderPoll(id);
+                return;
+            }
             const meta = await resp.json();
             this.applyReplayRenderState(id, meta.replay_info || {});
         } catch (e) {
-            this._replayRenderPoll = setTimeout(() => this.pollReplayRender(id), 8000);
+            if (this._replayOpenId !== id) return;
+            this._replayRenderBackoff = (this._replayRenderBackoff || 0) + 1;
+            this.scheduleReplayRenderPoll(id);
         }
     }
 
@@ -3061,13 +3091,23 @@ class VisionScorer {
         const id = this._replayOpenId;
         if (!id) return;
         const status = document.getElementById('replayRerenderStatus');
+        if (this._replayRenderStatus == null && !confirm(
+            'This replay\'s video was encoded live and has no recorded draw list. ' +
+            'The re-rendered video uses approximate projected boxes without masks ' +
+            '(with the final labels). The live video is kept as hud.live.mp4. Re-render?')) {
+            return;
+        }
         if (status) status.textContent = '…';
         try {
             const resp = await fetch(`/api/replays/${id}/render`, { method: 'POST' });
             const data = await resp.json().catch(() => ({}));
-            if (resp.ok || resp.status === 409) {
-                if (status) status.textContent = resp.ok ? 'queued' : 'already rendering';
+            if (resp.ok) {
+                if (status) status.textContent = 'queued';
                 this.applyReplayRenderState(id, { render_status: 'queued' });
+            } else if (resp.status === 409) {
+                // Already rendering: show it, and poll for the real state.
+                if (status) status.textContent = data.error || 'a render is running';
+                this.pollReplayRender(id);
             } else if (status) {
                 status.textContent = `✗ ${data.error || ('HTTP ' + resp.status)}`;
             }

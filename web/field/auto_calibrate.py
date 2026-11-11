@@ -79,6 +79,10 @@ class AutoCalibConfig:
     jev_verify: bool = True
     jev_min_p: float = 0.6
     locate_init_model: str = "pp_k1"
+    # A fresh full solve frees the lens; tags clustered on one structure (a hub
+    # corner spans ~0.6-0.9 m) fit perfectly yet extrapolate wildly (2026casnd
+    # corner_left). Below this field-space spread a full solve is never "ready".
+    min_full_solve_spread_m: float = 2.0
 
 
 @dataclass
@@ -174,6 +178,73 @@ def download_match_video(video_key: str, out_path: Path) -> Path:
     return out_path
 
 
+FREE_LENS_MIN_TAGS = 8   # a freer lens needs this many tags (not just spread) to be supported
+
+
+def free_lens_ladder(cal, corr, image_size, season, fm=None):
+    """Free the lens step by step (k1, then full) from a constrained fit ``cal`` — a
+    freer model is kept only if it fits clearly better (< 0.8 x RMS) and its distortion
+    does not fold back — over the field area in view when ``fm`` is given (else over the
+    points). Needs >= FREE_LENS_MIN_TAGS tags: 4 hub tags + 2 clicked wall tags span
+    4.7 m yet free "k1" fit them at 0.34 px and folded everywhere else (2026casnd
+    corner_right). Callers must also check the tags' field spread (``tag_spread_m``).
+    Returns (cal, the freest model adopted or None)."""
+    from web.field import tag_locator as tl
+    pts = np.vstack([np.asarray(i, float).reshape(-1, 2) for i, _ in corr.values()])
+    n_tags = len({k for k in corr})
+    freed = None
+    if n_tags < FREE_LENS_MIN_TAGS:
+        return cal, None
+    for model in ("k1", "full"):
+        if n_tags < tl.MODEL_MIN_TAGS[model]:
+            break
+        try:
+            c = tl.solve_model(corr, image_size, season, model, prev=cal)
+        except CalibrationError:
+            continue
+        mono = (tl.monotonic_ok(c, corr, fm, image_size) if fm is not None
+                else tl.distortion_monotonic(c, image_size, pts))
+        if c.rms_error < 0.8 * cal.rms_error and mono:
+            cal, freed = c, model
+    return cal, freed
+
+
+def solve_fresh_lens(corr, image_size, season, fm, min_spread_m: float = 2.0,
+                     init_model: str = "pp_k1"):
+    """A camera solve with NO prior lens that cannot run away: the constrained model
+    first (centred principal point, square pixels, one radial term), freed only when
+    the tags span >= ``min_spread_m`` of the field. Tags on one structure fit a free
+    lens perfectly yet extrapolate wildly (2026casnd corner_left). ``corr`` keys may be
+    ints or "a6"/"m6"/"r6". Returns (cal, model, spread_m)."""
+    from web.field import tag_locator as tl
+    from web.field.calibration import _tag_id_of_key
+    cal, err, model = None, None, None
+    for m in (init_model, "pp_k0"):
+        try:
+            cal, model = tl.solve_model(corr, image_size, season, m), m
+            break
+        except CalibrationError as e:
+            err = e
+    if cal is None:
+        raise err or CalibrationError("no constrained model could be solved")
+    ids = {_tag_id_of_key(k) for k in corr} - {None}
+    spread = tag_spread_m(fm, ids)
+    if spread >= min_spread_m:
+        cal, freed = free_lens_ladder(cal, corr, image_size, season, fm)
+        model = freed or model
+    return cal, model, spread
+
+
+def tag_spread_m(fm, tag_ids) -> float:
+    """Largest field-plane (x, y) distance between any two of ``tag_ids`` (metres);
+    0 for fewer than two known tags. How much of the field the tags constrain."""
+    pts = [np.asarray(fm.tag_translation(t), float)[:2] for t in tag_ids if t in fm.tags]
+    if len(pts) < 2:
+        return 0.0
+    P = np.stack(pts)
+    return float(np.max(np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)))
+
+
 def later_reference_videos(event_key: str, matches, after_key: str, dirs=None,
                            download_dir=None, downloader: Callable = None, limit: int = 3):
     """Yield (match_key, video_path) for matches AFTER ``after_key`` (match order) to
@@ -243,8 +314,12 @@ def make_detect_fn():
 
     def detect(frame_bgr):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # quad_decimate=1: the default (2) halves the image before finding tag
+        # outlines, which erases the ~25 px tags of distant corner cameras
+        # (2026casnd corner_right: 0 tags at 2, tags 5/8/9/10 at 1). ~5 ms per
+        # corner crop, ~30 ms per main crop.
         return {int(d.tag_id): np.asarray(d.corners, float)
-                for d in thread_detector().detect(gray)}
+                for d in thread_detector(quad_decimate=1.0).detect(gray)}
     return detect
 
 
@@ -284,15 +359,18 @@ def median_of_frames(frames: list):
     return np.partition(st, k, axis=0)[k]
 
 
-def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31):
+def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31,
+                 return_stack: bool = False):
     """Temporal median of the camera crop over ``n`` frames evenly spaced in
-    [t_lo, t_hi] seconds (clamped to the video). None if nothing could be read."""
+    [t_lo, t_hi] seconds (clamped to the video). None if nothing could be read.
+    ``return_stack``: return (median, frames) — the frames let the tag locator test
+    that a candidate is STATIC (bolted to the field) rather than a spectator."""
     cap = cv2.VideoCapture(str(video))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if n_frames <= 0 or n <= 0:
         cap.release()
-        return None
+        return (None, []) if return_stack else None
     x, y, w, h = (int(c) for c in crop)
     lo, hi = _window_frame_range(n_frames, fps, t_lo, t_hi)
     idxs = sorted({int(round(lo + (hi - lo) * i / max(1, n - 1))) for i in range(n)})
@@ -307,7 +385,8 @@ def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31):
                     frames.append(sub.copy())
     finally:
         cap.release()
-    return median_of_frames(frames)
+    med = median_of_frames(frames)
+    return (med, frames) if return_stack else med
 
 
 def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn):
@@ -512,7 +591,7 @@ def median_decodes(median, detect_fn, roi_detect_fn=None, scales=(2, 3)) -> dict
 
 
 def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_fn, judge,
-                       base, extra, lens=None):
+                       base, extra, lens=None, stack=None):
     """Run the undecoded-tag locator; adopt its calibration when it located anything.
     Fills base["auto_tags"] (ROI decodes, 4 corners) / base["manual_tags"] (centre
     points) and extra["located"/"candidates"/"notes"]. Returns (cal, description)."""
@@ -521,7 +600,8 @@ def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_f
                             jev_verify=cfg.jev_verify, jev_min_p=cfg.jev_min_p)
     try:
         res = tl.locate_undecoded(img, fm, corners, image_size, cfg.field_season, lcfg,
-                                  detect_fn=roi_detect_fn, judge=judge, lens=lens)
+                                  detect_fn=roi_detect_fn, judge=judge, lens=lens,
+                                  stack=stack)
     except Exception as e:
         extra["notes"].append(f"tag locator failed: {type(e).__name__}: {e}")
         return cal, how
@@ -582,9 +662,12 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     # Temporal median of the crop: robots/balls blocking a tag vanish. A tag decoded
     # ONLY there joins the set (the multi-frame aggregate wins when both have it).
     median = None
+    stack = None
     med_dec = {}
     if cfg.median_frames > 0:
-        median = median_frame(video, crop, cfg.window[0], cfg.window[1], cfg.median_frames)
+        mf = median_frame(video, crop, cfg.window[0], cfg.window[1],
+                          cfg.median_frames, return_stack=True)
+        median, stack = mf if isinstance(mf, tuple) else (mf, None)
     if median is not None:
         med_dec = {t: c for t, c in median_decodes(median, detect_fn, roi_detect_fn).items()
                    if t in fm.tags}
@@ -594,6 +677,7 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                 per_tag[str(int(tid))] = {"inliers": 0, "seen": 0, "std_px": None,
                                           "source": "median"}
     background = median if median is not None else agg["best_frame"]
+    loc_stack = stack if median is not None else None
     corr = {tid: (c, fm.tag_corners_3d(tid)) for tid, c in corners.items()}
     base = dict(
         match_key=match_key,
@@ -659,15 +743,43 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                           f"only {len(corr)} known tags found across {match_key} "
                           f"(need >= {cfg.min_tags}) — calibrate manually",
                           None, None, None)
-        try:
-            cal = Calibrator.solve_camera_from_tags(corr, image_size, cfg.field_season)
-        except CalibrationError as e:
-            return finish("failed", "full_solve", f"full solve failed: {e}",
+        # Start from the CONSTRAINED lens model (the locator's best extrapolator), not
+        # a fully free one: if the locator then finds nothing, the free model would
+        # be kept — perfect on a tight cluster of tags, wild everywhere else.
+        from web.field import tag_locator as tl
+        cal, err = None, None
+        for model in (cfg.locate_init_model, "pp_k0"):
+            try:
+                cal = tl.solve_model(corr, image_size, cfg.field_season, model)
+                break
+            except CalibrationError as e:
+                err = e
+        if cal is None:
+            return finish("failed", "full_solve", f"full solve failed: {err}",
                           None, None, None)
         how = f"full solve from {len(corr)} tags"
         if cfg.locate_undecoded and background is not None:
             cal, how = _grow_with_locator(cal, how, background, fm, corners, image_size,
-                                          cfg, roi_detect_fn, judge, base, extra)
+                                          cfg, roi_detect_fn, judge, base, extra,
+                                          stack=loc_stack)
+        used = set(int(t) for t in corr) | {int(d["id"]) for d in extra.get("located") or []}
+        spread = tag_spread_m(fm, used)
+        if not extra.get("located") and spread >= cfg.min_full_solve_spread_m:
+            # The locator adds nothing but the decoded tags themselves are numerous and
+            # spread: free the lens as the locator would (k1, then full), keeping a
+            # freer model only if it fits clearly better without distortion fold-back.
+            cal, freed = free_lens_ladder(cal, corr, image_size, cfg.field_season, fm)
+            if freed:
+                how = f"{how}, model {freed}"
+        extra["notes"].append(f"tags span {spread:.1f} m of the field")
+        if spread < cfg.min_full_solve_spread_m:
+            val = validate(cal)
+            return finish("failed", "full_solve",
+                          f"{how}: the tags only span {spread:.1f} m of the field (one "
+                          f"structure) — that can't determine the lens (needs >= "
+                          f"{cfg.min_full_solve_spread_m:.1f} m); correct manually by "
+                          f"clicking a few far tags",
+                          cal, val, cal)
         val = validate(cal)
         gate = val["gate_best_m"]
         if gate is None or gate >= cfg.drift_max_m:
@@ -721,7 +833,8 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         # Few decoded tags (often one structure) condition a pose badly: grow it
         # outward from the epoch's lens ("pose" -> "f_lens" -> ... ladder).
         cand, how = _grow_with_locator(cand, "", background, fm, corners, image_size, cfg,
-                                       roi_detect_fn, judge, base, extra, lens=ecal)
+                                       roi_detect_fn, judge, base, extra, lens=ecal,
+                                       stack=loc_stack)
         how = f" [{how.strip(' +')}]" if how else ""
     cval = validate(cand)
     pcfg = PoseFixConfig(min_tags=cfg.min_tags, drift_max_m=cfg.drift_max_m,

@@ -7,7 +7,9 @@ from pupil_apriltags import Detector
 # Module-level singleton holding C-level state — not thread-safe. Fine for the
 # sequential calibration UI and single-job inference; do not call detect_tags /
 # detect_tags_in_roi concurrently from multiple threads.
-_detector = Detector(families="tag36h11")
+# quad_decimate=1: the default (2) halves the image before finding tag outlines and
+# misses small tags (distant corner-camera tags ~25 px wide decode only at 1).
+_detector = Detector(families="tag36h11", quad_decimate=1.0)
 
 
 def detect_tags(frame_bgr: np.ndarray) -> dict[int, np.ndarray]:

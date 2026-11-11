@@ -24,6 +24,10 @@
   button.primary:hover { background:#1e7040; }
   .canvases { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
   .canvas-col h2 { font-size:.95em; color:#a0c4ff; margin-bottom:6px; }
+  .tag-chooser { position:absolute; z-index:5; background:#101828; border:1px solid #ffa028; border-radius:6px;
+                 padding:6px; display:flex; flex-direction:column; gap:4px; box-shadow:0 4px 14px rgba(0,0,0,.5); }
+  .tag-chooser .hint { font-size:11px; color:#c8b090; margin:0 0 2px; }
+  .tag-chooser button { padding:3px 10px; font-size:12px; text-align:left; }
   .canvas-wrap { position:relative; border:1px solid #334; display:inline-block;
                  background:#0a0a14; }
   #frameCanvas { cursor:crosshair; display:block; max-width:760px; }
@@ -225,7 +229,7 @@
 <div class="canvases">
   <div class="canvas-col">
     <h2>Broadcast frame</h2>
-    <div class="canvas-wrap"><canvas id="frameCanvas"></canvas><canvas id="loupe" width="160" height="160"></canvas></div>
+    <div class="canvas-wrap"><canvas id="frameCanvas"></canvas><canvas id="loupe" width="160" height="160"></canvas><div id="tagChooser" class="tag-chooser" style="display:none"></div></div>
     <div class="hint" id="frameHint">Click a tag here, then its marker on the map →</div>
     <label class="hint" style="display:inline-flex; align-items:center; gap:5px; margin-top:2px;">
       <input type="checkbox" id="magnifierToggle" checked> Magnifier — hover the frame to zoom;
@@ -336,6 +340,9 @@ let baseImg = null, frameW = 0, frameH = 0, fScale = 1.0;
 let autoTags = {};        // {id: [[u,v]x4]}
 let manualTags = [];      // [{id, u, v}]
 let pendingPixel = null;  // {u, v} awaiting a map click
+let predictedTags = {};   // {id: [u,v]} where the current solve predicts each tag (one-click placement)
+const SNAP_PX = 90;       // a frame click this close (crop px) to a predicted label places that tag
+let pairPending = null;   // {ids:[a,b], click} — first click on a pair whose labels overlap
 let heldOut = new Set();  // ids marked as held-out for validation
 let mapScale = 1, mapW = 0, mapH = 0;
 const MAP_PAD = 16;
@@ -679,7 +686,7 @@ async function grabFrame(opts){
     const j = await r.json();
     if (seq !== frameLoadSeq) return false;
     if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return false; }
-    autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null;
+    autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null; predictedTags = {}; pairPending = null;
     currentFrameSource = {match_key: mk, timestamp: ts};
     return await new Promise(resolve => {
       const img = new Image();
@@ -801,6 +808,19 @@ function redrawFrame(){
     ctx.setLineDash([]);
   }
 
+  // predicted positions of tags not placed yet: click near one to place it
+  const placed = new Set([...Object.keys(autoTags).map(Number), ...manualTags.map(m => m.id)]);
+  for (const [sid, uv] of Object.entries(predictedTags)){
+    const id = Number(sid);
+    if (placed.has(id)) continue;
+    const x = uv[0]*fScale, y = uv[1]*fScale;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, 2*Math.PI);
+    ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(255,160,40,0.95)'; ctx.lineWidth = 2;
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.font = 'bold 12px monospace';
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(x + 7, y - 17, ctx.measureText(sid).width + 4, 14);
+    ctx.fillStyle = '#ffa028'; ctx.fillText(sid, x + 9, y - 6);
+  }
   // auto tag quads
   ctx.lineWidth = 2;
   for (const [id, corners] of Object.entries(autoTags)){
@@ -819,6 +839,11 @@ function redrawFrame(){
     ctx.fillStyle='rgba(255,208,96,0.95)'; ctx.fill(); ctx.strokeStyle='#fff'; ctx.stroke();
     ctx.fillStyle='#ffd060'; ctx.font='bold 12px monospace'; ctx.fillText(m.id, x+7, y-6);
   });
+  if (pairPending){
+    const x = pairPending.click.u*fScale, y = pairPending.click.v*fScale;
+    ctx.beginPath(); ctx.arc(x, y, 7, 0, 2*Math.PI);
+    ctx.strokeStyle = '#ffa028'; ctx.lineWidth = 2; ctx.stroke();
+  }
   // pending
   if (pendingPixel){
     const x=pendingPixel.u*fScale, y=pendingPixel.v*fScale;
@@ -827,16 +852,143 @@ function redrawFrame(){
   }
 }
 
-document.getElementById('frameCanvas').addEventListener('click', function(e){
+document.getElementById('frameCanvas').addEventListener('click', async function(e){
   if (document.getElementById('maskMode').checked) return;
   if (!baseImg) return;
   const rect = this.getBoundingClientRect();
-  pendingPixel = {u: Math.round((e.clientX-rect.left)/fScale),
-                  v: Math.round((e.clientY-rect.top)/fScale)};
+  const click = {u: Math.round((e.clientX-rect.left)/fScale),
+                 v: Math.round((e.clientY-rect.top)/fScale)};
+  // ONE-CLICK placement: a click near an orange predicted label places that tag
+  // (Shift-click keeps the old frame-then-map flow, e.g. to pick a different id).
+  if (!e.shiftKey){
+    // Second click of an overlapping pair: order the two clicks along the wall the
+    // way the prediction orders the two tags (positions may be off; order is not).
+    if (pairPending){
+      const [a, b] = pairPending.ids, pa = predictedTags[a], pb = predictedTags[b];
+      const ax = [pb[0]-pa[0], pb[1]-pa[1]];
+      const c1 = pairPending.click, c2 = click;
+      const s1 = c1.u*ax[0] + c1.v*ax[1], s2 = c2.u*ax[0] + c2.v*ax[1];
+      pairPending = null;
+      const [ca, cb] = s1 <= s2 ? [c1, c2] : [c2, c1];
+      await placeTag(a, ca, false);
+      await placeTag(b, cb, true);
+      return;
+    }
+    const opts = clickOptions(click);
+    if (opts.length === 1){ await applyOption(opts[0], click); return; }
+    if (opts.length > 1){ showChooser(opts, click, e); return; }
+  }
+  hideChooser();
+  pendingPixel = click;
   document.getElementById('frameHint').textContent =
     'Pending click set — now click the matching tag on the map →';
   redrawFrame(); drawMap();
 });
+
+// Candidates for a frame click: every unplaced predicted tag within SNAP_PX, with tags
+// of one physical PAIR (same wall, <= 0.6 m apart) merged into a single pair option.
+// Nearest first. The prediction can be tens of px off — when several candidates are
+// near, the operator picks (a wrong id still fits the solve, so we never guess).
+function clickOptions(click){
+  const placed = new Set([...Object.keys(autoTags).map(Number), ...manualTags.map(m => m.id)]);
+  const near = Object.entries(predictedTags)
+    .map(([sid, uv]) => ({id: Number(sid), uv, d: Math.hypot(uv[0]-click.u, uv[1]-click.v)}))
+    .filter(o => !placed.has(o.id) && o.d < SNAP_PX).sort((x, y) => x.d - y.d);
+  const used = new Set(), out = [];
+  for (const o of near){
+    if (used.has(o.id)) continue;
+    const mate = near.find(q => q.id !== o.id && !used.has(q.id) && isPair(o.id, q.id));
+    if (mate){
+      used.add(o.id); used.add(mate.id);
+      const ids = [Math.min(o.id, mate.id), Math.max(o.id, mate.id)];
+      out.push({kind: 'pair', ids, d: Math.min(o.d, mate.d)});
+    } else {
+      used.add(o.id); out.push({kind: 'single', ids: [o.id], d: o.d});
+    }
+  }
+  return out;
+}
+
+function isPair(a, b){
+  const ta = tagMap[a], tb = tagMap[b];
+  return !!(ta && tb && Math.hypot(ta.x-tb.x, ta.y-tb.y) <= 0.6 && Math.abs((ta.z||0)-(tb.z||0)) <= 0.05);
+}
+
+async function applyOption(opt, click){
+  hideChooser();
+  if (opt.kind === 'single'){ await placeTag(opt.ids[0], click, true); return; }
+  pairPending = {ids: opt.ids, click};
+  redrawFrame();
+  setStatus(`Pair ${opt.ids[0]} / ${opt.ids[1]}: now click the OTHER tag of the pair — the `
+    + `ids follow the tags' order along the wall.`, 'rms-info');
+}
+
+function showChooser(opts, click, e){
+  const box = document.getElementById('tagChooser');
+  box.replaceChildren();
+  const h = document.createElement('div'); h.className = 'hint';
+  h.textContent = 'Which tag did you click? (nearest prediction first)';
+  box.appendChild(h);
+  opts.forEach(o => {
+    const b = document.createElement('button');
+    const t = tagMap[o.ids[0]] || {};
+    b.textContent = (o.kind === 'pair' ? `${o.ids[0]} / ${o.ids[1]} (pair)` : `tag ${o.ids[0]}`)
+      + (t.x != null ? ` · field (${(+t.x).toFixed(1)}, ${(+t.y).toFixed(1)})` : '');
+    b.onclick = (ev) => { ev.stopPropagation(); applyOption(o, click); };
+    box.appendChild(b);
+  });
+  const cancel = document.createElement('button'); cancel.textContent = 'Cancel';
+  cancel.onclick = (ev) => { ev.stopPropagation(); hideChooser(); };
+  box.appendChild(cancel);
+  const cv = document.getElementById('frameCanvas');
+  box.style.left = Math.min(click.u*fScale + 12, cv.width - 230) + 'px';
+  box.style.top = Math.max(0, click.v*fScale - 20) + 'px';
+  box.style.display = 'flex';
+}
+
+function hideChooser(){ const b = document.getElementById('tagChooser'); if (b) b.style.display = 'none'; }
+
+function nearestPredicted(click){
+  const placed = new Set([...Object.keys(autoTags).map(Number), ...manualTags.map(m => m.id)]);
+  let best = null, bestD = SNAP_PX * SNAP_PX;
+  for (const [sid, uv] of Object.entries(predictedTags)){
+    const id = Number(sid);
+    if (placed.has(id)) continue;
+    const d = (uv[0]-click.u)**2 + (uv[1]-click.v)**2;
+    if (d < bestD){ bestD = d; best = id; }
+  }
+  return best;
+}
+
+// Place tag ``id`` at a clicked pixel: snap to sub-pixel corners when the ROI decoder
+// can read it, else keep the click as a centre point. ``preview``: then re-solve as a
+// dry run so the overlay and the remaining orange labels move to the improved fit.
+async function placeTag(id, px, preview){
+  const camera = document.getElementById('camera').value;
+  setStatus(`Placing tag ${id}…`, 'rms-info');
+  let refined = null;
+  try {
+    const rr = await fetch('/api/calibration/refine-tag', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({camera, timestamp: currentFrameSource.timestamp,
+        u: px.u, v: px.v, id, aggregate: aggregateFrames(), event: autoEvent(),
+        match_key: currentFrameSource.match_key})});
+    refined = (await rr.json()).corners;   // [[u,v]x4] or null
+  } catch(e) { /* centre point below */ }
+  manualTags = manualTags.filter(m => m.id !== id);
+  if (refined){
+    autoTags[String(id)] = refined;
+  } else {
+    manualTags.push({id, u: px.u, v: px.v});
+  }
+  pendingPixel = null;
+  document.getElementById('frameHint').textContent =
+    'Click near an orange label to place that tag (Shift-click: pick the id on the map) →';
+  redrawFrame(); drawMap(); renderRows();
+  const how = refined ? '4 corners (decoded)' : 'centre point';
+  setStatus(`Placed tag ${id} — ${how}. Wrong id? Remove it with ✕ below.`, 'rms-good');
+  if (preview) await solve({dryRun: true, preview: true});
+}
 
 document.getElementById('mapCanvas').addEventListener('click', async function(e){
   if (document.getElementById('zoneMode').checked) return;  // drawing zones, not picking tags
@@ -939,7 +1091,12 @@ async function solve(opts){
       msg += ` · held-out ${he.toFixed(2)} m`;
       if (he>0.5) cls='rms-bad'; else if (he>0.3 && cls==='rms-good') cls='rms-warn';
     }
-    if (opts.dryRun){
+    if (j.predicted_tags){ predictedTags = j.predicted_tags; redrawFrame(); }
+    if (j.tag_spread_m != null && j.tag_spread_m < 2.0)
+      msg += ` · tags span only ${j.tag_spread_m} m — add a far tag (orange label) for a reliable lens`;
+    if (opts.preview){
+      msg += ' · preview (not saved) — keep clicking orange labels, then Solve & preview to save';
+    } else if (opts.dryRun){
       msg += ' · preview of the saved epoch (not re-saved)';
     } else {
       msg += startMatch ? ` · saved as new version from ${startMatch} →`
@@ -1825,6 +1982,14 @@ async function correctManually(cam){
   manualTags = (rec.manual_tags || []).map(m => ({id: m.id, u: m.u, v: m.v}));
   heldOut = new Set(); pendingPixel = null;
   currentFrameSource = {match_key: rec.match_key, timestamp: ts};
+  // Where the automatic candidate predicts every tag: one click near a label places it.
+  predictedTags = {};
+  try {
+    const pr = await fetch(`/api/calibration/predicted-tags?event=${encodeURIComponent(autoEvent())}`
+      + `&camera=${encodeURIComponent(cam)}`);
+    if (pr.ok && seq === frameLoadSeq) predictedTags = (await pr.json()).tags || {};
+  } catch(e){ /* labels just won't show */ }
+  if (seq !== frameLoadSeq) return;
   redrawFrame(); drawMap(); renderRows();
   const n = Object.keys(autoTags).length;
   const unused = (rec.metrics && rec.metrics.unused_visible_tags) || [];
@@ -1835,9 +2000,9 @@ async function correctManually(cam){
       + `@ ${ts} s couldn't be grabbed (${why}) — fix that before solving.`, 'rms-err');
     return;
   }
-  setStatus(`Loaded ${n} tags from the automatic run (${rec.match_key} @ ${ts} s). Click any `
-    + `orange-labelled (undecoded) tag${extra} on the frame, then its marker on the map, `
-    + `then Solve & preview.`, 'rms-info');
+  setStatus(`Loaded ${n} tags from the automatic run (${rec.match_key} @ ${ts} s). Click the `
+    + `real tag next to an orange label${extra} to place it — one click each; the labels move `
+    + `as the fit improves. Then Solve & preview to save.`, 'rms-info');
 }
 
 function setStatus(msg,cls){ const el=document.getElementById('statusLine');

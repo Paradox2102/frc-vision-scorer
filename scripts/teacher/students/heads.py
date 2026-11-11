@@ -173,6 +173,9 @@ def weak_rows(events: Sequence[str]) -> List[dict]:
                     if s2:
                         rows.append({"path": c["path"], "match_key": mk, "event": ev, "task": "s2",
                                      "y": S2_CLASSES.index(s2), "src": f"jev_call_{s2}"})
+                    if s2 == "not_bumper":  # S3 call-level negative (cleaner than tracklet-level)
+                        rows.append({"path": c["path"], "match_key": mk, "event": ev, "task": "s3",
+                                     "y": 0, "src": "jev_call_not_robot"})
                 # S3: tracklet-level
                 dec = lab["decision"]
                 if dec in ("team", "not_bumper"):
@@ -407,6 +410,7 @@ class Variant:
     weak_weight: float = 0.3   # per-row weight of weak rows vs 1.0 for gold
     neg_filter: bool = True    # s3: drop weak negatives the gold-only model calls robot
     neg_weight: float = NEG_WEIGHT
+    neg_source: str = "tracklet"  # s3 weak negatives: tracklet (Jev not_bumper tracklets) | call
 
 
 def _gold_xy(store, items, task, use_size):
@@ -423,7 +427,9 @@ def train_variant(v: Variant, store: FeatureStore, gold_train: List[dict], weak_
     n_out = 3 if v.task == "s2" else 2
     Xs, ys, ws = [Xg], [yg], [np.ones(len(yg), np.float32)]
     if v.weak:
-        wr = [r for r in weak_train if r["task"] == v.task]
+        neg_src = "jev_call_not_robot" if v.neg_source == "call" else "jev_tracklet_not_bumper"
+        wr = [r for r in weak_train if r["task"] == v.task
+              and (v.task == "s2" or r["y"] == 1 or r["src"] == neg_src)]
         if wr:
             Xw = design_matrix(store, wr, v.use_size)
             yw = np.array([r["y"] for r in wr])
@@ -486,6 +492,9 @@ def s2_eval(use, P, y, t, hand, hand_t_95) -> dict:
                  confusion(y[idx], P[idx].argmax(1)),
              "hand_gate_floor": s2_report(hand[idx], y[idx], LEGIBILITY_FLOOR),
              "hand_gate_keep95": s2_report(hand[idx], y[idx], hand_t_95)}
+        li = idx[y[idx] != 2]
+        r["auc_legible_vs_illegible"] = {"student": auc(gate[li], (y[li] == 0).astype(int)),
+                                         "hand_gate": auc(hand[li], (y[li] == 0).astype(int))}
         return r
     return per_slice(use, fn)
 
@@ -525,6 +534,8 @@ S2_VARIANTS = [
     Variant("s2_lr_weak", "s2", "lr", 1e-3, weak=True, weak_weight=0.3),
     Variant("s2_mlp_weak", "s2", "mlp", 1e-2, weak=True, weak_weight=0.3),
     Variant("s2_mlp_size_weak", "s2", "mlp", 1e-2, use_size=True, weak=True, weak_weight=0.3),
+    Variant("s2_mlp_weak_w1", "s2", "mlp", 1e-2, weak=True, weak_weight=1.0),
+    Variant("s2_mlp_weak_w01", "s2", "mlp", 1e-2, weak=True, weak_weight=0.1),
 ]
 S3_VARIANTS = [
     Variant("s3_lr", "s3", "lr", 1e-3),
@@ -535,6 +546,9 @@ S3_VARIANTS = [
     Variant("s3_mlp_weak", "s3", "mlp", 1e-2, weak=True, weak_weight=0.3),
     Variant("s3_mlp_weak_nofilter", "s3", "mlp", 1e-2, weak=True, weak_weight=0.3, neg_filter=False),
     Variant("s3_mlp_size_weak", "s3", "mlp", 1e-2, use_size=True, weak=True, weak_weight=0.3),
+    Variant("s3_lr_weak_callneg", "s3", "lr", 1e-3, weak=True, weak_weight=0.3, neg_source="call"),
+    Variant("s3_mlp_weak_callneg", "s3", "mlp", 1e-2, weak=True, weak_weight=0.3, neg_source="call"),
+    Variant("s3_mlp_weak_callneg_w1", "s3", "mlp", 1e-2, weak=True, weak_weight=1.0, neg_source="call"),
 ]
 VARIANTS = {v.name: v for v in S2_VARIANTS + S3_VARIANTS}
 S3_RECALL = 0.995
@@ -681,14 +695,25 @@ def cmd_final(a) -> None:
     # ---- S3
     v3 = VARIANTS[a.s3]
     cv3 = cvres["variants"][a.s3]
-    t3 = min(cv3["t_gold_oof"], cv3["t_weak_oof"])
+    t3_q995 = min(cv3["t_gold_oof"], cv3["t_weak_oof"])
+    # Conservative rule (declared before b2 was opened): the lowest out-of-fold score of any
+    # gold-positive over two CV repeats (val recall 100%), since a 99.5% quantile of ~365
+    # positives is decided by a single crop.
+    lows = []
+    for seed in (0, 1):
+        r = run_cv(v3, store, b1, weak, folds_by_match(b1, seed=seed))
+        yy = np.array([it["s3"] for it in r["use"]])
+        lows.append(float(r["P"][yy == 1, 1].min()))
+    t3 = min(lows) * 0.999 if a.s3_rule == "min2" else t3_q995
     h3 = train_variant(v3, store, b1, weak)
     use3 = [it for it in b2 if it["s3"] is not None]
     y3 = np.array([it["s3"] for it in use3])
     P3 = h3.predict_proba(design_matrix(store, use3, v3.use_size))
-    report["s3"] = {"variant": a.s3, "t_from_b1_cv": t3,
+    report["s3"] = {"variant": a.s3, "rule": a.s3_rule, "t_from_b1_cv": t3, "t_q995_b1_cv": t3_q995,
+                    "b1_oof_lowest_positive_by_repeat": lows,
                     "b2_dropped_judge_disagree": sum(it["s3_disagree"] for it in b2),
                     "b2": s3_eval(use3, P3, y3, t3),
+                    "b2_at_t_q995": s3_eval(use3, P3, y3, t3_q995),
                     "b2_dropped_robots": [{"id": it["id"], "path": it["path"], "kind": it["kind"],
                                            "p_robot": float(P3[i, 1])}
                                           for i, it in enumerate(use3) if y3[i] == 1 and P3[i, 1] < t3]}
@@ -703,10 +728,14 @@ def cmd_final(a) -> None:
         print("   ", fmt_s2("student", r["student"]))
         print("   ", fmt_s2("hand gate @ floor 0.005", r["hand_gate_floor"]))
         print("   ", fmt_s2("hand gate @ keep95 t (b1)", r["hand_gate_keep95"]))
-        print("    confusion", r["confusion(rows=gold legible/illegible/not_bumper, cols=pred)"])
+        print("    confusion", r["confusion(rows=gold legible/illegible/not_bumper, cols=pred)"],
+              "AUC(leg|ill)", {k: round(v, 3) for k, v in r["auc_legible_vs_illegible"].items()})
     print(f"== S3 {a.s3} on b2 (t={t3:.4g} from b1 CV)")
     for sl, r in report["s3"]["b2"].items():
         print("   ", fmt_s3(f"[{sl}]", r))
+    print(f"   (alt: t_q995 = {t3_q995:.4g})")
+    for sl, r in report["s3"]["b2_at_t_q995"].items():
+        print("   ", fmt_s3(f"[{sl}] @q995", r))
     for d in report["s3"]["b2_dropped_robots"]:
         print("    dropped robot:", d)
     print("->", MODELS)
@@ -723,6 +752,7 @@ def main() -> None:
     f = sub.add_parser("final")
     f.add_argument("--s2", required=True)
     f.add_argument("--s3", required=True)
+    f.add_argument("--s3-rule", choices=["min2", "q995"], default="min2")
     f.set_defaults(fn=cmd_final)
     a = ap.parse_args()
     a.fn(a)

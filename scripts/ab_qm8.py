@@ -367,6 +367,8 @@ PROFILES = {
     "deinterlace-on": [("deinterlace", {"bumper_deinterlace": True})],
     # Single window-labels arm (event-lineup baseline collection, Nov 10).
     "wl-on": [("wl_08", {"window_labels": True})],
+    # Same, plus the post-finalize HUD render (first knob-on end-to-end runs, Nov 10).
+    "wl-hud": [("wl_08_hud", {"window_labels": True, "hud_post_render": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

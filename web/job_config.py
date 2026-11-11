@@ -750,6 +750,14 @@ KNOBS = [
     # / 21 s misID offline). A value above 1 disables the lineup pass.
     Knob("window_labels_lineup_min_p", "WINDOW_LABELS_LINEUP_MIN_P", float, 0.8,
          min=0.0, max=1.01, section="Identity & votes"),
+    # Deinterlace window-label tiles: a native-resolution tile crop that combs
+    # is ECC-merged from its two fields (web/bumper_register.deinterlace_crop)
+    # before the resize, so the Jev digit reads see whole robots. Progressive
+    # crops are untouched; the stage stats count tiles_deinterlaced. Cached
+    # digit calls are not shared between the two settings. Needs window_labels.
+    # DEFAULT OFF pending the qm8 A/B (ab_qm8 profile "wl-deinterlace").
+    Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, False,
+         section="Identity & votes"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not
     # read at p >= 0.85 twice, from the anchors earlier matches of the event

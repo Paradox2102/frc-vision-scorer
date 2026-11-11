@@ -7106,6 +7106,7 @@ class InferenceJob:
                 view=tuple(view.crop),
                 ground_center_offset_m=float(getattr(cfg, "ground_center_offset_m", 0.0) or 0.0),
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
+                deinterlace=bool(getattr(cfg, "window_labels_deinterlace", False)),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
                 model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,

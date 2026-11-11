@@ -641,3 +641,14 @@ def test_hud_post_render_knob_default_off(monkeypatch):
     monkeypatch.setenv("HUD_POST_RENDER", "1")
     assert JobConfig().hud_post_render is True
     assert next(k for k in KNOBS if k.name == "hud_post_render").section == "Streaming & output"
+
+
+def test_window_labels_deinterlace_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.window_labels_deinterlace is False
+    assert "window_labels_deinterlace" not in cfg.non_defaults()
+    assert JobConfig({"window_labels_deinterlace": "true"}).window_labels_deinterlace is True
+    monkeypatch.setenv("WINDOW_LABELS_DEINTERLACE", "1")
+    assert JobConfig().window_labels_deinterlace is True

@@ -122,6 +122,18 @@ def test_success_rewrites_frames_events_segments_and_reports(monkeypatch):
     assert "window_labels.seconds" in timings and "window_labels.aborted" not in timings
 
 
+def test_the_deinterlace_knob_reaches_the_stage_params(monkeypatch):
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    _apply(job, rec)
+    assert seen["params"].deinterlace is False                # knob absent: off
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    job.config.window_labels_deinterlace = True
+    _apply(job, rec)
+    assert seen["params"].deinterlace is True
+
+
 def test_abort_leaves_the_replay_untouched(monkeypatch):
     res = {"aborted": "request errors: 300 of 2000 in the digit pass", "labels": None,
            "segments": None, "lineup_jpeg": None,

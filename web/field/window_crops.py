@@ -12,6 +12,7 @@ from typing import Iterable, Iterator, Optional
 import cv2
 import numpy as np
 
+from web.bumper_register import deinterlace_crop
 from web.field.calibration import push_from_camera
 
 TILE_PX = 240
@@ -75,19 +76,29 @@ def _ticks(tile: np.ndarray, tx: int, ty: int) -> None:
             cv2.polylines(tile, [tri], True, (0, 0, 0), 1)
 
 
-def wide_tile(view_img: np.ndarray, u: float, v: float, side: int) -> tuple:
+def wide_tile(view_img: np.ndarray, u: float, v: float, side: int,
+              deinterlace: bool = False) -> tuple:
     """Square crop of ``side`` px around (u, v), resized to TILE_PX, with tick
-    marks pointing at the target. Returns (tile, (tx, ty)): the target's
-    position in the tile after clamping the crop to the view."""
+    marks pointing at the target. Returns (tile, (tx, ty), deinterlaced): the
+    target's position in the tile after clamping the crop to the view, and
+    whether the crop was deinterlaced. ``deinterlace`` runs
+    bumper_register.deinterlace_crop on the native-resolution square before
+    the resize (the resize would blur the comb away); it changes only crops
+    that comb."""
     h, w = view_img.shape[:2]
     s = int(max(2, min(side, w, h)))
     x0 = max(0, min(w - s, int(u - s * TARGET_X)))
     y0 = max(0, min(h - s, int(v - s * TARGET_Y)))
-    tile = cv2.resize(view_img[y0:y0 + s, x0:x0 + s], (TILE_PX, TILE_PX),
-                      interpolation=cv2.INTER_CUBIC)
+    square = view_img[y0:y0 + s, x0:x0 + s]
+    fired = False
+    if deinterlace:
+        out = deinterlace_crop(square)
+        fired = out is not square
+        square = out
+    tile = cv2.resize(square, (TILE_PX, TILE_PX), interpolation=cv2.INTER_CUBIC)
     tx, ty = int((u - x0) / s * TILE_PX), int((v - y0) / s * TILE_PX)
     _ticks(tile, tx, ty)
-    return tile, (tx, ty)
+    return tile, (tx, ty), fired
 
 
 def zoom_tile(tile: np.ndarray) -> np.ndarray:

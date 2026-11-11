@@ -53,7 +53,7 @@ def _view(h=723, w=1920):
 
 
 def test_wide_tile_puts_the_target_at_50_62_and_draws_ticks():
-    tile, (tx, ty) = wc.wide_tile(_view(), 960.0, 400.0, 200)
+    tile, (tx, ty), _ = wc.wide_tile(_view(), 960.0, 400.0, 200)
     assert tile.shape == (240, 240, 3)
     assert tx == 120 and ty == int(0.62 * 240)
     assert tuple(tile[1, 120]) == (255, 255, 255)             # top tick
@@ -62,7 +62,7 @@ def test_wide_tile_puts_the_target_at_50_62_and_draws_ticks():
 
 
 def test_wide_tile_clamps_at_the_view_edge_and_reports_the_shifted_target():
-    tile, (tx, ty) = wc.wide_tile(_view(), 20.0, 700.0, 200)
+    tile, (tx, ty), _ = wc.wide_tile(_view(), 20.0, 700.0, 200)
     assert tile.shape == (240, 240, 3)
     assert tx == int(20 / 200 * 240)                          # crop starts at x = 0
     assert ty == int((700 - (723 - 200)) / 200 * 240)         # crop ends at the view bottom
@@ -82,7 +82,7 @@ def _white_ticks(tile, tx, ty):
                                  (1920.0, 400.0)])         # u equal to the view width
 def test_all_four_ticks_are_drawn_when_the_target_is_just_outside_the_view(u, v):
     assert wc.in_view(u, v, (1920, 723))
-    tile, (tx, ty) = wc.wide_tile(_view(), u, v, 200)
+    tile, (tx, ty), _ = wc.wide_tile(_view(), u, v, 200)
     assert tx >= 240 or ty >= 240                             # true target is off the tile
     assert _white_ticks(tile, tx, ty) == {"top": True, "bottom": True,
                                           "left": True, "right": True}
@@ -138,3 +138,57 @@ def test_decode_tile_round_trips_resizes_and_rejects_junk():
     assert back.shape == (240, 240, 3) and abs(int(back[120, 120, 0]) - 90) <= 2
     assert wc.decode_tile(wc.jpeg(np.zeros((100, 120, 3), np.uint8))).shape == (240, 240, 3)
     assert wc.decode_tile(b"not a jpeg") is None and wc.decode_tile(b"") is None
+
+
+# --------------------------------------------------------------------------- #
+# deinterlace (window_labels_deinterlace)
+# --------------------------------------------------------------------------- #
+from web.bumper_register import comb_ratio
+
+
+def _scene(dx=0, h=723, w=1920):
+    """Red bars and white digits on grey; ``dx`` shifts everything right."""
+    img = np.full((h, w, 3), 60, np.uint8)
+    for x0 in range(0, w, 37):
+        cv2.rectangle(img, (x0 + dx, 200), (x0 + dx + 18, 600), (40, 40, 200), -1)
+    cv2.putText(img, "3128 3128 3128", (300 + dx, 450), cv2.FONT_HERSHEY_SIMPLEX, 4,
+                (255, 255, 255), 8, cv2.LINE_AA)
+    return img
+
+
+def _woven(dx=4):
+    """Interlaced view: odd rows from a field captured after a ``dx`` px move."""
+    out = _scene()
+    out[1::2] = _scene(dx)[1::2]
+    return out
+
+
+def test_wide_tile_reports_no_deinterlace_by_default():
+    tile, (tx, ty), fired = wc.wide_tile(_woven(), 600.0, 450.0, 200)
+    assert fired is False
+    same, _, _ = wc.wide_tile(_woven(), 600.0, 450.0, 200, deinterlace=False)
+    assert np.array_equal(tile, same)
+
+
+def test_wide_tile_deinterlaces_a_combed_crop_at_native_resolution(monkeypatch):
+    view = _woven()
+    off, t_off, fired_off = wc.wide_tile(view, 600.0, 450.0, 240)
+    on, t_on, fired_on = wc.wide_tile(view, 600.0, 450.0, 240, deinterlace=True)
+    assert fired_on is True and fired_off is False and t_on == t_off
+    assert on.shape == off.shape == (240, 240, 3) and on.dtype == np.uint8
+    assert not np.array_equal(on, off)
+    assert comb_ratio(on) < 0.9 < comb_ratio(off)          # side 240: the resize is 1:1
+    # the deinterlacer sees the native square, before any resize
+    seen = []
+    real = wc.deinterlace_crop
+    monkeypatch.setattr(wc, "deinterlace_crop", lambda img: seen.append(img.shape) or real(img))
+    wc.wide_tile(view, 600.0, 450.0, 150, deinterlace=True)
+    wc.wide_tile(view, 600.0, 450.0, 420, deinterlace=True)
+    assert seen == [(150, 150, 3), (420, 420, 3)]
+
+
+def test_wide_tile_deinterlace_leaves_a_progressive_crop_identical():
+    view = _scene()
+    off, t_off, _ = wc.wide_tile(view, 600.0, 450.0, 200)
+    on, t_on, fired = wc.wide_tile(view, 600.0, 450.0, 200, deinterlace=True)
+    assert fired is False and t_on == t_off and np.array_equal(on, off)

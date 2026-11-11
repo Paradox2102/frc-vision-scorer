@@ -755,7 +755,10 @@ KNOBS = [
     # before the resize, so the Jev digit reads see whole robots. Progressive
     # crops are untouched; the stage stats count tiles_deinterlaced. Cached
     # digit calls are not shared between the two settings. Needs window_labels.
-    # DEFAULT OFF pending the qm8 A/B (ab_qm8 profile "wl-deinterlace").
+    # Offline qm8 (relabel_replay a0bbc991, lineup 0.8, 2 runs per arm, Nov 10):
+    # 701/964 tiles comb; digit-named windows 93-94 -> 111-114, full right
+    # 46-47% -> 51-52%, wrong 1-2% -> 2%, misID 10-13 s -> 12-14 s, same cost.
+    # DEFAULT OFF pending a live A/B (ab_qm8 profile "wl-deinterlace").
     Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, False,
          section="Identity & votes"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):

@@ -43,7 +43,10 @@ def _version(cal, vid="v1", start_match=None):
 # ----------------------------------------------------------------- full solve
 
 def test_full_solve_ready_with_metrics_and_overlay(tmp_path):
-    cam = truth_pinhole_camera()
+    # The shared fixture lens (k1 -0.25, k2 -0.08 at f 1200) folds back inside its own
+    # image (r_d peaks at 0.67, edge tags project to 0.72) — physically impossible,
+    # and the full solve now refuses non-monotonic lenses. Use a realistic lens here.
+    cam = truth_pinhole_camera(D=np.array([-0.12, 0.02, 0.0, 0.0, 0.0]))
     video = _video(tmp_path)
     res = ac.run_camera(video, "evt_qm1", "main", CROP, FM, versions=[],
                         detect_fn=_detector(cam))
@@ -431,3 +434,26 @@ def test_judge_p_single_counts_pair_but_pair_does_not_count_single():
     assert tl.judge_p(probs, "single_apriltag") == pytest.approx(0.75)
     assert tl.judge_p(probs, "pair_of_apriltags") == pytest.approx(0.5)
     assert tl.judge_p({"single_apriltag": 0.9, "pair_of_apriltags": 0.9}, "single_apriltag") == 1.0
+
+
+def test_full_solve_from_one_hub_corner_is_never_ready(tmp_path):
+    """2026casnd corner_left: 4 tags on two faces of ONE hub corner (~0.9 m apart)
+    fit a free lens perfectly but extrapolate wildly. Too little field spread to
+    determine a lens -> failed with a 'span' reason (candidate kept for inspection)."""
+    cam = truth_pinhole_camera(D=np.array([-0.12, 0.02, 0.0, 0.0, 0.0]))
+    hub = {5, 8, 9, 10}
+    assert hub <= set(project_tag_corners(cam, FM))
+    assert ac.tag_spread_m(FM, hub) < 1.0
+    res = ac.run_camera(_video(tmp_path), "evt_qm1", "corner_right", CROP, FM, versions=[],
+                        detect_fn=_detector(cam, only=hub))
+    rec = res.record
+    assert rec["status"] == "failed" and rec["method"] == "full_solve"
+    assert "only span" in rec["reason"] and "far tags" in rec["reason"]
+    assert res.overlay is not None
+
+
+def test_tag_spread_m():
+    assert ac.tag_spread_m(FM, []) == 0.0
+    assert ac.tag_spread_m(FM, [5]) == 0.0
+    assert ac.tag_spread_m(FM, [5, 8, 9, 10]) < 1.0
+    assert ac.tag_spread_m(FM, [5, 25]) > 5.0

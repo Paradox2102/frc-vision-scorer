@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1 roster-constrained bumper digit reader (design §5, §12).
 
-Model: PARSeq-base (Apache-2.0, vendored in parseq.py) fine-tuned from the official pretrained
+Model: PARSeq-base (Apache-2.0, vendored in web/students/parseq.py) fine-tuned from the official pretrained
 scene-text weights with a digits-only vocabulary. Input = the harvester's bumper crop (box + 25%
 padding per side, BGR), stretched to 32x128 like upstream PARSeq.
 
@@ -388,7 +388,7 @@ def tune_rule(ev: dict, colour_eps: Optional[float], max_wrong: float = MAX_WRON
 
 # ----------------------------------------------------------------------------- model io
 def build_model(cfg: dict):
-    from scripts.teacher.students.parseq import PARSeq
+    from web.students.parseq import PARSeq
     return PARSeq(**cfg)
 
 
@@ -541,7 +541,7 @@ def val_report(model, dev, colour_eps: float, seen: set, cache: dict) -> tuple:
 # ----------------------------------------------------------------------------- training
 def cmd_train(a) -> None:
     import torch
-    from scripts.teacher.students.parseq import BASE_CFG, PARSeq, plm_loss
+    from web.students.parseq import BASE_CFG, PARSeq, plm_loss
     _, _, MODELS = _paths()
     torch.manual_seed(a.seed)
     dev = a.device

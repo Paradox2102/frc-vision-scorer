@@ -5,7 +5,7 @@ import torch
 
 from scripts.teacher.students import digits as D
 from scripts.teacher.students import synth
-from scripts.teacher.students.parseq import PARSeq, DigitTokenizer, plm_loss
+from web.students.parseq import PARSeq, DigitTokenizer, plm_loss
 
 TINY = dict(max_label_length=6, embed_dim=48, enc_num_heads=2, enc_mlp_ratio=2, enc_depth=1,
             dec_num_heads=2, dec_mlp_ratio=2, dec_depth=1, dropout=0.0)

@@ -495,7 +495,17 @@ class Params:
     rows_alliance_only: bool = False           # ablation: one card per alliance
     digit_calls: Optional[dict] = None         # digit-call cache, reused per window fingerprint
     deinterlace: bool = False                  # deinterlace combed tiles (window_crops.wide_tile)
+    # Digit reader (window_labels_reader knob; teacher-distillation spec section 14):
+    # "jev" = every digit request goes to Jev (today's stage, unchanged);
+    # "student" = S1 reads every sample first, Jev only for windows S1 leaves
+    # undecided; "student_only" = no Jev in the digit pass. The lineup pass is
+    # Jev in every mode.
+    reader: str = "jev"
     cancelled: bool = False                    # a user stop: aborts at the next check, never partial
+
+
+READERS = ("jev", "student", "student_only")
+STUDENT_DETECT_BATCH = 16          # main-view frames per bumper-detector call
 
 
 class StageAbort(Exception):
@@ -517,8 +527,30 @@ def _stats(event_lineup: bool = False, deinterlace: bool = False) -> dict:
     return out
 
 
+def _student_stats(reader: str) -> dict:
+    return {"reader": reader, "fallback": None, "model": None, "samples": 0, "bumper_found": 0,
+            "crops": 0, "named_samples": 0, "conflict_samples": 0, "windows_s1": 0,
+            "windows_jev": 0, "jev_digit_calls": 0, "detect_s": 0.0, "read_s": 0.0}
+
+
+def _open_student(student) -> tuple:
+    """(reader or None, owned, why): ``student`` is a ready reader (tests,
+    a caller that keeps one), a zero-argument factory, or None for
+    window_student.StudentReader(). A reader this function built is owned:
+    the stage closes it."""
+    try:
+        if student is None:
+            from web.field.window_student import StudentReader
+            return StudentReader(), True, None
+        if callable(student) and not hasattr(student, "read"):
+            return student(), True, None
+        return student, False, None
+    except Exception as e:
+        return None, False, f"{type(e).__name__}: {e}"
+
+
 def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
-                      frame_source=None, clock=time.monotonic) -> dict:
+                      frame_source=None, clock=time.monotonic, student=None) -> dict:
     """Run the whole stage. Blocking; reads ``frames`` but never changes them.
 
     ``session``: a ``JevSession`` (anything with ``ask``, ``available``,
@@ -533,17 +565,42 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     store (event_lineup only), "digit_calls": the digit-pass cache
     {"calls", "wide_p", "fingerprints"} (None on abort), "row_sources": team
     -> {"own", "borrowed", "elim", "from"} (event_lineup only)}. On abort,
-    labels and segments are None and nothing should be applied or stored."""
+    labels and segments are None and nothing should be applied or stored.
+
+    ``params.reader`` "student" / "student_only": ``student`` is the S1
+    reader (see _open_student; default: loaded here on the GPU and released
+    before returning). When it cannot be loaded the stage runs as "jev" and
+    stats["student"]["fallback"] says why."""
     stats = _stats(params.event_lineup, params.deinterlace)
     before = _usage(session)
+    reader, stu, owned = "jev", None, False
+    if params.reader != "jev":
+        stats["student"] = _student_stats(params.reader)
+        if params.reader not in READERS:
+            why = f"unknown reader {params.reader!r}"
+        else:
+            stu, owned, why = _open_student(student)
+        if stu is None:
+            print(f"[window-labels] student reader unavailable, Jev reads every window: {why}")
+            stats["student"]["fallback"] = why
+        else:
+            reader = params.reader
+            stats["student"]["model"] = getattr(stu, "model_key", None)
     try:
-        out = _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats)
+        out = _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats,
+                         reader, stu)
     except StageAbort as e:
         stats["aborted"] = str(e)
         out = None
     except Exception as e:                       # never let the stage break a job
         stats["aborted"] = f"error: {type(e).__name__}: {e}"
         out = None
+    finally:
+        if owned:
+            try:
+                stu.close()
+            except Exception:
+                pass
     after = _usage(session)
     # HTTP attempts (retries included), not payloads
     stats["requests"] = after[0] - before[0]
@@ -665,14 +722,17 @@ def _wide_p(requests: dict, calls: dict) -> dict:
     return out
 
 
-def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats) -> dict:
+def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats,
+                reader: str = "jev", sent: Optional[list] = None) -> dict:
     """Digit calls for every window with tiles. A window's calls come from
     ``params.digit_calls`` when its fingerprint matches and the call count
     fits (cached failures stay failures); every other window is requested.
     Returns the cache for exactly the calls used: {"calls": wid -> [probs or
     None] in request order, "wide_p": wid -> {k: probs}, "fingerprints", plus
     the "roster" and "model_key" it was made for; a cache made for another
-    roster or model, or one that fails to load, is ignored whole."""
+    roster or model, or one that fails to load, is ignored whole. So is a
+    cache made by another ``reader`` mode (a cache without a "reader" key is
+    a "jev" cache). ``sent`` (a list) gets the number of requests sent."""
     requests = _requests(windows, tiles)
     by_wid = {w.wid: w for w in windows}
     fingerprints = {wid: window_fingerprint(frames, by_wid[wid], reqs, params.deinterlace)
@@ -681,7 +741,8 @@ def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stat
     cache = None
     try:                    # a cache from another roster / model, or a broken one, is no cache
         if (params.digit_calls and params.digit_calls.get("roster") == roster
-                and params.digit_calls.get("model_key") == params.model_key):
+                and params.digit_calls.get("model_key") == params.model_key
+                and params.digit_calls.get("reader", "jev") == reader):
             cache = load_digit_calls(params.digit_calls)
     except Exception:
         cache = None
@@ -694,6 +755,8 @@ def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stat
             calls[wid] = list(old)
         else:
             specs += [(wid, kind, k) for kind, k in reqs]
+    if sent is not None:
+        sent.append(len(specs))
     answers = _ask_batched(session, specs, digit_item, "team", params, clock, stats,
                            "in the digit pass")
     for (wid, _kind, _k), probs in zip(specs, answers):
@@ -757,7 +820,125 @@ def _anchors_out(frames, windows, by_wid, digit, own, calls, wide_p, tiles, colo
     return out
 
 
-def _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats) -> dict:
+class _StudentPass:
+    """S1 inputs cut while the video pass runs: frames are buffered, the
+    bumper detector runs per STUDENT_DETECT_BATCH frames (on one field when
+    deinterlacing, like the harvester on woven video), and the padded crops
+    of the bumpers near each sample's target are kept."""
+
+    def __init__(self, stu, deinterlace: bool, st: dict):
+        self.stu, self.deinterlace, self.st = stu, deinterlace, st
+        self.pending: list = []                # (main-view image, [(wid, k, u, v, side)])
+        self.crops: list = []
+        self.colours: list = []
+        self.by_sample: dict = {}              # (wid, k) -> crop indices, nearest first
+
+    def add(self, img, items) -> None:
+        if items:
+            self.pending.append((img, list(items)))
+        if len(self.pending) >= STUDENT_DETECT_BATCH:
+            self.flush()
+
+    def flush(self) -> None:
+        from web.field import window_student as ws
+        if not self.pending:
+            return
+        t0 = time.perf_counter()
+        imgs = [ws.field_frame(img) if self.deinterlace else img for img, _ in self.pending]
+        dets = self.stu.detect(imgs)
+        if len(dets) != len(imgs):
+            raise StageAbort(f"bumper detector returned {len(dets)} results for {len(imgs)} frames")
+        for (img, items), d in zip(self.pending, dets):
+            h, w = img.shape[:2]
+            for wid, k, u, v, side in items:
+                self.st["samples"] += 1
+                near = ws.near_bumpers(d, u, v, side)
+                if near:
+                    self.st["bumper_found"] += 1
+                for _dist, box, _conf, colour in near:
+                    x0, y0, x1, y1 = ws.pad_box(box, ws.PAD_BUMPER, w, h)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    crop = img[y0:y1, x0:x1].copy()
+                    if self.deinterlace:
+                        from web.bumper_register import deinterlace_crop
+                        crop = deinterlace_crop(crop)
+                    self.by_sample.setdefault((wid, k), []).append(len(self.crops))
+                    self.crops.append(crop)
+                    self.colours.append(colour)
+        self.pending = []
+        self.st["detect_s"] = round(self.st["detect_s"] + time.perf_counter() - t0, 3)
+
+    def calls(self, tiles: dict, red: list, blue: list) -> dict:
+        """wid -> one call per tile (sample number order): S1's read of
+        the sample's bumpers (window_student.sample_call), None where no
+        bumper was found."""
+        from web.field import window_student as ws
+        self.flush()
+        t0 = time.perf_counter()
+        roster = red + blue
+        reads = self.stu.read(self.crops, [{"red": red, "blue": blue}] * len(self.crops),
+                              self.colours) if self.crops else []
+        if len(reads) != len(self.crops):
+            raise StageAbort(f"S1 returned {len(reads)} reads for {len(self.crops)} crops")
+        self.st["crops"] = len(self.crops)
+        self.st["read_s"] = round(time.perf_counter() - t0, 3)
+        out = {}
+        for wid in tiles:
+            row = []
+            for k in sorted(tiles[wid]):
+                mine = [reads[j] for j in self.by_sample.get((wid, k), ())]
+                call = ws.sample_call(mine, roster)
+                if call is not None and call != ws.ABSTAIN:
+                    self.st["named_samples"] += 1
+                elif any(r.get("team") is not None for r in mine):
+                    self.st["conflict_samples"] += 1
+                row.append(call)
+            out[wid] = row
+        return out
+
+
+def _student_digit_calls(frames, windows, tiles, params, session, digit_item, clock, stats,
+                         reader: str, s1: dict) -> dict:
+    """The digit pass for reader "student" / "student_only": S1's calls
+    name a window when digit_decision accepts them; "student" sends Jev the
+    usual requests for every other window. Same cache shape as _digit_pass
+    plus "reader", "s1_model", "sources" (wid -> "s1" | "jev") and
+    "s1_calls" (every window's S1 calls). Fingerprints cover the Jev windows
+    only, so S1 calls are never reused as Jev calls."""
+    st = stats["student"]
+    roster = [str(t) for t in params.red] + [str(t) for t in params.blue]
+    decided = {wid for wid, c in s1.items() if digit_decision(c, roster)}
+    jdc, sent = {"calls": {}, "fingerprints": {}}, []
+    if reader == "student":
+        rest = [w for w in windows if w.wid not in decided and tiles.get(w.wid)]
+        jdc = _digit_pass(frames, rest, tiles, params, session, digit_item, clock, stats,
+                          reader, sent)
+    calls, sources, wide_p = {}, {}, {}
+    for w in windows:
+        if not tiles.get(w.wid):
+            continue
+        if w.wid in jdc["calls"]:
+            calls[w.wid], sources[w.wid] = jdc["calls"][w.wid], "jev"
+        else:
+            calls[w.wid], sources[w.wid] = list(s1[w.wid]), "s1"
+            if w.wid in decided:     # only named windows get "wide" calls (lineup tiles)
+                per_k = {k: c for k, c in zip(sorted(tiles[w.wid]), s1[w.wid])
+                         if c and any(c.get(t, 0.0) > 0.0 for t in roster)}
+                if per_k:
+                    wide_p[w.wid] = per_k
+    wide_p.update(jdc.get("wide_p") or {})
+    st["windows_s1"] = sum(1 for wid in decided if sources.get(wid) == "s1")
+    st["windows_jev"] = sum(1 for s in sources.values() if s == "jev")
+    st["jev_digit_calls"] = sum(sent)
+    return {"calls": calls, "wide_p": wide_p, "fingerprints": jdc["fingerprints"],
+            "roster": roster, "model_key": params.model_key, "reader": reader,
+            "s1_model": st.get("model"), "sources": sources,
+            "s1_calls": {wid: s1[wid] for wid in calls}}
+
+
+def _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats,
+               reader: str = "jev", stu=None) -> dict:
     from web import jev_reader
     from web.field import window_crops as crops
 
@@ -789,6 +970,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
 
     # 2. one sequential video pass; keep only the tiles
     tiles: dict = {}                                 # wid -> {k: tile}
+    spass = _StudentPass(stu, params.deinterlace, stats["student"]) if reader != "jev" else None
     source = (frame_source or crops.iter_view_frames)(video_path, list(want), params.view)
     try:
         for n, (frame_num, img) in enumerate(source, 1):
@@ -798,6 +980,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
                 stats["tiles"] += 1
                 if fired:
                     stats["tiles_deinterlaced"] += 1
+            if spass is not None:
+                spass.add(img, want.get(frame_num, ()))
             if n % 50 == 0:
                 _check(params, clock, "during the video pass")
     finally:
@@ -816,7 +1000,13 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
         return jev_reader.build_jev_window_payload(params.model_key, crops.jpeg(img), kind,
                                                    red, blue)
 
-    dc = _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats)
+    if reader == "jev":
+        dc = _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stats)
+    else:
+        s1 = spass.calls(tiles, red, blue)
+        _check(params, clock, "after the student pass")
+        dc = _student_digit_calls(frames, windows, tiles, params, session, digit_item, clock,
+                                  stats, reader, s1)
     calls, wide_p = dc["calls"], dc["wide_p"]
     digit = {}
     for wid, c in calls.items():

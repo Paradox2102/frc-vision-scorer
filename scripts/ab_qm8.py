@@ -41,6 +41,7 @@ _QWEN35_R = {"team_reader": "vllm", "read_census": True, "read_keep_evicted": Tr
 _SPEED_R = {"team_reader": "jev", "read_census": True, "read_keep_evicted": True}
 _SPEED_B2 = {**_SPEED_R, "sam2_track_fps": 5, "corner_track_stride": 3,
              "selective_mask_prop": True, "selective_app_weight": 0.3}
+_S4_AB = {"team_reader": "jev", "window_labels": True, "vllm_phase_exclusive": False}
 PROFILES = {
     "full": [
         ("baseline", {}),
@@ -647,6 +648,19 @@ PROFILES = {
                          "stream_analysis": True, "sam3_multiplex": True,
                          "sam3_chunk_frames": 100}),
     ],
+    # Nov 11: S4 same-robot embedder (teacher distillation §16) vs the
+    # default DINOv3 embedder, everything else at the live defaults
+    # (window_labels ON with the local S1 reader). window_labels is set
+    # explicitly so the harness waits for the finalize stage;
+    # vllm_phase_exclusive off so a second-server run never stops :8006
+    # (the jev reader needs no vLLM). Run with --full-match; score vs hand GT
+    # with scripts/relabel_replay.score_numbers.
+    "s4-embedder": [
+        ("emb-dinov3", {**_S4_AB, "robot_embedder": "dinov3"}),
+        ("emb-s4", {**_S4_AB, "robot_embedder": "s4"}),
+    ],
+    "s4-embedder-dinov3": [("emb-dinov3", {**_S4_AB, "robot_embedder": "dinov3"})],
+    "s4-embedder-s4": [("emb-s4", {**_S4_AB, "robot_embedder": "s4"})],
 }
 CONFIGS = PROFILES["full"]
 

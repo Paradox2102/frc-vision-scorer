@@ -902,6 +902,7 @@ if __name__ == "__main__":
     ap.add_argument("--match", type=int, default=MATCH)
     ap.add_argument("--video", default=str(VIDEO))
     ap.add_argument("--results", default=str(RESULTS))
+    ap.add_argument("--host", default=HOST, help="app server host:port (default localhost:8004)")
     ap.add_argument("--profile", choices=list(PROFILES), default="full")
     ap.add_argument("--full-match", action="store_true",
                     help="process whole matches (auto_period_only=False) unless an arm overrides it")
@@ -909,5 +910,8 @@ if __name__ == "__main__":
                     help="restart the app server between arms (VRAM hygiene for full-match sweeps)")
     a = ap.parse_args()
     MATCH_KEY, MATCH, VIDEO, RESULTS = a.match_key, a.match, Path(a.video), Path(a.results)
+    HOST = a.host
+    if a.restart_between and HOST != "localhost:8004":
+        sys.exit("--restart-between restarts the :8004 server via web/*_all.sh; not allowed with --host")
     CONFIGS = PROFILES[a.profile]
     main(a)

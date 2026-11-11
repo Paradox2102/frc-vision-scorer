@@ -2,9 +2,13 @@
 import pytest
 
 from scripts.teacher import events
+import numpy as np
+
 from scripts.teacher.harvest import (
-    MANIFEST_KEYS, Det, interlaced_from_idet, parse_idet, Tracklet, build_tracklets, bumper_in_robot, link_bumpers_to_robots,
-    manifest_row, pad_box, parse_matches, parse_roster, robot_links, select_crops, spread_pick,
+    MANIFEST_KEYS, Det, TrackParams, interlaced_from_idet, parse_idet, Tracklet, build_tracklets,
+    bumper_in_robot, bytetrack, field_frame, link_bumpers_to_robots, manifest_row, pad_box,
+    parse_matches, parse_roster, robot_links, select_crops, select_crops_v2, spread_pick,
+    suppress_duplicates, tracklet_stats,
 )
 
 
@@ -50,8 +54,10 @@ def test_tracklets_respect_class_and_max_length():
     mixed = build_tracklets([det(0, box, "red_bumper"), det(1, box, "blue_bumper")], "bumper", "b")
     assert len(mixed) == 2
     # 2 fps, 3 s max -> samples 0..6 fit in one tracklet, sample 7 starts another
-    long = build_tracklets([det(s, box) for s in range(10)], "bumper", "b")
+    long = build_tracklets([det(s, box) for s in range(10)], "bumper", "b", max_len_s=3.0)
     assert [len(t.dets) for t in long] == [7, 3]
+    # v2 default: no length cap
+    assert [len(t.dets) for t in build_tracklets([det(s, box) for s in range(10)], "bumper", "b")] == [10]
 
 
 def test_tracklets_greedy_highest_iou_first():
@@ -176,3 +182,125 @@ def test_idet_parsing_and_decision():
     assert interlaced_from_idet(c)
     assert not interlaced_from_idet(parse_idet(IDET_UND))
     assert not interlaced_from_idet(parse_idet("no idet output"))
+
+
+# ---- v2: duplicate suppression + ByteTrack-style association -----------------------
+
+def seq_of(dets, n=None):
+    """Dets -> [(sample, [dets])] covering every sample 0..max (empty ones too)."""
+    n = n if n is not None else max(d.sample for d in dets) + 1
+    by = {s: [] for s in range(n)}
+    for d in dets:
+        by[d.sample].append(d)
+    return sorted(by.items())
+
+
+def test_suppress_duplicates_same_class_iou_and_nested():
+    big = det(0, (100, 100, 200, 140), conf=0.9)
+    dup = det(0, (102, 101, 201, 141), conf=0.6)          # IoU ~0.95 -> dropped
+    nested = det(0, (110, 105, 150, 135), conf=0.7)       # fully inside big -> dropped
+    other_cls = det(0, (101, 100, 200, 140), "blue_bumper", conf=0.5)  # other class kept
+    apart = det(0, (300, 100, 400, 140), conf=0.5)
+    kept = suppress_duplicates([dup, nested, big, other_cls, apart])
+    assert big in kept and other_cls in kept and apart in kept
+    assert dup not in kept and nested not in kept
+    assert nested in suppress_duplicates([big, nested], nested_ioa=None)
+
+
+def test_bytetrack_follows_mover_through_gap_and_low_conf():
+    dets = []
+    for s in range(20):
+        x = 100 + 8 * s
+        if s in (6, 7, 8):          # 3-sample dropout (buffer 12 bridges it)
+            continue
+        conf = 0.2 if s == 12 else 0.9   # one low-conf fire: 2nd stage keeps it
+        dets.append(det(s, (x, 100, x + 60, 130), conf=conf))
+    trs = bytetrack(seq_of(dets), "bumper", "b", TrackParams(high=0.4, buffer=12))
+    assert len(trs) == 1 and len(trs[0].dets) == 17
+    assert trs[0].tid == "b0"
+
+
+def test_bytetrack_fast_small_box_centre_fallback():
+    # 40x20 box moving 28 px/sample: IoU 0.18 frame to frame (< 0.2: IoU-only splits
+    # before a velocity exists); centre fallback bridges, then prediction carries it.
+    dets = [det(s, (100 + 28 * s, 100, 140 + 28 * s, 120)) for s in range(8)]
+    one = bytetrack(seq_of(dets), "bumper", "b", TrackParams(high=0.4))
+    assert len(one) == 1
+    split = bytetrack(seq_of(dets), "bumper", "b", TrackParams(high=0.4, centre_fallback=0))
+    assert len(split) > 1
+
+
+def test_bytetrack_lost_buffer_and_new_track_threshold():
+    box = (100, 100, 160, 130)
+    # gap of 14 samples > buffer 12 -> two tracklets
+    trs = bytetrack(seq_of([det(0, box), det(1, box), det(16, box)]), "bumper", "b",
+                    TrackParams(high=0.4, buffer=12))
+    assert [len(t.dets) for t in trs] == [2, 1]
+    # a 0.45 fire can extend a track but not start one when new=0.5
+    trs = bytetrack(seq_of([det(0, box, conf=0.45), det(1, box, conf=0.9)]), "bumper", "b",
+                    TrackParams(high=0.4, new=0.5))
+    assert [len(t.dets) for t in trs] == [1] and trs[0].dets[0].sample == 1
+
+
+def test_bytetrack_two_crossing_tracks_keep_identity_and_class():
+    red = [det(s, (100 + 20 * s, 100, 160 + 20 * s, 130), "red_bumper") for s in range(10)]
+    blue = [det(s, (400 - 20 * s, 104, 460 - 20 * s, 134), "blue_bumper") for s in range(10)]
+    trs = bytetrack(seq_of(red + blue), "bumper", "b", TrackParams(high=0.4))
+    assert len(trs) == 2
+    for t in trs:
+        assert len({d.cls for d in t.dets}) == 1 and len(t.dets) == 10
+
+
+def test_bytetrack_one_shot_fire_does_not_linger():
+    box = (100, 100, 160, 130)
+    # single fire at sample 0, a real track appears at the same spot at sample 5:
+    # the one-shot track was closed after missing sample 1-2, so the new one is separate
+    trs = bytetrack(seq_of([det(0, box)] + [det(s, box) for s in range(5, 9)]), "bumper", "b")
+    assert [len(t.dets) for t in trs] == [1, 4]
+
+
+def test_tracklet_stats():
+    trs = [Tracklet("b0", "bumper", [det(s, (0, 0, 40, 20)) for s in range(6)]),
+           Tracklet("b1", "bumper", [det(0, (0, 0, 40, 20))])]
+    st = tracklet_stats(trs)
+    assert st["tracklets"] == 2 and st["median_dets"] == 3.5 and st["singleton_frac"] == 0.5
+    assert st["ge5_frac"] == 0.5 and st["dets_in_ge5_frac"] == round(6 / 7, 3)
+    assert tracklet_stats([]) == {"tracklets": 0}
+
+
+# ---- v2 crop selection --------------------------------------------------------------
+
+def test_select_crops_v2_time_spacing_and_static_skip():
+    fps = 12.0
+    # static box for 3 s: only the first crop survives (near-duplicates skipped)
+    static = Tracklet("b0", "bumper", [det(s, (100, 100, 160, 130), fps=fps) for s in range(36)])
+    assert len(select_crops_v2(static)) == 1
+    # mover (12 px/sample = 20% of width per sample): one crop per >= 0.5 s
+    mover = Tracklet("b1", "bumper", [det(s, (100 + 12 * s, 100, 160 + 12 * s, 130), fps=fps)
+                                      for s in range(30)])
+    picks = select_crops_v2(mover, k=100)
+    assert all(b.t - a.t >= 0.5 - 1e-9 for a, b in zip(picks, picks[1:]))
+    assert len(picks) == 5          # t = 0, .5, 1, 1.5, 2
+    # growing box (size change > 10%) counts as new view even without moving
+    grow = Tracklet("b2", "bumper", [det(s, (100, 100, 160 + 4 * s, 130 + 2 * s), fps=fps)
+                                     for s in range(30)])
+    assert len(select_crops_v2(grow, k=100)) == 5
+
+
+def test_select_crops_v2_caps_spreads_and_filters():
+    fps = 12.0
+    dets = [det(s, (100 + 12 * s, 100, 160 + 12 * s, 130), fps=fps) for s in range(120)]  # 10 s
+    dets[0] = det(0, (100, 100, 160, 115), fps=fps)          # short side 15 -> skipped
+    dets[6] = det(6, (172, 100, 232, 130), conf=0.3, fps=fps)  # below min_conf -> skipped
+    picks = select_crops_v2(Tracklet("b0", "bumper", dets), k=6, min_conf=0.4)
+    assert len(picks) == 6
+    assert picks[0].sample == 1 and picks[-1].t >= 9.0
+    assert [p.t for p in picks] == sorted(p.t for p in picks)
+    assert all(p.conf >= 0.4 and min(p.box[2] - p.box[0], p.box[3] - p.box[1]) >= 20 for p in picks)
+
+
+def test_field_frame_keeps_shape_and_drops_comb():
+    f = np.zeros((8, 4, 3), np.uint8)
+    f[1::2] = 255                    # pure comb: odd rows white
+    out = field_frame(f)
+    assert out.shape == f.shape and out.max() == 0

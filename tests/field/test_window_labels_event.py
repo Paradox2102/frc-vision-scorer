@@ -573,3 +573,68 @@ def test_a_cache_that_fails_to_load_is_no_cache_not_a_stage_error():
     res = _run(frames, s, digit_calls=cache)
     assert res["aborted"] is None and s.asked == [("team", 9)]
     assert res["labels"][(0, "B1")][0] == "3128"
+
+
+# --------------------------------------------------------------------------- #
+# deinterlace (window_labels_deinterlace)
+# --------------------------------------------------------------------------- #
+from tests.field.test_window_crops import _woven
+from tests.field.test_window_labels import _Cal, _params
+
+
+def _combed_source(video_path, frame_nums, view):
+    img = _woven()[:view[3], :view[2]]
+    for n in sorted({int(x) for x in frame_nums}):
+        yield n, img.copy()
+
+
+class Recording(FakeSession):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.payloads = []
+
+    def ask(self, items, question):
+        self.payloads += [json.dumps(p, sort_keys=True) for p, _sizes in items]
+        return super().ask(items, question)
+
+
+def _run_src(frames, session, source, **kw):
+    return wl.run_window_labels(frames, "video.mp4", _Cal(), session, _params(**kw),
+                                frame_source=source)
+
+
+def test_deinterlace_off_adds_no_stat_and_no_fingerprint_key():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    res = _run_src(frames, FakeSession(team_p={"3128": 0.9}), _combed_source)
+    assert "tiles_deinterlaced" not in res["stats"]
+    assert "deinterlace" not in res["digit_calls"]["fingerprints"][0]
+    assert wl.Params(fps=FPS, red=[], blue=[]).deinterlace is False
+
+
+def test_deinterlace_on_counts_combed_tiles_and_changes_what_is_sent():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    off_s, on_s = Recording(team_p={"3128": 0.9}), Recording(team_p={"3128": 0.9})
+    off = _run_src(frames, off_s, _combed_source)
+    on = _run_src(frames, on_s, _combed_source, deinterlace=True)
+    assert on["aborted"] is None and on["stats"]["tiles"] == off["stats"]["tiles"] == 4
+    assert on["stats"]["tiles_deinterlaced"] == 4
+    assert on["digit_calls"]["fingerprints"][0]["deinterlace"] is True
+    assert len(on_s.payloads) == len(off_s.payloads) == 9
+    assert all(a != b for a, b in zip(on_s.payloads, off_s.payloads))
+    # a progressive video: the knob changes nothing but the stat and the fingerprint
+    prog_off, prog_on = Recording(team_p={"3128": 0.9}), Recording(team_p={"3128": 0.9})
+    _run(frames, prog_off)
+    res = _run(frames, prog_on, deinterlace=True)
+    assert res["stats"]["tiles_deinterlaced"] == 0 and prog_on.payloads == prog_off.payloads
+
+
+def test_digit_calls_cached_with_deinterlace_off_are_not_reused_when_on_and_vice_versa():
+    frames = _frames({"B1": _still(range(20))}, 20)
+    for made_on in (False, True):
+        first = _run(frames, FakeSession(team_p={"3128": 0.9}), deinterlace=made_on)
+        cache = json.loads(json.dumps(first["digit_calls"]))
+        s = FakeSession(team_p={"3128": 0.9})
+        _run(frames, s, deinterlace=not made_on, digit_calls=cache)
+        assert s.asked == [("team", 9)], made_on
+        again = _run(frames, NoDigits(), deinterlace=made_on, digit_calls=cache)
+        assert again["labels"][(0, "B1")][0] == "3128"

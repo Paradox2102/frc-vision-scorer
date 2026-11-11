@@ -494,6 +494,7 @@ class Params:
     use_elimination: bool = True               # ablation: elimination anchors
     rows_alliance_only: bool = False           # ablation: one card per alliance
     digit_calls: Optional[dict] = None         # digit-call cache, reused per window fingerprint
+    deinterlace: bool = False                  # deinterlace combed tiles (window_crops.wide_tile)
     cancelled: bool = False                    # a user stop: aborts at the next check, never partial
 
 
@@ -505,12 +506,14 @@ class DeadlinePassed(StageAbort):
     """The stage's time budget ran out (a stop is a plain StageAbort)."""
 
 
-def _stats(event_lineup: bool = False) -> dict:
+def _stats(event_lineup: bool = False, deinterlace: bool = False) -> dict:
     out = {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
            "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
            "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
     if event_lineup:
         out.update(rows_own=0, rows_borrowed=0, rows_elim=0)
+    if deinterlace:                    # knob off: the stats stay exactly as they were
+        out["tiles_deinterlaced"] = 0
     return out
 
 
@@ -531,7 +534,7 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     {"calls", "wide_p", "fingerprints"} (None on abort), "row_sources": team
     -> {"own", "borrowed", "elim", "from"} (event_lineup only)}. On abort,
     labels and segments are None and nothing should be applied or stored."""
-    stats = _stats(params.event_lineup)
+    stats = _stats(params.event_lineup, params.deinterlace)
     before = _usage(session)
     try:
         out = _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats)
@@ -618,15 +621,21 @@ def _ask_batched(session, specs: list, build, question: str, params: Params, clo
     return results
 
 
-def window_fingerprint(frames: list, w: Window, requests: list) -> dict:
+def window_fingerprint(frames: list, w: Window, requests: list,
+                       deinterlace: bool = False) -> dict:
     """What a cached digit-call list must match to be reused (spec section 5):
     the slot, the window's first source frame, its sample frames and the
     (kind, k) requests the stage would send now. Window ids are positional
     and the in-view filter depends on calibration and offset, so a mismatch
-    means the cached calls belong to a different window."""
-    return {"slot": w.slot, "first_frame": int(frames[w.idx[0]]["frame_num"]),
-            "samples": [int(frames[i]["frame_num"]) for i in w.samples],
-            "requests": [[kind, int(k)] for kind, k in requests]}
+    means the cached calls belong to a different window. ``deinterlace``
+    adds a key (only when on, so knob-off caches stay valid): calls made on
+    combed tiles are not reused for deinterlaced ones, nor the reverse."""
+    fp = {"slot": w.slot, "first_frame": int(frames[w.idx[0]]["frame_num"]),
+          "samples": [int(frames[i]["frame_num"]) for i in w.samples],
+          "requests": [[kind, int(k)] for kind, k in requests]}
+    if deinterlace:
+        fp["deinterlace"] = True
+    return fp
 
 
 def load_digit_calls(obj) -> dict:
@@ -666,7 +675,7 @@ def _digit_pass(frames, windows, tiles, params, session, digit_item, clock, stat
     roster or model, or one that fails to load, is ignored whole."""
     requests = _requests(windows, tiles)
     by_wid = {w.wid: w for w in windows}
-    fingerprints = {wid: window_fingerprint(frames, by_wid[wid], reqs)
+    fingerprints = {wid: window_fingerprint(frames, by_wid[wid], reqs, params.deinterlace)
                     for wid, reqs in requests.items()}
     roster = [str(t) for t in params.red] + [str(t) for t in params.blue]
     cache = None
@@ -784,8 +793,11 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     try:
         for n, (frame_num, img) in enumerate(source, 1):
             for wid, k, u, v, side in want.get(frame_num, ()):
-                tiles.setdefault(wid, {})[k] = crops.wide_tile(img, u, v, side)[0]
+                tile, _, fired = crops.wide_tile(img, u, v, side, params.deinterlace)
+                tiles.setdefault(wid, {})[k] = tile
                 stats["tiles"] += 1
+                if fired:
+                    stats["tiles_deinterlaced"] += 1
             if n % 50 == 0:
                 _check(params, clock, "during the video pass")
     finally:

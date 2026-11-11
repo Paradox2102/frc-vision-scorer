@@ -125,14 +125,28 @@ def _answers(gold: Path) -> dict:
     return out
 
 
-def gold_team(ans: dict):
+MIN_CONF = 0.8
+
+
+def gold_team(ans: dict, min_conf: float = None):
+    """A judge's team answer, or None when unsure / not a robot / below the confidence floor."""
     t = ans.get("team")
-    return t if t and t not in ("unsure", "null", "none") else None
+    floor = MIN_CONF if min_conf is None else min_conf
+    if not t or t in ("unsure", "null", "none"):
+        return None
+    try:
+        conf = float(ans.get("conf") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return t if conf >= floor else None
 
 
 def cmd_score(a) -> None:
+    global MIN_CONF
+    MIN_CONF = a.min_conf
     gold = Path(a.gold)
-    key = {json.loads(l)["id"]: json.loads(l) for l in (gold / "key.jsonl").open()}
+    kpath = Path(a.key) if a.key else gold / "key.jsonl"
+    key = {json.loads(l)["id"]: json.loads(l) for l in kpath.open()}
     ans = _answers(gold)
     print(f"items {len(key)}, answered {sum(1 for k in key if k in ans)}")
     # judge-vs-judge on overlap
@@ -200,6 +214,8 @@ def main() -> None:
     s.set_defaults(fn=cmd_sample)
     c = sub.add_parser("score")
     c.add_argument("--gold", required=True)
+    c.add_argument("--min-conf", type=float, default=0.8)
+    c.add_argument("--key", default=None, help="key.jsonl path if kept outside the judges' folder")
     c.set_defaults(fn=cmd_score)
     a = ap.parse_args()
     a.fn(a)

@@ -59,9 +59,16 @@ def _paths():
 
 
 # ----------------------------------------------------------------------------- preprocessing
-def preprocess(crop_bgr: np.ndarray) -> np.ndarray:
-    """BGR crop -> float32 [3, 32, 128], RGB, normalised to [-1, 1] (upstream PARSeq)."""
+def preprocess(crop_bgr: np.ndarray, trim: float = 0.0) -> np.ndarray:
+    """BGR crop -> float32 [3, 32, 128], RGB, normalised to [-1, 1] (upstream PARSeq).
+    ``trim`` cuts that fraction of the padded crop off every side first (the bumper box itself
+    spans 1/6..5/6 of the harvester's 25%-padded crop)."""
     h, w = crop_bgr.shape[:2]
+    if trim > 0:
+        dy, dx = int(h * trim), int(w * trim)
+        if h - 2 * dy >= 4 and w - 2 * dx >= 4:
+            crop_bgr = crop_bgr[dy:h - dy, dx:w - dx]
+            h, w = crop_bgr.shape[:2]
     interp = cv2.INTER_AREA if (w > IMG_W and h > IMG_H) else cv2.INTER_CUBIC
     x = cv2.resize(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB), (IMG_W, IMG_H), interpolation=interp)
     return ((x.astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1)
@@ -211,8 +218,8 @@ def decode_jpeg(b: bytes) -> np.ndarray:
 class TrainSet:
     """Real crops (augmented) + synthetic bumpers; ``synth`` = synthetic fraction of an epoch."""
 
-    def __init__(self, rows, blobs, backgrounds, synth: float, seed: int = 0):
-        self.rows, self.blobs, self.bgs = rows, blobs, backgrounds
+    def __init__(self, rows, blobs, backgrounds, synth: float, seed: int = 0, trim: float = 0.0):
+        self.rows, self.blobs, self.bgs, self.trim = rows, blobs, backgrounds, trim
         self.n_real = len(rows)
         self.n_syn = int(round(self.n_real * synth / max(1e-6, 1 - synth))) if synth > 0 else 0
         self.seed, self.epoch = seed, 0
@@ -231,7 +238,7 @@ class TrainSet:
             from scripts.teacher.students.synth import render
             bg = decode_jpeg(self.bgs[rng.integers(len(self.bgs))]) if self.bgs else None
             img, label = render(rng, bg)
-        return torch.from_numpy(preprocess(img)), label
+        return torch.from_numpy(preprocess(img, self.trim)), label
 
 
 def _collate(batch):
@@ -391,6 +398,7 @@ def load_ckpt(path_or_dict, device: str = "cpu"):
                                                                         weights_only=True)
     model = build_model(ck["config"])
     model.load_state_dict({k: v.float() for k, v in ck["state_dict"].items()})
+    model.trim = float(ck.get("trim", 0.0))
     return model.to(device).eval(), ck
 
 
@@ -414,13 +422,14 @@ class DigitReader:
             self.model.half()
         self.batch = batch
         self.rules = self.ck["rules"]
+        self.trim = float(self.ck.get("trim", 0.0))
         self.use_colour = bool(self.ck.get("use_colour", True))
 
     def scores(self, crops_bgr, rosters, with_read=False):
         import torch
         teams_all, LP_all, reads_all = [], [], []
         for s in range(0, len(crops_bgr), self.batch):
-            X = torch.from_numpy(np.stack([preprocess(c) for c in crops_bgr[s:s + self.batch]])).to(self.device)
+            X = torch.from_numpy(np.stack([preprocess(c, self.trim) for c in crops_bgr[s:s + self.batch]])).to(self.device)
             X = X.half() if self.half else X
             t, LP, rd = score_batch(self.model, X, rosters[s:s + self.batch], with_read)
             teams_all += t
@@ -453,7 +462,8 @@ def eval_rows(model, rows, blobs, device, batch=256, with_read=False):
     import torch
     teams_all, LP_all, reads_all = [], [], []
     for s in range(0, len(rows), batch):
-        X = torch.from_numpy(np.stack([preprocess(decode_jpeg(b)) for b in blobs[s:s + batch]])).to(device)
+        X = torch.from_numpy(np.stack([preprocess(decode_jpeg(b), getattr(model, 'trim', 0.0))
+                                       for b in blobs[s:s + batch]])).to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             t, LP, rd = score_batch(model, X, [r["roster"] for r in rows[s:s + batch]], with_read)
         teams_all += t
@@ -556,7 +566,8 @@ def cmd_train(a) -> None:
     sd = torch.load(a.pretrained, map_location="cpu", weights_only=True) if a.pretrained else None
     cfg = dict(BASE_CFG, max_label_length=6)
     model = PARSeq.from_pretrained(sd, **cfg).to(dev)
-    ds = TrainSet(rows, blobs, bgs, a.synth, seed=a.seed)
+    model.trim = a.trim
+    ds = TrainSet(rows, blobs, bgs, a.synth, seed=a.seed, trim=a.trim)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.bs, shuffle=True, num_workers=a.workers,
                                      collate_fn=_collate, drop_last=True, persistent_workers=False,
                                      worker_init_fn=_worker_init, pin_memory=True)
@@ -600,10 +611,10 @@ def cmd_train(a) -> None:
     seen = {r["team"] for r in rows}
     rules, vres = val_report(model, dev, a.colour_eps, seen, {})
     res = {"train_rows": len(rows), "train_sources": dict(Counter(r["src"] for r in rows)),
-           "synth": a.synth, "epochs": a.epochs, "lr": a.lr, "bs": a.bs, "history": hist,
+           "synth": a.synth, "trim": a.trim, "epochs": a.epochs, "lr": a.lr, "bs": a.bs, "history": hist,
            **{f"val_{k}": v for k, v in vres.items()}}
     ck = {"config": cfg, "state_dict": {k: v.detach().half().cpu() for k, v in model.state_dict().items()},
-          "rules": rules, "colour_eps": a.colour_eps, "use_colour": True,
+          "rules": rules, "colour_eps": a.colour_eps, "use_colour": True, "trim": a.trim,
           "img_size": [IMG_H, IMG_W], "pad": 0.25, "arch": "parseq-base digits", "max_wrong": MAX_WRONG,
           "train_teams": sorted(seen), "report": json.loads(json.dumps(res, default=float))}
     MODELS.mkdir(parents=True, exist_ok=True)
@@ -643,7 +654,7 @@ def latency(model, device, n: int = 1024, batch: int = 128) -> dict:
         for _ in range(2):  # second pass timed (warm)
             t_gpu, t0 = 0.0, time.time()
             for s in range(0, n, batch):
-                X = torch.from_numpy(np.stack([preprocess(c) for c in crops[s:s + batch]])).to(device).half()
+                X = torch.from_numpy(np.stack([preprocess(c, getattr(model, 'trim', 0.0)) for c in crops[s:s + batch]])).to(device).half()
                 torch.cuda.synchronize()
                 g0 = time.time()
                 score_batch(model, X, rosters[s:s + batch], with_read)
@@ -739,6 +750,7 @@ def main() -> None:
     t.add_argument("--wd", type=float, default=0.01)
     t.add_argument("--workers", type=int, default=8)
     t.add_argument("--colour-eps", type=float, default=0.05)
+    t.add_argument("--trim", type=float, default=0.0, help="fraction cut off each side of the padded crop")
     t.add_argument("--limit", type=int, default=0)
     t.add_argument("--val-limit", type=int, default=0)
     t.add_argument("--seed", type=int, default=0)

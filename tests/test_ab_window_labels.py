@@ -56,3 +56,13 @@ def test_deinterlace_profile_arms():
     arms = dict(ab.PROFILES["wl-deinterlace"])
     assert arms == {"wl_08": {"window_labels": True},
                     "wl_08_di": {"window_labels": True, "window_labels_deinterlace": True}}
+
+
+def test_student_reader_profile_arms():
+    from web.job_config import JobConfig
+    arms = dict(ab.PROFILES["wl-student"])
+    assert arms["wl_08"] == {"window_labels": True}
+    assert arms["wl_08_s1"]["window_labels_reader"] == "student"
+    assert arms["wl_08_s1only"]["window_labels_reader"] == "student_only"
+    for cfg in arms.values():
+        JobConfig(cfg)                                   # every arm is a valid config

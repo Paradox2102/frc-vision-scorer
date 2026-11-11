@@ -134,6 +134,26 @@ def test_the_deinterlace_knob_reaches_the_stage_params(monkeypatch):
     assert seen["params"].deinterlace is True
 
 
+def test_the_reader_knob_reaches_the_stage_params_and_its_stats_reach_timings(monkeypatch):
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    _apply(job, rec)
+    assert seen["params"].reader == "jev"                     # knob absent: jev
+    res = _ok_result()
+    res["stats"] = {**res["stats"], "student": {"reader": "student", "windows_s1": 7,
+                                                "windows_jev": 2, "jev_digit_calls": 18,
+                                                "bumper_found": 30, "samples": 40,
+                                                "fallback": None}}
+    seen = _stub(monkeypatch, res)
+    job, rec = _job()
+    job.config.window_labels_reader = "student"
+    summary, timings = _apply(job, rec)
+    assert seen["params"].reader == "student"
+    assert summary["window_labels"]["student"]["windows_s1"] == 7
+    assert timings["window_labels.student.windows_s1"] == 7
+    assert timings["window_labels.student.jev_digit_calls"] == 18
+
+
 def test_abort_leaves_the_replay_untouched(monkeypatch):
     res = {"aborted": "request errors: 300 of 2000 in the digit pass", "labels": None,
            "segments": None, "lineup_jpeg": None,

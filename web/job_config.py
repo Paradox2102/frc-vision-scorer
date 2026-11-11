@@ -763,6 +763,17 @@ KNOBS = [
     # only acts when window_labels is on. WINDOW_LABELS_DEINTERLACE=0 to disable.
     Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, True,
          section="Identity & votes"),
+    # Window-label digit reader (teacher-distillation spec section 14): "jev"
+    # sends every digit request to Jev (unchanged); "student" reads every
+    # window sample first with the local S1 student (bumper detector box near
+    # the slot's projected target, padded like the harvester, PARSeq digit
+    # reader, GPU) and asks Jev only for windows S1 leaves undecided;
+    # "student_only" never asks Jev in the digit pass. The lineup pass is Jev
+    # in every mode. No CUDA / missing models: falls back to "jev" with a
+    # warning. Digit-call caches are not shared between modes. Needs
+    # window_labels. DEFAULT "jev" pending the A/B.
+    Knob("window_labels_reader", "WINDOW_LABELS_READER", str, "jev",
+         choices=("jev", "student", "student_only"), section="Identity & votes"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not
     # read at p >= 0.85 twice, from the anchors earlier matches of the event

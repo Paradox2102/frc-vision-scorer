@@ -18,6 +18,8 @@ Usage
         --calibration-version 20260630-210916-570400 --save-lineup /tmp/qm11_lineup.jpg
     .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --event-lineup \
         --namespace eval-full --digit-cache data/eval/event_lineup/digit_cache/a0bbc991.json
+    .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --deinterlace \
+        --reader student      # S1 student first, Jev only where S1 is undecided (GPU)
 
 Per-replay inputs come from the replay (event-lineup spec section 5b):
 ground_center_offset_m from summary.config (0.0 when the replay records no
@@ -205,11 +207,12 @@ class Options:
     use_elimination: bool = True
     alliance_rows: bool = False
     deinterlace: bool = False                       # window_labels_deinterlace
+    reader: str = "jev"                             # window_labels_reader
 
 
 def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: Options,
                 session, *, fps: float, view, frame_source=None, db_path=None,
-                anchor_root=None) -> dict:
+                anchor_root=None, student=None) -> dict:
     """Run the stage on one stored replay; ``meta`` is never changed. With
     opts.event_lineup the borrowed anchors come from opts.namespace; with
     opts.store_write the replay's anchors then replace its match's rows
@@ -240,9 +243,9 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
         event_lineup=opts.event_lineup, borrowed=borrowed,
         this_colors={**{t: "red" for t in red}, **{t: "blue" for t in blue}},
         use_elimination=opts.use_elimination, rows_alliance_only=opts.alliance_rows,
-        digit_calls=cache, deinterlace=opts.deinterlace)
+        digit_calls=cache, deinterlace=opts.deinterlace, reader=opts.reader)
     result = wl.run_window_labels(meta["frames"], str(video), cal, session, params,
-                                  frame_source=frame_source)
+                                  frame_source=frame_source, student=student)
     out = {"result": result, "relabelled": None, "stats": dict(result["stats"]),
            "cache_origin": origin, "gco": gco, "borrow_fetch_error": fetch_error}
     if result["aborted"]:
@@ -338,6 +341,10 @@ def main(argv=None) -> None:
     ap.add_argument("--deinterlace", action="store_true",
                     help="deinterlace combed tiles (the window_labels_deinterlace knob); "
                          "digit calls cached without it are not reused")
+    ap.add_argument("--reader", choices=wl.READERS, default="jev",
+                    help="digit reader (the window_labels_reader knob): jev, student (S1 first, "
+                         "Jev only for windows S1 leaves undecided) or student_only (no Jev "
+                         "digit calls); the lineup pass is Jev in every mode")
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")
@@ -362,7 +369,8 @@ def main(argv=None) -> None:
                    event_lineup=args.event_lineup, namespace=args.namespace,
                    before_match=args.before_match, store_write=args.store_write,
                    digit_cache=args.digit_cache, use_elimination=not args.no_elim,
-                   alliance_rows=args.alliance_rows, deinterlace=args.deinterlace)
+                   alliance_rows=args.alliance_rows, deinterlace=args.deinterlace,
+                   reader=args.reader)
     print(f"replay {row['id'][:8]}  {row['match_key']}  video {video.name}")
     t0 = time.time()
     out = relabel_one(row, meta, video, cal, red, blue, opts, session, fps=fps,

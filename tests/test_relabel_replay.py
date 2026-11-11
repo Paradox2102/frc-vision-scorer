@@ -205,3 +205,15 @@ def test_deinterlace_option_reaches_the_stage(store):
     assert on["result"]["digit_calls"]["fingerprints"][0]["deinterlace"] is True
     off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(), store)
     assert "tiles_deinterlaced" not in off["stats"]
+
+
+def test_reader_option_reaches_the_stage(store):
+    from tests.field.test_window_labels_student import FakeStudent
+    frames = _lineup_frames()
+    out = rr.relabel_one(ROW, _meta(frames), "video.mp4", _Cal(), RED, BLUE,
+                         rr.Options(reader="student_only", lineup_min_p=1.01),
+                         FakeSession(), fps=FPS, view=(0, 0, 1920, 723), frame_source=_source,
+                         student=FakeStudent(slots=()), **store)
+    assert out["stats"]["student"]["reader"] == "student_only"
+    assert out["relabelled"]["summary"]["window_labels_digit_calls"]["reader"] == "student_only"
+    assert rr.Options().reader == "jev"

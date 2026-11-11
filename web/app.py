@@ -7107,6 +7107,7 @@ class InferenceJob:
                 ground_center_offset_m=float(getattr(cfg, "ground_center_offset_m", 0.0) or 0.0),
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
                 deinterlace=bool(getattr(cfg, "window_labels_deinterlace", False)),
+                reader=str(getattr(cfg, "window_labels_reader", "jev") or "jev"),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
                 model_key=getattr(cfg, "jev_model", None) or jev_reader.DEFAULT_MODEL,
@@ -7178,6 +7179,10 @@ class InferenceJob:
                   "lineup_named", "unlabelled"):
             if isinstance(stats.get(k), (int, float)):
                 timings[f"window_labels.{k}"] = stats[k]
+        for k in ("windows_s1", "windows_jev", "jev_digit_calls", "bumper_found", "samples"):
+            v = (stats.get("student") or {}).get(k)
+            if isinstance(v, (int, float)):
+                timings[f"window_labels.student.{k}"] = v
         if stats.get("aborted"):
             timings["window_labels.aborted"] = 1
             print(f"[window-labels] aborted, labels unchanged: {stats['aborted']}")
@@ -7186,6 +7191,13 @@ class InferenceJob:
                   f"digits, {stats.get('lineup_named')} by lineup, {stats.get('unlabelled')} "
                   f"unlabelled; {stats.get('requests')} requests, ~{stats.get('cost_cents')}c, "
                   f"{stats['seconds']}s")
+            st = stats.get("student")
+            if st:
+                print(f"[window-labels] reader {st.get('reader')}: S1 named {st.get('windows_s1')} "
+                      f"windows, Jev asked for {st.get('windows_jev')} ({st.get('jev_digit_calls')} "
+                      f"digit calls); bumper found on {st.get('bumper_found')}/{st.get('samples')} "
+                      f"samples" + (f"; FALLBACK to jev: {st['fallback']}" if st.get("fallback")
+                                    else ""))
             if event_on:
                 print(f"[event-lineup] rows own {stats.get('rows_own')} / borrowed "
                       f"{stats.get('rows_borrowed')} / elim {stats.get('rows_elim')}; anchors "

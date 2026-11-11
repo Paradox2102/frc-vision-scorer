@@ -168,7 +168,7 @@ RED, BLUE = ["2637", "2724", "6497"], ["3128", "6773", "9066"]
 def _args(tmp_path, **kw):
     d = dict(lineup_min_p=0.8, no_event_lineup=False, namespace="eval-x", mode="incremental",
              store_write=True, digit_cache_dir=str(tmp_path / "dc"), no_elim=False,
-             alliance_rows=False, score=False)
+             alliance_rows=False, score=False, reader="jev")
     d.update(kw)
     return argparse.Namespace(**d)
 
@@ -260,7 +260,7 @@ def _main_with_one_item(tmp_path, monkeypatch, extra):
     monkeypatch.setattr(er, "select_replays", lambda *a, **k: ([item], []))
     monkeypatch.setattr(er, "relabel_match", lambda it, args, od: {"match_key": it["match_key"]})
     monkeypatch.setattr(er.ea, "clear", lambda ns, ev, **k: cleared.append((ns, ev)) or 5)
-    return cleared, er.main(["--event", "2026cur", "--namespace", "eval-x", *extra])
+    return cleared, er.main(["--event", "2026cur", "--namespace", "eval-x", "--reader", "jev", *extra])
 
 
 def test_reset_clears_a_non_live_namespace(tmp_path, monkeypatch):
@@ -289,6 +289,6 @@ def test_full_store_write_runs_one_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(er, "select_replays", lambda *a, **k: ([item], []))
     monkeypatch.setattr(er, "run_all", lambda items, fn, mode, workers, stop_on_error=False:
                         (seen.setdefault("w", workers), [{"match_key": "2026cur_qm8"}])[1])
-    er.main(["--event", "2026cur", "--namespace", "eval-x", "--mode", "full", "--store-write",
+    er.main(["--event", "2026cur", "--namespace", "eval-x", "--reader", "jev", "--mode", "full", "--store-write",
              "--workers", "4", "--out-dir", str(tmp_path / "o")])
     assert seen["w"] == 1

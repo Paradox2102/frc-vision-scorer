@@ -199,7 +199,8 @@ def relabel_match(item: dict, args, out_dir) -> dict:
                           before_match=before_match_for(args.mode, mk),
                           store_write=args.store_write,
                           digit_cache=str(Path(args.digit_cache_dir) / f"{row['id']}.json"),
-                          use_elimination=not args.no_elim, alliance_rows=args.alliance_rows)
+                          use_elimination=not args.no_elim, alliance_rows=args.alliance_rows,
+                          reader=args.reader)
         out = rr.relabel_one(row, meta, item["video"], chosen["calibration"], red, blue, opts,
                              session, fps=fps, view=load_layout()["main"].crop)
         rec = result_row(item, out, out_dir, args.score, time.time() - t0)
@@ -245,6 +246,8 @@ def main(argv=None) -> None:
                     help="ablation: one lineup card per alliance")
     ap.add_argument("--no-event-lineup", action="store_true",
                     help="own anchors only: today's stage (evaluation arm 1)")
+    ap.add_argument("--reader", choices=("jev", "student", "student_only"), default="student_only",
+                    help="digit reader (the window_labels_reader knob; default = the live default)")
     ap.add_argument("--lineup-min-p", type=float, default=0.8,
                     help="lineup acceptance floor; above 1 disables the lineup pass")
     ap.add_argument("--workers", type=int, default=4, help="parallel matches in full mode")

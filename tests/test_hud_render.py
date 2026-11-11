@@ -227,6 +227,38 @@ def test_a_near_static_video_aligned_has_no_mismatches(db, tmp_path):
     assert stats["decode_checked"] == 30 and stats["decode_mismatches"] == 0
 
 
+def test_a_failing_encoder_never_replaces_hud_mp4(db, tmp_path, monkeypatch):
+    import web.replay_recorder as rr
+    rid, d, _ = make_replay(tmp_path, live_video=True)
+    monkeypatch.setattr(rr.shutil, "which", lambda name: "/bin/sh")
+    real_popen = subprocess.Popen
+
+    def failing(cmd, **kw):                       # writes a partial file, exits 1
+        return real_popen(["/bin/sh", "-c", f"head -c 100 > '{cmd[-1]}'; exit 1"], **kw)
+    monkeypatch.setattr(rr.subprocess, "Popen", failing)
+    with pytest.raises(hud_render.RenderError, match="encoder exited 1"):
+        hud_render.render_replay(rid)
+    assert (d / "hud.mp4").read_bytes() == b"LIVE-ENCODED"
+    assert not (d / "hud.render.mp4").exists() and not (d / "render.json").exists()
+
+
+def test_an_encoded_frame_count_short_of_meta_is_a_render_error(db, tmp_path, monkeypatch):
+    from web.replay_recorder import ReplayRecorder
+    rid, d, _ = make_replay(tmp_path, live_video=True)
+    real_add = ReplayRecorder.add_frame
+    calls = []
+
+    def dropping(self, frame, record, draw=None):  # the encoder loses one frame
+        calls.append(1)
+        if len(calls) != 5:
+            real_add(self, frame, record, draw)
+    monkeypatch.setattr(ReplayRecorder, "add_frame", dropping)
+    with pytest.raises(hud_render.RenderError, match="11 frames, expected 12"):
+        hud_render.render_replay(rid)
+    assert (d / "hud.mp4").read_bytes() == b"LIVE-ENCODED"
+    assert not (d / "hud.render.mp4").exists()
+
+
 def test_a_missing_draw_list_line_still_emits_a_frame(db, tmp_path):
     rid, d, _ = make_replay(tmp_path)
     lines = [json.loads(l) for l in gzip.open(d / "draw.jsonl.gz", "rt")]

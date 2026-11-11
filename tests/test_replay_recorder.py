@@ -140,3 +140,32 @@ def test_diagnostics_integration(tmp_path):
     saved_meta = json.loads((tmp_path / "meta.json").read_text())
     assert saved_meta["summary"]["diagnostics_path"] == str(diag_file)
     assert saved_meta["summary"]["diagnostics_summary"]["counters"]["some_counter"] == 5
+
+
+def test_close_video_returns_the_encoder_exit_code(tmp_path):
+    rec = ReplayRecorder()
+    rec.open_lazy(_frame(), fps=8.0, out_dir=tmp_path)
+    for i in range(3):
+        rec.add_frame(_frame(val=10 + i), {})
+    assert rec.close_video() == 0 and rec.encoder_returncode == 0
+    assert rec.close_video() == 0                  # safe twice: keeps the code
+
+
+def test_close_video_reports_a_failing_ffmpeg(tmp_path, monkeypatch):
+    import web.replay_recorder as rr
+    monkeypatch.setattr(rr.shutil, "which", lambda name: "/bin/sh")
+    real_popen = subprocess.Popen
+    # A stand-in "ffmpeg" that eats its input and exits 1.
+    monkeypatch.setattr(rr.subprocess, "Popen", lambda cmd, **kw: real_popen(
+        ["/bin/sh", "-c", "cat >/dev/null; exit 1"], **kw))
+    rec = ReplayRecorder()
+    rec.open_lazy(_frame(), fps=8.0, out_dir=tmp_path)
+    rec.add_frame(_frame(), {})
+    assert rec.close_video() == 1 and rec.encoder_returncode == 1
+
+
+def test_metadata_only_close_video_returns_none(tmp_path):
+    rec = ReplayRecorder(record_video=False)
+    rec.open_lazy(_frame(), fps=8.0, out_dir=tmp_path)
+    rec.add_frame(_frame(), {})
+    assert rec.close_video() is None

@@ -255,6 +255,15 @@ def _write_json_atomic(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def _video_frame_count(path: Path) -> int:
+    """CAP_PROP_FRAME_COUNT of an encoded file (0 when it does not open)."""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    finally:
+        cap.release()
+
+
 def render_replay(replay_id: str, db_path=None) -> dict:
     """Render ``replay_id`` and replace its hud.mp4; returns the render stats
     (also written to render.json). Raises RenderError with the reason."""
@@ -379,15 +388,20 @@ def render_replay(replay_id: str, db_path=None) -> dict:
             rec.add_frame(composed, {})
             if idx == len(frames) // 2:
                 thumb = composed.copy()
-        rec.close_video()
+        rc = rec.close_video()
+        if rc not in (None, 0):
+            raise RenderError(f"encoder exited {rc}")
+        if not tmp_video.is_file() or tmp_video.stat().st_size == 0:
+            raise RenderError("encoder produced no video")
+        encoded = _video_frame_count(tmp_video)
+        if encoded != len(frames):
+            raise RenderError(f"encoded video has {encoded} frames, expected {len(frames)}")
     except BaseException:
         cap.release()
         rec.close_video()
         tmp_video.unlink(missing_ok=True)
         raise
     cap.release()
-    if not tmp_video.is_file() or tmp_video.stat().st_size == 0:
-        raise RenderError("encoder produced no video")
 
     final = out_dir / "hud.mp4"
     live = out_dir / LIVE_VIDEO

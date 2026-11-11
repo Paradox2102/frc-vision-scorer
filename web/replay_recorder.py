@@ -37,6 +37,7 @@ class ReplayRecorder:
         self._draw_fh = None             # draw.jsonl.gz, opened on the first draw line
         self._writer: Optional[cv2.VideoWriter] = None
         self._proc: Optional[subprocess.Popen] = None
+        self.encoder_returncode: Optional[int] = None
         self._out_dir: Optional[Path] = None
         self.fps: float = 0.0
         self.width: int = 0
@@ -124,21 +125,31 @@ class ReplayRecorder:
     def add_event(self, event: dict) -> None:
         self.events.append(dict(event))
 
-    def close_video(self) -> None:
-        """Finish the encoder (and the draw list); safe to call twice."""
+    def close_video(self) -> Optional[int]:
+        """Finish the encoder (and the draw list); safe to call twice.
+        Returns the encoder's exit code (also kept in ``encoder_returncode``):
+        ffmpeg's returncode, 0 for the OpenCV writer, None when no encoder
+        ran (metadata-only). A hung ffmpeg is killed (negative code)."""
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
                 self._proc.wait(timeout=180)
             except Exception:
                 self._proc.kill()
+                self._proc.wait()
+            self.encoder_returncode = self._proc.returncode
             self._proc = None
         if self._writer is not None:
             self._writer.release()
             self._writer = None
+            self.encoder_returncode = 0
         if self._draw_fh is not None:
             self._draw_fh.close()
             self._draw_fh = None
+        return self.encoder_returncode
 
     def finalize(self, status: str, summary: dict, diagnostics: Optional[Any] = None) -> dict:
         self.close_video()

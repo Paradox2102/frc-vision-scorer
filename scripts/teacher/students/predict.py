@@ -73,9 +73,9 @@ class Students:
 
     def read_digits(self, crops_bgr: Sequence[np.ndarray], rosters: Sequence, colours: Optional[Sequence] = None,
                     use_colour: Optional[bool] = None) -> list:
-        """S1 roster-constrained team read per bumper crop (see ``digits.DigitReader.read``)."""
+        """S1 roster-constrained team read per bumper crop (see ``web.students.digit_reader.DigitReader.read``)."""
         if self._s1 is None:
-            from scripts.teacher.students.digits import DigitReader
+            from web.students.digit_reader import DigitReader
             self._s1 = DigitReader(self.models_dir / "s1_digits.pt", device=self.device)
         return self._s1.read(crops_bgr, rosters, colours, use_colour)
 

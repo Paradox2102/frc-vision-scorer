@@ -43,23 +43,9 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# main-checkout resolution + the bumper detector path are shared with the runtime S1 reader
+from web.students.paths import BUMPER_WEIGHTS, MAIN, main_checkout  # noqa: E402,F401
 
-def main_checkout(repo: Path = REPO) -> Path:
-    """The main checkout (data, weights, .env live there even when this code
-    runs from a git worktree)."""
-    try:
-        common = subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-                                capture_output=True, text=True, check=True).stdout.strip()
-        p = Path(common)
-        if not p.is_absolute():
-            p = (repo / p).resolve()
-        return p.parent
-    except Exception:
-        return repo
-
-
-MAIN = main_checkout()
-BUMPER_WEIGHTS = MAIN / "runs/train/frc_bumpers_2026cur_v3/weights/best.pt"
 ROBOT_WEIGHTS = MAIN / "runs/train/hub_zone_yolo26s_2026cur_v2/weights/best.pt"
 ROBOT_CLASS = 1                     # hub_zone model: 0 fuel_ball, 1 robot, 2 hub_opening
 DEFAULT_OUT_ROOT = MAIN / "data/teacher/harvest_v2"   # v1 (2 fps greedy) stays in harvest/

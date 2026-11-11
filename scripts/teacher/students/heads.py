@@ -65,11 +65,11 @@ if str(REPO) not in sys.path:
 from scripts.teacher.gold import _answers, gold_team  # noqa: E402
 from scripts.teacher.harvest import MAIN, PAD_BUMPER, PAD_ROBOT, pad_box  # noqa: E402
 from scripts.teacher.students import features as F  # noqa: E402
+from web.students.paths import MODELS  # noqa: E402  (data/teacher/models in the main checkout)
 
 DATA = MAIN / "data/teacher"
 ROOT = DATA / "harvest_v2"
 GOLD = DATA / "gold"
-MODELS = DATA / "models"
 TRAIN_EVENTS = ("2025cur", "2026cur", "2026hop")
 TEST_EVENTS = ("2026alhu", "2025casd")
 EXCLUDE_MATCHES = {"2026cur_qm8", "2026cur_qm11"}  # GT matches: never trained on (design §3)

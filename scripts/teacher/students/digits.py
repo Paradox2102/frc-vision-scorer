@@ -11,14 +11,19 @@ Training data (§9 rule: only crops whose digits are visible):
   * synthetic bumpers (synth.py), ``--synth`` fraction of every epoch.
 Never: test events, GT matches, val matches, labels propagated along a tracklet.
 
-Decoding: teacher-forced log P(team digits, [E] | crop) for each roster team; "other" gets the
-remaining sequence-probability mass (1 - sum over the roster). Optional bumper-colour prior scales
-the off-alliance teams by ``colour_eps``. Abstain when the top option is "other", its probability
-is below ``t_p``, or its margin over the runner-up is below ``t_m`` (tuned on val for <=0.5% wrong
-among named crops).
+Decoding: teacher-forced log P(team digits, [E] | crop) for each roster team (``score_batch``), then a
+decision rule (``posterior`` / ``decide``) tuned on val:
+  * "softmax": softmax(LP / T) over the 6 roster numbers (the nearest roster number wins - the reader
+    often free-reads one digit off, e.g. "9473" for 2473), abstain below top-1 ``t_p`` / margin ``t_m``
+    or when the best raw log-likelihood is under ``floor``;
+  * "mass": P(team) = sequence probability, "other" = 1 - sum over the roster (stricter).
+Optional bumper-colour prior multiplies off-alliance teams by ``colour_eps``. The rule is chosen
+on val for <=0.5% wrong of named Jev-read crops and <=1% wrong vs the tracklet label on val crops
+Jev never read (propagated labels are ~99% pure; evaluation only, never training).
 
   python -m scripts.teacher.students.digits train --out s1_digits.pt          # train + val tune
-  python -m scripts.teacher.students.digits train --synth 0 --out s1_nosynth.pt --no-save-best
+  python -m scripts.teacher.students.digits train --synth 0 --out s1_nosynth.pt     # ablation
+  python -m scripts.teacher.students.digits retune --ckpt s1_digits.pt         # re-pick rule on val
   python -m scripts.teacher.students.digits test --ckpt s1_digits.pt          # TEST, run once
 """
 from __future__ import annotations
@@ -121,7 +126,37 @@ def jev_rows(splits: Sequence[str] = ("train", "val", "test"), unreadable: bool 
                 out.append({"path": c["path"], "team": top if not unreadable else None, "jev_top": top,
                             "jev_p": p, "roster": roster, "colour": m.get("alliance_colour"),
                             "px_w": m["px_w"], "event": m["event"], "year": int(m["year"]),
-                            "match_key": mk, "split": sp, "src": "jev"})
+                            "match_key": mk, "split": sp, "src": "jev",
+                            "tracklet_team": t.get("team") if t.get("decision") == "team" else None})
+    return out
+
+
+def propagated_rows(splits: Sequence[str] = ("val",)) -> List[dict]:
+    """Bumper crops Jev did NOT read, in tracklets Jev decided as a team (label = tracklet team).
+    Evaluation only (a mix of legible and illegible crops - the population S1 sees live); never
+    training data (design §9)."""
+    ROOT, _, _ = _paths()
+    out = []
+    for lf in sorted(ROOT.glob("*/*/labels_jev.jsonl")):
+        mk = lf.parent.name
+        sp = split_of(mk)
+        if sp not in splits:
+            continue
+        lab = {}
+        for l in lf.open():
+            t = json.loads(l)
+            if t.get("detector") == "bumper" and t.get("decision") == "team" and t.get("team"):
+                lab[t["tracklet_id"]] = (t["team"], {c["path"] for c in t.get("calls", [])})
+        for l in (lf.parent / "manifest.jsonl").open():
+            m = json.loads(l)
+            if m["detector"] != "bumper" or m["tracklet_id"] not in lab:
+                continue
+            team, called = lab[m["tracklet_id"]]
+            if m["path"] in called or team not in m["roster"]["red"] + m["roster"]["blue"]:
+                continue
+            out.append({"path": m["path"], "team": team, "roster": m["roster"], "colour": m.get("alliance_colour"),
+                        "px_w": m["px_w"], "event": m["event"], "year": int(m["year"]), "match_key": mk,
+                        "split": sp, "src": "propagated"})
     return out
 
 
@@ -209,40 +244,74 @@ def _worker_init(_):
 
 
 # ----------------------------------------------------------------------------- decoding
-def candidate_probs(model, X, rosters: Sequence[dict], colours: Optional[Sequence[Optional[str]]] = None,
-                    colour_eps: Optional[float] = None, with_read: bool = False):
-    """Roster-constrained posterior per crop.
+def roster_teams(r) -> List[str]:
+    return list(r["red"]) + list(r["blue"]) if isinstance(r, dict) else list(r)
 
-    Returns (teams: list of per-crop team lists, P: [N, K+1] numpy (last column = other), reads)."""
+
+def score_batch(model, X, rosters: Sequence, with_read: bool = False):
+    """Teacher-forced log P(team digits [E] | crop) per roster team.
+
+    Returns (teams per crop, LP [N, K] float64 numpy with -1e9 in padding slots, greedy reads)."""
     import torch
-    teams = [list(r["red"]) + list(r["blue"]) if isinstance(r, dict) else list(r) for r in rosters]
+    teams = [roster_teams(r) for r in rosters]
     K = max(len(t) for t in teams)
     cands = [t + [t[0]] * (K - len(t)) for t in teams]
     valid = torch.tensor([[j < len(t) for j in range(K)] for t in teams], device=X.device)
     with torch.no_grad():
         mem = model.encode(X)
-        lp = model.score_strings(mem, cands)
-        lp = lp.masked_fill(~valid, -1e9)
+        lp = model.score_strings(mem, cands).masked_fill(~valid, -1e9)
         reads = model.greedy(mem)[0] if with_read else None
-    p = lp.double().exp().cpu().numpy()
-    other = np.clip(1.0 - p.sum(1, keepdims=True), 1e-9, None)
-    P = np.concatenate([p, other], 1)
-    if colour_eps is not None and colours is not None:
-        for i, (r, c) in enumerate(zip(rosters, colours)):
-            if not isinstance(r, dict) or c not in ("red", "blue"):
-                continue
-            off = [j for j, t in enumerate(teams[i]) if t not in r[c]]
-            P[i, off] *= colour_eps
-    P = P / P.sum(1, keepdims=True)
-    return teams, P.astype(np.float64), reads
+    return teams, lp.double().cpu().numpy(), reads
 
 
-def decide(P: np.ndarray, t_p: float, t_m: float) -> np.ndarray:
+def colour_logprior(teams, rosters, colours, eps: Optional[float]) -> np.ndarray:
+    """log prior per candidate: 0 for the bumper's alliance (or unknown colour), log(eps) off-alliance."""
+    K = max(len(t) for t in teams) if teams else 0
+    out = np.zeros((len(teams), K))
+    if eps is None or colours is None:
+        return out
+    leps = math.log(eps) if eps > 0 else -1e9
+    for i, (t, r, c) in enumerate(zip(teams, rosters, colours)):
+        if isinstance(r, dict) and c in ("red", "blue"):
+            for j, team in enumerate(t):
+                if team not in r[c]:
+                    out[i, j] = leps
+    return out
+
+
+def posterior(LP: np.ndarray, logprior: np.ndarray, rule: dict) -> np.ndarray:
+    """[N, K+1] probabilities; the last column is "other".
+
+    mode "mass":    P(team) = P(string), P(other) = 1 - sum over the roster (the reader must
+                    put most of its sequence mass on one roster number to name it).
+    mode "softmax": softmax(LP / T) over the roster only (nearest roster number wins, e.g. a read
+                    "9473" still names 2473 when that is the only close candidate); P(other) = 0, the
+                    absolute evidence check is ``floor`` on the best raw log-likelihood."""
+    if rule["mode"] == "mass":
+        p = np.exp(LP + logprior)
+        other = np.clip(1.0 - np.exp(LP).sum(1, keepdims=True), 1e-12, None)
+        P = np.concatenate([p, other], 1)
+    else:
+        z = LP / rule["T"] + logprior
+        z = z - z.max(1, keepdims=True)
+        P = np.concatenate([np.exp(z), np.zeros((len(z), 1))], 1)
+    return P / P.sum(1, keepdims=True)
+
+
+def decide(P: np.ndarray, t_p: float, t_m: float, maxlp: Optional[np.ndarray] = None,
+           floor: float = -1e9) -> np.ndarray:
     """Index of the chosen team per row, or -1 (abstain). Column -1 is "other"."""
     s = np.sort(P, 1)
     top = P.argmax(1)
     ok = (top != P.shape[1] - 1) & (s[:, -1] >= t_p) & (s[:, -1] - s[:, -2] >= t_m)
+    if maxlp is not None:
+        ok &= maxlp >= floor
     return np.where(ok, top, -1)
+
+
+def apply_rule(LP, teams, rosters, colours, rule: dict) -> np.ndarray:
+    P = posterior(LP, colour_logprior(teams, rosters, colours, rule.get("colour_eps")), rule)
+    return decide(P, rule["t_p"], rule["t_m"], LP.max(1), rule.get("floor", -1e9)), P
 
 
 def tally(pred_idx: np.ndarray, teams: Sequence[List[str]], truth: Sequence[Optional[str]]) -> dict:
@@ -262,21 +331,52 @@ def tally(pred_idx: np.ndarray, teams: Sequence[List[str]], truth: Sequence[Opti
             "wrong_pct_of_all": round(100 * c["wrong"] / max(1, n), 3)}
 
 
-THRESH_GRID_P = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999]
-THRESH_GRID_M = [0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.98]
+def _fast_tally(pred: np.ndarray, truth_idx: np.ndarray) -> dict:
+    right = int(((pred >= 0) & (pred == truth_idx)).sum())
+    named = int((pred >= 0).sum())
+    return {"n": len(pred), "right": right, "wrong": named - right, "abstain": len(pred) - named}
 
 
-def tune_thresholds(P, teams, truth, max_wrong: float = MAX_WRONG) -> dict:
+GRID_P = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.999]
+GRID_M = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98]
+GRID_RULES = [("mass", 1.0, -1e9)] + [("softmax", T, f) for T in (1.0, 2.0, 4.0) for f in (-1e9, -12.0, -8.0, -5.0, -3.0)]
+PROP_MAX_WRONG = 0.01  # propagated tracklet labels are ~99% pure (gold §9/§10)
+
+
+def tune_rule(ev: dict, colour_eps: Optional[float], max_wrong: float = MAX_WRONG,
+              modes: Sequence[str] = ("mass", "softmax")) -> dict:
+    """Most val-right rule with wrong <= max_wrong of named on Jev-read val crops and, when
+    ``ev['prop']`` is given, <= PROP_MAX_WRONG of named on val crops Jev never read (tracklet label).
+    ``ev``: {"val": (LP, teams, rosters, colours, truth), "prop": (...) or None}."""
     best = None
-    for tp in THRESH_GRID_P:
-        for tm in THRESH_GRID_M:
-            r = tally(decide(P, tp, tm), teams, truth)
-            named = r["right"] + r["wrong"]
-            if named and r["wrong"] / named <= max_wrong and (best is None or r["right"] > best[2]["right"]):
-                best = (tp, tm, r)
+    for mode, T, floor in GRID_RULES:
+        if mode not in modes:
+            continue
+        pre = {}
+        for k, v in ev.items():
+            if v is None:
+                continue
+            LP, teams, rosters, colours, truth = v
+            base = {"mode": mode, "T": T, "colour_eps": colour_eps}
+            ti = np.array([t.index(y) if y in t else -2 for t, y in zip(teams, truth)])
+            pre[k] = (posterior(LP, colour_logprior(teams, rosters, colours, colour_eps), base), LP.max(1), ti)
+        for tp in GRID_P:
+            for tm in GRID_M:
+                res = {k: _fast_tally(decide(P, tp, tm, mx, floor), ti) for k, (P, mx, ti) in pre.items()}
+                r = res["val"]
+                named = r["right"] + r["wrong"]
+                if not named or r["wrong"] / named > max_wrong:
+                    continue
+                if "prop" in res:
+                    pn = res["prop"]["right"] + res["prop"]["wrong"]
+                    if pn and res["prop"]["wrong"] / pn > PROP_MAX_WRONG:
+                        continue
+                if best is None or r["right"] > best[1]["val"]["right"]:
+                    best = ({"mode": mode, "T": T, "floor": floor, "t_p": tp, "t_m": tm, "colour_eps": colour_eps}, res)
     if best is None:
-        return {"t_p": 0.999, "t_m": 0.98, "val": tally(decide(P, 0.999, 0.98), teams, truth)}
-    return {"t_p": best[0], "t_m": best[1], "val": best[2]}
+        rule = {"mode": "mass", "T": 1.0, "floor": -1e9, "t_p": 0.999, "t_m": 0.98, "colour_eps": colour_eps}
+        return {"rule": rule, "metrics": {}}
+    return {"rule": best[0], "metrics": best[1]}
 
 
 # ----------------------------------------------------------------------------- model io
@@ -296,7 +396,8 @@ def load_ckpt(path_or_dict, device: str = "cpu"):
 
 class DigitReader:
     """S1 inference: ``read(crops_bgr, rosters, colours)`` -> per crop
-    {"probs": {team: p, ..., "other": p}, "team": str|None, "p": float, "abstain": bool, "read": str}.
+    {"probs": {team: p, ..., "other": p}, "team": str|None, "p": float, "abstain": bool,
+     "read": free-decoded digit string, "roster_mass": sum of the roster numbers' sequence probability}.
 
     ``rosters``: per crop {"red": [...], "blue": [...]} (or a flat team list, which disables the colour
     prior for that crop). ``colours``: per crop "red"/"blue"/None (bumper class). ``use_colour``
@@ -312,57 +413,55 @@ class DigitReader:
         if self.half:
             self.model.half()
         self.batch = batch
-        th = self.ck["thresholds"]
-        self.colour_eps = float(self.ck.get("colour_eps", 0.05))
+        self.rules = self.ck["rules"]
         self.use_colour = bool(self.ck.get("use_colour", True))
-        self.t = {True: (th["colour"]["t_p"], th["colour"]["t_m"]), False: (th["plain"]["t_p"], th["plain"]["t_m"])}
 
-    def probs(self, crops_bgr, rosters, colours=None, use_colour=None, with_read=False):
+    def scores(self, crops_bgr, rosters, with_read=False):
         import torch
-        use_colour = self.use_colour if use_colour is None else use_colour
-        colours = list(colours) if colours is not None else [None] * len(crops_bgr)
-        teams_all, P_all, reads_all = [], [], []
+        teams_all, LP_all, reads_all = [], [], []
         for s in range(0, len(crops_bgr), self.batch):
             X = torch.from_numpy(np.stack([preprocess(c) for c in crops_bgr[s:s + self.batch]])).to(self.device)
             X = X.half() if self.half else X
-            t, P, rd = candidate_probs(self.model, X, rosters[s:s + self.batch], colours[s:s + self.batch],
-                                       self.colour_eps if use_colour else None, with_read)
+            t, LP, rd = score_batch(self.model, X, rosters[s:s + self.batch], with_read)
             teams_all += t
-            P_all += list(P)
+            LP_all += list(LP)
             reads_all += rd or [None] * len(t)
-        return teams_all, P_all, reads_all
+        return teams_all, LP_all, reads_all
 
     def read(self, crops_bgr: Sequence[np.ndarray], rosters, colours=None, use_colour=None) -> List[dict]:
         if not len(crops_bgr):
             return []
+        rosters = list(rosters)
+        colours = list(colours) if colours is not None else [None] * len(rosters)
         use_colour = self.use_colour if use_colour is None else use_colour
-        teams, P, reads = self.probs(list(crops_bgr), list(rosters), colours, use_colour, with_read=True)
-        t_p, t_m = self.t[bool(use_colour)]
+        rule = self.rules["colour" if use_colour else "plain"]
+        teams, LPs, reads = self.scores(list(crops_bgr), rosters, with_read=True)
         out = []
-        for tm, p, rd in zip(teams, P, reads):
-            k = int(decide(p[None], t_p, t_m)[0])
-            j = int(p.argmax())
-            probs = {t: float(p[i]) for i, t in enumerate(tm)}
+        for t, lp, r, c, rd in zip(teams, LPs, rosters, colours, reads):
+            k_, P = apply_rule(lp[None, :len(t)], [t], [r], [c], rule)
+            k, p = int(k_[0]), P[0]
+            probs = {team: float(p[i]) for i, team in enumerate(t)}
             probs[OTHER] = float(p[-1])
-            out.append({"probs": probs, "team": tm[k] if k >= 0 else None,
-                        "p": float(p[j]), "abstain": k < 0, "read": rd})
+            out.append({"probs": probs, "team": t[k] if k >= 0 else None, "p": float(p.max()),
+                        "abstain": k < 0, "read": rd, "roster_mass": float(np.exp(lp[:len(t)]).sum())})
         return out
 
 
 # ----------------------------------------------------------------------------- evaluation
-def eval_rows(model, rows, blobs, device, colour_eps=None, batch=256, with_read=False):
+def eval_rows(model, rows, blobs, device, batch=256, with_read=False):
+    """-> (LP [N, K], teams, rosters, colours, truth, reads)."""
     import torch
-    teams_all, P_all, reads_all = [], [], []
+    teams_all, LP_all, reads_all = [], [], []
     for s in range(0, len(rows), batch):
         X = torch.from_numpy(np.stack([preprocess(decode_jpeg(b)) for b in blobs[s:s + batch]])).to(device)
-        rs = rows[s:s + batch]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            t, P, rd = candidate_probs(model, X, [r["roster"] for r in rs], [r["colour"] for r in rs],
-                                       colour_eps, with_read)
+            t, LP, rd = score_batch(model, X, [r["roster"] for r in rows[s:s + batch]], with_read)
         teams_all += t
-        P_all.append(P)
+        LP_all.append(LP)
         reads_all += rd or [None] * len(t)
-    return teams_all, np.concatenate(P_all) if P_all else np.zeros((0, 7)), reads_all
+    LP = np.concatenate(LP_all) if LP_all else np.zeros((0, 6))
+    return (LP, teams_all, [r["roster"] for r in rows], [r["colour"] for r in rows],
+            [r.get("team") for r in rows], reads_all)
 
 
 def by_bucket(pred, teams, rows) -> dict:
@@ -385,6 +484,48 @@ def named_rate(pred) -> dict:
     n = len(pred)
     k = int((pred >= 0).sum())
     return {"n": n, "named": k, "named_pct": round(100 * k / max(1, n), 2)}
+
+
+VARIANTS = (("plain", None), ("colour", "eps"), ("colour_hard", 0.0))
+
+
+def val_report(model, dev, colour_eps: float, seen: set, cache: dict) -> tuple:
+    """Tune one rule per colour variant on val (+ propagated val crops) and report val metrics."""
+    for k, fn in (("val", lambda: jev_rows(("val",))), ("prop", lambda: propagated_rows(("val",))),
+                  ("unr", lambda: jev_rows(("val",), unreadable=True))):
+        if k not in cache:
+            rows = fn()
+            cache[k] = (rows, load_bytes(rows))
+    ev = {k: eval_rows(model, cache[k][0], cache[k][1], dev) for k in ("val", "prop", "unr")}
+    rules, res = {}, {}
+    for name, eps in VARIANTS:
+        eps = colour_eps if eps == "eps" else eps
+        tuned = tune_rule({"val": ev["val"][:5], "prop": ev["prop"][:5]}, eps)
+        rule = tuned["rule"]
+        rules[name] = rule
+        out = {"rule": rule}
+        for k in ("val", "prop"):
+            LP, teams, rosters, colours, truth, _ = ev[k]
+            pred, _ = apply_rule(LP, teams, rosters, colours, rule)
+            rows = cache[k][0]
+            out[k] = {"all": tally(pred, teams, truth), "by_size": by_bucket(pred, teams, rows),
+                      "by_year": by_key(pred, teams, rows, lambda r: r["year"])}
+            if k == "val":
+                out[k]["team_seen_in_train"] = by_key(pred, teams, rows, lambda r: r["team"] in seen)
+        # the earlier, stricter "mass" rule on the same val set, for comparison
+        mass = tune_rule({"val": ev["val"][:5], "prop": ev["prop"][:5]}, eps, modes=("mass",))
+        LP, teams, rosters, colours, truth, _ = ev["val"]
+        out["val_mass_rule"] = {"rule": mass["rule"],
+                                "all": tally(apply_rule(LP, teams, rosters, colours, mass["rule"])[0], teams, truth)}
+        LP, teams, rosters, colours, _, _ = ev["unr"]
+        pred, _ = apply_rule(LP, teams, rosters, colours, rule)
+        urows = cache["unr"][0]
+        out["jev_unreadable_named"] = {j: named_rate(pred[[i for i, r in enumerate(urows) if r["jev_top"] == j]])
+                                       for j in ("unreadable", "not_robot")}
+        res[name] = out
+        print(name, json.dumps(rule), "val", json.dumps(out["val"]["all"]), "prop", json.dumps(out["prop"]["all"]),
+              "unr", json.dumps(out["jev_unreadable_named"]), flush=True)
+    return rules, res
 
 
 # ----------------------------------------------------------------------------- training
@@ -429,6 +570,7 @@ def cmd_train(a) -> None:
                                                 cycle_momentum=False)
     rng = np.random.default_rng(a.seed)
     step, hist = 0, []
+    soft = {"mode": "softmax", "T": 2.0, "floor": -1e9, "colour_eps": None}
     for ep in range(a.epochs):
         ds.epoch = ep
         model.train()
@@ -449,42 +591,19 @@ def cmd_train(a) -> None:
                 print(f"  step {step}/{steps} loss {tl / tn:.4f} {tn * a.bs / (time.time() - te):.0f} img/s",
                       flush=True)
         model.eval()
-        teams, P, _ = eval_rows(model, val, vblobs, dev)
-        top1 = tally(decide(P, 0.0, 0.0), teams, [r["team"] for r in val])
-        th = tune_thresholds(P, teams, [r["team"] for r in val])
-        hist.append({"epoch": ep, "loss": tl / max(1, tn), "val_top1": top1, "val_tuned": th})
-        print(f"epoch {ep} loss {tl / max(1, tn):.4f} val top1 {top1['right']}/{top1['n']} "
-              f"tuned t_p={th['t_p']} t_m={th['t_m']} -> {th['val']} ({time.time() - te:.0f}s)", flush=True)
+        LP, teams, rosters, colours, truth, _ = eval_rows(model, val, vblobs, dev)
+        top1 = tally(apply_rule(LP, teams, rosters, colours, dict(soft, t_p=0.0, t_m=0.0))[0], teams, truth)
+        hist.append({"epoch": ep, "loss": tl / max(1, tn), "val_top1": top1})
+        print(f"epoch {ep} loss {tl / max(1, tn):.4f} val roster top-1 {top1['right']}/{top1['n']} "
+              f"({time.time() - te:.0f}s)", flush=True)
 
-    # final val report + thresholds (plain and colour prior)
     seen = {r["team"] for r in rows}
-    truth = [r["team"] for r in val]
+    rules, vres = val_report(model, dev, a.colour_eps, seen, {})
     res = {"train_rows": len(rows), "train_sources": dict(Counter(r["src"] for r in rows)),
-           "synth": a.synth, "epochs": a.epochs, "lr": a.lr, "bs": a.bs, "history": hist}
-    thresholds = {}
-    for name, eps in (("plain", None), ("colour", a.colour_eps), ("colour_hard", 0.0)):
-        teams, P, _ = eval_rows(model, val, vblobs, dev, colour_eps=eps)
-        th = tune_thresholds(P, teams, truth)
-        pred = decide(P, th["t_p"], th["t_m"])
-        thresholds[name] = {"t_p": th["t_p"], "t_m": th["t_m"]}
-        res[f"val_{name}"] = {"thresholds": thresholds[name], "all": tally(pred, teams, truth),
-                              "top1_no_abstain": tally(decide(P, 0.0, 0.0), teams, truth),
-                              "by_size": by_bucket(pred, teams, val),
-                              "by_year": by_key(pred, teams, val, lambda r: r["year"]),
-                              "team_seen_in_train": by_key(pred, teams, val, lambda r: r["team"] in seen)}
-        print(name, json.dumps(res[f"val_{name}"]["all"]), flush=True)
-    # hallucination check: val crops Jev called unreadable / not_robot
-    unr = jev_rows(("val",), unreadable=True)
-    ublobs = load_bytes(unr)
-    for name, eps in (("plain", None), ("colour", a.colour_eps)):
-        teams, P, _ = eval_rows(model, unr, ublobs, dev, colour_eps=eps)
-        pred = decide(P, thresholds[name]["t_p"], thresholds[name]["t_m"])
-        res[f"val_jev_unreadable_{name}"] = {
-            k: named_rate(pred[[i for i, r in enumerate(unr) if r["jev_top"] == k]])
-            for k in ("unreadable", "not_robot")}
-    print("jev-unreadable named:", json.dumps({k: v for k, v in res.items() if k.startswith("val_jev_unr")}))
+           "synth": a.synth, "epochs": a.epochs, "lr": a.lr, "bs": a.bs, "history": hist,
+           **{f"val_{k}": v for k, v in vres.items()}}
     ck = {"config": cfg, "state_dict": {k: v.detach().half().cpu() for k, v in model.state_dict().items()},
-          "thresholds": thresholds, "colour_eps": a.colour_eps, "use_colour": True,
+          "rules": rules, "colour_eps": a.colour_eps, "use_colour": True,
           "img_size": [IMG_H, IMG_W], "pad": 0.25, "arch": "parseq-base digits", "max_wrong": MAX_WRONG,
           "train_teams": sorted(seen), "report": json.loads(json.dumps(res, default=float))}
     MODELS.mkdir(parents=True, exist_ok=True)
@@ -494,60 +613,81 @@ def cmd_train(a) -> None:
     print(f"saved {out}")
 
 
+def cmd_retune(a) -> None:
+    """Re-tune the decision rules of a trained checkpoint on val (no TEST data touched)."""
+    import torch
+    _, _, MODELS = _paths()
+    model, ck = load_ckpt(MODELS / a.ckpt, a.device)
+    seen = set(ck.get("train_teams", []))
+    rules, vres = val_report(model, a.device, ck.get("colour_eps", 0.05), seen, {})
+    rep = dict(ck.get("report", {}))
+    rep = {k: v for k, v in rep.items() if not k.startswith("val_")}
+    rep.update({f"val_{k}": v for k, v in vres.items()})
+    ck.update(rules=rules, report=json.loads(json.dumps(rep, default=float)))
+    ck.pop("thresholds", None)
+    torch.save(ck, MODELS / a.ckpt)
+    (MODELS / (Path(a.ckpt).stem + "_val.json")).write_text(json.dumps(rep, indent=1, default=float))
+    print(f"re-tuned {a.ckpt}")
+
+
 # ----------------------------------------------------------------------------- TEST (once)
-def latency(model, device, n: int = 512, batch: int = 64) -> dict:
+def latency(model, device, n: int = 1024, batch: int = 128) -> dict:
     import torch
     rng = np.random.default_rng(0)
     crops = [rng.integers(0, 255, (int(rng.integers(30, 90)), int(rng.integers(60, 200)), 3), np.uint8)
              for _ in range(n)]
     rosters = [{"red": ["254", "1678", "118"], "blue": ["10254", "971", "6800"]}] * n
     model.half()
-    out = {}
+    out = {"batch": batch, "dtype": "fp16"}
     for with_read in (False, True):
-        for _ in range(2):
-            t0 = time.time()
+        for _ in range(2):  # second pass timed (warm)
+            t_gpu, t0 = 0.0, time.time()
             for s in range(0, n, batch):
                 X = torch.from_numpy(np.stack([preprocess(c) for c in crops[s:s + batch]])).to(device).half()
-                candidate_probs(model, X, rosters[s:s + batch], None, None, with_read)
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
+                g0 = time.time()
+                score_batch(model, X, rosters[s:s + batch], with_read)
+                torch.cuda.synchronize()
+                t_gpu += time.time() - g0
             dt = time.time() - t0
-        out["ms_per_crop" + ("_with_free_read" if with_read else "")] = round(1000 * dt / n, 3)
+        sfx = "_with_free_read" if with_read else ""
+        out["ms_per_crop_total" + sfx] = round(1000 * dt / n, 3)
+        out["ms_per_crop_model" + sfx] = round(1000 * t_gpu / n, 3)
     model.float()
-    out["batch"] = batch
     return out
 
 
 def cmd_test(a) -> None:
-    import torch
     _, _, MODELS = _paths()
     model, ck = load_ckpt(MODELS / a.ckpt, a.device)
-    th = ck["thresholds"]
-    eps = ck["colour_eps"]
-    rep = {"ckpt": a.ckpt, "val": {k: v for k, v in ck["report"].items() if k.startswith("val_")},
-           "synth": ck["report"].get("synth"), "thresholds": th, "colour_eps": eps}
+    rules = ck["rules"]
+    rep = {"ckpt": a.ckpt, "synth": ck["report"].get("synth"), "rules": rules,
+           "val": {k: v for k, v in ck["report"].items() if k.startswith("val_")}}
     test = jev_rows(("test",))
-    tb = load_bytes(test)
-    gold = [r for r in gold_rows("b2")]
-    gb = load_bytes(gold)
-    for name, e in (("plain", None), ("colour", eps), ("colour_hard", 0.0)):
-        t = th[name]
-        teams, P, _ = eval_rows(model, test, tb, a.device, colour_eps=e)
-        pred = decide(P, t["t_p"], t["t_m"])
-        truth = [r["team"] for r in test]
+    ev_t = eval_rows(model, test, load_bytes(test), a.device)
+    prop = propagated_rows(("test",))
+    ev_p = eval_rows(model, prop, load_bytes(prop), a.device)
+    gold = gold_rows("b2")
+    ev_g = eval_rows(model, gold, load_bytes(gold), a.device, with_read=True)
+    for name, _ in VARIANTS:
+        rule = rules[name]
+        LP, teams, rosters, colours, truth, _ = ev_t
+        pred, _ = apply_rule(LP, teams, rosters, colours, rule)
         rep[f"test_jev_{name}"] = {"all": tally(pred, teams, truth), "by_size": by_bucket(pred, teams, test),
-                                   "by_event": by_key(pred, teams, test, lambda r: r["event"]),
-                                   "top1_no_abstain": tally(decide(P, 0.0, 0.0), teams, truth)}
-        teams, P, reads = eval_rows(model, gold, gb, a.device, colour_eps=e, with_read=True)
-        pred = decide(P, t["t_p"], t["t_m"])
+                                   "by_event": by_key(pred, teams, test, lambda r: r["event"])}
+        LP, teams, rosters, colours, truth, _ = ev_p
+        pred, _ = apply_rule(LP, teams, rosters, colours, rule)
+        rep[f"test_propagated_{name}"] = {"all": tally(pred, teams, truth), "by_size": by_bucket(pred, teams, prop)}
+        LP, teams, rosters, colours, _, reads = ev_g
+        pred, _ = apply_rule(LP, teams, rosters, colours, rule)
         named = [i for i, r in enumerate(gold) if r["team"]]
         sub = lambda idx: (pred[idx], [teams[i] for i in idx], [gold[i] for i in idx])  # noqa: E731
         g = {}
         p_, t_, r_ = sub(named)
         g["judge_named"] = {"all": tally(p_, t_, [r["team"] for r in r_]), "by_size": by_bucket(p_, t_, r_),
                             "by_event": by_key(p_, t_, r_, lambda r: r["event"])}
-        # Jev's tracklet label on the same crops, for comparison
         jc = Counter()
-        for r in r_:
+        for r in r_:  # Jev's tracklet label on the same crops, for comparison
             jc["none" if not r["jev_team"] else ("right" if r["jev_team"] == r["team"] else "wrong")] += 1
         g["judge_named_jev_tracklet_label"] = dict(jc)
         for nm, cond in (("jev_unsure", lambda r: r["jev_decision"] == "unsure"),
@@ -556,29 +696,31 @@ def cmd_test(a) -> None:
             p_, t_, r_ = sub(idx)
             g[f"judge_named_{nm}"] = {"all": tally(p_, t_, [r["team"] for r in r_]),
                                       "by_size": by_bucket(p_, t_, r_)}
-        # crops judges could not name: how often does S1 still name a team?
         un = [i for i, r in enumerate(gold) if not r["team"] and not r["conflict"]]
-        g["judge_unnamed"] = {
+        g["judge_unnamed_s1_named"] = {
             "all": named_rate(pred[un]),
             "legible_none": named_rate(pred[[i for i in un if gold[i]["legible_none"]]]),
-            "kind_bumper_or_robot": named_rate(pred[[i for i in un if gold[i]["kind"] in ("bumper", "robot")]])}
+            "kind_bumper_or_robot": named_rate(pred[[i for i in un if gold[i]["kind"] in ("bumper", "robot")]]),
+            # where Jev's tracklet has a team, compare S1's name with it (a judge could not read the crop)
+            "vs_jev_tracklet": tally(np.array([pred[i] for i in un if gold[i]["jev_team"]], int),
+                                     [teams[i] for i in un if gold[i]["jev_team"]],
+                                     [gold[i]["jev_team"] for i in un if gold[i]["jev_team"]])}
+        g["wrong_examples"] = [{"id": gold[i]["id"], "path": gold[i]["path"], "judge": gold[i]["team"],
+                                "s1": teams[i][pred[i]], "read": reads[i], "px_w": gold[i]["px_w"]}
+                               for i in named if pred[i] >= 0 and teams[i][pred[i]] != gold[i]["team"]]
         rep[f"gold_b2_{name}"] = g
-        if name == "colour":
-            rep["gold_b2_examples_wrong"] = [
-                {"id": gold[i]["id"], "path": gold[i]["path"], "judge": gold[i]["team"],
-                 "s1": teams[i][pred[i]], "read": reads[i], "px_w": gold[i]["px_w"]}
-                for i in named if pred[i] >= 0 and teams[i][pred[i]] != gold[i]["team"]]
-        print(name, json.dumps(rep[f"test_jev_{name}"]["all"]), json.dumps(g["judge_named"]["all"]),
-              json.dumps(g["judge_named_jev_unsure"]["all"]), flush=True)
+        print(name, "test", json.dumps(rep[f"test_jev_{name}"]["all"]), "gold", json.dumps(g["judge_named"]["all"]),
+              "gold-jev-unsure", json.dumps(g["judge_named_jev_unsure"]["all"]), flush=True)
     if a.device.startswith("cuda"):
         rep["latency"] = latency(model, a.device)
         print("latency", rep["latency"])
     if a.ablation:
         rep["synth_ablation_val"] = {}
-        for f in a.ablation.split(","):
+        for f in [ck_name for ck_name in a.ablation.split(",") if ck_name]:
             v = json.loads((MODELS / (Path(f).stem + "_val.json")).read_text())
-            rep["synth_ablation_val"][f] = {"synth": v["synth"],
-                                           **{k: v[k]["all"] for k in v if k in ("val_plain", "val_colour")}}
+            rep["synth_ablation_val"][f] = {"synth": v["synth"], **{
+                k: {"val": v[k]["val"]["all"], "prop": v[k]["prop"]["all"], "rule": v[k]["rule"]}
+                for k in v if k in ("val_plain", "val_colour", "val_colour_hard")}}
     out = MODELS / a.report
     out.write_text(json.dumps(rep, indent=1, default=float))
     print(f"wrote {out}")
@@ -602,6 +744,10 @@ def main() -> None:
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default="cuda")
     t.set_defaults(fn=cmd_train)
+    r = sub.add_parser("retune", help="re-tune decision rules on val for a trained checkpoint")
+    r.add_argument("--ckpt", default="s1_digits.pt")
+    r.add_argument("--device", default="cuda")
+    r.set_defaults(fn=cmd_retune)
     e = sub.add_parser("test", help="held-out TEST events + gold b2 (run once)")
     e.add_argument("--ckpt", default="s1_digits.pt")
     e.add_argument("--report", default="s1_report.json")

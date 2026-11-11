@@ -9,15 +9,17 @@ from scripts.teacher.students.parseq import PARSeq, DigitTokenizer, plm_loss
 
 TINY = dict(max_label_length=6, embed_dim=48, enc_num_heads=2, enc_mlp_ratio=2, enc_depth=1,
             dec_num_heads=2, dec_mlp_ratio=2, dec_depth=1, dropout=0.0)
+SOFT = {"mode": "softmax", "T": 2.0, "floor": -1e9, "t_p": 0.0, "t_m": 0.0}
 ROSTER = {"red": ["254", "1678", "118"], "blue": ["10254", "971", "6800"]}
 
 
 def _ckpt(seed=0):
     torch.manual_seed(seed)
     m = PARSeq(**TINY)
-    th = {k: {"t_p": 0.0, "t_m": 0.0} for k in ("plain", "colour", "colour_hard")}
+    rules = {"plain": dict(SOFT, colour_eps=None), "colour": dict(SOFT, colour_eps=0.05),
+             "colour_hard": dict(SOFT, colour_eps=0.0)}
     return {"config": TINY, "state_dict": {k: v.half() for k, v in m.state_dict().items()},
-            "thresholds": th, "colour_eps": 0.05, "use_colour": True}
+            "rules": rules, "colour_eps": 0.05, "use_colour": True}
 
 
 def test_tokenizer_roundtrip():
@@ -64,32 +66,49 @@ def test_plm_loss_backprops():
     assert torch.isfinite(loss) and m.head.weight.grad is not None
 
 
-def test_decide_abstains_on_other_low_p_and_small_margin():
+def test_decide_abstains_on_other_low_p_small_margin_and_floor():
     P = np.array([[0.9, 0.05, 0.05],     # confident team 0
                   [0.1, 0.1, 0.8],       # "other" on top -> abstain
                   [0.5, 0.45, 0.05],     # small margin
                   [0.4, 0.3, 0.3]])      # low top-1
     assert D.decide(P, 0.6, 0.2).tolist() == [0, -1, -1, -1]
     assert D.decide(P, 0.0, 0.0).tolist() == [0, -1, 0, 0]
+    assert D.decide(P, 0.0, 0.0, np.array([-1.0, -1, -9, -1]), floor=-5).tolist() == [0, -1, -1, 0]
 
 
-def test_tally_and_threshold_tuning():
+def test_posterior_modes():
+    LP = np.log(np.array([[0.30, 0.02, 0.01], [0.9, 0.05, 0.01]]))
+    pm = D.posterior(LP, np.zeros_like(LP), {"mode": "mass"})
+    assert np.allclose(pm.sum(1), 1) and pm[0, -1] > pm[0, 0]          # most mass off-roster -> other
+    ps = D.posterior(LP, np.zeros_like(LP), {"mode": "softmax", "T": 1.0})
+    assert ps[0, -1] == 0 and ps[0, 0] > 0.9                           # nearest roster number wins
+    hot = D.posterior(LP, np.zeros_like(LP), {"mode": "softmax", "T": 4.0})
+    assert hot[0, 0] < ps[0, 0]                                        # temperature flattens
+
+
+def test_tally_and_rule_tuning():
     P = np.array([[0.99, 0.0, 0.01], [0.6, 0.39, 0.01], [0.7, 0.29, 0.01]])
     teams = [["1", "2"]] * 3
-    truth = ["1", "2", "1"]                              # row 1 is wrong at any threshold < 0.6
+    truth = ["1", "2", "1"]                              # row 1 is wrong unless t_p > 0.6
     r = D.tally(D.decide(P, 0.0, 0.0), teams, truth)
     assert (r["right"], r["wrong"], r["abstain"]) == (2, 1, 0)
-    th = D.tune_thresholds(P, teams, truth, max_wrong=0.0)
-    assert th["val"]["wrong"] == 0 and th["val"]["right"] == 2
+    LP = np.log(P[:, :2] + 1e-9)
+    rosters, colours = [["1", "2"]] * 3, [None] * 3
+    tuned = D.tune_rule({"val": (LP, teams, rosters, colours, truth), "prop": None}, None, max_wrong=0.0)
+    pred, _ = D.apply_rule(LP, teams, rosters, colours, tuned["rule"])
+    t = D.tally(pred, teams, truth)
+    assert t["wrong"] == 0 and t["right"] >= 1
 
 
 def test_colour_prior_downweights_off_alliance():
     m = PARSeq(**TINY).eval()
-    X = torch.randn(1, 3, 32, 128)
-    _, P0, _ = D.candidate_probs(m, X, [ROSTER], ["red"], None)
-    _, P1, _ = D.candidate_probs(m, X, [ROSTER], ["red"], 0.0)
-    assert P0.shape == (1, 7) and np.isclose(P1.sum(), 1.0)
-    assert np.allclose(P1[0, 3:6], 0.0) and P1[0, :3].sum() > P0[0, :3].sum()
+    teams, LP, _ = D.score_batch(m, torch.randn(1, 3, 32, 128), [ROSTER])
+    assert LP.shape == (1, 6) and (LP <= 0).all()
+    lp0 = D.colour_logprior(teams, [ROSTER], ["red"], None)
+    lp1 = D.colour_logprior(teams, [ROSTER], ["red"], 0.0)
+    P0 = D.posterior(LP, lp0, SOFT)
+    P1 = D.posterior(LP, lp1, SOFT)
+    assert np.isclose(P1.sum(), 1.0) and np.allclose(P1[0, 3:6], 0.0) and P1[0, :3].sum() >= P0[0, :3].sum()
 
 
 def test_reader_api_shapes(tmp_path):
@@ -100,7 +119,7 @@ def test_reader_api_shapes(tmp_path):
     out = rd.read(crops, [ROSTER, ROSTER, ["1", "22"]], ["red", None, "blue"])
     assert len(out) == 3
     for o in out:
-        assert set(o) == {"probs", "team", "p", "abstain", "read"}
+        assert set(o) == {"probs", "team", "p", "abstain", "read", "roster_mass"}
         assert np.isclose(sum(o["probs"].values()), 1.0)
         assert o["abstain"] == (o["team"] is None)
     assert set(out[2]["probs"]) == {"1", "22", "other"}

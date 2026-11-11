@@ -174,6 +174,43 @@ def download_match_video(video_key: str, out_path: Path) -> Path:
     return out_path
 
 
+def later_reference_videos(event_key: str, matches, after_key: str, dirs=None,
+                           download_dir=None, downloader: Callable = None, limit: int = 3):
+    """Yield (match_key, video_path) for matches AFTER ``after_key`` (match order) to
+    calibrate a camera on when it moved during the reference match: local footage
+    first, then (``downloader`` given) qual matches with a TBA video, downloading
+    each only when reached. At most ``limit`` candidates; download failures are
+    skipped."""
+    dirs = dirs or FOOTAGE_DIRS
+    after = match_sort_key(after_key)
+    by_key = {m.get("key"): m for m in (matches or []) if m.get("key")}
+    keys = sorted((set(by_key) | _local_keys_for_event(event_key, dirs)), key=match_sort_key)
+    later = [k for k in keys if match_sort_key(k) > after]
+    n = 0
+    for mk in later:
+        p = local_video_for(mk, dirs)
+        if p is not None:
+            n += 1
+            yield mk, p
+            if n >= limit:
+                return
+    if downloader is None:
+        return
+    for mk in later:
+        m = by_key.get(mk)
+        if (local_video_for(mk, dirs) is not None or m is None or not m.get("video_key")
+                or match_sort_key(mk)[0] != 0):
+            continue
+        try:
+            path = Path(downloader(m["video_key"], Path(download_dir or DOWNLOAD_DIR) / f"{mk}.mp4"))
+        except Exception:
+            continue
+        n += 1
+        yield mk, path
+        if n >= limit:
+            return
+
+
 def resolve_reference_video(event_key: str, matches, dirs=None, download_dir=None,
                             downloader: Callable = download_match_video):
     """(match_key, video_path) for the event's reference match, downloading it if no

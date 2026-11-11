@@ -11200,19 +11200,64 @@ def _auto_calib_judge():
         return None
 
 
+def _auto_calib_pick_steady(event: str, camera: str, match_key: str, video, cl, cfg,
+                            matches=()):
+    """(match_key, video, moved_notes) for this camera: the reference match unless the
+    camera was re-aimed DURING it — one calibration cannot fit both framings — in
+    which case the first later match (local footage first, then a download) where it
+    held still. ``moved_notes`` lists every match it moved on."""
+    from web.field import camera_motion
+    detect = auto_calibrate.make_detect_fn()
+    notes = []
+    cands = auto_calibrate.later_reference_videos(
+        event, matches, match_key, downloader=auto_calibrate.download_match_video)
+    for mk, path in [(match_key, video), *cands]:
+        try:
+            mot = camera_motion.detect_camera_move(path, cl.crop, cfg.window, detect)
+        except Exception as e:
+            print(f"[auto-calib] {event}/{camera}: motion check on {mk} failed: {e}")
+            return mk, path, notes
+        if not mot["moved"]:
+            return mk, path, notes
+        notes.append({"match": mk, "t_s": mot["t_s"], "shift_px": mot["shift_px"]})
+        print(f"[auto-calib] {event}/{camera}: {camera_motion.describe(mot)} on {mk} — "
+              f"trying a later match")
+    return match_key, video, notes        # no steady match found: report on the reference
+
+
 def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
-                           cl, fm) -> dict:
+                           cl, fm, matches=()) -> dict:
     """Worker-thread body for one camera: solve/verify, persist record + overlay."""
+    # Corners are held to the same gate as the job-time per-match corner check
+    # (corner_check_max_m), not main's looser drift gate: a corner "verified" at
+    # 0.48 m (2026hop qm4) is not usable.
+    gate = (CALIB_DRIFT_MAX_M if camera == "main"
+            else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
+    cfg = auto_calibrate.AutoCalibConfig(
+        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
+        field_season=_AUTO_CALIB_SEASON)
+    ref_key = match_key
+    match_key, video, moved = _auto_calib_pick_steady(event, camera, match_key, video,
+                                                      cl, cfg, matches)
     versions = field_store.load_versions(event, camera)
     epoch = select_epoch(versions, match_key) if versions else None
     masks = (epoch["calibration"].masks if epoch is not None and epoch["calibration"].masks
              else cl.masks)
-    cfg = auto_calibrate.AutoCalibConfig(
-        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=CALIB_DRIFT_MAX_M,
-        field_season=_AUTO_CALIB_SEASON)
     res = auto_calibrate.run_camera(video, match_key, camera, cl.crop, fm, versions,
                                     cfg=cfg, masks=masks, judge=_auto_calib_judge())
     rec = res.record
+    if moved:
+        rec["moved_mid_match"] = moved
+        where = ", ".join(f"{n['match']} (~{n['t_s']:.0f} s, {n['shift_px']:.0f} px)"
+                          for n in moved)
+        if match_key != ref_key:
+            note = f"camera moved mid-match on {where} — calibrated on {match_key} instead"
+        else:
+            note = (f"camera moved mid-match on {where} and no steady later match was "
+                    f"found — check carefully")
+            if rec.get("status") in ("ready", "verified"):
+                rec["status"] = "failed"
+        rec["reason"] = f"{note}; {rec.get('reason', '')}"
     rec["crop"] = [int(v) for v in cl.crop]      # the crop this candidate is solved in
     rec["preview"] = None
     rec["frame"] = None
@@ -11283,7 +11328,7 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
         t0 = time.time()
         try:
             rec = await asyncio.to_thread(_auto_calibrate_camera, event, cam,
-                                          match_key, video, layout[cam], fm)
+                                          match_key, video, layout[cam], fm, matches)
             print(f"[auto-calib] {event}/{cam}: {rec['status']} ({rec.get('method')}) "
                   f"in {time.time() - t0:.0f}s — {rec.get('reason')}")
         except Exception as e:

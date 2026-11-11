@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from web.field import auto_calibrate as ac
+from web.field import camera_motion
 from web.field.calibration import pose_plausibility, tag_alignment_error
 
 LABEL = "auto per-match (corner)"
@@ -44,6 +45,7 @@ class CornerStepConfig:
     median_frames: int = 31
     max_center_shift_m: float = 1.0
     jev_verify: bool = True
+    detect_motion: bool = True      # drop a corner re-aimed during the match
 
 
 @dataclass
@@ -120,6 +122,22 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
         from web.field.tag_locator import make_roi_detect_fn
         roi_detect_fn = make_roi_detect_fn()
     ecal, vid = epoch["calibration"], epoch["version_id"]
+    # A camera re-aimed DURING the match cannot be served by any one calibration —
+    # its tracking for this match is invalid. Drop it (never adopt a solve from the
+    # mixed footage); the next match's job calibrates on its own, post-move footage.
+    if cfg.detect_motion:
+        mot = camera_motion.detect_camera_move(
+            video, crop, (frame_range[0] / fps, frame_range[1] / fps), detect_fn)
+        if mot["moved"]:
+            overlay = _overlay_on_median(video, crop, frame_range, fps, ecal, fm, masks,
+                                         detect_fn, roi_detect_fn, cfg.median_frames)
+            return CornerOutcome(
+                "dropped", f"{camera_motion.describe(mot)} — this camera's tracking is "
+                           f"invalid for {match_key}; dropped for this match (the next "
+                           f"match calibrates on its own footage)",
+                vid, None, {"moved_mid_match": {k: mot[k] for k in
+                                                ("t_s", "shift_px", "stepping", "two_sided")}},
+                overlay=overlay, seconds=time.time() - t0)
     chk = check_epoch(ecal, video, crop, frame_range, fm, detect_fn, cfg)
     metrics = {"check_best_m": chk["best_m"], "check_tags": chk["n_tags"],
                "check_min_tags": chk["min_tags_used"], "check_frames": chk["frames"]}

@@ -51,7 +51,11 @@ import supervision as sv
 # do under pytest (which runs from the root). Harmless when already present.
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from web.embedder import RobotEmbedder, cosine_similarity, _apply_mask
+from web.embedder import (
+    ACTIVE_MODEL as EMBED_ACTIVE_MODEL, DINOV3_THRESHOLDS, RobotEmbedder, _apply_mask,
+    cosine_similarity, embedder_model_name, make_robot_embedder, resolve_embedder_backend,
+    thresholds_for,
+)
 from web.job_config import JobConfig
 from web import clef_reader
 from web import jev_reader
@@ -1113,6 +1117,13 @@ async def _run_job_serialized(job: "InferenceJob") -> None:
                                 "progress": 0.0})
         await job.process_video()
     finally:
+        # The appearance embedder is only used by tracking + the analysis
+        # loop; drop its weights so finished jobs (kept JOB_RETENTION deep)
+        # don't pin them.
+        try:
+            job._release_embedder()
+        except Exception:
+            pass
         _job_slots.release()
 
 
@@ -1365,6 +1376,15 @@ class InferenceJob:
         # Per-job knob values (override > env > default), validated at submit.
         # Legacy callers that don't pass a config get pure env/defaults.
         self.config = config if config is not None else JobConfig()
+        # Appearance embedder backend (robot_embedder knob) + its per-model
+        # cosine thresholds. Resolved up front (cheap: checkpoint + CUDA check)
+        # so the gallery load, registries and the tracker all agree on one
+        # embedding space; the weights load later with the tracker.
+        self.embed_backend, self._embed_fallback_reason = resolve_embedder_backend(
+            getattr(self.config, "robot_embedder", "dinov3"))
+        self.embed_thresholds = thresholds_for(self.embed_backend)
+        if self._embed_fallback_reason:
+            print(f"  [embedder] WARNING: {self._embed_fallback_reason}")
         if config is not None:
             self.team_reader = self.config.team_reader
         else:
@@ -1519,7 +1539,8 @@ class InferenceJob:
         self.identity_registry = self._build_identity_registry()
         # slot_id -> fused track id that last fed it (binding-disruption check).
         self._slot_feed_track: Dict[int, Any] = {}
-        self.confidence_config = ConfidenceConfig()
+        self.confidence_config = ConfidenceConfig(
+            confident_margin=self._emb_thr().confident_margin)
         self.co_occlusion_tracker = CoOcclusionTracker()
         # max_events raised well above a full multi-view match's event volume so
         # late-match diagnostics (e.g. sam2.object_culled) aren't truncated — the
@@ -1532,7 +1553,7 @@ class InferenceJob:
         self.robot_tracks: Dict[int, RobotTrack] = {}
         self.gallery: Optional[AppearanceGallery] = None  # loaded in process_video if enabled
         self._gallery_deposits = AppearanceGallery(
-            dedup_sim=GALLERY_DEDUP_SIM,
+            dedup_sim=self._gallery_dedup_sim(),
             max_exemplars=GALLERY_MAX_EXEMPLARS,
         )
         self._pending_gallery_rows: list = []  # buffered exemplar rows, flushed (awaited) at finalize
@@ -2303,7 +2324,8 @@ class InferenceJob:
                     sam_budget_frac=self.config.selective_sam_budget_frac,
                     kill_coast=self.config.selective_kill_coast,
                     kill_coast_frames=self.config.selective_kill_coast_frames,
-                    app_weight=self.config.selective_app_weight,
+                    app_weight=(self.config.selective_app_weight
+                                * self._emb_thr().selective_app_scale),
                     app_ema=self.config.selective_app_ema,
                     starve_windows=self.config.selective_starve_windows,
                     starve_trigger=self.config.selective_starve_trigger,
@@ -3335,7 +3357,7 @@ class InferenceJob:
         deposits = getattr(self, "_gallery_deposits", None)
         if deposits is None:
             deposits = AppearanceGallery(
-                dedup_sim=GALLERY_DEDUP_SIM,
+                dedup_sim=self._gallery_dedup_sim(),
                 max_exemplars=GALLERY_MAX_EXEMPLARS,
             )
             self._gallery_deposits = deposits
@@ -3358,7 +3380,8 @@ class InferenceJob:
             "job_id": self.job_id,
             # Tag with the model that actually produced this vector, so a later
             # switch to a different embedder can't cosine-compare across spaces.
-            "embed_model": getattr(getattr(self, "robot_embedder", None), "model_name", None),
+            "embed_model": (getattr(getattr(self, "robot_embedder", None), "model_name", None)
+                            or self._embed_model_tag()),
         })
 
     def _record_frame_evidence(self, fused, frame_num, main_person_boxes):
@@ -3419,7 +3442,10 @@ class InferenceJob:
         for slot_id, robot in self.robot_tracks.items():
             if robot.team_number_confirmed:
                 continue
-            verdict, team, sim = _apply_gallery_vote(robot, self.gallery)
+            conf_sim, conf_gap, sup_sim = self._gallery_vote_thresholds()
+            verdict, team, sim = _apply_gallery_vote(
+                robot, self.gallery, confirm_sim=conf_sim, confirm_gap=conf_gap,
+                supplement_sim=sup_sim)
             if verdict == "none" or not team:
                 continue
             card = by_slot.get(slot_id)
@@ -5885,7 +5911,8 @@ class InferenceJob:
             track = self.robot_tracks[cached]
             appearance_ok = (
                 det_embed is None or track.appearance_embedding is None
-                or cosine_similarity(det_embed, track.appearance_embedding) >= APP_FLOOR
+                or cosine_similarity(det_embed, track.appearance_embedding)
+                >= self._emb_thr().app_floor
             )
             if appearance_ok and cached not in claimed:
                 claimed.add(cached)
@@ -5902,7 +5929,7 @@ class InferenceJob:
         ]
         action, rid = reid.choose_canonical_match(
             det_pos=position, det_embed=det_embed, det_alliance=alliance,
-            tracks=tracks, app_floor=APP_FLOOR, pos_gate=POS_GATE_PX,
+            tracks=tracks, app_floor=self._emb_thr().app_floor, pos_gate=POS_GATE_PX,
             w_pos=W_POS, w_app=W_APP,
             cap_per_alliance=MAX_ROBOTS_PER_ALLIANCE, cap_total=MAX_ROBOTS_TOTAL,
             claimed=claimed,
@@ -6092,10 +6119,53 @@ class InferenceJob:
                 self.identity_registry._next_id = slot_id + 1
         return self._get_or_create_identity_track(ident.identity_id, alliance)
 
+    def _emb_thr(self):
+        """The job's appearance thresholds (web.embedder.EmbedThresholds for
+        its embedder backend); DINOv3's for partially-built jobs."""
+        return getattr(self, "embed_thresholds", None) or DINOV3_THRESHOLDS
+
+    def _embed_model_tag(self) -> str:
+        """embed_model tag of this job's vectors (gallery / crop rows), known
+        before the weights load. Cached; DINOv3's ACTIVE_MODEL on failure."""
+        tag = getattr(self, "_embed_model_tag_cache", None)
+        if tag is None:
+            try:
+                tag = embedder_model_name(getattr(self, "embed_backend", "dinov3"))
+            except Exception:
+                tag = EMBED_ACTIVE_MODEL
+            self._embed_model_tag_cache = tag
+        return tag
+
+    def _gallery_vote_thresholds(self) -> tuple:
+        """(confirm_sim, confirm_gap, supplement_sim) for this job's embedder.
+        DINOv3 keeps the env-overridable GALLERY_* module values."""
+        if getattr(self, "embed_backend", "dinov3") != "s4":
+            return GALLERY_CONFIRM_SIM, GALLERY_CONFIRM_GAP, GALLERY_SUPPLEMENT_SIM
+        thr = self._emb_thr()
+        return thr.gallery_confirm_sim, thr.gallery_confirm_gap, thr.gallery_supplement_sim
+
+    def _gallery_dedup_sim(self) -> float:
+        if getattr(self, "embed_backend", "dinov3") != "s4":
+            return GALLERY_DEDUP_SIM
+        return self._emb_thr().gallery_dedup_sim
+
+    def _release_embedder(self) -> None:
+        """Drop the job's appearance embedder weights (end of job)."""
+        emb = getattr(self, "robot_embedder", None)
+        self.robot_embedder = None
+        if emb is not None and hasattr(emb, "release"):
+            try:
+                emb.release()
+            except Exception:
+                pass
+
     def _build_identity_registry(self) -> IdentityRegistry:
         """The job's IdentityRegistry, wired to the identity_continuity knobs."""
         cfg = getattr(self, "config", None)
+        thr = self._emb_thr()
         return IdentityRegistry(
+            app_floor=thr.identity_floor,
+            update_margin=thr.update_margin,
             continuity=bool(getattr(cfg, "identity_continuity", False)),
             continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
             warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
@@ -6419,7 +6489,7 @@ class InferenceJob:
             appearance_divergent = False
             if is_observed and obs_emb is not None and ident.appearance_embedding is not None:
                 sim = cosine_similarity(obs_emb, ident.appearance_embedding)
-                if sim < 0.7:
+                if sim < self._emb_thr().divergence_sim:
                     appearance_divergent = True
 
             roster_uniqueness_ok = True
@@ -6483,7 +6553,7 @@ class InferenceJob:
                     fired.append(IMMEDIATE_RE_ATTACHMENT)
                     print(f"  Immediate read queued for identity {ident.identity_id}: re-attachment to slot {ident.active_slot}")
                 # low margins
-                if relink_margin < 0.1 and allow_immediate:
+                if relink_margin < self._emb_thr().confident_margin and allow_immediate:
                     fired.append(IMMEDIATE_LOW_MARGIN)
                     print(f"  Immediate read queued for identity {ident.identity_id}: low relink margin {relink_margin:.2f}")
                 # appearance divergence
@@ -7707,11 +7777,13 @@ class InferenceJob:
                             self.match_key,
                             teams=roster_teams or None,
                             verified_only=self.config.gallery_verified_only,
+                            embed_model=self._embed_model_tag(),
                         )
                         if self.match_key else []
                     )
                     self.gallery = AppearanceGallery.from_rows(
-                        rows, dedup_sim=GALLERY_DEDUP_SIM, max_exemplars=GALLERY_MAX_EXEMPLARS)
+                        rows, dedup_sim=self._gallery_dedup_sim(),
+                        max_exemplars=GALLERY_MAX_EXEMPLARS)
                     scope = (
                         f"match teams {roster_teams}"
                         if roster_teams else "all event teams (no match roster)"
@@ -7991,7 +8063,9 @@ class InferenceJob:
                                 f"{self.model_size} model, "
                                 f"vos_optimized={self.config.sam2_vos_optimized and device == 'cuda'}"
                             )
-                        embedder = RobotEmbedder()
+                        embedder = make_robot_embedder(self.embed_backend)
+                        print(f"  [embedder] backend={self.embed_backend} "
+                              f"model={embedder.model_name} thresholds={self._emb_thr()}")
                         self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
                         return tracker, detail, embedder
 
@@ -8880,6 +8954,7 @@ class InferenceJob:
                     self.use_sam2 = False
                 else:
                     self.fused_registry = FusedTrackRegistry(
+                        app_floor=self._emb_thr().relink_floor,
                         relink_max_dist_m=self.config.relink_max_dist_m)
 
                 # Every tracklet the analysis loop will ever read is already
@@ -9306,10 +9381,18 @@ class InferenceJob:
                             det_embeds = [None] * len(embed_candidates)
                             if small_frame is not None and embed_candidates:
                                 with self._stage("loop.embed"):
-                                    det_embeds = self.robot_embedder.embed_batch(
-                                        small_frame,
-                                        [c[5] for c in embed_candidates],
-                                        masks=[c[6] for c in embed_candidates])
+                                    if getattr(self.robot_embedder, "backend", "dinov3") == "s4":
+                                        # S4's own crop rule: unmasked, box + 10%
+                                        # pad on the FULL-RES view frame (what
+                                        # the harvester crops were cut from).
+                                        det_embeds = self.robot_embedder.embed_batch(
+                                            view_frame,
+                                            [c[1] for c in embed_candidates])
+                                    else:
+                                        det_embeds = self.robot_embedder.embed_batch(
+                                            small_frame,
+                                            [c[5] for c in embed_candidates],
+                                            masks=[c[6] for c in embed_candidates])
 
                             for (obj_id, full_box, xy, corner_weight, color, box_s,
                                  sub_mask), det_embed in zip(embed_candidates, det_embeds):
@@ -10156,8 +10239,9 @@ class InferenceJob:
                             "image": _thumbnail_bytes(c.get("robot_crop_b64") or c["crop_b64"]),
                             # Tag with the model that produced this vector (None
                             # alongside a None embedding — nothing to mismatch).
-                            "embed_model": (getattr(getattr(self, "robot_embedder", None),
-                                                     "model_name", None)
+                            "embed_model": ((getattr(getattr(self, "robot_embedder", None),
+                                                      "model_name", None)
+                                             or self._embed_model_tag())
                                             if has_embedding else None),
                         })
                 await database.upsert_match_robot_identities(identity_rows)

@@ -806,6 +806,18 @@ KNOBS = [
     # logs once). Adds the colour bar and the colour sentence to the card.
     # DEFAULT OFF pending the offline evaluation (spec section 8).
     Knob("event_lineup", "EVENT_LINEUP", bool, False, section="Identity & votes"),
+    # Robot appearance embedder (re-ID relink, identity veto, gallery, the
+    # selective TBD appearance term). "dinov3" = web/embedder.py RobotEmbedder
+    # (frozen DINOv3-S CLS 384-d, 8% inset crop, ROBOT_EMBEDDER_MODEL env
+    # route). "s4" = the teacher-distilled same-robot embedder
+    # (web/students/s4_embedder.py: DINOv3-S fine-tuned with SupCon, 128-d,
+    # harvester crop = box + 10% pad letterboxed, unmasked, full-res frame);
+    # every cosine threshold switches to its S4 value
+    # (web/embedder.py S4_THRESHOLDS, spec §16). Falls back to dinov3 with a
+    # warning when the checkpoint or CUDA is missing. Gallery / crop rows stay
+    # separated by embed_model. DEFAULT dinov3 pending the live A/B.
+    Knob("robot_embedder", "ROBOT_EMBEDDER", str, "dinov3",
+         choices=("dinov3", "s4"), section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /
     # expiry / coasting re-acquisition / feed change / identity birth /

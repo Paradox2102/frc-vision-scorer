@@ -198,8 +198,12 @@ class IdentityRegistry:
         continuity_soft_penalty: float = 0.1,
         warmup_frames: int = 0,
         alliance_by_territory: bool = True,
+        update_margin: float = 0.05,
     ) -> None:
         self.identities: dict[int, RobotIdentity] = {}
+        # Relink-margin gate on appearance EMA updates (cosine units of the
+        # job's embedder: web.embedder.EmbedThresholds.update_margin).
+        self.update_margin = float(update_margin)
         # alliance_by_territory (job knob, default True = legacy): a birth
         # from an observation with no known alliance takes its alliance from
         # the field half (alliance_side_fn). False: that birth is DEFERRED
@@ -405,7 +409,7 @@ class IdentityRegistry:
                         mature_ok = ident.confidence >= self.app_update_floor
                         warm_ok = (self.continuity and self.warmup_frames > 0
                                    and ident.obs_count <= self.warmup_frames)
-                        if obs.relink_margin >= 0.05 and (mature_ok or warm_ok):
+                        if obs.relink_margin >= self.update_margin and (mature_ok or warm_ok):
                             if not mature_ok:
                                 self.stats["warmup_updates"] += 1
                             old_emb = ident.appearance_embedding

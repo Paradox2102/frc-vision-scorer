@@ -5,6 +5,9 @@ from typing import Optional, List
 @dataclass
 class ConfidenceConfig:
     decay_rate: float = 0.005          # decay per frame when occluded/coasting
+    # Relink margin (cosine units of the job's embedder) above which an
+    # observation counts as confident (web.embedder.EmbedThresholds.confident_margin).
+    confident_margin: float = 0.1
     observation_rise: float = 0.02     # rise per frame when observed confidently
     low_margin_drop: float = 0.05      # drop when matched with low margin
     vlm_reinforce: float = 0.15        # rise when VLM read reinforces
@@ -82,7 +85,7 @@ def calculate_confidence_update(
         reasons.append("confirmed_status_floor")
         
     if signals.is_observed:
-        if signals.relink_margin >= 0.1:
+        if signals.relink_margin >= config.confident_margin:
             conf += config.observation_rise
             reasons.append("confident_observation")
         else:

@@ -8,6 +8,7 @@ below) — no caller changes.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import cv2
@@ -24,6 +25,112 @@ DEFAULT_MODEL = "timm/vit_small_patch16_dinov3.lvd1689m"
 ACTIVE_MODEL = os.environ.get("ROBOT_EMBEDDER_MODEL", DEFAULT_MODEL)
 MIN_CROP_PX = 10  # boxes smaller than this on either side yield no embedding
 BOX_INSET = 0.08  # shrink box by this fraction per side to shed background
+
+# Per-job embedder backend (JobConfig.robot_embedder). "dinov3" = RobotEmbedder
+# (ACTIVE_MODEL, env-routable); "s4" = the teacher-distilled S4 same-robot
+# embedder (web/students/s4_embedder.py, 128-d, own crop rule).
+EMBEDDER_BACKENDS = ("dinov3", "s4")
+
+
+@dataclass(frozen=True)
+class EmbedThresholds:
+    """Every cosine threshold / margin / weight that reads an appearance
+    similarity, per embedding space. Cosines from different models live on
+    different scales, so each backend carries its own table (tuned offline:
+    scripts/teacher/students/s4_thresholds.py, design spec §16)."""
+    app_floor: float           # legacy re-ID merge floor (app.APP_FLOOR, reid.py)
+    relink_floor: float        # FusedTrackRegistry appearance relink floor
+    identity_floor: float      # IdentityRegistry appearance veto / bonus floor
+    update_margin: float       # IdentityRegistry EMA-update relink-margin gate
+    confident_margin: float    # confidence rise / low-margin immediate read
+    divergence_sim: float      # obs-vs-identity "appearance divergent" floor
+    gallery_confirm_sim: float
+    gallery_confirm_gap: float
+    gallery_supplement_sim: float
+    gallery_dedup_sim: float
+    selective_app_scale: float  # multiplies JobConfig.selective_app_weight
+
+
+# DINOv3 (and the dinov2 env route): today's hand-set constants, unchanged.
+DINOV3_THRESHOLDS = EmbedThresholds(
+    app_floor=0.55, relink_floor=0.55, identity_floor=0.55,
+    update_margin=0.05, confident_margin=0.10, divergence_sim=0.70,
+    gallery_confirm_sim=0.88, gallery_confirm_gap=0.06,
+    gallery_supplement_sim=0.80, gallery_dedup_sim=0.92,
+    selective_app_scale=1.0,
+)
+# S4: tuned on the S4 VAL events (2026bcvi, 2024mimil — whole events never
+# trained on; the test events are not touched) by
+# scripts/teacher/students/s4_thresholds.py (data/teacher/models/
+# s4_thresholds.json). Rule per threshold: among S4 values whose false-pass
+# rate <= DINOv3's at today's value AND true-pass >= DINOv3's, take the
+# Youden-J (true - false) maximiser. Proxy operating points (DINOv3 -> S4):
+#   relink 0.55 -> 0.59: true 80.2% -> 88.9%, false 40.2% -> 9.4%
+#   divergence 0.70 -> 0.624: not-divergent true 34.9% -> 81.5%, false 3.6% -> 3.6%
+#   confident margin 0.10 -> 0.081: correct 22.6% -> 80.0%, wrong 2.7% -> 2.7%
+#   gallery supplement 0.80 -> 0.845: true 2.2% -> 18.2%, false 0.08% -> 0.08%
+# dedup: same same-team positive quantile; selective_app_scale: equal mean
+# (neg - pos) cost differential (S4 gap 0.366 vs DINOv3 0.061).
+S4_THRESHOLDS = EmbedThresholds(
+    app_floor=0.59, relink_floor=0.59, identity_floor=0.59,
+    update_margin=0.023, confident_margin=0.081, divergence_sim=0.624,
+    gallery_confirm_sim=0.943, gallery_confirm_gap=0.01,
+    gallery_supplement_sim=0.845, gallery_dedup_sim=0.965,
+    selective_app_scale=0.166,
+)
+
+
+def backend_of_model(model_name: Optional[str]) -> str:
+    """Embedding-space family of an ``embed_model`` tag ("s4" | "dinov3")."""
+    return "s4" if (model_name or "").startswith("s4:") else "dinov3"
+
+
+def thresholds_for(backend_or_model: Optional[str]) -> EmbedThresholds:
+    """Threshold table for a backend name ("dinov3"/"s4") or an embed_model tag."""
+    key = backend_or_model or "dinov3"
+    if key not in EMBEDDER_BACKENDS:
+        key = backend_of_model(key)
+    return S4_THRESHOLDS if key == "s4" else DINOV3_THRESHOLDS
+
+
+def resolve_embedder_backend(requested: Optional[str]) -> tuple[str, str]:
+    """(backend actually used, reason). "s4" needs its checkpoint and CUDA;
+    otherwise it falls back to "dinov3" with a reason the job prints as a
+    warning. Unknown names fall back too."""
+    req = (requested or "dinov3").lower()
+    if req not in EMBEDDER_BACKENDS:
+        return "dinov3", f"unknown robot_embedder {requested!r}; using dinov3"
+    if req == "dinov3":
+        return "dinov3", ""
+    try:
+        from web.students import s4_embedder as s4
+    except Exception as e:  # pragma: no cover - import failure only
+        return "dinov3", f"S4 embedder unavailable ({e}); using dinov3"
+    if not s4.DEFAULT_CKPT.exists():
+        return "dinov3", f"S4 checkpoint missing ({s4.DEFAULT_CKPT}); using dinov3"
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return "dinov3", "S4 embedder needs CUDA (none available); using dinov3"
+    except Exception as e:  # pragma: no cover
+        return "dinov3", f"torch unavailable ({e}); using dinov3"
+    return "s4", ""
+
+
+def make_robot_embedder(backend: str = "dinov3"):
+    """Embedder instance for a RESOLVED backend (see resolve_embedder_backend)."""
+    if backend == "s4":
+        from web.students import s4_embedder as s4
+        return s4.S4RobotEmbedder(ckpt=s4.DEFAULT_CKPT)
+    return RobotEmbedder()
+
+
+def embedder_model_name(backend: str) -> str:
+    """The embed_model tag a backend's vectors carry, without loading weights."""
+    if backend == "s4":
+        from web.students import s4_embedder as s4
+        return s4.model_tag(s4.DEFAULT_CKPT)
+    return ACTIVE_MODEL
 
 
 def cosine_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
@@ -83,6 +190,8 @@ def _apply_mask(crop_bgr: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
 class RobotEmbedder:
     """Lazy-loaded appearance embedder. The model loads on first embed() call."""
 
+    backend = "dinov3"
+
     def __init__(self, model_name: str = ACTIVE_MODEL):
         self.model_name = model_name
         self._model = None
@@ -127,6 +236,12 @@ class RobotEmbedder:
             self._model = None
             self._load_failed = True
             return False
+
+    def release(self) -> None:
+        """Drop the model (the job's GPU-release path calls this)."""
+        self._model = None
+        self._processor = None
+        self._transform = None
 
     def embed(self, frame: np.ndarray, box, mask: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """Return an L2-normalized embedding for the crop, or None if invalid/unavailable.

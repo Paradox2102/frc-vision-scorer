@@ -907,12 +907,14 @@ async def insert_gallery_exemplars(rows: List[Dict[str, Any]]) -> None:
 
 
 async def get_gallery_exemplars(
-    event_key: str, teams: Optional[List[str]] = None
+    event_key: str, teams: Optional[List[str]] = None,
+    embed_model: Optional[str] = None,
 ) -> List[Dict]:
     """Gallery exemplars for an event, optionally limited to specific teams.
 
-    Scoped to the active embed_model (NULL rows count as dinov2-small, the
-    only backend that ever ran pre-migration) — a row from a different model
+    Scoped to ``embed_model`` (default: the process's ACTIVE_MODEL; a job on
+    the S4 backend passes its own tag). NULL rows count as dinov2-small, the
+    only backend that ever ran pre-migration — a row from a different model
     is a different vector space and must not surface as if it matches.
     """
     team_filter = list(dict.fromkeys(
@@ -920,7 +922,7 @@ async def get_gallery_exemplars(
         if team is not None and str(team)
     ))
     where = "event_key = ? AND COALESCE(embed_model, ?) = ?"
-    params: List[Any] = [event_key, _LEGACY_EMBED_MODEL, ACTIVE_MODEL]
+    params: List[Any] = [event_key, _LEGACY_EMBED_MODEL, embed_model or ACTIVE_MODEL]
     if team_filter:
         where += f" AND team IN ({','.join('?' for _ in team_filter)})"
         params.extend(team_filter)
@@ -939,8 +941,11 @@ async def get_previous_gallery_exemplars(
     current_match_key: str,
     teams: Optional[List[str]] = None,
     verified_only: bool = False,
+    embed_model: Optional[str] = None,
 ) -> List[Dict]:
     """Return exemplars sourced only from matches before ``current_match_key``.
+
+    Only rows embedded by ``embed_model`` (default: ACTIVE_MODEL) are returned.
 
     Rows without match provenance are intentionally excluded: they cannot be
     proven to come from an earlier match.
@@ -1014,7 +1019,7 @@ async def get_previous_gallery_exemplars(
         # a silent garbage comparison, not a real re-ID signal. The team just
         # has no exemplars yet for the new model, which is fine — cold start.
         where += " AND COALESCE(embed_model, ?) = ?"
-        params.extend([_LEGACY_EMBED_MODEL, ACTIVE_MODEL])
+        params.extend([_LEGACY_EMBED_MODEL, embed_model or ACTIVE_MODEL])
 
         cursor = await db.execute(
             "SELECT id, source_match_key, team, alliance_color, embedding, legibility, "

@@ -2,9 +2,10 @@
 
 Teacher-distillation spec section 14 (docs/superpowers/specs/2026-11-10-teacher-distillation-design.md).
 
-S1 (scripts/teacher/students/digits.py) was trained on the harvester's bumper
-crops: the 2026cur_v3 bumper detector box (conf >= 0.40, imgsz 640 on the
-whole frame, one field of woven video), padded 25% per side, deinterlaced.
+S1 (web/students/digit_reader.py; trained by scripts/teacher/students/digits.py)
+was trained on the harvester's bumper crops: the 2026cur_v3 bumper detector
+box (conf >= 0.40, imgsz 640 on the whole frame, one field of woven video),
+padded 25% per side, deinterlaced.
 The window stage's digit requests are wide tiles around a tracked slot, so
 the reader cuts S1 inputs the harvester's way instead: the bumper detector
 runs on each sample's main-view frame, the bumpers whose centre is near the
@@ -102,9 +103,8 @@ class StudentReader:
                 device = "cpu"
             else:
                 device = "cuda"
-        from scripts.teacher.harvest import BUMPER_WEIGHTS
-        from scripts.teacher.students.digits import DigitReader
-        from scripts.teacher.students.heads import MODELS
+        from web.students.digit_reader import DigitReader
+        from web.students.paths import BUMPER_WEIGHTS, MODELS
         ckpt = MODELS / "s1_digits.pt"
         if not ckpt.exists():
             raise FileNotFoundError(f"S1 checkpoint missing: {ckpt}")

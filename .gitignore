@@ -14,6 +14,11 @@ data/results/
 # not in git (516MB); belong in dataset storage, not shared history.
 data/bumper_hardneg_2026cur/
 data/hub_zone_distill/
+# Teacher distillation (docs/superpowers/specs/2026-11-10-teacher-distillation-design.md):
+# harvested crops, Jev labels, gold sets, feature cache, student checkpoints (~5 GB)
+# and prior-season match videos — local data, not shared history.
+data/teacher/
+data/prior_years/
 models/*.pt
 models/*.onnx
 

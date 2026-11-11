@@ -10080,28 +10080,49 @@ def _render_command(replay_id: str) -> list:
 
 RENDER_TIMEOUT_PER_FRAME_S = 0.5    # ~10x a measured render's per-frame cost
 RENDER_TIMEOUT_MIN_S = 600.0
-RENDER_TIMEOUT_DEFAULT_S = 1800.0   # a row without a frame_count
+RENDER_TIMEOUT_DEFAULT_S = 1800.0   # a row without a usable frame_count
+RENDER_TIMEOUT_MAX_S = 3600.0
 
 
 def _render_timeout_s(row) -> float:
     """How long the worker lets one render subprocess run before killing it:
-    max(600 s, 0.5 s x the replay's frame_count), 1800 s without a count."""
-    n = (row or {}).get("frame_count")
-    if not n:
-        return RENDER_TIMEOUT_DEFAULT_S
-    return max(RENDER_TIMEOUT_MIN_S, RENDER_TIMEOUT_PER_FRAME_S * float(n))
-
-
-def _kill_render(proc) -> None:
-    """Kill the renderer's whole process group (it and its ffmpeg)."""
-    import signal as _signal
+    0.5 s x the replay's frame_count clamped to [600 s, 3600 s]; 1800 s when
+    the count is missing, non-numeric, non-finite or <= 0."""
     try:
-        os.killpg(proc.pid, _signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+        n = float((row or {}).get("frame_count"))
+    except (TypeError, ValueError):
+        return RENDER_TIMEOUT_DEFAULT_S
+    if not math.isfinite(n) or n <= 0:
+        return RENDER_TIMEOUT_DEFAULT_S
+    return min(RENDER_TIMEOUT_MAX_S, max(RENDER_TIMEOUT_MIN_S, RENDER_TIMEOUT_PER_FRAME_S * n))
+
+
+def _render_pgid(proc) -> Optional[int]:
+    """The renderer's process group, captured right after spawn (it runs in
+    its own session, so this is its pid); None when it cannot be read."""
+    try:
+        return os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _kill_render(proc, pgid: Optional[int]) -> None:
+    """Kill the renderer and its ffmpeg. Never signals a process already
+    reaped (its pid / pgid may have been reused): only the pgid captured at
+    spawn, only while ``proc`` is un-reaped; else just ``proc.kill()``."""
+    import signal as _signal
+    if proc.returncode is not None:
+        return
+    if pgid is not None:
         try:
-            proc.kill()
-        except ProcessLookupError:
+            os.killpg(pgid, _signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
             pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def _run_render(replay_id: str) -> None:
@@ -10111,10 +10132,11 @@ async def _run_render(replay_id: str) -> None:
             *_render_command(replay_id), cwd=str(PROJECT_ROOT),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True)
+        pgid = _render_pgid(proc)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
-            _kill_render(proc)
+            _kill_render(proc, pgid)
             await proc.wait()
             await database.set_render_status(replay_id, "render_failed",
                                              f"timeout after {timeout:g} s")

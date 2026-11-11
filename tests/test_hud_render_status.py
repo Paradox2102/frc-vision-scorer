@@ -304,6 +304,30 @@ def test_render_timeout_scales_with_the_frame_count():
     assert app_mod._render_timeout_s({"frame_count": 4000}) == 2000
     assert app_mod._render_timeout_s({"frame_count": None}) == 1800
     assert app_mod._render_timeout_s(None) == 1800
+    assert app_mod._render_timeout_s({"frame_count": 10**9}) == 3600       # clamped
+    for junk in ("abc", 0, -5, "nan", float("inf"), [], {}):
+        assert app_mod._render_timeout_s({"frame_count": junk}) == 1800, junk
+
+
+def test_kill_render_never_signals_a_reaped_process(monkeypatch):
+    import os
+    sent = []
+    monkeypatch.setattr(os, "killpg", lambda pg, sig: sent.append(("killpg", pg)))
+    reaped = SimpleNamespace(pid=12345, returncode=0, kill=lambda: sent.append("kill"))
+    app_mod._kill_render(reaped, 12345)
+    assert sent == []
+
+
+def test_kill_render_uses_the_captured_pgid_else_kill(monkeypatch):
+    import os
+    sent = []
+    monkeypatch.setattr(os, "killpg", lambda pg, sig: sent.append(("killpg", pg)))
+    live = SimpleNamespace(pid=12345, returncode=None, kill=lambda: sent.append("kill"))
+    app_mod._kill_render(live, 777)
+    assert sent == [("killpg", 777)]
+    sent.clear()
+    app_mod._kill_render(live, None)                   # no pgid captured: just the child
+    assert sent == ["kill"]
 
 
 def test_worker_kills_a_render_that_times_out(db, tmp_path, monkeypatch):

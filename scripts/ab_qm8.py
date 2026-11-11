@@ -369,6 +369,10 @@ PROFILES = {
     "wl-on": [("wl_08", {"window_labels": True})],
     # Same, plus the post-finalize HUD render (first knob-on end-to-end runs, Nov 10).
     "wl-hud": [("wl_08_hud", {"window_labels": True, "hud_post_render": True})],
+    # Window-label tiles deinterlaced before the Jev digit reads
+    # (window_labels_deinterlace) vs plain window labels.
+    "wl-deinterlace": [("wl_08", {"window_labels": True}),
+                       ("wl_08_di", {"window_labels": True, "window_labels_deinterlace": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

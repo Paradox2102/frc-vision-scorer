@@ -50,3 +50,9 @@ def test_wait_gives_up_after_the_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(ab, "REPO", tmp_path)
     monkeypatch.setattr(ab, "_replay_saved", lambda job_id, tries=1, delay=0.0: False)
     assert ab._wait_window_labels("job2", timeout_s=0.05, delay=0.01) is False
+
+
+def test_deinterlace_profile_arms():
+    arms = dict(ab.PROFILES["wl-deinterlace"])
+    assert arms == {"wl_08": {"window_labels": True},
+                    "wl_08_di": {"window_labels": True, "window_labels_deinterlace": True}}

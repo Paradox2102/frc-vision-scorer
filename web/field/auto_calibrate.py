@@ -178,6 +178,63 @@ def download_match_video(video_key: str, out_path: Path) -> Path:
     return out_path
 
 
+FREE_LENS_MIN_TAGS = 8   # a freer lens needs this many tags (not just spread) to be supported
+
+
+def free_lens_ladder(cal, corr, image_size, season, fm=None):
+    """Free the lens step by step (k1, then full) from a constrained fit ``cal`` — a
+    freer model is kept only if it fits clearly better (< 0.8 x RMS) and its distortion
+    does not fold back — over the field area in view when ``fm`` is given (else over the
+    points). Needs >= FREE_LENS_MIN_TAGS tags: 4 hub tags + 2 clicked wall tags span
+    4.7 m yet free "k1" fit them at 0.34 px and folded everywhere else (2026casnd
+    corner_right). Callers must also check the tags' field spread (``tag_spread_m``).
+    Returns (cal, the freest model adopted or None)."""
+    from web.field import tag_locator as tl
+    pts = np.vstack([np.asarray(i, float).reshape(-1, 2) for i, _ in corr.values()])
+    n_tags = len({k for k in corr})
+    freed = None
+    if n_tags < FREE_LENS_MIN_TAGS:
+        return cal, None
+    for model in ("k1", "full"):
+        if n_tags < tl.MODEL_MIN_TAGS[model]:
+            break
+        try:
+            c = tl.solve_model(corr, image_size, season, model, prev=cal)
+        except CalibrationError:
+            continue
+        mono = (tl.monotonic_ok(c, corr, fm, image_size) if fm is not None
+                else tl.distortion_monotonic(c, image_size, pts))
+        if c.rms_error < 0.8 * cal.rms_error and mono:
+            cal, freed = c, model
+    return cal, freed
+
+
+def solve_fresh_lens(corr, image_size, season, fm, min_spread_m: float = 2.0,
+                     init_model: str = "pp_k1"):
+    """A camera solve with NO prior lens that cannot run away: the constrained model
+    first (centred principal point, square pixels, one radial term), freed only when
+    the tags span >= ``min_spread_m`` of the field. Tags on one structure fit a free
+    lens perfectly yet extrapolate wildly (2026casnd corner_left). ``corr`` keys may be
+    ints or "a6"/"m6"/"r6". Returns (cal, model, spread_m)."""
+    from web.field import tag_locator as tl
+    from web.field.calibration import _tag_id_of_key
+    cal, err, model = None, None, None
+    for m in (init_model, "pp_k0"):
+        try:
+            cal, model = tl.solve_model(corr, image_size, season, m), m
+            break
+        except CalibrationError as e:
+            err = e
+    if cal is None:
+        raise err or CalibrationError("no constrained model could be solved")
+    ids = {_tag_id_of_key(k) for k in corr} - {None}
+    spread = tag_spread_m(fm, ids)
+    if spread >= min_spread_m:
+        cal, freed = free_lens_ladder(cal, corr, image_size, season, fm)
+        model = freed or model
+    return cal, model, spread
+
+
 def tag_spread_m(fm, tag_ids) -> float:
     """Largest field-plane (x, y) distance between any two of ``tag_ids`` (metres);
     0 for fewer than two known tags. How much of the field the tags constrain."""
@@ -711,18 +768,9 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
             # The locator adds nothing but the decoded tags themselves are numerous and
             # spread: free the lens as the locator would (k1, then full), keeping a
             # freer model only if it fits clearly better without distortion fold-back.
-            for model in ("k1", "full"):
-                if len(corr) < tl.MODEL_MIN_TAGS[model]:
-                    break
-                try:
-                    c = tl.solve_model(corr, image_size, cfg.field_season, model, prev=cal)
-                except CalibrationError:
-                    continue
-                pts = np.vstack([np.asarray(i, float).reshape(-1, 2) for i, _ in corr.values()])
-                if (c.rms_error < 0.8 * cal.rms_error
-                        and tl.distortion_monotonic(c, image_size, pts)):
-                    cal = c
-                    how = f"{how}, model {model}"
+            cal, freed = free_lens_ladder(cal, corr, image_size, cfg.field_season, fm)
+            if freed:
+                how = f"{how}, model {freed}"
         extra["notes"].append(f"tags span {spread:.1f} m of the field")
         if spread < cfg.min_full_solve_spread_m:
             val = validate(cal)

@@ -98,7 +98,9 @@ def test_solve_tags_recovers_and_saves(tmp_path, monkeypatch):
     monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
 
     fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()                       # image_size (1920,1080)
+    # Realistic, non-folding lens: the shared fixture lens folds back inside its own
+    # image and solve-tags now refuses non-monotonic lenses.
+    cam = truth_pinhole_camera(D=__import__('numpy').array([-0.12, 0.02, 0.0, 0.0, 0.0]))
     corr = project_tag_corners(cam, fm)
     auto = {str(tid): corr[tid][0].tolist() for tid in corr}
 
@@ -195,7 +197,7 @@ def test_solve_tags_stores_source_and_dry_run_skips_save(tmp_path, monkeypatch):
     monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
 
     fm = FieldModel.load("2026-rebuilt-welded")
-    cam = truth_pinhole_camera()
+    cam = truth_pinhole_camera(D=__import__('numpy').array([-0.12, 0.02, 0.0, 0.0, 0.0]))
     corr = project_tag_corners(cam, fm)
     auto = {str(tid): corr[tid][0].tolist() for tid in corr}
     body = {"event": "evt_src", "camera": "main", "season": "2026-rebuilt-welded",
@@ -503,3 +505,47 @@ def test_drift_records_lifecycle(tmp_path, monkeypatch):
     field_store.clear_drift("evt_d", "main", "evt_d_qm63")
     r = _client().get("/api/calibration/drift", params={"event": "evt_d"})
     assert "evt_d_qm63" not in r.json()["drift"]["main"]
+
+
+def test_solve_tags_returns_predicted_tags_and_constrains_one_structure(tmp_path, monkeypatch):
+    """One hub's tags only: solve-tags keeps the constrained lens (no runaway free
+    fit) and returns predicted positions for one-click placement."""
+    import numpy as np
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    from fastapi.testclient import TestClient
+    import web.app as app_mod
+    from tests._field_synth import truth_pinhole_camera, project_tag_corners
+    from web.field.field_model import FieldModel
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera(D=np.array([-0.12, 0.02, 0.0, 0.0, 0.0]))
+    corr = project_tag_corners(cam, fm)
+    hub = [t for t in (5, 8, 9, 10) if t in corr]
+    assert len(hub) >= 3
+    auto = {str(t): corr[t][0].tolist() for t in hub}
+    client = TestClient(app_mod.app)
+    r = client.post("/api/calibration/solve-tags", json={
+        "event": "evx", "camera": "corner_right", "image_size": [1920, 1080],
+        "auto_tags": auto, "manual_tags": [], "dry_run": True})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["model"] in ("pp_k1", "pp_k0") and j["tag_spread_m"] < 2.0
+    assert j["predicted_tags"] and all(len(v) == 2 for v in j["predicted_tags"].values())
+
+
+def test_predicted_tags_route_uses_auto_candidate(tmp_path, monkeypatch):
+    import numpy as np
+    from web.field import store as field_store
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    from fastapi.testclient import TestClient
+    import web.app as app_mod
+    from tests._field_synth import truth_pinhole_camera
+    cam = truth_pinhole_camera(D=np.array([-0.12, 0.02, 0.0, 0.0, 0.0]))
+    client = TestClient(app_mod.app)
+    assert client.get("/api/calibration/predicted-tags?event=evp&camera=corner_left").json()["tags"] == {}
+    field_store.save_auto_record("evp", "corner_left", {
+        "status": "failed", "calibration": cam.to_json(), "crop": [0, 743, 1920, 1080]})
+    j = client.get("/api/calibration/predicted-tags?event=evp&camera=corner_left").json()
+    assert j["status"] == "failed" and len(j["tags"]) >= 4
+    u, v = next(iter(j["tags"].values()))
+    assert 0 <= u < 1920 and 0 <= v < 1080

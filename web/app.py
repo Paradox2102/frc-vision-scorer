@@ -11396,6 +11396,37 @@ async def calibration_auto_status(event: str):
     return {"event": event, "running": running, "cameras": cams}
 
 
+def _predicted_tags(cal, fm, image_size) -> dict:
+    """{tag id: [u, v]} — where each field tag facing the camera should appear (crop
+    px) under ``cal``. The calibrate page draws these so the operator can place an
+    undecoded tag with ONE click near its label."""
+    from web.field import tag_locator as _tl
+    out = {}
+    for tid in fm.tags:
+        try:
+            p = _tl.predict_tag(cal, fm, tid, tuple(image_size))
+        except Exception:
+            p = None
+        if p is not None:
+            out[str(int(tid))] = [round(float(p[0][0]), 1), round(float(p[0][1]), 1)]
+    return out
+
+
+@app.get("/api/calibration/predicted-tags")
+async def calibration_predicted_tags(event: str, camera: str = "main"):
+    """Predicted tag positions under the camera's auto-calibration candidate (ready or
+    failed), for one-click placement in the manual editor. {tags, crop, status} or
+    {tags: {}} when there is no candidate."""
+    rec = field_store.load_auto_record(event, camera)
+    if not rec or not rec.get("calibration"):
+        return {"tags": {}, "crop": None, "status": rec.get("status") if rec else None}
+    cal = CameraCalibration.from_json(rec["calibration"])
+    fm = FieldModel.load(cal.field_season or _AUTO_CALIB_SEASON)
+    size = cal.image_size or (rec.get("crop") or [0, 0, 1920, 1080])[2:4]
+    return {"tags": _predicted_tags(cal, fm, size), "crop": rec.get("crop"),
+            "status": rec.get("status")}
+
+
 @app.get("/api/calibration/auto/preview")
 async def calibration_auto_preview(event: str, camera: str = "main"):
     """The auto-calibration overlay JPEG for (event, camera); 404 if none."""
@@ -11869,8 +11900,10 @@ async def calibration_solve_tags(request: Request):
     held = {k: v for k, v in corr.items() if _tag_id_of(k) in holdout_ids}
     solve_corr = {k: v for k, v in corr.items() if _tag_id_of(k) not in holdout_ids}
     try:
-        cal = Calibrator.solve_camera_from_tags(solve_corr, image_size=image_size,
-                                                field_season=season)
+        # Constrained lens first, freed only when the tags span the field: a free
+        # lens fitted to one hub's tags (+ a couple of clicks) extrapolates wildly.
+        cal, solve_model_used, solve_spread = auto_calibrate.solve_fresh_lens(
+            solve_corr, image_size, season, fm)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
@@ -11924,7 +11957,9 @@ async def calibration_solve_tags(request: Request):
         print(f"  calibration overlay render failed ({camera}): {e}")
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
             "n_points": n_points, "overlay": overlay_b64,
-            "holdout_error_m": holdout_err}
+            "holdout_error_m": holdout_err, "model": solve_model_used,
+            "tag_spread_m": round(solve_spread, 2),
+            "predicted_tags": _predicted_tags(cal, fm, image_size)}
 
 
 @app.get("/api/calibration/landmarks")

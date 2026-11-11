@@ -9955,6 +9955,7 @@ class InferenceJob:
                         "processing_sec": timings.get("total"),
                         "timings": _json.dumps(timings),
                         **artifacts,
+                        **self._replay_row_render_fields(),
                     })
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
                     # hud_post_render: render once the identity rows exist (below).
@@ -10034,10 +10035,18 @@ class InferenceJob:
                     print(f"  [identity-segments] segment persist failed ({e})")
             await self._queue_hud_render()
 
+    def _replay_row_render_fields(self) -> dict:
+        """hud_post_render: the replay row is inserted already ``queued``, so
+        the viewer shows "Rendering…" at once and a server that dies before
+        the queue picks it up leaves a row the startup sweep re-enqueues.
+        Knob off: nothing (render_status stays NULL, the row is unchanged)."""
+        return {"render_status": "queued"} if getattr(self, "_replay_draw_list", False) else {}
+
     async def _queue_hud_render(self) -> None:
         """hud_post_render: queue the HUD render once the replay row and the
         identity rows are written. Runs after the complete message was sent;
-        a failure to queue is logged, never raised."""
+        a failure to queue is logged and recorded as render_failed, never
+        raised."""
         if not getattr(self, "_replay_render_pending", False):
             return
         self._replay_render_pending = False
@@ -10046,6 +10055,11 @@ class InferenceJob:
                 print(f"[hud-render] queued {self.job_id}")
         except Exception as e:
             print(f"[hud-render] could not queue the render: {e}")
+            try:
+                await database.set_render_status(self.job_id, "render_failed",
+                                                 f"could not queue the render: {e}")
+            except Exception as e2:
+                print(f"[hud-render] could not record the queue failure: {e2}")
 
 
 # --- HUD post-render queue (docs/superpowers/specs/2026-11-10-hud-post-render-design.md) ---
@@ -10057,18 +10071,55 @@ _render_queue: Optional[asyncio.Queue] = None
 _render_queue_loop = None
 _render_worker_task = None
 _render_inflight: set = set()     # replay ids queued or running in this process
+RENDER_BUSY_MESSAGE = "a render is running — re-render again when it finishes"
 
 
 def _render_command(replay_id: str) -> list:
     return [sys.executable, "-m", "web.hud_render", replay_id, "--db", str(database.DB_PATH)]
 
 
+RENDER_TIMEOUT_PER_FRAME_S = 0.5    # ~10x a measured render's per-frame cost
+RENDER_TIMEOUT_MIN_S = 600.0
+RENDER_TIMEOUT_DEFAULT_S = 1800.0   # a row without a frame_count
+
+
+def _render_timeout_s(row) -> float:
+    """How long the worker lets one render subprocess run before killing it:
+    max(600 s, 0.5 s x the replay's frame_count), 1800 s without a count."""
+    n = (row or {}).get("frame_count")
+    if not n:
+        return RENDER_TIMEOUT_DEFAULT_S
+    return max(RENDER_TIMEOUT_MIN_S, RENDER_TIMEOUT_PER_FRAME_S * float(n))
+
+
+def _kill_render(proc) -> None:
+    """Kill the renderer's whole process group (it and its ffmpeg)."""
+    import signal as _signal
+    try:
+        os.killpg(proc.pid, _signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def _run_render(replay_id: str) -> None:
+    timeout = _render_timeout_s(await database.get_replay(replay_id))
     try:
         proc = await asyncio.create_subprocess_exec(
             *_render_command(replay_id), cwd=str(PROJECT_ROOT),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        out, _ = await proc.communicate()
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            _kill_render(proc)
+            await proc.wait()
+            await database.set_render_status(replay_id, "render_failed",
+                                             f"timeout after {timeout:g} s")
+            print(f"[hud-render] {replay_id}: render_failed (timeout after {timeout:g} s)")
+            return
         rc = proc.returncode
         tail = " | ".join((out or b"").decode(errors="replace").strip().splitlines()[-3:])
     except Exception as e:
@@ -10123,18 +10174,23 @@ async def enqueue_render(replay_id: str) -> bool:
     return True
 
 
-async def _sweep_stale_renders() -> int:
-    """Startup: renders left queued / rendering by a dead server become
-    render_failed ("server restarted"), unless a live process (the back-fill
-    script) holds the replay's render.lock. Returns how many were swept."""
-    n = 0
+async def _sweep_stale_renders() -> dict:
+    """Startup: renders a dead server left behind. ``queued`` rows are
+    re-enqueued; ``rendering`` rows whose render.lock no process holds become
+    render_failed ("server restarted"). A row whose lock is held (the
+    back-fill script) is left alone. Returns {"requeued": n, "failed": m}."""
+    out = {"requeued": 0, "failed": 0}
     for row in await database.list_replays_by_render_status(("queued", "rendering")):
         out_dir = Path(row["meta_path"]).parent if row.get("meta_path") else None
         if out_dir is not None and hud_render.lock_holder(out_dir) is not None:
             continue
+        if row.get("render_status") == "queued":
+            if await enqueue_render(row["id"]):
+                out["requeued"] += 1
+            continue
         await database.set_render_status(row["id"], "render_failed", "server restarted")
-        n += 1
-    return n
+        out["failed"] += 1
+    return out
 
 
 @app.on_event("startup")
@@ -10144,8 +10200,9 @@ async def startup():
     await init_db()
     try:
         swept = await _sweep_stale_renders()
-        if swept:
-            print(f"[hud-render] {swept} unfinished render(s) marked render_failed")
+        if swept["requeued"] or swept["failed"]:
+            print(f"[hud-render] startup: {swept['requeued']} queued render(s) re-enqueued, "
+                  f"{swept['failed']} interrupted render(s) marked render_failed")
     except Exception as e:
         print(f"[hud-render] startup sweep failed: {e}")
 
@@ -13435,11 +13492,12 @@ async def render_replay_endpoint(replay_id: str):
     if not row:
         return JSONResponse(status_code=404, content={"error": "not found"})
     busy = replay_id in _render_inflight
-    if not busy and row.get("render_status") in ("queued", "rendering") and row.get("meta_path"):
+    if not busy and row.get("meta_path"):
         busy = hud_render.lock_holder(Path(row["meta_path"]).parent) is not None
     if busy or not await enqueue_render(replay_id):
-        return JSONResponse(status_code=409, content={
-            "error": "a render is already queued or running for this replay"})
+        # A correction made now is recorded, but the running render read the
+        # corrections when it started: the user re-renders once it finishes.
+        return JSONResponse(status_code=409, content={"error": RENDER_BUSY_MESSAGE})
     return {"status": "queued", "id": replay_id}
 
 

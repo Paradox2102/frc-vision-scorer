@@ -247,8 +247,9 @@ def test_finalize_queues_only_when_pending(db, monkeypatch):
 
 # --- startup sweep ---
 
-def test_startup_sweep(db, tmp_path):
-    import os
+def test_startup_sweep(db, tmp_path, monkeypatch):
+    q = _FakeQueue()
+    monkeypatch.setattr(app_mod, "_render_queue_get", lambda: q)
     rows = {}
     for rid, status in (("q", "queued"), ("r", "rendering"), ("held", "rendering"),
                         ("done", "rendered")):
@@ -256,14 +257,69 @@ def test_startup_sweep(db, tmp_path):
         database.set_render_status_sync(rid, status)
     holder = hold_lock_in_subprocess(rows["held"])
     try:
-        assert asyncio.run(app_mod._sweep_stale_renders()) == 2
+        assert asyncio.run(app_mod._sweep_stale_renders()) == {"requeued": 1, "failed": 1}
     finally:
         kill(holder)
-    assert (_row("q")["render_status"], _row("q")["render_error"]) == ("render_failed",
+    assert q.items == ["q"] and _row("q")["render_status"] == "queued"   # re-enqueued
+    assert (_row("r")["render_status"], _row("r")["render_error"]) == ("render_failed",
                                                                        "server restarted")
-    assert _row("r")["render_status"] == "render_failed"
     assert _row("held")["render_status"] == "rendering"
     assert _row("done")["render_status"] == "rendered"
+
+
+def test_knob_on_replay_rows_are_inserted_queued(db, tmp_path, monkeypatch):
+    job = app_mod.InferenceJob.__new__(app_mod.InferenceJob)
+    job._replay_draw_list = False
+    assert job._replay_row_render_fields() == {}                       # knob off: no change
+    job._replay_draw_list = True
+    assert job._replay_row_render_fields() == {"render_status": "queued"}
+    # A server that dies between the insert and the queue leaves a queued
+    # row, which the startup sweep re-enqueues.
+    rid, d, _ = make_replay(tmp_path)
+    row = database.get_replay_sync(rid)
+    asyncio.run(database.insert_replay({**row, **job._replay_row_render_fields()}))
+    assert _row(rid)["render_status"] == "queued"
+    q = _FakeQueue()
+    monkeypatch.setattr(app_mod, "_render_queue_get", lambda: q)
+    assert asyncio.run(app_mod._sweep_stale_renders()) == {"requeued": 1, "failed": 0}
+    assert q.items == [rid]
+
+
+def test_a_failure_to_queue_marks_the_row_failed(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    database.set_render_status_sync(rid, "queued")
+
+    async def boom(r):
+        raise RuntimeError("no loop")
+    monkeypatch.setattr(app_mod, "enqueue_render", boom)
+    job = app_mod.InferenceJob.__new__(app_mod.InferenceJob)
+    job.job_id, job._replay_render_pending = rid, True
+    asyncio.run(job._queue_hud_render())
+    assert _row(rid)["render_status"] == "render_failed"
+    assert _row(rid)["render_error"] == "could not queue the render: no loop"
+
+
+def test_render_timeout_scales_with_the_frame_count():
+    assert app_mod._render_timeout_s({"frame_count": 100}) == 600
+    assert app_mod._render_timeout_s({"frame_count": 4000}) == 2000
+    assert app_mod._render_timeout_s({"frame_count": None}) == 1800
+    assert app_mod._render_timeout_s(None) == 1800
+
+
+def test_worker_kills_a_render_that_times_out(db, tmp_path, monkeypatch):
+    rid, d, _ = make_replay(tmp_path)
+    monkeypatch.setattr(app_mod, "_render_command",
+                        lambda r: [sys.executable, "-c", "import time; time.sleep(60)"])
+    monkeypatch.setattr(app_mod, "_render_timeout_s", lambda row: 0.5)
+
+    async def go():
+        await app_mod.enqueue_render(rid)
+        await asyncio.wait_for(app_mod._render_queue.join(), 20)
+
+    asyncio.run(go())
+    assert _row(rid)["render_status"] == "render_failed"
+    assert _row(rid)["render_error"] == "timeout after 0.5 s"
+    assert app_mod._render_inflight == set()
 
 
 # --- endpoints ---
@@ -284,7 +340,9 @@ def test_render_endpoint_queues_and_409s_while_in_flight(db, tmp_path, monkeypat
     r = c.post(f"/api/replays/{rid}/render")
     assert r.status_code == 200 and r.json() == {"status": "queued", "id": rid}
     assert q.items == [rid] and _row(rid)["render_status"] == "queued"
-    assert c.post(f"/api/replays/{rid}/render").status_code == 409
+    busy = c.post(f"/api/replays/{rid}/render")
+    assert busy.status_code == 409
+    assert busy.json()["error"] == "a render is running — re-render again when it finishes"
     assert c.post("/api/replays/nope/render").status_code == 404
 
 

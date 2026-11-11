@@ -113,7 +113,7 @@ def load_match_records(mdir: Path) -> List[dict]:
         out.append({
             "path": r["path"], "event": r["event"], "match_key": r["match_key"],
             "detector": r["detector"], "team": team, "t_sec": float(r["t_sec"]),
-            "tracklet_id": r["tracklet_id"], "roster": r.get("roster"),
+            "tracklet_id": r["tracklet_id"], "roster": r.get("roster"), "box": r.get("box"),
             "alliance": team_alliance(r.get("roster"), team),
         })
     return out
@@ -237,8 +237,9 @@ def augment(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 class CropDataset:
     def __init__(self, recs: Sequence[dict], root: Path = F.DEFAULT_ROOT, train: bool = False,
-                 seed: int = 0):
+                 seed: int = 0, inset: bool = False):
         self.recs, self.root, self.train, self.seed = recs, root, train, seed
+        self.inset = inset  # cut the production region (box inset 8%) out of the padded crop
         self._rng = None
 
     def __len__(self) -> int:
@@ -248,6 +249,8 @@ class CropDataset:
         img = cv2.imread(str(self.root / self.recs[i]["path"]))
         if img is None:
             img = np.zeros((32, 32, 3), np.uint8)
+        elif self.inset and self.recs[i].get("box"):
+            img = prod_crop(img, self.recs[i]["box"])
         if self.train:
             if self._rng is None:
                 import torch
@@ -333,7 +336,8 @@ def pair_aucs(E: np.ndarray, recs: Sequence[dict], max_pairs_per_event: int = 3_
     mk = codes(lambda r: r["match_key"])
     tm = codes(lambda r: (r["event"], r["team"]))
     al = codes(lambda r: (r["match_key"], r.get("alliance") or ""))
-    w_s, w_y, wa_s, wa_y, x_s, x_y = [], [], [], [], [], []
+    tk = codes(lambda r: (r["match_key"], r["detector"], r["tracklet_id"]))
+    w_s, w_y, wa_s, wa_y, wx_s, wx_y, x_s, x_y = [], [], [], [], [], [], [], []
     for e in np.unique(ev):
         idx = np.where(ev == e)[0]
         S = E[idx] @ E[idx].T
@@ -345,6 +349,8 @@ def pair_aucs(E: np.ndarray, recs: Sequence[dict], max_pairs_per_event: int = 3_
         w_s.append(s[same_m]); w_y.append(same_t[same_m])
         sel = same_m & same_a
         wa_s.append(s[sel]); wa_y.append(same_t[sel])
+        sel = same_m & (tk[idx][iu] != tk[idx][ju])  # relink-like: different tracklets
+        wx_s.append(s[sel]); wx_y.append(same_t[sel])
         xm = np.where(~same_m)[0]
         if len(xm) > max_pairs_per_event:
             xm = rng.choice(xm, max_pairs_per_event, replace=False)
@@ -353,6 +359,7 @@ def pair_aucs(E: np.ndarray, recs: Sequence[dict], max_pairs_per_event: int = 3_
     out = {
         "within_match_auc": auc_fast(cat(w_s), cat(w_y)),
         "within_match_same_alliance_auc": auc_fast(cat(wa_s), cat(wa_y)),
+        "within_match_cross_tracklet_auc": auc_fast(cat(wx_s), cat(wx_y)),
         "cross_match_auc": auc_fast(cat(x_s), cat(x_y)),
         "n_within_pairs": int(sum(len(a) for a in w_s)),
         "n_cross_pairs": int(sum(len(a) for a in x_s)),
@@ -455,18 +462,20 @@ class TrainCfg:
     lr_head: float = 1e-3
     weight_decay: float = 0.05
     tau: float = 0.1
-    warmup: int = 150
+    warmup: int = 100
     eval_every: int = 500
     workers: int = 6
     seed: int = 0
     dim: int = EMB_DIM
+    inset: bool = False
     extra: dict = field(default_factory=dict)
 
 
 def embed_records(net, recs: Sequence[dict], root: Path = F.DEFAULT_ROOT, batch: int = 128,
-                  workers: int = 6, device: str = "cuda", which: str = "proj") -> np.ndarray:
+                  workers: int = 6, device: str = "cuda", which: str = "proj",
+                  inset: bool = False) -> np.ndarray:
     import torch
-    dl = torch.utils.data.DataLoader(CropDataset(recs, root), batch_size=batch, num_workers=workers,
+    dl = torch.utils.data.DataLoader(CropDataset(recs, root, inset=inset), batch_size=batch, num_workers=workers,
                                      shuffle=False)
     out = []
     net.eval()
@@ -488,11 +497,45 @@ def frozen_cache_feats(recs: Sequence[dict]) -> np.ndarray:
     return X[[pmap[r["path"]] for r in recs]]
 
 
+def prod_crop(img: np.ndarray, box: Sequence[float], pad: float = ROBOT_PAD) -> np.ndarray:
+    """From a harvester crop (box padded by ``pad``) cut the production embedder's input
+    region: the box inset by web.embedder.BOX_INSET per side."""
+    from web.embedder import BOX_INSET
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    ox = int(max(0, np.floor(box[0] - pad * bw)))
+    oy = int(max(0, np.floor(box[1] - pad * bh)))
+    x0, y0 = int(box[0] + BOX_INSET * bw) - ox, int(box[1] + BOX_INSET * bh) - oy
+    x1, y1 = int(box[2] - BOX_INSET * bw) - ox, int(box[3] - BOX_INSET * bh) - oy
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    return img[y0:y1, x0:x1] if x1 - x0 >= 4 and y1 - y0 >= 4 else img
+
+
+def frozen_prod_feats(recs: Sequence[dict], batch: int = 128) -> np.ndarray:
+    """Frozen DINOv3-S CLS with the production transform (web/embedder.py: inset box, timm
+    eval transform = shorter side 256 bicubic + centre crop 256)."""
+    import timm
+    import torch
+    from PIL import Image
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = timm.create_model(F.MODEL_NAME, pretrained=True, num_classes=0).to(dev).eval()
+    tf = timm.data.create_transform(**timm.data.resolve_model_data_config(m), is_training=False)
+    out = []
+    for i in range(0, len(recs), batch):
+        xs = []
+        for r in recs[i:i + batch]:
+            img = cv2.imread(str(F.DEFAULT_ROOT / r["path"]))
+            xs.append(tf(Image.fromarray(cv2.cvtColor(prod_crop(img, r["box"]), cv2.COLOR_BGR2RGB))))
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
+            out.append(m.forward_features(torch.stack(xs).to(dev))[:, 0].float().cpu().numpy())
+    return np.concatenate(out)
+
+
 def _save_ckpt(net, cfg: TrainCfg, path: Path, extra: dict) -> None:
     import torch
     sd = {k: (v.half() if v.is_floating_point() else v) for k, v in net.state_dict().items()}
     torch.save({"state_dict": sd, "cfg": asdict(cfg), "model": F.MODEL_NAME, "dim": cfg.dim,
-                "input": {"pad": ROBOT_PAD, "mode": "letterbox", "size": F.DEFAULT_SIZE,
+                "input": {"pad": ROBOT_PAD, "inset": cfg.inset, "mode": "letterbox", "size": F.DEFAULT_SIZE,
                           "cls": "forward_features[:,0]"}, **extra}, path)
 
 
@@ -528,12 +571,15 @@ class S4Embedder:
         return np.concatenate(out) if out else np.zeros((0, self.ck["dim"]), np.float32)
 
     def embed_boxes(self, frame_bgr: np.ndarray, boxes) -> np.ndarray:
+        """Cut robot boxes the way the checkpoint was trained (harvester 10% pad, or the
+        production 8% inset when ``cfg.inset``) and embed them."""
         from scripts.teacher.harvest import pad_box
         h, w = frame_bgr.shape[:2]
         crops = []
         for b in boxes:
             x0, y0, x1, y1 = pad_box(b, ROBOT_PAD, w, h)
-            crops.append(frame_bgr[y0:y1, x0:x1])
+            c = frame_bgr[y0:y1, x0:x1]
+            crops.append(prod_crop(c, b) if self.ck["cfg"].get("inset") else c)
         return self.embed_crops(crops)
 
 
@@ -541,7 +587,8 @@ class S4Embedder:
 
 def _summ(name: str, m: dict) -> str:
     a = m["all"]
-    return (f"{name:28s} within {a['within_match_auc']:.4f} (same-all {a['within_match_same_alliance_auc']:.4f})"
+    return (f"{name:28s} within {a['within_match_auc']:.4f} (x-trk {a['within_match_cross_tracklet_auc']:.4f}"
+            f" same-all {a['within_match_same_alliance_auc']:.4f})"
             f"  cross {a['cross_match_auc']:.4f}  lineup6 crop {a['lineup_crop6_top1']:.3f} trk {a['lineup_trk6_top1']:.3f}"
             f"  lineup3 crop {a['lineup_crop3_top1']:.3f} trk {a['lineup_trk3_top1']:.3f}")
 
@@ -550,7 +597,8 @@ def cmd_train(a) -> None:
     import torch
     cfg = TrainCfg(name=a.name, detectors=tuple(a.detectors.split(",")), bumper_frac=a.bumper_frac,
                    p=a.p, k=a.k, steps=a.steps, train_blocks=a.train_blocks, lr_backbone=a.lr_backbone,
-                   lr_head=a.lr_head, tau=a.tau, eval_every=a.eval_every, workers=a.workers, seed=a.seed)
+                   lr_head=a.lr_head, tau=a.tau, eval_every=a.eval_every, workers=a.workers, seed=a.seed,
+                   inset=a.inset)
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -561,7 +609,7 @@ def cmd_train(a) -> None:
           f"identities {len({ident(r) for r in tr})}; val robot crops {len(va)}", flush=True)
     sampler = IdentityBatchSampler(tr, p=cfg.p, k=cfg.k, steps=cfg.steps, bumper_frac=cfg.bumper_frac,
                                    seed=cfg.seed)
-    ds = CropDataset(tr, train=True, seed=cfg.seed)
+    ds = CropDataset(tr, train=True, seed=cfg.seed, inset=cfg.inset)
     dl = torch.utils.data.DataLoader(ds, batch_sampler=sampler, num_workers=cfg.workers,
                                      pin_memory=True, prefetch_factor=4)
     id_index = {k: i for i, k in enumerate(sorted({ident(r) for r in tr}))}
@@ -602,7 +650,7 @@ def cmd_train(a) -> None:
                   f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GB", flush=True)
             run_loss = 0.0
         if (step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps:
-            E = embed_records(net, va, workers=cfg.workers)
+            E = embed_records(net, va, workers=cfg.workers, inset=cfg.inset)
             m = evaluate(E, va, per_event=False)["all"]
             m["step"] = step + 1
             log["evals"].append(m)
@@ -630,9 +678,9 @@ def _eval_recs(split: str) -> List[dict]:
 
 def cmd_baseline(a) -> None:
     recs = _eval_recs(a.split)
-    E = frozen_cache_feats(recs)
+    E = frozen_prod_feats(recs) if a.prod else frozen_cache_feats(recs)
     m = evaluate(E, recs)
-    print(_summ(f"frozen-cls {a.split}", m))
+    print(_summ(f"frozen-cls{'-prod' if a.prod else ''} {a.split}", m))
     for e in sorted(k for k in m if k != "all"):
         print(_summ(f"  {e}", {"all": m[e]}))
     if a.out:
@@ -644,7 +692,7 @@ def cmd_eval(a) -> None:
     net, ck = load_net(Path(a.ckpt))
     res = {}
     for which in a.which.split(","):
-        E = embed_records(net, recs, which=which)
+        E = embed_records(net, recs, which=which, inset=bool(ck["cfg"].get("inset")))
         m = evaluate(E, recs)
         res[which] = m
         print(_summ(f"{Path(a.ckpt).stem}[{which}] {a.split}", m))
@@ -679,6 +727,50 @@ def bench_latency(ckpt: Path, batch: int = 64, n_iter: int = 30) -> dict:
             "peak_vram_gb_inference": torch.cuda.max_memory_allocated() / 2**30}
 
 
+def _by_year(recs: Sequence[dict], E: np.ndarray) -> dict:
+    out = {}
+    for y in sorted({r["event"][:4] for r in recs}):
+        ix = [i for i, r in enumerate(recs) if r["event"].startswith(y)]
+        sub = [recs[i] for i in ix]
+        out[y] = {**pair_aucs(E[ix], sub), **lineup_top1(E[ix], sub), "n_crops": len(sub)}
+    return out
+
+
+def cmd_report(a) -> None:
+    """Final report: frozen baselines (cache letterbox + production transform) vs S4 on val
+    events and, once, on the TEST events; latency + VRAM. Writes s4_report.json."""
+    import torch
+    ck_path = Path(a.ckpt)
+    net, ck = load_net(ck_path)
+    rep = {"ckpt": str(ck_path), "cfg": ck["cfg"], "val_events": list(VAL_EVENTS),
+           "test_events": sorted(TEST_EVENTS), "selected_step": ck.get("step"),
+           "eval_crops": "robot-detector crops with a time-local per-crop team label (labels_robot.jsonl)",
+           "splits": {}}
+    log = MODELS / f"{ck_path.stem}.log.json"
+    if log.exists():
+        lj = json.loads(log.read_text())
+        rep["train"] = {k: lj.get(k) for k in ("train_s", "peak_vram_gb", "best_val_cross_auc")}
+    for split in ("val", "test"):
+        recs = _eval_recs(split)
+        ent = {"n_crops": len(recs), "n_matches": len({r["match_key"] for r in recs}),
+               "n_identities": len({ident(r) for r in recs})}
+        for name, E in (("frozen_cls_cache", frozen_cache_feats(recs)),
+                        ("frozen_cls_prod", frozen_prod_feats(recs)),
+                        ("s4", embed_records(net, recs, inset=bool(ck["cfg"].get("inset"))))):
+            m = evaluate(E, recs)
+            m["by_year"] = _by_year(recs, E)
+            ent[name] = m
+            print(_summ(f"{name} {split}", m), flush=True)
+        rep["splits"][split] = ent
+    del net
+    torch.cuda.empty_cache()
+    rep["latency"] = bench_latency(ck_path)
+    rep["train_peak_vram_gb"] = rep.get("train", {}).get("peak_vram_gb")
+    out = Path(a.out)
+    out.write_text(json.dumps(rep, indent=1))
+    print(json.dumps(rep["latency"]), "->", out)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -696,14 +788,19 @@ def main() -> None:
     t.add_argument("--eval-every", type=int, default=500)
     t.add_argument("--workers", type=int, default=6)
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--inset", action="store_true", help="train on the production region (box inset 8%%)")
     b = sub.add_parser("baseline")
     b.add_argument("--split", default="val", choices=["val", "test"])
     b.add_argument("--out", default=None)
+    b.add_argument("--prod", action="store_true", help="production transform instead of the cache")
     e = sub.add_parser("eval")
     e.add_argument("--ckpt", default=str(DEFAULT_CKPT))
     e.add_argument("--split", default="val", choices=["val", "test"])
     e.add_argument("--which", default="proj", help="proj and/or cls (comma list)")
     e.add_argument("--out", default=None)
+    rp = sub.add_parser("report")
+    rp.add_argument("--ckpt", default=str(DEFAULT_CKPT))
+    rp.add_argument("--out", default=str(MODELS / "s4_report.json"))
     lt = sub.add_parser("latency")
     lt.add_argument("--ckpt", default=str(DEFAULT_CKPT))
     a = ap.parse_args()
@@ -713,6 +810,8 @@ def main() -> None:
         cmd_baseline(a)
     elif a.cmd == "eval":
         cmd_eval(a)
+    elif a.cmd == "report":
+        cmd_report(a)
     elif a.cmd == "latency":
         print(json.dumps(bench_latency(Path(a.ckpt)), indent=1))
 

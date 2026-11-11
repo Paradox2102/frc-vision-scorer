@@ -181,7 +181,7 @@ def test_calibration_frame_match_key_requires_loaded_event():
     if app_mod.current_event:
         import pytest; pytest.skip("an event is loaded in this process")
     r = _client().post("/api/calibration/frame",
-                       json={"timestamp": 5, "match_key": "2026hop_qm1"})
+                       json={"timestamp": 5, "match_key": "2026zzzz_qm1"})   # no local footage
     assert r.status_code == 400
     assert "event" in r.json()["error"].lower()
 

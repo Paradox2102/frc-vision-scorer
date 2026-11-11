@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
-                                   tag_alignment_error)
+                                   check_solve_plausible, tag_alignment_error)
 from web.field.match_order import match_sort_key, select_epoch
 from web.field.pose_autofix import (PoseFixConfig, aggregate_tag_corners, evaluate_fix,
                                     resolve_pose)
@@ -580,6 +580,15 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
 
     def finish(status, method, reason, cal, val, overlay_cal, epoch=None,
                center_shift=None, rot_deg=None):
+        # Hard gate before anything can be confirmed / adopted / trusted: a mirrored,
+        # upside-down or behind-the-camera pose never comes out ready or verified.
+        gate_cal = cal if cal is not None else overlay_cal
+        if status in ("ready", "verified") and gate_cal is not None and corr:
+            why = check_solve_plausible(gate_cal, corr, cfg.field_season)
+            if why is not None:
+                status = "failed"
+                reason = (f"{reason}; REJECTED: physically implausible pose ({why}) — "
+                          f"calibrate manually")
         located = {d["id"]: (d["u"], d["v"]) for d in extra["located"]}
         have = set(corr) | set(located)
         unused = []

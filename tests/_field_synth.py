@@ -11,7 +11,10 @@ def look_at(eye, target, world_up=(0., 0., 1.)):
     """OpenCV-convention extrinsics: camera +z = forward, +x = right, +y = down."""
     eye = np.asarray(eye, float); target = np.asarray(target, float)
     z = target - eye; z /= np.linalg.norm(z)
-    x = np.cross(np.asarray(world_up, float), z); x /= np.linalg.norm(x)
+    # x = forward x up (camera +x = image right, +y = image down): an UPRIGHT camera.
+    # (up x forward gave a camera rolled 180 deg — upside down — which the pose
+    # plausibility gate in web.field.calibration rightly rejects.)
+    x = np.cross(z, np.asarray(world_up, float)); x /= np.linalg.norm(x)
     y = np.cross(z, x)
     R = np.vstack([x, y, z])                      # world -> camera
     rvec, _ = cv2.Rodrigues(R)

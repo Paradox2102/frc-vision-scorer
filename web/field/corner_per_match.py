@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 
 from web.field import auto_calibrate as ac
-from web.field.calibration import tag_alignment_error
+from web.field.calibration import pose_plausibility, tag_alignment_error
 
 LABEL = "auto per-match (corner)"
 
@@ -123,14 +123,18 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
     chk = check_epoch(ecal, video, crop, frame_range, fm, detect_fn, cfg)
     metrics = {"check_best_m": chk["best_m"], "check_tags": chk["n_tags"],
                "check_min_tags": chk["min_tags_used"], "check_frames": chk["frames"]}
-    if chk["best_m"] is not None and chk["best_m"] <= cfg.check_max_m:
+    implausible = pose_plausibility(ecal, fm=fm)
+    if implausible:
+        metrics["check_implausible"] = implausible
+    if chk["best_m"] is not None and chk["best_m"] <= cfg.check_max_m and not implausible:
         overlay = _overlay_on_median(video, crop, frame_range, fps, ecal, fm, masks,
                                      detect_fn, roi_detect_fn, cfg.median_frames)
         return CornerOutcome(
             "kept", f"epoch {vid} holds on {match_key}: best {chk['best_m']:.2f} m over "
                     f"{chk['n_tags']} tags (gate {cfg.check_max_m:.2f} m)",
             vid, None, metrics, overlay=overlay, seconds=time.time() - t0)
-    why_check = ("no check frame showed enough tags" if chk["best_m"] is None else
+    why_check = (f"epoch {vid} is physically implausible ({implausible})" if implausible else
+                 "no check frame showed enough tags" if chk["best_m"] is None else
                  f"epoch {vid} is {chk['best_m']:.2f} m off on {match_key} "
                  f"(gate {cfg.check_max_m:.2f} m)")
 

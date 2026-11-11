@@ -83,9 +83,11 @@ def resolve_pose(correspondences: dict, base_cal: CameraCalibration) -> CameraCa
         raise CalibrationError(
             "auto pose fix needs a projective (camera/pinhole) base calibration with "
             f"intrinsics; got mode='{base_cal.mode}'")
+    init = ((base_cal.rvec, base_cal.tvec)
+            if base_cal.rvec is not None and base_cal.tvec is not None else None)
     return Calibrator.solve_pose(
         correspondences, K=base_cal.K, D=base_cal.D, image_size=base_cal.image_size,
-        field_season=base_cal.field_season, mode=base_cal.mode)
+        field_season=base_cal.field_season, mode=base_cal.mode, init=init)
 
 
 def _pose_deltas(base_cal: CameraCalibration, cand_cal: CameraCalibration):

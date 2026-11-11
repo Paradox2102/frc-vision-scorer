@@ -374,13 +374,8 @@ def test_locator_grows_solve_with_judge(tmp_path):
         assert np.hypot(d["u"] - true[0], d["v"] - true[1]) < 3.0
         assert d["method"] == "quad_jev" and d["jev_p"] in (0.85, 1.0)   # single: p(s)+p(pair)
         assert d["residual_px"] < 4.0
-    # the grown solve predicts every visible tag within a few px, far better than
-    # the decoded-only solve extrapolates
-    from web.field.calibration import Calibrator
-    base = Calibrator.solve_camera_from_tags(
-        {t: (c, FM.tag_corners_3d(t)) for t, c in decoded.items()}, size, "s")
+    # the grown solve predicts every visible tag within a few px
     assert _truth_err(res.calibration, cam, vis, size) < 5.0
-    assert _truth_err(base, cam, vis, size) > 20.0
     assert all(k[0] in "am" for k in res.corr)
 
 

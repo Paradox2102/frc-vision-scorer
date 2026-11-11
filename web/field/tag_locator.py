@@ -42,7 +42,8 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from web.field.calibration import CameraCalibration, CalibrationError, Calibrator
+from web.field.calibration import (CameraCalibration, CalibrationError, Calibrator,
+                                   check_solve_plausible)
 
 # Model ladder, least -> most free. "pp_*" fix the principal point at the crop centre
 # and fx == fy; "k0" = no radial distortion, "k1" = k1 only, "full" = k1 + k2 (the
@@ -189,8 +190,10 @@ def solve_model(corr: dict, image_size, season: str, model: str,
             raise CalibrationError("pose model needs a pinhole lens prior")
         if len(corr) < 2:
             raise CalibrationError("pose model needs >= 2 correspondences")
+        init = ((prev.rvec, prev.tvec) if prev is not None and prev.rvec is not None
+                else ((lens.rvec, lens.tvec) if lens.rvec is not None else None))
         cal = Calibrator.solve_pose(corr, K=lens.K, D=lens.D, image_size=tuple(image_size),
-                                    field_season=season, mode="pinhole")
+                                    field_season=season, mode="pinhole", init=init)
         cal.crop_region = (0, 0, int(image_size[0]), int(image_size[1]))
         return cal
     best, err = None, None
@@ -246,12 +249,16 @@ def _solve_model_once(corr: dict, image_size, season: str, model: str,
             (w, h), K0, D0, flags=MODEL_FLAGS[model])
     except cv2.error as e:
         raise CalibrationError(f"calibrateCamera ({model}) failed: {str(e)[:120]}")
-    return CameraCalibration(mode="pinhole", K=np.asarray(K, float),
-                             D=np.asarray(D, float).reshape(-1),
-                             rvec=np.asarray(rv[0], float).reshape(3, 1),
-                             tvec=np.asarray(tv[0], float).reshape(3, 1),
-                             image_size=(w, h), crop_region=(0, 0, w, h),
-                             field_season=season, rms_error=float(rms))
+    cal = CameraCalibration(mode="pinhole", K=np.asarray(K, float),
+                            D=np.asarray(D, float).reshape(-1),
+                            rvec=np.asarray(rv[0], float).reshape(3, 1),
+                            tvec=np.asarray(tv[0], float).reshape(3, 1),
+                            image_size=(w, h), crop_region=(0, 0, w, h),
+                            field_season=season, rms_error=float(rms))
+    why = check_solve_plausible(cal, corr, season)
+    if why is not None:                 # mirrored / flipped minimum: not a candidate
+        raise CalibrationError(f"{model}: implausible pose ({why})")
+    return cal
 
 
 def distortion_monotonic(cal, image_size, points=None) -> bool:

@@ -282,3 +282,18 @@ def test_resolve_falls_back_to_base_lens(tmp_path, monkeypatch):
                           roi_detect_fn=lambda f: {}, alt_epochs=[_epoch(BASE, "base2")],
                           log=lambda m: None)
     assert calls == ["chain"] and out.status == "dropped"
+
+
+def test_implausible_epoch_is_never_kept(tmp_path, monkeypatch):
+    import cv2 as _cv2
+    flipped = truth_pinhole_camera()
+    R, _ = _cv2.Rodrigues(flipped.rvec)
+    Rz = np.diag([-1.0, -1.0, 1.0])                 # roll the camera 180 deg
+    flipped.rvec = _cv2.Rodrigues(Rz @ R)[0]
+    flipped.tvec = Rz @ flipped.tvec
+    monkeypatch.setattr(ac, "run_camera", lambda *a, **k: ac.AutoCalibResult(
+        ac.new_record("failed", "no"), None, None))
+    out = cpm.corner_step(_video(tmp_path), "evt_qm5", "corner_left", CROP, (), FM,
+                          _epoch(flipped), (0, 29), 1.0, detect_fn=_det(flipped),
+                          roi_detect_fn=lambda f: {}, log=lambda m: None)
+    assert out.status == "dropped" and "implausible" in out.reason

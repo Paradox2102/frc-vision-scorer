@@ -31,11 +31,13 @@ def test_image_to_field_above_horizon_returns_none():
     """
     cam = truth_camera()
 
-    # (a) Bottom-right corner (1920, 1080): past the fisheye extreme, the
-    # back-projected ray has world_z > 0 (points upward), so s <= 0 → None.
-    result_above = cam.image_to_field((1920.0, 1080.0))
+    # (a) Top-right corner (1920, 0) of the (upright) camera: past the fisheye
+    # extreme, the back-projected ray has world_z > 0 (points upward), so s <= 0
+    # → None. (Before the synthetic camera was made upright this was the
+    # bottom-right corner — the old look_at rolled the camera 180 deg.)
+    result_above = cam.image_to_field((1920.0, 0.0))
     assert result_above is None, (
-        f"Expected None for no-intersection pixel (1920, 1080), got {result_above}"
+        f"Expected None for no-intersection pixel (1920, 0), got {result_above}"
     )
 
     # (b) A normal in-field ground point must still round-trip correctly.

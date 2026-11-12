@@ -507,19 +507,14 @@ def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn
 # ---------------------------------------------------------------------- geometry/draw
 
 def _project(cal, p):
-    """field point -> (u, v) or None if it is behind the camera / not finite."""
-    p = np.asarray(p, float)
-    if cal.rvec is not None and cal.tvec is not None:
-        R, _ = cv2.Rodrigues(np.asarray(cal.rvec, float))
-        if (R @ p + np.asarray(cal.tvec, float).reshape(3))[2] <= 0:
-            return None
+    """field point -> (u, v) or None if the camera cannot see it: behind / at the
+    camera, past the lens's fold radius (a wide lens maps far off-axis points back
+    INTO the image), or not finite (CameraCalibration.project_checked with the frame
+    test off — callers test the frame themselves)."""
     try:
-        u, v = cal.field_to_image(tuple(p))
+        return cal.field_to_image_visible(tuple(np.asarray(p, float)), margin_px=None)
     except Exception:
         return None
-    if not (np.isfinite(u) and np.isfinite(v)):
-        return None
-    return float(u), float(v)
 
 
 def _faces_camera(cal, fm, tid) -> bool:
@@ -534,17 +529,18 @@ def _faces_camera(cal, fm, tid) -> bool:
 
 
 def visible_model_tags(cal, fm, image_size) -> list:
-    """Model tags whose centre projects inside the image (in front of the camera,
-    face toward it) under ``cal``. Sorted ids."""
-    w, h = image_size
-    out = []
-    for tid in fm.tags:
-        if not _faces_camera(cal, fm, tid):
-            continue
-        uv = _project(cal, fm.tag_translation(tid))
-        if uv is not None and 0 <= uv[0] < w and 0 <= uv[1] < h:
-            out.append(int(tid))
-    return sorted(out)
+    """Model tags the camera can see under ``cal``: centre visible inside the image
+    (CameraCalibration.in_view: in front of the camera, inside the lens fold
+    radius, in frame) and face toward the camera. Sorted ids."""
+    ids = [t for t in fm.tags if _faces_camera(cal, fm, t)]
+    if not ids:
+        return []
+    try:
+        ok = cal.in_view([fm.tag_translation(t) for t in ids],
+                         image_size=tuple(image_size))
+    except Exception:
+        return []
+    return sorted(int(t) for t, good in zip(ids, ok) if good)
 
 
 YELLOW = (0, 255, 255)

@@ -268,7 +268,7 @@
 
 <div class="overlay-section">
   <h2>Overlay (field structures + tags)</h2>
-  <p class="hint">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
+  <p class="hint" id="overlayLegend">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
   <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
   <img id="overlayImg" src="" alt="">
 </div>
@@ -543,7 +543,25 @@ async function fetchTagMap(){
     if (j.error){ tagMap = {}; setStatus(j.error, 'rms-warn'); return; }
     tagMap = j.tags || {}; field = j.field || field;
     tagMarkerGroups = j.marker_groups || null;
+    renderOverlayLegend(j.wireframe_legend);
   } catch(e){ setStatus('Could not load tag map: '+e.message,'rms-err'); }
+}
+
+// The overlay legend follows the event's field: the server lists the colours
+// hud_draw actually draws (2026 hubs/bumps/towers/trenches, 2025 reef/barge/...).
+function renderOverlayLegend(items){
+  const el = document.getElementById('overlayLegend');
+  if (!el || !Array.isArray(items) || !items.length) return;
+  el.textContent = '';
+  items.forEach((it, i) => {
+    if (i) el.appendChild(document.createTextNode(' · '));
+    const sw = document.createElement('span');
+    sw.style.cssText = 'display:inline-block;width:.8em;height:.8em;margin-right:.3em;'
+                     + 'vertical-align:middle;border:1px solid #445;background:'
+                     + (/^#[0-9a-f]{6}$/i.test(it.color) ? it.color : '#888');
+    el.appendChild(sw);
+    el.appendChild(document.createTextNode(String(it.label)));
+  });
 }
 
 // ---- Map oriented to match THIS camera ----

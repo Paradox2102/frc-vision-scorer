@@ -25,6 +25,92 @@ POSE_MAX_ROLL_DEG = 45.0
 # field (2026 corner cameras, the main camera) keep the check.
 POSE_ON_FIELD_INSET_M = 0.25
 
+# Visibility (CameraCalibration.project_checked): a field point closer to the camera
+# plane than this (camera-frame depth, metres) is not visible — projection blows up
+# near the camera and mirrors points behind it into the image.
+NEAR_LIMIT_M = 0.3
+_FOLD_SAMPLES = 20000
+
+
+def _radial_gain_pinhole(D: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """d(r * f(r))/dr for OpenCV's rational radial model
+    f(r) = (1 + k1 r^2 + k2 r^4 + k3 r^6) / (1 + k4 r^2 + k5 r^4 + k6 r^6),
+    D = [k1, k2, p1, p2, k3, k4, k5, k6, ...]; -1 where the denominator is <= 0
+    (the rational model's own singularity counts as a fold)."""
+    k = np.zeros(8)
+    k[:min(8, len(D))] = D[:8]
+    k1, k2, k3, k4, k5, k6 = k[0], k[1], k[4], k[5], k[6], k[7]
+    r2 = r * r
+    num = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    den = 1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3
+    # d/dr of r*num/den = (num + r num')/den - r num den'/den^2
+    dnum = 2 * k1 * r + 4 * k2 * r ** 3 + 6 * k3 * r ** 5
+    dden = 2 * k4 * r + 4 * k5 * r ** 3 + 6 * k6 * r ** 5
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = (num + r * dnum) / den - r * num * dden / (den * den)
+    return np.where(den > 0, g, -1.0)
+
+
+def _radial_gain_fisheye(D: np.ndarray, th: np.ndarray) -> np.ndarray:
+    """d(theta_d)/d(theta) for OpenCV's fisheye model
+    theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8)."""
+    k = np.zeros(4)
+    k[:min(4, len(D))] = D[:4]
+    t2 = th * th
+    return (1 + 3 * k[0] * t2 + 5 * k[1] * t2 ** 2 + 7 * k[2] * t2 ** 3
+            + 9 * k[3] * t2 ** 4)
+
+
+def _first_fold(gain, lo: float, hi: float) -> float:
+    """Smallest x in (lo, hi) where gain(x) <= 0 (inf if none), to ~1e-12."""
+    xs = np.linspace(lo, hi, _FOLD_SAMPLES)
+    bad = np.nonzero(~(gain(xs) > 0))[0]
+    if len(bad) == 0:
+        return float("inf")
+    i = int(bad[0])
+    if i == 0:
+        return float(lo)
+    a, b = float(xs[i - 1]), float(xs[i])       # gain(a) > 0 >= gain(b)
+    for _ in range(80):
+        m = 0.5 * (a + b)
+        if gain(np.array([m]))[0] > 0:
+            a = m
+        else:
+            b = m
+    return 0.5 * (a + b)
+
+
+_fold_cache: dict = {}
+
+
+def distortion_fold_radius(D, mode: str = "pinhole") -> float:
+    """The undistorted normalised radius r = |(X/Z, Y/Z)| at which the lens's radial
+    distortion stops being monotonic — d(r * f(r))/dr reaches 0 — or inf when it never
+    folds. Past it a point far outside the field of view maps back INTO the image
+    (k1 only: r^2 = -1 / (3 k1)). Tangential terms are ignored (small). ``mode``
+    "pinhole" uses OpenCV's rational model D = [k1, k2, p1, p2, k3, k4, k5, k6, ...];
+    "camera" (fisheye) uses theta_d = theta(1 + k1 theta^2 + ... + k4 theta^8), r = tan
+    theta, searched up to 90 degrees off-axis."""
+    if D is None:
+        return float("inf")
+    Dv = np.asarray(D, float).reshape(-1)
+    key = (mode, Dv.tobytes())
+    hit = _fold_cache.get(key)
+    if hit is not None:
+        return hit
+    if mode == "pinhole":
+        # search in angle (uniform resolution out to ~90 deg), then map back to r
+        th = _first_fold(lambda t: _radial_gain_pinhole(Dv, np.tan(t)),
+                         0.0, np.pi / 2 - 1e-6)
+        r = float("inf") if not np.isfinite(th) else float(np.tan(th))
+    else:
+        th = _first_fold(lambda t: _radial_gain_fisheye(Dv, t), 0.0, np.pi / 2 - 1e-9)
+        r = float("inf") if not np.isfinite(th) else float(np.tan(th))
+    if len(_fold_cache) > 256:
+        _fold_cache.clear()
+    _fold_cache[key] = r
+    return r
+
 
 @dataclass
 class CameraCalibration:
@@ -94,6 +180,69 @@ class CameraCalibration:
         u, v = img.reshape(2)
         return (float(u), float(v))
 
+    def project_checked(self, points, margin_px: Optional[float] = 0.0,
+                        near_m: float = NEAR_LIMIT_M, image_size=None):
+        """Batch field->image with a visibility test: ((N, 2) pixels, (N,) bool ok).
+
+        A point is visible when, in pose modes (pinhole / fisheye):
+          * its camera-frame depth exceeds ``near_m`` (not behind / at the camera),
+          * its undistorted normalised radius is inside the lens's monotonic region
+            (< distortion_fold_radius: past it a point far outside the field of view
+            folds back INTO the image), and
+          * its pixel is finite and inside the image grown by ``margin_px`` on every
+            side (``image_size`` (w, h), default self.image_size). ``margin_px=None``
+            skips the frame test — for drawing, where a line may run off-screen and
+            the canvas clips it.
+        Homography mode keeps its old behaviour: only the finite + frame test.
+        Pixels are field_to_image's for every row (ok or not)."""
+        P = np.asarray(points, np.float64).reshape(-1, 3)
+        n = len(P)
+        if n == 0:
+            return np.zeros((0, 2)), np.zeros(0, bool)
+        if self.mode == "homography":
+            Hinv = np.linalg.inv(self.H)
+            uv = cv2.perspectiveTransform(P[:, :2].reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+            ok = np.ones(n, bool)
+        else:
+            obj = P.reshape(-1, 1, 3)
+            R, _ = cv2.Rodrigues(np.asarray(self.rvec, float))
+            cam = P @ R.T + np.asarray(self.tvec, float).reshape(1, 3)
+            z = cam[:, 2]
+            ok = z > near_m
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.hypot(cam[:, 0], cam[:, 1]) / np.where(ok, z, 1.0)
+            ok &= r < distortion_fold_radius(self.D, self.mode)
+            if self.mode == "pinhole":
+                D = np.asarray(self.D, float).reshape(-1, 1)
+                uv, _ = cv2.projectPoints(obj, self.rvec, self.tvec, self.K, D)
+            else:
+                uv, _ = cv2.fisheye.projectPoints(obj, self.rvec, self.tvec, self.K, self.D)
+            uv = uv.reshape(-1, 2)
+        ok &= np.all(np.isfinite(uv), axis=1)
+        if margin_px is not None:
+            w, h = image_size if image_size is not None else self.image_size
+            m = float(margin_px)
+            with np.errstate(invalid="ignore"):
+                ok &= ((uv[:, 0] >= -m) & (uv[:, 0] < float(w) + m)
+                       & (uv[:, 1] >= -m) & (uv[:, 1] < float(h) + m))
+        return uv, ok
+
+    def in_view(self, points, margin_px: Optional[float] = 0.0,
+                near_m: float = NEAR_LIMIT_M, image_size=None) -> np.ndarray:
+        """(N,) bool: project_checked's visibility for each field point."""
+        return self.project_checked(points, margin_px, near_m, image_size)[1]
+
+    def field_to_image_visible(self, point_xyz, margin_px: Optional[float] = 0.0,
+                               near_m: float = NEAR_LIMIT_M,
+                               image_size=None) -> "tuple | None":
+        """field_to_image, or None when the point is not visible (see
+        project_checked: behind / at the camera, past the lens fold radius, or
+        outside the frame + ``margin_px``; ``margin_px=None`` skips the frame test)."""
+        uv, ok = self.project_checked([tuple(point_xyz)], margin_px, near_m, image_size)
+        if not ok[0]:
+            return None
+        return (float(uv[0, 0]), float(uv[0, 1]))
+
     def _cast_norm_ray_to_z(self, norm, z=0.0) -> "tuple | None":
         """Normalized camera ray (x_n, y_n) -> field (x, y) where it hits plane Z=z.
         z=0 is the carpet (used for projecting robot ground-contact points); a
@@ -135,6 +284,19 @@ class CameraCalibration:
         pt = np.array([[[float(uv[0]), float(uv[1])]]], dtype=np.float64)
         norm = cv2.fisheye.undistortPoints(pt, self.K, self.D).reshape(2)
         return self._cast_norm_ray_to_z(norm, z)
+
+
+def visible_point(cal, point_xyz, margin_px: Optional[float] = None) -> "tuple | None":
+    """cal.field_to_image_visible(point_xyz, margin_px) — default: depth + lens-fold
+    test only, no frame test. A duck-typed calibration without it (test doubles)
+    falls back to plain field_to_image, returning None for a non-finite pixel."""
+    f = getattr(cal, "field_to_image_visible", None)
+    if f is not None:
+        return f(point_xyz, margin_px=margin_px)
+    uv = cal.field_to_image(point_xyz)
+    if uv is None or not np.all(np.isfinite(np.asarray(uv, float))):
+        return None
+    return (float(uv[0]), float(uv[1]))
 
 
 def push_from_camera(cal, xy, offset_m) -> "tuple | None":

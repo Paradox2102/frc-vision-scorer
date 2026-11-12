@@ -11334,10 +11334,10 @@ async def calibration_autofix_preview(request: Request):
                 continue
             pts = np.asarray(corners, float).reshape(-1, 2)
             cv2.polylines(main, [pts.astype(np.int32)], True, (0, 255, 0), 2)
-            # model tag reprojected under the re-solved pose (should hug the green)
-            proj = np.array([cal.field_to_image(tuple(p))
-                             for p in fm.tag_corners_3d(tid)], float)
-            if np.all(np.isfinite(proj)):
+            # model tag reprojected under the re-solved pose (should hug the green);
+            # skipped unless every corner is visible (not behind / folded by the lens)
+            proj, vis = cal.project_checked(fm.tag_corners_3d(tid), margin_px=None)
+            if np.all(vis):
                 cv2.polylines(main, [proj.astype(np.int32)], True, (255, 255, 0), 1)
     except Exception as e:
         print(f"  [autofix] preview overlay draw failed: {e}")
@@ -12323,8 +12323,12 @@ async def calibration_solve_tags(request: Request):
             mh, mw = main.shape[:2]
             for tid in fm.tags:
                 t3 = fm.tag_translation(tid)
-                u, v = cal.field_to_image((float(t3[0]), float(t3[1]), float(t3[2])))
-                if 0 <= u < mw and 0 <= v < mh:
+                # only tags the camera can see: in front, inside the lens fold radius
+                # (a wide lens folds far off-axis tags onto the image) and in frame
+                uv = cal.field_to_image_visible(
+                    (float(t3[0]), float(t3[1]), float(t3[2])), image_size=(mw, mh))
+                if uv is not None:
+                    u, v = uv
                     color = (0, 255, 0) if tid in used else (0, 165, 255)
                     cv2.circle(main, (int(u), int(v)), 5, color, -1)
                     cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
@@ -12365,7 +12369,8 @@ _TAG_MARKER_GROUPS = {
 async def calibration_tag_map(season: Optional[str] = None, event: Optional[str] = None):
     """Top-down field tag layout for the calibration UI: tag (x,y,z) + field dims.
     ``season`` (a tag-layout stem) wins; else the ``event``'s season (its key's year
-    / override); neither -> the 2026 default. ``season_info`` describes the field."""
+    / override); neither -> the 2026 default. ``season_info`` describes the field;
+    ``wireframe_legend`` the overlay's colours on it (hud_draw.wireframe_legend)."""
     info = _event_season(event)
     if season:
         info = field_season_mod.season_for_layout(season) or info
@@ -12382,9 +12387,14 @@ async def calibration_tag_map(season: Optional[str] = None, event: Optional[str]
     tags = {str(tid): {"x": float(t["t"][0]), "y": float(t["t"][1]),
                        "z": float(t["t"][2])}
             for tid, t in fm.tags.items()}
+    try:
+        legend = hud_draw.wireframe_legend(fm)
+    except Exception:
+        legend = []
     return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m},
             "season": season, "season_info": info.public(),
-            "marker_groups": _TAG_MARKER_GROUPS.get(info.year, [])}
+            "marker_groups": _TAG_MARKER_GROUPS.get(info.year, []),
+            "wireframe_legend": legend}
 
 
 @app.get("/api/event/field-season")

@@ -152,8 +152,14 @@ def test_visible_model_tags_cover_used_tags_and_drop_back_facing():
     cam = truth_pinhole_camera()
     vis = set(ac.visible_model_tags(cam, FM, cam.image_size))
     in_frame = set(project_tag_corners(cam, FM))
-    facing = {t for t in in_frame if ac._faces_camera(cam, FM, t)}
+    # the synthetic lens (k1 -0.25, k2 -0.08) folds at r ~ 0.95: tags 29-31 sit past
+    # it (r 0.95-1.34, far off to the camera's left) yet project INTO the frame —
+    # not visible
+    folded = {t for t in in_frame if not cam.in_view([FM.tag_translation(t)]).all()}
+    assert {29, 30, 31} <= folded
+    facing = {t for t in in_frame - folded if ac._faces_camera(cam, FM, t)}
     assert facing and facing <= vis
+    assert not (folded & vis)
     assert all(ac._faces_camera(cam, FM, t) for t in vis)
 
 

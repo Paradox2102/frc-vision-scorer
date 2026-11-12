@@ -155,6 +155,22 @@ def test_tag_map_follows_the_event(app_mod):
     assert r.status_code == 400 and "2019" in r.json()["error"]
 
 
+def test_tag_map_overlay_legend_follows_the_season(app_mod):
+    """The calibrate page's overlay legend lists the colours hud_draw draws on the
+    event's field: 2025 GLB groups, 2026 hand-coded structures."""
+    from web import hud_draw
+    c = _client(app_mod)
+    j = c.get("/api/calibration/tag-map", params={"event": "2025hop"}).json()
+    leg = {d["label"]: d["color"] for d in j["wireframe_legend"]}
+    for g in ("reef", "barge", "coral_station", "processor", "perimeter", "tape"):
+        b, gg, r = hud_draw.WIREFRAME_GROUP_COLORS[g]
+        assert leg[g.replace("_", " ")] == f"#{r:02x}{gg:02x}{b:02x}"
+    assert "hubs" not in leg and "carpet grid" in leg
+    d = c.get("/api/calibration/tag-map").json()
+    assert [x["label"] for x in d["wireframe_legend"]] == [
+        "carpet grid", "hubs", "bumps", "towers", "trenches"]
+
+
 def test_field_season_override_endpoints(app_mod):
     c = _client(app_mod)
     j = c.get("/api/event/field-season", params={"event": "2025hop"}).json()

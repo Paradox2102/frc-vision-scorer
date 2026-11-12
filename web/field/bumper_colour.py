@@ -27,7 +27,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from web.field.calibration import push_from_camera
+from web.field.calibration import push_from_camera, visible_point
 
 # Robot footprint half-size (0.95 m square) and bumper band heights (m).
 HALF_FOOTPRINT_M = 0.475
@@ -99,7 +99,17 @@ def band_poly(cal, centre_xy, z0=BAND_Z0_M, z1=BAND_Z1_M, half=HALF_FOOTPRINT_M)
     if _behind_camera(cal, pts):
         return None
     try:
-        P = np.array([cal.field_to_image(p) for p in pts], np.float64)
+        # not visible past the lens fold radius (a wide lens maps far off-axis
+        # points back into the image) or at / behind the camera
+        if hasattr(cal, "project_checked"):
+            P, ok = cal.project_checked(pts, margin_px=None)
+            if not np.all(ok):
+                return None
+        else:
+            uvs = [visible_point(cal, p) for p in pts]
+            if any(uv is None for uv in uvs):
+                return None
+            P = np.array(uvs, np.float64)
     except Exception:
         return None
     if not np.all(np.isfinite(P)) or np.any(np.abs(P) > _MAX_ABS_PX):

@@ -27,6 +27,33 @@ TRENCH_HINGED_ARM_WIDTH_M = 203.2 / 1000.0
 TRENCH_HINGED_INNER_CAD_M = 2838.847 / 1000.0
 TRENCH_HINGED_OUTER_CAD_M = 4114.006 / 1000.0
 
+# (tag pair, tag the tower is centred on, +x direction into the field).
+# The tower is NOT centred on the field centreline: its panel and uprights are
+# centred on the outer tag of each pair (31 blue, 15 red; point-symmetric).
+# Measured Nov 11 2026: AdvantageScope 2026 field mesh puts the blue panel
+# centre at y=3.7455 (tag 31 y=3.746) and red at 4.3235 (tag 15 y=4.324), and
+# 2026utwv qm1 overhead footage shows both real ladders where the mesh puts
+# them, ~29 cm off the old centreline wireframe.
+TOWER_ANCHORS = (((31, 32), 31, 1.0), ((15, 16), 15, -1.0))
+
+
+def hub_center(prism) -> tuple[float, float]:
+    """Hub cabinet centre (x, y) from a tag-ring prism footprint.
+
+    The footprint is the convex hull of the hub tag centres. Every hub tag
+    sits on one of the four cabinet faces, so the hull's bounding box spans
+    face plane to face plane and its midpoint is the cabinet centre. The
+    hull's VERTEX mean is not: the tags are unevenly spaced along the faces
+    (24/27 and 25 are off-centre), which pulled it ~9 cm toward the alliance
+    wall (blue 4.537 vs 4.6255; the AdvantageScope mesh cabinet is 4.6225)."""
+    poly = np.asarray(prism.footprint, float)
+    lo, hi = poly.min(axis=0), poly.max(axis=0)
+    return float((lo[0] + hi[0]) / 2.0), float((lo[1] + hi[1]) / 2.0)
+
+
+def _tower_center_y(field_model, anchor_tag: int) -> float:
+    return float(field_model.tag_translation(anchor_tag)[1])
+
 
 def _box_edges(x0, x1, y0, y1, z0, z1):
     bottom = (
@@ -53,8 +80,7 @@ def structure_footprints(field_model, prisms) -> dict:
 
     for prism in prisms:
         poly = np.asarray(prism.footprint, float)
-        cx = float(poly[:, 0].mean())
-        cy = float(poly[:, 1].mean())
+        cx, cy = hub_center(prism)
         bh = HUB_BASE_WIDTH_M / 2.0
         out["hubs"].append(
             [(cx - bh, cy - bh), (cx + bh, cy - bh),
@@ -69,11 +95,11 @@ def structure_footprints(field_model, prisms) -> dict:
                 (far_y0, min(float(field_model.width_m), far_y0 + BUMP_WIDTH_M))):
             out["bumps"].append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
-    for tag_ids, inward_sign in (((31, 32), 1.0), ((15, 16), -1.0)):
+    for tag_ids, anchor_tag, inward_sign in TOWER_ANCHORS:
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         panel_x = float(pts[:, 0].mean())
         frame_x = panel_x + inward_sign * TOWER_DEPTH_M
-        cy = float(field_model.width_m) / 2.0
+        cy = _tower_center_y(field_model, anchor_tag)
         y0, y1 = cy - TOWER_WIDTH_M / 2.0, cy + TOWER_WIDTH_M / 2.0
         xa, xb = sorted((panel_x, frame_x))
         out["towers"].append([(xa, y0), (xb, y0), (xb, y1), (xa, y1)])
@@ -101,9 +127,7 @@ def hub_wireframe_edges(prisms):
     """Dimensioned hub cabinet, opening, and tapered upper frame."""
     edges = []
     for prism in prisms:
-        poly = np.asarray(prism.footprint, float)
-        cx = float(poly[:, 0].mean())
-        cy = float(poly[:, 1].mean())
+        cx, cy = hub_center(prism)
         base_half = HUB_BASE_WIDTH_M / 2.0
         top_half = HUB_TOP_WIDTH_M / 2.0
 
@@ -149,14 +173,13 @@ def hub_wireframe_edges(prisms):
 def tower_wireframe_edges(field_model):
     """Tower panel, uprights, rungs, and depth braces anchored to tower tags."""
     edges = []
-    for tag_ids, inward_sign in (((31, 32), 1.0), ((15, 16), -1.0)):
+    for tag_ids, anchor_tag, inward_sign in TOWER_ANCHORS:
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         panel_x = float(pts[:, 0].mean())
         frame_x = panel_x + inward_sign * TOWER_DEPTH_M
-        # The top-view drawing centers the tower frame on the field centerline.
-        # The two tower tags are offset on the rear panel, so their midpoint is
-        # not the structure center and would shift the wireframe by about 3.4 in.
-        center_y = float(field_model.width_m) / 2.0
+        # Centred on the outer tag, not the field centreline or the tag-pair
+        # midpoint (see TOWER_ANCHORS for the mesh + footage measurement).
+        center_y = _tower_center_y(field_model, anchor_tag)
         panel_y0 = center_y - TOWER_WIDTH_M / 2.0
         panel_y1 = center_y + TOWER_WIDTH_M / 2.0
         upright_ys = (
@@ -237,7 +260,7 @@ def bump_wireframe_edges(prisms, field_width):
     edges = []
     for prism in prisms:
         poly = np.asarray(prism.footprint, float)
-        center_x = float(poly[:, 0].mean())
+        center_x, _ = hub_center(prism)
         x0 = center_x - BUMP_DEPTH_M / 2.0
         x1 = center_x + BUMP_DEPTH_M / 2.0
         ridge_x = center_x

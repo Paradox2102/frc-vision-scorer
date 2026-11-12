@@ -17,7 +17,9 @@ from web.field.overlay_geometry import (
     TRENCH_HINGED_INNER_CAD_M,
     TRENCH_HINGED_OUTER_CAD_M,
     bump_wireframe_edges,
+    hub_center,
     hub_wireframe_edges,
+    structure_footprints,
     tower_wireframe_edges,
     trench_wireframe_edges,
 )
@@ -100,18 +102,52 @@ def test_tower_frame_extends_40_inches_inward_from_panel():
     assert abs((max(xs) - min(xs)) - TOWER_DEPTH_M) < 1e-9
 
 
-def test_tower_is_centered_on_field_not_tag_midpoint():
+def test_tower_is_centered_on_outer_tag_not_field_centerline():
+    # AdvantageScope mesh: blue panel centre y=3.7455, red 4.3235 (Nov 11 2026),
+    # confirmed on 2026utwv qm1 overhead footage.
     fm = FieldModel.load("2026-rebuilt-welded")
     edges = tower_wireframe_edges(fm)
-    blue_edges = edges[:14]
-    ys = [point[1] for edge in blue_edges for point in edge]
-    assert abs((min(ys) + max(ys)) / 2.0 - fm.width_m / 2.0) < 1e-9
+    for tower_edges, anchor, mesh_y in (
+            (edges[:14], 31, 3.7455), (edges[14:], 15, 4.3235)):
+        ys = [point[1] for edge in tower_edges for point in edge]
+        center = (min(ys) + max(ys)) / 2.0
+        assert abs(center - fm.tag_translation(anchor)[1]) < 1e-9
+        assert abs(center - mesh_y) < 0.01
+        assert abs(center - fm.width_m / 2.0) > 0.25
 
-    tag_midpoint = float(np.mean([
-        fm.tag_translation(31)[1],
-        fm.tag_translation(32)[1],
-    ]))
-    assert abs(tag_midpoint - fm.width_m / 2.0) > 0.05
+
+def test_towers_are_point_symmetric():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    towers = structure_footprints(fm, hub_prisms(fm))["towers"]
+    (bx, by), (rx, ry) = (np.asarray(p, float).mean(axis=0) for p in towers)
+    assert abs((bx + rx) - fm.length_m) < 0.01
+    assert abs((by + ry) - fm.width_m) < 0.01
+
+
+def test_hub_center_is_tag_face_midpoint_not_hull_vertex_mean():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    blue, red = hub_prisms(fm)
+    # Faces carry tags 25/26 (x=4.022) and 19/20 (x=5.229); mesh cabinet 4.6225.
+    assert abs(hub_center(blue)[0] - 4.6255) < 1e-3
+    assert abs(hub_center(blue)[1] - 4.0345) < 1e-3
+    assert abs(hub_center(red)[0] - 11.9155) < 1e-3
+    assert abs(hub_center(blue)[0] + hub_center(red)[0] - fm.length_m) < 1e-3
+    # The old vertex mean was ~9 cm short of the cabinet centre.
+    assert abs(blue.footprint[:, 0].mean() - hub_center(blue)[0]) > 0.08
+
+
+def test_hub_wireframe_bumps_and_footprints_share_hub_center():
+    fm = FieldModel.load("2026-rebuilt-welded")
+    prisms = hub_prisms(fm)
+    cx, cy = hub_center(prisms[0])
+    hub_pts = [p for e in hub_wireframe_edges(prisms[:1]) for p in e]
+    assert abs((min(p[0] for p in hub_pts) + max(p[0] for p in hub_pts)) / 2 - cx) < 1e-9
+    assert abs((min(p[1] for p in hub_pts) + max(p[1] for p in hub_pts)) / 2 - cy) < 1e-9
+    ridge_xs = {round(p[0], 9) for e in bump_wireframe_edges(prisms[:1], fm.width_m)
+                for p in e if abs(p[2] - BUMP_HEIGHT_M) < 1e-9}
+    assert ridge_xs == {round(cx, 9)}
+    fp = structure_footprints(fm, prisms)
+    assert np.allclose(np.asarray(fp["hubs"][0], float).mean(axis=0), (cx, cy))
 
 
 def test_trenches_have_rails_and_dimensioned_support_stations():

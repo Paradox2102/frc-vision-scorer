@@ -385,6 +385,10 @@ def test_gate_on_passes_app_overrides_to_selective_config():
     SelectiveConfig built for track_selective, not just sit unused on
     JobConfig."""
     job = _make_job()
+    # pin the DINOv3 embedder: S4 (the default since Nov 11) scales the
+    # appearance term by its selective_app_scale (0.166)
+    from web.embedder import DINOV3_THRESHOLDS
+    job.embed_backend, job.embed_thresholds = "dinov3", DINOV3_THRESHOLDS
     job.config.selective_mask_prop = True
     job.config.selective_app_weight = 0.6           # non-default overrides
     job.config.selective_app_ema = 0.7

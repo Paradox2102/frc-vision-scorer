@@ -32,7 +32,8 @@ def _seed():
     }))
 
 
-def test_list_gallery_groups_and_images(client):
+def test_list_gallery_groups_and_images(client, monkeypatch):
+    monkeypatch.setenv("ROBOT_EMBEDDER", "dinov3")   # rows below are DINOv3-tagged; the page lists the default embedder's rows
     c, _ = client
     _seed()
     r = c.get("/api/gallery?event_key=2026x")
@@ -51,7 +52,8 @@ def test_list_gallery_groups_and_images(client):
     assert "embedding" not in r.text
 
 
-def test_list_gallery_attaches_source_match_roster(client):
+def test_list_gallery_attaches_source_match_roster(client, monkeypatch):
+    monkeypatch.setenv("ROBOT_EMBEDDER", "dinov3")   # rows below are DINOv3-tagged; the page lists the default embedder's rows
     # Each exemplar carries the 6-team roster of the match it was pulled from,
     # so the UI can offer that match as a relabel dropdown.
     c, _ = client
@@ -144,3 +146,23 @@ def test_delete_gallery_exemplar(client):
     assert r.status_code == 200, r.text
     rows = asyncio.run(database.get_gallery_exemplars("2026x"))
     assert gid not in [e["id"] for e in rows]
+
+
+def test_list_gallery_lists_the_default_embedders_rows(client, monkeypatch):
+    # The page follows the default robot_embedder (S4 since Nov 11): jobs tag
+    # their gallery rows with their own embedder, so asking for DINOv3's rows
+    # would hide everything S4 jobs deposit.
+    import web.app as app_mod
+    seen = {}
+
+    async def fake_rows(event_key, teams=None, embed_model=None):
+        seen["embed_model"] = embed_model
+        return []
+
+    monkeypatch.delenv("ROBOT_EMBEDDER", raising=False)
+    monkeypatch.setattr(app_mod, "resolve_embedder_backend", lambda req: ("s4", ""))
+    monkeypatch.setattr(app_mod, "embedder_model_name", lambda b: f"{b}:tag")
+    monkeypatch.setattr(app_mod.database, "get_gallery_exemplars", fake_rows)
+    c, _tmp = client
+    r = c.get("/api/gallery", params={"event_key": "2026cur"})
+    assert r.status_code == 200 and seen["embed_model"] == "s4:tag"

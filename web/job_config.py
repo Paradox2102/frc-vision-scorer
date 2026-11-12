@@ -815,8 +815,11 @@ KNOBS = [
     # every cosine threshold switches to its S4 value
     # (web/embedder.py S4_THRESHOLDS, spec §16). Falls back to dinov3 with a
     # warning when the checkpoint or CUDA is missing. Gallery / crop rows stay
-    # separated by embed_model. DEFAULT dinov3 pending the live A/B.
-    Knob("robot_embedder", "ROBOT_EMBEDDER", str, "dinov3",
+    # separated by embed_model. DEFAULT s4 since Nov 11 (Nick): live qm8 x2
+    # misID 10-13 -> 7 s, wrong 1.3-1.7 -> 0.9-1.0%; unseen 2026casnd x3
+    # (spec section 17) no audited regression, appearance-veto churn -12..-53%.
+    # ROBOT_EMBEDDER=dinov3 to roll back.
+    Knob("robot_embedder", "ROBOT_EMBEDDER", str, "s4",
          choices=("dinov3", "s4"), section="Identity & votes"),
     # Exact slot discontinuity logging (web/field/slot_boundaries.py): one
     # diagnostic JSONL "slot_boundary" row per (frame, slot) with a seed /

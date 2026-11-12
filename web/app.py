@@ -14361,8 +14361,14 @@ async def _record_slot_correction(job_id: str, rec: dict, team: str) -> dict:
 @app.get("/api/gallery")
 async def list_gallery(event_key: str):
     """List appearance-gallery exemplars for an event. Returns thumbnails as
-    data-URLs; never serializes the raw embedding bytes."""
-    rows = await database.get_gallery_exemplars(event_key)
+    data-URLs; never serializes the raw embedding bytes. Rows of the DEFAULT
+    robot_embedder's model are listed (S4 since Nov 11; jobs deposit rows
+    tagged with their own embedder, so the page follows the default)."""
+    try:
+        model = embedder_model_name(resolve_embedder_backend(JobConfig().robot_embedder)[0])
+    except Exception:
+        model = EMBED_ACTIVE_MODEL
+    rows = await database.get_gallery_exemplars(event_key, embed_model=model)
     # Build a job_id -> roster ([blue+red team numbers]) map once, so each
     # exemplar can offer the 6 robots from the match it was pulled from.
     roster_by_job: dict[str, list] = {}

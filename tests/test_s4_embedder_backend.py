@@ -17,11 +17,11 @@ from web.students import s4_embedder as S4
 
 
 # ----------------------------------------------------------------------------- knob
-def test_robot_embedder_knob_default_dinov3(monkeypatch):
+def test_robot_embedder_knob_default_s4(monkeypatch):
     monkeypatch.delenv("ROBOT_EMBEDDER", raising=False)
     cfg = JobConfig()
-    assert cfg.robot_embedder == "dinov3" and "robot_embedder" not in cfg.non_defaults()
-    assert JobConfig({"robot_embedder": "s4"}).non_defaults() == {"robot_embedder": "s4"}
+    assert cfg.robot_embedder == "s4" and "robot_embedder" not in cfg.non_defaults()
+    assert JobConfig({"robot_embedder": "dinov3"}).non_defaults() == {"robot_embedder": "dinov3"}
     with pytest.raises(ValueError):
         JobConfig({"robot_embedder": "clip"})
     monkeypatch.setenv("ROBOT_EMBEDDER", "s4")

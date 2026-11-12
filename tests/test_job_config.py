@@ -556,6 +556,24 @@ def test_identity_registry_built_from_knobs(monkeypatch):
     assert reg.warmup_frames == 3
 
 
+def test_identity_per_cam_appearance_knob_default_off_and_wired(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    from web.app import InferenceJob
+    from web.field.identity import IdentityRegistry
+    cfg = JobConfig()
+    assert cfg.identity_per_cam_appearance is False
+    assert "identity_per_cam_appearance" not in cfg.non_defaults()
+    job = InferenceJob.__new__(InferenceJob)
+    job.config = cfg
+    assert InferenceJob._build_identity_registry(job).per_cam_appearance is False
+    monkeypatch.setenv("IDENTITY_PER_CAM_APPEARANCE", "1")
+    assert JobConfig().identity_per_cam_appearance is True
+    job.config = JobConfig({"identity_per_cam_appearance": "true"})
+    reg = InferenceJob._build_identity_registry(job)
+    assert isinstance(reg, IdentityRegistry) and reg.per_cam_appearance is True
+
+
 def test_identity_swap_resolve_knobs_default_off(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

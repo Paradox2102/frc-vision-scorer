@@ -279,12 +279,19 @@ def _merge_fused_group(group, ref_local: int) -> FusedObservation:
         emb = avg / norm if norm > 0 else avg
     else:
         emb = None
+    # Per-camera embeddings: union over the group, the ref member's camera
+    # entries winning ties (it is the main-backed / retained member).
+    cam_embs: dict = {}
+    for o in [ref] + [o for k, o in enumerate(group) if k != ref_local]:
+        for cam, e in (getattr(o.detection, "cam_embeddings", None) or {}).items():
+            cam_embs.setdefault(cam, e)
     rd = ref.detection
     det = FieldDetection(pos=rd.pos, color=rd.color, box=rd.box,
                          score=rd.score, track_id=rd.track_id, embedding=emb,
                          robot_crop_b64=rd.robot_crop_b64,
                          tracker_prob=rd.tracker_prob,
-                         cams=tuple(sorted({m[0] for m in members})))
+                         cams=tuple(sorted({m[0] for m in members})),
+                         cam_embeddings=cam_embs or None)
     # Carry the registry's per-detection relink annotations forward if present.
     for attr in ("relink_margin", "relink_evidence"):
         if hasattr(rd, attr):
@@ -363,10 +370,30 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     else:
         merged_embedding = None
 
+    # Per-camera embeddings (identity_per_cam_appearance): views of one robot
+    # from different cameras look different (2025hop qm2 S4: main-vs-corner
+    # same-frame median cosine 0.62 vs 0.92-0.93 within one camera), so the
+    # identity layer can compare like with like. One per camera: the
+    # highest-weight member with an embedding, L2-normalised.
+    best_by_cam: dict = {}
+    for cam, det, _crop, w in cluster:
+        if det.embedding is None:
+            continue
+        if cam not in best_by_cam or w > best_by_cam[cam][0]:
+            best_by_cam[cam] = (w, det.embedding)
+    cam_embeddings = None
+    if best_by_cam:
+        cam_embeddings = {}
+        for cam, (_w, e) in best_by_cam.items():
+            e = np.asarray(e, dtype=np.float32)
+            n = float(np.linalg.norm(e))
+            cam_embeddings[cam] = e / n if n > 0 else e
+
     return FusedObservation(
         detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box,
                                  embedding=merged_embedding, tracker_prob=tracker_prob,
-                                 cams=tuple(sorted(member_cameras))),
+                                 cams=tuple(sorted(member_cameras)),
+                                 cam_embeddings=cam_embeddings),
         evidence=evidence,
         members=members,
     )

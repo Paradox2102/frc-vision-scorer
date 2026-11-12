@@ -171,3 +171,25 @@ def test_identity_churn_summary_uses_final_slot_holders():
     assert payload["final_ages_s"]["B1"] == 10.0  # (1200-600)/60
     assert payload["final_ages_s"]["R2"] == 1.0
     assert payload["evictions"] == 1
+
+
+def _cam_frame(job, frame, pos, emb, cam):
+    job._current_frame = frame
+    job.field_tracker.binding_events = []
+    job.field_tracker.assignment_evidence = {0: {"detection_idx": 0}}
+    fused = [SimpleNamespace(track_id=7, detection=SimpleNamespace(
+        pos=pos, embedding=emb, box=None, cam_embeddings={cam: emb}))]
+    outs = [SimpleNamespace(slot_id=0, pos=pos, alliance="blue")]
+    asyncio.run(job._sync_identity_registry_frame(fused, [], outs, log_frame_num=frame))
+
+
+def test_per_cam_appearance_reaches_registry_through_the_loop():
+    """identity_per_cam_appearance: the fused detection's cam_embeddings feed
+    the IdentityObservation, so a corner-only view of a main-built identity
+    is neutral (no veto row); the legacy registry vetoes the same input."""
+    for per_cam, expect_rejects in ((False, 1), (True, 0)):
+        job = _job(IdentityRegistry(per_cam_appearance=per_cam))
+        _cam_frame(job, 8, (2.0, 2.0), A, "main")
+        _cam_frame(job, 16, (2.2, 2.0), B, "corner_left")
+        assert len(job.diagnostic.rejects) == expect_rejects
+        assert len(job.identity_registry.identities) == 1 + expect_rejects

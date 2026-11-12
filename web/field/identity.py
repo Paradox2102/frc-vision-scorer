@@ -44,6 +44,13 @@ class RobotIdentity:
     # (the birth observation counts as 1).
     born_frame: int = 0
     obs_count: int = 0
+    # Per-camera appearance (IdentityRegistry per_cam_appearance, knob
+    # identity_per_cam_appearance; empty when OFF): camera name -> EMA,
+    # first-seen anchor, last-5 exemplar FIFO — the per-camera mirror of
+    # appearance_embedding / anchor_embedding / recent_exemplars.
+    cam_appearance: dict = field(default_factory=dict)
+    cam_anchor: dict = field(default_factory=dict)
+    cam_exemplars: dict = field(default_factory=dict)
 
 @dataclass
 class IdentityObservation:
@@ -60,6 +67,10 @@ class IdentityObservation:
     # or the slot is now fed by a different track id than last frame). A
     # disrupted slot never gets the identity_continuity pass.
     slot_disrupted: bool = False
+    # Per-camera embeddings behind ``embedding`` (FieldDetection.cam_embeddings:
+    # camera -> L2-normalised crop embedding), or None. Read only when the
+    # registry's per_cam_appearance is on.
+    cam_embeddings: dict | None = None
 
 # Field-tracker binding events (FieldTracker.binding_events) that break slot
 # continuity for the identity_continuity gate. slot_rebound is deliberately
@@ -96,6 +107,41 @@ FAR_PENALTY = 1.0             # moved > FAR_DIST_M since last seen
 DIST_WEIGHT = 0.1             # per metre, within FAR_DIST_M
 TEAM_MATCH_BONUS = 0.4
 TEAM_CONFLICT_PENALTY = 0.8
+
+MAX_EXEMPLARS = 5
+
+
+def _per_cam_pairs(ident: RobotIdentity, obs) -> list | None:
+    """Cameras present in both ``obs.cam_embeddings`` and the identity's
+    per-camera stores, as [(cam, obs_emb)], or None when either side has no
+    per-camera appearance (caller falls back to the merged embedding)."""
+    cam_embs = getattr(obs, "cam_embeddings", None)
+    if not cam_embs or not ident.cam_appearance:
+        return None
+    return [(cam, e) for cam, e in cam_embs.items()
+            if e is not None and cam in ident.cam_appearance]
+
+
+def appearance_ema_similarity(ident: RobotIdentity, obs, per_cam: bool) -> float | None:
+    """Cosine of an observation vs the identity's appearance EMA (the
+    divergence check in InferenceJob._sync_identity_registry_frame), or None
+    when there is nothing comparable. ``per_cam``: compare only same-camera
+    embeddings (max over shared cameras); no shared camera -> None (neutral,
+    never divergent). Falls back to merged-vs-legacy EMA when either side
+    lacks per-camera appearance."""
+    if obs is None:
+        return None
+    if per_cam:
+        pairs = _per_cam_pairs(ident, obs)
+        if pairs is not None:
+            if not pairs:
+                return None
+            return max(cosine_similarity(e, ident.cam_appearance[cam])
+                       for cam, e in pairs)
+    if obs.embedding is None or ident.appearance_embedding is None:
+        return None
+    return cosine_similarity(obs.embedding, ident.appearance_embedding)
+
 
 # Why an observation did NOT join an existing identity (=> identity birth).
 BIRTH_REASONS = ("appearance_veto", "distance", "team_conflict", "no_candidate", "other")
@@ -180,6 +226,19 @@ class IdentityRegistry:
     early bad sample cannot erase the birth appearance; mature identities keep
     the confidence gate unchanged.
 
+    Per-camera appearance (``per_cam_appearance``, job knob
+    ``identity_per_cam_appearance``, default OFF): fusion averages the crop
+    embeddings of every camera in a cluster, but one robot seen from main and
+    from a corner looks different (2025hop qm2 S4 same-frame main-vs-corner
+    median cosine 0.62, 42% under the 0.59 floor; within one camera 0.92+).
+    When ON each identity also keeps a per-camera EMA / anchor / exemplar
+    FIFO, updated where and when the legacy fields are, and association
+    compares an observation's per-camera embeddings only against the same
+    camera's stores (max over shared cameras). No shared camera = neutral
+    appearance: no veto, no bonus (position/team decide). Observations or
+    identities without per-camera data fall back to the merged-embedding
+    comparison. The legacy fields keep updating either way.
+
     Telemetry (always on, cheap): ``stats`` counts births by reason
     (``births_<reason>``, reasons in BIRTH_REASONS), evictions, cap-rejected
     creations, matches, continuity holds and warm-up updates.
@@ -199,8 +258,10 @@ class IdentityRegistry:
         warmup_frames: int = 0,
         alliance_by_territory: bool = True,
         update_margin: float = 0.05,
+        per_cam_appearance: bool = False,
     ) -> None:
         self.identities: dict[int, RobotIdentity] = {}
+        self.per_cam_appearance = bool(per_cam_appearance)
         # Relink-margin gate on appearance EMA updates (cosine units of the
         # job's embedder: web.embedder.EmbedThresholds.update_margin).
         self.update_margin = float(update_margin)
@@ -318,13 +379,26 @@ class IdentityRegistry:
                     max_sim = None
                     veto = 0.0
                     
-                    # 2. Appearance similarity
-                    if obs.embedding is not None and ident.appearance_embedding is not None:
+                    # 2. Appearance similarity. Per-camera (knob): same-camera
+                    # stores only; no shared camera -> max_sim None = neutral.
+                    pairs = (_per_cam_pairs(ident, obs)
+                             if self.per_cam_appearance else None)
+                    sims = []
+                    if pairs is not None:
+                        for cam, e in pairs:
+                            sims.append(cosine_similarity(e, ident.cam_appearance[cam]))
+                            anchor = ident.cam_anchor.get(cam)
+                            if anchor is not None:
+                                sims.append(cosine_similarity(e, anchor))
+                            for ex in ident.cam_exemplars.get(cam, ()):
+                                sims.append(cosine_similarity(e, ex))
+                    elif obs.embedding is not None and ident.appearance_embedding is not None:
                         sims = [cosine_similarity(obs.embedding, ident.appearance_embedding)]
                         if ident.anchor_embedding is not None:
                             sims.append(cosine_similarity(obs.embedding, ident.anchor_embedding))
                         for ex in ident.recent_exemplars:
                             sims.append(cosine_similarity(obs.embedding, ex))
+                    if sims:
                         max_sim = max(sims)
                         all_sims[r, c] = max_sim
                         
@@ -363,6 +437,10 @@ class IdentityRegistry:
                 d = detail.get((r, c))
                 if cost < self.association_threshold:
                     assigned_id_map[r] = existing_ids[c]
+                    if (d is not None and d[0] is None and self.per_cam_appearance
+                            and observations[r].cam_embeddings):
+                        # Matched with appearance neutral (no shared camera).
+                        self.stats["percam_neutral_matches"] += 1
                     if (d is not None and self.continuity and d[2] > 0
                             and d[2] < VETO_PENALTY
                             and cost - d[2] + VETO_PENALTY >= self.association_threshold):
@@ -399,17 +477,21 @@ class IdentityRegistry:
                 # Margin = cost - next_best_cost
                 # (For simplicity and test matching, we use observations' own margins or calculate it if needed)
                 
-                # Update appearance embedding
+                # Update appearance embedding. Same gate for the legacy and
+                # the per-camera stores (per-camera: knob only).
+                mature_ok = ident.confidence >= self.app_update_floor
+                warm_ok = (self.continuity and self.warmup_frames > 0
+                           and ident.obs_count <= self.warmup_frames)
+                update_ok = obs.relink_margin >= self.update_margin and (mature_ok or warm_ok)
+                if self.per_cam_appearance:
+                    self._update_cam_appearance(ident, obs, update_ok)
                 if obs.embedding is not None:
                     if ident.appearance_embedding is None:
                         ident.appearance_embedding = obs.embedding
                         ident.anchor_embedding = obs.embedding
                         ident.recent_exemplars = [obs.embedding]
                     else:
-                        mature_ok = ident.confidence >= self.app_update_floor
-                        warm_ok = (self.continuity and self.warmup_frames > 0
-                                   and ident.obs_count <= self.warmup_frames)
-                        if obs.relink_margin >= self.update_margin and (mature_ok or warm_ok):
+                        if update_ok:
                             if not mature_ok:
                                 self.stats["warmup_updates"] += 1
                             old_emb = ident.appearance_embedding
@@ -419,7 +501,7 @@ class IdentityRegistry:
                             ident.appearance_embedding = blended / norm if norm > 0 else blended
                             
                             ident.recent_exemplars.append(obs.embedding)
-                            if len(ident.recent_exemplars) > 5:
+                            if len(ident.recent_exemplars) > MAX_EXEMPLARS:
                                 ident.recent_exemplars.pop(0)
             else:
                 # Create a new identity
@@ -474,5 +556,31 @@ class IdentityRegistry:
                     new_ident.appearance_embedding = obs.embedding
                     new_ident.anchor_embedding = obs.embedding
                     new_ident.recent_exemplars = [obs.embedding]
+                if self.per_cam_appearance:
+                    self._update_cam_appearance(new_ident, obs, False)
                 
                 self.identities[fused_id] = new_ident
+
+    def _update_cam_appearance(self, ident: RobotIdentity, obs, update_ok: bool) -> None:
+        """Per-camera mirror of the legacy appearance update: a camera seen for
+        the first time seeds its EMA / anchor / exemplars (like the legacy
+        first embedding, ungated); a known camera takes the EMA + exemplar
+        update only when ``update_ok`` (the legacy relink-margin/confidence
+        gate). The anchor never changes."""
+        for cam, e in (obs.cam_embeddings or {}).items():
+            if e is None:
+                continue
+            if cam not in ident.cam_appearance:
+                ident.cam_appearance[cam] = e
+                ident.cam_anchor[cam] = e
+                ident.cam_exemplars[cam] = [e]
+                continue
+            if not update_ok:
+                continue
+            blended = (1.0 - self.ema_alpha) * ident.cam_appearance[cam] + self.ema_alpha * e
+            norm = np.linalg.norm(blended)
+            ident.cam_appearance[cam] = blended / norm if norm > 0 else blended
+            fifo = ident.cam_exemplars.setdefault(cam, [])
+            fifo.append(e)
+            if len(fifo) > MAX_EXEMPLARS:
+                fifo.pop(0)

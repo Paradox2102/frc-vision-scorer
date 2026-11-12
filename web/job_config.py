@@ -896,6 +896,20 @@ KNOBS = [
          min=0.1, max=1.5, section="Identity & votes"),
     Knob("identity_warmup_frames", "IDENTITY_WARMUP_FRAMES", int, 5,
          min=0, max=30, section="Identity & votes"),
+    # Per-camera appearance (identity layer, web/field/identity.py): fusion
+    # averages every camera's crop embedding into one, but the same robot
+    # looks different from main and from a corner. 2025hop qm2 S4 cosines,
+    # same slot: main-vs-main (<=2 s apart) median 0.93 (6% < 0.59 floor),
+    # corner-vs-corner 0.92 (5%), main-vs-corner SAME frame 0.62 (42%) — so
+    # a corner-only observation (robot hidden from main, e.g. behind the
+    # reef) was vetoed against a main-built identity; with corner cameras on
+    # 2025hop births rose 2-3x (qm3 49 -> 134), mostly appearance_veto. ON:
+    # identities keep per-camera EMA/anchor/exemplars and only same-camera
+    # embeddings are compared (max over shared cameras); no shared camera =
+    # neutral appearance (no veto, no bonus). Also applies to the appearance
+    # divergence read trigger. DEFAULT OFF pending a live A/B.
+    Knob("identity_per_cam_appearance", "IDENTITY_PER_CAM_APPEARANCE", bool, False,
+         section="Identity & votes"),
     # --- cross-camera fusion ---
     # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,
     # so their range estimate is nearly meaningless (measured 1.1-3.8 m off on

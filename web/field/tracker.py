@@ -39,6 +39,12 @@ class FieldDetection:
     # a duplicate of a nearby main-backed one only if that one's cluster lacks
     # this corner camera (else the corner saw two robots there).
     cams: tuple = ()
+    # Per-camera crop embeddings behind the merged `embedding` (fusion
+    # payload): camera name -> L2-normalised embedding of that camera's
+    # highest-weight cluster member, or None when unknown. Only the identity
+    # registry's per-camera appearance (knob identity_per_cam_appearance)
+    # reads it; `embedding` stays the cross-camera average for everyone else.
+    cam_embeddings: Optional[dict] = None
 
 
 @dataclass

@@ -150,6 +150,7 @@ from web.scouting.api import router as scouting_router
 from web import database
 from web.field.identity import (
     DISRUPTING_BINDING_EVENTS,
+    appearance_ema_similarity,
     IdentityObservation,
     IdentityRegistry,
     RobotIdentity,
@@ -6203,6 +6204,7 @@ class InferenceJob:
             continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
             warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
             alliance_by_territory=bool(getattr(cfg, "alliance_by_territory", True)),
+            per_cam_appearance=bool(getattr(cfg, "identity_per_cam_appearance", False)),
         )
 
     def _retire_evicted_tracks(self, evicted_ids) -> None:
@@ -6415,6 +6417,8 @@ class InferenceJob:
             pos = fused_obs.detection.pos if fused_obs is not None else t.pos
             alliance = t.alliance
             emb = fused_obs.detection.embedding if fused_obs is not None else None
+            cam_embs = (getattr(fused_obs.detection, "cam_embeddings", None)
+                        if fused_obs is not None else None)
             
             margin = ev.margin if ev is not None else 1.0
             ev_type = ev.type if ev is not None else "initial"
@@ -6427,6 +6431,7 @@ class InferenceJob:
                 relink_margin=margin,
                 continuity_evidence=ev_type,
                 slot_disrupted=slot_id in disrupted_slots,
+                cam_embeddings=cam_embs,
             )
             observations.append(obs)
 
@@ -6488,6 +6493,7 @@ class InferenceJob:
             relink_margin = 1.0
             continuity_evidence = "initial"
             obs_emb = None
+            obs = None
             if is_observed:
                 # Find matching observation
                 obs = next((o for o in observations if o.slot_id == ident.active_slot), None)
@@ -6519,10 +6525,15 @@ class InferenceJob:
                 self._request_immediate_read(ident, IMMEDIATE_AMBIGUOUS)
 
             # Check for appearance divergence
+            # (identity_per_cam_appearance: same-camera EMA only; an
+            # observation sharing no camera with the identity is not divergent.)
             appearance_divergent = False
-            if is_observed and obs_emb is not None and ident.appearance_embedding is not None:
-                sim = cosine_similarity(obs_emb, ident.appearance_embedding)
-                if sim < self._emb_thr().divergence_sim:
+            if is_observed and obs_emb is not None:
+                sim = appearance_ema_similarity(
+                    ident, obs,
+                    per_cam=bool(getattr(self.identity_registry,
+                                         "per_cam_appearance", False)))
+                if sim is not None and sim < self._emb_thr().divergence_sim:
                     appearance_divergent = True
 
             roster_uniqueness_ok = True

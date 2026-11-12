@@ -26,6 +26,9 @@ class FieldModel:
     tags: dict[int, dict]   # id -> {"t": (3,) array, "q": (w,x,y,z)}
     length_m: float
     width_m: float
+    # tag-layout stem this model was loaded from ("2026-rebuilt-welded", ...); ""
+    # for a hand-built model. web.field.season dispatches drawing/structures on it.
+    season: str = ""
 
     @classmethod
     def load(cls, season: str) -> "FieldModel":
@@ -40,7 +43,7 @@ class FieldModel:
                 "q": np.array([q["W"], q["X"], q["Y"], q["Z"]], dtype=float),
             }
         return cls(tags=tags, length_m=float(data["field"]["length"]),
-                   width_m=float(data["field"]["width"]))
+                   width_m=float(data["field"]["width"]), season=str(season))
 
     def tag_translation(self, tag_id: int) -> np.ndarray:
         return self.tags[tag_id]["t"]

@@ -72,9 +72,11 @@ _NFREE = {"pose": 0, "f_lens": 1, "pp_k0": 1, "pp_k1": 2, "k0": 4, "k1": 5, "ful
 
 
 def _order(cfg) -> tuple:
-    """The model ladder starting at cfg.init_model."""
+    """The model ladder starting at cfg.init_model (and ending at cfg.max_model)."""
     seq = LENS_MODEL_ORDER if cfg.init_model in ("pose", "f_lens") else MODEL_ORDER
-    return seq[seq.index(cfg.init_model):]
+    out = seq[seq.index(cfg.init_model):]
+    cap = getattr(cfg, "max_model", None)
+    return out[:out.index(cap) + 1] if cap in out else out
 
 
 def _rank(cfg, m) -> int:
@@ -105,6 +107,9 @@ JUDGE_CRITERIA = {
 @dataclass
 class LocatorConfig:
     init_model: str = "pp_k1"
+    # Freest model the ladder may escalate to (None: no cap). "pose" keeps a BORROWED
+    # lens fixed: it belongs to another camera, so located points must not refit it.
+    max_model: Optional[str] = None
     jev_verify: bool = True           # False: accept every geometric quad candidate
     jev_min_p: float = 0.6
     max_residual_px: float = 4.0      # a located point must reproject this well

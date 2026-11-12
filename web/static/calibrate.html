@@ -254,6 +254,11 @@
 </div>
 
 <div class="solve-row">
+  <label style="color:#a0b0c0;" title="Borrow a sibling corner camera's lens and solve only the pose — for a corner camera with too few tags to pin down its own lens. The main camera never lends or borrows.">Lens
+    <select id="lensFrom" onchange="lensPin = null;">
+      <option value="">solve own lens</option>
+    </select>
+  </label>
   <button class="primary" onclick="solve()">Solve &amp; preview</button>
   <span id="statusLine" class="rms-info">—</span>
 </div>
@@ -770,6 +775,7 @@ async function refreshForSelection(){
   autoTags = src.auto_tags || {};
   manualTags = src.manual_tags || [];
   heldOut = new Set(src.holdout_ids || []);
+  setLensFrom(src.lens_from || '', src.lens_version_id || null);   // re-preview with the same lens
   pendingPixel = null;
   redrawFrame(); drawMap(); renderRows();
   const span = epoch.start_match ? `from ${epoch.start_match} →` : 'event start →';
@@ -1093,12 +1099,48 @@ function renderRows(){
   });
 }
 
+// Lens selector: "solve own lens" or borrow a sibling corner camera's lens (pose-only
+// solve). lensPin = the exact lender version a restored epoch used (dry-run re-preview).
+let lensPin = null;
+async function loadLensOptions(){
+  const event = document.getElementById('event').value.trim();
+  const camera = document.getElementById('camera').value.trim();
+  const others = [...document.getElementById('camera').options].map(o => o.value)
+    .filter(c => c && c !== 'main' && c !== camera && camera !== 'main');
+  const ok = [];
+  for (const c of others){
+    try {
+      const r = await fetch(`/api/calibration/versions?event=${encodeURIComponent(event)}`
+        + `&camera=${encodeURIComponent(c)}`);
+      if (r.ok && ((await r.json()).versions || []).length) ok.push(c);
+    } catch(e){ /* not offered */ }
+  }
+  if (document.getElementById('camera').value.trim() !== camera) return;   // superseded
+  const sel = document.getElementById('lensFrom');
+  const keep = sel.value;
+  sel.replaceChildren(new Option('solve own lens', ''));
+  ok.forEach(c => sel.add(new Option(`borrow from ${c}`, c)));
+  sel.value = ok.includes(keep) ? keep : '';
+  if (!sel.value) lensPin = null;
+}
+function setLensFrom(cam, versionId){
+  const sel = document.getElementById('lensFrom');
+  if (cam && ![...sel.options].some(o => o.value === cam)) sel.add(new Option(`borrow from ${cam}`, cam));
+  sel.value = cam || '';
+  lensPin = cam && versionId ? {camera: cam, version_id: versionId} : null;
+}
+
 async function solve(opts){
   opts = opts || {};
+  const lensFrom = document.getElementById('lensFrom').value || null;
   const nPoints = Object.keys(autoTags).length*4 + manualTags.length;
-  if (nPoints < 8){ setStatus(`Need ≥ 8 points; have ${nPoints}. Add more tags.`,'rms-err'); return; }
+  const nTags = new Set([...Object.keys(autoTags).map(Number), ...manualTags.map(m => +m.id)]).size;
+  if (lensFrom){
+    if (nTags < 2){ setStatus(`A borrowed lens needs ≥ 2 tags for the pose; have ${nTags}.`,'rms-err'); return; }
+  } else if (nPoints < 8){ setStatus(`Need ≥ 8 points; have ${nPoints}. Add more tags.`,'rms-err'); return; }
   const event = document.getElementById('event').value.trim() || 'test';
   const camera = document.getElementById('camera').value.trim() || 'main';
+  const lensVersion = (opts.dryRun && lensPin && lensPin.camera === lensFrom) ? lensPin.version_id : null;
   const startMatch = selectedMatch() || null;   // null = applies from event start
   if (!opts.dryRun) setStatus('Solving…','rms-info');
   try {
@@ -1111,19 +1153,22 @@ async function solve(opts){
         auto_tags:autoTags, manual_tags:manualTags, holdout_ids:[...heldOut],
         start_match: startMatch,
         match_key: currentFrameSource.match_key,
+        lens_from: lensFrom, lens_version_id: lensVersion,
         dry_run: !!opts.dryRun})});
     const j = await r.json();
     if (j.error){ setStatus('Solve error: '+j.error,'rms-err'); return; }
     const rms = parseFloat(j.rms_error);
     let cls='rms-good'; if (rms>=20) cls='rms-bad'; else if (rms>=8) cls='rms-warn';
     let msg = `RMS = ${rms.toFixed(2)} px  (${j.n_tags} tags, ${j.n_points} pts)`;
+    msg += j.lens_from ? ` · lens borrowed from ${j.lens_from.camera} (${j.lens_from.version_id}), pose only`
+                       : ` · own lens (model ${j.model})`;
     if (j.holdout_error_m != null){
       const he = parseFloat(j.holdout_error_m);
       msg += ` · held-out ${he.toFixed(2)} m`;
       if (he>0.5) cls='rms-bad'; else if (he>0.3 && cls==='rms-good') cls='rms-warn';
     }
     if (j.predicted_tags){ predictedTags = j.predicted_tags; redrawFrame(); }
-    if (j.tag_spread_m != null && j.tag_spread_m < 2.0)
+    if (!j.lens_from && j.tag_spread_m != null && j.tag_spread_m < 2.0)
       msg += ` · tags span only ${j.tag_spread_m} m — add a far tag (orange label) for a reliable lens`;
     if (opts.preview){
       msg += ' · preview (not saved) — keep clicking orange labels, then Solve & preview to save';
@@ -1388,6 +1433,7 @@ async function loadVersions(){
   const camera = document.getElementById('camera').value.trim();
   const ul = document.getElementById('versionList'); ul.replaceChildren();
   if (!event || !camera) return;
+  loadLensOptions();
   try {
     const r = await fetch(`/api/calibration/versions?event=${encodeURIComponent(event)}&camera=${encodeURIComponent(camera)}`);
     const j = await r.json();

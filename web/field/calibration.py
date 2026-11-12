@@ -112,6 +112,107 @@ def distortion_fold_radius(D, mode: str = "pinhole") -> float:
     return r
 
 
+# Fold conditioning (fold_conditioning): a lens fitted from few tags can bend its
+# distortion to absorb click error, pulling the fold radius in to just past the
+# outermost used tag. Ratio = max normalised radius of the used points / fold radius.
+# Stored pinhole solves with tag sources (Nov 11 2026, every event):
+#   over-fitted own lenses   2025hop corner_right 0.958 (fx 1168) and 0.856 (fx 1047,
+#                            centre x 7.4: wrong side of the barge); 2025hop
+#                            corner_left 0.756 (fx 1599 vs the true 740)
+#   good own lenses          2026casnd corner_right 0.696, 2025hop corner_left 0.62,
+#                            2026casnd corner_left 0.60, 2025hop main 0.37; 2026
+#                            lenses that never fold: 0
+#   borrowed (fixed) lens    2025hop corner_right 0.69
+# The brief's 0.8 misses the 0.756 over-fit; 0.72 separates every case above (good
+# max 0.696, bad min 0.756). A warning only, never a pass/fail gate.
+FOLD_RATIO_WARN = 0.72
+
+
+@dataclass
+class FoldConditioning:
+    ratio: float            # r_max / fold_radius; 0 for a lens that never folds, inf
+                            # when a used point is at / behind the camera
+    r_max: float            # largest undistorted normalised radius of the used points
+    fold_radius: float      # distortion_fold_radius (inf: never folds)
+    key: Optional[str]      # correspondence key of the outermost point ("a2", "m11")
+
+    @property
+    def tag_id(self) -> Optional[int]:
+        return None if self.key is None else _tag_id_of_key(self.key)
+
+    @property
+    def behind_camera(self) -> bool:
+        return not np.isfinite(self.r_max)
+
+    @property
+    def near_fold(self) -> bool:
+        return self.ratio >= FOLD_RATIO_WARN
+
+    def to_json(self) -> dict:
+        def fin(x, nd):
+            return round(float(x), nd) if np.isfinite(x) else None
+        return {"ratio": fin(self.ratio, 3), "r_max": fin(self.r_max, 3),
+                "fold_radius": fin(self.fold_radius, 3), "tag": self.tag_id,
+                "near_fold": bool(self.near_fold)}
+
+
+def fold_conditioning(cal, correspondences) -> "Optional[FoldConditioning]":
+    """How close ``cal``'s used correspondence points ({key: (img, obj (N,3))}) come
+    to its lens's fold radius. None for a pose-free (homography) calibration or no
+    points. The radius is project_checked's: |(X/Z, Y/Z)| in the camera frame."""
+    if (cal is None or cal.mode == "homography" or cal.rvec is None or cal.tvec is None
+            or not correspondences):
+        return None
+    R, _ = cv2.Rodrigues(np.asarray(cal.rvec, float))
+    t = np.asarray(cal.tvec, float).reshape(1, 3)
+    fold = distortion_fold_radius(cal.D, cal.mode)
+    best_r, best_key = -1.0, None
+    for key, (_img, obj) in correspondences.items():
+        P = np.asarray(obj, float).reshape(-1, 3)
+        if not len(P):
+            continue
+        C = P @ R.T + t
+        z = C[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = np.where(z > 0, np.hypot(C[:, 0], C[:, 1]) / np.where(z > 0, z, 1.0),
+                         np.inf)
+        rk = float(np.max(r))
+        if rk > best_r:
+            best_r, best_key = rk, str(key)
+    if best_key is None:
+        return None
+    if not np.isfinite(best_r):
+        ratio = float("inf")
+    elif not np.isfinite(fold):
+        ratio = 0.0
+    else:
+        ratio = best_r / fold
+    return FoldConditioning(ratio=float(ratio), r_max=float(best_r),
+                            fold_radius=float(fold), key=best_key)
+
+
+def fold_warning(cond: "Optional[FoldConditioning]", suggestion: Optional[str] = None,
+                 lens_fixed: bool = False) -> Optional[str]:
+    """Operator-facing warning for a near-fold solve, or None. ``lens_fixed``: the lens
+    was not fitted here (borrowed / shared), so it cannot be over-fitted — the warning
+    only says the points reach its distortion limit. ``suggestion`` (e.g. "try
+    borrowing from corner_left") is appended after an em dash."""
+    if cond is None or not cond.near_fold:
+        return None
+    what = f"tag {cond.tag_id}" if cond.tag_id is not None else f"point {cond.key}"
+    if cond.behind_camera:
+        msg = f"{what} is behind the camera in this solve — the pose is broken"
+    elif lens_fixed:
+        msg = (f"{what} reaches near the lens's distortion limit (r {cond.r_max:.2f} of "
+               f"{cond.fold_radius:.2f}) — projection there is unreliable")
+    else:
+        msg = (f"lens fit is near its distortion limit at {what} (r {cond.r_max:.2f} "
+               f"of {cond.fold_radius:.2f}) — the lens is probably over-fitted")
+    if suggestion:
+        msg += f"; {suggestion}"
+    return msg
+
+
 @dataclass
 class CameraCalibration:
     K: Optional[np.ndarray] = None       # (3,3) — None in homography mode

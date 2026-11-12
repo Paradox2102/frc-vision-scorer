@@ -1543,6 +1543,33 @@ _PROVENANCE_KNOBS = ("window_labels", "window_labels_reader", "auto_period_only"
                      "ground_center_offset_m")
 
 
+
+def _main_tag_alignment(video_path, main_view, frame_range, calib, field_model,
+                        n: int):
+    """The start-of-job drift check's measurement: ``tag_alignment_error`` of ``calib``
+    on ``n`` frames evenly spaced in ``frame_range`` (main view crop, masks applied).
+    Returns (best error m over frames with >= CALIB_CHECK_MIN_TAGS tags, its tag
+    count); (inf, 0) when no frame showed enough tags."""
+    lo, hi = frame_range
+    frame_idxs = [int(lo + (hi - lo) * i / (n - 1)) for i in range(n)] if n > 1 else [lo]
+    best_err, best_n = float("inf"), 0
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        for fidx in frame_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            crop = main_view.extract(frame)
+            detected = detect_tags(crop)
+            err_m, ntags = tag_alignment_error(calib, detected, field_model)
+            if ntags >= CALIB_CHECK_MIN_TAGS and err_m < best_err:
+                best_err, best_n = err_m, ntags
+    finally:
+        cap.release()
+    return best_err, best_n
+
+
 class InferenceJob:
     """Manages a single video inference job"""
 
@@ -7335,8 +7362,10 @@ class InferenceJob:
         match before tracking (web/field/corner_per_match.py) — keep the covering
         epoch when it checks out, else re-solve from this match's footage and adopt
         it as a new version anchored at the match (used immediately), else drop the
-        corner view from this job (corner_drop_on_fail). Main is untouched (it has
-        the drift check + staged autofix). Logs every outcome per (event, camera,
+        corner view from this job (corner_drop_on_fail). With calib_auto_on_move a
+        corner no existing lens re-solves gets a fresh full solve before it is
+        dropped. Main is untouched (it has the drift check + calib_auto_on_move /
+        staged autofix). Logs every outcome per (event, camera,
         match) for the calibrate page. Returns {camera: outcome summary}."""
         self._corner_calib_outcomes = {}
         cfg = getattr(self, "config", None)
@@ -7369,7 +7398,8 @@ class InferenceJob:
             check_max_m=float(cfg.corner_check_max_m),
             resolve_max_m=float(cfg.corner_resolve_max_m),
             same_view_fallback=bool(getattr(cfg, "corner_same_view_fallback", True)),
-            same_view_max_px=float(getattr(cfg, "corner_same_view_max_px", 8.0)))
+            same_view_max_px=float(getattr(cfg, "corner_same_view_max_px", 8.0)),
+            auto_full_solve=bool(getattr(cfg, "calib_auto_on_move", False)))
         drop = bool(cfg.corner_drop_on_fail)
         judge = _auto_calib_judge()
         sel = getattr(self, "_view_selection", None) or {}
@@ -7958,34 +7988,27 @@ class InferenceJob:
             self.autonomous_paths = filter_paths_by_dropped(
                 dict(self.autonomous_paths), dropped)
 
-    def _verify_calibration_alignment(self) -> bool:
+    def _verify_calibration_alignment(self, _allow_auto_move: bool = True) -> bool:
         """Validate self.calib against auto-detected AprilTags in sampled in-match
         frames (main view). Returns True to proceed. On drift, sets self.error +
         self.status='error' + self.needs_calibration and returns False. No tags -> warn
-        + proceed. detect_tags must stay on one sequential path."""
+        + proceed. detect_tags must stay on one sequential path.
+
+        calib_auto_on_move (knob, default ON): on drift the camera is first
+        auto-calibrated from this match's footage (``_auto_calibrate_moved_main``);
+        a solve that validates is adopted as a new version anchored at this match,
+        tracking is re-initialised on it and the check runs ONCE more
+        (``_allow_auto_move`` False: a second drift aborts without another attempt).
+        Off: the old staged pose autofix."""
         if not CALIB_CHECK_ENABLED or self.calib is None:
             return True
         main_view = next((v for v in self.views if v.name == "main"), None)
         if main_view is None or not self.processing_ranges:
             return True
-        lo, hi = self.processing_ranges[0]
         n = max(1, CALIB_CHECK_SAMPLE_FRAMES)
-        frame_idxs = [int(lo + (hi - lo) * i / (n - 1)) for i in range(n)] if n > 1 else [lo]
-        best_err, best_n = float("inf"), 0
-        cap = cv2.VideoCapture(str(self.video_path))
-        try:
-            for fidx in frame_idxs:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-                ok, frame = cap.read()
-                if not ok:
-                    continue
-                crop = main_view.extract(frame)
-                detected = detect_tags(crop)
-                err_m, ntags = tag_alignment_error(self.calib, detected, self.field_model)
-                if ntags >= CALIB_CHECK_MIN_TAGS and err_m < best_err:
-                    best_err, best_n = err_m, ntags
-        finally:
-            cap.release()
+        best_err, best_n = _main_tag_alignment(self.video_path, main_view,
+                                               self.processing_ranges[0], self.calib,
+                                               self.field_model, n)
         if best_n < CALIB_CHECK_MIN_TAGS:
             print(f"  [calib] WARNING: could not validate calibration — <{CALIB_CHECK_MIN_TAGS} "
                   f"AprilTags detected across {n} sampled frames; proceeding unvalidated.")
@@ -7993,15 +8016,43 @@ class InferenceJob:
         # best_err is finite here: the guard above returns when best_n < MIN_TAGS,
         # which is the only case best_err stays inf (no frame ever updated it).
         if best_err > CALIB_DRIFT_MAX_M:
+            cfg = getattr(self, "config", None)
+            auto_on = bool(getattr(cfg, "calib_auto_on_move", False))
+            moved = None
+            if auto_on and _allow_auto_move and self.event_key and self.match_key:
+                moved = self._auto_calibrate_moved_main(main_view, best_err, best_n)
+                if moved["status"] == "adopted":
+                    if not self._init_field_tracking():
+                        self.status = "error"
+                        print(f"  FIELD TRACKING ABORTED: {self.error}")
+                        return False
+                    self._apply_endgame_corner_cutoff()
+                    print(f"  [calib-move] re-initialised tracking on version "
+                          f"{self._calib_version_id}; re-checking alignment")
+                    if self._verify_calibration_alignment(_allow_auto_move=False):
+                        self._calib_move_warning = moved["warning"]
+                        return True
+                    # The adopted solve fails the job's own check: un-adopt it so the
+                    # next job does not inherit it (the abort state is already set).
+                    print(f"  [calib-move] adopted version {moved['version_id']} still "
+                          f"fails the drift check — un-adopting it")
+                    self._unadopt_moved_main(moved)
+                    return False
             self.status = "error"
-            # Before giving up, try to auto-recover the pose against the fixed lens
-            # and STAGE it for approval (never auto-adopted). A staged fix flips the
-            # abort message from "recalibrate manually" to "review/approve".
             autofix = None
-            if (CALIB_AUTOFIX_ENABLED and self.match_key
-                    and getattr(self.calib, "mode", None) in ("camera", "pinhole")):
+            if moved is None and auto_on and not _allow_auto_move:
+                # the re-check after an auto adoption: no autofix, no second attempt
+                moved = {"status": "failed", "reason": (
+                    f"the auto-recalibrated version {self._calib_version_id} still reads "
+                    f"{best_err:.2f} m off on the drift check")}
+            elif moved is None and (CALIB_AUTOFIX_ENABLED and self.match_key
+                                    and getattr(self.calib, "mode", None) in ("camera", "pinhole")):
+                # Before giving up, try to auto-recover the pose against the fixed lens
+                # and STAGE it for approval (never auto-adopted). A staged fix flips the
+                # abort message from "recalibrate manually" to "review/approve".
                 autofix = self._attempt_autofix(main_view, best_err)
-            self.error, self.needs_calibration = self._drift_abort_state(best_err, autofix)
+            self.error, self.needs_calibration = self._drift_abort_state(best_err, autofix,
+                                                                         moved=moved)
             if self.match_key:
                 # Persist the failure so the calibrate page can flag this match
                 # in its selector until a new epoch covers it (or a check passes).
@@ -8013,6 +8064,127 @@ class InferenceJob:
             field_store.clear_drift(self.event_key, self.camera, self.match_key)
         print(f"  [calib] OK: {best_n} tags align to {best_err:.3f} m (epoch {self._calib_version_id})")
         return True
+
+    def _auto_calibrate_moved_main(self, main_view, best_err: float, best_n: int) -> dict:
+        """calib_auto_on_move: the main camera failed the start-of-job drift check —
+        calibrate it from THIS match's footage (``auto_calibrate.resolve_moved_camera``:
+        pose re-solve on the epoch's lens, then a fresh full solve, then both again
+        without low-support tag decodes). Ready -> saved as a new version anchored at
+        this match (masks carried over) and logged per match like the corner step
+        ("adopted"; reviewable / rejectable on /calibrate). Not ready -> logged
+        "failed" with the candidate overlay. A match whose auto version an operator
+        rejected is never re-solved ("rejected"). Returns {status: adopted | failed |
+        rejected, reason, version_id, metrics, warning, base_epoch}."""
+        t0 = time.perf_counter()
+        event, cam, mk = self.event_key, self.camera, self.match_key
+        base_epoch = self._calib_version_id
+        prior = field_store.load_permatch_log(event, cam).get(mk) or {}
+        if prior.get("status") == "rejected":
+            print(f"  [calib-move] {cam} {mk}: drift {best_err:.2f} m but this match's "
+                  f"auto-recalibration was rejected by the operator — manual calibration")
+            return {"status": "rejected", "base_epoch": base_epoch, "version_id": None,
+                    "warning": None,
+                    "reason": "this match's automatic recalibration was rejected by the "
+                              "operator"}
+        fps = float(getattr(self, "video_fps", 0) or 30.0)
+        ranges = self.processing_ranges
+        window = (ranges[0][0] / fps, ranges[-1][1] / fps)
+        # endgame_layout_switch seasons (2025): calibrate on the pre-endgame framing
+        # only, like the corner step / event auto-calibration.
+        eg = getattr(self, "endgame_cutoff", None)
+        if eg is not None and eg.get("cutoff_s") is not None:
+            hi = min(window[1], float(eg["cutoff_s"]))
+            if hi > window[0]:
+                window = (window[0], hi)
+        acfg = dataclass_replace(_auto_calib_cfg(cam, self.field_model), window=window)
+        versions = field_store.load_versions(event, cam)
+        old_cal = self.calib
+        print(f"  [calib-move] {cam} {mk}: tags {best_err:.2f} m off over {best_n} tags "
+              f"(epoch {base_epoch}) — auto-calibrating from this match "
+              f"({window[0]:.0f}-{window[1]:.0f} s)")
+        res, err = None, None
+        try:
+            res = auto_calibrate.resolve_moved_camera(
+                self.video_path, mk, cam, main_view.crop, self.field_model, versions, acfg,
+                masks=list(main_view.masks or ()), judge=_auto_calib_judge())
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            err = f"{type(e).__name__}: {e}"
+        seconds = time.perf_counter() - t0
+        rec = res.record if res is not None else {}
+        m = rec.get("metrics") or {}
+        metrics = {"check_best_m": round(float(best_err), 3), "check_tags": int(best_n),
+                   "n_tags": m.get("n_tags"), "rms_px": m.get("rms_px"),
+                   "val_best_m": m.get("val_gate_best_m"),
+                   "val_median_m": m.get("val_median_m"), "val_source": m.get("val_source"),
+                   "located_tags": m.get("located_tags") or [],
+                   "center_shift_m": m.get("center_shift_m"),
+                   "rotation_delta_deg": m.get("rotation_delta_deg"),
+                   "method": rec.get("method"),
+                   "excluded_tags": rec.get("excluded_tags") or []}
+        attempts = rec.get("attempts") or []
+        ready = (res is not None and rec.get("status") == "ready"
+                 and res.calibration is not None)
+        reason = (f"auto-calibration error: {err}" if err is not None
+                  else rec.get("reason") or "no result")
+        new_vid = None
+        if ready:
+            cal = res.calibration
+            cal.masks = list(getattr(old_cal, "masks", None) or [])
+            cal.robot_track_top_crop = getattr(old_cal, "robot_track_top_crop", 0.0)
+            new_vid = field_store.save_version(
+                event, cam, cal, start_match=mk, label="auto: camera moved",
+                source=_version_source(event, cam, {
+                    "method": "auto_on_move", "crop": [int(c) for c in main_view.crop],
+                    "auto_tags": rec.get("auto_tags") or {},
+                    "manual_tags": rec.get("manual_tags") or [],
+                    "metrics": metrics, "match_key": mk, "base_epoch": base_epoch,
+                    "attempts": attempts, "timestamp": rec.get("timestamp")}))
+        preview = None
+        if res is not None and res.overlay is not None:
+            try:
+                preview = field_store.save_permatch_preview(
+                    event, cam, mk, auto_calibrate.encode_jpeg(res.overlay, 85))
+            except Exception as e:
+                print(f"  [calib-move] {cam}: preview not saved: {e}")
+        status = "adopted" if ready else "failed"
+        entry_reason = (f"camera moved: epoch {base_epoch} {best_err:.2f} m off on {mk}; "
+                        + ("auto-recalibrated: " if ready else "auto-calibration failed: ")
+                        + reason)
+        field_store.save_permatch_entry(event, cam, mk, {
+            "status": status, "job_outcome": status, "version_id": new_vid,
+            "epoch_checked": base_epoch, "metrics": metrics, "reason": entry_reason,
+            "preview": preview, "attempts": attempts, "seconds": round(seconds, 1),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        out = {"status": status, "reason": reason, "version_id": new_vid,
+               "metrics": metrics, "base_epoch": base_epoch, "warning": None}
+        if ready:
+            field_store.clear_drift(event, cam, mk)
+            val = metrics["val_best_m"]
+            out["warning"] = (
+                f"Camera '{cam}' moved before {mk} — auto-recalibrated (version {new_vid}, "
+                f"{'n/a' if val is None else f'{val:.2f}'} m over {metrics['n_tags']} tags, "
+                f"{rec.get('method')}). Review at /calibrate?match={mk}&camera={cam}")
+            print(f"  [calib-move] {cam} {mk}: ADOPTED version {new_vid} ({seconds:.0f}s) — "
+                  f"{reason}")
+        else:
+            print(f"  [calib-move] {cam} {mk}: FAILED ({seconds:.0f}s) — {reason}")
+        return out
+
+    def _unadopt_moved_main(self, moved: dict) -> None:
+        """An auto-on-move version that failed the job's own re-check: flag it rejected
+        (select_epoch ignores it) and mark this match's per-match entry failed."""
+        vid = moved.get("version_id")
+        if vid:
+            field_store.set_version_rejected(self.event_key, self.camera, vid, True)
+        e = field_store.load_permatch_log(self.event_key, self.camera).get(self.match_key)
+        if e:
+            field_store.update_permatch_entry(
+                self.event_key, self.camera, self.match_key, status="failed",
+                job_outcome="failed", version_id=None, unadopted_version=vid,
+                reason=(e.get("reason") or "") + " — but it still failed the job's drift "
+                       "check, so it was not used")
 
     def _attempt_autofix(self, main_view, best_err: float):
         """Re-solve the camera pose against the fixed lens from AprilTags across the
@@ -8036,10 +8208,12 @@ class InferenceJob:
             print(f"  [autofix] no safe auto-fix ({result.reason}); manual recalibration needed")
         return result
 
-    def _drift_abort_state(self, best_err: float, autofix):
+    def _drift_abort_state(self, best_err: float, autofix, moved: Optional[dict] = None):
         """PURE: build the (error message, needs_calibration dict) for a drift abort.
         ``autofix`` is the PoseFixResult from _attempt_autofix (or None). A passing
-        fix routes the operator to review/approve; otherwise to manual recalibration."""
+        fix routes the operator to review/approve; otherwise to manual recalibration.
+        ``moved``: the calib_auto_on_move outcome (``_auto_calibrate_moved_main``)
+        when that ran instead — its reason goes into the manual-calibration prompt."""
         calib_url = (f"/calibrate?match={self.match_key}&camera={self.camera}"
                      if self.match_key else "/calibrate")
         needs = {"event": self.event_key, "camera": self.camera,
@@ -8047,6 +8221,21 @@ class InferenceJob:
                  "epoch": self._calib_version_id}
         head = (f"Calibration drift for '{self.camera}' on {self.match_key or 'this match'}: "
                 f"AprilTags are {best_err:.2f} m off (epoch {self._calib_version_id}). ")
+        if moved is not None:
+            reason = str(moved.get("reason") or "")
+            if moved.get("status") == "rejected":
+                needs["auto_rejected"] = True
+                error = (head + "The automatic recalibration for this match was rejected "
+                         f"on the calibration page — calibrate manually at {calib_url} "
+                         f"(saved as a new version applying from this match onward).")
+            else:
+                needs["auto_attempted"] = True
+                needs["auto_reason"] = reason
+                short = reason if len(reason) <= 400 else reason[:400].rstrip() + "…"
+                error = (head + f"The camera likely moved/zoomed and auto-calibration on "
+                         f"this match failed: {short} — calibrate manually at {calib_url} "
+                         f"(saved as a new version applying from this match onward).")
+            return error, needs
         if autofix is not None and autofix.passed:
             needs["autofix_pending"] = True
             needs["autofix_summary"] = autofix.summary()
@@ -8282,6 +8471,10 @@ class InferenceJob:
                     except Exception:
                         pass
                 return
+            _move_warn = getattr(self, "_calib_move_warning", None)
+            if _move_warn:
+                # calib_auto_on_move adopted a fresh calibration for a moved main camera
+                await self._warn_degraded("calib_moved", _move_warn)
             self._raise_if_stopped()  # phase boundary: after calibration check
             # Per-match corner calibration (knob corner_per_match_calib): keep /
             # re-solve+adopt / drop each corner view before tracking uses it.

@@ -852,6 +852,22 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("corner_same_view_max_px", "CORNER_SAME_VIEW_MAX_PX", float, 8.0, min=0.5,
          max=50.0, section="Fusion & field position"),
+    # Auto-calibrate a camera that MOVED between matches, at job start
+    # (auto_calibrate.resolve_moved_camera). Main: when the start-of-job drift
+    # check fails, this match's footage is solved on its own — pose re-solve
+    # against the epoch's lens, then a fresh full solve (lens + pose), then both
+    # again without low-support tag decodes (tags seen in < max(5, 5%) of the
+    # best tag's frames). A solve passing the usual gates (validation <=
+    # CALIB_DRIFT_MAX_M, plausibility, tag spread) is saved as a new version
+    # anchored at this match, logged per match (reviewable / rejectable on
+    # /calibrate) and used immediately; otherwise the job aborts with the manual
+    # calibration prompt as before. Corners: after the per-lens re-solves fail,
+    # the corner step tries the same fresh full solve (+ low-support retry)
+    # under corner_resolve_max_m. 2026hop qm45 main (re-placed, lower + zoomed):
+    # full solve without 3 bogus decodes -> 0.02 m. DEFAULT ON (user request
+    # Nov 12). Off = old behaviour (staged pose autofix for main).
+    Knob("calib_auto_on_move", "CALIB_AUTO_ON_MOVE", bool, True,
+         section="Fusion & field position"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not
     # read at p >= 0.85 twice, from the anchors earlier matches of the event

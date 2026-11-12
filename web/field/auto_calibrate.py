@@ -10,6 +10,10 @@ Given one reference match's footage, each camera gets ONE of:
   * pose_resolve— the covering epoch no longer aligns: re-solve only the pose
                   against its lens (``pose_autofix``) and stage it for review.
 
+``resolve_moved_camera`` serves the JOB side (knob calib_auto_on_move): a camera that
+failed the start-of-match drift check is solved from that match's footage alone
+(pose re-solve, fresh full solve, both again without low-support tag decodes).
+
 Nothing here persists anything or writes a calibration version — the result is a
 record dict + candidate calibration + overlay image, which the app stores as a
 review artifact. The operator confirms (promotes to a version) or corrects manually.
@@ -796,10 +800,67 @@ def _borrowed_lens_solve(own: AutoCalibResult, camera, lenders, corr, corners, i
     return own
 
 
+@dataclass
+class Prep:
+    """The expensive, attempt-independent input stage of ``run_camera`` for one
+    (video, crop, window): the multi-frame tag aggregate (``aggregate_with_best_frame``)
+    and the temporal median with its decodes. Several solve attempts on the same
+    footage (``resolve_moved_camera``, the per-match corner step) share one."""
+    agg: dict
+    median: Optional[np.ndarray]
+    stack: Optional[list]
+    med_dec: dict                     # median-frame decodes of KNOWN tags
+    crop: tuple
+    window: tuple
+
+
+def prepare_inputs(video, crop, fm, cfg: Optional[AutoCalibConfig] = None, detect_fn=None,
+                   roi_detect_fn=None) -> Prep:
+    """``run_camera``'s input stage (see ``Prep``). Raises AutoCalibError when the
+    video yields no frames."""
+    cfg = cfg or AutoCalibConfig()
+    detect_fn = detect_fn or make_detect_fn()
+    if roi_detect_fn is None:
+        from web.field.tag_locator import make_roi_detect_fn
+        roi_detect_fn = make_roi_detect_fn()
+    crop = tuple(int(c) for c in crop)
+    agg = aggregate_with_best_frame(video, crop, fm, cfg, detect_fn)
+    if agg["n_frames"] <= 0:
+        raise AutoCalibError(f"cannot read frames from {Path(str(video)).name}")
+    median = None
+    stack = None
+    med_dec = {}
+    if cfg.median_frames > 0:
+        mf = median_frame(video, crop, cfg.window[0], cfg.window[1],
+                          cfg.median_frames, return_stack=True)
+        median, stack = mf if isinstance(mf, tuple) else (mf, None)
+    if median is not None:
+        med_dec = {t: c for t, c in median_decodes(median, detect_fn, roi_detect_fn).items()
+                   if t in fm.tags}
+    return Prep(agg=agg, median=median, stack=stack, med_dec=med_dec, crop=crop,
+                window=tuple(cfg.window))
+
+
+def low_support_tags(diag: dict, min_seen: int = 5, frac: float = 0.05) -> list:
+    """Aggregated tags seen in too few sampled frames to trust next to the rest:
+    n_seen < max(min_seen, frac * the best-seen tag's n_seen). ``diag`` is the
+    aggregate's {tag_id: (n_inliers, n_seen, std_px)}. A bogus decode (a tag id read
+    off texture / a partially hidden tag) shows up in a handful of frames while the
+    real tags of a static camera show in most of them (2026hop qm45 main: tags 1, 2,
+    11 in 3 of ~166 frames wrecked the full solve). Median-only tags are not in
+    ``diag`` and are never flagged."""
+    seen = {int(t): int(d[1]) for t, d in (diag or {}).items()}
+    if not seen:
+        return []
+    thr = max(float(min_seen), float(frac) * max(seen.values()))
+    return sorted(t for t, n in seen.items() if n < thr)
+
+
 def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                cfg: Optional[AutoCalibConfig] = None, detect_fn=None,
                masks=(), judge=None, roi_detect_fn=None,
-               force_resolve: bool = False, lenders=()) -> AutoCalibResult:
+               force_resolve: bool = False, lenders=(), prep: Optional[Prep] = None,
+               exclude_tags=()) -> AutoCalibResult:
     """Auto-calibrate ONE camera from ONE reference match. Pure w.r.t. persistence:
     returns the record (status ready / verified / failed), the candidate calibration
     (or None) and the overlay image (camera crop, or None if no frame was read).
@@ -817,7 +878,12 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     camera's own full solve FAILS (too few tags for its own lens, tags on one
     structure, or the validation / plausibility gates), retry with each lender's
     lens fixed and only the pose solved (``_borrowed_lens_solve``). A camera that
-    solves on its own never looks at them; "main" never borrows."""
+    solves on its own never looks at them; "main" never borrows.
+
+    ``prep``: a ``prepare_inputs`` result for this video / crop / window (computed
+    here when None). ``exclude_tags``: tag ids dropped from the aggregate and never
+    re-added from the median decodes (nor used by the median-frame validation
+    fallback) — e.g. ``low_support_tags``."""
     cfg = cfg or AutoCalibConfig()
     detect_fn = detect_fn or make_detect_fn()
     if roi_detect_fn is None:
@@ -826,25 +892,25 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     crop = tuple(int(c) for c in crop)
     image_size = (crop[2], crop[3])
 
-    agg = aggregate_with_best_frame(video, crop, fm, cfg, detect_fn)
-    if agg["n_frames"] <= 0:
-        raise AutoCalibError(f"cannot read frames from {Path(str(video)).name}")
-    corners = {tid: c for tid, c in agg["corners"].items() if tid in fm.tags}
+    if prep is None:
+        prep = prepare_inputs(video, crop, fm, cfg, detect_fn, roi_detect_fn)
+    elif tuple(prep.crop) != crop:
+        raise ValueError(f"prep was computed for crop {prep.crop}, not {crop}")
+    excl = {int(t) for t in (exclude_tags or ())}
+    agg = prep.agg
+    corners = {tid: c for tid, c in agg["corners"].items()
+               if tid in fm.tags and tid not in excl}
     per_tag = {str(int(t)): {"inliers": int(d[0]), "seen": int(d[1]),
                              "std_px": round(float(d[2]), 2)}
                for t, d in agg["diag"].items() if t in fm.tags}
+    for t in excl:
+        if str(t) in per_tag:
+            per_tag[str(t)]["excluded"] = True
     # Temporal median of the crop: robots/balls blocking a tag vanish. A tag decoded
     # ONLY there joins the set (the multi-frame aggregate wins when both have it).
-    median = None
-    stack = None
-    med_dec = {}
-    if cfg.median_frames > 0:
-        mf = median_frame(video, crop, cfg.window[0], cfg.window[1],
-                          cfg.median_frames, return_stack=True)
-        median, stack = mf if isinstance(mf, tuple) else (mf, None)
+    median, stack = prep.median, prep.stack
+    med_dec = {t: c for t, c in prep.med_dec.items() if t not in excl}
     if median is not None:
-        med_dec = {t: c for t, c in median_decodes(median, detect_fn, roi_detect_fn).items()
-                   if t in fm.tags}
         for tid, c in med_dec.items():
             if tid in fm.tags and tid not in corners:
                 corners[tid] = np.asarray(c, float)
@@ -859,6 +925,8 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         per_tag=per_tag, manual_tags=[],
         auto_tags={str(int(t)): np.asarray(c, float).round(2).tolist()
                    for t, c in corners.items()})
+    if excl:
+        base["excluded_tags"] = sorted(excl)
     extra = {"located": [], "candidates": [], "notes": []}
 
     def validate(c):
@@ -1037,6 +1105,98 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         reason += " — calibrate manually"
     return finish(status, "pose_resolve", reason, cand, cval, cand, epoch=vid,
                   center_shift=verdict.center_shift_m, rot_deg=verdict.rotation_delta_deg)
+
+
+# ------------------------------------------------- moved camera (job start)
+
+MOVED_METHOD_LABELS = {"pose_resolve": "pose re-solve against the epoch's lens",
+                       "full_solve": "fresh full solve"}
+
+
+def _low_support_note(tags, diag) -> str:
+    seen = {int(t): int(d[1]) for t, d in (diag or {}).items()}
+    top = max(seen.values()) if seen else 0
+    return "ignored low-support decodes: " + ", ".join(
+        f"tag {t} ({seen.get(int(t), 0)}/{top} frames)" for t in tags)
+
+
+def resolve_moved_camera(video, match_key: str, camera: str, crop, fm, versions,
+                         cfg: Optional[AutoCalibConfig] = None, *, detect_fn=None,
+                         masks=(), judge=None, roi_detect_fn=None, lenders=(),
+                         prep: Optional[Prep] = None) -> AutoCalibResult:
+    """Calibrate a camera that MOVED before ``match_key`` from this match's footage
+    alone (job start: the covering epoch failed the drift check). The inputs are
+    prepared ONCE, then, stopping at the first attempt whose record is "ready":
+
+      1. pose re-solve against the covering epoch's lens (skipped without versions)
+         — a re-aim / small nudge;
+      2. fresh full solve (lens + pose; ``lenders`` for corner cameras) — a re-placed
+         or re-zoomed camera;
+      3. only when ``low_support_tags`` flags aggregate tags and >= ``cfg.min_tags``
+         tags remain: 1 and 2 again without them (a few bogus decodes wreck a solve).
+
+    run_camera's own gates (validation vs ``cfg.drift_max_m``, plausibility, tag
+    spread, pose-shift bound) decide "ready". Returns the ready result, else the
+    most informative failure (the last full solve that produced a candidate). Its
+    record carries ``attempts`` [{method, status, reason, excluded_tags}]."""
+    cfg = cfg or AutoCalibConfig()
+    detect_fn = detect_fn or make_detect_fn()
+    if roi_detect_fn is None:
+        from web.field.tag_locator import make_roi_detect_fn
+        roi_detect_fn = make_roi_detect_fn()
+    crop = tuple(int(c) for c in crop)
+    if prep is None:
+        prep = prepare_inputs(video, crop, fm, cfg, detect_fn, roi_detect_fn)
+    diag = {int(t): d for t, d in prep.agg["diag"].items() if t in fm.tags}
+    known = {int(t) for t in prep.agg["corners"] if t in fm.tags} | {
+        int(t) for t in prep.med_dec}
+    plan = ([("pose_resolve", ())] if versions else []) + [("full_solve", ())]
+    low = low_support_tags(diag)
+    if low and len(known - set(low)) >= cfg.min_tags:
+        plan += ([("pose_resolve", tuple(low))] if versions else []) + [
+            ("full_solve", tuple(low))]
+    attempts, results = [], []
+    for method, excl in plan:
+        try:
+            if method == "pose_resolve":
+                r = run_camera(video, match_key, camera, crop, fm, versions, cfg=cfg,
+                               detect_fn=detect_fn, masks=masks, judge=judge,
+                               roi_detect_fn=roi_detect_fn, force_resolve=True,
+                               prep=prep, exclude_tags=excl)
+            else:
+                r = run_camera(video, match_key, camera, crop, fm, [], cfg=cfg,
+                               detect_fn=detect_fn, masks=masks, judge=judge,
+                               roi_detect_fn=roi_detect_fn, lenders=lenders,
+                               prep=prep, exclude_tags=excl)
+        except Exception as e:           # one attempt failing never ends the search
+            r = AutoCalibResult(record=new_record(
+                "failed", f"{MOVED_METHOD_LABELS[method]} errored: {type(e).__name__}: {e}",
+                match_key=match_key, method=method), calibration=None, overlay=None,
+                median=prep.median)
+        attempts.append({"method": method, "status": r.record.get("status"),
+                         "reason": r.record.get("reason", ""),
+                         "excluded_tags": [int(t) for t in excl]})
+        results.append((method, excl, r))
+        if r.record.get("status") == "ready":
+            break
+    method, excl, res = results[-1]
+    if res.record.get("status") != "ready":
+        full = [x for x in results if x[0] == "full_solve"]
+        with_cand = [x for x in full if x[2].calibration is not None]
+        method, excl, res = (with_cand or full or results)[-1]
+    rec = res.record
+    rec["attempts"] = attempts
+    rec["moved_attempt"] = method
+    note = _low_support_note(excl, diag) if excl else ""
+    if note:
+        rec["reason"] = f"{rec.get('reason', '')} [{note}]"
+    if rec.get("status") != "ready":
+        tried = "; ".join(
+            f"{MOVED_METHOD_LABELS[a['method']]}"
+            f"{' without tags ' + ','.join(map(str, a['excluded_tags'])) if a['excluded_tags'] else ''}"
+            f": {a['status']}" for a in attempts)
+        rec["reason"] = f"{rec.get('reason', '')} [tried: {tried}]"
+    return res
 
 
 # ------------------------------------------------------- joint corner lens (run)

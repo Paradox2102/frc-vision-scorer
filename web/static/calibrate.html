@@ -154,10 +154,12 @@
   <div id="layoutCard" class="auto-card layout-card" style="display:none;"></div>
   <div id="autoCards" class="auto-cards"></div>
   <details id="permatchSection" class="pm-section" style="display:none;" open>
-    <summary>Per-match corner calibrations <span id="pmSummary" class="auto-msg"></span></summary>
+    <summary>Per-match calibrations <span id="pmSummary" class="auto-msg"></span></summary>
     <p class="hint" style="margin:4px 0;">Each job checks the corner cameras on its own match and
       re-solves (and adopts) them when they moved; a corner that can't be verified is dropped from
-      that job. Spot-check the overlays; <b>Reject</b> stops a match's result from being used.</p>
+      that job. When <b>main</b> moved between matches the job auto-calibrates it from that match
+      (adopted), or stops and asks for a manual calibration (failed). Spot-check the overlays;
+      <b>Reject</b> stops a match's result from being used.</p>
     <div id="permatchBody"></div>
   </details>
 </section>
@@ -1823,7 +1825,8 @@ function renderPerMatch(){
     const c = s => keys.filter(k => log[k].status === s).length;
     nAd += c('adopted'); nDr += c('dropped'); nKe += kept.length;
     box.appendChild(_el('div', 'pm-cam-head',
-      `${cam} — ${c('adopted')} adopted · ${c('dropped')} dropped · ${c('rejected')} rejected · ${kept.length} kept`));
+      `${cam} — ${c('adopted')} adopted · ${c('dropped')} dropped · ${c('rejected')} rejected · ${kept.length} kept`
+      + (c('failed') ? ` · ${c('failed')} failed` : '')));
     if (flagged.length){
       const g = _el('div', 'pm-grid');
       flagged.forEach(k => g.appendChild(pmTile(cam, k, log[k])));

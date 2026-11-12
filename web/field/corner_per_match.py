@@ -15,6 +15,8 @@ For each corner view of a job, ``corner_step``:
      from the epoch's lens (pose -> focal -> freer models as tags accumulate), and
      validate it within the match against a stricter gate. Pass -> "adopted": the
      caller saves a NEW version anchored at this match and uses it immediately.
+     No lens fits (``auto_full_solve``, knob calib_auto_on_move): a fresh full solve
+     (+ a retry without low-support tag decodes) under the same gate.
   3. Fail -> "dropped": the caller excludes the corner view from this job.
 A match whose adopted version an operator rejected is never re-solved again (the
 corner is dropped unless the covering epoch passes the check).
@@ -59,6 +61,11 @@ class CornerStepConfig:
     same_view_min_inliers: int = 60
     same_view_min_inlier_ratio: float = 0.25
     same_view_min_spread: float = 0.2
+    # calib_auto_on_move: when every lens re-solve fails, try a FRESH full solve
+    # (lens + pose) from this match's footage, retried without low-support tag
+    # decodes (auto_calibrate.resolve_moved_camera), under the same resolve_max_m
+    # gate — a corner re-placed / re-zoomed beyond what a pose re-solve can follow.
+    auto_full_solve: bool = False
 
 
 @dataclass
@@ -307,6 +314,12 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
         or getattr(fm, "season", None) or DEFAULT_LAYOUT)
     res, base_used, errs = None, None, []
     seen_lens = []
+    # One input stage (tag aggregate + temporal median) for every attempt below —
+    # each re-solve used to re-aggregate the same footage. Results are identical.
+    try:
+        prep = ac.prepare_inputs(video, crop, fm, acfg, detect_fn, roi_detect_fn)
+    except Exception:
+        prep = None                       # run_camera recomputes and reports the error
     for base in [epoch, *alt_epochs]:
         bcal = base["calibration"]
         lens_key = (None if bcal.K is None else
@@ -318,7 +331,7 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
         try:
             r = ac.run_camera(video, match_key, camera, crop, fm, [base], cfg=acfg,
                               detect_fn=detect_fn, masks=masks, judge=judge,
-                              roi_detect_fn=roi_detect_fn, force_resolve=True)
+                              roi_detect_fn=roi_detect_fn, force_resolve=True, prep=prep)
         except Exception as e:
             errs.append(f"{base['version_id']}: {type(e).__name__}: {e}")
             continue
@@ -326,6 +339,24 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
             res, base_used = r, base
         if r.record["status"] == "ready":
             break
+    if cfg.auto_full_solve and (res is None or res.record["status"] != "ready"):
+        # calib_auto_on_move: the camera may have been re-placed / re-zoomed — no
+        # existing lens fits. Fresh full solve (+ low-support exclusion retry).
+        try:
+            fb = ac.resolve_moved_camera(video, match_key, camera, crop, fm, [], acfg,
+                                         detect_fn=detect_fn, masks=masks, judge=judge,
+                                         roi_detect_fn=roi_detect_fn, prep=prep)
+        except Exception as e:
+            fb = None
+            errs.append(f"fresh full solve: {type(e).__name__}: {e}")
+        if fb is not None:
+            if fb.record["status"] == "ready" and fb.calibration is not None:
+                res, base_used = fb, None
+            elif res is None:
+                res, base_used = fb, None
+            else:
+                res.record["reason"] = (f"{res.record.get('reason', '')}; fresh full solve "
+                                        f"failed too: {fb.record.get('reason', '')}")
     if res is None:
         return fail(f"{why_check}; re-solve error: {'; '.join(errs)}")
     rec = res.record
@@ -341,9 +372,17 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
     cal = res.calibration
     cal.masks = list(getattr(ecal, "masks", None) or [])
     cal.robot_track_top_crop = getattr(ecal, "robot_track_top_crop", 0.0)
-    lens_note = ("" if base_used is epoch else
-                 f" (lens of {base_used['version_id']}; the covering epoch's lens did not validate)")
-    extra["lens_from"] = base_used["version_id"]
+    if base_used is None:
+        lens_note = " (fresh full solve: no existing lens re-solve validated)"
+        extra["lens_from"] = None
+        extra["method"] = "full_solve"
+        if rec.get("excluded_tags"):
+            extra["excluded_tags"] = rec["excluded_tags"]
+    else:
+        lens_note = ("" if base_used is epoch else
+                     f" (lens of {base_used['version_id']}; the covering epoch's lens did "
+                     f"not validate)")
+        extra["lens_from"] = base_used["version_id"]
     return CornerOutcome(
         "adopted", f"{why_check}; re-solved on {match_key}{lens_note}: {rec['reason']}", vid, cal,
         {**metrics, **extra}, auto_tags=rec.get("auto_tags") or {},

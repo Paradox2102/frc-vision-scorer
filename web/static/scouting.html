@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scouting — FRC Vision Scorer</title>
+<link rel="stylesheet" href="/static/style.css?v=20260707b">
+<style>
+  /* Data colours: the dataviz reference palette, dark-surface steps (this app is
+     dark-only). Categorical order is the CVD-safety mechanism, so it is fixed. */
+  :root {
+    --cat-1:#3987e5; --cat-2:#d95926; --cat-3:#199e70; --cat-4:#c98500;
+    --cat-5:#d55181; --cat-6:#008300; --cat-7:#9085e9; --cat-8:#e66767;
+    --cat-other:#8a93a8;
+    --st-warning:#fab219; --st-serious:#ec835a;
+  }
+  a.nav-btn { text-decoration:none; display:inline-block; }
+  .sc-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:0.75rem;
+                padding:0.6rem 0; border-bottom:1px solid var(--border); }
+  .sc-toolbar label { color:var(--text-secondary); font-size:0.85rem; }
+  .sc-toolbar select, .sc-search, .sc-select {
+    background:var(--bg-tertiary); color:var(--foreground); border:1px solid var(--input);
+    border-radius:calc(var(--radius) - 2px); padding:0.3rem 0.5rem; font-size:0.85rem; }
+  .sc-status { color:var(--text-secondary); font-size:0.82rem; }
+  .sc-status b { color:var(--foreground); font-weight:600; }
+  .sc-export { margin-left:auto; font-size:0.82rem; color:var(--primary); text-decoration:none; }
+  .sc-export:hover { text-decoration:underline; }
+
+  .sc-layout { display:grid; grid-template-columns:190px minmax(0,1fr); gap:0.9rem;
+               padding-top:0.75rem; flex:1; min-height:0; }
+  .sc-teams { display:flex; flex-direction:column; gap:0.4rem; min-height:0; }
+  .sc-search { width:100%; }
+  .sc-team-list { overflow-y:auto; max-height:calc(100vh - 170px); display:flex;
+                  flex-direction:column; gap:2px; padding-right:2px; }
+  .sc-team { display:flex; justify-content:space-between; align-items:baseline; width:100%;
+             background:transparent; border:1px solid transparent; color:var(--foreground);
+             border-radius:calc(var(--radius) - 2px); padding:0.25rem 0.5rem; cursor:pointer;
+             font-size:0.88rem; font-variant-numeric:tabular-nums; text-align:left; }
+  .sc-team:hover { background:var(--accent); }
+  .sc-team.active { background:var(--primary); color:#fff; }
+  .sc-team small { color:var(--text-secondary); font-size:0.75rem; }
+  .sc-team.active small { color:#dbe7ff; }
+  .sc-team.unlabelled { color:var(--text-secondary); }
+
+  .sc-main { display:flex; flex-direction:column; gap:0.9rem; min-width:0; }
+  .sc-panel { background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+              padding:0.75rem 0.9rem; }
+  .sc-panel-head { display:flex; flex-wrap:wrap; align-items:baseline; gap:0.6rem 1rem;
+                   margin-bottom:0.6rem; }
+  .sc-panel-head h2 { font-size:1rem; font-weight:600; }
+  .sc-panel-head .sc-sub { color:var(--text-secondary); font-size:0.82rem; }
+  .sc-panel-head .sc-controls { margin-left:auto; display:flex; flex-wrap:wrap; gap:0.4rem 0.9rem;
+                                align-items:center; font-size:0.82rem; color:var(--text-secondary); }
+  .sc-controls label { display:inline-flex; align-items:center; gap:0.3rem; cursor:pointer; }
+  .sc-empty { color:var(--text-secondary); font-size:0.88rem; padding:1rem 0; }
+  .sc-note { color:var(--text-secondary); font-size:0.76rem; margin-top:0.5rem; line-height:1.45; }
+
+  /* ---- auto paths ---- */
+  .sc-auto-body { display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:0.8rem; align-items:start; }
+  .sc-canvas-wrap { position:relative; min-width:0; }
+  .sc-canvas-wrap canvas { display:block; border-radius:calc(var(--radius) - 2px); }
+  .sc-tip { position:absolute; pointer-events:none; background:rgba(10,14,26,0.94);
+            border:1px solid var(--border); border-radius:6px; padding:0.3rem 0.5rem;
+            font-size:0.78rem; color:var(--foreground); white-space:nowrap; display:none; z-index:3;
+            box-shadow:0 4px 12px rgba(0,0,0,0.4); }
+  .sc-list { max-height:520px; overflow-y:auto; display:flex; flex-direction:column; gap:0.35rem;
+             font-size:0.83rem; }
+  .sc-group { border:1px solid var(--border); border-radius:calc(var(--radius) - 2px);
+              background:var(--bg-tertiary); }
+  .sc-group.sel { border-color:var(--ring); box-shadow:0 0 0 1px var(--ring); }
+  .sc-group-head { display:flex; align-items:center; gap:0.45rem; width:100%; padding:0.35rem 0.5rem;
+                   background:transparent; border:none; color:var(--foreground); cursor:pointer;
+                   text-align:left; font-size:0.83rem; }
+  .sc-group-head .sc-caret { margin-left:auto; color:var(--text-secondary); font-size:0.7rem;
+                             transition:transform 0.15s; }
+  .sc-group.open .sc-caret { transform:rotate(90deg); }
+  .sc-group-head .sc-meta { color:var(--text-secondary); font-size:0.76rem; }
+  .sc-group-body { display:none; padding:0 0.35rem 0.35rem; flex-direction:column; gap:2px; }
+  .sc-group.open .sc-group-body { display:flex; }
+  .sc-swatch { width:16px; height:4px; border-radius:2px; flex:none; }
+  .sc-swatch.dashed { background:repeating-linear-gradient(90deg, var(--cat-other) 0 4px, transparent 4px 7px) !important; }
+  .sc-match { display:flex; flex-wrap:wrap; align-items:center; gap:0.3rem 0.45rem; width:100%;
+              padding:0.25rem 0.4rem; background:transparent; border:1px solid transparent;
+              border-radius:4px; color:var(--foreground); cursor:pointer; text-align:left;
+              font-size:0.8rem; font-variant-numeric:tabular-nums; }
+  .sc-match:hover { background:var(--accent); }
+  .sc-match.sel { border-color:var(--ring); background:rgba(59,130,246,0.12); }
+  .sc-match.muted { color:var(--text-secondary); cursor:default; }
+  .sc-match.muted:hover { background:transparent; }
+  .sc-match .mk { font-weight:600; min-width:2.6rem; }
+  .sc-match .cov { color:var(--text-secondary); }
+  .sc-match .rep { color:var(--text-secondary); font-size:0.72rem; }
+  .sc-all { font-size:0.65rem; padding:0.05rem 0.35rem; border-radius:3px; font-weight:600; }
+  .sc-all.red { background:var(--red-bg); color:#fca5a5; border:1px solid var(--red-border); }
+  .sc-all.blue { background:var(--blue-bg); color:#9cc8ff; border:1px solid var(--blue-border); }
+  .sc-badge { font-size:0.66rem; padding:0.02rem 0.35rem; border-radius:999px; border:1px solid var(--border);
+              color:var(--text-secondary); white-space:nowrap; }
+  .sc-badge.warn { color:var(--st-warning); border-color:rgba(250,178,25,0.55); }
+  .sc-badge.serious { color:var(--st-serious); border-color:rgba(236,131,90,0.55); }
+  .sc-section-label { color:var(--text-secondary); font-size:0.72rem; text-transform:uppercase;
+                      letter-spacing:0.04em; margin:0.35rem 0 0.1rem; }
+
+  /* ---- heatmap ---- */
+  .sc-chips { display:inline-flex; flex-wrap:wrap; gap:0.25rem; }
+  .sc-chip { font-size:0.76rem; padding:0.15rem 0.55rem; border-radius:999px; cursor:pointer;
+             border:1px solid var(--border); background:transparent; color:var(--text-secondary); }
+  .sc-chip.on { background:var(--accent); color:var(--foreground); border-color:var(--ring); }
+  .sc-legend { display:inline-flex; align-items:center; gap:0.4rem; font-size:0.76rem;
+               color:var(--text-secondary); font-variant-numeric:tabular-nums; }
+  .sc-legend .bar { width:110px; height:8px; border-radius:2px; }
+  .sc-heat-grid { display:grid; gap:0.6rem 0.6rem; align-items:start; }
+  .sc-heat-colhead { font-size:0.82rem; font-weight:600; }
+  .sc-heat-colhead small { display:block; font-weight:400; color:var(--text-secondary); font-size:0.74rem; }
+  .sc-heat-rowhead { font-size:0.82rem; font-weight:600; padding-top:0.2rem; }
+  .sc-heat-rowhead small { display:block; font-weight:400; color:var(--text-secondary); font-size:0.74rem; }
+  .sc-heat-cell { min-width:0; position:relative; }
+  .sc-heat-cell canvas { display:block; width:100%; border-radius:4px; }
+  .sc-heat-cap { font-size:0.74rem; color:var(--text-secondary); margin-top:0.2rem;
+                 font-variant-numeric:tabular-nums; line-height:1.35; }
+  .sc-heat-cap b { color:var(--foreground); font-weight:600; }
+  .sc-table { border-collapse:collapse; font-size:0.78rem; margin-top:0.4rem;
+              font-variant-numeric:tabular-nums; }
+  .sc-table th, .sc-table td { padding:0.2rem 0.6rem; border-bottom:1px solid var(--border); text-align:right; }
+  .sc-table th:first-child, .sc-table td:first-child { text-align:left; }
+  .sc-table th { color:var(--text-secondary); font-weight:500; }
+  details.sc-details summary { cursor:pointer; color:var(--text-secondary); font-size:0.8rem; margin-top:0.5rem; }
+
+  @media (max-width: 1100px) {
+    .sc-auto-body { grid-template-columns:minmax(0,1fr); }
+    .sc-list { max-height:none; }
+  }
+  @media (max-width: 720px) {
+    .sc-layout { grid-template-columns:minmax(0,1fr); }
+    .sc-team-list { max-height:180px; }
+  }
+</style>
+</head>
+<body data-mode="standard">
+<div class="container">
+  <header>
+    <h1>FRC Vision Scorer</h1>
+    <nav>
+      <a class="nav-btn" href="/">Scorer</a>
+      <span class="nav-btn active">Scouting</span>
+    </nav>
+  </header>
+
+  <div class="sc-toolbar">
+    <label for="eventSel">Event</label>
+    <select id="eventSel"></select>
+    <span class="sc-status" id="eventStatus">Loading events…</span>
+    <a class="sc-export" id="exportLink" href="#" target="_blank" rel="noopener" style="display:none">Export JSON</a>
+  </div>
+
+  <div class="sc-layout">
+    <aside class="sc-teams">
+      <input class="sc-search" id="teamSearch" type="search" placeholder="Find team…" autocomplete="off" aria-label="Find team">
+      <div class="sc-team-list" id="teamList" role="listbox" aria-label="Teams"></div>
+    </aside>
+
+    <main class="sc-main">
+      <section class="sc-panel" id="autoPanel">
+        <div class="sc-panel-head">
+          <h2 id="autoTitle">Auto paths</h2>
+          <span class="sc-sub" id="autoSub"></span>
+          <div class="sc-controls">
+            <label id="optMirrorWrap" title="Group a routine with its left/right reflection (same auto run from the other side of the field)"><input type="checkbox" id="optMirror" checked> Group mirrored routines</label>
+            <label><input type="checkbox" id="optTicks" checked> 5 s ticks</label>
+            <label><input type="checkbox" id="optUnclustered" checked> ungrouped paths</label>
+          </div>
+        </div>
+        <div class="sc-auto-body">
+          <div class="sc-canvas-wrap" id="autoWrap">
+            <canvas id="autoCanvas"></canvas>
+            <div class="sc-tip" id="autoTip"></div>
+          </div>
+          <div class="sc-list" id="autoList"></div>
+        </div>
+        <p class="sc-note">Alliance perspective: every path is drawn as if the team were blue — own alliance wall on the left, opponents on the right (red matches are <span id="autoSym">rotated 180°</span> onto this side). Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Click a routine or match to highlight it; click empty field to clear.</p>
+      </section>
+
+      <section class="sc-panel" id="heatPanel" style="display:none">
+        <div class="sc-panel-head">
+          <h2 id="heatTitle">Shift heatmaps</h2>
+          <span class="sc-sub" id="heatSub"></span>
+          <div class="sc-controls">
+            <span class="sc-chips" id="bucketChips"></span>
+            <select class="sc-select" id="heatScale" aria-label="Colour scale">
+              <option value="share">Share of each map's time</option>
+              <option value="row">Seconds, scale per row</option>
+              <option value="global">Seconds, one scale</option>
+            </select>
+            <span class="sc-legend" id="heatLegend"></span>
+          </div>
+        </div>
+        <div id="heatBody"></div>
+        <p class="sc-note" id="heatNote"></p>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script>
+'use strict';
+const PALETTE = ['--cat-1','--cat-2','--cat-3','--cat-4','--cat-5','--cat-6','--cat-7','--cat-8']
+  .map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const OTHER = getComputedStyle(document.documentElement).getPropertyValue('--cat-other').trim();
+// Sequential blue (dataviz reference ramp), dark end = little time, light end = most.
+const SEQ = ['#1c5cab','#256abf','#2a78d6','#3987e5','#5598e7',
+             '#6da7ec','#86b6ef','#9ec5f4','#b7d3f6','#cde2fb'];
+const BUCKET_LABEL = {auto:'Auto', transition:'Transition', active:'Hub active',
+                      inactive:'Hub inactive', endgame:'Endgame', unknown:'Shift unknown'};
+const BUCKET_HINT = {
+  auto:'Autonomous period', transition:'Teleop start, both hubs active (140–130 s)',
+  active:"Shifts when this team's hub is active", inactive:"Shifts when this team's hub is inactive",
+  endgame:'Last 30 s, both hubs active', unknown:'Shifts 1–4 when TBA auto fuel is tied or missing'};
+const LOW_COVERAGE = 0.5;
+
+const S = {
+  events: [], event: null, year: null, metrics: [], teams: [], team: null,
+  field: {},              // year -> {meta, img, grey}
+  auto: null, heat: null, // current envelopes
+  sel: null,              // {type:'cluster', id} | {type:'match', key}
+  open: new Set(),        // expanded cluster ids
+  buckets: null, hits: [], token: 0,
+};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct = v => v == null ? '—' : `${Math.round(v * 100)}%`;
+const fmtS = v => v == null ? '—' : (v >= 100 ? `${Math.round(v)} s` : `${v.toFixed(1)} s`);
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    let msg = `${r.status}`;
+    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+function matchLabel(m) {
+  const lvl = (m.comp_level || '').toLowerCase();
+  if (lvl === 'qm') return `Q${m.match_number}`;
+  if (!lvl || lvl === 'unknown') return (m.match_key || '').split('_').pop();
+  return `${lvl.toUpperCase()}${m.set_number}-${m.match_number}`;
+}
+function allianceChip(m) {
+  if (!m.alliance) return '';
+  const a = m.alliance === 'red' ? 'red' : 'blue';
+  return `<span class="sc-all ${a}">${a === 'red' ? 'Red' : 'Blue'}${m.station ? ' ' + m.station : ''}</span>`;
+}
+function setURL() {
+  const q = new URLSearchParams();
+  if (S.event) q.set('event', S.event);
+  if (S.team) q.set('team', S.team);
+  history.replaceState(null, '', `${location.pathname}?${q}`);
+}
+
+// ------------------------------------------------------------------ field image
+async function loadField(year) {
+  if (S.field[year]) return S.field[year];
+  let meta = null, img = null;
+  try {
+    meta = await getJSON(`/api/scouting/field-image/${year}/meta`);
+    img = await new Promise((res) => {
+      const im = new Image();
+      im.onload = () => res(im); im.onerror = () => res(null);
+      im.src = meta.url;
+    });
+  } catch (_) { meta = null; }
+  let grey = null;
+  if (meta && img) {   // dim greyscale copy of just the field rectangle, for the heatmaps
+    const [x0, y0] = meta.field_top_left_px, [x1, y1] = meta.field_bottom_right_px;
+    grey = document.createElement('canvas');
+    grey.width = Math.round(x1 - x0); grey.height = Math.round(y1 - y0);
+    const g = grey.getContext('2d');
+    g.filter = 'grayscale(1) brightness(0.55) contrast(0.9)';
+    g.drawImage(img, x0, y0, x1 - x0, y1 - y0, 0, 0, grey.width, grey.height);
+    g.filter = 'none';
+  }
+  return (S.field[year] = {meta, img, grey});
+}
+
+// Field metres (alliance perspective, x right / y up) <-> canvas px.
+// crop = the image-pixel rectangle shown; without an image a synthetic one.
+function makeMapper(field, L, W, cssW, margin) {
+  let tl, br;
+  if (field.meta) { tl = field.meta.field_top_left_px; br = field.meta.field_bottom_right_px; }
+  else { tl = [0, 0]; br = [L * 100, W * 100]; }
+  const fw = br[0] - tl[0], fh = br[1] - tl[1], m = fw * margin;
+  const crop = {x: tl[0] - m, y: tl[1] - m, w: fw + 2 * m, h: fh + 2 * m};
+  if (field.meta && field.meta.image_size) {
+    const [iw, ih] = field.meta.image_size;
+    crop.x = Math.max(0, crop.x); crop.y = Math.max(0, crop.y);
+    crop.w = Math.min(iw - crop.x, crop.w); crop.h = Math.min(ih - crop.y, crop.h);
+  }
+  const k = cssW / crop.w, cssH = crop.h * k;
+  return {
+    crop, k, cssW, cssH, L, W,
+    to(ax, ay) {
+      return [(tl[0] + ax / L * fw - crop.x) * k, (tl[1] + (W - ay) / W * fh - crop.y) * k];
+    },
+    from(cx, cy) {
+      return [((cx / k + crop.x) - tl[0]) / fw * L, W - ((cy / k + crop.y) - tl[1]) / fh * W];
+    },
+  };
+}
+function sizeCanvas(cv, w, h) {
+  const d = window.devicePixelRatio || 1;
+  cv.width = Math.round(w * d); cv.height = Math.round(h * d);
+  cv.style.width = `${w}px`; cv.style.height = `${h}px`;
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  return ctx;
+}
+function fieldDims() {
+  const env = S.auto || S.heat;
+  const fm = (env && env.frame && env.frame.field_m) || (S.field[S.year]?.meta?.field_m) || [16.541, 8.069];
+  return [fm[0], fm[1]];
+}
+
+// ------------------------------------------------------------------ events / teams
+async function init() {
+  try { S.events = await getJSON('/api/scouting/events'); }
+  catch (e) { $('eventStatus').textContent = `Could not load events: ${e.message}`; return; }
+  const sel = $('eventSel');
+  if (!S.events.length) { $('eventStatus').textContent = 'No events with finished replays yet.'; return; }
+  sel.innerHTML = S.events.map(e =>
+    `<option value="${esc(e.event_key)}">${esc(e.event_key)} — ${e.n_matches} match${e.n_matches === 1 ? '' : 'es'}</option>`).join('');
+  const q = new URLSearchParams(location.search);
+  const want = q.get('event');
+  const ev = S.events.find(e => e.event_key === want) || S.events[0];   // most matches first
+  sel.value = ev.event_key;
+  sel.addEventListener('change', () => selectEvent(sel.value, null));
+  await selectEvent(ev.event_key, q.get('team'));
+}
+
+async function selectEvent(eventKey, wantTeam) {
+  const tok = ++S.token;
+  S.event = eventKey; S.team = null; S.auto = S.heat = null; S.sel = null;
+  const ev = S.events.find(e => e.event_key === eventKey) || {};
+  S.year = ev.year;
+  $('eventStatus').textContent = 'Loading replays…';
+  $('teamList').innerHTML = '';
+  $('exportLink').href = `/api/scouting/${encodeURIComponent(eventKey)}/export`;
+  $('exportLink').style.display = '';
+  let info, teams;
+  try {
+    [info, teams] = await Promise.all([
+      getJSON(`/api/scouting/${encodeURIComponent(eventKey)}/metrics`),
+      getJSON(`/api/scouting/${encodeURIComponent(eventKey)}/teams`),
+      loadField(ev.year),
+    ]);
+  } catch (e) {
+    if (tok === S.token) $('eventStatus').textContent = `Could not load ${eventKey}: ${e.message}`;
+    return;
+  }
+  if (tok !== S.token) return;
+  S.metrics = info.metrics.map(m => m.key);
+  S.metricInfo = Object.fromEntries(info.metrics.map(m => [m.key, m]));
+  $('optMirrorWrap').style.display =
+    'mirror_aware' in (S.metricInfo.auto_paths?.default_params || {}) ? '' : 'none';
+  S.teams = teams.teams;
+  const legacy = info.sources.filter(s => s.legacy_labels).length;
+  const parts = [`<b>${info.sources.length}</b> matches analysed`];
+  if (info.skipped.length) {
+    parts.push(`<span title="${esc(info.skipped.map(s => `${s.match_key}: ${s.reason}`).join('\n'))}">${info.skipped.length} skipped</span>`);
+  }
+  if (legacy) parts.push(`${legacy} with legacy labels`);
+  parts.push(`${S.teams.length} teams`);
+  $('eventStatus').innerHTML = parts.join(' · ');
+  $('heatPanel').style.display = S.metrics.includes('shift_heatmap') ? '' : 'none';
+  $('autoPanel').style.display = S.metrics.includes('auto_paths') ? '' : 'none';
+  renderTeams();
+  const t = S.teams.find(x => String(x.team_number) === String(wantTeam))
+         || S.teams.find(x => x.n_labelled > 0) || S.teams[0];
+  if (t) selectTeam(t.team_number); else { setURL(); renderAuto(); renderHeat(); }
+}
+
+function renderTeams() {
+  const q = $('teamSearch').value.trim();
+  const list = S.teams.filter(t => !q || String(t.team_number).includes(q));
+  $('teamList').innerHTML = list.map(t => {
+    const cls = ['sc-team', t.team_number === S.team ? 'active' : '', t.n_labelled ? '' : 'unlabelled'].join(' ');
+    const title = `${t.n_matches} match(es) in the analysed replays; seen with a label in ${t.n_labelled}`;
+    return `<button class="${cls}" data-team="${t.team_number}" role="option" aria-selected="${t.team_number === S.team}" title="${title}">
+      <span>${t.team_number}</span><small>${t.n_labelled}/${t.n_matches}</small></button>`;
+  }).join('') || '<div class="sc-empty">No team matches.</div>';
+}
+$('teamList').addEventListener('click', e => {
+  const b = e.target.closest('.sc-team');
+  if (b) selectTeam(+b.dataset.team);
+});
+$('teamSearch').addEventListener('input', renderTeams);
+$('teamSearch').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const b = $('teamList').querySelector('.sc-team');
+    if (b) selectTeam(+b.dataset.team);
+  }
+});
+
+async function selectTeam(team) {
+  const tok = ++S.token;
+  S.team = team; S.sel = null; S.open = new Set();
+  renderTeams(); setURL();
+  const active = $('teamList').querySelector('.sc-team.active');
+  if (active) active.scrollIntoView({block: 'nearest'});
+  $('autoTitle').textContent = `Auto paths — ${team}`;
+  $('heatTitle').textContent = `Shift heatmaps — ${team}`;
+  $('autoSub').textContent = 'loading…'; $('heatSub').textContent = 'loading…';
+  const ek = encodeURIComponent(S.event);
+  const want = [];
+  want.push(S.metrics.includes('auto_paths')
+    ? fetchAuto(team) : null);
+  want.push(S.metrics.includes('shift_heatmap')
+    ? getJSON(`/api/scouting/${ek}/metric/shift_heatmap?team=${team}`).catch(e => ({error: e.message})) : null);
+  const [auto, heat] = await Promise.all(want);
+  if (tok !== S.token) return;
+  S.auto = auto; S.heat = heat;
+  defaultOpen();
+  if (heat && !heat.error && !S.buckets) S.buckets = new Set(heat.default_buckets || ['active', 'inactive', 'endgame']);
+  renderAuto(); renderHeat();
+}
+
+// ------------------------------------------------------------------ auto paths
+function fetchAuto(team) {
+  const q = new URLSearchParams({team});
+  if ($('optMirrorWrap').style.display !== 'none' && !$('optMirror').checked) q.set('mirror_aware', 'false');
+  return getJSON(`/api/scouting/${encodeURIComponent(S.event)}/metric/auto_paths?${q}`)
+    .catch(e => ({error: e.message}));
+}
+$('optMirror').addEventListener('change', async () => {
+  if (S.team == null) return;
+  const tok = ++S.token, team = S.team;
+  $('autoSub').textContent = 'loading…';
+  const auto = await fetchAuto(team);
+  if (tok !== S.token) return;
+  S.auto = auto; S.sel = null;
+  defaultOpen();
+  renderAuto();
+});
+// Repeated routines start expanded; singletons stay collapsed.
+function defaultOpen() {
+  const p = autoTeam();
+  S.open = new Set(p ? p.clusters.filter(c => c.count > 1).map(c => c.id) : []);
+}
+function autoTeam() {
+  return S.auto && !S.auto.error && S.auto.teams ? S.auto.teams[String(S.team)] : null;
+}
+function clusterColour(p, cid) {
+  const i = p.clusters.findIndex(c => c.id === cid);
+  return i >= 0 && i < PALETTE.length ? PALETTE[i] : OTHER;
+}
+function clusterName(p, cid) {
+  const i = p.clusters.findIndex(c => c.id === cid);
+  return i < 0 ? '?' : (i < 26 ? String.fromCharCode(65 + i) : `#${i + 1}`);
+}
+function isSelected(m) {
+  if (!S.sel) return true;
+  return S.sel.type === 'cluster' ? m.cluster === S.sel.id : m.match_key === S.sel.key;
+}
+
+function renderAuto() {
+  const p = autoTeam(), list = $('autoList');
+  const sym = S.auto && S.auto.frame && S.auto.frame.symmetry;
+  $('autoSym').textContent = sym === 'mirror' ? 'mirrored end-to-end' : 'rotated 180°';
+  if (S.auto && S.auto.error) {
+    $('autoSub').textContent = ''; list.innerHTML = `<div class="sc-empty">Could not compute: ${esc(S.auto.error)}</div>`;
+  } else if (!p) {
+    $('autoSub').textContent = '';
+    list.innerHTML = `<div class="sc-empty">No auto data for ${esc(S.team ?? '—')} at this event.</div>`;
+  } else {
+    const nRoutines = p.clusters.filter(c => c.count > 1).length;
+    $('autoSub').textContent = `${p.n_matches} match${p.n_matches === 1 ? '' : 'es'} · ${p.n_with_path} with a path · ` +
+      `${p.clusters.length} routine${p.clusters.length === 1 ? '' : 's'}` +
+      (p.clusters.length ? ` (${nRoutines} repeated)` : '');
+    list.innerHTML = autoListHTML(p);
+  }
+  drawAuto();
+}
+
+function matchRowHTML(m, p, opts = {}) {
+  const badges = [];
+  if (m.mirrored === true) badges.push(`<span class="sc-badge" title="Left/right reflection of this routine's typical match (drawn as seen, not flipped)">mirrored</span>`);
+  if (m.identity_conflict) badges.push(`<span class="sc-badge warn" title="Label share ${pct(m.label_share)}, runner-up ${pct(m.runner_up_share)} — the path may mix two robots">ID conflict</span>`);
+  if (m.coverage != null && m.coverage < LOW_COVERAGE && !opts.muted) badges.push(`<span class="sc-badge serious" title="Path seen for ${pct(m.coverage)} of auto">low coverage</span>`);
+  if (m.legacy_labels) badges.push(`<span class="sc-badge" title="Replay predates window labels (older identity method)">legacy labels</span>`);
+  if (m.source === 'frames') badges.push(`<span class="sc-badge" title="No pipeline auto path for this robot; built from per-frame team labels">from labels</span>`);
+  const isRep = opts.rep ? `<span class="rep">typical</span>` : '';
+  const sel = S.sel && S.sel.type === 'match' && S.sel.key === m.match_key ? ' sel' : '';
+  const covTitle = `label share ${pct(m.label_share)} · ${m.n_samples} samples`;
+  if (opts.muted) {
+    return `<div class="sc-match muted"><span class="mk">${esc(matchLabel(m))}</span>${allianceChip(m)}<span>${m.n_samples ? `too little seen (${m.n_samples} samples, cov ${pct(m.coverage)})` : 'no auto path seen'}</span>${badges.join('')}</div>`;
+  }
+  return `<button class="sc-match${sel}" data-key="${esc(m.match_key)}" title="${esc(covTitle)}">
+    <span class="mk">${esc(matchLabel(m))}</span>${allianceChip(m)}
+    <span class="cov">cov ${pct(m.coverage)}</span>${isRep}${badges.join('')}</button>`;
+}
+
+function autoListHTML(p) {
+  const byKey = Object.fromEntries(p.matches.map(m => [m.match_key, m]));
+  const out = [];
+  p.clusters.forEach((c, i) => {
+    const open = S.open.has(c.id), sel = S.sel && S.sel.type === 'cluster' && S.sel.id === c.id;
+    const spread = c.count > 1 ? ` · spread ${c.mean_spread_m.toFixed(2)} m` : '';
+    const dur = c.duration_s != null ? ` · ${c.duration_s.toFixed(1)} s` : '';
+    const members = c.members.map(k => byKey[k]).filter(Boolean)
+      .map(m => matchRowHTML(m, p, {rep: c.count > 1 && m.match_key === c.representative})).join('');
+    out.push(`<div class="sc-group${open ? ' open' : ''}${sel ? ' sel' : ''}" data-cluster="${c.id}">
+      <button class="sc-group-head" data-cluster="${c.id}">
+        <span class="sc-swatch" style="background:${clusterColour(p, c.id)}"></span>
+        <span><b>Routine ${clusterName(p, c.id)}</b> — ${c.count} match${c.count === 1 ? '' : 'es'}${c.n_mirrored ? ` (${c.n_mirrored} mirrored)` : ''}<span class="sc-meta">${spread}${dur}</span></span>
+        <span class="sc-caret">▶</span>
+      </button>
+      <div class="sc-group-body">${members}</div></div>`);
+  });
+  const loose = p.matches.filter(m => m.cluster == null && (m.points || []).length >= 2);
+  if (loose.length) {
+    out.push(`<div class="sc-section-label" title="Paths too short or overlapping too little in time to compare with the others">
+      <span class="sc-swatch dashed" style="display:inline-block;vertical-align:middle;margin-right:0.35rem"></span>Not grouped</div>`);
+    out.push(loose.map(m => matchRowHTML(m, p)).join(''));
+  }
+  const none = p.matches.filter(m => (m.points || []).length < 2);
+  if (none.length) {
+    out.push(`<div class="sc-section-label">No path seen</div>`);
+    out.push(none.map(m => matchRowHTML(m, p, {muted: true})).join(''));
+  }
+  return out.join('') || '<div class="sc-empty">No matches.</div>';
+}
+
+$('autoList').addEventListener('click', e => {
+  const head = e.target.closest('.sc-group-head');
+  if (head) {
+    const id = +head.dataset.cluster;
+    const already = S.sel && S.sel.type === 'cluster' && S.sel.id === id;
+    if (e.target.closest('.sc-caret')) {
+      S.open.has(id) ? S.open.delete(id) : S.open.add(id);
+    } else {
+      S.sel = already ? null : {type: 'cluster', id};
+      if (!already) S.open.add(id);
+    }
+    renderAuto(); return;
+  }
+  const row = e.target.closest('.sc-match[data-key]');
+  if (row) {
+    const key = row.dataset.key;
+    S.sel = S.sel && S.sel.type === 'match' && S.sel.key === key ? null : {type: 'match', key};
+    renderAuto();
+  }
+});
+$('optTicks').addEventListener('change', drawAuto);
+$('optUnclustered').addEventListener('change', drawAuto);
+
+function drawBackground(ctx, field, mp) {
+  ctx.fillStyle = '#0a0e1a';
+  ctx.fillRect(0, 0, mp.cssW, mp.cssH);
+  if (field.img) {
+    const c = mp.crop;
+    ctx.globalAlpha = 0.6;
+    ctx.drawImage(field.img, c.x, c.y, c.w, c.h, 0, 0, mp.cssW, mp.cssH);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(10,14,26,0.35)';
+    ctx.fillRect(0, 0, mp.cssW, mp.cssH);
+  } else {
+    const [x0, y0] = mp.to(0, mp.W), [x1, y1] = mp.to(mp.L, 0);
+    ctx.strokeStyle = '#3a4566'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo((x0 + x1) / 2, y0); ctx.lineTo((x0 + x1) / 2, y1); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function pathStyle(m, p) {
+  const c = m.cluster != null ? p.clusters.find(x => x.id === m.cluster) : null;
+  const rep = c && (c.representative === m.match_key);
+  const colour = c ? clusterColour(p, c.id) : OTHER;
+  const sel = isSelected(m), focused = S.sel && sel;
+  let width = c ? (rep ? 3.5 : 1.75) : 1.5, alpha = c ? (rep ? 1 : 0.6) : 0.65;
+  if (focused) { width += 1; alpha = 1; }
+  if (!sel) alpha = 0.12;
+  return {colour, width, alpha, dash: c ? [] : [6, 5], rep, sel, cluster: c, focused};
+}
+
+function interpAt(pts, t) {
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i][0] >= t) {
+      const [t0, x0, y0] = pts[i - 1], [t1, x1, y1] = pts[i];
+      if (t0 > t) return null;
+      if (t1 - t0 > 1.5) return null;          // don't draw a tick inside a gap
+      const f = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      return [x0 + f * (x1 - x0), y0 + f * (y1 - y0)];
+    }
+  }
+  return null;
+}
+
+function drawArrow(ctx, pts, mp, size, colour) {
+  const [, ex, ey] = pts[pts.length - 1];
+  let j = pts.length - 2;
+  while (j > 0 && Math.hypot(pts[j][1] - ex, pts[j][2] - ey) < 0.3) j--;
+  const [x1, y1] = mp.to(ex, ey), [x0, y0] = mp.to(pts[j][1], pts[j][2]);
+  const a = Math.atan2(y1 - y0, x1 - x0);
+  ctx.beginPath();
+  ctx.moveTo(x1 + Math.cos(a) * size, y1 + Math.sin(a) * size);
+  ctx.lineTo(x1 + Math.cos(a + 2.5) * size, y1 + Math.sin(a + 2.5) * size);
+  ctx.lineTo(x1 + Math.cos(a - 2.5) * size, y1 + Math.sin(a - 2.5) * size);
+  ctx.closePath();
+  ctx.fillStyle = colour; ctx.fill();
+  ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(10,14,26,0.9)'; ctx.stroke();
+}
+
+function drawAuto() {
+  const cv = $('autoCanvas'), wrap = $('autoWrap');
+  const field = S.field[S.year] || {};
+  const [L, W] = fieldDims();
+  const cssW = Math.max(280, wrap.clientWidth);
+  const mp = makeMapper(field, L, W, cssW, 0.02);
+  const ctx = sizeCanvas(cv, cssW, mp.cssH);
+  drawBackground(ctx, field, mp);
+  // own / opponent wall labels
+  ctx.font = '600 11px Inter, system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(232,234,240,0.85)';
+  ctx.textBaseline = 'top';
+  const [wx] = mp.to(0, 0), [ox] = mp.to(L, 0);
+  ctx.textAlign = 'left'; ctx.fillText('◀ OWN WALL', wx + 4, 4);
+  ctx.textAlign = 'right'; ctx.fillText('OPPONENT WALL ▶', ox - 4, 4);
+  S.hits = [];
+  const p = autoTeam();
+  if (!p) return;
+  const showLoose = $('optUnclustered').checked, ticks = $('optTicks').checked;
+  const drawn = p.matches
+    .filter(m => (m.points || []).length >= 2 && (m.cluster != null || showLoose
+             || (S.sel && S.sel.type === 'match' && S.sel.key === m.match_key)))
+    .map(m => ({m, st: pathStyle(m, p)}));
+  // painter's order: dimmed, ungrouped, members, typical, then the focused ones
+  const rank = ({st}) => (st.sel ? 10 : 0) + (st.cluster ? (st.rep ? 3 : 2) : 1);
+  drawn.sort((a, b) => rank(a) - rank(b));
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (const {m, st} of drawn) {
+    const cp = m.points.map(([, x, y]) => mp.to(x, y));
+    // surface halo keeps lines legible over the field art
+    ctx.globalAlpha = st.alpha * 0.8;
+    ctx.setLineDash(st.dash);
+    ctx.strokeStyle = 'rgba(10,14,26,0.85)'; ctx.lineWidth = st.width + 2.5;
+    ctx.beginPath(); cp.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+    ctx.globalAlpha = st.alpha;
+    ctx.strokeStyle = st.colour; ctx.lineWidth = st.width;
+    ctx.beginPath(); cp.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+    ctx.setLineDash([]);
+    if (st.sel && (st.rep || st.focused || !S.sel || !st.cluster)) {
+      const big = st.rep || st.focused;
+      const [sx, sy] = cp[0];
+      ctx.beginPath(); ctx.arc(sx, sy, big ? 5.5 : 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = st.colour; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(10,14,26,0.9)'; ctx.stroke();
+      drawArrow(ctx, m.points, mp, big ? 9 : 6, st.colour);
+      if (st.rep) {            // direct label: routine letter at the start
+        ctx.font = '700 12px Inter, system-ui, sans-serif';
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,14,26,0.9)';
+        const lbl = clusterName(p, st.cluster.id);
+        ctx.strokeText(lbl, sx - 8, sy - 8); ctx.fillStyle = '#e8eaf0'; ctx.fillText(lbl, sx - 8, sy - 8);
+      }
+      if (ticks && (st.rep || st.focused)) drawTicks(ctx, m.points, mp, st.colour);
+    }
+    ctx.globalAlpha = 1;
+    S.hits.push({m, cp, st});
+  }
+  S.mapper = mp;
+}
+
+function drawTicks(ctx, pts, mp, colour) {
+  const tEnd = pts[pts.length - 1][0];
+  ctx.font = '600 10px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  for (let t = 5; t < tEnd; t += 5) {
+    const q = interpAt(pts, t);
+    if (!q) continue;
+    const [x, y] = mp.to(q[0], q[1]);
+    ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#e8eaf0'; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = colour; ctx.stroke();
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,14,26,0.9)';
+    ctx.strokeText(`${t}s`, x + 4, y - 3);
+    ctx.fillStyle = '#e8eaf0'; ctx.fillText(`${t}s`, x + 4, y - 3);
+  }
+}
+
+function nearestPath(cx, cy) {
+  let best = null, bestD = 9;
+  for (const h of S.hits) {
+    if (S.sel && !h.st.sel) continue;
+    for (let i = 1; i < h.cp.length; i++) {
+      const [x0, y0] = h.cp[i - 1], [x1, y1] = h.cp[i];
+      const dx = x1 - x0, dy = y1 - y0, L2 = dx * dx + dy * dy;
+      const f = L2 ? Math.max(0, Math.min(1, ((cx - x0) * dx + (cy - y0) * dy) / L2)) : 0;
+      const d = Math.hypot(cx - x0 - f * dx, cy - y0 - f * dy);
+      if (d < bestD) { bestD = d; best = {h, i, f}; }
+    }
+  }
+  return best;
+}
+$('autoCanvas').addEventListener('mousemove', e => {
+  const r = e.currentTarget.getBoundingClientRect(), cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const tip = $('autoTip'), hit = nearestPath(cx, cy), p = autoTeam();
+  e.currentTarget.style.cursor = hit ? 'pointer' : 'default';
+  if (!hit || !p) { tip.style.display = 'none'; return; }
+  const m = hit.h.m, pts = m.points;
+  const t = pts[hit.i - 1][0] + hit.f * (pts[hit.i][0] - pts[hit.i - 1][0]);
+  const routine = m.cluster != null ? `Routine ${clusterName(p, m.cluster)}${m.mirrored ? ' (mirrored)' : ''}` : 'not grouped';
+  tip.innerHTML = `<b>${esc(matchLabel(m))}</b> · ${m.alliance === 'red' ? 'Red' : 'Blue'} ${m.station ?? ''} · ${routine}<br>` +
+    `t = ${t.toFixed(1)} s · coverage ${pct(m.coverage)} · label share ${pct(m.label_share)}`;
+  tip.style.display = 'block';
+  const wrapW = $('autoWrap').clientWidth;
+  tip.style.left = `${Math.min(cx + 12, wrapW - tip.offsetWidth - 4)}px`;
+  tip.style.top = `${cy + 14}px`;
+});
+$('autoCanvas').addEventListener('mouseleave', () => { $('autoTip').style.display = 'none'; });
+$('autoCanvas').addEventListener('click', e => {
+  const r = e.currentTarget.getBoundingClientRect();
+  const hit = nearestPath(e.clientX - r.left, e.clientY - r.top);
+  if (hit) {
+    const key = hit.h.m.match_key;
+    S.sel = S.sel && S.sel.type === 'match' && S.sel.key === key ? null : {type: 'match', key};
+    if (hit.h.m.cluster != null) S.open.add(hit.h.m.cluster);
+  } else S.sel = null;
+  renderAuto();
+});
+
+// ------------------------------------------------------------------ shift heatmap
+function heatTeam() {
+  return S.heat && !S.heat.error && S.heat.teams ? S.heat.teams[String(S.team)] : null;
+}
+const bucketSeconds = b => (b && (b.seconds ?? b.seconds_total)) || 0;
+
+function renderBucketChips() {
+  const h = S.heat;
+  const all = (h && h.buckets) || Object.keys(BUCKET_LABEL);
+  $('bucketChips').innerHTML = all.map(b =>
+    `<button class="sc-chip${S.buckets && S.buckets.has(b) ? ' on' : ''}" data-b="${b}" title="${esc(BUCKET_HINT[b] || '')}"
+       aria-pressed="${!!(S.buckets && S.buckets.has(b))}">${esc(BUCKET_LABEL[b] || b)}</button>`).join('');
+}
+$('bucketChips').addEventListener('click', e => {
+  const c = e.target.closest('.sc-chip');
+  if (!c) return;
+  const b = c.dataset.b;
+  if (!S.buckets) S.buckets = new Set();
+  S.buckets.has(b) ? S.buckets.delete(b) : S.buckets.add(b);
+  renderHeat();
+});
+$('heatScale').addEventListener('change', renderHeat);
+
+function seqColour(t) {
+  return SEQ[Math.max(0, Math.min(SEQ.length - 1, Math.round(t * (SEQ.length - 1))))];
+}
+
+function renderHeat() {
+  const body = $('heatBody');
+  if (!S.metrics.includes('shift_heatmap')) return;
+  renderBucketChips();
+  const h = S.heat, tm = heatTeam();
+  $('heatLegend').innerHTML = '';
+  if (h && h.error) { $('heatSub').textContent = ''; body.innerHTML = `<div class="sc-empty">Could not compute: ${esc(h.error)}</div>`; return; }
+  if (!tm) { $('heatSub').textContent = ''; body.innerHTML = `<div class="sc-empty">No heatmap data for ${esc(S.team ?? '—')} at this event.</div>`; $('heatNote').textContent = ''; return; }
+  const order = (h.buckets || Object.keys(BUCKET_LABEL)).filter(b => S.buckets && S.buckets.has(b));
+  const rows = ['all', ...['1', '2', '3'].filter(s => (tm.matches_by_station?.[s] || 0) > 0 && tm.by_station[s])];
+  $('heatSub').textContent = `${tm.n_matches} match${tm.n_matches === 1 ? '' : 'es'} · ` +
+    ['1', '2', '3'].map(s => `station ${s}: ${tm.matches_by_station?.[s] || 0}`).join(', ');
+  if (!order.length) { body.innerHTML = '<div class="sc-empty">Pick at least one shift above.</div>'; return; }
+
+  const mode = $('heatScale').value;
+  // value of a cell under the chosen scale, and the scale max (per row or global)
+  const val = (bk, s) => mode === 'share' ? (bucketSeconds(bk) > 0 ? s / bucketSeconds(bk) : 0) : s;
+  // Scale top = 98th percentile of the cell values in scope, so one parked-robot
+  // (or mislabelled) cell doesn't wash every other cell out; cells above it saturate.
+  const robustMax = vs => {
+    if (!vs.length) return 0;
+    vs.sort((x, y) => x - y);
+    return vs[Math.min(vs.length - 1, Math.floor(0.98 * (vs.length - 1)))];
+  };
+  const rowMax = {}, allVals = [];
+  for (const r of rows) {
+    const vs = [];
+    for (const b of order) {
+      const bk = tm.by_station[r]?.[b];
+      for (const [, , s] of (bk?.cells || [])) { const v = val(bk, s); if (v > 0) vs.push(v); }
+    }
+    allVals.push(...vs);
+    rowMax[r] = robustMax(vs);
+  }
+  const globalMax = robustMax(allVals);
+  const scaleMax = r => (mode === 'row' ? rowMax[r] : globalMax) || 1;
+  const fmtV = v => mode === 'share' ? `${(v * 100).toFixed(v < 0.1 ? 1 : 0)}%` : fmtS(v);
+
+  // legend: sqrt scale, so the midpoint label is max/4
+  const grad = `linear-gradient(90deg, ${SEQ.join(',')})`;
+  const legendMax = mode === 'row' ? '≥ row top' : `≥ ${fmtV(globalMax)}`;
+  $('heatLegend').innerHTML = `<span>0</span><span class="bar" style="background:${grad}"></span><span>${legendMax}</span>`;
+  $('heatLegend').title = 'Square-root colour scale (the middle of the bar is a quarter of the top). ' +
+    'The top is the 98th percentile of cell values; cells above it show at full colour.';
+
+  const cols = `minmax(64px, 84px) repeat(${order.length}, minmax(0, 1fr))`;
+  const cov = tm.coverage || {};
+  let html = `<div class="sc-heat-grid" style="grid-template-columns:${cols}"><div></div>`;
+  html += order.map(b => `<div class="sc-heat-colhead" title="${esc(BUCKET_HINT[b] || '')}">${esc(BUCKET_LABEL[b] || b)}
+    <small>coverage ${cov[b] == null ? 'n/a' : pct(cov[b])}</small></div>`).join('');
+  for (const r of rows) {
+    const n = r === 'all' ? tm.n_matches : (tm.matches_by_station?.[r] || 0);
+    const rmax = mode === 'row' ? `<small>top ${fmtV(rowMax[r])}</small>` : '';
+    html += `<div class="sc-heat-rowhead">${r === 'all' ? 'All stations' : `Station ${r}`}<small>${n} match${n === 1 ? '' : 'es'}</small>${rmax}</div>`;
+    for (const b of order) {
+      const bk = tm.by_station[r]?.[b], sm = bk?.summary || {}, secs = bucketSeconds(bk);
+      const cap = secs > 0
+        ? `<b>${fmtS(secs)}</b> · own half ${pct(sm.own_half_frac)} / opp ${pct(sm.opp_half_frac)}`
+        : 'no samples';
+      html += `<div class="sc-heat-cell"><canvas data-row="${r}" data-b="${b}"></canvas>
+        <div class="sc-heat-cap">${cap}</div></div>`;
+    }
+  }
+  html += '</div>';
+  html += perMatchTable(tm, order);
+  body.innerHTML = html;
+  body.querySelectorAll('canvas').forEach(cv => {
+    const r = cv.dataset.row, b = cv.dataset.b;
+    drawMini(cv, tm.by_station[r]?.[b], r, val, scaleMax(r), fmtV);
+  });
+  const layout = h.station_layout || {};
+  $('heatNote').innerHTML =
+    `Own alliance wall on the left of every map (alliance perspective, red matches ${h.frame?.symmetry === 'mirror' ? 'mirrored' : 'rotated 180°'}). Colour = time spent in each ${h.grid?.cell_m ?? 0.5} m cell, ` +
+    (mode === 'share' ? "as a share of that map's total, on one scale across maps" : mode === 'row' ? 'in seconds, scaled per row' : 'in seconds, one scale for all maps') +
+    `; square-root scale topped at the 98th percentile cell. Coverage = labelled seconds ÷ seconds the team was on the field in that shift — low coverage means a sparse map, not a parked robot. ` +
+    `Hub active/inactive comes from TBA auto fuel; ties or missing data go to "Shift unknown". ` +
+    `Station markers 1/2/3 on the wall (${['1', '2', '3'].map(s => `${s} ${layout[s] || '?'}`).join(', ')}): <b>station marker positions unverified</b>.`;
+}
+
+function perMatchTable(tm, order) {
+  if (!tm.matches || !tm.matches.length) return '';
+  const head = `<tr><th>Match</th><th>Station</th><th>Auto winner</th>${order.map(b => `<th>${esc(BUCKET_LABEL[b] || b)}</th>`).join('')}</tr>`;
+  const rows = tm.matches.map(m => `<tr><td>${esc(matchLabel(m))} ${allianceChip(m)}</td><td>${m.station ?? '—'}</td>
+    <td>${m.auto_winner ? esc(m.auto_winner) : 'tie / n/a'}</td>
+    ${order.map(b => `<td>${fmtS(m.seconds?.[b] ?? 0)}</td>`).join('')}</tr>`).join('');
+  return `<details class="sc-details"><summary>Seconds per match</summary><table class="sc-table">${head}${rows}</table></details>`;
+}
+
+function drawMini(cv, bk, row, val, max, fmtV) {
+  const field = S.field[S.year] || {};
+  const g = S.heat.grid || {};
+  const [L, W] = g.field_m || fieldDims();
+  const cssW = Math.max(120, cv.parentElement.clientWidth);
+  const mp = makeMapper(field, L, W, cssW, 0);
+  const ctx = sizeCanvas(cv, cssW, mp.cssH);
+  ctx.fillStyle = '#10141f'; ctx.fillRect(0, 0, mp.cssW, mp.cssH);
+  if (field.grey) ctx.drawImage(field.grey, 0, 0, mp.cssW, mp.cssH);
+  // halfway line
+  const [hx] = mp.to(L / 2, 0);
+  ctx.strokeStyle = 'rgba(232,234,240,0.35)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, mp.cssH); ctx.stroke(); ctx.setLineDash([]);
+  const cell = g.cell_m || 0.5;
+  const cells = bk?.cells || [];
+  for (const [ix, iy, s] of cells) {
+    const v = val(bk, s);
+    if (v <= 0) continue;
+    const t = Math.sqrt(Math.min(1, v / max));
+    const [x0, y0] = mp.to(ix * cell, Math.min(W, (iy + 1) * cell));
+    const [x1, y1] = mp.to(Math.min(L, (ix + 1) * cell), iy * cell);
+    ctx.globalAlpha = 0.6 + 0.4 * t;
+    ctx.fillStyle = seqColour(t);
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  }
+  ctx.globalAlpha = 1;
+  // own wall + station markers
+  const [wx] = mp.to(0, 0);
+  ctx.fillStyle = 'rgba(232,234,240,0.55)'; ctx.fillRect(wx, 0, 3, mp.cssH);
+  const layout = S.heat.station_layout || {};
+  const yFor = {high: W * 5 / 6, mid: W / 2, low: W / 6};
+  ctx.font = '700 9px Inter, system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const s of ['1', '2', '3']) {
+    const pos = yFor[layout[s]];
+    if (pos == null) continue;
+    const [, y] = mp.to(0, pos), on = s === row;
+    ctx.beginPath(); ctx.arc(wx + 8, y, 6.5, 0, Math.PI * 2);
+    ctx.fillStyle = on ? '#e8eaf0' : 'rgba(10,14,26,0.85)'; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = on ? '#e8eaf0' : 'rgba(232,234,240,0.6)'; ctx.stroke();
+    ctx.fillStyle = on ? '#0a0e1a' : 'rgba(232,234,240,0.85)'; ctx.fillText(s, wx + 8, y + 0.5);
+  }
+  // hover readout
+  cv.onmousemove = e => {
+    const r = cv.getBoundingClientRect();
+    const [fx, fy] = mp.from(e.clientX - r.left, e.clientY - r.top);
+    const ix = Math.floor(fx / cell), iy = Math.floor(fy / cell);
+    const hit = cells.find(c => c[0] === ix && c[1] === iy);
+    cv.title = hit
+      ? `x ${(ix * cell).toFixed(1)}–${((ix + 1) * cell).toFixed(1)} m, y ${(iy * cell).toFixed(1)}–${((iy + 1) * cell).toFixed(1)} m: ` +
+        `${fmtS(hit[2])} (${(100 * hit[2] / (bucketSeconds(bk) || 1)).toFixed(1)}% of this map)`
+      : `x ${fx.toFixed(1)} m, y ${fy.toFixed(1)} m: no time`;
+  };
+}
+
+// ------------------------------------------------------------------ resize
+let resizeTimer = null;
+new ResizeObserver(() => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { drawAuto(); if (heatTeam()) renderHeat(); }, 120);
+}).observe($('autoWrap'));
+
+init();
+</script>
+</body>
+</html>

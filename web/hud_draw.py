@@ -411,6 +411,28 @@ def draw_field_wireframe(frame, cal, fm):
     return fp
 
 
+def _hex(bgr) -> str:
+    b, g, r = (int(c) for c in bgr)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def wireframe_legend(fm) -> list:
+    """[{"label", "color" ("#rrggbb")}] for what draw_field_wireframe draws on
+    ``fm``'s field: the outline + carpet grid, then the 2026 hand-coded structures
+    or the season's AdvantageScope wireframe groups (in WIREFRAME_GROUP_COLORS
+    order, unlisted groups last in the default grey)."""
+    from web.field.season import is_2026, wireframe_for
+    out = [{"label": "carpet grid", "color": _hex(FIELD_OUTLINE_COLOR)}]
+    if is_2026(fm):
+        return out + [{"label": k, "color": _hex(c)} for k, c in STRUCTURE_COLORS_2026.items()]
+    groups = [g for g in (wireframe_for(fm) or {}) if g not in WIREFRAME_SKIP_GROUPS]
+    known = [g for g in WIREFRAME_GROUP_COLORS if g in groups]
+    rest = sorted(g for g in groups if g not in WIREFRAME_GROUP_COLORS)
+    return out + [{"label": g.replace("_", " "),
+                   "color": _hex(WIREFRAME_GROUP_COLORS.get(g, WIREFRAME_DEFAULT_COLOR))}
+                  for g in known + rest]
+
+
 def extract_view(composite_frame: np.ndarray, crop, masks=()) -> np.ndarray:
     """A camera's working frame: its crop of the composite (a copy) with the
     overlay masks blacked out (= web.field.camera_view.CameraView.extract)."""

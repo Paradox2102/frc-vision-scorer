@@ -12243,7 +12243,8 @@ _TAG_MARKER_GROUPS = {
 async def calibration_tag_map(season: Optional[str] = None, event: Optional[str] = None):
     """Top-down field tag layout for the calibration UI: tag (x,y,z) + field dims.
     ``season`` (a tag-layout stem) wins; else the ``event``'s season (its key's year
-    / override); neither -> the 2026 default. ``season_info`` describes the field."""
+    / override); neither -> the 2026 default. ``season_info`` describes the field;
+    ``wireframe_legend`` the overlay's colours on it (hud_draw.wireframe_legend)."""
     info = _event_season(event)
     if season:
         info = field_season_mod.season_for_layout(season) or info
@@ -12260,9 +12261,14 @@ async def calibration_tag_map(season: Optional[str] = None, event: Optional[str]
     tags = {str(tid): {"x": float(t["t"][0]), "y": float(t["t"][1]),
                        "z": float(t["t"][2])}
             for tid, t in fm.tags.items()}
+    try:
+        legend = hud_draw.wireframe_legend(fm)
+    except Exception:
+        legend = []
     return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m},
             "season": season, "season_info": info.public(),
-            "marker_groups": _TAG_MARKER_GROUPS.get(info.year, [])}
+            "marker_groups": _TAG_MARKER_GROUPS.get(info.year, []),
+            "wireframe_legend": legend}
 
 
 @app.get("/api/event/field-season")

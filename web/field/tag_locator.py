@@ -165,18 +165,21 @@ def _faces(cal, fm, tid) -> bool:
 
 
 def predict_tag(cal, fm, tid, image_size):
-    """(centre (2,), corners (4,2), side_px) under ``cal``, or None if the tag is behind
-    the camera, faces away, or its centre is outside the image."""
+    """(centre (2,), corners (4,2), side_px) under ``cal``, or None if the tag faces
+    away or the camera cannot see it (CameraCalibration.project_checked): a corner
+    behind / at the camera or past the lens fold radius — a wide lens maps far
+    off-axis points back INTO the image — or the centre outside the image."""
     if not _faces(cal, fm, tid):
         return None
-    c3 = fm.tag_corners_3d(tid)
-    if min(_cam_z(cal, p) for p in c3) <= 0:
+    c3 = np.asarray(fm.tag_corners_3d(tid), float).reshape(-1, 3)
+    pts = np.vstack([np.asarray(fm.tag_translation(tid), float).reshape(1, 3), c3])
+    uv, ok = cal.project_checked(pts, margin_px=None)
+    if not np.all(ok):
         return None
-    ctr = np.array(cal.field_to_image(tuple(fm.tag_translation(tid))), float)
+    ctr, pc = uv[0].astype(float), uv[1:].astype(float)
     w, h = image_size
-    if not (np.all(np.isfinite(ctr)) and 0 <= ctr[0] < w and 0 <= ctr[1] < h):
+    if not (0 <= ctr[0] < w and 0 <= ctr[1] < h):
         return None
-    pc = np.array([cal.field_to_image(tuple(p)) for p in c3], float)
     side = float(np.mean(np.linalg.norm(pc - np.roll(pc, 1, axis=0), axis=1)))
     return ctr, pc, side
 

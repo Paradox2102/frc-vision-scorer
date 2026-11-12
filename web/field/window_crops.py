@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 
 from web.bumper_register import deinterlace_crop
-from web.field.calibration import push_from_camera
+from web.field.calibration import push_from_camera, visible_point
 
 TILE_PX = 240
 # Crop side = base + gain * projected width of a 0.95 m bumper. Fitted to the
@@ -44,11 +44,13 @@ def target(cal, field_pos, ground_center_offset_m: float = 0.0) -> Optional[tupl
     try:
         offset = max(0.0, ROBOT_CENTRE_OFFSET_M - float(ground_center_offset_m or 0.0))
         xy = push_from_camera(cal, (float(field_pos[0]), float(field_pos[1])), offset)
-        u, v = cal.field_to_image((xy[0], xy[1], TARGET_Z_M))
+        # visible_point: None at / behind the camera or past the lens fold radius
+        # (a wide lens maps far off-axis points back into the image)
+        u, v = visible_point(cal, (xy[0], xy[1], TARGET_Z_M))
         spans = []
         for dx, dy in ((HALF_BUMPER_M, 0.0), (0.0, HALF_BUMPER_M)):
-            a = cal.field_to_image((xy[0] - dx, xy[1] - dy, TARGET_Z_M))
-            b = cal.field_to_image((xy[0] + dx, xy[1] + dy, TARGET_Z_M))
+            a = visible_point(cal, (xy[0] - dx, xy[1] - dy, TARGET_Z_M))
+            b = visible_point(cal, (xy[0] + dx, xy[1] + dy, TARGET_Z_M))
             spans.append(float(np.hypot(a[0] - b[0], a[1] - b[1])))
     except Exception:
         return None

@@ -174,18 +174,22 @@ def test_2025_wireframe_draws_reefs_on_a_synthetic_calibration():
 def test_wireframe_skips_floor_and_other_groups(monkeypatch):
     from web.field import season as sn
     seen = []
-    real = hud_draw._project_many
+    real = hud_draw._project_drawable
 
-    def spy(cal, pts):
-        seen.append(len(pts))
-        return real(cal, pts)
-    monkeypatch.setattr(hud_draw, "_project_many", spy)
+    def spy(cal, pts, *a):
+        seen.append(np.asarray(pts, float))
+        return real(cal, pts, *a)
+    monkeypatch.setattr(hud_draw, "_project_drawable", spy)
     groups = {"floor": np.ones((3, 6)), "other": np.ones((2, 6)),
               "reef": np.array([[4.0, 4.0, 0.0, 5.0, 4.0, 0.0]])}
     monkeypatch.setattr(sn, "wireframe_for", lambda fm: groups)
     img = np.zeros((1080, 1920, 3), np.uint8)
     hud_draw.draw_field_wireframe(img, _cam(FM25, "2025-reefscape-welded"), FM25)
-    assert len(seen) == 1          # only the reef group was projected
+    # only the reef group was projected (perimeter/grid lines sit at z = 0)
+    glb = [p for p in seen if np.allclose(p[:, 1], 4.0) and np.allclose(p[:, 2], 0.0)
+           and p[:, 0].min() >= 4.0 and p[:, 0].max() <= 5.0]
+    assert len(glb) == 1
+    assert not any(np.allclose(p, 1.0) for p in seen)        # floor / other
 
 
 def test_season_without_wireframe_draws_only_perimeter_and_grid():
@@ -201,7 +205,7 @@ def test_glb_wireframe_drops_points_behind_the_camera(monkeypatch):
     from web.field import season as sn
     cam = _cam(FM25, "2025-reefscape-welded")   # at (cx, -3, 6) looking down at +y
     front, behind = (8.77, 4.0, 0.0), (8.77, -6.0, 8.0)
-    assert list(hud_draw._in_front(cam, [front, behind])) == [True, False]
+    assert list(cam.in_view([front, behind], margin_px=None)) == [True, False]
     monkeypatch.setattr(sn, "wireframe_for", lambda fm: {
         "reef": np.array([[8.0, -6.0, 8.0, 9.5, -6.5, 8.5]])})   # wholly behind
     img = np.zeros((1080, 1920, 3), np.uint8)

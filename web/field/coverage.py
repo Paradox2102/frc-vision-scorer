@@ -16,6 +16,7 @@ from web.field.detect_bridge import (
     corner_detection_weight,
     expected_robot_pixel_width,
 )
+from web.field.calibration import visible_point
 from web.field.occlusion import occluded_by_hub
 
 
@@ -23,10 +24,12 @@ def _in_frustum(calibration, x: float, y: float) -> bool:
     """Whether field point (x, y, 0.0) projects inside the camera's image bounds.
 
     field_to_image can raise or return nonsensical values for points behind the
-    camera in pose modes (fisheye/pinhole) — that's not "in view", so treat any
-    such failure as outside the frustum rather than letting it propagate."""
+    camera in pose modes (fisheye/pinhole), and a wide lens folds points far
+    outside the view back INTO the image — none of that is "in view"
+    (visible_point), so treat any such failure as outside the frustum rather than
+    letting it propagate."""
     try:
-        uv = calibration.field_to_image((x, y, 0.0))
+        uv = visible_point(calibration, (x, y, 0.0))
     except Exception:
         return False
     if uv is None:

@@ -166,11 +166,13 @@ def draw_projected_robot_plane(img: np.ndarray, cal, field_pos, vel, color,
                 cv2.polylines(img, [poly], True, color, 2)
 
         speed = float(np.hypot(vx, vy))
-        center = cal.field_to_image((x, y, 0.0))
+        wh = (img.shape[1], img.shape[0])
+        center = _drawable_point(cal, (x, y, 0.0), wh)
         if flags.velocity_arrow and speed >= 0.15 and center is not None:
             n = max(speed, 1e-6)
             arrow_len = min(1.0, 0.35 + speed * 0.20)
-            tip = cal.field_to_image((x + arrow_len * vx / n, y + arrow_len * vy / n, 0.0))
+            tip = _drawable_point(cal, (x + arrow_len * vx / n, y + arrow_len * vy / n, 0.0),
+                                  wh)
             if tip is None:
                 return
             cv2.arrowedLine(img, (int(center[0]), int(center[1])),
@@ -248,6 +250,16 @@ WIREFRAME_GROUP_COLORS = {
     "tape": (255, 255, 255),
 }
 WIREFRAME_DEFAULT_COLOR = (160, 160, 160)
+# BGR colours of the field outline / 2 m carpet grid (every season) and the 2026
+# hand-coded structures.
+FIELD_OUTLINE_COLOR = (0, 255, 0)
+FIELD_GRID_COLOR = (0, 180, 0)
+STRUCTURE_COLORS_2026 = {
+    "hubs": (255, 220, 0),
+    "bumps": (0, 140, 255),
+    "towers": (255, 0, 255),
+    "trenches": (180, 80, 255),
+}
 WIREFRAME_SKIP_GROUPS = frozenset({"floor", "other"})
 _WIRE_SAMPLE_M = 0.25        # sample spacing along a GLB edge (lens distortion)
 _WIRE_MAX_SAMPLES = 24
@@ -271,23 +283,63 @@ def _project_many(cal, pts) -> np.ndarray:
     return img.reshape(-1, 2)
 
 
-def _in_front(cal, pts, min_z: float = 0.05) -> np.ndarray:
-    """(N,) bool: the point is in front of the camera. projectPoints mirrors points
-    behind it onto the image, which streaks structures a close corner camera sits
-    beside across the frame. Pose-free (homography) calibrations: all True."""
+_DRAW_GUARD_PX = 10000      # keep int32 polyline coords sane off-screen
+
+
+def _project_drawable(cal, pts, frame_wh=None):
+    """((N, 2) pixels, (N,) bool drawable) for field points. Drawable = visible to
+    the camera with the frame test off (cal.project_checked(margin_px=None): in
+    front of the near limit and inside the lens's fold radius — past it a point far
+    outside the view folds back into the image and streaks lines through it), finite,
+    and within _DRAW_GUARD_PX of the frame so the int32 polyline can't overflow.
+    A duck-typed calibration without project_checked is projected point by point
+    (finite + guard only). ``frame_wh``: the canvas the guard is measured from
+    (default cal.image_size)."""
     pts = np.asarray(pts, np.float64).reshape(-1, 3)
-    if cal.mode == "homography" or cal.rvec is None or cal.tvec is None:
-        return np.ones(len(pts), bool)
-    R, _ = cv2.Rodrigues(np.asarray(cal.rvec, float))
-    z = pts @ R[2] + float(np.asarray(cal.tvec, float).reshape(3)[2])
-    return z > min_z
+    if len(pts) == 0:
+        return np.zeros((0, 2)), np.zeros(0, bool)
+    if hasattr(cal, "project_checked"):
+        uv, ok = cal.project_checked(pts, margin_px=None)
+    else:
+        uv = np.array([cal.field_to_image(tuple(p)) for p in pts], np.float64).reshape(-1, 2)
+        ok = np.all(np.isfinite(uv), axis=1)
+    w, h = frame_wh or getattr(cal, "image_size", None) or (0, 0)
+    g = _DRAW_GUARD_PX
+    with np.errstate(invalid="ignore"):
+        ok = ok & ((uv[:, 0] >= -g) & (uv[:, 0] <= w + g)
+                   & (uv[:, 1] >= -g) & (uv[:, 1] <= h + g))
+    return uv, ok
+
+
+def _drawable_point(cal, p, frame_wh=None):
+    """(u, v) for one field point, or None when it is not drawable (_project_drawable)."""
+    uv, ok = _project_drawable(cal, [p], frame_wh)
+    return (float(uv[0, 0]), float(uv[0, 1])) if ok[0] else None
+
+
+def _runs(uv, ok, bounds):
+    """Polylines (int32 (k, 2)) of consecutive drawable samples: each [a, b) in
+    ``bounds`` is one sampled edge, broken wherever a sample is not drawable."""
+    polys = []
+    for a, b in bounds:
+        run = []
+        for j in range(a, b):
+            if ok[j]:
+                run.append((int(uv[j, 0]), int(uv[j, 1])))
+            else:
+                if len(run) >= 2:
+                    polys.append(np.array(run, np.int32))
+                run = []
+        if len(run) >= 2:
+            polys.append(np.array(run, np.int32))
+    return polys
 
 
 def _draw_glb_wireframe(frame, cal, groups) -> None:
     """Draw AdvantageScope wireframe groups ({name: (N, 6) segments}) as sampled
-    polylines, broken wherever a sample is non-finite or projects more than 10000 px
-    off-screen (the same rule as draw_field_wireframe's seg3), or lies behind the
-    camera."""
+    polylines, broken wherever a sample is not drawable (_project_drawable: behind /
+    at the camera, past the lens fold radius, non-finite, or far off-screen) — the
+    same rule as draw_field_wireframe's seg3."""
     H, Wd = frame.shape[:2]
     for name, segs in groups.items():
         if name in WIREFRAME_SKIP_GROUPS or segs is None or len(segs) == 0:
@@ -299,24 +351,9 @@ def _draw_glb_wireframe(frame, cal, groups) -> None:
                     1, _WIRE_MAX_SAMPLES).astype(int)
         P = np.vstack([a[i] + (b[i] - a[i]) * np.linspace(0.0, 1.0, k + 1)[:, None]
                        for i, k in enumerate(n)])
-        uv = _project_many(cal, P)
-        good = (np.all(np.isfinite(uv), axis=1) & _in_front(cal, P)
-                & (uv[:, 0] >= -10000) & (uv[:, 0] <= Wd + 10000)
-                & (uv[:, 1] >= -10000) & (uv[:, 1] <= H + 10000))
-        polys = []
-        start = 0
-        for k in n:
-            run = []
-            for j in range(start, start + k + 1):
-                if good[j]:
-                    run.append((int(uv[j, 0]), int(uv[j, 1])))
-                else:
-                    if len(run) >= 2:
-                        polys.append(np.array(run, np.int32))
-                    run = []
-            if len(run) >= 2:
-                polys.append(np.array(run, np.int32))
-            start += k + 1
+        uv, good = _project_drawable(cal, P, (Wd, H))
+        ends = np.cumsum(n + 1)
+        polys = _runs(uv, good, zip(ends - (n + 1), ends))
         if polys:
             cv2.polylines(frame, polys, False, color, 1)
 
@@ -336,55 +373,41 @@ def draw_field_wireframe(frame, cal, fm):
     def fp(x, y):
         u, v = cal.field_to_image((x, y, 0.0))
         return (int(u), int(v))
-    def _ok(u, v):
-        # A poorly-conditioned calibration can project ground points to enormous
-        # (or non-finite) pixel coords — points near/behind the camera blow up.
-        # Keep only finite coords within a generous off-screen margin so the int32
-        # polyline conversion can't overflow (and we don't draw garbage segments).
-        return (np.isfinite(u) and np.isfinite(v)
-                and -10000 <= u <= Wd + 10000 and -10000 <= v <= H + 10000)
     def seg3(p0, p1, color, thick, n=24):
-        x0, y0, z0 = p0
-        x1, y1, z1 = p1
-        run = []
-        def flush():
-            if len(run) >= 2:
-                cv2.polylines(frame, [np.array(run, np.int32)], False, color, thick)
-            run.clear()
-        for t in range(n + 1):
-            u, v = cal.field_to_image((x0 + (x1 - x0) * t / n,
-                                       y0 + (y1 - y0) * t / n,
-                                       z0 + (z1 - z0) * t / n))
-            if _ok(u, v):
-                run.append((int(u), int(v)))
-            else:
-                flush()   # break the polyline across the blown-up region
-        flush()
+        # Sampled polyline, broken at samples that are not drawable: behind or at
+        # the camera, past the lens fold radius (a wide lens maps far off-axis
+        # points back into the image), non-finite, or blown far off-screen.
+        a, b = np.asarray(p0, np.float64), np.asarray(p1, np.float64)
+        t = np.arange(n + 1, dtype=np.float64)[:, None]
+        uv, ok = _project_drawable(cal, a + (b - a) * t / n, (Wd, H))
+        for run in _runs(uv, ok, [(0, n + 1)]):
+            cv2.polylines(frame, [run], False, color, thick)
     def seg(p0, p1, color, thick, n=24):
         seg3((p0[0], p0[1], 0.0), (p1[0], p1[1], 0.0),
              color, thick, n)
     for a, b in [((0, 0), (L, 0)), ((L, 0), (L, W)), ((L, W), (0, W)), ((0, W), (0, 0))]:
-        seg(a, b, (0, 255, 0), 2)
+        seg(a, b, FIELD_OUTLINE_COLOR, 2)
     x = 0.0
     while x <= L + 1e-6:
-        seg((x, 0), (x, W), (0, 180, 0), 1); x += 2.0
+        seg((x, 0), (x, W), FIELD_GRID_COLOR, 1); x += 2.0
     y = 0.0
     while y <= W + 1e-6:
-        seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
+        seg((0, y), (L, y), FIELD_GRID_COLOR, 1); y += 2.0
     if not is_2026(fm):
         groups = wireframe_for(fm)
         if groups:
             _draw_glb_wireframe(frame, cal, groups)
         return fp
     prisms = hub_prisms(fm)
+    sc = STRUCTURE_COLORS_2026
     for a, b in hub_wireframe_edges(prisms):
-        seg3(a, b, (255, 220, 0), 2, n=12)
+        seg3(a, b, sc["hubs"], 2, n=12)
     for a, b in bump_wireframe_edges(prisms, W):
-        seg3(a, b, (0, 140, 255), 2, n=8)
+        seg3(a, b, sc["bumps"], 2, n=8)
     for a, b in tower_wireframe_edges(fm):
-        seg3(a, b, (255, 0, 255), 2, n=8)
+        seg3(a, b, sc["towers"], 2, n=8)
     for a, b in trench_wireframe_edges(fm):
-        seg3(a, b, (180, 80, 255), 2, n=8)
+        seg3(a, b, sc["trenches"], 2, n=8)
     return fp
 
 

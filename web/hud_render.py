@@ -190,15 +190,18 @@ def backfill_box(cal, field_pos, gco: float) -> Optional[list]:
     volume centred on push_from_camera(cal, field_pos, 0.475 - gco), as
     window_crops.target centres its crops. None when any corner does not
     project to a finite point."""
-    from web.field.calibration import push_from_camera
+    from web.field.calibration import push_from_camera, visible_point
     try:
         offset = max(0.0, ROBOT_CENTRE_OFFSET_M - float(gco or 0.0))
         cx, cy = push_from_camera(cal, (float(field_pos[0]), float(field_pos[1])), offset)
-        pts = [cal.field_to_image((cx + dx, cy + dy, z))
+        # visible_point: None at / behind the camera or past the lens fold radius
+        pts = [visible_point(cal, (cx + dx, cy + dy, z))
                for dx in (-ROBOT_HALF_M, ROBOT_HALF_M)
                for dy in (-ROBOT_HALF_M, ROBOT_HALF_M)
                for z in (0.0, ROBOT_HEIGHT_M)]
     except Exception:
+        return None
+    if any(p is None for p in pts):
         return None
     a = np.asarray(pts, float)
     if a.shape != (8, 2) or not np.all(np.isfinite(a)):

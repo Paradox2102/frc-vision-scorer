@@ -212,6 +212,34 @@ def test_deinterlace_option_reaches_the_stage(store):
     assert "tiles_deinterlaced" not in off["stats"]
 
 
+def test_fill_option_reaches_the_stage_and_defaults_to_the_knob(store, monkeypatch):
+    from web.job_config import KNOBS
+    assert rr.Options().fill is next(k for k in KNOBS if k.name == "window_labels_fill").default
+    frames = _lineup_frames()
+    on = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(reader="jev"),
+             store)
+    assert "fill_frames" in on["stats"]
+    assert on["relabelled"]["summary"]["window_labels"]["fill_frames"] == on["stats"]["fill_frames"]
+    off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
+              rr.Options(reader="jev", fill=False), store)
+    assert "fill_frames" not in off["stats"]
+    seen = {}
+    monkeypatch.setattr(rr, "load_inputs", lambda *a: (_ for _ in ()).throw(SystemExit("stop")))
+    real = rr.argparse.ArgumentParser.parse_args
+
+    def spy(self, argv=None, namespace=None):
+        args = real(self, argv, namespace)
+        seen["fill"] = args.fill
+        return args
+
+    monkeypatch.setattr(rr.argparse.ArgumentParser, "parse_args", spy)
+    for argv, want in ((["--replay", "x"], True), (["--replay", "x", "--no-fill"], False),
+                       (["--replay", "x", "--fill"], True)):
+        with pytest.raises(SystemExit):
+            rr.main(argv)
+        assert seen["fill"] is want
+
+
 def test_reader_option_reaches_the_stage(store):
     from tests.field.test_window_labels_student import FakeStudent
     frames = _lineup_frames()

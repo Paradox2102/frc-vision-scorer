@@ -200,7 +200,7 @@ def relabel_match(item: dict, args, out_dir) -> dict:
                           store_write=args.store_write,
                           digit_cache=str(Path(args.digit_cache_dir) / f"{row['id']}.json"),
                           use_elimination=not args.no_elim, alliance_rows=args.alliance_rows,
-                          reader=args.reader)
+                          reader=args.reader, fill=not args.no_fill)
         out = rr.relabel_one(row, meta, item["video"], chosen["calibration"], red, blue, opts,
                              session, fps=fps,
                              view=load_layout(event_key=mk.split("_")[0])["main"].crop)
@@ -249,6 +249,9 @@ def main(argv=None) -> None:
                     help="own anchors only: today's stage (evaluation arm 1)")
     ap.add_argument("--reader", choices=("jev", "student", "student_only"), default="student_only",
                     help="digit reader (the window_labels_reader knob; default = the live default)")
+    ap.add_argument("--no-fill", action="store_true",
+                    help="leave unread windows unlabelled (window_labels_fill off; the live "
+                         "default fills them)")
     ap.add_argument("--lineup-min-p", type=float, default=0.8,
                     help="lineup acceptance floor; above 1 disables the lineup pass")
     ap.add_argument("--workers", type=int, default=4, help="parallel matches in full mode")

@@ -168,7 +168,7 @@ RED, BLUE = ["2637", "2724", "6497"], ["3128", "6773", "9066"]
 def _args(tmp_path, **kw):
     d = dict(lineup_min_p=0.8, no_event_lineup=False, namespace="eval-x", mode="incremental",
              store_write=True, digit_cache_dir=str(tmp_path / "dc"), no_elim=False,
-             alliance_rows=False, score=False, reader="jev")
+             alliance_rows=False, score=False, reader="jev", no_fill=False)
     d.update(kw)
     return argparse.Namespace(**d)
 

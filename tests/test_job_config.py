@@ -654,6 +654,18 @@ def test_window_labels_deinterlace_knob_default_on(monkeypatch):
     assert JobConfig().window_labels_deinterlace is False
 
 
+def test_window_labels_fill_knob_default_on(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.window_labels_fill is True
+    assert "window_labels_fill" not in cfg.non_defaults()
+    assert JobConfig({"window_labels_fill": "false"}).window_labels_fill is False
+    assert next(k for k in KNOBS if k.name == "window_labels_fill").section == "Identity & votes"
+    monkeypatch.setenv("WINDOW_LABELS_FILL", "0")
+    assert JobConfig().window_labels_fill is False
+
+
 def test_window_labels_reader_knob_default_student_only(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

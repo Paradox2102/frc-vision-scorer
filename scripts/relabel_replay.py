@@ -20,6 +20,9 @@ Usage
         --namespace eval-full --digit-cache data/eval/event_lineup/digit_cache/a0bbc991.json
     .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --deinterlace \
         --reader student      # S1 student first, Jev only where S1 is undecided (GPU)
+    .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --no-fill
+
+--fill / --no-fill: the window_labels_fill knob (default on, like live).
 
 Per-replay inputs come from the replay (event-lineup spec section 5b):
 ground_center_offset_m from summary.config (0.0 when the replay records no
@@ -210,6 +213,7 @@ class Options:
     alliance_rows: bool = False
     deinterlace: bool = False                       # window_labels_deinterlace
     reader: str = "student_only"                    # window_labels_reader (live default)
+    fill: bool = True                               # window_labels_fill (live default)
 
 
 def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: Options,
@@ -245,7 +249,8 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
         event_lineup=opts.event_lineup, borrowed=borrowed,
         this_colors={**{t: "red" for t in red}, **{t: "blue" for t in blue}},
         use_elimination=opts.use_elimination, rows_alliance_only=opts.alliance_rows,
-        digit_calls=cache, deinterlace=opts.deinterlace, reader=opts.reader)
+        digit_calls=cache, deinterlace=opts.deinterlace, reader=opts.reader,
+        fill_runs=opts.fill)
     result = wl.run_window_labels(meta["frames"], str(video), cal, session, params,
                                   frame_source=frame_source, student=student)
     out = {"result": result, "relabelled": None, "stats": dict(result["stats"]),
@@ -347,6 +352,11 @@ def main(argv=None) -> None:
                     help="digit reader (the window_labels_reader knob): jev, student (S1 first, "
                          "Jev only for windows S1 leaves undecided) or student_only (no Jev "
                          "digit calls; the live default); the lineup pass is Jev in every mode")
+    ap.add_argument("--fill", dest="fill", action="store_true", default=True,
+                    help="fill unread windows along track chains (the window_labels_fill "
+                         "knob; on by default, like live)")
+    ap.add_argument("--no-fill", dest="fill", action="store_false",
+                    help="leave unread windows unlabelled (window_labels_fill off)")
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")
@@ -372,7 +382,7 @@ def main(argv=None) -> None:
                    before_match=args.before_match, store_write=args.store_write,
                    digit_cache=args.digit_cache, use_elimination=not args.no_elim,
                    alliance_rows=args.alliance_rows, deinterlace=args.deinterlace,
-                   reader=args.reader)
+                   reader=args.reader, fill=args.fill)
     print(f"replay {row['id'][:8]}  {row['match_key']}  video {video.name}")
     t0 = time.time()
     out = relabel_one(row, meta, video, cal, red, blue, opts, session, fps=fps,

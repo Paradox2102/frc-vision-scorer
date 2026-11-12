@@ -7307,6 +7307,7 @@ class InferenceJob:
                 ground_center_offset_m=float(getattr(cfg, "ground_center_offset_m", 0.0) or 0.0),
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
                 deinterlace=bool(getattr(cfg, "window_labels_deinterlace", False)),
+                fill_runs=bool(getattr(cfg, "window_labels_fill", False)),
                 reader=str(getattr(cfg, "window_labels_reader", "jev") or "jev"),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
@@ -7376,7 +7377,7 @@ class InferenceJob:
         stats["seconds"] = round(time.perf_counter() - t0, 2)
         summary["window_labels"] = stats
         for k in ("requests", "input_tokens", "cost_cents", "seconds", "digit_named",
-                  "lineup_named", "unlabelled"):
+                  "lineup_named", "unlabelled", "fill_frames", "fill_windows"):
             if isinstance(stats.get(k), (int, float)):
                 timings[f"window_labels.{k}"] = stats[k]
         for k in ("windows_s1", "windows_jev", "jev_digit_calls", "bumper_found", "samples"):
@@ -7391,6 +7392,10 @@ class InferenceJob:
                   f"digits, {stats.get('lineup_named')} by lineup, {stats.get('unlabelled')} "
                   f"unlabelled; {stats.get('requests')} requests, ~{stats.get('cost_cents')}c, "
                   f"{stats['seconds']}s")
+            if "fill_frames" in stats:
+                print(f"[window-labels] fill: {stats['fill_frames']} slot-frames in "
+                      f"{stats.get('fill_windows')} unread windows "
+                      f"({stats.get('fill_chains_bridged')} runs bridged)")
             st = stats.get("student")
             if st:
                 print(f"[window-labels] reader {st.get('reader')}: S1 named {st.get('windows_s1')} "

@@ -765,6 +765,21 @@ KNOBS = [
     # only acts when window_labels is on. WINDOW_LABELS_DEINTERLACE=0 to disable.
     Knob("window_labels_deinterlace", "WINDOW_LABELS_DEINTERLACE", bool, True,
          section="Identity & votes"),
+    # Window-label run fill (window_labels.fill_runs): a named window's team
+    # spreads over the unread windows of the same track chain (one slot's
+    # runs, joined across gaps <= 2 s when the slot reappears within
+    # 1 m + 3 m/s * gap), between agreeing reads and out to the chain's ends,
+    # stopping at a conflicting single-sample read or where another track
+    # starts / ends within 3 m (where the tracker swaps robots). Fills are
+    # unconfirmed (HUD "1234?", segment source window_fill) and never become
+    # lineup / event anchors; one team per frame still holds. Offline, qm8
+    # hand GT + Jev audit on 6 held-out matches: plain whole-run fill 85%
+    # precise, this guarded rule ~98%, about +4-6 points of correctly
+    # labelled robot time. DEFAULT ON (Nov 11, user request: a robot named at
+    # t=15 is named back to t=0). Needs window_labels. WINDOW_LABELS_FILL=0
+    # to disable.
+    Knob("window_labels_fill", "WINDOW_LABELS_FILL", bool, True,
+         section="Identity & votes"),
     # Window-label digit reader (teacher-distillation spec section 14): "jev"
     # sends every digit request to Jev (unchanged); "student" reads every
     # window sample first with the local S1 student (bumper detector box near

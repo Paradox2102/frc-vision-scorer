@@ -382,6 +382,10 @@ PROFILES = {
                    ("wl_08_s1", {"window_labels": True, "window_labels_reader": "student"}),
                    ("wl_08_s1only", {"window_labels": True,
                                      "window_labels_reader": "student_only"})],
+    # Window-label run fill (window_labels_fill, default ON): unread windows
+    # of a track chain take the chain's named team vs stay unlabelled.
+    "wl-fill": [("wl_nofill", {"window_labels": True, "window_labels_fill": False}),
+                ("wl_fill", {"window_labels": True, "window_labels_fill": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

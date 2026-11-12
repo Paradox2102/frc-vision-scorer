@@ -134,6 +134,25 @@ def test_the_deinterlace_knob_reaches_the_stage_params(monkeypatch):
     assert seen["params"].deinterlace is True
 
 
+def test_the_fill_knob_reaches_the_stage_params_and_its_stats_reach_timings(monkeypatch):
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    _, timings = _apply(job, rec)
+    assert seen["params"].fill_runs is False                  # knob absent: off
+    assert "window_labels.fill_frames" not in timings
+    res = _ok_result()
+    res["stats"] = {**res["stats"], "fill_frames": 40, "fill_windows": 2,
+                    "fill_chains_bridged": 1}
+    seen = _stub(monkeypatch, res)
+    job, rec = _job()
+    job.config.window_labels_fill = True
+    summary, timings = _apply(job, rec)
+    assert seen["params"].fill_runs is True
+    assert summary["window_labels"]["fill_chains_bridged"] == 1
+    assert timings["window_labels.fill_frames"] == 40
+    assert timings["window_labels.fill_windows"] == 2
+
+
 def test_the_reader_knob_reaches_the_stage_params_and_its_stats_reach_timings(monkeypatch):
     seen = _stub(monkeypatch, _ok_result())
     job, rec = _job()

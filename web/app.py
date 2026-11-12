@@ -124,6 +124,7 @@ from web.field.detection_archive import DetectionArchive
 from web.field.hardneg_miner import mine_hard_negatives
 from web.field.number_lock import ConsecutiveValueTracker
 from web.field.radar import Radar, RadarTrack
+from web.field import field2d as field2d_mod
 from web.field.manta import overlay_paths_for_job
 from web.field.appearance_gallery import AppearanceGallery, classify_match
 from web.field.camera_view import load_views
@@ -12713,10 +12714,24 @@ async def calibration_tag_map(season: Optional[str] = None, event: Optional[str]
         legend = hud_draw.wireframe_legend(fm)
     except Exception:
         legend = []
+    f2d = field2d_mod.field2d_for_layout(season)
+    if f2d:
+        f2d["url"] = f"/api/field2d/{f2d['name']}.jpg"
+        f2d.pop("image_path", None)
     return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m},
             "season": season, "season_info": info.public(),
             "marker_groups": _TAG_MARKER_GROUPS.get(info.year, []),
-            "wireframe_legend": legend}
+            "wireframe_legend": legend, "field2d": f2d}
+
+
+@app.get("/api/field2d/{name}.jpg")
+async def field2d_image(name: str):
+    """An AdvantageScope top-down field drawing (data/field/advantagescope)."""
+    if name not in field2d_mod.field2d_names():
+        return JSONResponse(status_code=404, content={"error": f"no field drawing '{name}'"})
+    return FileResponse(str(field2d_mod.FIELD2D_DIR / f"{name}.jpg"),
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/api/event/field-season")

@@ -76,8 +76,10 @@ def test_2025_structure_footprints_and_radar():
     assert set(fp) == {"reefs"} and len(fp["reefs"]) == 2
     assert all(len(poly) == 6 for poly in fp["reefs"])
     r = Radar(FM25.length_m, FM25.width_m, field_model=FM25)
+    assert r.field_image == "2025_field2d"        # the map is the 2025 drawing
     px, py = (int(v) for v in r.field_to_pixel((4.489 + 0.6, 4.026)))
-    assert tuple(r._base[py, px]) != tuple(r._base[5, r.w // 4])   # reef fill drawn
+    cx, cy = (int(v) for v in r.field_to_pixel((2.0, 1.0)))  # open carpet
+    assert abs(int(r._base[py, px].sum()) - int(r._base[cy, cx].sum())) > 60  # reef shown
 
 
 def test_reef_occludes_a_robot_behind_it_from_a_low_camera():

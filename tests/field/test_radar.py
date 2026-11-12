@@ -1,4 +1,9 @@
-"""Field map v2: exact structure footprints + track-state rendering."""
+"""Field map v2: AdvantageScope drawing base (structure-footprint fallback) +
+track-state rendering."""
+import dataclasses
+import json
+from pathlib import Path
+
 import numpy as np
 
 from web.field.field_model import FieldModel
@@ -63,8 +68,12 @@ def test_render_accepts_rich_tracks_and_draws_field():
 
 
 def test_render_draws_structures_at_exact_positions():
-    fm = _fm()
+    # Fallback path: a season with no AdvantageScope drawing -> plain carpet +
+    # CAD structure footprints, no margin offset.
+    fm = dataclasses.replace(_fm(), season="")
     r = Radar(fm.length_m, fm.width_m, field_model=fm)
+    assert r.field_image is None and (r.ox, r.oy) == (0, 0)
+    assert (r.w, r.h) == (round(fm.length_m * r.s), round(fm.width_m * r.s))
     img = r.render([])
     fp = structure_footprints(fm, hub_prisms(fm))
     # The hub footprint edge must be inked (different from carpet background).
@@ -218,3 +227,104 @@ def test_reference_path_is_semi_transparent():
     expected_half = 0.5 * base[peak] + 0.5 * full
     assert np.abs(img[peak] - expected_half).max() <= 12
     assert np.abs(img[peak] - full).max() > 40    # and not fully opaque
+
+
+# --- AdvantageScope 2D drawing as the map base ---
+FIELD2D = Path(__file__).resolve().parents[2] / "data" / "field" / "advantagescope"
+
+
+def _cfg(name):
+    return json.loads((FIELD2D / f"{name}.json").read_text())
+
+
+def test_2026_base_is_the_advantagescope_drawing_with_margin():
+    fm = _fm()
+    r = Radar(fm.length_m, fm.width_m, field_model=fm)
+    assert r.field_image == "2026_field2d"
+    assert r._base.shape == (r.h, r.w, 3)
+    # Margin (~0.45 m) on every side around the L x W field rect.
+    assert r.w > round(fm.length_m * r.s) + 40 and r.h > round(fm.width_m * r.s) + 40
+    assert r.ox > 15 and r.oy > 15
+    assert r.w - (r.ox + fm.length_m * r.s) > 15 and r.h - (r.oy + fm.width_m * r.s) > 15
+    # Not the flat 235 carpet: a dark drawing with detail.
+    assert r._base.std() > 10
+    assert abs(float(r._base.mean()) - 235) > 60
+
+
+def _expected_canvas_px(r, name, x, y, fm):
+    """Where field (x, y) sits on the canvas, computed straight from the JSON: the
+    drawing's field rect is resized (crop of tl/br +- 0.45 m) to the canvas."""
+    c = _cfg(name)
+    (tlx, tly), (brx, bry) = c["field_top_left_px"], c["field_bottom_right_px"]
+    iw, ih = c["image_size"]
+    kx, ky = (brx - tlx) / fm.length_m, (bry - tly) / fm.width_m
+    x0 = max(0, int(np.floor(tlx - 0.45 * kx)))
+    y0 = max(0, int(np.floor(tly - 0.45 * ky)))
+    x1 = min(iw, int(np.ceil(brx + 0.45 * kx)))
+    y1 = min(ih, int(np.ceil(bry + 0.45 * ky)))
+    ix, iy = tlx + x * kx, tly + (fm.width_m - y) * ky      # image px of (x, y)
+    return ((ix - x0) * r.w / (x1 - x0), (iy - y0) * r.h / (y1 - y0))
+
+
+def test_field_to_pixel_lands_on_the_drawings_field_corners():
+    for stem, name in (("2026-rebuilt-welded", "2026_field2d"),
+                       ("2025-reefscape-welded", "2025_field2d")):
+        fm = FieldModel.load(stem)
+        r = Radar(fm.length_m, fm.width_m, field_model=fm)
+        for x, y in ((0.0, 0.0), (fm.length_m, fm.width_m), (fm.length_m, 0.0)):
+            got = r.field_to_pixel((x, y))
+            want = _expected_canvas_px(r, name, x, y, fm)
+            assert abs(got[0] - want[0]) <= 2 and abs(got[1] - want[1]) <= 2, (stem, x, y)
+
+
+def test_field_rect_corner_is_where_the_carpet_starts():
+    # Independent visual check on the 2026 drawing: the JSON field rect is the inner
+    # edge of the light border rail, so walking inward from the margin the
+    # bright-rail -> dark-carpet step lands on field_to_pixel's edge.
+    fm = _fm()
+    r = Radar(fm.length_m, fm.width_m, field_model=fm)
+    base = r._base.astype(int).sum(axis=2)
+
+    def rail_end(profile):
+        peak = int(np.argmax(profile[:60]))
+        mid = (profile[peak] + profile[peak + 15]) / 2
+        return peak + int(np.argmax(profile[peak:] < mid))
+
+    u, v = r.field_to_pixel((fm.length_m / 4, fm.width_m))    # top wall
+    assert abs(rail_end(base[:, int(u)]) - v) <= 2
+    u, v = r.field_to_pixel((0.0, fm.width_m / 3))            # blue wall
+    assert abs(rail_end(base[int(v), :]) - u) <= 2
+
+
+def test_2025_variants_resolve_to_their_own_drawings():
+    from web.field.field2d import field2d_for_layout
+    assert field2d_for_layout("2025-reefscape-welded")["name"] == "2025_field2d"
+    assert field2d_for_layout("2025-reefscape-andymark")["name"] == "2025_andymark_field2d"
+    assert field2d_for_layout("2026-rebuilt-welded")["name"] == "2026_field2d"
+    assert field2d_for_layout("2024-crescendo")["name"] == "2024_field2d"
+    assert field2d_for_layout("") is None and field2d_for_layout("2031-future") is None
+    fm = FieldModel.load("2025-reefscape-andymark")
+    assert Radar(fm.length_m, fm.width_m, field_model=fm).field_image == "2025_andymark_field2d"
+    m = field2d_for_layout("2025-reefscape-welded")
+    assert m["field_m"] == [_cfg("2025_field2d")["field_length_m"],
+                            _cfg("2025_field2d")["field_width_m"]]
+
+
+def test_track_dot_draws_on_the_drawing():
+    for stem in ("2026-rebuilt-welded", "2025-reefscape-welded"):
+        fm = FieldModel.load(stem)
+        r = Radar(fm.length_m, fm.width_m, field_model=fm)
+        empty = r.render([])
+        for t in (_track(pos=(4.0, 2.0)),
+                  _track(pos=(12.0, 6.0), alliance="red", state="coasting",
+                         corner_only=True)):
+            img = r.render([t])
+            u, v = (int(c) for c in r.field_to_pixel(t.pos))
+            assert np.abs(img[v - 6:v + 7, u - 6:u + 7].astype(int)
+                          - empty[v - 6:v + 7, u - 6:u + 7].astype(int)).max() > 60
+
+
+def test_no_model_keeps_the_plain_map():
+    r = Radar(16.541, 8.069)
+    assert r.field_image is None and r.field_to_pixel((0.0, 8.069)) == (0.0, 0.0)
+    assert (r._base[r.h // 4, r.w // 4] == 235).all()

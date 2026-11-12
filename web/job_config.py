@@ -907,8 +907,12 @@ KNOBS = [
     # identities keep per-camera EMA/anchor/exemplars and only same-camera
     # embeddings are compared (max over shared cameras); no shared camera =
     # neutral appearance (no veto, no bonus). Also applies to the appearance
-    # divergence read trigger. DEFAULT OFF pending a live A/B.
-    Knob("identity_per_cam_appearance", "IDENTITY_PER_CAM_APPEARANCE", bool, False,
+    # divergence read trigger. DEFAULT ON (Nov 12, Nick: "if it helps, flip
+    # it"). Live A/B, corners in: 2025hop births qm2 121->83, qm3 132->107,
+    # qm4 155->102 (appearance vetoes halved), wrong-alliance labels 12->7,
+    # 40->25, 124->128; 2026cur qm8 GT right 60->58%, wrong 1->1%, misID
+    # 8.5->6.2 s. Cost: named time / right% 0-2 pts lower on every match.
+    Knob("identity_per_cam_appearance", "IDENTITY_PER_CAM_APPEARANCE", bool, True,
          section="Identity & votes"),
     # --- cross-camera fusion ---
     # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,

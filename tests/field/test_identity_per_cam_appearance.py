@@ -1,4 +1,4 @@
-"""Per-camera appearance (knob identity_per_cam_appearance, default OFF).
+"""Per-camera appearance (knob identity_per_cam_appearance, default ON since Nov 12).
 
 2025hop qm2, S4 cosines on the same slot: main-vs-main (<=2 s) median 0.93,
 corner-vs-corner median 0.92, but main-vs-corner SAME frame median 0.62 (42%

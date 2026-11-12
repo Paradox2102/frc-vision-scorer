@@ -81,19 +81,33 @@ def candidate_replays(conn, event_key: str) -> dict:
     return out
 
 
+def _is_full_match(meta: dict) -> bool:
+    """A replay that processed teleop (not an auto-only ground-truth / A/B run)."""
+    summary = meta.get("summary") or {}
+    if (summary.get("config") or {}).get("auto_period_only"):
+        return False
+    return any(p.get("label") == "teleop" for p in summary.get("periods") or [])
+
+
 def pick_replay(rows: list) -> tuple:
-    """(row, meta, legacy) for the best replay of one match, or (None, None, None)."""
-    fallback = None
+    """(row, meta, legacy) for the best replay of one match, or (None, None, None).
+
+    Rank, newest first within a rank: full match with window labels > full
+    match (legacy labels) > auto-only with window labels > auto-only. Stops
+    reading meta.json at the first top-rank hit (rows are newest first)."""
+    best, best_rank = None, -1
     for row in rows:
         path = _meta_path(row)
         meta = _read_meta(path) if path else None
         if not meta:
             continue
-        if (meta.get("summary") or {}).get("window_labels"):
-            return row, meta, False
-        if fallback is None:
-            fallback = (row, meta, True)
-    return fallback or (None, None, None)
+        wl = bool((meta.get("summary") or {}).get("window_labels"))
+        rank = 2 * _is_full_match(meta) + wl
+        if rank > best_rank:
+            best, best_rank = (row, meta, not wl), rank
+            if rank == 3:
+                break
+    return best or (None, None, None)
 
 
 def match_lineup(conn, match_key: str) -> dict:

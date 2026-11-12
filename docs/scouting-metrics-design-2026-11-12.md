@@ -160,9 +160,13 @@ available on each sample.
   `sources[].skipped`.
 - A metric never invents data. Low coverage and identity conflicts are
   surfaced as fields, not filtered silently.
-- Replay choice: the newest `complete` replay whose summary has
-  `window_labels` (current identity method). If none has it, the newest
-  `complete` replay is used and flagged `legacy_labels: true`.
+- Replay choice, newest first within each rank: (1) a full-match replay
+  with `window_labels`, then (2) a full-match replay with legacy labels, then
+  (3) an auto-only replay with window labels, then (4) any other auto-only
+  replay. Auto-only means `config.auto_period_only` is set or there is no
+  teleop period. Ranks (2)–(4) are flagged `legacy_labels` when the replay has
+  no window labels. This keeps auto-only A/B and ground-truth runs from
+  replacing a match's teleop data.
 
 ## Testing
 

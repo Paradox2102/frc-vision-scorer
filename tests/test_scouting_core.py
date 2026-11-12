@@ -177,15 +177,31 @@ def test_build_match_without_clock_is_skipped():
 
 
 def test_pick_replay_prefers_window_label_runs(tmp_path):
-    def write(name, wl):
+    def write(name, wl, full=True):
         p = tmp_path / f"{name}.json"
-        p.write_text(json.dumps({"summary": {"window_labels": {"w": 1}} if wl else {}}))
+        summary = {"periods": PERIODS if full else PERIODS[:1]}
+        if wl:
+            summary["window_labels"] = {"w": 1}
+        p.write_text(json.dumps({"summary": summary}))
         return {"id": name, "meta_path": str(p)}
     rows = [write("newest_legacy", False), write("older_wl", True)]
     row, _, legacy = pick_replay(rows)
     assert row["id"] == "older_wl" and legacy is False
     row, _, legacy = pick_replay(rows[:1])
     assert row["id"] == "newest_legacy" and legacy is True
+
+
+def test_pick_replay_skips_newer_auto_only_runs(tmp_path):
+    def write(name, summary):
+        p = tmp_path / f"{name}.json"
+        p.write_text(json.dumps({"summary": summary}))
+        return {"id": name, "meta_path": str(p)}
+    wl = {"window_labels": {"w": 1}}
+    rows = [write("auto_only_flag", {**wl, "periods": PERIODS, "config": {"auto_period_only": True}}),
+            write("auto_only_periods", {**wl, "periods": PERIODS[:1]}),
+            write("older_full", {**wl, "periods": PERIODS})]
+    assert pick_replay(rows)[0]["id"] == "older_full"
+    assert pick_replay(rows[:2])[0]["id"] == "auto_only_flag"     # nothing better: newest
 
 
 # ------------------------------------------------------------------ export

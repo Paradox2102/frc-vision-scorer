@@ -11460,8 +11460,9 @@ def _auto_calib_pick_steady(event: str, camera: str, match_key: str, video, cl, 
 
 
 def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
-                           cl, fm, matches=()) -> dict:
-    """Worker-thread body for one camera: solve/verify, persist record + overlay."""
+                           cl, fm, matches=(), lenders=()) -> dict:
+    """Worker-thread body for one camera: solve/verify, persist record + overlay.
+    ``lenders``: sibling corner lenses for a failed full solve (``run_camera``)."""
     # Corners are held to the same gate as the job-time per-match corner check
     # (corner_check_max_m), not main's looser drift gate: a corner "verified" at
     # 0.48 m (2026hop qm4) is not usable.
@@ -11482,7 +11483,8 @@ def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
     masks = (epoch["calibration"].masks if epoch is not None and epoch["calibration"].masks
              else cl.masks)
     res = auto_calibrate.run_camera(video, match_key, camera, cl.crop, fm, versions,
-                                    cfg=cfg, masks=masks, judge=_auto_calib_judge())
+                                    cfg=cfg, masks=masks, judge=_auto_calib_judge(),
+                                    lenders=list(lenders))
     rec = res.record
     if endgame is not None:
         how = {"match_clock": "match clock", "match_clock_auto": "auto clock + match length",
@@ -11573,21 +11575,27 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
               f"existing/default layout")
     layout = _auto_calib_layout(event)
     fm = FieldModel.load(season.tag_layout)
-    for cam in todo:
-        if cam not in layout:
-            field_store.save_auto_record(event, cam, auto_calibrate.new_record(
-                "failed", "camera not present in this event's broadcast layout",
-                match_key=match_key))
-            print(f"[auto-calib] {event}/{cam}: not in the event layout — skipped")
-            continue
+    from web.field import lens_borrow
+    run_records = {}       # this run's results: a ready corner can lend its lens
+
+    def lenders_for(cam):
+        return lens_borrow.find_lenders(
+            cam, list(layout), lambda c: field_store.load_versions(event, c), match_key,
+            run_records)
+
+    async def run_one(cam, lenders):
         field_store.save_auto_record(event, cam, auto_calibrate.new_record(
-            "running", f"aggregating AprilTags on {match_key}", match_key=match_key))
+            "running", f"aggregating AprilTags on {match_key}"
+            + (f" (lens from {lenders[0].camera})" if lenders and cam in run_records
+               else ""), match_key=match_key))
         t0 = time.time()
         try:
             rec = await asyncio.to_thread(_auto_calibrate_camera, event, cam,
-                                          match_key, video, layout[cam], fm, matches)
+                                          match_key, video, layout[cam], fm, matches,
+                                          lenders)
             print(f"[auto-calib] {event}/{cam}: {rec['status']} ({rec.get('method')}) "
                   f"in {time.time() - t0:.0f}s — {rec.get('reason')}")
+            run_records[cam] = rec
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -11596,6 +11604,24 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
             print(f"[auto-calib] {event}/{cam}: failed — {reason}")
             field_store.save_auto_record(event, cam, auto_calibrate.new_record(
                 "failed", reason, match_key=match_key))
+
+    for cam in todo:
+        if cam not in layout:
+            field_store.save_auto_record(event, cam, auto_calibrate.new_record(
+                "failed", "camera not present in this event's broadcast layout",
+                match_key=match_key))
+            print(f"[auto-calib] {event}/{cam}: not in the event layout — skipped")
+            continue
+        await run_one(cam, lenders_for(cam))
+    # Second pass: a corner that failed before a sibling became ready retries with
+    # that sibling's lens (only failures retry; a camera that solved stays as is).
+    for cam in todo:
+        if cam in layout:
+            lenders = lenders_for(cam)
+            if lens_borrow.should_retry(run_records.get(cam), cam, lenders):
+                print(f"[auto-calib] {event}/{cam}: retrying with a lens from "
+                      f"{', '.join(l.camera for l in lenders)}")
+                await run_one(cam, lenders)
 
 
 def _auto_calib_task_done(event: str, task) -> None:
@@ -11759,6 +11785,8 @@ async def calibration_auto_confirm(request: Request):
             "holdout_ids": [], "timestamp": rec.get("timestamp"),
             "match_key": match_key, "method": "auto",
             "metrics": rec.get("metrics"),
+            **{k: rec[k] for k in ("lens_from", "lens_version_id", "lens_kind")
+               if rec.get(k)},
             "crop": list(run_crop) if run_crop else (list(cur.crop) if cur else None)}))
     rec = field_store.update_auto_record(
         event, camera, status="confirmed",
@@ -12122,12 +12150,36 @@ def _tag_id_of(key: str) -> int:
     return int(key[1:]) if key[:1] in ("a", "m") else int(key)
 
 
+def _solve_tags_lender(event: str, camera: str, lens_from: str, start_match,
+                       version_id: Optional[str] = None):
+    """(LensLender, None) for solve-tags ``lens_from``: the lender camera's version
+    covering ``start_match`` (or exactly ``version_id``, a re-preview's pin), or
+    (None, error) — main never lends/borrows, a camera can't borrow its own lens."""
+    from web.field import lens_borrow
+    why = lens_borrow.borrow_rule_error(camera, lens_from)
+    if why:
+        return None, why
+    versions = field_store.load_versions(event, lens_from)
+    if version_id:
+        ep = next((v for v in versions if v["version_id"] == version_id), None)
+        if ep is None:
+            return None, f"{lens_from} has no calibration version {version_id}"
+    else:
+        ep = select_epoch(versions, start_match)
+        if ep is None:
+            return None, f"{lens_from} has no calibration version to borrow a lens from"
+    return lens_borrow.LensLender(lens_from, ep["calibration"], ep["version_id"]), None
+
+
 @app.post("/api/calibration/solve-tags")
 async def calibration_solve_tags(request: Request):
     """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
-    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}]}.
+    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}], lens_from?, lens_version_id?}.
     Solves a single-view pinhole camera model from AprilTag correspondences
-    (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay."""
+    (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay.
+    ``lens_from`` (a sibling corner camera): fix that camera's covering lens
+    (``lens_borrow.transfer_lens``) and solve only the pose ("model": "pose"); the
+    version's source records lens_from / lens_version_id."""
     body = await request.json()
     event = body.get("event", "test"); camera = body.get("camera", "main")
     season = body.get("season") or _event_layout(event)
@@ -12152,11 +12204,30 @@ async def calibration_solve_tags(request: Request):
     holdout_ids = set(int(i) for i in body.get("holdout_ids", []))
     held = {k: v for k, v in corr.items() if _tag_id_of(k) in holdout_ids}
     solve_corr = {k: v for k, v in corr.items() if _tag_id_of(k) not in holdout_ids}
+    # lens_from: borrow a sibling corner camera's lens and solve only the pose (too
+    # few tags to pin down this camera's own lens). Pose only — freeing the focal
+    # too lets it trade focal against distance again (2025hop corner_right).
+    lender = None
+    if body.get("lens_from"):
+        lender, why = _solve_tags_lender(event, camera, str(body["lens_from"]),
+                                         body.get("start_match"),
+                                         body.get("lens_version_id"))
+        if lender is None:
+            return JSONResponse(status_code=400, content={"error": why})
     try:
-        # Constrained lens first, freed only when the tags span the field: a free
-        # lens fitted to one hub's tags (+ a couple of clicks) extrapolates wildly.
-        cal, solve_model_used, solve_spread = auto_calibrate.solve_fresh_lens(
-            solve_corr, image_size, season, fm)
+        if lender is not None:
+            from web.field import lens_borrow
+            cal = lens_borrow.solve_pose_with_lens(
+                solve_corr, image_size, season,
+                lens_borrow.transfer_lens(lender.calibration, image_size))
+            solve_model_used = "pose"
+            solve_spread = auto_calibrate.tag_spread_m(
+                fm, {_tag_id_of(k) for k in solve_corr})
+        else:
+            # Constrained lens first, freed only when the tags span the field: a free
+            # lens fitted to one hub's tags (+ a couple of clicks) extrapolates wildly.
+            cal, solve_model_used, solve_spread = auto_calibrate.solve_fresh_lens(
+                solve_corr, image_size, season, fm)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
@@ -12175,7 +12246,8 @@ async def calibration_solve_tags(request: Request):
                 "auto_tags": auto, "manual_tags": manual,
                 "holdout_ids": sorted(holdout_ids),
                 "timestamp": float(body.get("timestamp", 75)),
-                "match_key": body.get("match_key")}))
+                "match_key": body.get("match_key"),
+                **(lender.source_fields() if lender is not None else {})}))
         _auto_calib_mark_manual(event, camera, new_vid)
     holdout_err = holdout_field_error(cal, held) if held else None
 
@@ -12211,6 +12283,8 @@ async def calibration_solve_tags(request: Request):
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
             "n_points": n_points, "overlay": overlay_b64,
             "holdout_error_m": holdout_err, "model": solve_model_used,
+            "lens_from": (None if lender is None else
+                          {"camera": lender.camera, "version_id": lender.version_id}),
             "tag_spread_m": round(solve_spread, 2),
             "predicted_tags": _predicted_tags(cal, fm, image_size)}
 

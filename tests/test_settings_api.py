@@ -121,3 +121,21 @@ class TestSettingsEndpoints:
         assert r.status_code == 200
         assert JobConfig().reprompt_seconds == 2.0
         assert JobConfig().corner_track_stride == 3
+
+
+class TestVlmModelsDefaultReader:
+    """/api/vlm_models names the server's default team_reader so the UI's
+    "Server default" option can show which reader a job will really get."""
+
+    def test_reports_env_default_reader(self, client, monkeypatch):
+        monkeypatch.setenv("TEAM_READER", "jev")
+        assert client.get("/api/vlm_models").json()["default_reader"] == "jev"
+
+    def test_follows_env_switch_to_vllm(self, client, monkeypatch):
+        monkeypatch.setenv("TEAM_READER", "vllm")
+        assert client.get("/api/vlm_models").json()["default_reader"] == "vllm"
+
+    def test_runtime_override_wins(self, client, monkeypatch):
+        monkeypatch.setenv("TEAM_READER", "jev")
+        job_config.set_runtime_override("team_reader", "clef")
+        assert client.get("/api/vlm_models").json()["default_reader"] == "clef"

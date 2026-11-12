@@ -1244,25 +1244,54 @@ class VisionScorer {
                 select.appendChild(opt);
             }
             this._defaultVlmModel = data.default;
+            this._defaultTeamReader = data.default_reader || null;
         } catch (err) {
             console.error('Failed to load VLM model list:', err);
+        }
+        this.syncTeamReaderControls();
+    }
+
+    // Reader a submitted job will actually use: the picker's choice, or the
+    // server's TEAM_READER default for "Server default" (null until loaded).
+    effectiveTeamReader() {
+        const value = document.getElementById('teamReader')?.value;
+        return value || this._defaultTeamReader || null;
+    }
+
+    // The bumper reader model picker only drives the Qwen readers (vLLM or
+    // in-process local); Jev / Clef / DeepSeek ignore it.
+    readerUsesVlmModel(reader) {
+        return reader === 'vllm' || reader === 'local';
+    }
+
+    syncTeamReaderControls() {
+        const reader = document.getElementById('teamReader');
+        if (!reader) return;
+        const defaultOpt = reader.querySelector('option[value=""]');
+        if (defaultOpt) {
+            const names = { jev: 'Jev', vllm: 'vLLM', clef: 'Clef',
+                            local: 'local Qwen', deepseek: 'DeepSeek' };
+            const d = this._defaultTeamReader;
+            defaultOpt.textContent = d
+                ? `Server default (${names[d] || d})` : 'Server default';
+        }
+        const effective = this.effectiveTeamReader();
+        const clefGroup = document.getElementById('clefModelGroup');
+        const vlmGroup = document.getElementById('vlmModelGroup');
+        if (clefGroup) clefGroup.style.display = effective === 'clef' ? '' : 'none';
+        if (vlmGroup) {
+            vlmGroup.style.display = this.readerUsesVlmModel(effective) ? '' : 'none';
         }
     }
 
     initTeamReaderControls() {
-        // Debug-only reader backend picker. Clef runs in the cloud, so the
-        // vLLM model picker doesn't apply to it; show the Clef model instead.
+        // Debug-only reader backend picker. Each reader shows only its own
+        // model picker: Clef its Clef models, vLLM/local the Qwen models,
+        // Jev none. Re-synced once /api/vlm_models names the server default.
         const reader = document.getElementById('teamReader');
         if (!reader) return;
-        const sync = () => {
-            const isClef = reader.value === 'clef';
-            const clefGroup = document.getElementById('clefModelGroup');
-            const vlmGroup = document.getElementById('vlmModelGroup');
-            if (clefGroup) clefGroup.style.display = isClef ? '' : 'none';
-            if (vlmGroup) vlmGroup.style.display = isClef ? 'none' : '';
-        };
-        reader.addEventListener('change', sync);
-        sync();
+        reader.addEventListener('change', () => this.syncTeamReaderControls());
+        this.syncTeamReaderControls();
     }
 
     async handleSubmit(e) {
@@ -1283,8 +1312,8 @@ class VisionScorer {
             formData.append('youtube_url', youtubeUrl);
         }
         // team_reader is only sent (via config_json below) when the debug
-        // picker selects Clef; otherwise the server default (vllm via
-        // start_all.sh) applies, with automatic in-process fallback.
+        // picker names a reader; "Server default" sends nothing, so the
+        // server's TEAM_READER (jev via start_all.sh) applies.
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
             formData.append('sam2_max_gpu_frames', vramBudget);
@@ -1311,13 +1340,14 @@ class VisionScorer {
             config.field_wireframe_overlay = true;
         }
         const teamReader = document.getElementById('teamReader')?.value;
-        if (teamReader === 'clef') {
-            config.team_reader = 'clef';
+        if (teamReader) config.team_reader = teamReader;
+        const effectiveReader = this.effectiveTeamReader();
+        if (effectiveReader === 'clef') {
             const clefModel = document.getElementById('clefModel')?.value;
             if (clefModel && clefModel !== 'clef-flash') {
                 config.clef_model = clefModel;
             }
-        } else {
+        } else if (this.readerUsesVlmModel(effectiveReader)) {
             // Bumper reader model: only send the override when it differs from the
             // server default (mirrors how tracking_backend / model_size are sent).
             const vlmModel = document.getElementById('vlmModel')?.value;

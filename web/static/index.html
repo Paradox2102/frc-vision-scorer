@@ -145,14 +145,20 @@
                             <div class="input-group debug-only" id="teamReaderGroup">
                                 <label for="teamReader">Bumper reader backend:</label>
                                 <select id="teamReader">
-                                    <option value="" selected>Server default (vLLM)</option>
+                                    <option value="" selected>Server default</option>
+                                    <option value="jev">Jev (TypeSafe, cloud, no GPU)</option>
+                                    <option value="vllm">vLLM (local Qwen on GPU)</option>
                                     <option value="clef">Clef (Cloudflare Workers AI, no GPU)</option>
                                 </select>
                                 <small style="color:#889;display:block;margin-top:4px;">
-                                    Clef picks the team from the full match roster in the cloud
-                                    (~0.5 s, ~$0.00004 per read) and never starts vLLM. Needs
-                                    CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN in .env; if the
-                                    quota runs out, reads stop for that job (no local fallback).
+                                    The server default comes from TEAM_READER (Jev unless the
+                                    server was started with TEAM_READER=vllm). Jev and Clef pick
+                                    the team from the full match roster in the cloud and never
+                                    start vLLM; Jev needs JEV_TYPESAFE_API_TOKEN, Clef needs
+                                    CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN in .env. If a
+                                    cloud reader's quota or auth fails, reads stop for that job
+                                    (no local fallback). vLLM reads on the local GPU with the
+                                    model picked below.
                                 </small>
                             </div>
                             <div class="input-group debug-only" id="clefModelGroup" style="display:none;">

@@ -14754,11 +14754,16 @@ async def vlm_models_endpoint():
     All models are served by the same vLLM server in HF format; `status` is
     `ready` (in the HF cache) or `needs_download` (vLLM fetches it on first
     serve). The UI annotates `needs_download` but keeps it selectable.
+
+    `default_reader` is the team_reader a job gets when the page sends none
+    (env TEAM_READER / runtime override / knob default), so the reader picker
+    can name it instead of hard-coding a label that goes stale.
     """
     from web import vlm_models
     # scan_cache_dir touches disk; keep the event loop free.
     rows = await asyncio.to_thread(vlm_models.describe)
-    return {"default": vlm_models.DEFAULT_KEY, "models": rows}
+    return {"default": vlm_models.DEFAULT_KEY, "models": rows,
+            "default_reader": JobConfig().team_reader}
 
 
 async def _load_db_roster(match_key: Optional[str]) -> Optional[tuple[list, list, list]]:

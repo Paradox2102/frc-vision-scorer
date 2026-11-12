@@ -669,12 +669,14 @@ def median_decodes(median, detect_fn, roi_detect_fn=None, scales=(2, 3)) -> dict
 
 
 def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_fn, judge,
-                       base, extra, lens=None, stack=None):
+                       base, extra, lens=None, stack=None, max_model=None):
     """Run the undecoded-tag locator; adopt its calibration when it located anything.
     Fills base["auto_tags"] (ROI decodes, 4 corners) / base["manual_tags"] (centre
-    points) and extra["located"/"candidates"/"notes"]. Returns (cal, description)."""
+    points) and extra["located"/"candidates"/"notes"]. Returns (cal, description).
+    ``max_model``: cap the locator's model ladder ("pose" keeps ``lens`` fixed)."""
     from web.field import tag_locator as tl
     lcfg = tl.LocatorConfig(init_model="pose" if lens is not None else cfg.locate_init_model,
+                            max_model=max_model,
                             jev_verify=cfg.jev_verify, jev_min_p=cfg.jev_min_p)
     try:
         res = tl.locate_undecoded(img, fm, corners, image_size, cfg.field_season, lcfg,
@@ -706,10 +708,82 @@ def _grow_with_locator(cal, how, img, fm, corners, image_size, cfg, roi_detect_f
                              f"model {res.model}")
 
 
+def _borrowed_lens_solve(own: AutoCalibResult, camera, lenders, corr, corners, image_size,
+                        fm, cfg, background, loc_stack, roi_detect_fn, judge, base, extra,
+                        validate, finish) -> AutoCalibResult:
+    """``run_camera``'s fallback after ``camera``'s own full solve failed (``own``):
+    for each sibling lender (``lens_borrow.LensLender``) fix its lens, rescaled to
+    this crop, and solve only the pose — grown by the locator with the ladder capped
+    at "pose" (the lens is another camera's, located points must not refit it). The
+    normal validation gate decides: the first lender that validates is "ready";
+    otherwise the first borrowed candidate comes back "failed" for review. When no
+    borrowed pose can be solved at all, ``own`` comes back with the reasons added."""
+    from web.field import lens_borrow as lb
+    tried = [l.camera for l in lenders if lb.borrow_rule_error(camera, l.camera) is None]
+    own_reason = own.record.get("reason", "")
+    if not tried:
+        return own
+    own.record["lens_lenders_tried"] = tried
+    if len(corr) < lb.MIN_BORROW_TAGS:
+        own.record["reason"] = (f"{own_reason}; a borrowed lens ({', '.join(tried)}) needs "
+                                f">= {lb.MIN_BORROW_TAGS} tags for the pose")
+        return own
+    first, failures = None, []
+    for lender in lenders:
+        if lender.camera not in tried:
+            continue
+        # every attempt starts from the decoded tags only (the own attempt's locator
+        # may have added located tags to the record)
+        base["auto_tags"] = {str(int(t)): np.asarray(c, float).round(2).tolist()
+                             for t, c in corners.items()}
+        base["manual_tags"] = []
+        extra.clear()
+        extra.update(located=[], candidates=[], notes=[])
+        try:
+            lens = lb.transfer_lens(lender.calibration, image_size)
+            cal = lb.solve_pose_with_lens(corr, image_size, cfg.field_season, lens)
+        except CalibrationError as e:
+            failures.append(f"{lender.describe()}: {e}")
+            continue
+        how = f"pose from {len(corr)} tags"
+        if cfg.locate_undecoded and background is not None:
+            cal, how = _grow_with_locator(cal, how, background, fm, corners, image_size, cfg,
+                                          roi_detect_fn, judge, base, extra, lens=lens,
+                                          stack=loc_stack, max_model="pose")
+        val = validate(cal)
+        gate = val["gate_best_m"]
+        lead = (f"lens borrowed from {lender.describe()} (fx {lens.K[0, 0]:.0f} px, k1 "
+                f"{float(np.asarray(lens.D).reshape(-1)[0]):.3f}): {how} "
+                f"(rms {cal.rms_error:.2f} px)")
+        if gate is not None and gate < cfg.drift_max_m:
+            status = "ready"
+            reason = (f"{lead}; validation best {_fmt(val['best_m'])} / median "
+                      f"{_fmt(val['median_m'])} / worst {_fmt(val['worst_m'])} m over "
+                      f"{val['frames']} frames — check the overlay, then confirm")
+        else:
+            status = "failed"
+            reason = (f"{lead} does not validate: best {_fmt(gate)} m on >= "
+                      f"{cfg.min_tags}-tag frames vs the {cfg.drift_max_m:.2f} m gate — "
+                      f"review the borrowed-lens candidate or correct manually")
+        res = finish(status, "full_solve", f"{reason} [own lens: {own_reason}]", cal, val, cal)
+        res.record.update(lender.source_fields(), lens_lenders_tried=tried,
+                          own_lens_reason=own_reason)
+        if res.record["status"] == "ready":
+            return res
+        first = first or res
+    if first is not None:
+        if failures:
+            first.record["reason"] += " [" + "; ".join(failures) + "]"
+        return first
+    own.record["reason"] = (f"{own_reason}; a borrowed lens failed too: "
+                            + "; ".join(failures))
+    return own
+
+
 def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                cfg: Optional[AutoCalibConfig] = None, detect_fn=None,
                masks=(), judge=None, roi_detect_fn=None,
-               force_resolve: bool = False) -> AutoCalibResult:
+               force_resolve: bool = False, lenders=()) -> AutoCalibResult:
     """Auto-calibrate ONE camera from ONE reference match. Pure w.r.t. persistence:
     returns the record (status ready / verified / failed), the candidate calibration
     (or None) and the overlay image (camera crop, or None if no frame was read).
@@ -721,7 +795,13 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     (``tag_locator.make_jev_judge``); None with ``cfg.jev_verify`` -> only ROI
     decodes are located. ``force_resolve``: with versions, skip the "verified"
     shortcut and always re-solve the pose from this footage (the caller already
-    decided the epoch does not hold, e.g. the per-match corner step)."""
+    decided the epoch does not hold, e.g. the per-match corner step).
+
+    ``lenders`` (``lens_borrow.LensLender``, sibling corner cameras): when a corner
+    camera's own full solve FAILS (too few tags for its own lens, tags on one
+    structure, or the validation / plausibility gates), retry with each lender's
+    lens fixed and only the pose solved (``_borrowed_lens_solve``). A camera that
+    solves on its own never looks at them; "main" never borrows."""
     cfg = cfg or AutoCalibConfig()
     detect_fn = detect_fn or make_detect_fn()
     if roi_detect_fn is None:
@@ -815,7 +895,7 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                                median=median, candidates=extra["candidates"])
 
     # ---- no calibration for this camera yet: full solve -------------------------
-    if not versions:
+    def own_full_solve():
         if len(corr) < cfg.min_tags:
             return finish("failed", "full_solve",
                           f"only {len(corr)} known tags found across {match_key} "
@@ -874,6 +954,14 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                       f"{_fmt(val['median_m'])} / worst {_fmt(val['worst_m'])} m over "
                       f"{val['frames']} frames — check the overlay, then confirm",
                       cal, val, cal)
+
+    if not versions:
+        res = own_full_solve()
+        if res.record["status"] == "failed" and lenders and camera != "main":
+            res = _borrowed_lens_solve(res, camera, lenders, corr, corners, image_size, fm,
+                                       cfg, background, loc_stack, roi_detect_fn, judge,
+                                       base, extra, validate, finish)
+        return res
 
     # ---- existing epoch: verify, then pose re-solve if it drifted ---------------
     epoch = select_epoch(versions, match_key)

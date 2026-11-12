@@ -920,6 +920,17 @@ KNOBS = [
     # 8.5->6.2 s. Cost: named time / right% 0-2 pts lower on every match.
     Knob("identity_per_cam_appearance", "IDENTITY_PER_CAM_APPEARANCE", bool, True,
          section="Identity & votes"),
+    # Per-camera appearance for the FUSED-ID relink (FusedTrackRegistry, the
+    # SAM2 tracklet path): a cluster whose member keys are all new relinks onto
+    # an inactive fused id on appearance; the averaged multi-camera embedding
+    # rarely matches across views (main-vs-corner same-robot cosine ~0.62), so
+    # the miss becomes a new fused id -> slot track change + crop-buffer flush.
+    # ON: relink similarity = max over cameras the cluster and the id share
+    # (per-camera EMA/anchor/exemplars); no shared camera = not a candidate.
+    # Missing per-camera data on either side -> averaged comparison. OFF =
+    # today's averaged relink. The always-on fused_ids gauge counts outcomes.
+    Knob("fused_per_cam_relink", "FUSED_PER_CAM_RELINK", bool, False,
+         section="Identity & votes"),
     # --- cross-camera fusion ---
     # Ray-aware cross-camera merge gate: corner cameras sit near carpet level,
     # so their range estimate is nearly meaningless (measured 1.1-3.8 m off on

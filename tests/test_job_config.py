@@ -574,6 +574,44 @@ def test_identity_per_cam_appearance_knob_default_on_and_wired(monkeypatch):
     assert InferenceJob._build_identity_registry(job).per_cam_appearance is False
 
 
+def test_fused_per_cam_relink_knob_default_off_wired_and_gauged(monkeypatch, capsys):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    from web.app import InferenceJob
+    from web.field.fused_track_id import FusedTrackRegistry
+    from web.field.identity_diagnostics import IdentityDiagnosticRecorder
+    cfg = JobConfig()
+    assert cfg.fused_per_cam_relink is False
+    assert "fused_per_cam_relink" not in cfg.non_defaults()
+    job = InferenceJob.__new__(InferenceJob)
+    job.config = JobConfig({"relink_max_dist_m": "2.5"})
+    reg = InferenceJob._build_fused_registry(job)
+    assert isinstance(reg, FusedTrackRegistry) and reg.per_cam_relink is False
+    assert reg.relink_max_dist_m == 2.5
+    assert reg.app_floor == job._emb_thr().relink_floor
+    job.config = JobConfig({"fused_per_cam_relink": "true"})
+    assert InferenceJob._build_fused_registry(job).per_cam_relink is True
+    monkeypatch.setenv("FUSED_PER_CAM_RELINK", "1")
+    assert JobConfig().fused_per_cam_relink is True
+
+    # End-of-job gauge + log line.
+    job.identity_diagnostics = IdentityDiagnosticRecorder()
+    job.fused_registry = InferenceJob._build_fused_registry(job)
+    job.fused_registry.stats.update({"continued": 40, "created_with_emb": 3,
+                                     "created_crossview_only": 2})
+    job._record_fused_ids_summary()
+    gauge = job.identity_diagnostics.summary()["gauges"]["fused_ids"]
+    assert gauge["continued"] == 40 and gauge["created_with_emb"] == 3
+    assert gauge["created_crossview_only"] == 2 and gauge["relinked"] == 0
+    assert gauge["per_cam_relink"] is True
+    assert "[fused-ids] continued 40" in capsys.readouterr().out
+    # No registry (Kalman path): no gauge, no crash.
+    job2 = InferenceJob.__new__(InferenceJob)
+    job2.identity_diagnostics = IdentityDiagnosticRecorder()
+    job2._record_fused_ids_summary()
+    assert "fused_ids" not in job2.identity_diagnostics.summary()["gauges"]
+
+
 def test_identity_swap_resolve_knobs_default_off(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

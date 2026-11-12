@@ -12,9 +12,28 @@ corner-only robot later seen by main) or dropping out (main occluded). That is
 exactly union-find over member keys: each member key remembers its fused id, and
 a cluster that touches several known ids collapses them to one.
 
+Appearance relink (``fused_per_cam_relink``, job knob, default OFF): fusion
+averages every camera's crop embedding into ``FieldDetection.embedding``, but
+one robot looks very different from main vs a broadcast corner (S4 main-vs-
+corner same-robot median cosine 0.62, within one camera 0.92-0.93). The
+registry therefore always keeps per-camera EMA / anchor / exemplar stores per
+fused id (fed by ``FieldDetection.cam_embeddings``); with the knob ON the
+relink similarity is the max over cameras the observation and the inactive id
+share, and a pair sharing no camera is not a relink candidate. Either side
+lacking per-camera data falls back to the averaged comparison. The legacy
+averaged stores always update (``get_embedding`` consumers read them).
+
+``stats`` (Counter, always on): per-observation outcome — continued, merged,
+relinked, created_with_emb, created_no_emb — plus two diagnostics on
+created_with_emb: created_crossview_only (some spatially plausible inactive id
+shared no camera with it) and created_samecam_below_floor /
+created_samecam_above_floor (best same-camera cosine vs a plausible inactive
+id, below / at-or-above app_floor).
+
 Pure: no torch / SAM2 / cv2 imports."""
 from __future__ import annotations
 import numpy as np
+from collections import Counter
 from dataclasses import dataclass
 from web.embedder import cosine_similarity
 from scipy.optimize import linear_sum_assignment
@@ -29,7 +48,7 @@ class FusedAssignmentEvidence:
 
 class FusedTrackRegistry:
     def __init__(self, app_floor: float = 0.55, ema_alpha: float = 0.3,
-                 relink_max_dist_m: float = 0.0) -> None:
+                 relink_max_dist_m: float = 0.0, per_cam_relink: bool = False) -> None:
         # member key (camera, per_camera_id) -> fused id
         self._key_to_id: dict[tuple, int] = {}
         self._next_id = 0
@@ -48,6 +67,96 @@ class FusedTrackRegistry:
         self._id_to_anchor: dict[int, np.ndarray] = {}
         # last N frame embeddings to prevent EMA drift
         self._recent_exemplars: dict[int, list[np.ndarray]] = {}
+        # Per-camera mirror of the three stores above (fused id -> camera ->
+        # EMA / first-seen anchor / last-5 exemplars). Always kept (the
+        # created_* diagnostics read them); relink reads them only when
+        # per_cam_relink is on. Keys of _cam_appearance[id] = the cameras whose
+        # embeddings the id has seen.
+        self.per_cam_relink = bool(per_cam_relink)
+        self._cam_appearance: dict[int, dict] = {}
+        self._cam_anchor: dict[int, dict] = {}
+        self._cam_exemplars: dict[int, dict] = {}
+        self.stats: Counter = Counter()
+
+    def _update_cam_stores(self, fused_id: int, obs, update_ok: bool) -> None:
+        """Per-camera mirror of the legacy appearance update (same shape as
+        IdentityRegistry._update_cam_appearance): a camera seen for the first
+        time seeds its EMA / anchor / exemplars ungated; a known camera takes
+        the EMA + exemplar update only when ``update_ok``. Anchor never moves."""
+        cam_embs = getattr(obs.detection, "cam_embeddings", None)
+        if not cam_embs:
+            return
+        ema = self._cam_appearance.setdefault(fused_id, {})
+        anchor = self._cam_anchor.setdefault(fused_id, {})
+        exemplars = self._cam_exemplars.setdefault(fused_id, {})
+        for cam, e in cam_embs.items():
+            if e is None:
+                continue
+            if cam not in ema:
+                ema[cam] = e
+                anchor[cam] = e
+                exemplars[cam] = [e]
+                continue
+            if not update_ok:
+                continue
+            blended = (1.0 - self.ema_alpha) * ema[cam] + self.ema_alpha * e
+            norm = np.linalg.norm(blended)
+            ema[cam] = blended / norm if norm > 0 else blended
+            fifo = exemplars.setdefault(cam, [])
+            fifo.append(e)
+            if len(fifo) > 5:
+                fifo.pop(0)
+
+    def _merge_cam_stores(self, winner: int, loser: int) -> None:
+        """Fold a collapsed id's per-camera stores into the winner, per camera
+        exactly as the legacy merge does (adopt when the winner lacks the
+        camera, else 50/50 EMA blend; winner's anchor kept; exemplars
+        concatenated, last 5 kept)."""
+        l_ema = self._cam_appearance.pop(loser, None) or {}
+        l_anchor = self._cam_anchor.pop(loser, None) or {}
+        l_ex = self._cam_exemplars.pop(loser, None) or {}
+        if not (l_ema or l_anchor or l_ex):
+            return
+        w_ema = self._cam_appearance.setdefault(winner, {})
+        w_anchor = self._cam_anchor.setdefault(winner, {})
+        w_ex = self._cam_exemplars.setdefault(winner, {})
+        for cam, e in l_ema.items():
+            if cam not in w_ema:
+                w_ema[cam] = e
+            else:
+                blended = 0.5 * w_ema[cam] + 0.5 * e
+                norm = np.linalg.norm(blended)
+                w_ema[cam] = blended / norm if norm > 0 else blended
+        for cam, e in l_anchor.items():
+            w_anchor.setdefault(cam, e)
+        for cam, fifo in l_ex.items():
+            merged = w_ex.setdefault(cam, [])
+            merged.extend(fifo)
+            if len(merged) > 5:
+                w_ex[cam] = merged[-5:]
+
+    def _samecam_similarity(self, obs, fused_id: int):
+        """(shared, sim): ``shared`` is None when either side has no per-camera
+        data (unclassifiable -> legacy); else whether any camera is shared, and
+        ``sim`` the max cosine over shared cameras vs that camera's EMA, anchor
+        and exemplars (None when nothing is shared)."""
+        cam_embs = getattr(obs.detection, "cam_embeddings", None)
+        ema = self._cam_appearance.get(fused_id)
+        if not cam_embs or not ema:
+            return None, None
+        best = None
+        for cam, e in cam_embs.items():
+            if e is None or cam not in ema:
+                continue
+            cands = [ema[cam]]
+            a = self._cam_anchor.get(fused_id, {}).get(cam)
+            if a is not None:
+                cands.append(a)
+            cands.extend(self._cam_exemplars.get(fused_id, {}).get(cam, []))
+            for ref in cands:
+                c = cosine_similarity(e, ref)
+                best = c if best is None else max(best, c)
+        return best is not None, best
 
     def get_embedding(self, track_id: int) -> "np.ndarray | None":
         """Running (EMA) appearance embedding for a fused track, or None if the
@@ -101,6 +210,7 @@ class FusedTrackRegistry:
                         if loser in self._recent_exemplars:
                             self._recent_exemplars.setdefault(fused_id, []).extend(self._recent_exemplars[loser])
                             self._recent_exemplars.pop(loser, None)
+                        self._merge_cam_stores(fused_id, loser)
                     
                     if fused_id in self._recent_exemplars and len(self._recent_exemplars[fused_id]) > 5:
                         self._recent_exemplars[fused_id] = self._recent_exemplars[fused_id][-5:]
@@ -118,6 +228,7 @@ class FusedTrackRegistry:
             obs.detection.relink_margin = 1.0
             
             ev_type = "merged" if is_merge else "continued"
+            self.stats[ev_type] += 1
             ev = FusedAssignmentEvidence(track_id=fused_id, type=ev_type, margin=1.0)
             obs.relink_evidence = ev
             obs.detection.relink_evidence = ev
@@ -140,6 +251,9 @@ class FusedTrackRegistry:
                     exemplars.append(obs.detection.embedding)
                     if len(exemplars) > 5:
                         exemplars.pop(0)
+            # Continued/merged: per-camera stores update ungated, like the
+            # legacy EMA above.
+            self._update_cam_stores(fused_id, obs, True)
 
         # 2. Second pass: Handle unmatched observations and match them globally against inactive tracks.
         # Only observations with embeddings can be matched using appearance.
@@ -149,6 +263,9 @@ class FusedTrackRegistry:
         inactive_ids = sorted(list(set(self._id_to_embedding.keys()) - active_ids_this_frame))
         
         relinked_matches = {} # index in unmatched_with_emb -> (inactive_id, similarity, margin)
+        # Per row: created_* diagnostics over spatially plausible inactive ids
+        # ({"crossview": bool, "samecam": best same-camera cosine or None}).
+        row_diag: dict[int, dict] = {}
         
         if unmatched_with_emb and inactive_ids:
             num_rows = len(unmatched_with_emb)
@@ -158,8 +275,30 @@ class FusedTrackRegistry:
             
             for r in range(num_rows):
                 obs = unmatched_with_emb[r]
+                diag = row_diag.setdefault(r, {"crossview": False, "samecam": None})
                 for c in range(num_cols):
                     inactive_id = inactive_ids[c]
+                    shared, cam_sim = self._samecam_similarity(obs, inactive_id)
+                    gate_ok = True
+                    if self.relink_max_dist_m > 0 and inactive_id in self._id_to_pos:
+                        px, py = self._id_to_pos[inactive_id]
+                        d = float(np.hypot(obs.detection.pos[0] - px,
+                                           obs.detection.pos[1] - py))
+                        gate_ok = d <= self.relink_max_dist_m
+                    if gate_ok and shared is False:
+                        diag["crossview"] = True
+                    if gate_ok and cam_sim is not None:
+                        diag["samecam"] = (cam_sim if diag["samecam"] is None
+                                           else max(diag["samecam"], cam_sim))
+                    if self.per_cam_relink and shared is not None:
+                        # Same-camera appearance only; no shared camera = no
+                        # appearance evidence = not a relink candidate.
+                        sim = cam_sim if shared else -1.0
+                        if not gate_ok:
+                            sim = -1.0
+                        all_sims[r, c] = sim
+                        cost_matrix[r, c] = 1.0 - sim
+                        continue
                     # Compute max similarity over EMA, anchor, and recent exemplars
                     sim_candidates = []
                     sim_candidates.append(cosine_similarity(obs.detection.embedding, self._id_to_embedding[inactive_id]))
@@ -210,6 +349,9 @@ class FusedTrackRegistry:
                 obs.relink_evidence = ev
                 obs.detection.relink_evidence = ev
                 evidence_list.append(ev)
+                self.stats["relinked"] += 1
+                # Same quarantine for the per-camera stores (new cameras seed).
+                self._update_cam_stores(fused_id, obs, margin >= 0.05)
                 
                 # Quarantine uncertain updates
                 if margin >= 0.05:
@@ -241,6 +383,18 @@ class FusedTrackRegistry:
                 self._id_to_embedding[fused_id] = obs.detection.embedding
                 self._id_to_anchor[fused_id] = obs.detection.embedding
                 self._recent_exemplars[fused_id] = [obs.detection.embedding]
+                self._update_cam_stores(fused_id, obs, False)
+
+                self.stats["created_with_emb"] += 1
+                diag = row_diag.get(r)
+                if diag is not None:
+                    if diag["crossview"]:
+                        self.stats["created_crossview_only"] += 1
+                    if diag["samecam"] is not None:
+                        key = ("created_samecam_below_floor"
+                               if diag["samecam"] < self.app_floor
+                               else "created_samecam_above_floor")
+                        self.stats[key] += 1
                 
         # For unmatched observations with no embeddings, they get fresh IDs
         for obs in unmatched_no_emb:
@@ -256,6 +410,7 @@ class FusedTrackRegistry:
             obs.relink_evidence = ev
             obs.detection.relink_evidence = ev
             evidence_list.append(ev)
+            self.stats["created_no_emb"] += 1
 
         # Register every member key of this cluster to the chosen id, and record
         # each id's latest field position for the appearance-relink spatial gate.

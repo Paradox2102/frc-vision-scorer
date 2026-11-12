@@ -6366,6 +6366,31 @@ class InferenceJob:
             per_cam_appearance=bool(getattr(cfg, "identity_per_cam_appearance", False)),
         )
 
+    def _build_fused_registry(self) -> FusedTrackRegistry:
+        """The job's cross-camera FusedTrackRegistry (SAM2 tracklet path)."""
+        cfg = self.config
+        return FusedTrackRegistry(
+            app_floor=self._emb_thr().relink_floor,
+            relink_max_dist_m=cfg.relink_max_dist_m,
+            per_cam_relink=bool(getattr(cfg, "fused_per_cam_relink", False)),
+        )
+
+    def _record_fused_ids_summary(self) -> None:
+        """End-of-job fused-id outcome counts (FusedTrackRegistry.stats): one
+        log line + the ``fused_ids`` diagnostics gauge. No-op without a
+        registry (Kalman / non-SAM2 path)."""
+        reg = getattr(self, "fused_registry", None)
+        if reg is None:
+            return
+        keys = ("continued", "merged", "relinked", "created_with_emb",
+                "created_no_emb", "created_crossview_only",
+                "created_samecam_below_floor", "created_samecam_above_floor")
+        counts = {k: int(reg.stats.get(k, 0)) for k in keys}
+        counts["per_cam_relink"] = bool(reg.per_cam_relink)
+        print("  [fused-ids] " + " ".join(f"{k} {counts[k]}" for k in keys)
+              + f" (per_cam_relink {'on' if reg.per_cam_relink else 'off'})")
+        self.identity_diagnostics.gauge("fused_ids", counts)
+
     def _retire_evicted_tracks(self, evicted_ids) -> None:
         """Identities evicted from the registry this frame are dead: drop the
         team (and confirmed flag) from their RobotTrack; votes stay as
@@ -9313,9 +9338,7 @@ class InferenceJob:
                     )
                     self.use_sam2 = False
                 else:
-                    self.fused_registry = FusedTrackRegistry(
-                        app_floor=self._emb_thr().relink_floor,
-                        relink_max_dist_m=self.config.relink_max_dist_m)
+                    self.fused_registry = self._build_fused_registry()
 
                 # Every tracklet the analysis loop will ever read is already
                 # in self.sam2_raw (CPU); the SAM predictor weights and any
@@ -10456,6 +10479,10 @@ class InferenceJob:
                 self.identity_diagnostics.gauge("identity_churn", _churn)
             except Exception as e:
                 print(f"  [identity] churn summary failed: {e}")
+            try:
+                self._record_fused_ids_summary()
+            except Exception as e:
+                print(f"  [fused-ids] summary failed: {e}")
             try:
                 rec = getattr(self, "_replay", None)
                 if rec is not None and rec.is_open:

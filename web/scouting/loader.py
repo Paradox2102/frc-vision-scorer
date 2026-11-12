@@ -180,8 +180,8 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
                       x=float(xy[0]), y=float(xy[1]), ax=ax, ay=ay, dt=dt,
                       confirmed=bool(confirmed), slot=slot)
 
-    slot_votes: dict = defaultdict(Counter)   # auto-period labels per slot
     slot_auto_xy: dict = defaultdict(list)    # slot -> [(frame_num, xy)] in auto
+    slot_auto_labels: dict = defaultdict(dict)  # slot -> {frame_num: team} in auto
     off_roster = dups = 0
     for fr in frames:
         at = clock.at(int(fr.get("frame_num", -1)))
@@ -204,7 +204,7 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
                 continue
             alliance = roster.get(team) or rb.get("alliance") or "blue"
             if period == "auto" and rb.get("slot"):
-                slot_votes[rb["slot"]][team] += 1
+                slot_auto_labels[rb["slot"]][int(fr["frame_num"])] = team
             prev = seen.get(team)
             if prev is not None:
                 dups += 1
@@ -218,45 +218,104 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
                        rb.get("confirmed"), rb.get("slot")))
             md.labelled_s[period] += dt
 
-    _attach_auto_paths(md, summary.get("autonomous_paths") or {}, slot_votes, slot_auto_xy,
-                       clock, roster, team_match, sample)
+    _attach_auto_paths(md, summary.get("autonomous_paths") or {}, slot_auto_labels,
+                       slot_auto_xy, clock, roster, team_match, sample)
     md.off_roster_samples, md.duplicate_label_samples = off_roster, dups
     return md, None
 
 
-def _attach_auto_paths(md, paths, slot_votes, slot_auto_xy, clock, roster, team_match,
+AUTO_GAP_S = 1.0       # a slot unseen this long was re-seeded, maybe on another robot
+MIN_LABEL_RUN = 3       # shorter label runs inside one track are treated as misreads
+OVERLAP_TOL_S = 0.4     # two pieces of one team may overlap this much in time
+
+
+def _slot_spans(presence: list) -> list:
+    """Split one slot's auto track into single-robot time spans.
+
+    A slot is a tracker *seat*, not a robot: after a track is lost the slot can
+    be re-seeded on a different robot (2026casnd qm14: R3 = 3128 for 2 s, then
+    2839 for the rest of auto). ``presence`` = time-sorted [(t_match, team or
+    None)], one entry per frame the slot was on the field. The track is cut
+    where the slot vanished for > AUTO_GAP_S and again between label runs of
+    different teams (unlabelled frames go to the nearer run; runs shorter than
+    MIN_LABEL_RUN are misreads). Returns [(team, t_lo, t_hi, Counter of labels
+    in the span)]; spans with no label are dropped (nobody to attribute them to).
+    """
+    segs: list = []
+    for p in presence:
+        if segs and p[0] - segs[-1][-1][0] <= AUTO_GAP_S:
+            segs[-1].append(p)
+        else:
+            segs.append([p])
+    spans = []
+    for seg in segs:
+        runs: list = []                      # [team, first_i, last_i, n]
+        for i, (_, team) in enumerate(seg):
+            if team is None:
+                continue
+            if runs and runs[-1][0] == team:
+                runs[-1][2], runs[-1][3] = i, runs[-1][3] + 1
+            else:
+                runs.append([team, i, i, 1])
+        strong: list = []
+        for r in ([r for r in runs if r[3] >= MIN_LABEL_RUN] or runs):
+            if strong and strong[-1][0] == r[0]:
+                strong[-1][2], strong[-1][3] = r[2], strong[-1][3] + r[3]
+            else:
+                strong.append(list(r))
+        cuts = [0] + [(a[2] + 1 + b[1]) // 2 for a, b in zip(strong, strong[1:])] + [len(seg)]
+        for r, lo, hi in zip(strong, cuts, cuts[1:]):
+            votes = Counter(team for _, team in seg[lo:hi] if team is not None)
+            spans.append((r[0], seg[lo][0], seg[hi - 1][0], votes))
+    return spans
+
+
+def _attach_auto_paths(md, paths, slot_labels, slot_auto_xy, clock, roster, team_match,
                        sample) -> None:
-    # Each slot's path goes to its majority auto label; a team claimed by two
-    # slots keeps the slot with more votes. The pipeline's path starts at the
-    # clock's auto start_frame, which is ~CLOCK_LEAD_S late (clock.py); the
-    # slot's frames before that (the processing lead) are prepended.
-    claims: dict = {}
-    for slot, votes in slot_votes.items():
-        if slot not in paths or not votes:
-            continue
-        total = sum(votes.values())
-        (team, n), *rest = votes.most_common()
-        runner = rest[0][1] / total if rest else 0.0
-        if team not in claims or n > claims[team][1]:
-            claims[team] = (slot, n, n / total, runner)
-    for team, (slot, _n, share, runner) in claims.items():
-        alliance = roster.get(team) or ("red" if str(slot).startswith("R") else "blue")
+    # The pipeline's per-slot path starts at the clock's auto start, which can
+    # trail the real start (clock.py); the slot's earlier frames (the
+    # processing lead) are prepended. Each slot track is split into
+    # single-robot time spans (_slot_spans, from the slot's per-frame presence
+    # and labels, not from the stored path, which skips coasting samples) and
+    # every span's path points go to that span's team. So a robot whose track
+    # broke and re-seeded on another slot keeps both halves, and a slot re-used
+    # for another robot does not leak into it.
+    by_team: dict = defaultdict(list)       # team -> [(votes, slot, points, Counter)]
+    for slot, path in paths.items():
+        first = min((int(p.get("frame_num", 1 << 30)) for p in path), default=1 << 30)
+        pts = [(fn, xy, clock.at(fn)) for fn, xy in slot_auto_xy.get(slot, []) if fn < first]
+        pts += [(int(p["frame_num"]), p.get("field_pos"), clock.at(int(p.get("frame_num", -1))))
+                for p in path if p.get("field_pos") and "frame_num" in p]
+        pts = sorted((p for p in pts if p[1] and p[2] and p[2][0] == "auto"),
+                     key=lambda p: p[0])
+        labels = slot_labels.get(slot, {})
+        presence = sorted((at[1], labels.get(fn)) for fn, at in
+                          ((fn, clock.at(fn)) for fn, _ in slot_auto_xy.get(slot, []))
+                          if at and at[0] == "auto")
+        for team, lo, hi, votes in _slot_spans(presence):
+            piece = [p for p in pts if lo <= p[2][1] <= hi]
+            if piece:
+                by_team[team].append((votes[team], slot, piece, votes))
+    for team, cands in by_team.items():
+        kept: list = []
+        for c in sorted(cands, key=lambda c: (-c[0], -len(c[2]))):
+            t0, t1 = c[2][0][2][1], c[2][-1][2][1]
+            if all(t1 <= k[2][0][2][1] + OVERLAP_TOL_S or t0 >= k[2][-1][2][1] - OVERLAP_TOL_S
+                   for k in kept):
+                kept.append(c)        # a simultaneous duplicate claim keeps the stronger
+        kept.sort(key=lambda c: c[2][0][2][1])
+        slot0 = kept[0][1]
+        alliance = roster.get(team) or ("red" if str(slot0).startswith("R") else "blue")
         tm = team_match(team, alliance)
-        first = min((int(p.get("frame_num", 1 << 30)) for p in paths[slot]), default=1 << 30)
-        pts = []
-        for fn, xy in slot_auto_xy.get(slot, []):
-            at = clock.at(fn)
-            if fn < first and at and at[0] == "auto":
-                pts.append(sample(fn, at, xy, alliance, slot=slot))
-        for p in paths[slot]:
-            xy = p.get("field_pos")
-            at = clock.at(int(p.get("frame_num", -1)))
-            if xy and at and at[0] == "auto":
-                pts.append(sample(p["frame_num"], at, xy, alliance, slot=slot))
-        if pts:
-            tm.auto_path, tm.auto_slot = pts, slot
-            tm.auto_label_share, tm.auto_runner_up_share = round(share, 3), round(runner, 3)
-            tm.auto_source = "autonomous_paths"
+        tm.auto_path = [sample(fn, at, xy, alliance, slot=slot)
+                        for _, slot, piece, _ in kept for fn, xy, at in piece]
+        tm.auto_slot = "+".join(dict.fromkeys(c[1] for c in kept))
+        votes = sum((c[3] for c in kept), Counter())
+        total = sum(votes.values()) or 1
+        runner = max((n for t, n in votes.items() if t != team), default=0)
+        tm.auto_label_share = round(votes[team] / total, 3)
+        tm.auto_runner_up_share = round(runner / total, 3)
+        tm.auto_source = "autonomous_paths"
     for tm in md.teams.values():
         if not tm.auto_path:
             auto = [s for s in tm.samples if s.period == "auto"]

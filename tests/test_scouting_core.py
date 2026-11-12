@@ -161,6 +161,39 @@ def test_build_match_attributes_samples_and_stations():
     assert md.labelled_s["auto"] == pytest.approx(2 * len(in_auto) * 0.2)
 
 
+def test_auto_path_follows_robot_across_reseeded_slots():
+    # 2026casnd qm14: R3 tracks 6497 briefly, is lost, then re-seeds on 2724;
+    # 6497 reappears on R2 (unlabelled at first). 6497's path must be R3's
+    # first span + all of R2; 2724 gets only R3's second span.
+    clock = MatchClock(PERIODS)
+    auto = [fn for fn in range(600, 1800, 12) if (clock.at(fn) or ("",))[0] == "auto"]
+    t = {fn: clock.at(fn)[1] for fn in auto}
+    frames, r2_path, r3_path = [], [], []
+    for fn in auto:
+        robots = []
+        if t[fn] <= 4.0:                                     # R3 = 6497
+            robots.append(_robot("R3", "red", "6497", 10.0, 5.0))
+        elif t[fn] >= 6.0:                                   # R3 re-seeded = 2724
+            robots.append(_robot("R3", "red", "2724" if t[fn] >= 9.0 else None, 13.0, 1.5))
+        if t[fn] >= 4.6:                                     # R2 = 6497 again
+            robots.append(_robot("R2", "red", "6497" if t[fn] >= 8.0 else None, 8.0, 4.0))
+        frames.append({"frame_num": fn, "robots": robots})
+        for r in robots:
+            # the stored path skips some samples (coasting): must not split spans
+            if int(t[fn] * 10) % 7:
+                (r2_path if r["slot"] == "R2" else r3_path).append(
+                    {"frame_num": fn, "field_pos": r["field_pos"]})
+    md, _ = build_match("2026cur", "2026cur_qm8", {"id": "r"},
+                        _meta(frames, {"R2": r2_path, "R3": r3_path}), False, LINEUP, 2026)
+    a, b = md.teams[6497], md.teams[2724]
+    assert a.auto_slot == "R3+R2"
+    assert {(s.x, s.y) for s in a.auto_path} == {(10.0, 5.0), (8.0, 4.0)}
+    assert min(s.t_match for s in a.auto_path) < 4.6                # starts with R3 span, before R2
+    assert {(s.x, s.y) for s in b.auto_path} == {(13.0, 1.5)}
+    assert min(s.t_match for s in b.auto_path) >= 6.0
+    assert a.auto_label_share == 1.0 and b.auto_label_share == 1.0
+
+
 def test_build_match_duplicate_team_keeps_confirmed_slot():
     frames = [{"frame_num": 2400 + 12 * i, "robots": [
         _robot("B1", "blue", "3128", 3.0, 3.0),

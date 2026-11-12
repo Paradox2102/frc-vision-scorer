@@ -76,6 +76,12 @@ KNOBS = [
          section="Seeding & re-seeding"),
     Knob("opening_window_seconds", "OPENING_WINDOW_SECONDS", float, 6.0, min=0.0,
          section="Seeding & re-seeding"),
+    # Processing lead before the auto clock start_frame (teleop keeps 0.5 s).
+    # The broadcast clock holds 0:20 for 1.0-1.8 s after the real start, so
+    # the legacy 0.5 s lead missed starting positions and first motion;
+    # stops at the clock run's first sample. 0.5 reproduces the legacy lead.
+    Knob("auto_start_lead_seconds", "AUTO_START_LEAD_SECONDS", float, 2.5, min=0.0,
+         section="Seeding & re-seeding"),
     # Motion override: frame-diff pixel motion as positive robot evidence at
     # re-prompt boundaries — a moving detection claimed by a stationary mask
     # seeds anyway, and may evict a stationary once-absent object from a

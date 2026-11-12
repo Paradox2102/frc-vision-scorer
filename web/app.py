@@ -7168,8 +7168,11 @@ class InferenceJob:
             print(f"  [corner-calib] endgame layout switch: corner check on frames "
                   f"{frange[0]}-{frange[1]} (cutoff {eg['cutoff_s']:.1f} s, {eg['method']})")
         fps = float(self.video_fps or 30.0)
-        ccfg = cpm.CornerStepConfig(check_max_m=float(cfg.corner_check_max_m),
-                                    resolve_max_m=float(cfg.corner_resolve_max_m))
+        ccfg = cpm.CornerStepConfig(
+            check_max_m=float(cfg.corner_check_max_m),
+            resolve_max_m=float(cfg.corner_resolve_max_m),
+            same_view_fallback=bool(getattr(cfg, "corner_same_view_fallback", True)),
+            same_view_max_px=float(getattr(cfg, "corner_same_view_max_px", 8.0)))
         drop = bool(cfg.corner_drop_on_fail)
         judge = _auto_calib_judge()
         sel = getattr(self, "_view_selection", None) or {}
@@ -7188,11 +7191,20 @@ class InferenceJob:
                                  if (x.get("source") or {}).get("method") != "auto_per_match"],
                                 self.match_key)
             alts = [base] if base is not None and base["version_id"] != epoch["version_id"] else []
+            # Same-view fallback reference: the epoch's calibration frame (median
+            # of its source match), cached per version so later jobs need no
+            # source video.
+            def ref_view_fn(ep=epoch, cam=v.name, crop=v.crop, ev=self.event_key):
+                evid = ep["version_id"]
+                return cpm.reference_view(
+                    ep, crop,
+                    load_cached=lambda: field_store.load_refview(ev, cam, evid),
+                    save_cached=lambda b: field_store.save_refview(ev, cam, evid, b))
             try:
                 out = cpm.corner_step(self.video_path, self.match_key, v.name, v.crop,
                                       v.masks, self.field_model, epoch, frange, fps, ccfg,
                                       judge=judge, rejected=rejected, drop_on_fail=drop,
-                                      alt_epochs=alts)
+                                      alt_epochs=alts, ref_view_fn=ref_view_fn)
             except Exception as e:
                 import traceback
                 traceback.print_exc()

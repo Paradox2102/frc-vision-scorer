@@ -336,3 +336,30 @@ def save_permatch_preview(event_key, camera, match_key, jpeg_bytes: bytes) -> st
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_write(permatch_preview_path(event_key, camera, match_key), jpeg_bytes)
     return permatch_preview_name(event_key, camera, match_key)
+
+
+# ---- reference (calibration-frame) views for the per-match same-view check -----
+
+def refview_name(event_key: str, camera: str, version_id: str) -> str:
+    """File name of a version's cached calibration-frame median (JPEG). Versions are
+    immutable in their source frame, so the cache never needs invalidating."""
+    safe_v = "".join(c for c in str(version_id) if c.isalnum() or c in "_-")
+    return f"calibration_refview_{_auto_safe(event_key, camera)}__{safe_v}.jpg"
+
+
+def refview_path(event_key: str, camera: str, version_id: str) -> Path:
+    return UPLOAD_DIR / refview_name(event_key, camera, version_id)
+
+
+def save_refview(event_key, camera, version_id, jpeg_bytes: bytes) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(refview_path(event_key, camera, version_id), jpeg_bytes)
+    return refview_name(event_key, camera, version_id)
+
+
+def load_refview(event_key, camera, version_id) -> bytes | None:
+    p = refview_path(event_key, camera, version_id)
+    try:
+        return p.read_bytes() if p.is_file() else None
+    except OSError:
+        return None

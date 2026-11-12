@@ -832,6 +832,20 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("corner_resolve_max_m", "CORNER_RESOLVE_MAX_M", float, 0.15, min=0.01, max=5.0,
          section="Fusion & field position"),
+    # Same-view fallback for the per-match corner check. 2025 corners (2025hop)
+    # see only 1-2 AprilTags, so the tag check above is inconclusive on every
+    # match and the re-solve cannot run either (needs >= 3 tags) -> both corners
+    # were dropped from every job although the cameras never moved. When NO check
+    # frame shows enough tags (never when tags measure the epoch off), this
+    # match's median corner view is registered onto the epoch's calibration
+    # frame (ORB + RANSAC homography; reference median cached as
+    # calibration_refview_*.jpg in uploads); if no crop corner/centre moves more
+    # than corner_same_view_max_px the epoch is kept. 2025hop qm1 vs qm2-4: 1-7 px
+    # on ~965x347 crops. DEFAULT ON. Off = drop as before.
+    Knob("corner_same_view_fallback", "CORNER_SAME_VIEW_FALLBACK", bool, True,
+         section="Fusion & field position"),
+    Knob("corner_same_view_max_px", "CORNER_SAME_VIEW_MAX_PX", float, 8.0, min=0.5,
+         max=50.0, section="Fusion & field position"),
     # Event lineup store (docs/superpowers/specs/2026-11-10-event-lineup-design.md):
     # window_labels' lineup card borrows rows, for teams this match did not
     # read at p >= 0.85 twice, from the anchors earlier matches of the event

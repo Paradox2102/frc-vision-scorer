@@ -297,3 +297,203 @@ def test_implausible_epoch_is_never_kept(tmp_path, monkeypatch):
                           _epoch(flipped), (0, 29), 1.0, detect_fn=_det(flipped),
                           roi_detect_fn=lambda f: {}, log=lambda m: None)
     assert out.status == "dropped" and "implausible" in out.reason
+
+
+# ------------------------------------------------------- same-view fallback
+# 2025 corners see only 1-2 tags: the tag check is inconclusive every match. When
+# this match's view registers onto the epoch's calibration frame, keep the epoch.
+
+from tests.field.test_view_registration import _crop, _scene   # noqa: E402
+
+SCENE = _scene()
+REF_IMG = _crop(SCENE)                       # the epoch's calibration view
+SAME_IMG = _crop(SCENE, dx=2)                # this match, unchanged camera
+MOVED_IMG = _crop(SCENE, dx=30, dy=6)        # this match, camera re-aimed
+
+
+def _ref_fn(img=REF_IMG, calls=None):
+    def fn():
+        if calls is not None:
+            calls.append(1)
+        return {"image": img, "match_key": "evt_qm1", "timestamp": 125.8,
+                "reason": None if img is not None else "source video not local"}
+    return fn
+
+
+def _sv_step(tmp_path, monkeypatch, match_img, *, best_m=None, cfg=None, ref_fn="default",
+             resolve_ok=False):
+    """corner_step with the tag check stubbed to ``best_m`` and this match's median
+    stubbed to ``match_img``; returns (outcome, run_camera call count)."""
+    monkeypatch.setattr(cpm, "check_epoch", lambda *a, **k: {
+        "best_m": best_m, "n_tags": 0 if best_m is None else 3,
+        "min_tags_used": None if best_m is None else 3, "frames": 6,
+        "frames_used": 0 if best_m is None else 6})
+    monkeypatch.setattr(ac, "median_frame", lambda *a, **k: match_img.copy())
+    runs = []
+
+    def fake_run(*a, **k):
+        runs.append(1)
+        if resolve_ok:
+            return ac.AutoCalibResult(ac.new_record("ready", "ok", metrics={}), MOVED, None)
+        return ac.AutoCalibResult(ac.new_record(
+            "failed", "only 1 known tags found (need >= 3)"), None, None)
+    monkeypatch.setattr(ac, "run_camera", fake_run)
+    cfg = cfg or cpm.CornerStepConfig(detect_motion=False)
+    out = cpm.corner_step(_video(tmp_path), "evt_qm5", "corner_left", CROP, (), FM,
+                          _epoch(), (0, 29), 1.0, cfg, detect_fn=lambda f: {},
+                          roi_detect_fn=lambda f: {}, log=lambda m: None,
+                          ref_view_fn=_ref_fn() if ref_fn == "default" else ref_fn)
+    return out, len(runs)
+
+
+def test_same_view_keeps_epoch_without_resolve(tmp_path, monkeypatch):
+    out, runs = _sv_step(tmp_path, monkeypatch, SAME_IMG)
+    assert out.status == "kept", out.reason
+    assert runs == 0 and out.calibration is None and out.epoch_checked == "v0"
+    assert "too few tags" in out.reason and "evt_qm1 @ 125.8 s" in out.reason
+    m = out.metrics
+    assert 1.0 < m["same_view_px"] < 3.0 and m["same_view_inliers"] >= 60
+    assert m["same_view_ref"] == "evt_qm1"
+    assert out.overlay is not None
+
+
+def test_moved_view_falls_through_and_drops(tmp_path, monkeypatch):
+    out, runs = _sv_step(tmp_path, monkeypatch, MOVED_IMG)
+    assert out.status == "dropped" and runs == 1
+    assert "did not validate" in out.reason
+    assert "calibration frame" in out.reason            # the same-view result is explained
+    assert out.metrics["same_view_ref"] == "evt_qm1"
+    assert out.metrics.get("same_view_px") is None or out.metrics["same_view_px"] > 8.0
+
+
+def test_moved_view_can_still_adopt_a_resolve(tmp_path, monkeypatch):
+    out, runs = _sv_step(tmp_path, monkeypatch, MOVED_IMG, resolve_ok=True)
+    assert out.status == "adopted" and runs == 1
+
+
+def test_tags_measured_off_never_consult_the_view(tmp_path, monkeypatch):
+    calls = []
+    out, runs = _sv_step(tmp_path, monkeypatch, SAME_IMG, best_m=0.9,
+                         ref_fn=_ref_fn(calls=calls))
+    assert calls == [] and runs == 1 and out.status == "dropped"
+    assert "same_view_px" not in out.metrics
+
+
+def test_fallback_disabled_is_old_behaviour(tmp_path, monkeypatch):
+    calls = []
+    out, runs = _sv_step(tmp_path, monkeypatch, SAME_IMG, ref_fn=_ref_fn(calls=calls),
+                         cfg=cpm.CornerStepConfig(detect_motion=False,
+                                                  same_view_fallback=False))
+    assert calls == [] and runs == 1 and out.status == "dropped"
+    assert "same_view_ref" not in out.metrics
+
+
+def test_no_reference_is_old_behaviour(tmp_path, monkeypatch):
+    out, runs = _sv_step(tmp_path, monkeypatch, SAME_IMG, ref_fn=_ref_fn(img=None))
+    assert out.status == "dropped" and runs == 1
+    assert "source video not local" in out.metrics["same_view_reason"]
+    out, runs = _sv_step(tmp_path, monkeypatch, SAME_IMG, ref_fn=None)
+    assert out.status == "dropped" and runs == 1
+
+
+def test_rejected_match_still_kept_by_same_view(tmp_path, monkeypatch):
+    monkeypatch.setattr(cpm, "check_epoch", lambda *a, **k: {
+        "best_m": None, "n_tags": 0, "min_tags_used": None, "frames": 6, "frames_used": 0})
+    monkeypatch.setattr(ac, "median_frame", lambda *a, **k: SAME_IMG.copy())
+    monkeypatch.setattr(ac, "run_camera", lambda *a, **k: pytest.fail("must not re-solve"))
+    out = cpm.corner_step(_video(tmp_path), "evt_qm5", "corner_left", CROP, (), FM,
+                          _epoch(), (0, 29), 1.0, cpm.CornerStepConfig(detect_motion=False),
+                          detect_fn=lambda f: {}, roi_detect_fn=lambda f: {},
+                          log=lambda m: None, rejected=True, ref_view_fn=_ref_fn())
+    assert out.status == "kept"
+
+
+# ------------------------------------------------------- reference view builder
+
+def _src_epoch(**src):
+    e = _epoch()
+    e["source"] = {"match_key": "evt_qm1", "timestamp": 125.8, "crop": list(CROP), **src}
+    return e
+
+
+def test_reference_view_builds_median_and_caches(tmp_path, monkeypatch):
+    vid = tmp_path / "evt_qm1.mp4"
+    vid.write_bytes(b"x")
+    seen = {}
+
+    def fake_median(video, crop, lo, hi, n=31, **k):
+        seen.update(video=video, crop=tuple(crop), lo=lo, hi=hi, n=n)
+        return REF_IMG.copy()
+    monkeypatch.setattr(ac, "median_frame", fake_median)
+    saved = []
+    r = cpm.reference_view(_src_epoch(), CROP, video_for=lambda mk: vid,
+                           load_cached=lambda: None, save_cached=saved.append)
+    assert r["image"] is not None and r["match_key"] == "evt_qm1" and r["timestamp"] == 125.8
+    assert seen["hi"] == 125.8 and seen["lo"] < 125.8 and seen["lo"] >= 125.8 - 30
+    assert saved and saved[0].startswith(b"\xff\xd8")       # cached as JPEG
+    # cache hit: no video needed
+    monkeypatch.setattr(ac, "median_frame", lambda *a, **k: pytest.fail("cache must win"))
+    r2 = cpm.reference_view(_src_epoch(), CROP, video_for=lambda mk: None,
+                            load_cached=lambda: saved[0], save_cached=None)
+    assert r2["image"].shape == REF_IMG.shape and r2["reason"] is None
+
+
+@pytest.mark.parametrize("epoch,why", [
+    (_epoch(), "no calibration source"),
+    (_src_epoch(timestamp=None), "no calibration source"),
+    (_src_epoch(crop=[0, 733, 965, 347]), "crop"),
+    (_src_epoch(), "not local"),
+])
+def test_reference_view_unavailable(epoch, why, monkeypatch):
+    monkeypatch.setattr(ac, "median_frame", lambda *a, **k: pytest.fail("must not read"))
+    r = cpm.reference_view(epoch, CROP, video_for=lambda mk: None,
+                           load_cached=lambda: None, save_cached=None)
+    assert r["image"] is None and why in r["reason"]
+
+
+def test_refview_store_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+    assert field_store.load_refview("e", "corner_left", "v1") is None
+    name = field_store.save_refview("e", "corner_left", "v1", b"\xff\xd8jpg")
+    assert (tmp_path / name).is_file() and name.endswith(".jpg") and "v1" in name
+    assert field_store.refview_path("e", "corner_left", "v1") == tmp_path / name
+    assert field_store.load_refview("e", "corner_left", "v1") == b"\xff\xd8jpg"
+    assert field_store.load_refview("e", "corner_right", "v1") is None
+
+
+# ------------------------------------------------------- job wiring
+
+def test_same_view_knob_defaults():
+    from web.job_config import JobConfig
+    c = JobConfig()
+    assert (c.corner_same_view_fallback, c.corner_same_view_max_px) == (True, 8.0)
+    with pytest.raises(Exception):
+        JobConfig({"corner_same_view_max_px": 0.1})
+
+
+def test_job_passes_same_view_knobs_and_ref_fn(app_mod, tmp_path, monkeypatch):
+    job, v0 = _job(app_mod, tmp_path, {"corner_same_view_fallback": False,
+                                       "corner_same_view_max_px": 5.0})
+    seen = {}
+
+    def fake(video, mk, cam, crop, masks, fm, epoch, frange, fps, cfg, **k):
+        seen["cfg"], seen["ref"] = cfg, k.get("ref_view_fn")
+        return _fake_outcome("kept")()
+    monkeypatch.setattr(cpm, "corner_step", fake)
+    out = app_mod.InferenceJob._corner_per_match_step(job)
+    assert seen["cfg"].same_view_fallback is False and seen["cfg"].same_view_max_px == 5.0
+    assert callable(seen["ref"])
+    assert out["corner_left"]["status"] == "kept" and out["corner_left"]["version_id"] == "v0"
+    # the job's ref_view_fn caches through the store
+    monkeypatch.setattr(ac, "local_video_for", lambda mk: None)
+    r = seen["ref"]()
+    assert r["image"] is None                         # _job's v0 has no source
+    vid = field_store.save_version("evt", "corner_left", BASE, source={
+        "match_key": "evt_qm5", "timestamp": 20.0, "crop": list(CROP)})
+    field_store.save_refview("evt", "corner_left", vid, ac.encode_jpeg(REF_IMG, 95))
+    job2, _ = _job(app_mod, tmp_path)
+    job2._view_selection = {"corner_left": vid}
+    monkeypatch.setattr(ac, "median_frame", lambda *a, **k: pytest.fail("cache must win"))
+    app_mod.InferenceJob._corner_per_match_step(job2)
+    r = seen["ref"]()
+    assert r["image"] is not None and r["match_key"] == "evt_qm5"

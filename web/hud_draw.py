@@ -237,11 +237,100 @@ def draw_ocr_regions(img: np.ndarray, regions: dict) -> None:
         cv2.putText(img, region_key, (rx, ry - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, rect_color, 1)
 
 
+# BGR colour per AdvantageScope wireframe group (non-2026 seasons). Groups not listed
+# draw grey; WIREFRAME_SKIP_GROUPS are not drawn (floor decals / loose bits).
+WIREFRAME_GROUP_COLORS = {
+    "reef": (255, 220, 0),
+    "barge": (255, 0, 255),
+    "coral_station": (0, 140, 255),
+    "processor": (180, 80, 255),
+    "perimeter": (200, 200, 200),
+    "tape": (255, 255, 255),
+}
+WIREFRAME_DEFAULT_COLOR = (160, 160, 160)
+WIREFRAME_SKIP_GROUPS = frozenset({"floor", "other"})
+_WIRE_SAMPLE_M = 0.25        # sample spacing along a GLB edge (lens distortion)
+_WIRE_MAX_SAMPLES = 24
+
+
+def _project_many(cal, pts) -> np.ndarray:
+    """(N, 3) field points -> (N, 2) pixels, the batch form of cal.field_to_image
+    (same model per mode; homography ignores z, as field_to_image does)."""
+    pts = np.asarray(pts, np.float64).reshape(-1, 3)
+    if len(pts) == 0:
+        return np.zeros((0, 2))
+    if cal.mode == "homography":
+        Hinv = np.linalg.inv(cal.H)
+        return cv2.perspectiveTransform(pts[:, :2].reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+    obj = pts.reshape(-1, 1, 3)
+    if cal.mode == "pinhole":
+        D = np.asarray(cal.D, float).reshape(-1, 1)
+        img, _ = cv2.projectPoints(obj, cal.rvec, cal.tvec, cal.K, D)
+    else:
+        img, _ = cv2.fisheye.projectPoints(obj, cal.rvec, cal.tvec, cal.K, cal.D)
+    return img.reshape(-1, 2)
+
+
+def _in_front(cal, pts, min_z: float = 0.05) -> np.ndarray:
+    """(N,) bool: the point is in front of the camera. projectPoints mirrors points
+    behind it onto the image, which streaks structures a close corner camera sits
+    beside across the frame. Pose-free (homography) calibrations: all True."""
+    pts = np.asarray(pts, np.float64).reshape(-1, 3)
+    if cal.mode == "homography" or cal.rvec is None or cal.tvec is None:
+        return np.ones(len(pts), bool)
+    R, _ = cv2.Rodrigues(np.asarray(cal.rvec, float))
+    z = pts @ R[2] + float(np.asarray(cal.tvec, float).reshape(3)[2])
+    return z > min_z
+
+
+def _draw_glb_wireframe(frame, cal, groups) -> None:
+    """Draw AdvantageScope wireframe groups ({name: (N, 6) segments}) as sampled
+    polylines, broken wherever a sample is non-finite or projects more than 10000 px
+    off-screen (the same rule as draw_field_wireframe's seg3), or lies behind the
+    camera."""
+    H, Wd = frame.shape[:2]
+    for name, segs in groups.items():
+        if name in WIREFRAME_SKIP_GROUPS or segs is None or len(segs) == 0:
+            continue
+        color = WIREFRAME_GROUP_COLORS.get(name, WIREFRAME_DEFAULT_COLOR)
+        segs = np.asarray(segs, float).reshape(-1, 6)
+        a, b = segs[:, :3], segs[:, 3:]
+        n = np.clip(np.ceil(np.linalg.norm(b - a, axis=1) / _WIRE_SAMPLE_M),
+                    1, _WIRE_MAX_SAMPLES).astype(int)
+        P = np.vstack([a[i] + (b[i] - a[i]) * np.linspace(0.0, 1.0, k + 1)[:, None]
+                       for i, k in enumerate(n)])
+        uv = _project_many(cal, P)
+        good = (np.all(np.isfinite(uv), axis=1) & _in_front(cal, P)
+                & (uv[:, 0] >= -10000) & (uv[:, 0] <= Wd + 10000)
+                & (uv[:, 1] >= -10000) & (uv[:, 1] <= H + 10000))
+        polys = []
+        start = 0
+        for k in n:
+            run = []
+            for j in range(start, start + k + 1):
+                if good[j]:
+                    run.append((int(uv[j, 0]), int(uv[j, 1])))
+                else:
+                    if len(run) >= 2:
+                        polys.append(np.array(run, np.int32))
+                    run = []
+            if len(run) >= 2:
+                polys.append(np.array(run, np.int32))
+            start += k + 1
+        if polys:
+            cv2.polylines(frame, polys, False, color, 1)
+
+
 def draw_field_wireframe(frame, cal, fm):
-    """Draw the reprojected field, hubs, and bumps using cal.field_to_image.
+    """Draw the reprojected field and its structures using cal.field_to_image.
     Field lines are SAMPLED into polylines (a straight field line projects to a curved
     image line under lens distortion, so a 2-point segment can't trace it).
+    Every season gets the perimeter + 2 m grid. 2026 (web.field.season.is_2026) adds
+    the hand-coded hubs, bumps, towers and trenches; other seasons add their
+    AdvantageScope GLB wireframe groups (data/field/wireframes/<season>.json), and a
+    season without one draws just the perimeter and grid.
     Returns fp(x,y)->(int,int) so callers can add their own markers."""
+    from web.field.season import is_2026, wireframe_for
     L, W = fm.length_m, fm.width_m
     H, Wd = frame.shape[:2]
     def fp(x, y):
@@ -282,6 +371,11 @@ def draw_field_wireframe(frame, cal, fm):
     y = 0.0
     while y <= W + 1e-6:
         seg((0, y), (L, y), (0, 180, 0), 1); y += 2.0
+    if not is_2026(fm):
+        groups = wireframe_for(fm)
+        if groups:
+            _draw_glb_wireframe(frame, cal, groups)
+        return fp
     prisms = hub_prisms(fm)
     for a, b in hub_wireframe_edges(prisms):
         seg3(a, b, (255, 220, 0), 2, n=12)

@@ -1,4 +1,10 @@
-"""Wireframe geometry used to validate field-camera calibration."""
+"""Wireframe geometry used to validate field-camera calibration.
+
+The hand-coded structures here (hub, bump, tower, trench) are the 2026 REBUILT
+field. Other seasons draw their AprilTag-derived structures (2025 reefs) and the
+AdvantageScope GLB wireframe instead (web.hud_draw); every function here returns
+nothing for a field that is not 2026 (web.field.season.is_2026) rather than look up
+2026 tag ids that field does not have."""
 from __future__ import annotations
 
 import numpy as np
@@ -51,6 +57,20 @@ def hub_center(prism) -> tuple[float, float]:
     return float((lo[0] + hi[0]) / 2.0), float((lo[1] + hi[1]) / 2.0)
 
 
+def _has_tags(field_model, ids) -> bool:
+    tags = getattr(field_model, "tags", None) or {}
+    return all(i in tags for i in ids)
+
+
+def _is_2026(field_model) -> bool:
+    from web.field.season import is_2026
+    return is_2026(field_model)
+
+
+def _hub_only(prisms):
+    return [p for p in prisms if getattr(p, "kind", "hub") == "hub"]
+
+
 def _tower_center_y(field_model, anchor_tag: int) -> float:
     return float(field_model.tag_translation(anchor_tag)[1])
 
@@ -75,10 +95,20 @@ def structure_footprints(field_model, prisms) -> dict:
     Single source of truth shared by the calibrate overlay (wireframes above)
     and the 2D field map: hub cabinet bases, bumps, towers, trenches. Returns
     {"hubs": [poly], "bumps": [...], "towers": [...], "trenches": [...]}
-    where each poly is a list of (x, y) vertices in drawing order."""
+    where each poly is a list of (x, y) vertices in drawing order.
+
+    2025: {"reefs": [hexagon, ...]} from the reef prisms. A field without
+    modelled structures: {}."""
+    from web.field.season import STRUCTURE_2025_REEF, STRUCTURE_2026_HUB, structure_kind
+    kind = structure_kind(field_model)
+    if kind == STRUCTURE_2025_REEF:
+        return {"reefs": [[(float(x), float(y)) for x, y in np.asarray(p.footprint, float)]
+                          for p in prisms if getattr(p, "kind", "hub") == "reef"]}
+    if kind != STRUCTURE_2026_HUB:
+        return {}
     out = {"hubs": [], "bumps": [], "towers": [], "trenches": []}
 
-    for prism in prisms:
+    for prism in _hub_only(prisms):
         poly = np.asarray(prism.footprint, float)
         cx, cy = hub_center(prism)
         bh = HUB_BASE_WIDTH_M / 2.0
@@ -96,6 +126,8 @@ def structure_footprints(field_model, prisms) -> dict:
             out["bumps"].append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
     for tag_ids, anchor_tag, inward_sign in TOWER_ANCHORS:
+        if not _has_tags(field_model, tag_ids):
+            continue
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         panel_x = float(pts[:, 0].mean())
         frame_x = panel_x + inward_sign * TOWER_DEPTH_M
@@ -105,6 +137,8 @@ def structure_footprints(field_model, prisms) -> dict:
         out["towers"].append([(xa, y0), (xb, y0), (xb, y1), (xa, y1)])
 
     for tag_ids in ((17, 28), (22, 23), (6, 7), (1, 12)):
+        if not _has_tags(field_model, tag_ids):
+            continue
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         center_x = float(pts[:, 0].mean())
         tagged_y = float(pts[:, 1].mean())
@@ -124,9 +158,10 @@ def structure_footprints(field_model, prisms) -> dict:
 
 
 def hub_wireframe_edges(prisms):
-    """Dimensioned hub cabinet, opening, and tapered upper frame."""
+    """Dimensioned hub cabinet, opening, and tapered upper frame (2026 hub
+    prisms only; reef prisms are skipped)."""
     edges = []
-    for prism in prisms:
+    for prism in _hub_only(prisms):
         cx, cy = hub_center(prism)
         base_half = HUB_BASE_WIDTH_M / 2.0
         top_half = HUB_TOP_WIDTH_M / 2.0
@@ -171,9 +206,14 @@ def hub_wireframe_edges(prisms):
 
 
 def tower_wireframe_edges(field_model):
-    """Tower panel, uprights, rungs, and depth braces anchored to tower tags."""
+    """Tower panel, uprights, rungs, and depth braces anchored to tower tags.
+    [] on a non-2026 field."""
     edges = []
+    if not _is_2026(field_model):
+        return edges
     for tag_ids, anchor_tag, inward_sign in TOWER_ANCHORS:
+        if not _has_tags(field_model, tag_ids):
+            continue
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         panel_x = float(pts[:, 0].mean())
         frame_x = panel_x + inward_sign * TOWER_DEPTH_M
@@ -220,10 +260,14 @@ def trench_wireframe_edges(field_model):
 
     The STEP assembly uses a centered field coordinate frame. The fixed arm
     reaches the adjacent bump, while the hinged arm has a shorter field-side
-    extent. AprilTag pairs anchor each arm's x center.
+    extent. AprilTag pairs anchor each arm's x center. [] on a non-2026 field.
     """
     edges = []
+    if not _is_2026(field_model):
+        return edges
     for tag_ids in ((17, 28), (22, 23), (6, 7), (1, 12)):
+        if not _has_tags(field_model, tag_ids):
+            continue
         pts = np.array([field_model.tag_translation(i) for i in tag_ids], float)
         center_x = float(pts[:, 0].mean())
         tagged_y = float(pts[:, 1].mean())
@@ -255,10 +299,11 @@ def bump_wireframe_edges(prisms, field_width):
     """Return triangular-prism wireframes for the four bumps.
 
     Each hub has one bump on its near-sideline side and one on its far-sideline
-    side. The hub footprint anchors their exact field placement.
+    side. The hub footprint anchors their exact field placement. (2026 hub
+    prisms only; reef prisms are skipped.)
     """
     edges = []
-    for prism in prisms:
+    for prism in _hub_only(prisms):
         poly = np.asarray(prism.footprint, float)
         center_x, _ = hub_center(prism)
         x0 = center_x - BUMP_DEPTH_M / 2.0

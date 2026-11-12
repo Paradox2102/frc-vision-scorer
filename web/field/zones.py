@@ -45,11 +45,15 @@ def prism_bounding_zones(prisms, margin=0.2) -> list:
     for prism in prisms:
         xs = prism.footprint[:, 0]
         ys = prism.footprint[:, 1]
+        # A reef is a hexagon: its bounding rect already overhangs the four angled
+        # faces, where robots score with their centres ~0.4 m off the face, so a
+        # margin would block seeding them (rect corners reach past the faces).
+        m = 0.0 if getattr(prism, "kind", "hub") == "reef" else margin
         zones.append((
-            float(xs.min()) - margin,
-            float(ys.min()) - margin,
-            float(xs.max()) + margin,
-            float(ys.max()) + margin,
+            float(xs.min()) - m,
+            float(ys.min()) - m,
+            float(xs.max()) + m,
+            float(ys.max()) + m,
         ))
     return zones
 

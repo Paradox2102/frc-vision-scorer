@@ -1,8 +1,10 @@
 """Occlusion geometry (pure NumPy + a CameraCalibration for projection).
 
-An occluder lies between the camera and the robot. Hubs are static prisms derived
-from the tallest tag z-ring; persons/robots are depth-ordered boxes. Produces, per
-track, view_occluded (drives coasting) and bumper_occluded (gates VLM reads)."""
+An occluder lies between the camera and the robot. Fixed structures are static
+prisms built per season (web.field.season.structure_kind): 2026 hubs from the
+tallest tag z-ring, 2025 reefs from the reef-face tags, none on other fields;
+persons/robots are depth-ordered boxes. Produces, per track, view_occluded (drives
+coasting) and bumper_occluded (gates VLM reads)."""
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
@@ -13,6 +15,16 @@ class Prism:
     footprint: np.ndarray   # (N,2) convex polygon, field meters
     z_top: float
     z_bottom: float = 0.0
+    kind: str = "hub"       # "hub" (2026) | "reef" (2025)
+
+
+# 2025 REEFSCAPE reefs (data/field/FIELD_REFERENCE_2025.md): one tag per hexagon
+# face, 0.83 m from the reef centre. The AdvantageScope wireframe's reef base hexagon
+# has circumradius 0.956 m (= 0.828 / cos 30), so the tag ring IS the base outline.
+# Height: the wireframe's reef mesh tops out at 1.37 m (its central column; the coral
+# branches are not in the extracted edges); the L4 branches reach 72 in (1.83 m).
+REEF_TAG_GROUPS = ((17, 18, 19, 20, 21, 22), (6, 7, 8, 9, 10, 11))   # blue, red
+REEF_HEIGHT_M = 72.0 * 0.0254
 
 
 def _zgroups(zs, tol=0.05):
@@ -42,8 +54,48 @@ def _convex_hull(pts):
 
 
 def hub_prisms(field_model):
+    """The fixed-structure prisms of ``field_model``'s season: the two 2026 hubs,
+    the two 2025 reefs, or [] for a field without modelled structures. (Named for
+    the 2026 hubs; every no-robot-zone / occluder / radar consumer calls this.)"""
+    from web.field.season import (STRUCTURE_2025_REEF, STRUCTURE_2026_HUB,
+                                  structure_kind)
+    kind = structure_kind(field_model)
+    if kind == STRUCTURE_2026_HUB:
+        return _hub_prisms_2026(field_model)
+    if kind == STRUCTURE_2025_REEF:
+        return reef_prisms(field_model)
+    return []
+
+
+structure_prisms = hub_prisms
+
+
+def reef_prisms(field_model):
+    """One hexagonal prism per 2025 reef: centre = mean of its 6 face tags, flat
+    faces through the tags (apothem = mean tag distance), vertices 30 deg off each
+    face normal. A reef missing any face tag is skipped."""
+    prisms = []
+    for ids in REEF_TAG_GROUPS:
+        if not all(i in field_model.tags for i in ids):
+            continue
+        xy = np.array([field_model.tag_translation(i)[:2] for i in ids], float)
+        c = xy.mean(axis=0)
+        d = xy - c
+        apothem = float(np.linalg.norm(d, axis=1).mean())
+        radius = apothem / np.cos(np.pi / 6.0)
+        normals = np.sort(np.arctan2(d[:, 1], d[:, 0]))
+        verts = [c + radius * np.array([np.cos(a + np.pi / 6.0), np.sin(a + np.pi / 6.0)])
+                 for a in normals]
+        prisms.append(Prism(footprint=np.array(verts), z_top=float(REEF_HEIGHT_M),
+                            kind="reef"))
+    return prisms
+
+
+def _hub_prisms_2026(field_model):
     """Two hub prisms from the tallest tag z-group, split at the field midline."""
     ids = list(field_model.tags)
+    if not ids:
+        return []
     ts = np.array([field_model.tag_translation(i) for i in ids])  # (N,3)
     top = _zgroups(ts[:, 2])[-1]
     mask = np.isin(np.round(ts[:, 2], 3), np.round(top, 3))

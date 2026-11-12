@@ -789,7 +789,14 @@ KNOBS = [
     # it only acts with the student readers (Jev-only runs have no colours).
     # Labels are unconfirmed (segment source window_elim). Offline qm8 hand
     # GT WITHOUT the colour gate: ~+2-3 pts correct but ~1/3 wrong (all
-    # cross-alliance slots); gated numbers TBD. Default OFF. Needs
+    # cross-alliance slots). WITH the gate (Nov 11): qm8 GT correct 59.9 ->
+    # 61.7%, wrong flat 1.7%, misID flat 12.8 s (54 GT-checked frames right,
+    # 0 wrong); held-out Jev audit of the added frames (casnd qm14/26/30)
+    # only 14 right / 6 wrong of 20 confidently judged - 4 of the 6 are a
+    # duplicate slot sitting on a partner's robot (partner 1.2-1.4 m away
+    # holding the team the judge saw). Stays OFF until a duplicate-slot guard
+    # is validated on more matches (s1_colours are now stored in every
+    # replay's window_labels_digit_calls for offline re-evaluation). Needs
     # window_labels. WINDOW_LABELS_ELIMINATE=1 to enable.
     Knob("window_labels_eliminate", "WINDOW_LABELS_ELIMINATE", bool, False,
          section="Identity & votes"),

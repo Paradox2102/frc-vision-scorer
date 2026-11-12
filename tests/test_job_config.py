@@ -666,6 +666,19 @@ def test_window_labels_fill_knob_default_on(monkeypatch):
     assert JobConfig().window_labels_fill is False
 
 
+def test_window_labels_eliminate_knob_default_off(monkeypatch):
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.window_labels_eliminate is False
+    assert "window_labels_eliminate" not in cfg.non_defaults()
+    assert JobConfig({"window_labels_eliminate": "true"}).window_labels_eliminate is True
+    assert next(k for k in KNOBS if k.name == "window_labels_eliminate").section == \
+        "Identity & votes"
+    monkeypatch.setenv("WINDOW_LABELS_ELIMINATE", "1")
+    assert JobConfig().window_labels_eliminate is True
+
+
 def test_window_labels_reader_knob_default_student_only(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

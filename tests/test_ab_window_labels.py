@@ -67,6 +67,15 @@ def test_fill_profile_arms():
         JobConfig(cfg)                                   # every arm is a valid config
 
 
+def test_eliminate_profile_arms():
+    from web.job_config import JobConfig
+    arms = dict(ab.PROFILES["wl-elim"])
+    assert arms == {"wl_noelim": {"window_labels": True, "window_labels_eliminate": False},
+                    "wl_elim": {"window_labels": True, "window_labels_eliminate": True}}
+    for cfg in arms.values():
+        JobConfig(cfg)                                   # every arm is a valid config
+
+
 def test_student_reader_profile_arms():
     from web.job_config import JobConfig
     arms = dict(ab.PROFILES["wl-student"])

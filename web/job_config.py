@@ -780,6 +780,19 @@ KNOBS = [
     # to disable.
     Knob("window_labels_fill", "WINDOW_LABELS_FILL", bool, True,
          section="Identity & votes"),
+    # Window-label chain roster elimination (window_labels.eliminate_chains),
+    # EXPERIMENTAL: after the fill, an unlabelled frame of a track chain takes
+    # the third team of its slot's alliance when the alliance's other two
+    # teams are read (digits / lineup) on its other slots in that frame and
+    # the third team is on no other slot. Gated on the chain's S1 bumper
+    # colours (every coloured sample must be the slot's alliance colour), so
+    # it only acts with the student readers (Jev-only runs have no colours).
+    # Labels are unconfirmed (segment source window_elim). Offline qm8 hand
+    # GT WITHOUT the colour gate: ~+2-3 pts correct but ~1/3 wrong (all
+    # cross-alliance slots); gated numbers TBD. Default OFF. Needs
+    # window_labels. WINDOW_LABELS_ELIMINATE=1 to enable.
+    Knob("window_labels_eliminate", "WINDOW_LABELS_ELIMINATE", bool, False,
+         section="Identity & votes"),
     # Window-label digit reader (teacher-distillation spec section 14): "jev"
     # sends every digit request to Jev (unchanged); "student" reads every
     # window sample first with the local S1 student (bumper detector box near

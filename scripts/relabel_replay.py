@@ -21,8 +21,11 @@ Usage
     .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --deinterlace \
         --reader student      # S1 student first, Jev only where S1 is undecided (GPU)
     .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --no-fill
+    .venv/bin/python scripts/relabel_replay.py --replay a0bbc991 --score --eliminate
 
 --fill / --no-fill: the window_labels_fill knob (default on, like live).
+--eliminate: the window_labels_eliminate knob (experimental, default off;
+colour-gated, so it needs a student reader).
 
 Per-replay inputs come from the replay (event-lineup spec section 5b):
 ground_center_offset_m from summary.config (0.0 when the replay records no
@@ -214,6 +217,7 @@ class Options:
     deinterlace: bool = False                       # window_labels_deinterlace
     reader: str = "student_only"                    # window_labels_reader (live default)
     fill: bool = True                               # window_labels_fill (live default)
+    eliminate: bool = False                         # window_labels_eliminate (live default)
 
 
 def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: Options,
@@ -250,7 +254,7 @@ def relabel_one(row: dict, meta: dict, video, cal, red: list, blue: list, opts: 
         this_colors={**{t: "red" for t in red}, **{t: "blue" for t in blue}},
         use_elimination=opts.use_elimination, rows_alliance_only=opts.alliance_rows,
         digit_calls=cache, deinterlace=opts.deinterlace, reader=opts.reader,
-        fill_runs=opts.fill)
+        fill_runs=opts.fill, eliminate=opts.eliminate)
     result = wl.run_window_labels(meta["frames"], str(video), cal, session, params,
                                   frame_source=frame_source, student=student)
     out = {"result": result, "relabelled": None, "stats": dict(result["stats"]),
@@ -357,6 +361,10 @@ def main(argv=None) -> None:
                          "knob; on by default, like live)")
     ap.add_argument("--no-fill", dest="fill", action="store_false",
                     help="leave unread windows unlabelled (window_labels_fill off)")
+    ap.add_argument("--eliminate", action="store_true", default=False,
+                    help="experimental colour-gated roster elimination after the fill (the "
+                         "window_labels_eliminate knob; off by default, like live; needs a "
+                         "student reader for bumper colours)")
     args = ap.parse_args(argv)
     if args.store_write and not args.event_lineup:
         ap.error("--store-write needs --event-lineup")
@@ -382,7 +390,7 @@ def main(argv=None) -> None:
                    before_match=args.before_match, store_write=args.store_write,
                    digit_cache=args.digit_cache, use_elimination=not args.no_elim,
                    alliance_rows=args.alliance_rows, deinterlace=args.deinterlace,
-                   reader=args.reader, fill=args.fill)
+                   reader=args.reader, fill=args.fill, eliminate=args.eliminate)
     print(f"replay {row['id'][:8]}  {row['match_key']}  video {video.name}")
     t0 = time.time()
     out = relabel_one(row, meta, video, cal, red, blue, opts, session, fps=fps,

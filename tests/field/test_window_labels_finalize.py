@@ -153,6 +153,31 @@ def test_the_fill_knob_reaches_the_stage_params_and_its_stats_reach_timings(monk
     assert timings["window_labels.fill_windows"] == 2
 
 
+def test_the_eliminate_knob_reaches_the_stage_params_and_its_stats_reach_timings(
+        monkeypatch, capsys):
+    seen = _stub(monkeypatch, _ok_result())
+    job, rec = _job()
+    _, timings = _apply(job, rec)
+    assert seen["params"].eliminate is False                  # knob absent: off
+    assert "window_labels.elim_frames" not in timings
+    assert "elimination" not in capsys.readouterr().out
+    res = _ok_result()
+    res["stats"] = {**res["stats"], "elim_frames": 12, "elim_chains": 2,
+                    "elim_chains_colour_skipped": 3}
+    res["digit_calls"] = {"calls": {0: [None]}, "wide_p": {}, "fingerprints": {},
+                          "s1_calls": {0: [None]}, "s1_colours": {0: ["blue"]}}
+    seen = _stub(monkeypatch, res)
+    job, rec = _job()
+    job.config.window_labels_eliminate = True
+    summary, timings = _apply(job, rec)
+    assert seen["params"].eliminate is True
+    assert summary["window_labels"]["elim_chains_colour_skipped"] == 3
+    assert timings["window_labels.elim_frames"] == 12
+    assert timings["window_labels.elim_chains"] == 2
+    assert summary["window_labels_digit_calls"]["s1_colours"] == {0: ["blue"]}
+    assert "elimination: 12 slot-frames in 2 chains" in capsys.readouterr().out
+
+
 def test_the_reader_knob_reaches_the_stage_params_and_its_stats_reach_timings(monkeypatch):
     seen = _stub(monkeypatch, _ok_result())
     job, rec = _job()

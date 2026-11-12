@@ -7308,6 +7308,7 @@ class InferenceJob:
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
                 deinterlace=bool(getattr(cfg, "window_labels_deinterlace", False)),
                 fill_runs=bool(getattr(cfg, "window_labels_fill", False)),
+                eliminate=bool(getattr(cfg, "window_labels_eliminate", False)),
                 reader=str(getattr(cfg, "window_labels_reader", "jev") or "jev"),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
                 seed=zlib.crc32(str(getattr(self, "job_id", "")).encode()),
@@ -7377,7 +7378,8 @@ class InferenceJob:
         stats["seconds"] = round(time.perf_counter() - t0, 2)
         summary["window_labels"] = stats
         for k in ("requests", "input_tokens", "cost_cents", "seconds", "digit_named",
-                  "lineup_named", "unlabelled", "fill_frames", "fill_windows"):
+                  "lineup_named", "unlabelled", "fill_frames", "fill_windows",
+                  "elim_frames", "elim_chains"):
             if isinstance(stats.get(k), (int, float)):
                 timings[f"window_labels.{k}"] = stats[k]
         for k in ("windows_s1", "windows_jev", "jev_digit_calls", "bumper_found", "samples"):
@@ -7396,6 +7398,10 @@ class InferenceJob:
                 print(f"[window-labels] fill: {stats['fill_frames']} slot-frames in "
                       f"{stats.get('fill_windows')} unread windows "
                       f"({stats.get('fill_chains_bridged')} runs bridged)")
+            if "elim_frames" in stats:
+                print(f"[window-labels] elimination: {stats['elim_frames']} slot-frames in "
+                      f"{stats.get('elim_chains')} chains "
+                      f"({stats.get('elim_chains_colour_skipped')} chains failed the colour gate)")
             st = stats.get("student")
             if st:
                 print(f"[window-labels] reader {st.get('reader')}: S1 named {st.get('windows_s1')} "

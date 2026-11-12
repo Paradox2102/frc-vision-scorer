@@ -240,6 +240,43 @@ def test_fill_option_reaches_the_stage_and_defaults_to_the_knob(store, monkeypat
         assert seen["fill"] is want
 
 
+def test_eliminate_option_reaches_the_stage_and_defaults_to_the_knob(store, monkeypatch):
+    from web.job_config import KNOBS
+    from tests.field.test_window_labels_student import FakeStudent
+    assert rr.Options().eliminate is next(
+        k for k in KNOBS if k.name == "window_labels_eliminate").default
+    assert rr.Options().eliminate is False
+    frames = _lineup_frames()
+    off = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}), rr.Options(reader="jev"),
+              store)
+    assert "elim_frames" not in off["stats"]
+    on = _go(_meta(frames), _lineup_session(frames, who_p={"B": 0.9}),
+             rr.Options(reader="jev", eliminate=True), store)
+    assert on["relabelled"]["summary"]["window_labels"]["elim_frames"] == on["stats"]["elim_frames"]
+    # a student run stores the S1 sample colours with the digit calls
+    stu = rr.relabel_one(ROW, _meta(frames), "video.mp4", _Cal(), RED, BLUE,
+                         rr.Options(reader="student_only", lineup_min_p=1.01, eliminate=True),
+                         FakeSession(), fps=FPS, view=(0, 0, 1920, 723), frame_source=_source,
+                         student=FakeStudent(slots=()), **store)
+    saved = stu["relabelled"]["summary"]["window_labels_digit_calls"]
+    assert saved["s1_colours"] and all(c is None for v in saved["s1_colours"].values() for c in v)
+    assert "elim_frames" in stu["stats"]
+    seen = {}
+    monkeypatch.setattr(rr, "load_inputs", lambda *a: (_ for _ in ()).throw(SystemExit("stop")))
+    real = rr.argparse.ArgumentParser.parse_args
+
+    def spy(self, argv=None, namespace=None):
+        args = real(self, argv, namespace)
+        seen["eliminate"] = args.eliminate
+        return args
+
+    monkeypatch.setattr(rr.argparse.ArgumentParser, "parse_args", spy)
+    for argv, want in ((["--replay", "x"], False), (["--replay", "x", "--eliminate"], True)):
+        with pytest.raises(SystemExit):
+            rr.main(argv)
+        assert seen["eliminate"] is want
+
+
 def test_reader_option_reaches_the_stage(store):
     from tests.field.test_window_labels_student import FakeStudent
     frames = _lineup_frames()

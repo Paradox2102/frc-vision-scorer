@@ -386,6 +386,10 @@ PROFILES = {
     # of a track chain take the chain's named team vs stay unlabelled.
     "wl-fill": [("wl_nofill", {"window_labels": True, "window_labels_fill": False}),
                 ("wl_fill", {"window_labels": True, "window_labels_fill": True})],
+    # Window-label chain roster elimination (window_labels_eliminate,
+    # experimental, default OFF): colour-gated third-team labels after the fill.
+    "wl-elim": [("wl_noelim", {"window_labels": True, "window_labels_eliminate": False}),
+                ("wl_elim", {"window_labels": True, "window_labels_eliminate": True})],
     "window-labels": [
         ("off", {}),
         ("wl_08", {"window_labels": True}),

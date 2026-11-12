@@ -200,6 +200,7 @@ def _same_view_check(ref_view_fn, med, cfg: CornerStepConfig) -> dict:
                                    min_inlier_spread=cfg.same_view_min_spread)
     r = vreg.same_view(ref["image"], med, cfg.same_view_max_px, cfg=rcfg)
     metrics.update(same_view_px=r["disp_px"] if r["ok"] else None,
+                   same_view_corner_px=r.get("corner_disp_px"),
                    same_view_inliers=r["inliers"], same_view_matches=r["matches"],
                    same_view_gate_px=cfg.same_view_max_px)
     if not r["same"]:

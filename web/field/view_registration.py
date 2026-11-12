@@ -37,8 +37,10 @@ def register_views(ref_bgr, img_bgr, *, n_features: Optional[int] = None,
                    ransac_px: Optional[float] = None,
                    cfg: Optional[RegistrationConfig] = None) -> dict:
     """Homography from ``ref_bgr`` to ``img_bgr`` (same camera crop). Returns
-    {"ok", "disp_px" (max displacement of the 4 crop corners + centre), "inliers",
-    "matches", "spread" (inlier bbox / crop area), "reason" (why not ok, else None)}."""
+    {"ok", "disp_px" (90th percentile shift of the RANSAC inlier features),
+    "corner_disp_px" (max shift of the 4 crop corners + centre under the homography;
+    diagnostic), "inliers", "matches", "spread" (inlier bbox / crop area), "reason"
+    (why not ok, else None)}."""
     cfg = cfg or RegistrationConfig()
     n_features = cfg.n_features if n_features is None else n_features
     ransac_px = cfg.ransac_px if ransac_px is None else ransac_px
@@ -74,11 +76,23 @@ def register_views(ref_bgr, img_bgr, *, n_features: Optional[int] = None,
     if n_in:
         bw, bh = pts.max(axis=0) - pts.min(axis=0)
         out["spread"] = round(float(bw * bh) / float(w * h), 3)
+    # disp_px: 90th percentile of the inlier features' own shift. The homography
+    # extrapolated to the crop corners (corner_disp_px, diagnostic only) amplifies
+    # perspective-term noise at the edges: the same unmoved 2025hop corner read
+    # 2.8 px on one median and 8.2 px on another, while the inlier p90 held at
+    # 2-4 px on qm2-qm4. A real re-aim / zoom shifts the edge features, which p90
+    # still catches.
+    if n_in:
+        shift = np.linalg.norm(dst.reshape(-1, 2)[inl] - pts, axis=1)
+        disp = float(np.percentile(shift, 90))
+    else:
+        disp = float("nan")
+    out["disp_px"] = round(disp, 2) if np.isfinite(disp) else None
     probe = np.float32([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1],
                         [(w - 1) / 2, (h - 1) / 2]]).reshape(-1, 1, 2)
     moved = cv2.perspectiveTransform(probe, H)
-    disp = float(np.max(np.linalg.norm((moved - probe).reshape(-1, 2), axis=1)))
-    out["disp_px"] = round(disp, 2) if np.isfinite(disp) else None
+    cdisp = float(np.max(np.linalg.norm((moved - probe).reshape(-1, 2), axis=1)))
+    out["corner_disp_px"] = round(cdisp, 2) if np.isfinite(cdisp) else None
     if n_in < cfg.min_inliers:
         out["reason"] = f"too few inliers ({n_in} < {cfg.min_inliers})"
     elif n_in < cfg.min_inlier_ratio * len(matches):

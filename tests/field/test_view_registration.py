@@ -80,3 +80,22 @@ def test_localized_static_texture_is_not_enough():
     a[10:110, 10:200] = s[:100, :190]
     r = vr.register_views(a, a.copy())
     assert not r["ok"] and "spread" in r["reason"]
+
+
+def test_zoom_fails_the_gate_on_inlier_p90():
+    """A re-zoom moves edge features most; the p90 inlier shift must catch it
+    even though features near the centre barely move."""
+    s = _scene()
+    ref = _crop(s)
+    h, w = ref.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), 0.0, 1.06)
+    zoomed = cv2.warpAffine(_crop(s), M, (w, h), borderMode=cv2.BORDER_REFLECT)
+    r = vr.register_views(ref, zoomed)
+    assert not r["ok"] or r["disp_px"] > 8.0, r
+    assert not vr.same_view(ref, zoomed, max_px=8.0)["same"]
+
+
+def test_corner_disp_is_reported_as_diagnostic():
+    s = _scene()
+    r = vr.register_views(_crop(s), _crop(s, dx=3))
+    assert r["corner_disp_px"] is not None and 2.0 < r["corner_disp_px"] < 4.5

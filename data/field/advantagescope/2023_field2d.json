@@ -1,0 +1,21 @@
+{
+ "source": "AdvantageScope Field2d_2023FRCFieldV4 (github.com/Mechanical-Advantage/AdvantageScopeAssets, release archive-v1)",
+ "original_source": "https://www.chiefdelphi.com/t/2023-top-down-field-renders/421365",
+ "advantagescope_name": "2023 Field",
+ "transform": "rotated 180 deg so the blue wall is on the left (WPILib x right, y up); scaled 0.5405x",
+ "image_size": [
+  1950,
+  790
+ ],
+ "field_top_left_px": [
+  260.5,
+  48.1
+ ],
+ "field_bottom_right_px": [
+  1689.5,
+  742.1
+ ],
+ "field_length_m": 16.5418,
+ "field_width_m": 8.0137,
+ "apriltag_layout": "2023-chargedup.json"
+}

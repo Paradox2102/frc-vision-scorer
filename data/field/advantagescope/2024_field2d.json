@@ -1,0 +1,21 @@
+{
+ "source": "AdvantageScope Field2d_2024FRCFieldV3 (github.com/Mechanical-Advantage/AdvantageScopeAssets, release archive-v1)",
+ "original_source": "https://www.chiefdelphi.com/t/2024-crescendo-top-down-field-renders/447764",
+ "advantagescope_name": "2024 Field",
+ "transform": "rotated 180 deg so the blue wall is on the left (WPILib x right, y up); scaled 0.5078x",
+ "image_size": [
+  1950,
+  789
+ ],
+ "field_top_left_px": [
+  260.5,
+  40.1
+ ],
+ "field_bottom_right_px": [
+  1689.5,
+  749.5
+ ],
+ "field_length_m": 16.5418,
+ "field_width_m": 8.2105,
+ "apriltag_layout": "2024-crescendo.json"
+}

@@ -1,0 +1,21 @@
+{
+ "source": "AdvantageScope Field2d_2019FieldV1 (github.com/Mechanical-Advantage/AdvantageScopeAssets, release archive-v1)",
+ "original_source": "https://www.chiefdelphi.com/t/8k-2019-top-down-orthographic-field-views/337019",
+ "advantagescope_name": "2019 Field",
+ "transform": "not rotated (asset already blue-left) so the blue wall is on the left (WPILib x right, y up); scaled 0.5269x",
+ "image_size": [
+  1950,
+  790
+ ],
+ "field_top_left_px": [
+  261.3,
+  41.1
+ ],
+ "field_bottom_right_px": [
+  1688.1,
+  748.7
+ ],
+ "field_length_m": 16.4592,
+ "field_width_m": 8.2296,
+ "apriltag_layout": null
+}

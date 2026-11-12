@@ -1,0 +1,21 @@
+{
+ "source": "AdvantageScope Field2d_2025FRCFieldWeldedV3 (github.com/Mechanical-Advantage/AdvantageScopeAssets, release archive-v1)",
+ "original_source": "https://www.chiefdelphi.com/t/4k-field-image-2025-reefscape/478797",
+ "advantagescope_name": "2025 Field (Welded)",
+ "transform": "rotated 180 deg so the blue wall is on the left (WPILib x right, y up); scaled 0.5168x",
+ "image_size": [
+  1950,
+  790
+ ],
+ "field_top_left_px": [
+  217.6,
+  47.0
+ ],
+ "field_bottom_right_px": [
+  1732.4,
+  742.7
+ ],
+ "field_length_m": 17.5482,
+ "field_width_m": 8.0518,
+ "apriltag_layout": "2025-reefscape-welded.json"
+}

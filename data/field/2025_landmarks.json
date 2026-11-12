@@ -1,0 +1,80 @@
+{
+ "_source": "derived from data/field/2025-reefscape-welded.json (WPILib v2026.2.2); reef centres = mean of the six reef-face tags",
+ "landmarks": [
+  {
+   "name": "Field corner: Blue-Right (origin)",
+   "x": 0.0,
+   "y": 0.0
+  },
+  {
+   "name": "Field corner: Blue-Left",
+   "x": 0.0,
+   "y": 8.052
+  },
+  {
+   "name": "Field corner: Red-Right",
+   "x": 17.548,
+   "y": 0.0
+  },
+  {
+   "name": "Field corner: Red-Left",
+   "x": 17.548,
+   "y": 8.052
+  },
+  {
+   "name": "Midline @ scoring-table side",
+   "x": 8.774,
+   "y": 0.0
+  },
+  {
+   "name": "Midline @ far side",
+   "x": 8.774,
+   "y": 8.052
+  },
+  {
+   "name": "Field center (barge centre)",
+   "x": 8.774,
+   "y": 4.026
+  },
+  {
+   "name": "Blue reef centre",
+   "x": 4.4893,
+   "y": 4.0259
+  },
+  {
+   "name": "Red reef centre",
+   "x": 13.0589,
+   "y": 4.0259
+  },
+  {
+   "name": "Blue processor (tag 16)",
+   "x": 5.9875,
+   "y": -0.0038
+  },
+  {
+   "name": "Red processor (tag 3)",
+   "x": 11.5608,
+   "y": 8.0556
+  },
+  {
+   "name": "Blue coral station, scoring-table side (tag 12)",
+   "x": 0.8512,
+   "y": 0.6553
+  },
+  {
+   "name": "Blue coral station, far side (tag 13)",
+   "x": 0.8512,
+   "y": 7.3965
+  },
+  {
+   "name": "Red coral station, scoring-table side (tag 1)",
+   "x": 16.6972,
+   "y": 0.6553
+  },
+  {
+   "name": "Red coral station, far side (tag 2)",
+   "x": 16.6972,
+   "y": 7.3965
+  }
+ ]
+}

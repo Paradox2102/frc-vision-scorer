@@ -1,0 +1,21 @@
+{
+ "source": "AdvantageScope Field2d_2022FRCFieldV3 (github.com/Mechanical-Advantage/AdvantageScopeAssets, release archive-v1)",
+ "original_source": "https://www.chiefdelphi.com/t/2022-top-down-field-renders/399031",
+ "advantagescope_name": "2022 Field",
+ "transform": "rotated 180 deg so the blue wall is on the left (WPILib x right, y up); scaled 0.2768x",
+ "image_size": [
+  1950,
+  812
+ ],
+ "field_top_left_px": [
+  245.0,
+  41.0
+ ],
+ "field_bottom_right_px": [
+  1705.3,
+  771.1
+ ],
+ "field_length_m": 16.4592,
+ "field_width_m": 8.2296,
+ "apriltag_layout": null
+}

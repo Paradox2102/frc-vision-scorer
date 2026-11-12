@@ -860,7 +860,7 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                cfg: Optional[AutoCalibConfig] = None, detect_fn=None,
                masks=(), judge=None, roi_detect_fn=None,
                force_resolve: bool = False, lenders=(), prep: Optional[Prep] = None,
-               exclude_tags=()) -> AutoCalibResult:
+               exclude_tags=(), lens_max_model: Optional[str] = None) -> AutoCalibResult:
     """Auto-calibrate ONE camera from ONE reference match. Pure w.r.t. persistence:
     returns the record (status ready / verified / failed), the candidate calibration
     (or None) and the overlay image (camera crop, or None if no frame was read).
@@ -1090,9 +1090,10 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
     if cfg.locate_undecoded and background is not None and ecal.mode == "pinhole":
         # Few decoded tags (often one structure) condition a pose badly: grow it
         # outward from the epoch's lens ("pose" -> "f_lens" -> ... ladder).
+        # ``lens_max_model`` caps that ladder ("pose": the epoch's lens stays fixed).
         cand, how = _grow_with_locator(cand, "", background, fm, corners, image_size, cfg,
                                        roi_detect_fn, judge, base, extra, lens=ecal,
-                                       stack=loc_stack)
+                                       stack=loc_stack, max_model=lens_max_model)
         how = f" [{how.strip(' +')}]" if how else ""
     cval = validate(cand)
     pcfg = PoseFixConfig(min_tags=cfg.min_tags, drift_max_m=cfg.drift_max_m,
@@ -1129,7 +1130,11 @@ def resolve_moved_camera(video, match_key: str, camera: str, crop, fm, versions,
     prepared ONCE, then, stopping at the first attempt whose record is "ready":
 
       1. pose re-solve against the covering epoch's lens (skipped without versions)
-         — a re-aim / small nudge;
+         — a re-aim / small nudge. First with that lens HELD (the locator may only
+         refine the pose), then with the locator free to refit it: located tags
+         usually sit on one or two structures in a band of the image, and a k1+k2
+         lens fitted to them validates on those same tags yet folds at the image
+         edges (2026hop qm45 live: k2 +0.55, towers / field corners way off);
       2. fresh full solve (lens + pose; ``lenders`` for corner cameras) — a re-placed
          or re-zoomed camera;
       3. only when ``low_support_tags`` flags aggregate tags and >= ``cfg.min_tags``
@@ -1150,19 +1155,24 @@ def resolve_moved_camera(video, match_key: str, camera: str, crop, fm, versions,
     diag = {int(t): d for t, d in prep.agg["diag"].items() if t in fm.tags}
     known = {int(t) for t in prep.agg["corners"] if t in fm.tags} | {
         int(t) for t in prep.med_dec}
-    plan = ([("pose_resolve", ())] if versions else []) + [("full_solve", ())]
+    def stage(excl):
+        # least lens freedom first: held epoch lens, then the locator's free ladder
+        pose = ([("pose_resolve", excl, "pose"), ("pose_resolve", excl, None)]
+                if versions else [])
+        return pose + [("full_solve", excl, None)]
+
+    plan = stage(())
     low = low_support_tags(diag)
     if low and len(known - set(low)) >= cfg.min_tags:
-        plan += ([("pose_resolve", tuple(low))] if versions else []) + [
-            ("full_solve", tuple(low))]
+        plan += stage(tuple(low))
     attempts, results = [], []
-    for method, excl in plan:
+    for method, excl, cap in plan:
         try:
             if method == "pose_resolve":
                 r = run_camera(video, match_key, camera, crop, fm, versions, cfg=cfg,
                                detect_fn=detect_fn, masks=masks, judge=judge,
                                roi_detect_fn=roi_detect_fn, force_resolve=True,
-                               prep=prep, exclude_tags=excl)
+                               prep=prep, exclude_tags=excl, lens_max_model=cap)
             else:
                 r = run_camera(video, match_key, camera, crop, fm, [], cfg=cfg,
                                detect_fn=detect_fn, masks=masks, judge=judge,
@@ -1175,7 +1185,9 @@ def resolve_moved_camera(video, match_key: str, camera: str, crop, fm, versions,
                 median=prep.median)
         attempts.append({"method": method, "status": r.record.get("status"),
                          "reason": r.record.get("reason", ""),
-                         "excluded_tags": [int(t) for t in excl]})
+                         "excluded_tags": [int(t) for t in excl],
+                         "lens": ("held" if cap == "pose" else "free")
+                         if method == "pose_resolve" else "solved"})
         results.append((method, excl, r))
         if r.record.get("status") == "ready":
             break
@@ -1193,6 +1205,7 @@ def resolve_moved_camera(video, match_key: str, camera: str, crop, fm, versions,
     if rec.get("status") != "ready":
         tried = "; ".join(
             f"{MOVED_METHOD_LABELS[a['method']]}"
+            f"{' (lens ' + a['lens'] + ')' if a.get('lens') in ('held', 'free') else ''}"
             f"{' without tags ' + ','.join(map(str, a['excluded_tags'])) if a['excluded_tags'] else ''}"
             f": {a['status']}" for a in attempts)
         rec["reason"] = f"{rec.get('reason', '')} [tried: {tried}]"

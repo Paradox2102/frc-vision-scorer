@@ -131,7 +131,9 @@ def _scripted_run(outcomes, calls):
     "failed_cand" = failed with a candidate calibration)."""
     def run(video, mk, cam, crop, fm, versions, **k):
         method = "pose_resolve" if versions else "full_solve"
-        calls.append((method, tuple(k.get("exclude_tags") or ()), k.get("prep")))
+        label = (("pose_held" if k.get("lens_max_model") == "pose" else "pose_free")
+                 if versions else "full_solve")
+        calls.append((label, tuple(k.get("exclude_tags") or ()), k.get("prep")))
         st = outcomes[len(calls) - 1]
         cal = BASE if st in ("ready", "failed_cand") else None
         rec = ac.new_record("ready" if st == "ready" else "failed", f"{method} {st}",
@@ -141,10 +143,16 @@ def _scripted_run(outcomes, calls):
 
 
 @pytest.mark.parametrize("outcomes,expect_calls,expect_method", [
-    (["ready"], [("pose_resolve", ())], "pose_resolve"),
-    (["failed", "ready"], [("pose_resolve", ()), ("full_solve", ())], "full_solve"),
+    (["ready"], [("pose_held", ())], "pose_resolve"),
+    (["failed", "ready"], [("pose_held", ()), ("pose_free", ())], "pose_resolve"),
+    (["failed", "failed", "ready"],
+     [("pose_held", ()), ("pose_free", ()), ("full_solve", ())], "full_solve"),
     (["failed", "failed", "failed", "ready"],
-     [("pose_resolve", ()), ("full_solve", ()), ("pose_resolve", (1, 2, 11)),
+     [("pose_held", ()), ("pose_free", ()), ("full_solve", ()),
+      ("pose_held", (1, 2, 11))], "pose_resolve"),
+    (["failed"] * 5 + ["ready"],
+     [("pose_held", ()), ("pose_free", ()), ("full_solve", ()),
+      ("pose_held", (1, 2, 11)), ("pose_free", (1, 2, 11)),
       ("full_solve", (1, 2, 11))], "full_solve"),
 ])
 def test_resolve_attempt_order_stops_at_first_ready(monkeypatch, outcomes, expect_calls,
@@ -159,7 +167,10 @@ def test_resolve_attempt_order_stops_at_first_ready(monkeypatch, outcomes, expec
     assert all(c[2] is prep for c in calls)               # inputs prepared once
     rec = res.record
     assert rec["status"] == "ready" and rec["method"] == expect_method
-    assert [a["method"] for a in rec["attempts"]] == [c[0] for c in expect_calls]
+    assert [a["method"] for a in rec["attempts"]] == [
+        "full_solve" if c[0] == "full_solve" else "pose_resolve" for c in expect_calls]
+    assert [a["lens"] for a in rec["attempts"]] == [
+        {"pose_held": "held", "pose_free": "free"}.get(c[0], "solved") for c in expect_calls]
     assert rec["attempts"][-1]["status"] == "ready"
     if expect_calls[-1][1]:
         assert rec["attempts"][-1]["excluded_tags"] == [1, 2, 11]
@@ -171,16 +182,18 @@ def test_resolve_attempt_order_stops_at_first_ready(monkeypatch, outcomes, expec
 def test_resolve_all_fail_returns_last_full_solve_candidate(monkeypatch):
     calls = []
     monkeypatch.setattr(ac, "run_camera",
-                        _scripted_run(["failed", "failed_cand", "failed", "failed"], calls))
+                        _scripted_run(["failed", "failed", "failed_cand"] + ["failed"] * 3,
+                                      calls))
     res = ac.resolve_moved_camera("v.mp4", "evt_qm45", "main", CROP, FM,
                                   [_version(BASE)], ac.AutoCalibConfig(), prep=_fake_prep(),
                                   detect_fn=lambda f: {}, roi_detect_fn=lambda f: {})
-    assert len(calls) == 4
+    assert len(calls) == 6
     rec = res.record
     assert rec["status"] == "failed" and rec["method"] == "full_solve"
     assert res.calibration is BASE                     # the one with a candidate
     assert rec["moved_attempt"] == "full_solve" and "tried:" in rec["reason"]
-    assert len(rec["attempts"]) == 4
+    assert "(lens held)" in rec["reason"] and "(lens free)" in rec["reason"]
+    assert len(rec["attempts"]) == 6
 
 
 def test_resolve_without_versions_skips_pose(monkeypatch):
@@ -195,21 +208,22 @@ def test_resolve_without_versions_skips_pose(monkeypatch):
 
 def test_resolve_no_retry_when_too_few_tags_would_remain(monkeypatch):
     calls = []
-    monkeypatch.setattr(ac, "run_camera", _scripted_run(["failed", "failed"], calls))
+    monkeypatch.setattr(ac, "run_camera", _scripted_run(["failed"] * 3, calls))
     diag = {6: (160, 166, .5), 8: (110, 112, .5), 1: (3, 3, .2)}   # 2 strong tags
     res = ac.resolve_moved_camera("v.mp4", "evt_qm45", "main", CROP, FM,
                                   [_version(BASE)], ac.AutoCalibConfig(min_tags=3),
                                   prep=_fake_prep(diag), detect_fn=lambda f: {},
                                   roi_detect_fn=lambda f: {})
-    assert [c[:2] for c in calls] == [("pose_resolve", ()), ("full_solve", ())]
+    assert [c[:2] for c in calls] == [("pose_held", ()), ("pose_free", ()),
+                                      ("full_solve", ())]
     assert res.record["status"] == "failed"
     # a median-only tag counts toward what remains
     calls.clear()
-    monkeypatch.setattr(ac, "run_camera", _scripted_run(["failed"] * 4, calls))
+    monkeypatch.setattr(ac, "run_camera", _scripted_run(["failed"] * 6, calls))
     ac.resolve_moved_camera("v.mp4", "evt_qm45", "main", CROP, FM, [_version(BASE)],
                             ac.AutoCalibConfig(min_tags=3), prep=_fake_prep(diag, med=(17,)),
                             detect_fn=lambda f: {}, roi_detect_fn=lambda f: {})
-    assert len(calls) == 4
+    assert len(calls) == 6
 
 
 def test_resolve_attempt_exception_is_recorded_not_raised(monkeypatch):
@@ -231,8 +245,10 @@ def test_resolve_relocated_camera_end_to_end(tmp_path):
                                   ac.AutoCalibConfig(locate_undecoded=False),
                                   detect_fn=_det(RELOCATED), roi_detect_fn=lambda f: {})
     rec = res.record
-    assert [a["method"] for a in rec["attempts"]] == ["pose_resolve", "full_solve"]
-    assert rec["attempts"][0]["status"] == "failed"
+    assert [a["method"] for a in rec["attempts"]] == ["pose_resolve", "pose_resolve",
+                                                     "full_solve"]
+    assert [a["lens"] for a in rec["attempts"]] == ["held", "free", "solved"]
+    assert all(a["status"] == "failed" for a in rec["attempts"][:2])
     assert "camera center moved" in rec["attempts"][0]["reason"]
     assert rec["status"] == "ready" and rec["method"] == "full_solve"
     c = np.asarray(res.calibration.camera_center)

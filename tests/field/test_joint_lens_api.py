@@ -188,3 +188,18 @@ def test_joint_needs_the_partners_stored_tags(app_mod):
     r = _client(app_mod).post("/api/calibration/solve-tags",
                               json=_right_body(joint_with="corner_far"))
     assert r.status_code == 400 and "no calibration version" in r.json()["error"]
+
+
+def test_joint_preview_renders_the_partners_overlay_on_its_own_frame(app_mod, monkeypatch):
+    import numpy as np
+    _save_left()
+    asked = []
+
+    def frame(body):
+        asked.append((body.get("match_key"), body.get("timestamp")))
+        return np.zeros((1080, 1920, 3), np.uint8), None
+    monkeypatch.setattr(app_mod, "_read_composite_frame", frame)
+    j = _client(app_mod).post("/api/calibration/solve-tags", json=_right_body(
+        joint_with="corner_left", dry_run=True)).json()
+    assert j["overlay"] and j["joint"]["partner_overlay"]
+    assert ("2025hop_qm1", 125.8) in asked          # corner_left's stored frame

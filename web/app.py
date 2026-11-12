@@ -12387,6 +12387,40 @@ def _solve_tags_joint(event: str, camera: str, partner: str, start_match,
     return (res, ep), None
 
 
+def _solve_tags_overlay(frame, cl, cal, fm, used, camera) -> Optional[str]:
+    """Base64 JPEG of ``cal``'s field wireframe + tag dots on ``camera``'s crop of the
+    composite ``frame`` (used tags green, others orange), or None.
+    Overlay is a best-effort visualization. A poorly-conditioned calibration can
+    make projection blow up; never let drawing failures sink the solve result
+    (the caller still needs rms_error + holdout_error_m to judge the calibration)."""
+    try:
+        if frame is None or cl is None:
+            return None
+        cx, cy, cw, ch = cl.crop
+        main = frame[cy:cy + ch, cx:cx + cw].copy()
+        for (mx, my, mw_, mh_) in cl.masks:
+            main[my:my + mh_, mx:mx + mw_] = 0
+        _draw_field_overlay(main, cal, fm)
+        mh, mw = main.shape[:2]
+        for tid in fm.tags:
+            t3 = fm.tag_translation(tid)
+            # only tags the camera can see: in front, inside the lens fold radius
+            # (a wide lens folds far off-axis tags onto the image) and in frame
+            uv = cal.field_to_image_visible(
+                (float(t3[0]), float(t3[1]), float(t3[2])), image_size=(mw, mh))
+            if uv is not None:
+                u, v = uv
+                color = (0, 255, 0) if tid in used else (0, 165, 255)
+                cv2.circle(main, (int(u), int(v)), 5, color, -1)
+                cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return base64.b64encode(buf.tobytes()).decode() if okj else None
+    except Exception as e:
+        print(f"  calibration overlay render failed ({camera}): {e}")
+        return None
+
+
 @app.post("/api/calibration/solve-tags")
 async def calibration_solve_tags(request: Request):
     """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
@@ -12531,37 +12565,18 @@ async def calibration_solve_tags(request: Request):
 
     used = {int(s) for s in auto.keys()} | {int(m["id"]) for m in manual}
     n_points = sum(len(c[0]) for c in corr.values())
-    overlay_b64 = None
     frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
-    cl = _auto_calib_layout(event).get(camera)
-    # Overlay is a best-effort visualization. A poorly-conditioned calibration can
-    # make projection blow up; never let drawing failures sink the solve result
-    # (the caller still needs rms_error + holdout_error_m to judge the calibration).
-    try:
-        if frame is not None and cl is not None:
-            cx, cy, cw, ch = cl.crop
-            main = frame[cy:cy + ch, cx:cx + cw].copy()
-            for (mx, my, mw_, mh_) in cl.masks:
-                main[my:my + mh_, mx:mx + mw_] = 0
-            _draw_field_overlay(main, cal, fm)
-            mh, mw = main.shape[:2]
-            for tid in fm.tags:
-                t3 = fm.tag_translation(tid)
-                # only tags the camera can see: in front, inside the lens fold radius
-                # (a wide lens folds far off-axis tags onto the image) and in frame
-                uv = cal.field_to_image_visible(
-                    (float(t3[0]), float(t3[1]), float(t3[2])), image_size=(mw, mh))
-                if uv is not None:
-                    u, v = uv
-                    color = (0, 255, 0) if tid in used else (0, 165, 255)
-                    cv2.circle(main, (int(u), int(v)), 5, color, -1)
-                    cv2.putText(main, str(tid), (int(u) + 4, int(v) - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            okj, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            if okj:
-                overlay_b64 = base64.b64encode(buf.tobytes()).decode()
-    except Exception as e:
-        print(f"  calibration overlay render failed ({camera}): {e}")
+    overlay_b64 = _solve_tags_overlay(frame, _auto_calib_layout(event).get(camera), cal,
+                                      fm, used, camera)
+    if joint_out is not None:
+        # the partner's overlay on ITS stored frame: both cameras must line up
+        pframe, _ = await asyncio.to_thread(_read_composite_frame, {
+            "event": event, "match_key": psrc.get("match_key"),
+            "timestamp": psrc.get("timestamp", 75)})
+        pused = ({int(s) for s in (psrc.get("auto_tags") or {})}
+                 | {int(m["id"]) for m in psrc.get("manual_tags") or []})
+        joint_out["partner_overlay"] = _solve_tags_overlay(
+            pframe, _auto_calib_layout(event).get(partner), pcal, fm, pused, partner)
     return {"status": "ok", "rms_error": cal.rms_error, "n_tags": len(corr),
             "n_points": n_points, "overlay": overlay_b64,
             "holdout_error_m": holdout_err, "model": solve_model_used,

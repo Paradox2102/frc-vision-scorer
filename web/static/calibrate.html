@@ -52,6 +52,8 @@
                 min-width:240px; }
   .rms-good{color:#60ff90;} .rms-warn{color:#ffd060;} .rms-bad{color:#ff6060;}
   .rms-info{color:#a0c4ff;} .rms-err{color:#ff8080;}
+  .fold-warning{color:#1a1200;background:#ffb020;border-radius:4px;padding:3px 8px;
+    font-weight:600;font-size:.9em;}
   .overlay-section h2 { font-size:1em; color:#a0c4ff; margin-bottom:8px; }
   #overlayImg { max-width:100%; border:1px solid #334; display:none; background:#0a0a14; }
   .hint { color:#7a86a0; font-size:12px; margin-top:4px; }
@@ -254,13 +256,15 @@
 </div>
 
 <div class="solve-row">
-  <label style="color:#a0b0c0;" title="Borrow a sibling corner camera's lens and solve only the pose — for a corner camera with too few tags to pin down its own lens. The main camera never lends or borrows.">Lens
-    <select id="lensFrom" onchange="lensPin = null;">
+  <label style="color:#a0b0c0;" title="Corner cameras share a lens model. Joint: fit ONE lens to this camera's tags and the sibling's saved tags (saving writes a new version for both). Borrow: use the sibling's lens and solve only the pose. The main camera never lends, borrows or shares.">Lens
+    <select id="lensFrom" onchange="lensPin = null; lensExplicit = true; showLensHint();">
       <option value="">solve own lens</option>
     </select>
   </label>
+  <span id="lensHint" class="hint" style="margin:0;font-size:.85em;color:#889;"></span>
   <button class="primary" onclick="solve()">Solve &amp; preview</button>
   <span id="statusLine" class="rms-info">—</span>
+  <span id="foldWarning" class="fold-warning" style="display:none;"></span>
 </div>
 
 <div class="points-section">
@@ -276,6 +280,10 @@
   <p class="hint" id="overlayLegend">Green = carpet grid · cyan = hubs · orange = bumps · magenta = towers · pink = trenches</p>
   <p class="hint" id="noOverlayMsg">Overlay appears here after a successful solve.</p>
   <img id="overlayImg" src="" alt="">
+  <div id="partnerOverlayBox" style="display:none;margin-top:8px;">
+    <p class="hint" id="partnerOverlayTitle" style="margin:4px 0;"></p>
+    <img id="partnerOverlayImg" src="" alt="" style="max-width:100%;border:1px solid #334;background:#0a0a14;">
+  </div>
 </div>
 </div>
 </details>
@@ -749,6 +757,10 @@ async function grabFrame(opts){
 // solve inputs, restore them onto the SAME frame they were clicked on and re-run
 // a dry-run solve so the overlay preview appears. Otherwise just grab fresh.
 async function refreshForSelection(){
+  // a new camera / match: the server's lens default applies again unless the
+  // restored epoch below carries its own lens choice
+  lensExplicit = false; lensPin = null;
+  showFoldWarning(null);
   loadVersions();
   refreshAutofix();
   // Frame restore only while the manual editor is open; otherwise owe it.
@@ -775,7 +787,7 @@ async function refreshForSelection(){
   autoTags = src.auto_tags || {};
   manualTags = src.manual_tags || [];
   heldOut = new Set(src.holdout_ids || []);
-  setLensFrom(src.lens_from || '', src.lens_version_id || null);   // re-preview with the same lens
+  setLensFrom(lensValueOfSource(src), lensPinOfSource(src));   // re-preview with the same lens
   pendingPixel = null;
   redrawFrame(); drawMap(); renderRows();
   const span = epoch.start_match ? `from ${epoch.start_match} →` : 'event start →';
@@ -1099,48 +1111,99 @@ function renderRows(){
   });
 }
 
-// Lens selector: "solve own lens" or borrow a sibling corner camera's lens (pose-only
-// solve). lensPin = the exact lender version a restored epoch used (dry-run re-preview).
+// Lens selector: "solve own lens", "joint with <sibling>" (value "joint:<cam>": one
+// lens fitted to both cameras' tags, a version saved for both) or "borrow from
+// <sibling>" (pose-only solve). The server picks the default (/api/calibration/
+// lens-options: joint > borrow > own; main always own) unless the operator chose,
+// or a restored epoch set its own choice (lensExplicit). lensPin = the exact
+// sibling version a restored epoch used (dry-run re-preview).
 let lensPin = null;
+let lensExplicit = false;
+let lensDefaultHint = '';
+let lensOptionsSeq = 0;
+const JOINT_PREFIX = 'joint:';
+function lensLabel(value){
+  if (!value) return 'solve own lens';
+  return value.startsWith(JOINT_PREFIX) ? `joint with ${value.slice(JOINT_PREFIX.length)}`
+                                        : `borrow from ${value}`;
+}
+function showLensHint(){
+  const sel = document.getElementById('lensFrom');
+  const el = document.getElementById('lensHint');
+  if (!sel.value) { el.textContent = lensExplicit ? '' : lensDefaultHint; return; }
+  const sib = sel.value.startsWith(JOINT_PREFIX) ? sel.value.slice(JOINT_PREFIX.length) : sel.value;
+  if (sel.value.startsWith(JOINT_PREFIX))
+    el.textContent = (lensExplicit ? 'corner cameras share a lens model' : lensDefaultHint)
+      + ` — saving also writes a new version for ${sib}`;
+  else
+    el.textContent = lensExplicit ? 'corner cameras share a lens model' : lensDefaultHint;
+}
 async function loadLensOptions(){
+  const seq = ++lensOptionsSeq;
   const event = document.getElementById('event').value.trim();
   const camera = document.getElementById('camera').value.trim();
-  const others = [...document.getElementById('camera').options].map(o => o.value)
-    .filter(c => c && c !== 'main' && c !== camera && camera !== 'main');
-  const ok = [];
-  for (const c of others){
-    try {
-      const r = await fetch(`/api/calibration/versions?event=${encodeURIComponent(event)}`
-        + `&camera=${encodeURIComponent(c)}`);
-      if (r.ok && ((await r.json()).versions || []).length) ok.push(c);
-    } catch(e){ /* not offered */ }
-  }
-  if (document.getElementById('camera').value.trim() !== camera) return;   // superseded
+  let j = null;
+  try {
+    const r = await fetch(`/api/calibration/lens-options?event=${encodeURIComponent(event)}`
+      + `&camera=${encodeURIComponent(camera)}&match=${encodeURIComponent(selectedMatch())}`);
+    if (r.ok) j = await r.json();
+  } catch(e){ /* own lens only */ }
+  if (seq !== lensOptionsSeq) return;   // superseded
+  const opts = (j && j.options) || [{value:'', label:'solve own lens'}];
   const sel = document.getElementById('lensFrom');
   const keep = sel.value;
-  sel.replaceChildren(new Option('solve own lens', ''));
-  ok.forEach(c => sel.add(new Option(`borrow from ${c}`, c)));
-  sel.value = ok.includes(keep) ? keep : '';
-  if (!sel.value) lensPin = null;
+  sel.replaceChildren();
+  opts.forEach(o => sel.add(new Option(o.label, o.value)));
+  lensDefaultHint = (j && j.hint) || '';
+  const has = v => [...sel.options].some(o => o.value === v);
+  if (lensExplicit){
+    if (keep && !has(keep)) sel.add(new Option(lensLabel(keep), keep));   // restored choice
+    sel.value = keep;
+  } else {
+    sel.value = (j && has(j.default)) ? j.default : '';
+  }
+  if (!sel.value || (lensPin && lensPin.value !== sel.value)) lensPin = null;
+  showLensHint();
 }
-function setLensFrom(cam, versionId){
+function setLensFrom(value, versionId){
   const sel = document.getElementById('lensFrom');
-  if (cam && ![...sel.options].some(o => o.value === cam)) sel.add(new Option(`borrow from ${cam}`, cam));
-  sel.value = cam || '';
-  lensPin = cam && versionId ? {camera: cam, version_id: versionId} : null;
+  if (value && ![...sel.options].some(o => o.value === value)) sel.add(new Option(lensLabel(value), value));
+  sel.value = value || '';
+  lensExplicit = true;
+  lensPin = value && versionId ? {value, version_id: versionId} : null;
+  showLensHint();
+}
+// a saved epoch's lens choice, as a selector value
+function lensValueOfSource(src){
+  if (src.lens_kind === 'joint' && src.lens_partner) return JOINT_PREFIX + src.lens_partner;
+  return src.lens_from || '';
+}
+function lensPinOfSource(src){
+  if (src.lens_kind === 'joint') return src.lens_partner_version_id || src.lens_partner_input_version_id || null;
+  return src.lens_version_id || null;
+}
+function showFoldWarning(text){
+  const el = document.getElementById('foldWarning');
+  el.textContent = text ? '⚠ ' + text : '';
+  el.style.display = text ? '' : 'none';
 }
 
 async function solve(opts){
   opts = opts || {};
-  const lensFrom = document.getElementById('lensFrom').value || null;
+  const lensValue = document.getElementById('lensFrom').value || '';
+  const jointWith = lensValue.startsWith(JOINT_PREFIX) ? lensValue.slice(JOINT_PREFIX.length) : null;
+  const lensFrom = (!jointWith && lensValue) ? lensValue : null;
   const nPoints = Object.keys(autoTags).length*4 + manualTags.length;
   const nTags = new Set([...Object.keys(autoTags).map(Number), ...manualTags.map(m => +m.id)]).size;
-  if (lensFrom){
-    if (nTags < 2){ setStatus(`A borrowed lens needs ≥ 2 tags for the pose; have ${nTags}.`,'rms-err'); return; }
+  if (lensFrom || jointWith){
+    const what = jointWith ? 'A joint lens' : 'A borrowed lens';
+    if (nTags < 2){ setStatus(`${what} needs ≥ 2 tags for the pose; have ${nTags}.`,'rms-err'); return; }
   } else if (nPoints < 8){ setStatus(`Need ≥ 8 points; have ${nPoints}. Add more tags.`,'rms-err'); return; }
   const event = document.getElementById('event').value.trim() || 'test';
   const camera = document.getElementById('camera').value.trim() || 'main';
-  const lensVersion = (opts.dryRun && lensPin && lensPin.camera === lensFrom) ? lensPin.version_id : null;
+  const pinned = (opts.dryRun && lensPin && lensPin.value === lensValue) ? lensPin.version_id : null;
+  const lensVersion = lensFrom ? pinned : null;
+  const jointVersion = jointWith ? pinned : null;
   const startMatch = selectedMatch() || null;   // null = applies from event start
   if (!opts.dryRun) setStatus('Solving…','rms-info');
   try {
@@ -1154,29 +1217,46 @@ async function solve(opts){
         start_match: startMatch,
         match_key: currentFrameSource.match_key,
         lens_from: lensFrom, lens_version_id: lensVersion,
+        joint_with: jointWith, joint_version_id: jointVersion,
         dry_run: !!opts.dryRun})});
     const j = await r.json();
-    if (j.error){ setStatus('Solve error: '+j.error,'rms-err'); return; }
+    if (j.error){ showFoldWarning(null); setStatus('Solve error: '+j.error,'rms-err'); return; }
+    showFoldWarning(j.warning);
     const rms = parseFloat(j.rms_error);
     let cls='rms-good'; if (rms>=20) cls='rms-bad'; else if (rms>=8) cls='rms-warn';
     let msg = `RMS = ${rms.toFixed(2)} px  (${j.n_tags} tags, ${j.n_points} pts)`;
-    msg += j.lens_from ? ` · lens borrowed from ${j.lens_from.camera} (${j.lens_from.version_id}), pose only`
-                       : ` · own lens (model ${j.model})`;
+    const jt = j.joint;
+    if (jt){
+      msg += ` · joint lens with ${jt.partner} (f ${jt.f_px} px, k1 ${jt.k1}; both cameras `
+        + `${jt.rms_px} px RMS, ${jt.rms_inlier_px} px without ${jt.outliers.length} outlier`
+        + `${jt.outliers.length === 1 ? '' : 's'}`
+        + (jt.outliers.length ? ': ' + jt.outliers.map(o => `${o.camera} ${o.key} ${o.px} px`).join(', ') : '')
+        + `; ${jt.partner} ${jt.cameras[jt.partner].rms_px} px)`;
+    } else {
+      msg += j.lens_from ? ` · lens borrowed from ${j.lens_from.camera} (${j.lens_from.version_id}), pose only`
+                         : ` · own lens (model ${j.model})`;
+    }
+    if (j.fold_ratio != null) msg += ` · fold ratio ${j.fold_ratio.toFixed(2)}`;
     if (j.holdout_error_m != null){
       const he = parseFloat(j.holdout_error_m);
       msg += ` · held-out ${he.toFixed(2)} m`;
       if (he>0.5) cls='rms-bad'; else if (he>0.3 && cls==='rms-good') cls='rms-warn';
     }
     if (j.predicted_tags){ predictedTags = j.predicted_tags; redrawFrame(); }
-    if (!j.lens_from && j.tag_spread_m != null && j.tag_spread_m < 2.0)
+    if (!j.lens_from && !jt && j.tag_spread_m != null && j.tag_spread_m < 2.0)
       msg += ` · tags span only ${j.tag_spread_m} m — add a far tag (orange label) for a reliable lens`;
     if (opts.preview){
       msg += ' · preview (not saved) — keep clicking orange labels, then Solve & preview to save';
+      if (jt) msg += ` (saving also writes a new ${jt.partner} version)`;
     } else if (opts.dryRun){
       msg += ' · preview of the saved epoch (not re-saved)';
+      if (jt) msg += ` — saving would also write a new ${jt.partner} version`;
     } else {
       msg += startMatch ? ` · saved as new version from ${startMatch} →`
                         : ' · saved as new version (event start)';
+      if (jt && jt.partner_version_id)
+        msg += ` · ${jt.partner} ALSO got a new version ${jt.partner_version_id} (from `
+          + `${jt.partner_start_match || 'event start'} →, same lens)`;
       loadVersions();
       // The new epoch may resolve recorded drift failures — refresh the ❌ marks.
       loadDrift().then(populateMatchSelector);
@@ -1184,6 +1264,15 @@ async function solve(opts){
       loadAutoStatus();
     }
     setStatus(msg, cls);
+    const pbox = document.getElementById('partnerOverlayBox');
+    if (jt && jt.partner_overlay){
+      document.getElementById('partnerOverlayTitle').textContent =
+        `${jt.partner} with the same joint lens (its saved frame)`
+        + (jt.partner_version_id ? ` — saved as its new version ${jt.partner_version_id}`
+                                 : ' — gets a new version when you save');
+      document.getElementById('partnerOverlayImg').src = 'data:image/jpeg;base64,' + jt.partner_overlay;
+      pbox.style.display = '';
+    } else pbox.style.display = 'none';
     if (j.overlay){ const img=document.getElementById('overlayImg');
       img.src='data:image/jpeg;base64,'+j.overlay; img.style.display='block';
       document.getElementById('noOverlayMsg').style.display='none'; }

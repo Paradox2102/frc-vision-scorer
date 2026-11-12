@@ -952,3 +952,182 @@ def test_stage_fills_never_become_anchors():
     key = [(a.team, a.kind, a.frame_num, a.p) for a in off["anchors_out"]]
     assert key and [(a.team, a.kind, a.frame_num, a.p) for a in on["anchors_out"]] == key
     assert on["row_sources"] == off["row_sources"]
+
+
+# --------------------------------------------------------------------------- #
+# eliminate_chains (window_labels_eliminate): colour-gated roster elimination
+# --------------------------------------------------------------------------- #
+RED3, BLUE3 = ["2637", "2724", "6497"], ["3128", "6773", "9066"]
+B2_FAR, B3_FAR = (12.0, 6.0), (6.0, 7.0)
+
+
+def _elim_setup(tracks, n, named, colours=None, extra=None, red=RED3, blue=BLUE3):
+    """Windows, assembled lab (``named``: (slot, window number) -> (team,
+    rank)) plus ``extra`` entries, eliminate_chains stats. ``colours``:
+    (slot, window number) -> one colour for every sample, or a list (one per
+    sample)."""
+    frames = _frames(tracks, n)
+    ws = wl.build_windows(frames, FPS)
+    by = {}
+    for w in ws:
+        by.setdefault(w.slot, []).append(w)
+    ev = {by[s][j].wid: (team, rank, 0.9) for (s, j), (team, rank) in named.items()}
+    lab, _ = wl.assemble_labels(ws, ev)
+    lab.update(extra or {})
+    cols = {}
+    for (s, j), c in (colours or {}).items():
+        w = by[s][j]
+        seq = c if isinstance(c, list) else [c] * len(w.samples)
+        cols[w.wid] = {k: col for k, col in enumerate(seq, 1)}
+    st = wl.eliminate_chains(frames, ws, lab, FPS, red, blue, cols)
+    return frames, by, lab, st
+
+
+def _three_blue(n=20):
+    return {"B1": _still(range(n)), "B2": _still(range(n), B2_FAR),
+            "B3": _still(range(n), B3_FAR)}
+
+
+PARTNERS = {("B2", 0): ("3128", wl.RANK_DIGITS), ("B3", 0): ("6773", wl.RANK_LINEUP)}
+
+
+def test_elimination_names_the_third_team():
+    frames, _by, lab, st = _elim_setup(_three_blue(), 20, PARTNERS, {("B1", 0): "blue"})
+    assert all(lab[(i, "B1")] == ("9066", wl.RANK_ELIM, 0.0, 20) for i in range(20))
+    assert st == {"elim_frames": 20, "elim_chains": 1, "elim_chains_colour_skipped": 0}
+    assert wl.SOURCE[wl.RANK_ELIM] == "window_elim"
+    rows = wl.window_segments(frames, lab)[wl.slot_label_to_id("B1")]
+    assert [(r["team_number"], r["source"], r["confirmed"]) for r in rows] == [
+        ("9066", "window_elim", False)]
+    wl.apply_labels(frames, lab)
+    b1 = next(r for r in frames[0]["robots"] if r["slot"] == "B1")
+    assert b1["team_number"] == "9066" and b1["confirmed"] is False
+
+
+def test_no_elimination_with_only_one_partner_named():
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, {("B2", 0): ("3128", wl.RANK_DIGITS)},
+                                   {("B1", 0): "blue"})
+    assert all((i, "B1") not in lab for i in range(20)) and st["elim_frames"] == 0
+
+
+def test_fill_ranked_partners_do_not_count():
+    extra = {(i, "B3"): ("6773", wl.RANK_FILL, 0.9, 20) for i in range(20)}
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, {("B2", 0): ("3128", wl.RANK_DIGITS)},
+                                   {("B1", 0): "blue"}, extra=extra)
+    assert all((i, "B1") not in lab for i in range(20)) and st["elim_frames"] == 0
+
+
+def test_partners_on_the_other_alliance_do_not_count():
+    tracks = {"B1": _still(range(20)), "R2": _still(range(20), B2_FAR),
+              "B3": _still(range(20), B3_FAR)}
+    _f, _by, lab, _st = _elim_setup(tracks, 20, {("R2", 0): ("3128", wl.RANK_DIGITS),
+                                                 ("B3", 0): ("6773", wl.RANK_DIGITS)},
+                                    {("B1", 0): "blue"})
+    assert all((i, "B1") not in lab for i in range(20))
+
+
+def test_no_elimination_when_the_third_team_is_on_another_slot():
+    tracks = {**_three_blue(), "R1": _still(range(20), (14.0, 1.0))}
+    extra = {(i, "R1"): ("9066", wl.RANK_FILL, 0.9, 20) for i in range(5, 10)}   # any rank
+    _f, _by, lab, st = _elim_setup(tracks, 20, PARTNERS, {("B1", 0): "blue"}, extra=extra)
+    assert all((i, "B1") not in lab for i in range(5, 10))
+    assert all(lab[(i, "B1")][:2] == ("9066", wl.RANK_ELIM)
+               for i in list(range(5)) + list(range(10, 20)))
+    assert st["elim_frames"] == 15
+
+
+@pytest.mark.parametrize("colours", [{("B1", 0): "red"},
+                                     {("B1", 0): ["blue", "blue", "red", None]},
+                                     {("B1", 0): None},
+                                     {}])
+def test_no_elimination_when_the_chain_colours_disagree_or_are_absent(colours):
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, PARTNERS, colours)
+    assert all((i, "B1") not in lab for i in range(20))
+    assert st == {"elim_frames": 0, "elim_chains": 0, "elim_chains_colour_skipped": 1}
+
+
+def test_uncoloured_samples_are_ignored_by_the_colour_gate():
+    _f, _by, lab, _st = _elim_setup(_three_blue(), 20, PARTNERS,
+                                    {("B1", 0): [None, "blue", None, None]})
+    assert lab[(0, "B1")][:2] == ("9066", wl.RANK_ELIM)
+
+
+def test_the_colour_gate_reads_every_window_of_the_chain():
+    # B1's chain has 3 windows; one red sample in its last window vetoes it all
+    named = {(s, j): PARTNERS[(s, 0)] for s in ("B2", "B3") for j in range(3)}
+    _f, _by, lab, st = _elim_setup(_three_blue(60), 60, named,
+                                   {("B1", 0): "blue", ("B1", 2): ["red"] + [None] * 3})
+    assert all((i, "B1") not in lab for i in range(60))
+    assert st["elim_chains_colour_skipped"] == 1
+
+
+def test_red_slots_need_red_bumpers():
+    tracks = {"R1": _still(range(20)), "R2": _still(range(20), B2_FAR),
+              "R3": _still(range(20), B3_FAR)}
+    named = {("R2", 0): ("2637", wl.RANK_DIGITS), ("R3", 0): ("2724", wl.RANK_DIGITS)}
+    _f, _by, lab, _st = _elim_setup(tracks, 20, named, {("R1", 0): "red"})
+    assert lab[(0, "R1")][:2] == ("6497", wl.RANK_ELIM)
+    _f, _by, lab, _st = _elim_setup(tracks, 20, named, {("R1", 0): "blue"})
+    assert (0, "R1") not in lab
+
+
+def test_an_alliance_without_three_teams_is_skipped():
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, PARTNERS, {("B1", 0): "blue"},
+                                   blue=["3128", "6773"])
+    assert (0, "B1") not in lab and st["elim_chains_colour_skipped"] == 0
+
+
+def test_elimination_scope_unread_vs_all(monkeypatch):
+    # B1's last window is read (lineup, 9066); its first two are unread
+    named = {(s, j): PARTNERS[(s, 0)] for s in ("B2", "B3") for j in range(3)}
+    named[("B1", 2)] = ("9066", wl.RANK_LINEUP)
+    assert wl.ELIM_SCOPE == "all"
+    _f, _by, lab, st = _elim_setup(_three_blue(60), 60, named, {("B1", 0): "blue"})
+    assert all(lab[(i, "B1")][:2] == ("9066", wl.RANK_ELIM) for i in range(40))
+    assert lab[(40, "B1")][:2] == ("9066", wl.RANK_LINEUP)          # a read is never touched
+    assert st["elim_frames"] == 40
+    monkeypatch.setattr(wl, "ELIM_SCOPE", "unread")
+    _f, _by, lab, st = _elim_setup(_three_blue(60), 60, named, {("B1", 0): "blue"})
+    assert all((i, "B1") not in lab for i in range(40)) and st["elim_frames"] == 0
+    # an unread chain is still eliminated under "unread"
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, PARTNERS, {("B1", 0): "blue"})
+    assert st["elim_frames"] == 20
+
+
+def test_cleared_and_labelled_entries_are_never_touched():
+    extra = {(3, "B1"): None, (4, "B1"): ("9066", wl.RANK_FILL, 0.6, 20)}
+    _f, _by, lab, st = _elim_setup(_three_blue(), 20, PARTNERS, {("B1", 0): "blue"},
+                                   extra=extra)
+    assert lab[(3, "B1")] is None and lab[(4, "B1")] == ("9066", wl.RANK_FILL, 0.6, 20)
+    assert st["elim_frames"] == 18
+
+
+def test_two_slots_eliminated_to_one_team_both_drop():
+    # a fourth blue slot (tracker duplicate): B1 and B4 would both be 9066
+    tracks = {**_three_blue(), "B4": _still(range(10), (14.0, 1.0))}
+    _f, _by, lab, st = _elim_setup(tracks, 20, PARTNERS, {("B1", 0): "blue", ("B4", 0): "blue"})
+    assert all((i, "B1") not in lab and (i, "B4") not in lab for i in range(10))
+    assert all(lab[(i, "B1")][:2] == ("9066", wl.RANK_ELIM) for i in range(10, 20))
+    assert st == {"elim_frames": 10, "elim_chains": 1, "elim_chains_colour_skipped": 0}
+
+
+def test_elim_colours_map_s1_colours_by_sample_number():
+    ws = [wl.Window(0, "B1", 0, [0, 1, 2, 3], [0, 1, 2, 3]),
+          wl.Window(1, "B2", 0, [0, 1, 2, 3], [0, 1, 2, 3]),
+          wl.Window(2, "B3", 0, [0, 1], [0, 1])]
+    tiles = {0: {1: "t", 3: "t"}, 1: {2: "t"}}
+    dc = {"s1_colours": {0: ["blue", None], 1: ["red"], 2: ["blue"]}}
+    assert wl.elim_colours(ws, tiles, dc) == {0: {1: "blue", 3: None}, 1: {2: "red"}}
+    assert wl.elim_colours(ws, tiles, {"calls": {}}) == {}          # Jev-only: no colours
+
+
+def test_stage_eliminate_knob_off_is_unchanged_and_jev_runs_have_no_colours():
+    frames = _frames({"B1": _still(range(60))}, 60)
+    base = _run(frames, _three_window_session(frames))
+    off = _run(frames, _three_window_session(frames), eliminate=False)
+    assert off == base and "elim_frames" not in off["stats"]
+    assert "s1_colours" not in off["digit_calls"]
+    on = _run(frames, _three_window_session(frames), eliminate=True)
+    assert on["labels"] == off["labels"]
+    assert {k: on["stats"][k] for k in ("elim_frames", "elim_chains")} == {
+        "elim_frames": 0, "elim_chains": 0}

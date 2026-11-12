@@ -249,3 +249,101 @@ def test_field_frame_keeps_the_size_and_drops_the_odd_rows():
     img[1::2] = 255
     out = ws.field_frame(img)
     assert out.shape == img.shape and out.max() == 0
+
+
+# --------------------------------------------------------------------------- #
+# S1 sample colours (s1_colours) and the colour-gated elimination
+
+
+class NearestFirst(FakeStudent):
+    """B1: a red bumper 6 px right of the target listed before a blue one
+    on it (nearest = blue); B2: nothing detected."""
+
+    def detect(self, images):
+        self.detected += len(images)
+        u, v = _target(B1_XY)
+        return [[((u + 6 - 20, v - 12, u + 6 + 20, v + 12), 0.9, "red"),
+                 ((u - 20, v - 12, u + 20, v + 12), 0.9, "blue")] for _img in images]
+
+
+def test_s1_colours_keep_the_nearest_bumper_per_tile_aligned_with_s1_calls():
+    res = _run(_two_slots(), Counting(), lineup_min_p=1.01, reader="student_only",
+               student=NearestFirst())
+    dc = res["digit_calls"]
+    assert dc["s1_colours"] == {0: ["blue"] * 4, 1: [None] * 4}
+    assert {w: len(c) for w, c in dc["s1_colours"].items()} == {
+        w: len(c) for w, c in dc["s1_calls"].items()}
+    assert dc["s1_calls"][1] == [None] * 4                   # no bumper: no call, no colour
+
+
+def test_s1_colours_survive_json_and_a_cache_with_or_without_them_is_reused():
+    stu = lambda: FakeStudent(teams={40: "3128", 80: None})  # noqa: E731
+    first = _run(_two_slots(), Counting(), lineup_min_p=1.01, reader="student", student=stu())
+    assert first["digit_calls"]["s1_colours"] == {0: ["blue"] * 4, 1: ["blue"] * 4}
+    cache = json.loads(json.dumps(first["digit_calls"]))
+    assert cache["s1_colours"] == {"0": ["blue"] * 4, "1": ["blue"] * 4}
+    assert set(wl.load_digit_calls(cache)) == {"calls", "wide_p", "fingerprints"}
+    old = {k: v for k, v in cache.items() if k != "s1_colours"}     # a pre-colour cache
+    for c in (cache, old):
+        s = Counting()
+        again = _run(_two_slots(), s, lineup_min_p=1.01, reader="student", digit_calls=c,
+                     student=stu())
+        assert s.asked == [] and again["labels"] == first["labels"]
+        assert again["digit_calls"]["s1_colours"] == first["digit_calls"]["s1_colours"]
+
+
+B3_XY = (6.0, 4.0)
+
+
+class ThreeBlue(FakeStudent):
+    """Bumpers at B1 / B2 / B3 with per-slot widths and colours; S1 names by
+    crop width (B1 abstains)."""
+    W = {"B1": 40, "B2": 60, "B3": 80}
+    XY = {"B1": B1_XY, "B2": B3_XY, "B3": B2_XY}
+
+    def __init__(self, colours=None):
+        super().__init__(teams={40: None, 60: "6773", 80: "3128"})
+        self.cols = {"B1": "blue", "B2": "blue", "B3": "blue", **(colours or {})}
+
+    def detect(self, images):
+        self.detected += len(images)
+        dets = []
+        for slot, xy in self.XY.items():
+            u, v = _target(xy)
+            w = self.W[slot]
+            dets.append(((u - w / 2, v - 12, u + w / 2, v + 12), 0.9, self.cols[slot]))
+        return [list(dets) for _img in images]
+
+    def read(self, crops, rosters, colours):
+        self.read_n += len(crops)
+        out = []
+        for c in crops:
+            w = min(self.W.values(), key=lambda x: abs(x - c.shape[1] / 1.5))
+            team = self.teams.get(w)
+            probs = {t: 0.0 for t in rosters[0]["red"] + rosters[0]["blue"]}
+            probs["other"] = 0.0
+            if team:
+                probs[team] = 0.99
+            out.append({"probs": probs, "team": team, "p": 0.99, "abstain": team is None})
+        return out
+
+
+def _three_slots():
+    return _frames({s: _still(range(20), xy) for s, xy in ThreeBlue.XY.items()}, 20)
+
+
+def test_stage_elimination_names_the_third_blue_robot_from_s1_reads():
+    kw = dict(lineup_min_p=1.01, reader="student_only")
+    off = _run(_three_slots(), Counting(), student=ThreeBlue(), **kw)
+    assert (0, "B1") not in off["labels"] and "elim_frames" not in off["stats"]
+    assert {_team(off, "B2"), _team(off, "B3")} == {"6773", "3128"}
+    on = _run(_three_slots(), Counting(), student=ThreeBlue(), eliminate=True, **kw)
+    assert all(on["labels"][(i, "B1")] == ("9066", wl.RANK_ELIM, 0.0, 20) for i in range(20))
+    assert {k: on["stats"][k] for k in ("elim_frames", "elim_chains",
+                                        "elim_chains_colour_skipped")} == {
+        "elim_frames": 20, "elim_chains": 1, "elim_chains_colour_skipped": 0}
+    b1 = wl.slot_label_to_id("B1")
+    assert [r["source"] for r in on["segments"][b1]] == ["window_elim"]
+    # a red bumper on B1's robot: a blue slot following a red robot is never eliminated
+    red = _run(_three_slots(), Counting(), student=ThreeBlue({"B1": "red"}), eliminate=True, **kw)
+    assert (0, "B1") not in red["labels"] and red["stats"]["elim_chains_colour_skipped"] == 1

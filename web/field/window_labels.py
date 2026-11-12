@@ -38,9 +38,9 @@ MAX_ERROR_FRACTION = 0.10
 MIN_ERRORS_TO_ABORT_EARLY = 20
 STAGE_TIMEOUT_S = 360.0
 REQUEST_BATCH = 32
-RANK_DIGITS, RANK_LINEUP, RANK_FILL = 2, 1, 0
+RANK_DIGITS, RANK_LINEUP, RANK_FILL, RANK_ELIM = 2, 1, 0, -1
 SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup",
-          RANK_FILL: "window_fill"}
+          RANK_FILL: "window_fill", RANK_ELIM: "window_elim"}
 SOURCE_NONE = "window_none"
 LETTERS = "ABCDEF"
 BORROW_PER_MATCH = 2              # borrowed anchors from any one source match, per row
@@ -66,6 +66,17 @@ FILL_BRIDGE_SPEED_M_S = 3.0       #     metres of where it vanished
 FILL_POINT_MIN_P = DIGIT_MIN_P    # a single sample read is a waypoint at this p or above
 FILL_STOP_RADIUS_M = 3.0          # an edge fill stops where another chain starts / ends
 FILL_STOP_SLACK_FRAMES = 2        # this close (frame indices) and closer than RADIUS
+
+# Chain roster elimination (eliminate_chains; window_labels_eliminate knob,
+# experimental, default OFF). An unlabelled frame of a track chain takes the
+# third team of its slot's alliance when the other two are read (digits /
+# lineup) on that alliance's other slots in the same frame. Offline qm8 (hand
+# GT) without a colour gate: ~+2-3 pts correct labels but ~1/3 wrong, every
+# wrong one a slot following a robot of the other alliance -> gated on the
+# chain's S1 bumper colours.
+ELIM_MIN_COLOUR_SAMPLES = 1       # coloured S1 samples the chain needs
+ELIM_COLOUR_AGREE = 1.0           # fraction of them that must be the slot's alliance colour
+ELIM_SCOPE = "all"                # "unread": chains with no digit / lineup entry; "all": any
 
 
 @dataclass
@@ -584,6 +595,95 @@ def fill_points(windows: list, tiles: dict, dc: dict) -> dict:
     return out
 
 
+def elim_colours(windows: list, tiles: dict, dc: dict) -> dict:
+    """eliminate_chains' ``colours`` from a digit pass: window id -> {k:
+    colour}, k the sample number (sorted tiles order, as fill_points). Only
+    S1 passes record colours (dc["s1_colours"]); a Jev-only pass gives {}.
+    Every window S1 cut is used, whoever read its digits: the colour is the
+    bumper detector's, not the reader's."""
+    cols = dc.get("s1_colours") or {}
+    out = {}
+    for w in windows:
+        c = cols.get(w.wid)
+        if tiles.get(w.wid) and c:
+            out[w.wid] = dict(zip(sorted(tiles[w.wid]), c))
+    return out
+
+
+def eliminate_chains(frames: list, windows: list, lab: dict, fps: float, red: list, blue: list,
+                     colours: Optional[dict] = None) -> dict:
+    """Colour-gated roster elimination along track chains (fill_chains).
+    Changes ``lab`` in place (assemble_labels' format) and returns
+    {"elim_frames", "elim_chains", "elim_chains_colour_skipped"}.
+
+    ``colours``: window id -> {sample number k (1-based): "red" / "blue" /
+    None}, the sample's frame ``w.samples[k - 1]`` (elim_colours).
+
+    Per chain (slot S, alliance A = slot_alliance(S); skipped unless A's
+    roster has exactly 3 teams):
+      * colour gate: the chain's windows' samples need at least
+        ELIM_MIN_COLOUR_SAMPLES non-None colours, and at least
+        ELIM_COLOUR_AGREE of them must be A's colour; else the chain is
+        skipped (elim_chains_colour_skipped; a chain with no unlabelled
+        frame is never counted);
+      * scope: ELIM_SCOPE "unread" skips a chain with any digit / lineup
+        entry; "all" takes any chain;
+      * every frame i of the chain whose key (i, S) is absent from ``lab``
+        (None-cleared entries and labels are never touched): when the teams
+        on A's other slots at i with a digit or lineup entry cover exactly
+        2 of A's roster, the remaining team T is the candidate, unless T is
+        already on another slot at i (any alliance, any rank, fills too).
+    One team per frame among the candidates: two slots with one T at one
+    frame both drop. Survivors are written as (T, RANK_ELIM, 0.0, length of
+    the window holding i)."""
+    colours = colours or {}
+    rosters = {"red": {str(t) for t in red}, "blue": {str(t) for t in blue}}
+    at: dict = {}                                    # frame -> {slot: entry}, before this pass
+    for (i, slot), e in lab.items():
+        if e:
+            at.setdefault(i, {})[slot] = e
+    chains, _ = fill_chains(frames, windows, fps)
+    cand: dict = {}                                  # (i, slot) -> (team, window len, chain)
+    skipped = 0
+    for ci, (slot, ws) in enumerate(chains):
+        a = slot_alliance(slot)
+        roster_a = rosters.get(a) or set()
+        todo = [(w, i) for w in ws for i in w.idx if (i, slot) not in lab]
+        if len(roster_a) != 3 or not todo:           # nothing could be eliminated here
+            continue
+        seen = [c for w in ws for c in (colours.get(w.wid) or {}).values() if c is not None]
+        agree = sum(1 for c in seen if c == a)
+        if len(seen) < ELIM_MIN_COLOUR_SAMPLES or agree < ELIM_COLOUR_AGREE * len(seen) - 1e-9:
+            skipped += 1
+            continue
+        if ELIM_SCOPE == "unread" and any(
+                (lab.get((i, slot)) or (None, None))[1] in (RANK_DIGITS, RANK_LINEUP)
+                for w in ws for i in w.idx):
+            continue
+        for w, i in todo:
+            here = at.get(i) or {}
+            named = {e[0] for s, e in here.items()
+                     if s != slot and slot_alliance(s) == a
+                     and e[1] in (RANK_DIGITS, RANK_LINEUP)} & roster_a
+            if len(named) != 2:
+                continue
+            team = next(iter(roster_a - named))
+            if any(s != slot and e[0] == team for s, e in here.items()):
+                continue
+            cand[(i, slot)] = (team, len(w.idx), ci)
+    rivals: dict = {}                                # (frame, team) -> candidate slots
+    for (i, _slot), (team, _wlen, _ci) in cand.items():
+        rivals[(i, team)] = rivals.get((i, team), 0) + 1
+    n, used = 0, set()
+    for (i, slot), (team, wlen, ci) in sorted(cand.items(), key=lambda kv: kv[0]):
+        if rivals[(i, team)] > 1:
+            continue
+        lab[(i, slot)] = (team, RANK_ELIM, 0.0, wlen)
+        used.add(ci)
+        n += 1
+    return {"elim_frames": n, "elim_chains": len(used), "elim_chains_colour_skipped": skipped}
+
+
 def apply_labels(frames: list, lab: dict) -> None:
     """Write the assembled labels into replay frames, in place. Every robot
     row is rewritten: a labelled entry gets its team, everything else None."""
@@ -697,6 +797,9 @@ class Params:
     # window_labels_fill knob: fill_runs after assembly (named windows' teams
     # spread over unread windows of the same track chain, RANK_FILL).
     fill_runs: bool = False
+    # window_labels_eliminate knob (experimental): eliminate_chains after the
+    # fill (colour-gated roster elimination, RANK_ELIM).
+    eliminate: bool = False
     cancelled: bool = False                    # a user stop: aborts at the next check, never partial
 
 
@@ -712,7 +815,8 @@ class DeadlinePassed(StageAbort):
     """The stage's time budget ran out (a stop is a plain StageAbort)."""
 
 
-def _stats(event_lineup: bool = False, deinterlace: bool = False, fill: bool = False) -> dict:
+def _stats(event_lineup: bool = False, deinterlace: bool = False, fill: bool = False,
+           eliminate: bool = False) -> dict:
     out = {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
            "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
            "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
@@ -722,6 +826,8 @@ def _stats(event_lineup: bool = False, deinterlace: bool = False, fill: bool = F
         out["tiles_deinterlaced"] = 0
     if fill:                           # knob off: no fill keys
         out.update(fill_frames=0, fill_windows=0, fill_chains_bridged=0)
+    if eliminate:                      # knob off: no elimination keys
+        out.update(elim_frames=0, elim_chains=0, elim_chains_colour_skipped=0)
     return out
 
 
@@ -769,7 +875,7 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     reader (see _open_student; default: loaded here on the GPU and released
     before returning). When it cannot be loaded the stage runs as "jev" and
     stats["student"]["fallback"] says why."""
-    stats = _stats(params.event_lineup, params.deinterlace, params.fill_runs)
+    stats = _stats(params.event_lineup, params.deinterlace, params.fill_runs, params.eliminate)
     before = _usage(session)
     reader, stu, owned = "jev", None, False
     if params.reader != "jev":
@@ -1022,7 +1128,8 @@ class _StudentPass:
     """S1 inputs cut while the video pass runs: frames are buffered, the
     bumper detector runs per STUDENT_DETECT_BATCH frames (on one field when
     deinterlacing, like the harvester on woven video), and the padded crops
-    of the bumpers near each sample's target are kept."""
+    of the bumpers near each sample's target are kept, with the detector's
+    colour of each sample's nearest bumper (None: no bumper near it)."""
 
     def __init__(self, stu, deinterlace: bool, st: dict):
         self.stu, self.deinterlace, self.st = stu, deinterlace, st
@@ -1030,6 +1137,7 @@ class _StudentPass:
         self.crops: list = []
         self.colours: list = []
         self.by_sample: dict = {}              # (wid, k) -> crop indices, nearest first
+        self.sample_colour: dict = {}          # (wid, k) -> nearest bumper's colour or None
 
     def add(self, img, items) -> None:
         if items:
@@ -1053,6 +1161,7 @@ class _StudentPass:
                 near = ws.near_bumpers(d, u, v, side)
                 if near:
                     self.st["bumper_found"] += 1
+                self.sample_colour[(wid, k)] = near[0][3] if near else None
                 for _dist, box, _conf, colour in near:
                     x0, y0, x1, y1 = ws.pad_box(box, ws.PAD_BUMPER, w, h)
                     if x1 <= x0 or y1 <= y0:
@@ -1066,6 +1175,13 @@ class _StudentPass:
                     self.colours.append(colour)
         self.pending = []
         self.st["detect_s"] = round(self.st["detect_s"] + time.perf_counter() - t0, 3)
+
+    def tile_colours(self, tiles: dict) -> dict:
+        """wid -> the nearest bumper's colour per tile (sample number order,
+        aligned with ``calls``), None where no bumper was found."""
+        self.flush()
+        return {wid: [self.sample_colour.get((wid, k)) for k in sorted(tiles[wid])]
+                for wid in tiles}
 
     def calls(self, tiles: dict, red: list, blue: list) -> dict:
         """wid -> one call per tile (sample number order): S1's read of
@@ -1097,13 +1213,15 @@ class _StudentPass:
 
 
 def _student_digit_calls(frames, windows, tiles, params, session, digit_item, clock, stats,
-                         reader: str, s1: dict) -> dict:
+                         reader: str, s1: dict, s1_colours: Optional[dict] = None) -> dict:
     """The digit pass for reader "student" / "student_only": S1's calls
     name a window when digit_decision accepts them; "student" sends Jev the
     usual requests for every other window. Same cache shape as _digit_pass
-    plus "reader", "s1_model", "sources" (wid -> "s1" | "jev") and
-    "s1_calls" (every window's S1 calls). Fingerprints cover the Jev windows
-    only, so S1 calls are never reused as Jev calls."""
+    plus "reader", "s1_model", "sources" (wid -> "s1" | "jev"), "s1_calls"
+    (every window's S1 calls) and "s1_colours" (every window's nearest-bumper
+    colour per tile, aligned with s1_calls; _StudentPass.tile_colours).
+    Fingerprints cover the Jev windows only, so S1 calls are never reused as
+    Jev calls."""
     st = stats["student"]
     roster = [str(t) for t in params.red] + [str(t) for t in params.blue]
     decided = {wid for wid, c in s1.items() if digit_decision(c, roster)}
@@ -1132,7 +1250,9 @@ def _student_digit_calls(frames, windows, tiles, params, session, digit_item, cl
     return {"calls": calls, "wide_p": wide_p, "fingerprints": jdc["fingerprints"],
             "roster": roster, "model_key": params.model_key, "reader": reader,
             "s1_model": st.get("model"), "sources": sources,
-            "s1_calls": {wid: s1[wid] for wid in calls}}
+            "s1_calls": {wid: s1[wid] for wid in calls},
+            "s1_colours": {wid: list((s1_colours or {}).get(wid) or [None] * len(s1[wid]))
+                           for wid in calls}}
 
 
 def _run_stage(frames, video_path, cal, session, params, frame_source, clock, stats,
@@ -1204,7 +1324,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
         s1 = spass.calls(tiles, red, blue)
         _check(params, clock, "after the student pass")
         dc = _student_digit_calls(frames, windows, tiles, params, session, digit_item, clock,
-                                  stats, reader, s1)
+                                  stats, reader, s1, spass.tile_colours(tiles))
     calls, wide_p = dc["calls"], dc["wide_p"]
     digit = {}
     for wid, c in calls.items():
@@ -1276,6 +1396,9 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     if params.fill_runs:          # after the anchors: a fill is never an anchor or a read
         stats.update(fill_runs(frames, windows, lab, params.fps,
                                fill_points(windows, tiles, dc), roster))
+    if params.eliminate:          # after the fill: fills block a team, never name a partner
+        stats.update(eliminate_chains(frames, windows, lab, params.fps, red, blue,
+                                      elim_colours(windows, tiles, dc)))
     stats["unlabelled"] = len(windows) - len(evidence)
     return {"labels": lab, "segments": window_segments(frames, lab),
             "lineup_jpeg": jpegs.get("all", jpegs.get("red")),

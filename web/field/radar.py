@@ -1,8 +1,10 @@
 """Top-down field map: exact structure footprints + track-state rendering.
 
-Structures come from overlay_geometry.structure_footprints — the same
-CAD-derived placements the /calibrate overlay draws — so the map and the
-camera overlays can never disagree about where the field furniture is.
+With a field model whose season has an AdvantageScope 2D drawing
+(web/field/field2d.py), the map is that drawing cropped to the field plus a
+small margin (walls + driver-station edge). Without one, it falls back to a
+plain carpet with structure footprints from overlay_geometry.structure_footprints
+— the same CAD-derived placements the /calibrate overlay draws.
 
 Per-track rendering encodes tracking state for replay review:
   solid dot            visible, main-camera-backed position
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from web.field.field2d import field2d_for_layout, field2d_image
 from web.field.occlusion import hub_prisms
 from web.field.overlay_geometry import structure_footprints
 
@@ -32,6 +35,8 @@ class RadarTrack:
     trail: tuple = ()            # oldest-first recent positions
 
 _BG = 235
+# Margin (m) of the drawing shown around the field rect: walls + driver-station edge.
+_IMAGE_MARGIN_M = 0.45
 _ALLIANCE = {"blue": (255, 120, 0), "red": (0, 0, 255), None: (150, 150, 150)}
 # Scouted (Manta) ghost routes: a wide, translucent band the crisp live trail rides
 # on top of. 4x the 2px live stroke, blended at half opacity.
@@ -90,13 +95,22 @@ class Radar:
         self.L, self.W, self.s = field_length, field_width, px_per_m
         self.w = round(field_length * px_per_m)
         self.h = round(field_width * px_per_m)
-        footprints = None
+        # Pixel offset of field (0, W) — non-zero only when the drawing's margin shows.
+        self.ox = self.oy = 0.0
+        self.field_image = None          # drawing name when the base is the image
+        base = None
         if field_model is not None:
-            try:
-                footprints = structure_footprints(field_model, hub_prisms(field_model))
-            except Exception:
-                footprints = None
-        self._base = self._render_base(footprints)
+            base = self._image_base(getattr(field_model, "season", ""))
+        if base is None:
+            footprints = None
+            if field_model is not None:
+                try:
+                    footprints = structure_footprints(field_model, hub_prisms(field_model))
+                except Exception:
+                    footprints = None
+            base = self._render_base(footprints)
+        self._base = base
+        self._set_tones(base)
         # Optional scouted reference routes (e.g. Manta auto paths), precomputed
         # to pixels once — they are static for the whole match.
         self._reference: list[dict] = []
@@ -104,10 +118,74 @@ class Radar:
     def field_to_pixel(self, xy) -> tuple:
         # WPILib field coordinates use +Y across the field. For the observer HUD,
         # draw +Y upward on screen so the map matches the main broadcast view.
-        return (xy[0] * self.s, (self.W - xy[1]) * self.s)
+        return (self.ox + xy[0] * self.s, self.oy + (self.W - xy[1]) * self.s)
 
     def _poly_px(self, poly) -> np.ndarray:
         return np.array([self.field_to_pixel(p) for p in poly], np.int32)
+
+    def _image_base(self, layout_stem: str):
+        """Crop the AdvantageScope drawing to the field rect + margin and scale it
+        to px_per_m. Sets w/h/ox/oy. None when the season has no drawing."""
+        meta = field2d_for_layout(layout_stem)
+        if not meta:
+            return None
+        src = field2d_image(meta["image_path"])
+        if src is None:
+            return None
+        (tlx, tly), (brx, bry) = meta["field_top_left_px"], meta["field_bottom_right_px"]
+        # Image px per metre, mapping the drawing's field rect onto THIS model's L x W.
+        kx, ky = (brx - tlx) / self.L, (bry - tly) / self.W
+        ih, iw = src.shape[:2]
+        x0 = max(0, int(np.floor(tlx - _IMAGE_MARGIN_M * kx)))
+        y0 = max(0, int(np.floor(tly - _IMAGE_MARGIN_M * ky)))
+        x1 = min(iw, int(np.ceil(brx + _IMAGE_MARGIN_M * kx)))
+        y1 = min(ih, int(np.ceil(bry + _IMAGE_MARGIN_M * ky)))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        w = round((x1 - x0) * self.s / kx)
+        h = round((y1 - y0) * self.s / ky)
+        img = cv2.resize(src[y0:y1, x0:x1], (w, h), interpolation=cv2.INTER_AREA)
+        # Canvas px per image px (== s/k up to rounding), so the offsets are exact.
+        self.ox = (tlx - x0) * w / (x1 - x0)
+        self.oy = (tly - y0) * h / (y1 - y0)
+        self.w, self.h = w, h
+        self.field_image = meta["name"]
+        self._draw_corner_labels(img, outline=True)
+        return img
+
+    def _set_tones(self, base: np.ndarray) -> None:
+        """Background tone + label colours, chosen from the base's luminance so the
+        light fallback looks as before and the dark drawing gets light labels."""
+        if self.field_image:
+            self._bg = base.reshape(-1, 3).mean(axis=0)
+        else:
+            self._bg = np.full(3, float(_BG))
+        lum = float(0.114 * self._bg[0] + 0.587 * self._bg[1] + 0.299 * self._bg[2])
+        self._dark = lum < 150
+        if self._dark:
+            self._text_fg, self._text_bg = (250, 250, 250), (15, 15, 15)
+            self._ring = (245, 245, 245)       # visible-dot outline
+            self._corner_ring = (225, 225, 225)
+            self._legend = (225, 225, 225)
+        else:
+            self._text_fg, self._text_bg = (20, 20, 20), (250, 250, 250)
+            self._ring = (20, 20, 20)
+            self._corner_ring = (60, 60, 60)
+            self._legend = (90, 90, 90)
+
+    def _draw_corner_labels(self, img, outline: bool = False) -> None:
+        for text, org, col in (("BLUE", (8, 18), _ALLIANCE["blue"]),
+                               ("RED", (self.w - 48, 18), _ALLIANCE["red"])):
+            if outline:
+                # On the drawing: a dark tab behind lightened alliance text.
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                x = min(org[0], self.w - tw - 6)
+                cv2.rectangle(img, (x - 4, org[1] - th - 4), (x + tw + 3, org[1] + 4),
+                              (20, 20, 20), -1)
+                col = tuple(min(255, c + 70) for c in col)
+                org = (x, org[1])
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        col, 1, cv2.LINE_AA)
 
     def _render_base(self, footprints) -> np.ndarray:
         img = np.full((self.h, self.w, 3), _BG, np.uint8)
@@ -123,10 +201,7 @@ class Radar:
                 cv2.addWeighted(overlay, 0.22, img, 0.78, 0, img)
                 cv2.polylines(img, [pts], True, color, 2)
 
-        cv2.putText(img, "BLUE", (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, _ALLIANCE["blue"], 1, cv2.LINE_AA)
-        cv2.putText(img, "RED", (self.w - 48, 18), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, _ALLIANCE["red"], 1, cv2.LINE_AA)
+        self._draw_corner_labels(img)
         return img
 
     def set_reference_paths(self, paths) -> None:
@@ -198,21 +273,26 @@ class Radar:
         x, y = ref["pts_px"][0]
         org = (int(x) + 10, int(y) - 8)
         color = _ALLIANCE.get(ref["alliance"], _ALLIANCE[None])
+        # Alliance-coloured text needs a light halo on either background.
         cv2.putText(img, ref["team"], org, cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     (250, 250, 250), 3, cv2.LINE_AA)
         cv2.putText(img, ref["team"], org, cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     color, 1, cv2.LINE_AA)
 
     def _draw_reference_legend(self, img) -> None:
-        cv2.putText(img, "- - scouted (Manta)", (8, self.h - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 90), 1, cv2.LINE_AA)
+        org = (8, self.h - 8)
+        if self._dark:
+            cv2.putText(img, "- - scouted (Manta)", org, cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, self._text_bg, 3, cv2.LINE_AA)
+        cv2.putText(img, "- - scouted (Manta)", org, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, self._legend, 1, cv2.LINE_AA)
 
     def _draw_trail(self, img, t: RadarTrack) -> None:
         trail = list(t.trail or ())
         if len(trail) < 2:
             return
         color = np.array(_ALLIANCE.get(t.alliance, _ALLIANCE[None]), float)
-        bg = np.full(3, _BG, float)
+        bg = np.asarray(self._bg, float)
         n = len(trail)
         for i in range(n - 1):
             a = self.field_to_pixel(trail[i])
@@ -231,23 +311,30 @@ class Radar:
 
         if t.state == "coasting":
             # Hollow, washed-out dot: last known position, not a live fix.
-            faded = tuple(int(_BG + (ch - _BG) * 0.55) for ch in color)
+            faded = tuple(int(b + (ch - b) * 0.55) for ch, b in zip(color, self._bg))
+            if self._dark:
+                # Dark under-stroke: keeps the hollow ring readable over same-colour
+                # field art (a red ghost on the red bump, blue on the blue one).
+                cv2.circle(img, c, r, self._text_bg, 4, cv2.LINE_AA)
             cv2.circle(img, c, r, faded, 2, cv2.LINE_AA)
             cv2.circle(img, c, 2, faded, -1, cv2.LINE_AA)
         else:
-            cv2.circle(img, c, r + 1, (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.circle(img, c, r + 1, self._ring, 2, cv2.LINE_AA)
             cv2.circle(img, c, r, color, -1, cv2.LINE_AA)
 
         if t.corner_only:
             # Dashed outer ring: position is corner-camera-sourced (poor range).
             for a0 in range(0, 360, 90):
+                if self._dark:   # dark under-stroke so the light dashes read on white
+                    cv2.ellipse(img, c, (r + 5, r + 5), 0, a0, a0 + 50,
+                                self._text_bg, 3, cv2.LINE_AA)
                 cv2.ellipse(img, c, (r + 5, r + 5), 0, a0, a0 + 50,
-                            (60, 60, 60), 1, cv2.LINE_AA)
+                            self._corner_ring, 1, cv2.LINE_AA)
 
         label = t.team or (f"S{t.slot_id}" if t.slot_id is not None else None)
         if label:
             org = (c[0] - 4 * len(label), c[1] - r - 6)
             cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        (250, 250, 250), 3, cv2.LINE_AA)
+                        self._text_bg, 3, cv2.LINE_AA)
             cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        (20, 20, 20), 1, cv2.LINE_AA)
+                        self._text_fg, 1, cv2.LINE_AA)

@@ -155,6 +155,25 @@ def test_tag_map_follows_the_event(app_mod):
     assert r.status_code == 400 and "2019" in r.json()["error"]
 
 
+def test_tag_map_carries_the_advantagescope_drawing(app_mod):
+    c = _client(app_mod)
+    j = c.get("/api/calibration/tag-map", params={"event": "2025hop"}).json()
+    f = j["field2d"]
+    assert f["name"] == "2025_field2d" and f["url"] == "/api/field2d/2025_field2d.jpg"
+    assert len(f["field_top_left_px"]) == 2 and len(f["field_bottom_right_px"]) == 2
+    assert "image_path" not in f                       # no server paths leak out
+    d = c.get("/api/calibration/tag-map").json()
+    assert d["field2d"]["url"] == "/api/field2d/2026_field2d.jpg"
+    am = c.get("/api/calibration/tag-map",
+               params={"season": "2025-reefscape-andymark"}).json()
+    assert am["field2d"]["name"] == "2025_andymark_field2d"
+    img = c.get(f["url"])
+    assert img.status_code == 200 and img.headers["content-type"] == "image/jpeg"
+    assert img.content[:2] == b"\xff\xd8"
+    for bad in ("2031_field2d", "README", "..%2F..%2Fweb%2Fapp", "2026_field2d.json"):
+        assert c.get(f"/api/field2d/{bad}.jpg").status_code == 404, bad
+
+
 def test_tag_map_overlay_legend_follows_the_season(app_mod):
     """The calibrate page's overlay legend lists the colours hud_draw draws on the
     event's field: 2025 GLB groups, 2026 hand-coded structures."""

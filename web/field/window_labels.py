@@ -5,7 +5,9 @@ Spec: docs/superpowers/specs/2026-11-09-jev-window-labels-design.md.
 A slot's track is cut into windows of at most MAX_WINDOW_S (split at gaps and
 jumps); a reader names each window from a few native-resolution crops; the
 window's team goes to every frame of that slot in the window. Unread windows
-stay unlabelled and a team sits on at most one slot per frame.
+stay unlabelled (with Params.fill_runs, fill_runs spreads named windows' teams
+over unread windows of the same track chain, unconfirmed) and a team sits on
+at most one slot per frame.
 
 Everything above ``run_window_labels`` is pure (no I/O). Event-store access happens in the callers (web/app.py, scripts/relabel_replay.py)."""
 from __future__ import annotations
@@ -14,6 +16,7 @@ import math
 import random
 import statistics
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,8 +38,9 @@ MAX_ERROR_FRACTION = 0.10
 MIN_ERRORS_TO_ABORT_EARLY = 20
 STAGE_TIMEOUT_S = 360.0
 REQUEST_BATCH = 32
-RANK_DIGITS, RANK_LINEUP = 2, 1
-SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup"}
+RANK_DIGITS, RANK_LINEUP, RANK_FILL = 2, 1, 0
+SOURCE = {RANK_DIGITS: "window_digits", RANK_LINEUP: "window_lineup",
+          RANK_FILL: "window_fill"}
 SOURCE_NONE = "window_none"
 LETTERS = "ABCDEF"
 BORROW_PER_MATCH = 2              # borrowed anchors from any one source match, per row
@@ -49,6 +53,19 @@ ELIM_MIN_WIDE_CALLS = 3           # returned wide calls W3 needs
 ELIM_MAX_NOT_ROBOT_P = 0.3        # every returned wide call below this p(not_robot)
 ELIM_TILES_PER_WINDOW = 3
 ELIM_PER_TEAM = 3                 # per team per match
+
+# Run fill (fill_runs; window_labels_fill knob). A named window's team spreads
+# over the unread windows of the same track "chain" (one slot's runs joined
+# across short plausible gaps), up to a conflicting read or a nearby track
+# start / end. Offline (qm8 hand GT + Jev audit on 6 held-out matches): plain
+# whole-run fill was 85% precise; this guarded rule ~98%, about +4-6 points of
+# correctly-labelled robot time.
+FILL_BRIDGE_GAP_S = 2.0           # join two runs of a slot across at most this gap ...
+FILL_BRIDGE_BASE_M = 1.0          # ... when the slot reappears within BASE + SPEED * gap
+FILL_BRIDGE_SPEED_M_S = 3.0       #     metres of where it vanished
+FILL_POINT_MIN_P = DIGIT_MIN_P    # a single sample read is a waypoint at this p or above
+FILL_STOP_RADIUS_M = 3.0          # an edge fill stops where another chain starts / ends
+FILL_STOP_SLACK_FRAMES = 2        # this close (frame indices) and closer than RADIUS
 
 
 @dataclass
@@ -391,6 +408,182 @@ def assemble_labels(windows: list, evidence: dict) -> tuple:
     return lab, cleared
 
 
+def fill_chains(frames: list, windows: list, fps: float) -> tuple:
+    """(chains, bridged): each chain is (slot, [Window] in time order), one
+    slot's runs joined a -> b when b starts at most FILL_BRIDGE_GAP_S after
+    a ends and the slot reappears within FILL_BRIDGE_BASE_M +
+    FILL_BRIDGE_SPEED_M_S * gap metres of where it vanished. ``bridged``
+    counts the joins. ``Window.run`` is left as it is."""
+    by_slot: dict = {}
+    for w in windows:
+        by_slot.setdefault(w.slot, {}).setdefault(w.run, []).append(w)
+    chains, bridged = [], 0
+    for slot in sorted(by_slot):
+        runs = [sorted(ws, key=lambda w: w.idx[0]) for ws in by_slot[slot].values()]
+        runs.sort(key=lambda ws: ws[0].idx[0])
+        cur = list(runs[0])
+        for a, b in zip(runs, runs[1:]):
+            ia, ib = a[-1].idx[-1], b[0].idx[0]
+            pa, pb = _slot_xy(frames, ia, slot), _slot_xy(frames, ib, slot)
+            gap = (frames[ib]["frame_num"] - frames[ia]["frame_num"]) / float(fps)
+            if (pa and pb and gap <= FILL_BRIDGE_GAP_S + 1e-9
+                    and math.hypot(pb[0] - pa[0], pb[1] - pa[1])
+                    <= FILL_BRIDGE_BASE_M + FILL_BRIDGE_SPEED_M_S * gap + 1e-9):
+                cur += b
+                bridged += 1
+            else:
+                chains.append((slot, cur))
+                cur = list(b)
+        chains.append((slot, cur))
+    return chains, bridged
+
+
+def _sample_team(probs, roster) -> Optional[tuple]:
+    """(team, p) when a single sample's call names a team at FILL_POINT_MIN_P
+    or above: its top key is a roster team (any all-digit key when no roster
+    is given), never "other" / "not_robot" / "unreadable"."""
+    if not probs:
+        return None
+    top = max(probs, key=lambda t: float(probs.get(t) or 0.0))
+    p = float(probs.get(top) or 0.0)
+    ok = top in roster if roster is not None else str(top).isdigit()
+    return (str(top), p) if ok and p >= FILL_POINT_MIN_P else None
+
+
+def fill_runs(frames: list, windows: list, lab: dict, fps: float, point: Optional[dict] = None,
+              roster: Optional[list] = None) -> dict:
+    """Spread window labels over the unread windows of the same track chain
+    (fill_chains). Changes ``lab`` in place (assemble_labels' format) and
+    returns {"fill_frames", "fill_windows", "fill_chains_bridged"}.
+
+    ``point``: window id -> {sample number k (1-based, as tiles / wide_p):
+    probability dict}; the sample's frame is ``w.samples[k - 1]``.
+
+    Waypoints along a chain (frame -> team): every frame of a named window
+    (its team: the most common non-None, non-fill entry over its frames;
+    frames cleared to None count too), and every other frame whose single
+    sample read names a team (_sample_team). A chain with no named window
+    is not filled. Between two consecutive waypoints of one team every frame
+    is filled; between two teams nothing (the robot changed somewhere in
+    between). Before the first and after the last waypoint its team extends
+    outward until the first hazard frame (exclusive): another chain (any
+    slot, the same slot's other chains included) starts or ends within
+    FILL_STOP_SLACK_FRAMES frames of it, closer than FILL_STOP_RADIUS_M to
+    this slot's position there. A sample waypoint's own frame is filled when
+    it bounds a fill (an agreeing neighbour, or it is an edge waypoint).
+
+    Only keys absent from ``lab`` are filled, as (team, RANK_FILL, p of the
+    waypoint the fill came from, window length). One team per frame: a fill
+    is dropped when ``lab`` already has its team on another slot in that
+    frame, or another fill puts the team on another slot at a distance (in
+    chain frames from its waypoint) no larger than its own (a tie drops
+    both)."""
+    point = point or {}
+    roster = None if roster is None else [str(t) for t in roster]
+    chains, bridged = fill_chains(frames, windows, fps)
+    ends: dict = {}                                  # frame index -> [(chain, x, y)]
+    for ci, (slot, ws) in enumerate(chains):
+        for i in {ws[0].idx[0], ws[-1].idx[-1]}:
+            xy = _slot_xy(frames, i, slot)
+            if xy is None:
+                continue
+            for d in range(-FILL_STOP_SLACK_FRAMES, FILL_STOP_SLACK_FRAMES + 1):
+                ends.setdefault(i + d, []).append((ci, xy[0], xy[1]))
+
+    def hazard(i, ci, slot):
+        near = ends.get(i)
+        me = _slot_xy(frames, i, slot) if near else None
+        return bool(me) and any(cj != ci and math.hypot(x - me[0], y - me[1]) < FILL_STOP_RADIUS_M
+                                for cj, x, y in near)
+
+    cand: dict = {}                                  # (i, slot) -> (team, dist, p, window len, wid)
+    for ci, (slot, ws) in enumerate(chains):
+        seq, win_of, way = [], {}, {}                # way: frame -> (team, p, named)
+        for w in ws:
+            seq += w.idx
+            for i in w.idx:
+                win_of[i] = w
+            got = [e for e in (lab.get((i, slot)) for i in w.idx) if e and e[1] != RANK_FILL]
+            if got:
+                team = Counter(e[0] for e in got).most_common(1)[0][0]   # ties: first seen
+                p = max(float(e[2]) for e in got if e[0] == team)
+                for i in w.idx:
+                    way[i] = (team, p, True)
+        if not way:
+            continue
+        for w in ws:
+            for k, probs in (point.get(w.wid) or {}).items():
+                if not 1 <= int(k) <= len(w.samples):
+                    continue
+                i = w.samples[int(k) - 1]
+                st = _sample_team(probs, roster)
+                if st and i not in way:
+                    way[i] = (st[0], st[1], False)
+        pts = [(k, way[i]) for k, i in enumerate(seq) if i in way]
+
+        def put(k, team, d, p, slot=slot, seq=seq, win_of=win_of):
+            i = seq[k]
+            if (i, slot) in lab:
+                return
+            old = cand.get((i, slot))
+            if old is None or d < old[1]:
+                w = win_of[i]
+                cand[(i, slot)] = (team, d, p, len(w.idx), w.wid)
+
+        for (ka, (ta, pa, _na)), (kb, (tb, pb, _nb)) in zip(pts, pts[1:]):
+            if ta != tb:
+                continue
+            for k in range(ka, kb + 1):              # endpoints: only sample frames are absent
+                put(k, ta, min(k - ka, kb - k), pa if k - ka <= kb - k else pb)
+        k0, (t0, p0, _n0) = pts[0]
+        put(k0, t0, 0, p0)
+        for k in range(k0 - 1, -1, -1):
+            if hazard(seq[k], ci, slot):
+                break
+            put(k, t0, k0 - k, p0)
+        k1, (t1, p1, _n1) = pts[-1]
+        put(k1, t1, 0, p1)
+        for k in range(k1 + 1, len(seq)):
+            if hazard(seq[k], ci, slot):
+                break
+            put(k, t1, k - k1, p1)
+
+    held: dict = {}                                  # (frame, team) -> slots already labelled
+    for (i, slot), e in lab.items():
+        if e:
+            held.setdefault((i, e[0]), set()).add(slot)
+    rivals: dict = {}                                # (frame, team) -> [(slot, dist)]
+    for (i, slot), c in cand.items():
+        rivals.setdefault((i, c[0]), []).append((slot, c[1]))
+    filled_windows = set()
+    n = 0
+    for (i, slot), (team, d, p, wlen, wid) in sorted(cand.items(), key=lambda kv: kv[0]):
+        if held.get((i, team), set()) - {slot}:
+            continue
+        if any(s != slot and d2 <= d for s, d2 in rivals[(i, team)]):
+            continue
+        lab[(i, slot)] = (team, RANK_FILL, float(p), wlen)
+        filled_windows.add(wid)
+        n += 1
+    return {"fill_frames": n, "fill_windows": len(filled_windows), "fill_chains_bridged": bridged}
+
+
+def fill_points(windows: list, tiles: dict, dc: dict) -> dict:
+    """fill_runs' ``point`` from a digit pass: window id -> {k: probs}. A
+    window S1 read (dc["sources"][wid] == "s1") takes its S1 calls, one per
+    tile in sample-number order; every other window its wide calls."""
+    sources = dc.get("sources") or {}
+    calls, wide_p = dc.get("calls") or {}, dc.get("wide_p") or {}
+    out = {}
+    for w in windows:
+        if sources.get(w.wid) == "s1":
+            if tiles.get(w.wid) and calls.get(w.wid):
+                out[w.wid] = dict(zip(sorted(tiles[w.wid]), calls[w.wid]))
+        elif wide_p.get(w.wid):
+            out[w.wid] = dict(wide_p[w.wid])
+    return out
+
+
 def apply_labels(frames: list, lab: dict) -> None:
     """Write the assembled labels into replay frames, in place. Every robot
     row is rewritten: a labelled entry gets its team, everything else None."""
@@ -501,6 +694,9 @@ class Params:
     # undecided; "student_only" = no Jev in the digit pass. The lineup pass is
     # Jev in every mode.
     reader: str = "jev"
+    # window_labels_fill knob: fill_runs after assembly (named windows' teams
+    # spread over unread windows of the same track chain, RANK_FILL).
+    fill_runs: bool = False
     cancelled: bool = False                    # a user stop: aborts at the next check, never partial
 
 
@@ -516,7 +712,7 @@ class DeadlinePassed(StageAbort):
     """The stage's time budget ran out (a stop is a plain StageAbort)."""
 
 
-def _stats(event_lineup: bool = False, deinterlace: bool = False) -> dict:
+def _stats(event_lineup: bool = False, deinterlace: bool = False, fill: bool = False) -> dict:
     out = {"windows": 0, "digit_named": 0, "lineup_named": 0, "cleared_by_uniqueness": 0,
            "unlabelled": 0, "lineup_rows": 0, "samples": 0, "tiles": 0, "requests": 0,
            "input_tokens": 0, "cost_cents": 0.0, "request_errors": 0, "aborted": None}
@@ -524,6 +720,8 @@ def _stats(event_lineup: bool = False, deinterlace: bool = False) -> dict:
         out.update(rows_own=0, rows_borrowed=0, rows_elim=0)
     if deinterlace:                    # knob off: the stats stay exactly as they were
         out["tiles_deinterlaced"] = 0
+    if fill:                           # knob off: no fill keys
+        out.update(fill_frames=0, fill_windows=0, fill_chains_bridged=0)
     return out
 
 
@@ -571,7 +769,7 @@ def run_window_labels(frames: list, video_path, cal, session, params: Params, *,
     reader (see _open_student; default: loaded here on the GPU and released
     before returning). When it cannot be loaded the stage runs as "jev" and
     stats["student"]["fallback"] says why."""
-    stats = _stats(params.event_lineup, params.deinterlace)
+    stats = _stats(params.event_lineup, params.deinterlace, params.fill_runs)
     before = _usage(session)
     reader, stu, owned = "jev", None, False
     if params.reader != "jev":
@@ -1075,6 +1273,9 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     evidence.update({wid: (t, RANK_LINEUP, p) for wid, (t, p) in lineup.items()})
     lab, cleared = assemble_labels(windows, evidence)
     stats["cleared_by_uniqueness"] = cleared
+    if params.fill_runs:          # after the anchors: a fill is never an anchor or a read
+        stats.update(fill_runs(frames, windows, lab, params.fps,
+                               fill_points(windows, tiles, dc), roster))
     stats["unlabelled"] = len(windows) - len(evidence)
     return {"labels": lab, "segments": window_segments(frames, lab),
             "lineup_jpeg": jpegs.get("all", jpegs.get("red")),

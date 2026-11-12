@@ -686,3 +686,269 @@ def test_lineup_payloads_share_one_encoded_card_asset():
     assert res["aborted"] is None and len(sent) == 2
     assert sent[0][0]["assets"]["lineup_image"] is sent[1][0]["assets"]["lineup_image"]
     assert sent[0][0]["assets"]["crops_image"] is not sent[1][0]["assets"]["crops_image"]
+
+
+# --------------------------------------------------------------------------- #
+# fill_runs (window_labels_fill): spread window labels along track chains
+# --------------------------------------------------------------------------- #
+FAR = (12.0, 6.0)          # > FILL_STOP_RADIUS_M from (3, 2)
+
+
+def _fill_setup(tracks, n, named, point=None, extra=None):
+    """Windows, assembled lab (``named``: (slot, window number within the
+    slot) -> (team, rank)), fill_runs stats. ``extra``: lab entries to set
+    before filling."""
+    frames = _frames(tracks, n)
+    ws = wl.build_windows(frames, FPS)
+    by = {}
+    for w in ws:
+        by.setdefault(w.slot, []).append(w)
+    ev = {by[s][j].wid: (team, rank, 0.9) for (s, j), (team, rank) in named.items()}
+    lab, _ = wl.assemble_labels(ws, ev)
+    lab.update(extra or {})
+    pt = {by[s][j].wid: kp for (s, j), kp in (point or {}).items()}
+    st = wl.fill_runs(frames, ws, lab, FPS, pt, roster=["2637", "2724", "6497", "3128", "6773",
+                                                         "9066"])
+    return frames, by, lab, st
+
+
+def _team(lab, i, slot="B1"):
+    e = lab.get((i, slot))
+    return e[0] if e else None
+
+
+def test_fill_backward_to_the_chain_start():
+    _f, by, lab, st = _fill_setup({"B1": _still(range(60))}, 60,
+                                  {("B1", 2): ("3128", wl.RANK_DIGITS)})
+    assert [len(w.idx) for w in by["B1"]] == [20, 20, 20]
+    assert all(_team(lab, i) == "3128" for i in range(60))
+    assert lab[(0, "B1")] == ("3128", wl.RANK_FILL, 0.9, 20)
+    assert lab[(40, "B1")][1] == wl.RANK_DIGITS                    # the read stays a read
+    assert st == {"fill_frames": 40, "fill_windows": 2, "fill_chains_bridged": 0}
+
+
+def test_fill_forward_to_the_chain_end():
+    _f, _by, lab, st = _fill_setup({"B1": _still(range(60))}, 60,
+                                   {("B1", 0): ("3128", wl.RANK_LINEUP)})
+    assert all(lab[(i, "B1")][:2] == ("3128", wl.RANK_FILL) for i in range(20, 60))
+    assert st["fill_frames"] == 40
+
+
+def test_a_conflicting_single_sample_read_stops_the_fill():
+    # B1 named 3128 in window 0; window 2's first sample (frame 40) reads 6773
+    _f, by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                   {("B1", 0): ("3128", wl.RANK_DIGITS)},
+                                   point={("B1", 2): {1: {"6773": 0.8, "other": 0.2}}})
+    assert by["B1"][2].samples[0] == 40
+    assert all((i, "B1") not in lab for i in range(20, 40))        # a hop somewhere in between
+    # the edge past the last waypoint extends its team, as in the measured rule
+    assert all(_team(lab, i) == "6773" for i in range(40, 60))
+
+
+def test_weak_or_escape_sample_reads_are_not_waypoints():
+    _f, _by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                    {("B1", 0): ("3128", wl.RANK_DIGITS)},
+                                    point={("B1", 2): {1: {"6773": 0.45, "other": 0.3},
+                                                       2: {"other": 0.9, "6773": 0.1},
+                                                       3: None}})
+    assert all(_team(lab, i) == "3128" for i in range(60))
+
+
+def test_interior_fill_between_agreeing_waypoints():
+    _f, _by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                    {("B1", 0): ("3128", wl.RANK_DIGITS),
+                                     ("B1", 2): ("3128", wl.RANK_LINEUP)})
+    assert all(lab[(i, "B1")][:2] == ("3128", wl.RANK_FILL) for i in range(20, 40))
+    # agreeing sample read: the window between a named window and the sample fills too
+    _f, by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                   {("B1", 0): ("3128", wl.RANK_DIGITS)},
+                                   point={("B1", 1): {4: {"3128": 0.7}}})
+    assert by["B1"][1].samples[3] == 39
+    assert all(_team(lab, i) == "3128" for i in range(60))
+    assert lab[(39, "B1")] == ("3128", wl.RANK_FILL, 0.7, 20)       # the sample's own frame
+
+
+def test_two_named_teams_leave_the_frames_between_them_empty():
+    _f, _by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                    {("B1", 0): ("3128", wl.RANK_DIGITS),
+                                     ("B1", 2): ("6773", wl.RANK_DIGITS)})
+    assert all((i, "B1") not in lab for i in range(20, 40))
+
+
+def test_a_chain_with_only_single_sample_reads_is_not_filled():
+    _f, _by, lab, st = _fill_setup({"B1": _still(range(60))}, 60, {},
+                                   point={("B1", 0): {1: {"3128": 0.99}, 2: {"3128": 0.99}},
+                                          ("B1", 2): {1: {"3128": 0.99}}})
+    assert lab == {} and st["fill_frames"] == 0
+
+
+def _gap_tracks(gap, xy2):
+    """B1 still at (3, 2) on frames 0-19, absent ``gap`` frames, then 20
+    frames at ``xy2``."""
+    track = _still(range(20))
+    track.update(_still(range(20 + gap, 40 + gap), xy2))
+    return {"B1": track}, 40 + gap
+
+
+def test_runs_are_bridged_across_a_short_gap_with_a_plausible_reappearance():
+    tracks, n = _gap_tracks(5, (4.0, 2.0))     # 1.2 s gap, 1 m away (limit 1 + 3 * 1.2 m)
+    _f, by, lab, st = _fill_setup(tracks, n, {("B1", 1): ("3128", wl.RANK_DIGITS)})
+    assert by["B1"][0].run != by["B1"][1].run                         # build_windows split it
+    assert all(_team(lab, i) == "3128" for i in range(20))
+    assert st["fill_chains_bridged"] == 1 and st["fill_frames"] == 20
+
+
+@pytest.mark.parametrize("gap,xy2", [(15, (4.0, 2.0)),     # 3.2 s: too long
+                                     (5, (9.0, 2.0))])     # 6 m in 1.2 s: too far
+def test_runs_are_not_bridged_across_a_long_gap_or_a_far_reappearance(gap, xy2):
+    tracks, n = _gap_tracks(gap, xy2)
+    _f, _by, lab, st = _fill_setup(tracks, n, {("B1", 1): ("3128", wl.RANK_DIGITS)})
+    assert all((i, "B1") not in lab for i in range(20))
+    assert st["fill_chains_bridged"] == 0 and st["fill_frames"] == 0
+
+
+def test_an_edge_fill_stops_at_another_chain_start_or_end_nearby():
+    # B1 named on frames 40-59; R1 is tracked 1 m away on frames 10-19, so its
+    # end (frame 19) is a hazard on frames 17-21: the backward fill stops at 21.
+    tracks = {"B1": _still(range(60)), "R1": _still(range(10, 20), (4.0, 2.0))}
+    _f, _by, lab, _st = _fill_setup(tracks, 60, {("B1", 2): ("3128", wl.RANK_DIGITS)})
+    assert all(_team(lab, i) == "3128" for i in range(22, 60))
+    assert all((i, "B1") not in lab for i in range(22))
+    # the forward edge stops too: R1 starts 1 m away at frame 50 (hazard 48-52)
+    tracks = {"B1": _still(range(60)), "R1": _still(range(50, 60), (4.0, 2.0))}
+    _f, _by, lab, _st = _fill_setup(tracks, 60, {("B1", 0): ("3128", wl.RANK_DIGITS)})
+    assert all(_team(lab, i) == "3128" for i in range(48))
+    assert all((i, "B1") not in lab for i in range(48, 60))
+
+
+def test_an_edge_fill_ignores_chain_starts_and_ends_far_away():
+    tracks = {"B1": _still(range(60)), "R1": _still(range(10, 20), FAR)}
+    _f, _by, lab, _st = _fill_setup(tracks, 60, {("B1", 2): ("3128", wl.RANK_DIGITS)})
+    assert all(_team(lab, i) == "3128" for i in range(60))
+
+
+def test_interior_fills_are_not_hazard_checked():
+    tracks = {"B1": _still(range(60)), "R1": _still(range(25, 35), (4.0, 2.0))}
+    _f, _by, lab, _st = _fill_setup(tracks, 60, {("B1", 0): ("3128", wl.RANK_DIGITS),
+                                                 ("B1", 2): ("3128", wl.RANK_DIGITS)})
+    assert all(_team(lab, i) == "3128" for i in range(60))
+
+
+def test_cleared_entries_are_never_filled():
+    _f, _by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                    {("B1", 2): ("3128", wl.RANK_DIGITS)},
+                                    extra={(10, "B1"): None})
+    assert lab[(10, "B1")] is None
+    assert _team(lab, 9) == "3128" and _team(lab, 11) == "3128"
+
+
+def test_a_fill_never_takes_a_team_another_slot_already_has():
+    # B2 (far away) is named 3128 on frames 0-19: B1's backward fill stops short of it
+    tracks = {"B1": _still(range(60)), "B2": _still(range(20), FAR)}
+    _f, _by, lab, _st = _fill_setup(tracks, 60, {("B1", 2): ("3128", wl.RANK_DIGITS),
+                                                 ("B2", 0): ("3128", wl.RANK_DIGITS)})
+    assert all((i, "B1") not in lab for i in range(20))
+    assert all(_team(lab, i) == "3128" for i in range(20, 60))
+
+
+def test_two_fills_of_one_team_keep_the_nearer_and_a_tie_drops_both():
+    # B1: named 3128 on 40-59 -> backward fill, distance 40 - i.
+    # B2: named 3128 on 0-19 plus an agreeing sample at frame 20 -> forward
+    # fill, distance i - 20. B2 wins below 30, B1 above, frame 30 is a tie.
+    tracks = {"B1": _still(range(60)), "B2": _still(range(60), FAR)}
+    _f, by, lab, _st = _fill_setup(tracks, 60, {("B1", 2): ("3128", wl.RANK_DIGITS),
+                                                ("B2", 0): ("3128", wl.RANK_DIGITS)},
+                                   point={("B2", 1): {1: {"3128": 0.8}}})
+    assert by["B2"][1].samples[0] == 20
+    assert all(_team(lab, i, "B2") == "3128" and (i, "B1") not in lab for i in range(20, 30))
+    assert (30, "B1") not in lab and (30, "B2") not in lab
+    assert all(_team(lab, i, "B1") == "3128" and (i, "B2") not in lab for i in range(31, 40))
+
+
+def test_fill_runs_leaves_window_run_ids_alone_and_refills_nothing():
+    tracks, n = _gap_tracks(5, (4.0, 2.0))
+    frames, by, lab, _st = _fill_setup(tracks, n, {("B1", 1): ("3128", wl.RANK_DIGITS)})
+    assert [w.run for w in by["B1"]] == [0, 1]
+    before = dict(lab)
+    again = wl.fill_runs(frames, by["B1"], lab, FPS)        # fills are not waypoints
+    assert lab == before and again["fill_frames"] == 0
+
+
+def test_fill_segments_and_hud_flags():
+    frames, _by, lab, _st = _fill_setup({"B1": _still(range(60))}, 60,
+                                        {("B1", 2): ("3128", wl.RANK_DIGITS)})
+    rows = wl.window_segments(frames, lab)[0]
+    assert [(r["team_number"], r["source"], r["confirmed"]) for r in rows] == [
+        ("3128", "window_fill", False), ("3128", "window_digits", True)]
+    wl.apply_labels(frames, lab)
+    assert frames[0]["robots"][0]["team_number"] == "3128"
+    assert frames[0]["robots"][0]["confirmed"] is False             # HUD: "3128?"
+    assert frames[45]["robots"][0]["confirmed"] is True
+
+
+def test_fill_points_take_s1_calls_by_tile_and_wide_calls_otherwise():
+    ws = [wl.Window(0, "B1", 0, [0, 1, 2, 3], [0, 1, 2, 3]),
+          wl.Window(1, "B2", 0, [0, 1, 2, 3], [0, 1, 2, 3])]
+    tiles = {0: {1: "t", 3: "t"}, 1: {1: "t", 2: "t"}}
+    dc = {"calls": {0: [{"3128": 0.9}, None], 1: [{"x": 1}] * 5},
+          "wide_p": {1: {2: {"6773": 0.7}}}, "sources": {0: "s1", 1: "jev"}}
+    assert wl.fill_points(ws, tiles, dc) == {0: {1: {"3128": 0.9}, 3: None},
+                                             1: {2: {"6773": 0.7}}}
+    assert wl.fill_points(ws, tiles, {"calls": dc["calls"], "wide_p": dc["wide_p"]}) == {
+        1: {2: {"6773": 0.7}}}                                     # no sources: all Jev
+
+
+def _three_window_session(frames):
+    s = BySlot()
+    plan = []
+    for j, w in enumerate(wl.build_windows(frames, FPS)):
+        plan += [{"3128": 0.9} if j == 0 else {"unreadable": 0.9}] * (2 * len(w.samples) + 1)
+    s.plan = plan
+    return s
+
+
+def test_stage_fill_knob_off_is_unchanged_and_on_fills():
+    frames = _frames({"B1": _still(range(60))}, 60)
+    base = _run(frames, _three_window_session(frames))
+    off = _run(frames, _three_window_session(frames), fill_runs=False)
+    assert off == base and "fill_frames" not in off["stats"]
+    assert (25, "B1") not in off["labels"]
+    on = _run(frames, _three_window_session(frames), fill_runs=True)
+    assert on["labels"][(25, "B1")][:2] == ("3128", wl.RANK_FILL)
+    st = on["stats"]
+    assert st["fill_frames"] == 40 and st["fill_windows"] == 2 and st["fill_chains_bridged"] == 0
+    assert st["unlabelled"] == off["stats"]["unlabelled"] == 2       # windows the readers named
+    assert [r["source"] for r in on["segments"][0]] == ["window_digits", "window_fill"]
+    assert on["digit_calls"] == off["digit_calls"]
+
+
+def test_stage_fill_uses_wide_sample_reads_as_conflicts():
+    # window 0 reads 3128; window 2's first wide call reads 6773 (one top
+    # call: below the digit bar, so unnamed) - a conflicting waypoint
+    frames = _frames({"B1": _still(range(60))}, 60)
+    s = BySlot()
+    plan = []
+    for j, w in enumerate(wl.build_windows(frames, FPS)):
+        reqs = [r for _k in w.samples for r in ("wide", "zoom")] + ["grid"]
+        if j == 0:
+            plan += [{"3128": 0.9}] * len(reqs)
+        elif j == 2:
+            plan += [{"6773": 0.6} if n == 0 else {"unreadable": 0.9}
+                     for n, _r in enumerate(reqs)]
+        else:
+            plan += [{"unreadable": 0.9}] * len(reqs)
+    s.plan = plan
+    res = _run(frames, s, fill_runs=True)
+    assert res["stats"]["digit_named"] == 1
+    assert all((i, "B1") not in res["labels"] for i in range(20, 40))
+    assert res["labels"][(40, "B1")][:2] == ("6773", wl.RANK_FILL)
+
+
+def test_stage_fills_never_become_anchors():
+    frames = _lineup_frames()
+    kw = dict(seed=1, event_lineup=True)
+    off = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), **kw)
+    on = _run(frames, _lineup_session(frames, who_p={"B": 0.9}), fill_runs=True, **kw)
+    key = [(a.team, a.kind, a.frame_num, a.p) for a in off["anchors_out"]]
+    assert key and [(a.team, a.kind, a.frame_num, a.p) for a in on["anchors_out"]] == key
+    assert on["row_sources"] == off["row_sources"]

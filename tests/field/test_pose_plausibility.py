@@ -123,3 +123,88 @@ def test_full_solve_gate_rejects_upside_down_camera():
             for t, (_, o) in project_tag_corners(truth_pinhole_camera(), FM).items()}
     with pytest.raises(CalibrationError, match="implausible"):
         Calibrator.solve_camera_from_tags(corr, flipped.image_size, "2026-rebuilt-welded")
+
+
+# --- cameras mounted ON the field (2025 barge cameras look outward) -----------------
+
+FM25 = FieldModel.load("2025-reefscape-welded")
+BARGE_EYE = (8.25, 3.6, 1.3)       # blue face of the barge (tags 14/15 at x 8.27)
+
+
+def _barge_cam_looking_at_blue_reef():
+    """A 2025 'corner_left' camera: mounted on the barge at the midline, looking
+    outward toward the blue reef and the blue wall. The field centre is BEHIND it."""
+    cam = truth_pinhole_camera(eye=BARGE_EYE, target=(4.49, 4.03, 0.4))
+    return CameraCalibration(K=cam.K, D=cam.D, rvec=cam.rvec, tvec=cam.tvec,
+                             image_size=cam.image_size, crop_region=None,
+                             field_season="2025-reefscape-welded", mode="pinhole")
+
+
+def _visible_tags(cam, fm):
+    """project_tag_corners minus tags behind the camera (projection alone folds
+    them into the frame) and tags facing away from it."""
+    R, _ = cv2.Rodrigues(cam.rvec)
+    t = cam.tvec.reshape(3)
+    c = -R.T @ t
+    out = {}
+    for tid, (uv, c3d) in project_tag_corners(cam, fm).items():
+        if np.all((np.asarray(c3d) @ R.T + t)[:, 2] > 0) and \
+                (c - fm.tag_translation(tid)) @ _normal(fm, tid) > 0:
+            out[tid] = (uv, c3d)
+    return out
+
+
+def _normal(fm, tid):
+    from web.field.field_model import _quat_to_matrix
+    return _quat_to_matrix(fm.tag_quaternion(tid)) @ [1.0, 0.0, 0.0]
+
+
+def test_barge_mounted_2025_pose_looking_at_blue_reef_is_plausible():
+    cam = _barge_cam_looking_at_blue_reef()
+    R, _ = cv2.Rodrigues(cam.rvec)
+    ctr = np.array([FM25.length_m / 2, FM25.width_m / 2, 0.0])
+    assert (R @ ctr + cam.tvec.reshape(3))[2] <= 0          # field centre IS behind it
+    corr = _visible_tags(cam, FM25)
+    assert {21, 20, 22} <= set(corr)                          # the blue reef's near faces
+    assert pose_plausibility(cam, fm=FM25) is None
+    assert check_solve_plausible(cam, corr, "2025-reefscape-welded") is None
+
+
+def test_barge_mounted_2025_pose_solves_through_the_gate():
+    cam = _barge_cam_looking_at_blue_reef()
+    corr = _visible_tags(cam, FM25)
+    sol = Calibrator.solve_pose(corr, K=cam.K, D=cam.D, image_size=cam.image_size,
+                                field_season="2025-reefscape-welded", mode="pinhole")
+    assert np.linalg.norm(np.asarray(sol.camera_center) - BARGE_EYE) < 0.05
+
+
+def test_barge_mounted_upside_down_is_still_rejected():
+    cam = _barge_cam_looking_at_blue_reef()
+    R, _ = cv2.Rodrigues(cam.rvec)
+    Rz = np.diag([-1.0, -1.0, 1.0])
+    bad = CameraCalibration(K=cam.K, D=cam.D, rvec=cv2.Rodrigues(Rz @ R)[0],
+                            tvec=Rz @ cam.tvec, image_size=cam.image_size,
+                            field_season="2025-reefscape-welded", mode="pinhole")
+    assert "upside down" in (pose_plausibility(bad, fm=FM25) or "")
+
+
+def test_barge_mounted_tags_seen_from_behind_are_still_rejected():
+    """On the field but on the WRONG side of the reef: the reef's barge-facing tags
+    (20-22) would be seen from behind — still a mirror minimum, still rejected."""
+    cam = truth_pinhole_camera(eye=(1.5, 4.03, 1.9), target=(6.0, 4.03, 0.3))
+    cam = CameraCalibration(K=cam.K, D=cam.D, rvec=cam.rvec, tvec=cam.tvec,
+                            image_size=cam.image_size, crop_region=None,
+                            field_season="2025-reefscape-welded", mode="pinhole")
+    why = pose_plausibility(cam, fm=FM25, tag_ids=[20, 21, 22])
+    assert why is not None and "from behind" in why
+
+
+@pytest.mark.parametrize("fm,eye,target", [
+    (FM, (8.27, -3.0, 6.0), (8.27, -12.0, 0.0)),        # 2026: behind the table, facing out
+    (FM, (-1.5, 4.03, 3.0), (-10.0, 4.03, 0.0)),        # 2026: behind the blue wall
+    (FM25, (-1.5, 4.03, 3.0), (-10.0, 4.03, 0.0)),      # 2025 too, when OUTSIDE the field
+])
+def test_camera_outside_field_facing_away_is_still_rejected(fm, eye, target):
+    cam = truth_pinhole_camera(eye=eye, target=target)
+    why = pose_plausibility(cam, fm=fm)
+    assert why is not None and "field centre is behind" in why

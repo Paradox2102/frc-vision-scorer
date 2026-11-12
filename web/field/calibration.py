@@ -19,6 +19,11 @@ MIN_CALIB_POINTS = 8       # single-view calibrateCamera: ~10 free params
 # limit are loose on purpose — they only have to reject mirror/flip solutions.
 POSE_Z_BAND_M = (0.3, 15.0)
 POSE_MAX_ROLL_DEG = 45.0
+# A camera centre at least this far INSIDE the field rectangle is mounted on a field
+# structure (2025: the barge cameras at the midline) and looks outward — the
+# field-centre-in-front check does not apply to it. Broadcast cameras outside the
+# field (2026 corner cameras, the main camera) keep the check.
+POSE_ON_FIELD_INSET_M = 0.25
 
 
 @dataclass
@@ -336,9 +341,12 @@ def pose_plausibility(cal: "CameraCalibration", obj_points=None, fm=None, tag_id
       * camera centre height within ``z_band`` metres;
       * camera upright — world +z points UP in the image (roll within max_roll_deg);
       * every correspondence point (``obj_points``) in front of the camera;
-      * with a field model: the field centre in front of the camera, and the used
-        tags (``tag_ids``) facing it — a decoded tag cannot be seen from behind. A
-        MAJORITY must face (synthetic fixtures include tags seen edge-on/from behind).
+      * with a field model: the field centre in front of the camera — unless the
+        camera centre lies inside the field rectangle (inset POSE_ON_FIELD_INSET_M):
+        a camera mounted ON the field (2025 barge cameras) looks outward and has
+        the centre behind it — and the used tags (``tag_ids``) facing it: a decoded
+        tag cannot be seen from behind. A MAJORITY must face (synthetic fixtures
+        include tags seen edge-on/from behind).
     Pose-free (homography) calibrations are always plausible."""
     if cal is None or cal.rvec is None or cal.tvec is None:
         return None
@@ -364,7 +372,9 @@ def pose_plausibility(cal: "CameraCalibration", obj_points=None, fm=None, tag_id
             return f"{int(np.sum(zc <= 0))} of {len(zc)} tag points are behind the camera"
     if fm is not None:
         ctr = np.array([fm.length_m / 2.0, fm.width_m / 2.0, 0.0])
-        if (R @ ctr + t)[2] <= 0:
+        m = POSE_ON_FIELD_INSET_M
+        on_field = (m <= c[0] <= fm.length_m - m) and (m <= c[1] <= fm.width_m - m)
+        if not on_field and (R @ ctr + t)[2] <= 0:
             return "the field centre is behind the camera"
         ids = [i for i in dict.fromkeys(tag_ids) if i is not None and i in fm.tags]
         if ids:

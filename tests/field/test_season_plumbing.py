@@ -22,7 +22,7 @@ def app_mod(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "_auto_calib_judge", lambda: None)
     # never probe footage for camera moves in these tests
     monkeypatch.setattr(mod, "_auto_calib_pick_steady",
-                        lambda event, camera, mk, video, *a, **k: (mk, video, []))
+                        lambda event, camera, mk, video, *a, **k: (mk, video, [], None))
     return mod
 
 

@@ -125,8 +125,9 @@ def test_event_level_moves_to_a_later_steady_match(monkeypatch):
     class CL:
         crop = (0, 0, 10, 10)
 
-    mk, path, notes = app._auto_calib_pick_steady("ev", "corner_left", "ev_qm1",
-                                                  "/x/ev_qm1.mp4", CL(), ac.AutoCalibConfig())
+    mk, path, notes, endgame = app._auto_calib_pick_steady(
+        "ev", "corner_left", "ev_qm1", "/x/ev_qm1.mp4", CL(), ac.AutoCalibConfig())
     assert (mk, path) == ("ev_qm2", "/x/ev_qm2.mp4")
+    assert endgame is None
     assert notes == [{"match": "ev_qm1", "t_s": 60.0, "shift_px": 20.0}]
     assert calls == ["/x/ev_qm1.mp4", "/x/ev_qm2.mp4"]

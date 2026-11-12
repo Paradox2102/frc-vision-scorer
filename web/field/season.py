@@ -58,6 +58,11 @@ class Season:
     structures: Optional[str]            # STRUCTURE_* or None
     field_m: Optional[tuple] = None      # (length, width) of the welded field
     known: bool = True                   # False: year not in the registry
+    # The broadcast re-tiles the camera row when the endgame starts (2025 Champs:
+    # the two reef cameras narrow and a barge view appears at 0:20). Auto-
+    # calibration then aggregates / motion-checks / validates only BEFORE the
+    # endgame, instead of treating the switch as a camera move.
+    endgame_layout_switch: bool = False
     variant: str = "welded"
     source: str = "year"                 # "year" | "default" | "override"
 
@@ -72,6 +77,7 @@ class Season:
                 "wireframe": self.wireframe, "structures": self.structures,
                 "auto_s": self.auto_s, "teleop_s": self.teleop_s,
                 "endgame_s": self.endgame_s, "known": self.known, "source": self.source,
+                "endgame_layout_switch": self.endgame_layout_switch,
                 "has_andymark": bool(self.tag_layout_andymark)}
 
 
@@ -83,7 +89,8 @@ SEASONS: dict = {
     2025: Season(2025, "2025 REEFSCAPE", "2025-reefscape-welded",
                  "2025-reefscape-andymark", "2025-reefscape-welded",
                  auto_s=15.0, teleop_s=135.0, endgame_s=20.0,
-                 structures=STRUCTURE_2025_REEF, field_m=(17.548, 8.052)),
+                 structures=STRUCTURE_2025_REEF, field_m=(17.548, 8.052),
+                 endgame_layout_switch=True),
     2024: Season(2024, "2024 CRESCENDO", "2024-crescendo", None, None,
                  auto_s=15.0, teleop_s=135.0, endgame_s=20.0, structures=None,
                  field_m=(16.541, 8.211)),

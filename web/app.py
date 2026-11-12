@@ -33,7 +33,7 @@ import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -734,6 +734,37 @@ def _scan_clock_samples_sequential(video_path, total_frames, sample_step,
         pool.shutdown(wait=True, cancel_futures=True)
         scan_cap.release()
     return samples
+
+
+def read_match_clock_roi(overhead_frame, region) -> Optional[int]:
+    """OCR the match clock in ``region`` (x, y, w, h) of an overhead-crop frame.
+    Thread-safe: each pytesseract call runs in its own subprocess."""
+    if overhead_frame is None or overhead_frame.size == 0 or region is None:
+        return None
+    x, y, w, h = region
+    fh, fw = overhead_frame.shape[:2]
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+        return None
+    roi = overhead_frame[y:y + h, x:x + w]
+    roi = cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, thresholded = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    text = pytesseract.image_to_string(
+        thresholded, config=MATCH_CLOCK_OCR_CONFIG
+    ).strip()
+    return parse_match_clock_text(text)
+
+
+def clock_scan_cache_path(video_path, sample_step: int, overhead_height: int) -> Path:
+    """Clock-scan cache file for ``video_path``. Keyed on the video CONTENT
+    (size + head hash), not the filename: every job re-uploads the same bytes
+    under a fresh uuid name. Shared by the job's scan and auto-calibration."""
+    video_path = Path(video_path)
+    h = hashlib.md5()
+    with open(video_path, "rb") as f:
+        h.update(f.read(1 << 20))
+    h.update(f"{video_path.stat().st_size}:{sample_step}:{overhead_height}".encode())
+    return UPLOAD_DIR / f"clockscan_{h.hexdigest()}.json"
 
 
 def scan_clock_samples(
@@ -5196,33 +5227,13 @@ class InferenceJob:
         Called from the clock-scan OCR thread pool: it only reads
         ``self.ocr_regions`` (fixed before the scan starts) and each
         pytesseract call runs in its own subprocess on its own temp file."""
-        if overhead_frame is None or overhead_frame.size == 0:
-            return None
-        region = self.ocr_regions.get("match_clock")
-        if region is None:
-            return None
-        x, y, w, h = region
-        fh, fw = overhead_frame.shape[:2]
-        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
-            return None
-        roi = overhead_frame[y:y + h, x:x + w]
-        roi = cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, thresholded = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        text = pytesseract.image_to_string(
-            thresholded, config=MATCH_CLOCK_OCR_CONFIG
-        ).strip()
-        return parse_match_clock_text(text)
+        return read_match_clock_roi(overhead_frame, self.ocr_regions.get("match_clock"))
 
     def _clock_scan_cache_path(self, sample_step: int) -> Path:
         """Cache key = video CONTENT fingerprint, not filename: every job
         re-uploads the same bytes under a fresh uuid name, so the name is
         useless as a key while size+head-hash is stable and cheap."""
-        h = hashlib.md5()
-        with open(self.video_path, "rb") as f:
-            h.update(f.read(1 << 20))
-        h.update(f"{self.video_path.stat().st_size}:{sample_step}:{self.overhead_height}".encode())
-        return UPLOAD_DIR / f"clockscan_{h.hexdigest()}.json"
+        return clock_scan_cache_path(self.video_path, sample_step, self.overhead_height)
 
     def _scan_match_clock(self) -> List[Tuple[int, Optional[int]]]:
         """Sparse-decode the source video and OCR the clock every half second.
@@ -11349,29 +11360,103 @@ def _auto_calib_judge():
         return None
 
 
+def _auto_calib_endgame_clock(video, season) -> Optional[dict]:
+    """When the endgame starts in ``video`` (video seconds), from the same match-clock
+    OCR scan a processing job runs (and shares its content-keyed cache file):
+    ``auto_calibrate.endgame_start_from_clock`` on the countdowns
+    ``compute_active_windows`` finds. None when no countdown was read."""
+    cap = cv2.VideoCapture(str(video))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+    if fps <= 0 or total <= 0 or width <= 0 or height <= 0:
+        return None
+    overhead_height = int(height * OVERHEAD_CROP_RATIO)
+    region = scale_ocr_regions(width, overhead_height).get("match_clock")
+    sample_step = max(1, int(round(fps * MATCH_CLOCK_SAMPLE_SECONDS)))
+    cache = clock_scan_cache_path(video, sample_step, overhead_height)
+    try:
+        samples = [(int(i), None if v is None else int(v))
+                   for i, v in json.loads(cache.read_text())]
+    except (OSError, ValueError):
+        samples = scan_clock_samples(video, total, sample_step, overhead_height,
+                                     lambda o: read_match_clock_roi(o, region))
+        try:
+            cache.write_text(json.dumps(samples))
+        except OSError:
+            pass
+    _, periods, _, _ = compute_active_windows(samples, fps, total, auto_s=season.auto_s,
+                                              teleop_s=season.teleop_s)
+    return auto_calibrate.endgame_start_from_clock(samples, fps, periods, season)
+
+
+def _auto_calib_endgame_window(event: str, camera: str, match_key: str, path, cl, cfg,
+                               season, detect) -> dict:
+    """The pre-endgame cutoff for ``path`` (season.endgame_layout_switch): the match
+    clock, else a camera move found over the full window, else the conservative
+    estimate (``auto_calibrate.endgame_cutoff``). Adds ``match``."""
+    from web.field import camera_motion
+    clock = None
+    try:
+        clock = _auto_calib_endgame_clock(path, season)
+    except Exception as e:
+        print(f"[auto-calib] {event}/{camera}: match-clock scan on {match_key} failed: {e}")
+    move_t = None
+    if not clock:
+        try:
+            mot = camera_motion.detect_camera_move(path, cl.crop, cfg.window, detect)
+            if mot["moved"]:
+                move_t = mot["t_s"]
+        except Exception as e:
+            print(f"[auto-calib] {event}/{camera}: motion check on {match_key} failed: {e}")
+    eg = auto_calibrate.endgame_cutoff(season, cfg.window, clock=clock, move_t=move_t)
+    eg["match"] = match_key
+    print(f"[auto-calib] {event}/{camera}: {match_key} endgame cutoff {eg['cutoff_s']:.1f} s "
+          f"({eg['method']})")
+    return eg
+
+
 def _auto_calib_pick_steady(event: str, camera: str, match_key: str, video, cl, cfg,
-                            matches=()):
-    """(match_key, video, moved_notes) for this camera: the reference match unless the
-    camera was re-aimed DURING it — one calibration cannot fit both framings — in
-    which case the first later match (local footage first, then a download) where it
-    held still. ``moved_notes`` lists every match it moved on."""
+                            matches=(), season=None):
+    """(match_key, video, moved_notes, endgame) for this camera: the reference match
+    unless the camera was re-aimed DURING it — one calibration cannot fit both
+    framings — in which case the first later match (local footage first, then a
+    download) where it held still. ``moved_notes`` lists every match it moved on.
+
+    ``season.endgame_layout_switch`` (2025): the broadcast re-tiles the camera row at
+    the endgame, so the motion check (and the caller's calibration) runs only BEFORE
+    the endgame and ``endgame`` is that match's cutoff dict
+    (``_auto_calib_endgame_window``); a move inside that window still rejects the
+    match. Otherwise ``endgame`` is None and the whole window is checked."""
     from web.field import camera_motion
     detect = auto_calibrate.make_detect_fn()
+    switch = bool(getattr(season, "endgame_layout_switch", False))
     notes = []
     cands = auto_calibrate.later_reference_videos(
         event, matches, match_key, downloader=auto_calibrate.download_match_video)
     for mk, path in [(match_key, video), *cands]:
+        window, eg = cfg.window, None
+        if switch:
+            eg = _auto_calib_endgame_window(event, camera, mk, path, cl, cfg, season, detect)
+            window = (cfg.window[0], eg["cutoff_s"])
         try:
-            mot = camera_motion.detect_camera_move(path, cl.crop, cfg.window, detect)
+            mot = camera_motion.detect_camera_move(path, cl.crop, window, detect)
         except Exception as e:
             print(f"[auto-calib] {event}/{camera}: motion check on {mk} failed: {e}")
-            return mk, path, notes
+            return mk, path, notes, eg
         if not mot["moved"]:
-            return mk, path, notes
+            return mk, path, notes, eg
         notes.append({"match": mk, "t_s": mot["t_s"], "shift_px": mot["shift_px"]})
         print(f"[auto-calib] {event}/{camera}: {camera_motion.describe(mot)} on {mk} — "
               f"trying a later match")
-    return match_key, video, notes        # no steady match found: report on the reference
+    # no steady match found: report on the reference
+    eg = (_auto_calib_endgame_window(event, camera, match_key, video, cl, cfg, season, detect)
+          if switch else None)
+    return match_key, video, notes, eg
 
 
 def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
@@ -11386,8 +11471,12 @@ def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
         min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
         field_season=getattr(fm, "season", "") or _AUTO_CALIB_SEASON)
     ref_key = match_key
-    match_key, video, moved = _auto_calib_pick_steady(event, camera, match_key, video,
-                                                      cl, cfg, matches)
+    season = field_season_mod.season_for_layout(cfg.field_season)
+    match_key, video, moved, endgame = _auto_calib_pick_steady(
+        event, camera, match_key, video, cl, cfg, matches, season=season)
+    if endgame is not None:
+        # calibrate on the pre-endgame framing only (aggregate, median, validation)
+        cfg = dataclass_replace(cfg, window=(cfg.window[0], float(endgame["cutoff_s"])))
     versions = field_store.load_versions(event, camera)
     epoch = select_epoch(versions, match_key) if versions else None
     masks = (epoch["calibration"].masks if epoch is not None and epoch["calibration"].masks
@@ -11395,6 +11484,14 @@ def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
     res = auto_calibrate.run_camera(video, match_key, camera, cl.crop, fm, versions,
                                     cfg=cfg, masks=masks, judge=_auto_calib_judge())
     rec = res.record
+    if endgame is not None:
+        how = {"match_clock": "match clock", "match_clock_auto": "auto clock + match length",
+               "camera_move": "detected layout switch", "estimate": "match-length estimate"
+               }.get(endgame["method"], endgame["method"])
+        rec["endgame_cutoff"] = dict(endgame)
+        rec["reason"] = (f"{rec.get('reason', '')}; tags taken before the endgame layout "
+                         f"switch only (cutoff {endgame['cutoff_s']:.1f} s on "
+                         f"{endgame['match']}, from the {how})")
     if moved:
         rec["moved_mid_match"] = moved
         where = ", ".join(f"{n['match']} (~{n['t_s']:.0f} s, {n['shift_px']:.0f} px)"

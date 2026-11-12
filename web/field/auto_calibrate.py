@@ -97,6 +97,81 @@ class AutoCalibResult:
     candidates: list = field(default_factory=list)   # locator candidates (eval/debug)
 
 
+# ------------------------------------------------------------------ endgame cutoff
+# Seasons whose broadcast re-tiles the camera row at the endgame
+# (Season.endgame_layout_switch; 2025 Champs: the reef cameras narrow at 0:20 and a
+# barge view appears) calibrate on the pre-endgame framing only: one calibration
+# cannot fit both, and the switch otherwise looks like a camera move.
+ENDGAME_CLOCK_MARGIN_S = 3.0    # stop this long before the clock reads endgame_s
+                                # (2025hop: the cut lands ~1 s after it reads 0:20)
+ENDGAME_MOVE_MARGIN_S = 5.0     # before a detected move (3 s motion stride + slack)
+ENDGAME_MIN_WINDOW_S = 30.0     # a cutoff leaving less than this is not believed
+
+
+def endgame_start_from_clock(samples, fps: float, periods, season) -> Optional[dict]:
+    """Video time (s) at which the endgame starts, from the match-clock scan.
+
+    ``samples``: [(frame, clock_seconds_or_None)] (``web.app.scan_clock_samples``);
+    ``periods``: the labelled periods ``compute_active_windows`` found. With a teleop
+    period: the median over its reads within a minute of the endgame of
+    ``t + (clock - endgame_s)`` (isolated misreads drop out) -> method
+    "match_clock". With only the auto countdown: its start + auto_s + teleop_s -
+    endgame_s, ignoring the auto/teleop pause -> a LOWER bound, method
+    "match_clock_auto". None when neither was found."""
+    if not samples or not fps or fps <= 0:
+        return None
+    by = {p.get("label"): p for p in (periods or [])}
+    tele = by.get("teleop")
+    if tele is not None:
+        lo, hi = int(tele["start_frame"]), int(tele["end_frame"])
+        top = min(float(tele.get("start_seconds") or season.teleop_s), season.endgame_s + 60)
+        est = [f / fps + (v - season.endgame_s) for f, v in samples
+               if v is not None and lo <= f <= hi and season.endgame_s <= v <= top]
+        if len(est) >= 5:
+            med = float(np.median(est))
+            est = [e for e in est if abs(e - med) <= 3.0]
+            return {"endgame_t_s": round(float(np.median(est)), 2), "method": "match_clock",
+                    "reads": len(est)}
+    auto = by.get("auto")
+    if auto is not None:
+        start = (int(auto["start_frame"]) / fps
+                 - max(0.0, season.auto_s - float(auto.get("start_seconds") or season.auto_s)))
+        return {"endgame_t_s": round(start + season.auto_s + season.teleop_s
+                                     - season.endgame_s, 2),
+                "method": "match_clock_auto"}
+    return None
+
+
+def endgame_cutoff(season, window, *, clock: Optional[dict] = None,
+                   move_t: Optional[float] = None) -> dict:
+    """{"cutoff_s", "method", "endgame_t_s"?}: where the calibration window ends for a
+    season whose broadcast switches layout at the endgame. In order:
+      * the match clock (``clock`` from endgame_start_from_clock) - margin;
+      * else the conservative estimate auto_s + teleop_s - endgame_s - margin from the
+        START of the video (footage never starts after the match does, so the real
+        endgame is later), lowered to a detected camera move (``move_t``) - margin
+        when that comes earlier (a broadcast trimmed into the match). A move after
+        the estimate never raises it: with few tags the split time can land well
+        after the real switch (2025hop qm2 corner_right: 161 s vs 145.5 s).
+    The cutoff never extends ``window`` and a clock cutoff leaving less than
+    ENDGAME_MIN_WINDOW_S of window is ignored."""
+    lo, hi = float(window[0]), float(window[1])
+    if clock and clock.get("endgame_t_s") is not None:
+        cut = float(clock["endgame_t_s"]) - ENDGAME_CLOCK_MARGIN_S
+        if cut - lo >= ENDGAME_MIN_WINDOW_S:
+            return {"cutoff_s": round(min(hi, cut), 2), "method": clock.get("method",
+                                                                               "match_clock"),
+                    "endgame_t_s": float(clock["endgame_t_s"])}
+    est = season.auto_s + season.teleop_s - season.endgame_s - ENDGAME_CLOCK_MARGIN_S
+    out = {"cutoff_s": est, "method": "estimate"}
+    if move_t is not None:
+        mv = float(move_t) - ENDGAME_MOVE_MARGIN_S
+        if mv < est and mv - lo >= ENDGAME_MIN_WINDOW_S:
+            out = {"cutoff_s": mv, "method": "camera_move", "move_t_s": float(move_t)}
+    out["cutoff_s"] = round(min(hi, out["cutoff_s"]), 2)
+    return out
+
+
 # --------------------------------------------------------------------------- footage
 
 def valid_match_key(match_key) -> bool:

@@ -649,6 +649,25 @@ def _fmt(x) -> str:
     return "n/a" if x is None else f"{x:.2f}"
 
 
+def fold_note(cal, corr: dict, fm=None, located_ids=(), lens_fixed: bool = False):
+    """(fold_ratio | None, note | None) for an auto record: calibration.fold_conditioning
+    over the solve's points (``corr`` + the centres of ``located_ids``, needs ``fm``)
+    and, at >= FOLD_RATIO_WARN, calibration.fold_warning's text. Informational only:
+    the validation gate decides the status."""
+    from web.field.calibration import fold_conditioning, fold_warning
+    pts = dict(corr or {})
+    if fm is not None:
+        for tid in located_ids or ():
+            tid = int(tid)
+            if tid in fm.tags and tid not in pts and f"m{tid}" not in pts:
+                pts[f"m{tid}"] = (None, fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3))
+    cond = fold_conditioning(cal, {str(k) if not isinstance(k, str) else k: v
+                                   for k, v in pts.items()})
+    if cond is None:
+        return None, None
+    return cond.to_json()["ratio"], fold_warning(cond, lens_fixed=lens_fixed)
+
+
 def median_decodes(median, detect_fn, roi_detect_fn=None, scales=(2, 3)) -> dict:
     """Decode tags on the temporal-median frame: the normal detector, then the
     no-decimation ROI detector on 2x / 3x upscaled copies — small or oblique tags
@@ -761,7 +780,8 @@ def _borrowed_lens_solve(own: AutoCalibResult, camera, lenders, corr, corners, i
             reason = (f"{lead} does not validate: best {_fmt(gate)} m on >= "
                       f"{cfg.min_tags}-tag frames vs the {cfg.drift_max_m:.2f} m gate — "
                       f"review the borrowed-lens candidate or correct manually")
-        res = finish(status, "full_solve", f"{reason} [own lens: {own_reason}]", cal, val, cal)
+        res = finish(status, "full_solve", f"{reason} [own lens: {own_reason}]", cal, val, cal,
+                     lens_fixed=True)
         res.record.update(lender.source_fields(), lens_lenders_tried=tried,
                           own_lens_reason=own_reason)
         if res.record["status"] == "ready":
@@ -854,7 +874,7 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         return v
 
     def finish(status, method, reason, cal, val, overlay_cal, epoch=None,
-               center_shift=None, rot_deg=None):
+               center_shift=None, rot_deg=None, lens_fixed=None):
         # Hard gate before anything can be confirmed / adopted / trusted: a mirrored,
         # upside-down or behind-the-camera pose never comes out ready or verified.
         gate_cal = cal if cal is not None else overlay_cal
@@ -874,6 +894,14 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                            val, unused, center_shift, rot_deg)
         metrics["located_tags"] = [{k: d[k] for k in ("id", "method", "jev_p", "residual_px")}
                                    for d in extra["located"]]
+        # Fold conditioning of the solve (a note only; validation decides the status).
+        # The lens is fixed in a pose re-solve / verify and when borrowed.
+        fixed = (method != "full_solve") if lens_fixed is None else lens_fixed
+        ratio, fnote = fold_note(gate_cal, corr, fm, [d["id"] for d in extra["located"]],
+                                 lens_fixed=fixed)
+        metrics["fold_ratio"] = ratio
+        if fnote:
+            reason = f"{reason} [{fnote}]"
         if val and val.get("source") == "median":
             metrics["val_source"] = "median"
             reason = reason + " [validated on the median frame: no single frame shows "\
@@ -1009,6 +1037,168 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         reason += " — calibrate manually"
     return finish(status, "pose_resolve", reason, cand, cval, cand, epoch=vid,
                   center_shift=verdict.center_shift_m, rot_deg=verdict.rotation_delta_deg)
+
+
+# ------------------------------------------------------- joint corner lens (run)
+
+JOINT_METHOD = "joint_lens"
+
+
+def joint_candidate(rec: Optional[dict], camera: str) -> bool:
+    """A corner camera whose OWN full solve this run failed, or came out ready with an
+    own lens near its distortion fold (FOLD_RATIO_WARN), with >= 2 tags for a pose.
+    Re-solves against an existing epoch (pose_resolve / verify) never join."""
+    from web.field.calibration import FOLD_RATIO_WARN
+    if not rec or camera == "main" or rec.get("method") != "full_solve":
+        return False
+    if int((rec.get("metrics") or {}).get("n_tags") or 0) < 2:
+        return False
+    if rec.get("status") == "failed":
+        return True
+    ratio = (rec.get("metrics") or {}).get("fold_ratio")
+    return (rec.get("status") == "ready" and not rec.get("lens_from")
+            and ratio is not None and ratio >= FOLD_RATIO_WARN)
+
+
+def record_corr(rec: dict, fm) -> dict:
+    """{key: (img, obj)} of an auto record's tags: auto_tags -> 4 corners ("a<id>"),
+    manual_tags (located centres) -> the tag centre ("m<id>")."""
+    corr = {}
+    for sid, c in (rec.get("auto_tags") or {}).items():
+        tid = int(sid)
+        if tid in fm.tags:
+            corr[f"a{tid}"] = (np.asarray(c, float).reshape(-1, 2), fm.tag_corners_3d(tid))
+    for m in rec.get("manual_tags") or []:
+        tid = int(m["id"])
+        if tid in fm.tags and f"a{tid}" not in corr:
+            corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]]),
+                               fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3))
+    return corr
+
+
+def _validate_or_median(cal, video, crop, fm, cfg, detect_fn, median):
+    """validate_across_window, falling back (as run_camera does) to the temporal
+    median frame's decodes when no single frame shows cfg.min_tags tags."""
+    v = (validate_across_window(cal, video, crop, fm, cfg, detect_fn) if video is not None
+         else {"best_m": None, "median_m": None, "worst_m": None, "frames": 0,
+               "gate_best_m": None, "gate_tags": 0})
+    if v["gate_best_m"] is None and median is not None:
+        dec = {t: c for t, c in detect_fn(median).items() if t in fm.tags}
+        if len(dec) >= cfg.min_tags:
+            e, n = tag_alignment_error(cal, dec, fm)
+            if n >= cfg.min_tags and np.isfinite(e):
+                v.update(gate_best_m=round(float(e), 3), gate_tags=int(n), source="median",
+                         best_m=v["best_m"] if v["best_m"] is not None
+                         else round(float(e), 3))
+    return v
+
+
+def run_joint(cams: dict, fm, cfgs: dict, detect_fn=None) -> dict:
+    """Fit ONE lens to several corner cameras' tags from this run
+    (joint_lens.solve_joint_lens) and judge each camera by the usual gates.
+
+    ``cams``: {camera: {"record": its auto record (auto_tags / manual_tags / crop),
+    "video": the footage it was aggregated on (or None), "median": its temporal-median
+    crop (or None), "masks": overlay masks, "detect_fn": optional per-camera
+    detector}}; ``cfgs``: {camera: AutoCalibConfig}.
+    Returns {camera: AutoCalibResult} — status "ready" only when the joint pose is
+    plausible AND validates under the camera's gate, else "failed" (with the joint
+    candidate for review). Raises CalibrationError when no joint fit is possible."""
+    from web.field import joint_lens
+    detect_fn = detect_fn or make_detect_fn()
+    inputs = {}
+    for cam, d in cams.items():
+        rec = d["record"]
+        crop = [int(v) for v in rec["crop"]]
+        inputs[cam] = (record_corr(rec, fm), (crop[2], crop[3]))
+    season = next(iter(cfgs.values())).field_season
+    res = joint_lens.solve_joint_lens(inputs, season)
+    out = {}
+    names = list(cams)
+    for cam in names:
+        d, cfg = cams[cam], cfgs[cam]
+        rec = d["record"]
+        cal = res.calibrations[cam]
+        corr = inputs[cam][0]
+        crop = tuple(int(v) for v in rec["crop"])
+        val = _validate_or_median(cal, d.get("video"), crop, fm, cfg,
+                                  d.get("detect_fn") or detect_fn, d.get("median"))
+        gate = val["gate_best_m"]
+        others = [c for c in names if c != cam]
+        lead = (f"joint lens with {', '.join(others)} (f {res.f_px:.0f} px, k1 "
+                f"{res.k1:.3f}; {res.rms_px:.2f} px RMS over {res.n_points} points of "
+                f"{len(names)} cameras, {res.rms_inlier_px:.2f} px without "
+                f"{len(res.outliers)} outlier{'s' if len(res.outliers) != 1 else ''}; "
+                f"this camera {cal.rms_error:.2f} px)")
+        why = res.plausibility.get(cam)
+        if why is not None:
+            status = "failed"
+            reason = f"{lead}: REJECTED: physically implausible pose ({why})"
+        elif gate is not None and gate < cfg.drift_max_m:
+            status = "ready"
+            reason = (f"{lead}; validation best {_fmt(val['best_m'])} / median "
+                      f"{_fmt(val['median_m'])} / worst {_fmt(val['worst_m'])} m over "
+                      f"{val['frames']} frames — check the overlay, then confirm")
+        else:
+            status = "failed"
+            reason = (f"{lead} does not validate: best {_fmt(gate)} m on >= "
+                      f"{cfg.min_tags}-tag frames vs the {cfg.drift_max_m:.2f} m gate")
+        if val.get("source") == "median":
+            reason += (" [validated on the median frame: no single frame shows "
+                       f"{cfg.min_tags}+ tags]")
+        ratio, fnote = fold_note(cal, corr, lens_fixed=True)
+        if fnote:
+            reason += f" [{fnote}]"
+        metrics = _metrics(len(corr), cal, val, [])
+        metrics["fold_ratio"] = ratio
+        if val.get("source") == "median":
+            metrics["val_source"] = "median"
+        jsum = {"f_px": round(res.f_px, 1), "k1": round(res.k1, 4),
+                "rms_px": round(res.rms_px, 2), "rms_inlier_px": round(res.rms_inlier_px, 2),
+                "outliers": res.outliers, "cameras": names}
+        new = new_record(status, reason, method=JOINT_METHOD,
+                         match_key=rec.get("match_key"), timestamp=rec.get("timestamp"),
+                         calibration=cal.to_json(), metrics=metrics,
+                         per_tag=rec.get("per_tag") or {},
+                         auto_tags=rec.get("auto_tags") or {},
+                         manual_tags=rec.get("manual_tags") or [],
+                         lens_kind="joint", lens_partner=others[0], lens_partners=others,
+                         joint=jsum)
+        for k in ("crop", "frame", "endgame_cutoff", "moved_mid_match"):
+            if k in rec:
+                new[k] = rec[k]
+        overlay = None
+        if d.get("median") is not None:
+            corners = {int(t): np.asarray(c, float)
+                       for t, c in (rec.get("auto_tags") or {}).items()}
+            used = sorted({_tag_id_of_corr_key(k) for k in corr})
+            overlay = render_overlay(d["median"], cal, fm, corners, used, d.get("masks") or ())
+        out[cam] = AutoCalibResult(record=new, calibration=cal, overlay=overlay,
+                                   median=d.get("median"))
+    return out
+
+
+def _tag_id_of_corr_key(k) -> int:
+    return int(str(k)[1:]) if str(k)[:1] in ("a", "m", "r") else int(k)
+
+
+def adopt_joint(own: dict, joint: dict) -> dict:
+    """The record to keep for a camera after a joint attempt: the joint record when it
+    is ready (the own result kept as own_lens_reason / own_status), else the camera's
+    own record with the joint failure appended — a ready own result stays ready, a
+    failed one stays failed (the joint candidate is summarised in joint_attempt)."""
+    if joint.get("status") == "ready":
+        out = dict(joint)
+        out["own_lens_reason"] = own.get("reason", "")
+        out["own_status"] = own.get("status")
+        out["own_fold_ratio"] = (own.get("metrics") or {}).get("fold_ratio")
+        return out
+    out = dict(own)
+    out["reason"] = f"{own.get('reason', '')} [{joint.get('reason', 'joint lens failed')}]"
+    out["joint_attempt"] = {"status": joint.get("status"),
+                            "calibration": joint.get("calibration"),
+                            "metrics": joint.get("metrics"), **(joint.get("joint") or {})}
+    return out
 
 
 # --------------------------------------------------------------- event layout

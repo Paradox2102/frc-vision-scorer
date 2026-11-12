@@ -11585,18 +11585,67 @@ def _auto_calib_pick_steady(event: str, camera: str, match_key: str, video, cl, 
     return match_key, video, notes, eg
 
 
+def _auto_calib_cfg(camera: str, fm) -> "auto_calibrate.AutoCalibConfig":
+    """The auto-calibration config for ``camera``. Corners are held to the same gate
+    as the job-time per-match corner check (corner_check_max_m), not main's looser
+    drift gate: a corner "verified" at 0.48 m (2026hop qm4) is not usable."""
+    gate = (CALIB_DRIFT_MAX_M if camera == "main"
+            else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
+    return auto_calibrate.AutoCalibConfig(
+        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
+        field_season=getattr(fm, "season", "") or _AUTO_CALIB_SEASON)
+
+
+def _auto_calib_joint(event: str, cams: list, run_records: dict, layout: dict, fm,
+                      run_match: str, run_video) -> None:
+    """Worker-thread body of the joint-lens pass: corners that each failed (or came
+    out near their lens fold) on their own lens get ONE lens fitted to all their
+    tags from this run (``auto_calibrate.run_joint``). A camera's record becomes the
+    joint one only when that validates (ready); otherwise its own record stays, with
+    the joint failure noted. Updates ``run_records`` and the stored records."""
+    inputs, cfgs = {}, {}
+    for cam in cams:
+        rec = run_records[cam]
+        cfg = _auto_calib_cfg(cam, fm)
+        eg = rec.get("endgame_cutoff")
+        if eg and eg.get("cutoff_s") is not None:
+            cfg = dataclass_replace(cfg, window=(cfg.window[0], float(eg["cutoff_s"])))
+        mk = rec.get("match_key")
+        video = run_video if mk == run_match else auto_calibrate.local_video_for(mk or "")
+        median = None
+        fp = field_store.auto_frame_path(event, cam)
+        if rec.get("frame") and fp.is_file():
+            median = cv2.imread(str(fp))
+        cl = layout.get(cam)
+        inputs[cam] = {"record": rec, "video": video, "median": median,
+                       "masks": cl.masks if cl is not None else ()}
+        cfgs[cam] = cfg
+    try:
+        results = auto_calibrate.run_joint(inputs, fm, cfgs)
+    except CalibrationError as e:
+        for cam in cams:
+            rec = dict(run_records[cam])
+            rec["reason"] = (f"{rec.get('reason', '')} [joint lens with "
+                             f"{', '.join(c for c in cams if c != cam)} failed: {e}]")
+            field_store.save_auto_record(event, cam, rec)
+            run_records[cam] = rec
+        return
+    for cam, res in results.items():
+        rec = auto_calibrate.adopt_joint(run_records[cam], res.record)
+        if rec.get("method") == auto_calibrate.JOINT_METHOD and res.overlay is not None:
+            rec["preview"] = field_store.save_auto_preview(
+                event, cam, auto_calibrate.encode_jpeg(res.overlay))
+        field_store.save_auto_record(event, cam, rec)
+        run_records[cam] = rec
+        print(f"[auto-calib] {event}/{cam}: joint lens -> {rec['status']} "
+              f"({rec.get('method')}) — {rec.get('reason')}")
+
+
 def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
                            cl, fm, matches=(), lenders=()) -> dict:
     """Worker-thread body for one camera: solve/verify, persist record + overlay.
     ``lenders``: sibling corner lenses for a failed full solve (``run_camera``)."""
-    # Corners are held to the same gate as the job-time per-match corner check
-    # (corner_check_max_m), not main's looser drift gate: a corner "verified" at
-    # 0.48 m (2026hop qm4) is not usable.
-    gate = (CALIB_DRIFT_MAX_M if camera == "main"
-            else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
-    cfg = auto_calibrate.AutoCalibConfig(
-        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
-        field_season=getattr(fm, "season", "") or _AUTO_CALIB_SEASON)
+    cfg = _auto_calib_cfg(camera, fm)
     ref_key = match_key
     season = field_season_mod.season_for_layout(cfg.field_season)
     match_key, video, moved, endgame = _auto_calib_pick_steady(
@@ -11748,6 +11797,20 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
                 print(f"[auto-calib] {event}/{cam}: retrying with a lens from "
                       f"{', '.join(l.camera for l in lenders)}")
                 await run_one(cam, lenders)
+    # Joint pass: two or more corners that each failed (or came out near their lens
+    # fold) on their own share ONE lens fitted to all their tags. Corner cameras of
+    # a broadcast are identical units; ~5 tags each can't pin a lens, both can.
+    joint_cams = [c for c in todo if c in layout
+                  and auto_calibrate.joint_candidate(run_records.get(c), c)]
+    if len(joint_cams) >= 2:
+        print(f"[auto-calib] {event}: joint lens over {', '.join(joint_cams)}")
+        try:
+            await asyncio.to_thread(_auto_calib_joint, event, joint_cams, run_records,
+                                    layout, fm, match_key, video)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[auto-calib] {event}: joint lens pass crashed: {e}")
 
 
 def _auto_calib_task_done(event: str, task) -> None:
@@ -11911,7 +11974,8 @@ async def calibration_auto_confirm(request: Request):
             "holdout_ids": [], "timestamp": rec.get("timestamp"),
             "match_key": match_key, "method": "auto",
             "metrics": rec.get("metrics"),
-            **{k: rec[k] for k in ("lens_from", "lens_version_id", "lens_kind")
+            **{k: rec[k] for k in ("lens_from", "lens_version_id", "lens_kind",
+                                   "lens_partner", "lens_partners", "joint")
                if rec.get(k)},
             "crop": list(run_crop) if run_crop else (list(cur.crop) if cur else None)}))
     rec = field_store.update_auto_record(

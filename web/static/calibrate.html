@@ -1559,6 +1559,9 @@ function pmMetricText(e){
   const nloc = (m.located_tags || []).length;
   if (m.n_tags != null) bits.push(`${m.n_tags}${nloc ? '+' + nloc : ''} tags`);
   else if (m.check_tags) bits.push(`${m.check_tags} tags`);
+  // 2025-style endgame re-tile: the check only saw the teleop framing
+  const eg = e.endgame_cutoff;
+  if (eg && eg.cutoff_s != null) bits.push(`to ${_num(eg.cutoff_s, 0)} s (${eg.method})`);
   return bits.join(' · ');
 }
 function pmTile(cam, mk, e){

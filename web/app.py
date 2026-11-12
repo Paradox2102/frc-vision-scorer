@@ -1537,6 +1537,12 @@ class InferenceJob:
         self.match_periods: List[dict] = []
         self.timer_gate_fallback = True
         self.timer_gate_fallback_reason: Optional[str] = None
+        # The clock scan's (frame, seconds) samples and the event's season, kept
+        # for the endgame cutoff (Season.endgame_layout_switch, 2025): from it on
+        # the broadcast re-tiles the corner cameras (_compute_endgame_cutoff).
+        self._clock_samples: List[Tuple[int, Optional[int]]] = []
+        self._match_season = None
+        self.endgame_cutoff: Optional[dict] = None
         self.sam2_source_to_local: Dict[int, int] = {}
         # Per-view source-frame -> tracker-local-index maps. Corner views may
         # be decimated (corner_track_stride), so each view has its own index
@@ -7054,6 +7060,42 @@ class InferenceJob:
             if cc is not None:
                 self._camera_centers_xy[v.name] = (float(cc[0]), float(cc[1]))
 
+    def _compute_endgame_cutoff(self) -> Optional[dict]:
+        """Where the corner cameras' teleop framing ends, for a season whose
+        broadcast re-tiles the camera row at the endgame
+        (Season.endgame_layout_switch; 2025: the reef cameras narrow and a barge
+        view appears at 0:20). None for every other season (2026).
+
+        Same logic as event auto-calibration: ``auto_calibrate.
+        endgame_start_from_clock`` on this job's own clock scan, then
+        ``auto_calibrate.endgame_cutoff`` (clock - margin, else the conservative
+        estimate from the start of the video). Returns its dict plus
+        ``cutoff_frame``: the first source frame on the endgame side."""
+        season = getattr(self, "_match_season", None)
+        if season is None:
+            season = field_season_mod.season_for_event(getattr(self, "event_key", None))
+        if not getattr(season, "endgame_layout_switch", False):
+            return None
+        fps = float(getattr(self, "video_fps", 0) or 0)
+        ranges = getattr(self, "processing_ranges", None) or []
+        if fps <= 0 or not ranges:
+            return None
+        clock = None
+        try:
+            clock = auto_calibrate.endgame_start_from_clock(
+                getattr(self, "_clock_samples", None) or [], fps,
+                getattr(self, "match_periods", None) or [], season)
+        except Exception as e:
+            print(f"  [endgame] clock-based endgame start failed: {e}")
+        window = (ranges[0][0] / fps, ranges[-1][1] / fps)
+        eg = auto_calibrate.endgame_cutoff(season, window, clock=clock)
+        eg["cutoff_frame"] = int(round(float(eg["cutoff_s"]) * fps))
+        warn = "" if eg["method"] == "match_clock" else " — WARNING: teleop clock not read"
+        print(f"  [endgame] {season.name}: corner layout switches at the endgame; "
+              f"teleop framing ends at {eg['cutoff_s']:.1f} s (frame {eg['cutoff_frame']}, "
+              f"{eg['method']}){warn}")
+        return eg
+
     def _corner_per_match_step(self) -> dict:
         """corner_per_match_calib: decide each CORNER view's calibration for THIS
         match before tracking (web/field/corner_per_match.py) — keep the covering
@@ -7074,6 +7116,20 @@ class InferenceJob:
         from web.field import corner_per_match as cpm
         t0 = time.perf_counter()
         frange = (int(self.processing_ranges[0][0]), int(self.processing_ranges[-1][1]))
+        # endgame_layout_switch seasons (2025): the corner crops/calibrations
+        # describe the teleop framing only — the endgame re-tile would read as a
+        # camera move (every corner dropped) and mix two framings into the check
+        # and re-solve. Check on the frames before the cutoff only.
+        eg = getattr(self, "endgame_cutoff", None)
+        eg_log = None
+        if eg is not None and eg.get("cutoff_frame") is not None:
+            hi = min(frange[1], int(eg["cutoff_frame"]) - 1)
+            if hi > frange[0]:
+                frange = (frange[0], hi)
+            eg_log = {k: eg[k] for k in ("cutoff_s", "method", "cutoff_frame", "endgame_t_s")
+                      if k in eg}
+            print(f"  [corner-calib] endgame layout switch: corner check on frames "
+                  f"{frange[0]}-{frange[1]} (cutoff {eg['cutoff_s']:.1f} s, {eg['method']})")
         fps = float(self.video_fps or 30.0)
         ccfg = cpm.CornerStepConfig(check_max_m=float(cfg.corner_check_max_m),
                                     resolve_max_m=float(cfg.corner_resolve_max_m))
@@ -7106,6 +7162,10 @@ class InferenceJob:
                 out = cpm.CornerOutcome("dropped" if drop else "failed_kept",
                                         f"corner step error: {type(e).__name__}: {e}",
                                         epoch["version_id"])
+            if eg_log is not None:
+                out.metrics = {**(out.metrics or {}),
+                               "endgame_cutoff_s": eg_log["cutoff_s"],
+                               "endgame_cutoff_method": eg_log["method"]}
             new_vid = None
             if out.status == "adopted":
                 new_vid = field_store.save_version(
@@ -7134,6 +7194,8 @@ class InferenceJob:
                      "metrics": out.metrics, "reason": out.reason, "preview": preview,
                      "seconds": round(out.seconds, 1),
                      "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            if eg_log is not None:
+                entry["endgame_cutoff"] = eg_log
             if rejected:       # the operator's decision persists across re-runs
                 entry["rejected_version"] = prior.get("rejected_version") or prior.get("version_id")
                 entry["prev_status"] = prior.get("prev_status")
@@ -7232,6 +7294,9 @@ class InferenceJob:
         corners = getattr(self, "_corner_calib_outcomes", None)
         if corners:          # per-match corner step outcome (kept / adopted / dropped)
             out["corner_calibration"] = corners
+        eg = getattr(self, "endgame_cutoff", None)
+        if eg:               # endgame_layout_switch season: corners end here
+            out["endgame_cutoff"] = dict(eg)
         return out
 
     def _new_replay_recorder(self) -> ReplayRecorder:
@@ -7898,6 +7963,17 @@ class InferenceJob:
                     "  [timer] WARNING: using the legacy post-title-screen range: "
                     f"{self.timer_gate_fallback_reason}"
                 )
+            self._clock_samples = clock_samples
+            self._match_season = clock_season
+            self.endgame_cutoff = self._compute_endgame_cutoff()
+            if self.endgame_cutoff is not None and self.endgame_cutoff["method"] != "match_clock":
+                await self._warn_degraded(
+                    "endgame_cutoff",
+                    f"{clock_season.name}: the teleop clock was not read, so the "
+                    f"corner cameras' endgame re-tile is placed at "
+                    f"{self.endgame_cutoff['cutoff_s']:.1f} s "
+                    f"({self.endgame_cutoff['method']}); corner views are not used "
+                    "after it.")
             elif self.config.auto_period_only:
                 print(
                     "  [timer] AUTO-PERIOD-ONLY: restricting processing to the "

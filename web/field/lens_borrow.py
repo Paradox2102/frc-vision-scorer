@@ -153,3 +153,89 @@ def should_retry(rec: Optional[dict], camera: str, lenders) -> bool:
         return False
     tried = set(rec.get("lens_lenders_tried") or ())
     return any(l.camera not in tried for l in lenders)
+
+
+# ------------------------------------------------- the calibrate page's Lens selector
+
+LENS_HINT = "corner cameras share a lens model"
+JOINT_PREFIX = "joint:"
+
+
+def source_tag_ids(source: Optional[dict]) -> list:
+    """Tag ids a version's stored solve inputs (``source`` auto_tags / manual_tags)
+    can contribute to a joint solve: hold-outs excluded, sorted."""
+    if not source:
+        return []
+    hold = {int(i) for i in source.get("holdout_ids") or []}
+    ids = {int(t) for t in (source.get("auto_tags") or {})}
+    ids |= {int(m["id"]) for m in source.get("manual_tags") or [] if "id" in m}
+    return sorted(ids - hold)
+
+
+def lens_options(camera: str, cameras: Iterable[str], versions_for: Callable,
+                 match_key: Optional[str]) -> dict:
+    """The Lens selector for ``camera`` on the calibrate page:
+    {"options": [{value, kind, label, camera?, version_id?, rms_error?}],
+     "default": value, "hint": str | None}.
+
+    kind "own" (value "") always; for every sibling corner camera whose version
+    covering ``match_key`` is pinhole: kind "joint" (value "joint:<cam>") when that
+    version's ``source`` holds >= 2 usable tags, and kind "borrow" (value "<cam>").
+    "main" gets only "own" (it never lends or borrows).
+
+    Default: joint with a sibling > borrow from a sibling > own. Among several
+    siblings the one whose covering version has the lowest RMS wins (every stored
+    version is operator-saved or a confirmed auto result — rejected ones are not
+    loaded — so RMS is the only quality signal they share). The hint says why."""
+    own = {"value": "", "kind": "own", "label": "solve own lens"}
+    if camera == MAIN_CAMERA:
+        return {"options": [own], "default": "", "hint": None}
+    joint, borrow = [], []
+    for cam in dict.fromkeys(cameras):
+        if borrow_rule_error(camera, cam) is not None:
+            continue
+        ep = select_epoch(versions_for(cam) or [], match_key)
+        if ep is None or not _pinhole(ep["calibration"]):
+            continue
+        rms = getattr(ep["calibration"], "rms_error", None)
+        info = {"camera": cam, "version_id": ep["version_id"],
+                "rms_error": None if rms is None else round(float(rms), 2)}
+        if len(source_tag_ids(ep.get("source"))) >= MIN_BORROW_TAGS:
+            joint.append(dict(info, value=JOINT_PREFIX + cam, kind="joint",
+                              label=f"joint with {cam}"))
+        borrow.append(dict(info, value=cam, kind="borrow", label=f"borrow from {cam}"))
+
+    def by_rms(o):
+        return float("inf") if o["rms_error"] is None else o["rms_error"]
+    joint.sort(key=by_rms)
+    borrow.sort(key=by_rms)
+    options = [own] + joint + borrow
+    if joint:
+        d = joint[0]
+        hint = (f"{LENS_HINT} — defaulted to one lens fitted to this camera's and "
+                f"{d['camera']}'s tags together")
+    elif borrow:
+        d = borrow[0]
+        hint = (f"{LENS_HINT} — defaulted to {d['camera']}'s lens (rms "
+                f"{d['rms_error']} px); {d['camera']} has no stored tags for a joint fit")
+    else:
+        return {"options": options, "default": "",
+                "hint": "no sibling corner camera is calibrated for this match — "
+                        "solving this camera's own lens"}
+    return {"options": options, "default": d["value"], "hint": hint}
+
+
+def lens_suggestion(options: dict, current_kind: str = "own") -> Optional[str]:
+    """What a near-fold warning suggests, from ``lens_options``: a joint fit beats a
+    borrowed lens beats nothing. None when the camera already uses the best kind."""
+    rank = {"own": 0, "borrow": 1, "joint": 2}
+    best = None
+    for o in options.get("options") or []:
+        if rank[o["kind"]] > rank.get(current_kind, 0):
+            if best is None or rank[o["kind"]] > rank[best["kind"]]:
+                best = o
+    if best is None:
+        return None
+    if best["kind"] == "joint":
+        return f"try the joint lens with {best['camera']}"
+    return f"try borrowing from {best['camera']}"

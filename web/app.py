@@ -12297,15 +12297,113 @@ def _solve_tags_lender(event: str, camera: str, lens_from: str, start_match,
     return lens_borrow.LensLender(lens_from, ep["calibration"], ep["version_id"]), None
 
 
+def _tag_corr(fm, auto: dict, manual: list) -> dict:
+    """solve-tags correspondences: auto tags -> 4 corners ("a<id>"), manual clicks ->
+    the tag centre ("m<id>"); tags the field model does not know are skipped."""
+    corr = {}
+    for sid, corners in (auto or {}).items():
+        tid = int(sid)
+        if tid in fm.tags:
+            corr[f"a{tid}"] = (np.array(corners, float).reshape(-1, 2),
+                               fm.tag_corners_3d(tid))
+    for m in manual or []:
+        tid = int(m["id"])
+        if tid in fm.tags:
+            center3d = fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3)
+            corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]], float),
+                               center3d)
+    return corr
+
+
+def _lens_cameras(event: Optional[str]) -> list:
+    """Every camera the event's OR the default layout knows (lens sharing candidates)."""
+    return list(dict.fromkeys(list(_auto_calib_layout(event)) + list(load_layout())))
+
+
+def _lens_options(event: str, camera: str, match_key: Optional[str]) -> dict:
+    from web.field import lens_borrow
+    return lens_borrow.lens_options(camera, _lens_cameras(event),
+                                    lambda c: field_store.load_versions(event, c),
+                                    match_key)
+
+
+@app.get("/api/calibration/lens-options")
+async def calibration_lens_options(event: str, camera: str = "main",
+                                   match: str | None = None):
+    """The calibrate page's Lens selector for ``camera``: {options, default, hint}
+    (``lens_borrow.lens_options``). Corner cameras default to a joint lens with a
+    sibling corner that has stored tags, else to borrowing a sibling's lens; main
+    always solves its own."""
+    return _lens_options(event, camera, match or None)
+
+
+def _solve_tags_joint(event: str, camera: str, partner: str, start_match,
+                      version_id: Optional[str], fm, season: str, solve_corr: dict,
+                      image_size, prev_cal):
+    """solve-tags ``joint_with``: one lens fitted to this camera's correspondences and
+    the partner's covering version's stored ones (``source``), a pose for each.
+    Returns ((JointLensResult, partner version), None) or (None, error)."""
+    from web.field import joint_lens, lens_borrow
+    why = lens_borrow.borrow_rule_error(camera, partner)
+    if why:
+        return None, why
+    versions = field_store.load_versions(event, partner)
+    if version_id:
+        ep = next((v for v in versions if v["version_id"] == version_id), None)
+        if ep is None:
+            return None, f"{partner} has no calibration version {version_id}"
+    else:
+        ep = select_epoch(versions, start_match)
+        if ep is None:
+            return None, f"{partner} has no calibration version for a joint lens"
+    pcal, src = ep["calibration"], ep.get("source") or {}
+    if pcal is None or pcal.mode != "pinhole" or pcal.K is None:
+        return None, f"{partner}'s version {ep['version_id']} is not a pinhole lens"
+    hold = {int(i) for i in src.get("holdout_ids") or []}
+    pcorr = {k: v for k, v in _tag_corr(fm, src.get("auto_tags"),
+                                        src.get("manual_tags")).items()
+             if _tag_id_of(k) not in hold}
+    if len(pcorr) < joint_lens.MIN_TAGS_PER_CAMERA:
+        return None, (f"{partner}'s version {ep['version_id']} has no stored tags for a "
+                      f"joint lens (has {len(pcorr)}) — borrow its lens instead")
+    psize = tuple(int(v) for v in pcal.image_size)
+    # start from the partner's lens (rescaled to this camera's crop height) and
+    # both stored poses; joint_lens adds its own default starts
+    init = {"f": float(pcal.K[1, 1]) * float(image_size[1]) / float(psize[1]),
+            "k1": float(np.asarray(pcal.D, float).reshape(-1)[0]),
+            "poses": {partner: (pcal.rvec, pcal.tvec)}}
+    if (prev_cal is not None and prev_cal.mode == "pinhole" and prev_cal.rvec is not None
+            and tuple(int(v) for v in prev_cal.image_size) == tuple(image_size)):
+        init["poses"][camera] = (prev_cal.rvec, prev_cal.tvec)
+    try:
+        res = joint_lens.solve_joint_lens(
+            {camera: (solve_corr, tuple(image_size)), partner: (pcorr, psize)},
+            season, init=init)
+    except CalibrationError as e:
+        return None, f"joint lens with {partner}: {e}"
+    if not res.plausible:
+        bad = "; ".join(f"{c}: {w}" for c, w in res.plausibility.items() if w)
+        return None, f"joint lens with {partner}: implausible pose ({bad})"
+    return (res, ep), None
+
+
 @app.post("/api/calibration/solve-tags")
 async def calibration_solve_tags(request: Request):
     """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
-    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}], lens_from?, lens_version_id?}.
+    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}], lens_from?, lens_version_id?,
+    joint_with?, joint_version_id?}.
     Solves a single-view pinhole camera model from AprilTag correspondences
     (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay.
     ``lens_from`` (a sibling corner camera): fix that camera's covering lens
     (``lens_borrow.transfer_lens``) and solve only the pose ("model": "pose"); the
-    version's source records lens_from / lens_version_id."""
+    version's source records lens_from / lens_version_id.
+    ``joint_with`` (a sibling corner camera): fit ONE lens to this camera's tags and
+    the sibling's covering version's stored tags, a pose each ("model": "joint",
+    ``joint_lens.solve_joint_lens``); a save writes a new version for BOTH cameras
+    (the sibling's keeps its start_match and inputs; sources carry lens_kind "joint",
+    lens_partner, joint_id). Returns ``joint`` with both cameras' results.
+    Every solve returns ``fold_ratio`` (calibration.fold_conditioning) and a
+    ``warning`` when it is >= FOLD_RATIO_WARN."""
     body = await request.json()
     event = body.get("event", "test"); camera = body.get("camera", "main")
     season = body.get("season") or _event_layout(event)
@@ -12315,33 +12413,37 @@ async def calibration_solve_tags(request: Request):
     fm = FieldModel.load(season)
     auto = body.get("auto_tags", {}) or {}
     manual = body.get("manual_tags", []) or []
-    corr = {}
-    for sid, corners in auto.items():
-        tid = int(sid)
-        if tid in fm.tags:
-            corr[f"a{tid}"] = (np.array(corners, float).reshape(-1, 2),
-                               fm.tag_corners_3d(tid))
-    for m in manual:
-        tid = int(m["id"])
-        if tid in fm.tags:
-            center3d = fm.tag_corners_3d(tid).mean(axis=0).reshape(1, 3)
-            corr[f"m{tid}"] = (np.array([[float(m["u"]), float(m["v"])]], float),
-                               center3d)
+    corr = _tag_corr(fm, auto, manual)
     holdout_ids = set(int(i) for i in body.get("holdout_ids", []))
     held = {k: v for k, v in corr.items() if _tag_id_of(k) in holdout_ids}
     solve_corr = {k: v for k, v in corr.items() if _tag_id_of(k) not in holdout_ids}
+    start_match = body.get("start_match")
+    prev = select_epoch(field_store.load_versions(event, camera), start_match)
+    existing = prev["calibration"] if prev else None
     # lens_from: borrow a sibling corner camera's lens and solve only the pose (too
     # few tags to pin down this camera's own lens). Pose only — freeing the focal
     # too lets it trade focal against distance again (2025hop corner_right).
     lender = None
-    if body.get("lens_from"):
+    joint = None          # (JointLensResult, partner's input version)
+    if body.get("joint_with"):
+        joint, why = _solve_tags_joint(event, camera, str(body["joint_with"]),
+                                       start_match, body.get("joint_version_id"), fm,
+                                       season, solve_corr, image_size, existing)
+        if joint is None:
+            return JSONResponse(status_code=400, content={"error": why})
+    elif body.get("lens_from"):
         lender, why = _solve_tags_lender(event, camera, str(body["lens_from"]),
                                          body.get("start_match"),
                                          body.get("lens_version_id"))
         if lender is None:
             return JSONResponse(status_code=400, content={"error": why})
     try:
-        if lender is not None:
+        if joint is not None:
+            cal = joint[0].calibrations[camera]
+            solve_model_used = "joint"
+            solve_spread = auto_calibrate.tag_spread_m(
+                fm, {_tag_id_of(k) for k in solve_corr})
+        elif lender is not None:
             from web.field import lens_borrow
             cal = lens_borrow.solve_pose_with_lens(
                 solve_corr, image_size, season,
@@ -12356,16 +12458,66 @@ async def calibration_solve_tags(request: Request):
                 solve_corr, image_size, season, fm)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    start_match = body.get("start_match")
     label = body.get("label")
-    prev = select_epoch(field_store.load_versions(event, camera), start_match)
-    existing = prev["calibration"] if prev else None
     if existing is not None:
         cal.masks = existing.masks
         cal.robot_track_top_crop = existing.robot_track_top_crop
+    # Fold conditioning: a lens bent to absorb click error folds just past its
+    # outermost tag (2025hop corner_right own lens: 0.86).
+    from web.field import lens_borrow
+    from web.field.calibration import fold_conditioning, fold_warning
+    fold = fold_conditioning(cal, solve_corr)
+    kind = "joint" if joint is not None else ("borrow" if lender is not None else "own")
+    warning = None
+    if fold is not None and fold.near_fold:
+        suggestion = lens_borrow.lens_suggestion(
+            _lens_options(event, camera, start_match), kind)
+        warning = fold_warning(fold, suggestion, lens_fixed=kind != "own")
+    joint_out = None
+    if joint is not None:
+        jres, pver = joint
+        partner = next(c for c in jres.calibrations if c != camera)
+        pcal = jres.calibrations[partner]
+        joint_out = dict(jres.to_json(), partner=partner,
+                         partner_input_version_id=pver["version_id"],
+                         partner_start_match=pver["start_match"],
+                         partner_version_id=None)
+        psrc = pver.get("source") or {}
+        pfold = fold_conditioning(pcal, {k: v for k, v in _tag_corr(
+            fm, psrc.get("auto_tags"), psrc.get("manual_tags")).items()
+            if _tag_id_of(k) not in {int(i) for i in psrc.get("holdout_ids") or []}})
+        joint_out["partner_fold_ratio"] = None if pfold is None else pfold.to_json()["ratio"]
     # dry_run solves + renders the overlay without persisting — used by the
     # calibrate page to re-preview a saved epoch's stored correspondences.
     if not body.get("dry_run"):
+        lens_fields = lender.source_fields() if lender is not None else {}
+        if joint is not None:
+            # the partner first (its version id goes into this camera's source); it
+            # keeps its own epoch, inputs, masks and top crop
+            joint_id = f"joint-{time.strftime('%Y%m%d-%H%M%S')}-{camera}-{partner}"
+            pcal.masks = pver["calibration"].masks
+            pcal.robot_track_top_crop = pver["calibration"].robot_track_top_crop
+            partner_vid = field_store.save_version(
+                event, partner, pcal, start_match=pver["start_match"],
+                label=f"joint lens with {camera}",
+                source=_version_source(event, partner, {
+                    **{k: v for k, v in psrc.items()
+                       if k not in ("lens_from", "lens_version_id", "lens_kind",
+                                    "lens_partner", "lens_partner_version_id",
+                                    "joint_id", "joint", "method", "metrics")},
+                    "lens_kind": "joint", "lens_partner": camera,
+                    "lens_partner_input_version_id": pver["version_id"],
+                    "joint_id": joint_id,
+                    "joint": {k: joint_out[k] for k in ("f_px", "k1", "rms_px",
+                                                        "rms_inlier_px", "outliers")}}))
+            _auto_calib_mark_manual(event, partner, partner_vid)
+            joint_out["partner_version_id"] = partner_vid
+            lens_fields = {"lens_kind": "joint", "lens_partner": partner,
+                           "lens_partner_version_id": partner_vid,
+                           "lens_partner_input_version_id": pver["version_id"],
+                           "joint_id": joint_id,
+                           "joint": {k: joint_out[k] for k in (
+                               "f_px", "k1", "rms_px", "rms_inlier_px", "outliers")}}
         new_vid = field_store.save_version(
             event, camera, cal, start_match=start_match, label=label,
             source=_version_source(event, camera, {
@@ -12373,7 +12525,7 @@ async def calibration_solve_tags(request: Request):
                 "holdout_ids": sorted(holdout_ids),
                 "timestamp": float(body.get("timestamp", 75)),
                 "match_key": body.get("match_key"),
-                **(lender.source_fields() if lender is not None else {})}))
+                **lens_fields}))
         _auto_calib_mark_manual(event, camera, new_vid)
     holdout_err = holdout_field_error(cal, held) if held else None
 
@@ -12415,6 +12567,10 @@ async def calibration_solve_tags(request: Request):
             "holdout_error_m": holdout_err, "model": solve_model_used,
             "lens_from": (None if lender is None else
                           {"camera": lender.camera, "version_id": lender.version_id}),
+            "joint": joint_out,
+            "fold_ratio": None if fold is None else fold.to_json()["ratio"],
+            "fold": None if fold is None else fold.to_json(),
+            "warning": warning,
             "tag_spread_m": round(solve_spread, 2),
             "predicted_tags": _predicted_tags(cal, fm, image_size)}
 

@@ -12435,7 +12435,8 @@ def _solve_tags_joint(event: str, camera: str, partner: str, start_match,
     # both stored poses; joint_lens adds its own default starts
     init = {"f": float(pcal.K[1, 1]) * float(image_size[1]) / float(psize[1]),
             "k1": float(np.asarray(pcal.D, float).reshape(-1)[0]),
-            "poses": {partner: (pcal.rvec, pcal.tvec)}}
+            "poses": ({partner: (pcal.rvec, pcal.tvec)}
+                      if pcal.rvec is not None and pcal.tvec is not None else {})}
     if (prev_cal is not None and prev_cal.mode == "pinhole" and prev_cal.rvec is not None
             and tuple(int(v) for v in prev_cal.image_size) == tuple(image_size)):
         init["poses"][camera] = (prev_cal.rvec, prev_cal.tvec)

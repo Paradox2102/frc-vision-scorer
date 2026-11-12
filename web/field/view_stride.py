@@ -14,7 +14,7 @@ analysis loop (source frame -> local index) all agree on the mapping.
 """
 from __future__ import annotations
 
-from typing import Dict, List, NamedTuple, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence
 
 
 class ViewFramePlan(NamedTuple):
@@ -30,6 +30,7 @@ def build_view_frame_plan(
     prompt_local_idx: int,
     stride: int,
     dense_frames: int = 0,
+    end_frame: Optional[int] = None,
 ) -> ViewFramePlan:
     """Decimate the shared kept-frame list for one view.
 
@@ -44,6 +45,10 @@ def build_view_frame_plan(
     reads), and the corner-stride A/B showed full-time decimation starves
     confirmation. A dense head keeps the lock-formation window at full rate
     while the long tail pays the stride.
+
+    ``end_frame`` (a view inactive from that source frame on, e.g. a corner
+    re-tiled at the endgame) drops every kept frame at or after it, so the
+    tracker never sees those pixels. The prompt frame is always kept.
     """
     stride = max(1, int(stride))
     dense_frames = max(0, int(dense_frames))
@@ -53,7 +58,9 @@ def build_view_frame_plan(
             f"of length {len(all_frames)}")
     phase = prompt_local_idx % stride
     kept = [i for i in range(len(all_frames))
-            if i < dense_frames or i % stride == phase]
+            if (i < dense_frames or i % stride == phase)
+            and (end_frame is None or all_frames[i] < end_frame
+                 or i == prompt_local_idx)]
     source_frames = [all_frames[i] for i in kept]
     source_to_local = {sf: vi for vi, sf in enumerate(source_frames)}
     return ViewFramePlan(

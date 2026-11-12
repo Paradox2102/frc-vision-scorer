@@ -16,7 +16,6 @@ from tests.field.test_corner_per_match import BASE, CROP, FM, _fake_outcome, _vi
 from tests.field.test_endgame_cutoff import FPS, S25, S26, _clock
 
 
-
 @pytest.fixture
 def app_mod(tmp_path, monkeypatch):
     mod = importlib.import_module("web.app")
@@ -209,3 +208,106 @@ def test_provenance_records_the_cutoff(app_mod, tmp_path):
     job26 = _job(app_mod, tmp_path, season=S26, samples=_clock()[0])
     job26.endgame_cutoff = app_mod.InferenceJob._compute_endgame_cutoff(job26)
     assert "endgame_cutoff" not in app_mod.InferenceJob._replay_provenance(job26)
+
+
+# ------------------------------------- Part B: corner views stop feeding tracking
+
+def _job_with_cutoff(app_mod, tmp_path, **kw):
+    job = _job(app_mod, tmp_path, **kw)
+    job.endgame_cutoff = app_mod.InferenceJob._compute_endgame_cutoff(job)
+    app_mod.InferenceJob._apply_endgame_corner_cutoff(job)
+    return job
+
+
+def test_camera_view_is_active_until_its_cutoff():
+    v = CameraView("corner_left", CROP, (), BASE)
+    assert v.active_until_frame is None and v.active_at(10 ** 9)
+    v.active_until_frame = 100
+    assert v.active_at(99) and not v.active_at(100) and not v.active_at(101)
+
+
+def test_2025_corners_end_at_the_cutoff_and_main_never(app_mod, tmp_path):
+    job = _job_with_cutoff(app_mod, tmp_path)
+    cut = job.endgame_cutoff["cutoff_frame"]
+    by = {v.name: v for v in job.views}
+    assert by["main"].active_until_frame is None
+    assert by["corner_left"].active_until_frame == cut
+    assert [v.name for v in app_mod.InferenceJob._frame_views(job, cut - 1)] == [
+        "main", "corner_left"]
+    assert [v.name for v in app_mod.InferenceJob._frame_views(job, cut)] == ["main"]
+    assert [v.name for v in app_mod.InferenceJob._frame_views(job, cut + 900)] == ["main"]
+
+
+def test_2025_fallback_corners_end_at_the_estimate(app_mod, tmp_path):
+    job = _job_with_cutoff(app_mod, tmp_path, fallback=True)
+    corner = next(v for v in job.views if v.name == "corner_left")
+    assert job.endgame_cutoff["method"] == "estimate"
+    assert corner.active_until_frame == job.endgame_cutoff["cutoff_frame"]
+
+
+def test_2026_corners_stay_active_for_the_whole_match(app_mod, tmp_path):
+    job = _job_with_cutoff(app_mod, tmp_path, season=S26, samples=_clock()[0])
+    assert job.endgame_cutoff is None
+    assert all(v.active_until_frame is None for v in job.views)
+    for f in (0, job.processing_ranges[-1][1], job.total_frames + 10):
+        assert app_mod.InferenceJob._frame_views(job, f) == job.views
+
+
+def test_2025_corner_detections_after_the_cutoff_are_excluded(app_mod, tmp_path):
+    """What the analysis loop gathers per frame: every view in _frame_views feeds
+    per_camera (detections, masks, crops for reads); main is kept throughout."""
+    job = _job_with_cutoff(app_mod, tmp_path)
+    cut = job.endgame_cutoff["cutoff_frame"]
+    dets = {"main": ["m"], "corner_left": ["c"]}
+
+    def gather(f):
+        return {v.name: dets[v.name] for v in app_mod.InferenceJob._frame_views(job, f)}
+    assert gather(cut - 3) == {"main": ["m"], "corner_left": ["c"]}
+    assert gather(cut) == {"main": ["m"]}
+    assert gather(job.processing_ranges[-1][1]) == {"main": ["m"]}
+
+
+def test_analysis_loop_iterates_the_frame_views():
+    """The per-frame evidence / fusion / occlusion loops respect the cutoff: they
+    walk ``frame_views`` (InferenceJob._frame_views), not every loaded view."""
+    import inspect
+    import web.app as app
+    src = inspect.getsource(app.InferenceJob.process_video)
+    assert "frame_views = self._frame_views(frame_num)" in src
+    start = src.index("frame_views = self._frame_views(frame_num)")
+    body = src[start:src.index("self._occ = _merge_occlusion", start)]
+    assert "self.views" not in body
+    assert body.count("for view in frame_views") == 2
+
+
+def test_view_plan_ends_at_the_cutoff_and_keeps_the_prompt():
+    from web.field.view_stride import build_view_frame_plan
+    frames = [100 + 3 * i for i in range(40)]
+    full = build_view_frame_plan(frames, 4, 2)
+    assert build_view_frame_plan(frames, 4, 2, end_frame=None) == full
+    cut = build_view_frame_plan(frames, 4, 2, end_frame=frames[20])
+    assert cut.source_frames == [f for f in full.source_frames if f < frames[20]]
+    assert cut.source_frames[cut.prompt_idx] == frames[4]
+    assert all(cut.source_to_local[f] == i for i, f in enumerate(cut.source_frames))
+    # a cutoff at/before the prompt frame never drops the prompt
+    early = build_view_frame_plan(frames, 4, 1, end_frame=frames[2])
+    assert early.source_frames[early.prompt_idx] == frames[4]
+
+
+def test_prefetch_skips_inactive_views():
+    from web.analysis_prefetch import MISS, AnalysisPrefetcher
+
+    def read():
+        for n in (10, 20, 30):
+            yield n, np.full((8, 4, 3), n, dtype=np.uint8)
+    calls = []
+
+    def setup():
+        return (lambda o: None), (lambda vf: calls.append(int(vf[0, 0, 0])) or [])
+    pf = AnalysisPrefetcher(read, overhead_height=4, ocr_frames=set(), setup_gpu=setup,
+                            views=[("main", lambda f: f, None),
+                                   ("corner_left", lambda f: f + 1, 20)])
+    pf.run()
+    assert calls == [10, 11, 20, 30]
+    assert pf.take_person(20, "corner_left") is MISS          # never computed
+    assert pf.take_person(10, "corner_left") == []

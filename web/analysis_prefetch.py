@@ -93,7 +93,9 @@ class AnalysisPrefetcher:
             (decoded exactly as the loop decodes them).
         overhead_height: rows of the composite frame the loop calls the
             overhead crop (``frame[:overhead_height]``).
-        views: ``[(view_name, extract_fn)]`` in loop order.
+        views: ``[(view_name, extract_fn)]`` or ``[(view_name, extract_fn,
+            active_until_frame)]`` in loop order; a view is skipped from its
+            ``active_until_frame`` on (None: never), as the loop skips it.
         ocr_frames: source frames the loop will OCR (``ocr_frames_for``).
         ocr_fn: ``fn(overhead_frame, alliance) -> int | None`` (thread-safe).
         setup_gpu: optional zero-arg callable run in the worker thread,
@@ -204,7 +206,9 @@ class AnalysisPrefetcher:
                 if main_det_fn is not None:
                     self._main[frame_num] = main_det_fn(overhead)
                 if person_fn is not None:
-                    for name, extract in self._views:
+                    for name, extract, *until in self._views:
+                        if until and until[0] is not None and frame_num >= until[0]:
+                            continue
                         self._person[(frame_num, name)] = person_fn(extract(frame))
                 if frame_num in self._ocr_frames:
                     for alliance in OCR_ALLIANCES:

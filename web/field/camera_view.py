@@ -15,6 +15,14 @@ class CameraView:
     crop: tuple                  # (x, y, w, h) in full-composite pixels
     masks: tuple                 # tuple of (x, y, w, h), relative to crop origin
     calibration: Optional[object]  # web.field.calibration.CameraCalibration or None
+    # First source frame this view must NOT feed tracking from (None: the whole
+    # match). Set on corner views of a season whose broadcast re-tiles them at the
+    # endgame (Season.endgame_layout_switch, 2025): after it their pixels no
+    # longer match the crop/calibration. The HUD still shows the raw panel.
+    active_until_frame: Optional[int] = None
+
+    def active_at(self, frame_num: int) -> bool:
+        return self.active_until_frame is None or frame_num < self.active_until_frame
 
     def extract(self, composite_frame: np.ndarray) -> np.ndarray:
         x, y, w, h = self.crop

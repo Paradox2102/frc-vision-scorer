@@ -620,6 +620,13 @@ def _pad_clock_period(
     return item
 
 
+def _view_active_until(view) -> Optional[int]:
+    """A view's CameraView.active_until_frame (the first frame it no longer feeds
+    tracking from), None when it has none (the whole match)."""
+    until = getattr(view, "active_until_frame", None)
+    return int(until) if isinstance(until, (int, np.integer)) else None
+
+
 def compute_active_windows(
     samples: List[Tuple[int, Optional[int]]],
     fps: float,
@@ -2506,7 +2513,9 @@ class InferenceJob:
         pf = AnalysisPrefetcher(
             read_frames,
             overhead_height=self.overhead_height,
-            views=[(v.name, v.extract) for v in self.views] if plan.gpu else [],
+            views=([(v.name, v.extract, _view_active_until(v))
+                    for v in self.views]
+                   if plan.gpu else []),
             ocr_frames=ocr_frames_for(frames, OCR_FRAME_INTERVAL),
             ocr_fn=self.ocr_score if plan.ocr else None,
             setup_gpu=setup_gpu,
@@ -7096,6 +7105,34 @@ class InferenceJob:
               f"{eg['method']}){warn}")
         return eg
 
+    def _apply_endgame_corner_cutoff(self) -> None:
+        """endgame_layout_switch seasons: every corner view is inactive from the
+        cutoff frame on (CameraView.active_until_frame) — its detections, mask
+        tracking and crops would be the re-tiled endgame framing projected through
+        the teleop calibration. Main stays active. No cutoff (2026): untouched."""
+        eg = getattr(self, "endgame_cutoff", None)
+        if not eg or eg.get("cutoff_frame") is None:
+            return
+        cut = int(eg["cutoff_frame"])
+        names = []
+        for v in getattr(self, "views", None) or []:
+            if v.name != "main":
+                v.active_until_frame = cut
+                names.append(v.name)
+        if names:
+            print(f"  [endgame] corner views {names} feed tracking only before frame "
+                  f"{cut} ({eg['cutoff_s']:.1f} s, {eg['method']})")
+
+    def _frame_views(self, frame_num: int) -> list:
+        """The views that feed fusion / tracking / identity at ``frame_num`` (all of
+        them unless a view's ``active_until_frame`` has passed)."""
+        out = []
+        for v in self.views:
+            until = _view_active_until(v)
+            if until is None or frame_num < until:
+                out.append(v)
+        return out
+
     def _corner_per_match_step(self) -> dict:
         """corner_per_match_calib: decide each CORNER view's calibration for THIS
         match before tracking (web/field/corner_per_match.py) — keep the covering
@@ -7966,6 +8003,7 @@ class InferenceJob:
             self._clock_samples = clock_samples
             self._match_season = clock_season
             self.endgame_cutoff = self._compute_endgame_cutoff()
+            self._apply_endgame_corner_cutoff()
             if self.endgame_cutoff is not None and self.endgame_cutoff["method"] != "match_clock":
                 await self._warn_degraded(
                     "endgame_cutoff",
@@ -8242,6 +8280,9 @@ class InferenceJob:
                         prompt_local_idx,
                         1 if v.name == "main" else corner_stride,
                         dense_frames=0 if v.name == "main" else corner_dense_frames,
+                        # a view inactive from the endgame cutoff on (2025
+                        # corners) is never tracked past it
+                        end_frame=_view_active_until(v),
                     )
                     for v in self.views
                 }
@@ -8481,7 +8522,12 @@ class InferenceJob:
                     # timeline: 1.0 for main, the full stride for a pure
                     # decimated view, in between with a dense head. Used to
                     # rescale wall-clock-denominated tracker knobs.
-                    view_stride = len(all_frames) / max(1, len(view_plan.source_frames))
+                    # A view that ends early (active_until_frame) averages over
+                    # its own span only.
+                    view_until = _view_active_until(view)
+                    view_span = (len(all_frames) if view_until is None else
+                                 max(1, sum(1 for f in all_frames if f < view_until)))
+                    view_stride = view_span / max(1, len(view_plan.source_frames))
                     prompt_boxes_scaled = view_prompt_boxes[view.name]
                     self.sam2_obj_color[view.name] = {
                         i + 1: color
@@ -9345,6 +9391,10 @@ class InferenceJob:
                 self.update_hub_positions(detections)
                 
                 # ---- Multi-camera field-space tracking ----
+                # Views that feed fusion / tracking / identity at this frame: a
+                # corner past its active_until_frame (2025 endgame re-tile) is
+                # left out of detections, mask evidence, crops and occlusion.
+                frame_views = self._frame_views(frame_num)
                 per_camera = {}            # cam_name -> [(FieldDetection, crop_b64), ...]
                 person_boxes_by_cam = {}   # cam_name -> [boxes] in that cam's pixels
                 person_evidence_boxes_by_cam = {}
@@ -9355,7 +9405,7 @@ class InferenceJob:
                     _mf_src = self._clef_mf_enabled()
                     if self.use_sam2:
                         SAM2_SCALE = self.sam2_export_scale
-                        for view in self.views:
+                        for view in frame_views:
                             paired = []
                             view_raw = self.sam2_raw.get(view.name, {})
                             # Per-view index space: a decimated corner view has no
@@ -9535,7 +9585,7 @@ class InferenceJob:
                             person_boxes_by_cam[view.name] = person_boxes
                             person_evidence_boxes_by_cam[view.name] = person_boxes_all
                     else:
-                        for view in self.views:
+                        for view in frame_views:
                             pre = detections if view.name == "main" else None
                             paired, pboxes, raw_pboxes = self._detect_view(
                                 view,
@@ -9549,10 +9599,10 @@ class InferenceJob:
 
                 with self._stage("loop.fuse_track"):
                     weights = {v.name: (CORNER_VOTE_WEIGHT if v.name != "main" else 1.0)
-                               for v in self.views}
+                               for v in frame_views}
                     camera_centers = {
                         v.name: v.calibration.camera_center
-                        for v in self.views
+                        for v in frame_views
                         if v.calibration.camera_center is not None
                     }
 
@@ -9686,7 +9736,7 @@ class InferenceJob:
                     #    is occluded only if occluded in ALL posed cameras.
                     occ_input = [{"slot_id": t.slot_id, "pos": t.pos, "box": t.box}
                                  for t in track_outs]
-                    posed = [v for v in self.views
+                    posed = [v for v in frame_views
                              if v.calibration.camera_center is not None]
                     self._occ_by_cam = {
                         v.name: resolve_occlusion(

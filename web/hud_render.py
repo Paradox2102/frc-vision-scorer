@@ -39,9 +39,11 @@ import cv2
 import numpy as np
 
 from web import hud_draw, hud_labels
+from web.field.season import DEFAULT_LAYOUT
 
 OVERHEAD_CROP_RATIO = 0.67          # = web.app.OVERHEAD_CROP_RATIO (pinned by a test)
-DEFAULT_FIELD_SEASON = "2026-rebuilt-welded"
+# Only when neither the replay nor its event names a field (web.field.season).
+DEFAULT_FIELD_SEASON = DEFAULT_LAYOUT
 # A recorded main_thumb (hud_draw) is aligned when no thumbnail pixel differs
 # by more than this. The same decode gives 0. A 1-frame offset is not caught
 # on every frame: on real 60 fps broadcast files with duplicated frames (~30 fps
@@ -384,6 +386,12 @@ def render_replay(replay_id: str, db_path=None) -> dict:
                                      (vw, overhead_height))
         views = _corner_views(row.get("event_key"), row.get("match_key"))
         ocr_regions, refs, season, wire_cal = {}, [], getattr(cal, "field_season", None), None
+    if not season:
+        from web.field.season import layout_for_event
+        season = layout_for_event(row.get("event_key") or (static or {}).get("event_key"))
+        if not season:
+            warnings.append("event has no AprilTag field layout: radar uses the "
+                            f"{DEFAULT_FIELD_SEASON} field")
     field_model = FieldModel.load(season or DEFAULT_FIELD_SEASON)
     radar = Radar(field_model.length_m, field_model.width_m, field_model=field_model)
     if refs:

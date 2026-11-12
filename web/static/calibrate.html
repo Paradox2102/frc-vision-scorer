@@ -336,6 +336,8 @@
 // ---- State ----
 let tagMap = {};          // {id: {x,y,z}}
 let field = {length: 16.541, width: 8.069};
+let tagMarkerGroups = null;  // per-season tag clusters from /api/calibration/tag-map
+let fieldSeasonName = '';    // e.g. "2025 REEFSCAPE" — the field the event is played on
 let baseImg = null, frameW = 0, frameH = 0, fScale = 1.0;
 let autoTags = {};        // {id: [[u,v]x4]}
 let manualTags = [];      // [{id, u, v}]
@@ -531,10 +533,16 @@ async function fetchCurrentEvent(){
 }
 
 async function fetchTagMap(){
+  // The event's field follows its year (2025xxx -> 2025 REEFSCAPE layout).
+  const ev = autoEvent();
   try {
-    const r = await fetch('/api/calibration/tag-map');
+    const r = await fetch('/api/calibration/tag-map'
+                          + (ev ? '?event=' + encodeURIComponent(ev) : ''));
     const j = await r.json();
+    fieldSeasonName = (j.season_info && j.season_info.name) || '';
+    if (j.error){ tagMap = {}; setStatus(j.error, 'rms-warn'); return; }
     tagMap = j.tags || {}; field = j.field || field;
+    tagMarkerGroups = j.marker_groups || null;
   } catch(e){ setStatus('Could not load tag map: '+e.message,'rms-err'); }
 }
 
@@ -558,7 +566,7 @@ function layoutTagMarkers(){
 
   // Keep each field element's original tag pattern, but uniformly enlarge it
   // around its center just enough to make neighboring markers clickable.
-  const groups = [
+  const groups = tagMarkerGroups || [
     ['2','3','4','5','8','9','10','11'],       // red hub
     ['18','19','20','21','24','25','26','27'], // blue hub
     ['1','12'], ['6','7'], ['17','28'], ['22','23'], // trenches
@@ -618,6 +626,11 @@ function drawMap(){
     ctx.fillText(id, mx, my+0.5);
   }
   ctx.textAlign='start'; ctx.textBaseline='alphabetic';
+  if (fieldSeasonName){
+    ctx.fillStyle='#8890a8'; ctx.font='11px sans-serif'; ctx.textAlign='right';
+    ctx.fillText(fieldSeasonName + ' field', canvas.width - MAP_PAD, canvas.height - 3);
+    ctx.textAlign='start';
+  }
   drawZonesOnMap(ctx);
   if (pendingPixel){
     ctx.fillStyle='#ffd060'; ctx.font='12px sans-serif';

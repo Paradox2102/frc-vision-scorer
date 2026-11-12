@@ -68,6 +68,7 @@ from web.field import store as field_store
 from web.field.sam2_tracker import TrackStopped
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
+from web.field import season as field_season_mod
 from web.field.calibration import (CameraCalibration, Calibrator, CalibrationError,
                                    holdout_field_error, tag_alignment_error, MIN_POSE_TAGS,
                                    push_from_camera)
@@ -626,18 +627,22 @@ def compute_active_windows(
     lead_seconds: float = MATCH_CLOCK_LEAD_SECONDS,
     tail_seconds: float = MATCH_CLOCK_TAIL_SECONDS,
     auto_only: bool = False,
+    auto_s: float = 20,
+    teleop_s: float = 140,
 ) -> Tuple[List[Tuple[int, int]], List[dict], bool, Optional[str]]:
     """Return merged processing ranges, labeled core periods, and fallback state.
 
     When ``auto_only`` is set, restrict processing to the autonomous window and
     skip the teleop search entirely — auto-only ground-truth runs (vs. Manta)
     don't need teleop, and a clip that ends in auto still locks cleanly.
+    ``auto_s`` / ``teleop_s``: the season's countdown starts (2026: 20 / 140;
+    2025 and earlier: 15 / 135 — web.field.season).
     """
     full_range = [(0, max(0, total_frames - 1))]
     if not samples or fps <= 0 or total_frames <= 0:
         return full_range, [], True, "missing clock samples or video metadata"
 
-    auto = _find_clock_period(samples, 20, fps=fps)
+    auto = _find_clock_period(samples, int(round(auto_s)), fps=fps)
     if auto is None:
         return full_range, [], True, "autonomous countdown was not found"
 
@@ -654,7 +659,7 @@ def compute_active_windows(
         )
 
     teleop = _find_clock_period(
-        samples, 140, after_frame=auto["end_frame"], fps=fps
+        samples, int(round(teleop_s)), after_frame=auto["end_frame"], fps=fps
     )
     if teleop is None:
         return full_range, [dict(auto, label="auto")], True, "teleop countdown was not found"
@@ -7849,6 +7854,7 @@ class InferenceJob:
                 "message": "Scanning match clock…", "progress": 0.0,
             })
             clock_samples = await asyncio.to_thread(self._scan_match_clock)
+            clock_season = field_season_mod.season_for_event(self.event_key)
             (
                 self.processing_ranges,
                 self.match_periods,
@@ -7857,6 +7863,7 @@ class InferenceJob:
             ) = compute_active_windows(
                 clock_samples, self.video_fps, self.total_frames,
                 auto_only=self.config.auto_period_only,
+                auto_s=clock_season.auto_s, teleop_s=clock_season.teleop_s,
             )
             self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
             self._raise_if_stopped()  # phase boundary: after clock scan
@@ -10783,7 +10790,8 @@ async def save_calibration_masks(request: Request):
     if not versions:
         # No calibration yet — create a default base version (mirrors today's
         # "no calibration -> default" branch).
-        cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
+        cal = CameraCalibration(image_size=(1920, 1080), field_season=_event_layout(event) or "",
+                                mode="pinhole")
         cal.masks = [tuple(m) for m in masks]
         field_store.save_version(event, camera, cal, start_match=None,
                                  source=_version_source(event, camera))
@@ -10813,7 +10821,8 @@ async def save_robot_track_top_crop(request: Request):
     version_id = body.get("version_id")
     versions = field_store.load_versions(event, camera)
     if not versions:
-        cal = CameraCalibration(image_size=(1920, 1080), field_season="2026-rebuilt-welded", mode="pinhole")
+        cal = CameraCalibration(image_size=(1920, 1080), field_season=_event_layout(event) or "",
+                                mode="pinhole")
         cal.robot_track_top_crop = crop
         field_store.save_version(event, camera, cal, start_match=None,
                                  source=_version_source(event, camera))
@@ -10858,7 +10867,8 @@ async def calibration_manual(request: Request):
     prev = select_epoch(field_store.load_versions(event, camera), start_match)
     existing = prev["calibration"] if prev else None
     image_size = existing.image_size if existing else tuple(body.get("image_size", (1920, 1080)))
-    season = existing.field_season if existing else body.get("season", "2026-rebuilt-welded")
+    season = (existing.field_season if existing
+              else body.get("season") or _event_layout(event) or "")
     try:
         cal = Calibrator.solve_pose(corr, K=K, D=D, image_size=image_size,
                                     field_season=season, mode=intr_mode)
@@ -10879,7 +10889,9 @@ async def calibration_auto(request: Request):
     Frames are pre-grabbed (e.g. via /api/grab-frame)."""
     body = await request.json()
     event = body["event"]; camera = body.get("camera", "main")
-    season = body.get("season", "2026-rebuilt-welded")
+    season = body.get("season") or _event_layout(event)
+    if not season:
+        return JSONResponse(status_code=400, content={"error": _no_layout_error(event)})
     base = field_store.load(event, camera)   # most-recent cal: intrinsics + lens mode
     if base is None or base.K is None:
         return JSONResponse(status_code=400, content={
@@ -11174,7 +11186,10 @@ async def calibration_autofix_preview(request: Request):
     main = frame[cy:cy + ch, cx:cx + cw].copy()
     for (mx, my, mw_, mh_) in (cal.masks or cl.masks):
         main[my:my + mh_, mx:mx + mw_] = 0
-    fm = FieldModel.load(cal.field_season or "2026-rebuilt-welded")
+    season = cal.field_season or _event_layout(event)
+    if not season:
+        return JSONResponse(status_code=400, content={"error": _no_layout_error(event)})
+    fm = FieldModel.load(season)
     try:
         _draw_field_overlay(main, cal, fm)
         for tid, corners in detect_tags(main).items():
@@ -11252,7 +11267,24 @@ async def calibration_autofix_reject(request: Request):
 # calibration version until the operator confirms it (or saves a manual solve).
 
 _auto_calib_tasks: Dict[str, "asyncio.Task"] = {}
-_AUTO_CALIB_SEASON = "2026-rebuilt-welded"
+# Fallback tag layout only where no event is known; an event's own season comes
+# from web.field.season (its key's year / override).
+_AUTO_CALIB_SEASON = field_season_mod.DEFAULT_LAYOUT
+
+
+def _event_season(event: Optional[str]):
+    """The field season ``event`` is played on (web.field.season): its override,
+    else its key's year; no event -> the 2026 default."""
+    return field_season_mod.season_for_event(event)
+
+
+def _event_layout(event: Optional[str]) -> Optional[str]:
+    """Tag-layout stem for ``event`` — None when its season has no AprilTags."""
+    return _event_season(event).tag_layout
+
+
+def _no_layout_error(event: Optional[str]) -> str:
+    return field_season_mod.no_layout_reason(_event_season(event))
 
 
 def _auto_calib_layout(event: Optional[str]):
@@ -11352,7 +11384,7 @@ def _auto_calibrate_camera(event: str, camera: str, match_key: str, video,
             else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
     cfg = auto_calibrate.AutoCalibConfig(
         min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
-        field_season=_AUTO_CALIB_SEASON)
+        field_season=getattr(fm, "season", "") or _AUTO_CALIB_SEASON)
     ref_key = match_key
     match_key, video, moved = _auto_calib_pick_steady(event, camera, match_key, video,
                                                       cl, cfg, matches)
@@ -11406,10 +11438,21 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
         todo.append(cam)
     if not todo:
         return
+    season = _event_season(event)
+    if not season.tag_layout:
+        # A field with no AprilTag layout (<= 2022, or a year we have no data for):
+        # nothing to solve against — never silently fall back to the 2026 field.
+        reason = field_season_mod.no_layout_reason(season)
+        print(f"[auto-calib] {event}: {reason}")
+        for cam in todo:
+            field_store.save_auto_record(event, cam,
+                                         auto_calibrate.new_record("failed", reason))
+        return
     for cam in todo:
         field_store.save_auto_record(event, cam, auto_calibrate.new_record(
             "running", "queued — finding reference footage"))
-    print(f"[auto-calib] {event}: cameras {todo} (force={force})")
+    print(f"[auto-calib] {event}: cameras {todo} (force={force}, field "
+          f"{season.tag_layout})")
     try:
         match_key, video = await asyncio.to_thread(
             auto_calibrate.resolve_reference_video, event, matches,
@@ -11432,7 +11475,7 @@ async def _run_auto_calibrate(event: str, matches: list, cameras=None,
         print(f"[auto-calib] {event}: layout detection failed ({e}) — using the "
               f"existing/default layout")
     layout = _auto_calib_layout(event)
-    fm = FieldModel.load(_AUTO_CALIB_SEASON)
+    fm = FieldModel.load(season.tag_layout)
     for cam in todo:
         if cam not in layout:
             field_store.save_auto_record(event, cam, auto_calibrate.new_record(
@@ -11526,7 +11569,10 @@ async def calibration_predicted_tags(event: str, camera: str = "main"):
     if not rec or not rec.get("calibration"):
         return {"tags": {}, "crop": None, "status": rec.get("status") if rec else None}
     cal = CameraCalibration.from_json(rec["calibration"])
-    fm = FieldModel.load(cal.field_season or _AUTO_CALIB_SEASON)
+    season = cal.field_season or _event_layout(event)
+    if not season:
+        return {"tags": {}, "crop": rec.get("crop"), "status": rec.get("status")}
+    fm = FieldModel.load(season)
     size = cal.image_size or (rec.get("crop") or [0, 0, 1920, 1080])[2:4]
     return {"tags": _predicted_tags(cal, fm, size), "crop": rec.get("crop"),
             "status": rec.get("status")}
@@ -11883,9 +11929,12 @@ async def calibration_frame(request: Request):
     main = frame[cy:cy + ch, cx:cx + cw].copy()
     for (mx, my, mw, mh) in cl.masks:
         main[my:my + mh, mx:mx + mw] = 0
-    fm = FieldModel.load("2026-rebuilt-welded")
-    det = detect_tags(main)
-    detected = {str(tid): det[tid].tolist() for tid in det if tid in fm.tags}
+    season = _event_layout(body.get("event"))
+    detected = {}
+    if season:                         # a field without AprilTags: frame only
+        fm = FieldModel.load(season)
+        det = detect_tags(main)
+        detected = {str(tid): det[tid].tolist() for tid in det if tid in fm.tags}
     ok2, buf = cv2.imencode(".jpg", main, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not ok2:
         return JSONResponse(status_code=500, content={"error": "jpeg encode failed"})
@@ -11936,9 +11985,9 @@ async def calibration_solve_homography(request: Request):
     img_pts = np.array([[p["u"], p["v"]] for p in pts], float)
     fld_xy = np.array([[p["x"], p["y"]] for p in pts], float)
     image_size = tuple(body.get("image_size", [1920, 1080]))
+    season = _event_layout(event) or ""
     try:
-        cal = Calibrator.solve_ground_homography(img_pts, fld_xy, image_size,
-                                                 "2026-rebuilt-welded")
+        cal = Calibrator.solve_ground_homography(img_pts, fld_xy, image_size, season)
     except CalibrationError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     start_match = body.get("start_match")
@@ -11952,11 +12001,11 @@ async def calibration_solve_homography(request: Request):
                              source=_version_source(event, camera, {"method": "homography"}))
 
     # Build overlay on the same frame/timestamp (and same source video).
-    fm = FieldModel.load("2026-rebuilt-welded")
+    fm = FieldModel.load(season) if season else None
     frame, _frame_err = await asyncio.to_thread(_read_composite_frame, body)
     overlay_b64 = None
     cl = _auto_calib_layout(event).get(camera)
-    if frame is not None and cl is not None:
+    if frame is not None and cl is not None and fm is not None:
         cx, cy, cw, ch = cl.crop
         main = frame[cy:cy + ch, cx:cx + cw].copy()
         for (mx, my, mw_, mh_) in cl.masks:
@@ -11984,7 +12033,9 @@ async def calibration_solve_tags(request: Request):
     (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay."""
     body = await request.json()
     event = body.get("event", "test"); camera = body.get("camera", "main")
-    season = body.get("season", "2026-rebuilt-welded")
+    season = body.get("season") or _event_layout(event)
+    if not season:
+        return JSONResponse(status_code=400, content={"error": _no_layout_error(event)})
     image_size = tuple(body.get("image_size", [1920, 648]))
     fm = FieldModel.load(season)
     auto = body.get("auto_tags", {}) or {}
@@ -12074,14 +12125,71 @@ async def calibration_landmarks():
     return json.loads(p.read_text())
 
 
+# Calibrate-page map: tag ids drawn as a cluster that is spread apart for clicking.
+_TAG_MARKER_GROUPS = {
+    2026: [['2', '3', '4', '5', '8', '9', '10', '11'],          # red hub
+           ['18', '19', '20', '21', '24', '25', '26', '27'],    # blue hub
+           ['1', '12'], ['6', '7'], ['17', '28'], ['22', '23'],  # trenches
+           ['13', '14'], ['15', '16'], ['29', '30'], ['31', '32']],  # wall structures
+    2025: [['17', '18', '19', '20', '21', '22'],                # blue reef
+           ['6', '7', '8', '9', '10', '11'],                    # red reef
+           ['14', '15'], ['4', '5'],                            # barge
+           ['12', '13'], ['1', '2']],                           # coral stations
+}
+
+
 @app.get("/api/calibration/tag-map")
-async def calibration_tag_map(season: str = "2026-rebuilt-welded"):
-    """Top-down field tag layout for the calibration UI: tag (x,y,z) + field dims."""
-    fm = FieldModel.load(season)
+async def calibration_tag_map(season: Optional[str] = None, event: Optional[str] = None):
+    """Top-down field tag layout for the calibration UI: tag (x,y,z) + field dims.
+    ``season`` (a tag-layout stem) wins; else the ``event``'s season (its key's year
+    / override); neither -> the 2026 default. ``season_info`` describes the field."""
+    info = _event_season(event)
+    if season:
+        info = field_season_mod.season_for_layout(season) or info
+    else:
+        season = info.tag_layout
+    if not season:
+        return JSONResponse(status_code=400, content={
+            "error": field_season_mod.no_layout_reason(info),
+            "season_info": info.public()})
+    try:
+        fm = FieldModel.load(season)
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"error": f"unknown season '{season}'"})
     tags = {str(tid): {"x": float(t["t"][0]), "y": float(t["t"][1]),
                        "z": float(t["t"][2])}
             for tid, t in fm.tags.items()}
-    return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m}}
+    return {"tags": tags, "field": {"length": fm.length_m, "width": fm.width_m},
+            "season": season, "season_info": info.public(),
+            "marker_groups": _TAG_MARKER_GROUPS.get(info.year, [])}
+
+
+@app.get("/api/event/field-season")
+async def get_event_field_season(event: str):
+    """The field season ``event`` is played on (web.field.season) + its override."""
+    return {"event": event, "season": _event_season(event).public(),
+            "override": field_season_mod.load_override(event)}
+
+
+@app.post("/api/event/field-season")
+async def set_event_field_season(request: Request):
+    """Override an event's field. Body: {event, year?, variant?: welded|andymark}
+    or {event, clear: true}. Affects calibrations solved from now on; existing
+    calibrations keep the field_season they were solved against."""
+    body = await request.json()
+    event = body.get("event")
+    if not event:
+        return JSONResponse(status_code=400, content={"error": "event is required"})
+    if body.get("clear"):
+        field_season_mod.clear_override(event)
+    else:
+        try:
+            field_season_mod.save_override(event, body.get("year"),
+                                           body.get("variant") or "welded")
+        except (field_season_mod.SeasonError, TypeError, ValueError) as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+    return {"event": event, "season": _event_season(event).public(),
+            "override": field_season_mod.load_override(event)}
 
 
 def _vision_read_bumpers(robot_crops_b64: list, match_teams: list,
@@ -13602,6 +13710,8 @@ async def get_current_event():
         "timezone": current_event.get('timezone'),
         "has_ocr_regions": custom_ocr_regions is not None,
         "has_hub_positions": event_hub_positions is not None,
+        "field_season": field_season_mod.season_for_event(
+            current_event['event_key']).public(),
     }
 
 

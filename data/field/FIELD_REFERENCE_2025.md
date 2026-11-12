@@ -101,6 +101,15 @@ structure as 2026.
 
 ## What is still 2026-locked in the pipeline (as of main deb248f4)
 
+**Update (season registry, `web/field/season.py`):** items 1, 2 and 4 are now driven by
+the event's year. `season_for_event("2025hop")` picks `2025-reefscape-welded` (an
+override in `web/uploads/field_season_<event>.json` can pick the AndyMark layout or
+another year). Auto/manual calibration, the tag map, the wireframe (GLB groups for
+non-2026 fields), the structure prisms (2025: two reef hexagons as no-robot zones,
+occluders and radar shapes; the barge is not a zone), the match-clock search (15 / 135)
+and the GT auto window follow it. 2026 is unchanged. Items 3 and 5 remain, as do the
+2026-tuned corner-zone constants in `web/field/detect_bridge.py`.
+
 1. **Season literal:** `"2026-rebuilt-welded"` is the default in about 10 Python files
    (`web/app.py`, `web/hud_render.py`, `web/field/auto_calibrate.py`, `corner_per_match.py`,
    `manta.py`, several `scripts/`). It should come from the event's year.

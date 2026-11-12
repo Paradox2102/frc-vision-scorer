@@ -35,11 +35,12 @@ from web.field.camera_view import load_views  # noqa: E402
 from web.field.composite_layout import load_layout  # noqa: E402
 from web.field.field_model import FieldModel  # noqa: E402
 from web.field.match_order import select_epoch  # noqa: E402
+from web.field.season import DEFAULT_LAYOUT, layout_for_event  # noqa: E402
 
 HTML_PATH = ROOT / "tools" / "gt_annotator.html"
 DB_PATH = Path(os.environ.get("GT_ANNOTATOR_DB", ROOT / "frc_scorer.db"))
 GT_DIR = Path(os.environ.get("GT_ANNOTATOR_DIR", gt.GT_DIR))
-DEFAULT_SEASON = "2026-rebuilt-welded"
+DEFAULT_SEASON = DEFAULT_LAYOUT     # only when the event has no tag layout
 GRID_STEP_PX = 8           # client-side projection lookup grid spacing
 KF_FIELDS = ("frame", "state", "uv", "src", "rate", "note")
 
@@ -260,7 +261,8 @@ def views_for(event_key: str, match_key: Optional[str]):
     """(views, selection, field_dims)."""
     sel = calibration_selection(event_key, match_key)
     views = load_views(event_key, sel or None)
-    season = DEFAULT_SEASON
+    # the event's field (its key's year / override); 2026 only with no layout
+    season = layout_for_event(event_key) or DEFAULT_SEASON
     for v in views:
         if v.calibration is not None and getattr(v.calibration, "field_season", ""):
             season = v.calibration.field_season

@@ -34,6 +34,7 @@ from web.field.calibration import (CameraCalibration, Calibrator, CalibrationErr
 from web.field.match_order import match_sort_key, select_epoch
 from web.field.pose_autofix import (PoseFixConfig, aggregate_tag_corners, evaluate_fix,
                                     resolve_pose)
+from web.field.season import DEFAULT_LAYOUT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FOOTAGE_DIRS = (PROJECT_ROOT / "data" / "test_footage", PROJECT_ROOT / "data" / "videos")
@@ -68,7 +69,9 @@ class AutoCalibConfig:
     validate_samples: int = 12
     drift_max_m: float = 0.5          # mirrors CALIB_DRIFT_MAX_M
     max_center_shift_m: float = 1.0   # pose_resolve sanity bound (PoseFixConfig)
-    field_season: str = "2026-rebuilt-welded"
+    # Tag layout the solve is against. Callers pass the event's season
+    # (web.field.season.season_for_event); the default is only for no-event use.
+    field_season: str = DEFAULT_LAYOUT
     # Temporal median of the camera crop over the match window: the camera is static
     # in play, so robots/balls/people blocking a tag vanish. Tags decoded only there
     # join the aggregated set, and it is the overlay / locator image. 0 disables.

@@ -54,13 +54,31 @@ from scipy.optimize import linear_sum_assignment
 POSITIONED = ("visible", "estimated")
 STATE_GROUPS = ("visible", "estimated", "all")   # "all" = visible + estimated
 DEFAULT_SRC_FPS = 60.0
-AUTO_SECONDS = 20.0
+AUTO_SECONDS = 20.0          # 2026; a match_key's season overrides it (auto_seconds_for)
 _BIG = 1e9
 _EPS = 1e-6
 
 
 class AlignmentError(ValueError):
     """GT video can't be placed on the replay's time base."""
+
+
+def auto_seconds_for(match_key: Optional[str]) -> float:
+    """Length of the autonomous period for ``match_key``'s season (2026: 20 s,
+    2025 and earlier: 15 s); AUTO_SECONDS when there is no key."""
+    if not match_key:
+        return AUTO_SECONDS
+    from web.field.season import season_for_event
+    return float(season_for_event(str(match_key).split("_")[0]).auto_s)
+
+
+def field_length_for(match_key: Optional[str], default: float = 16.541) -> float:
+    """Field length (m) of ``match_key``'s season, ``default`` when unknown."""
+    if not match_key:
+        return default
+    from web.field.season import season_for_event
+    s = season_for_event(str(match_key).split("_")[0])
+    return float(s.field_m[0]) if s.field_m else default
 
 
 def norm_team(t) -> Optional[str]:
@@ -500,12 +518,18 @@ def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: flo
                 period: str = "full", eval_step_s: float = 0.25, lag_ms: float = 0.0,
                 interp_max_gap_s: float = 1.0, force: bool = False,
                 details: bool = False, roster: Optional[dict] = None,
-                field_length_m: float = 16.541) -> dict:
+                field_length_m: Optional[float] = None,
+                match_key: Optional[str] = None) -> dict:
     """Score one replay against a match's GT docs. See module doc.
 
     Returns ``{params, window, alignment, warnings, robots: [...],
     aggregate: {visible, estimated, all}, headline}``; ``headline`` is the
-    visible-keyframe aggregate. ``details`` adds per-sample records."""
+    visible-keyframe aggregate. ``details`` adds per-sample records.
+    ``match_key`` picks the season's auto length (auto window when the replay has no
+    auto period) and, unless ``field_length_m`` is given, its field length."""
+    auto_seconds = auto_seconds_for(match_key)
+    if field_length_m is None:
+        field_length_m = field_length_for(match_key)
     docs = [d for d in gt_docs if d and d.get("team") is not None]
     tracks = [gt_track(d, rt, lag_ms=lag_ms, force=force) for d in docs]
     warnings = [t.alignment["warning"] for t in tracks if t.alignment["warning"]]
@@ -521,7 +545,7 @@ def score_match(gt_docs: Iterable[dict], rt: ReplayTrack, *, match_radius_m: flo
                 raise AlignmentError("period=auto: replay has no auto period and no GT "
                                      "doc has match_t0_frame")
             t = t0s[0]
-            window = (t.t0_rf, t.t0_rf + AUTO_SECONDS * t.gt_fps * t.alignment["scale"])
+            window = (t.t0_rf, t.t0_rf + auto_seconds * t.gt_fps * t.alignment["scale"])
     elif period != "full":
         raise ValueError(f"period must be 'auto' or 'full', not {period!r}")
     anchor = rt.auto[0] if rt.auto else 0.0

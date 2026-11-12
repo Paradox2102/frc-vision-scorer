@@ -31,6 +31,7 @@ import numpy as np
 from web.field import auto_calibrate as ac
 from web.field import camera_motion
 from web.field.calibration import pose_plausibility, tag_alignment_error
+from web.field.season import DEFAULT_LAYOUT
 
 LABEL = "auto per-match (corner)"
 
@@ -173,7 +174,7 @@ def corner_step(video, match_key: str, camera: str, crop, masks, fm, epoch: dict
         window=(frame_range[0] / fps, frame_range[1] / fps), drift_max_m=cfg.resolve_max_m,
         max_center_shift_m=cfg.max_center_shift_m, median_frames=cfg.median_frames,
         jev_verify=cfg.jev_verify, field_season=getattr(ecal, "field_season", None)
-        or "2026-rebuilt-welded")
+        or getattr(fm, "season", None) or DEFAULT_LAYOUT)
     res, base_used, errs = None, None, []
     seen_lens = []
     for base in [epoch, *alt_epochs]:

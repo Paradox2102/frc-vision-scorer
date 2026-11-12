@@ -303,7 +303,8 @@ def score_numbers(meta: dict, row: dict, video) -> Optional[dict]:
     rt = replay_from_meta(shifted, src_fps=_probe_fps(video), fingerprint=video_fingerprint(video))
     out = {}
     for period in ("full", "auto"):
-        res = score_match(docs, rt, period=period, roster=match_roster(match_key))
+        res = score_match(docs, rt, period=period, roster=match_roster(match_key),
+                          match_key=match_key)
         h, i = res["headline"], res["identity"]
         out[period] = {"right": h["label_correct"], "wrong": h["label_wrong"],
                        "unlabelled": h["unlabeled"], "misid_s": i["misid_s"],

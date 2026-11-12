@@ -175,7 +175,8 @@ def score_replay(replay_id: str, *, period: str = "full", match_radius_m: float 
         rt = load_replay(row, score_shift_m, meta_path)
         res = score_match(docs, rt, match_radius_m=match_radius_m, period=period,
                           eval_step_s=eval_step_s, lag_ms=lag_ms, force=force,
-                          details=details, roster=match_roster(row["match_key"]))
+                          details=details, roster=match_roster(row["match_key"]),
+                          match_key=row["match_key"])
         res["params"]["score_shift_m"] = score_shift_m
         res["params"]["meta"] = meta_path
         if rt.fingerprint is None:

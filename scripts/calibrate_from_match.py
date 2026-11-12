@@ -36,6 +36,7 @@ from web.field.calibration import Calibrator, tag_alignment_error
 from web.field.composite_layout import load_layout
 from web.field.field_model import FieldModel
 from web.field.pose_autofix import aggregate_tag_corners  # shared robust aggregation
+from web.field.season import no_layout_reason, season_for_event
 
 DRIFT_MAX_M = 0.5  # mirrors CALIB_DRIFT_MAX_M default in web/app.py
 
@@ -69,15 +70,22 @@ def main():
     ap.add_argument("--stride-sec", type=float, default=1.0)
     ap.add_argument("--mad-px", type=float, default=5.0, help="reject frames > this from a tag's median")
     ap.add_argument("--min-tags", type=int, default=3)
+    ap.add_argument("--season", default=None,
+                    help="tag layout (data/field/<season>.json); default: the --event's "
+                         "season (its year, e.g. 2025hop -> 2025-reefscape-welded)")
     ap.add_argument("--save", action="store_true", help="persist a calibration version (default: dry-run)")
     args = ap.parse_args()
+    season = args.season or season_for_event(args.event).tag_layout
+    if not season:
+        raise SystemExit(no_layout_reason(season_for_event(args.event)))
 
     layout = load_layout(event_key=args.event)
     if args.camera not in layout:
         raise SystemExit(f"unknown camera '{args.camera}'; known: {list(layout)}")
     crop = layout[args.camera].crop
 
-    fm = FieldModel.load("2026-rebuilt-welded")
+    fm = FieldModel.load(season)
+    print(f"field: {season}")
     corners, diag, fps, n_frames = aggregate_tag_corners(
         args.video, crop, args.window[0], args.window[1], args.stride_sec, args.mad_px)
 
@@ -91,7 +99,7 @@ def main():
     if len(corr) < args.min_tags:
         raise SystemExit(f"only {len(corr)} known tags aggregated (< {args.min_tags}); widen --window")
 
-    cal = Calibrator.solve_camera_from_tags(corr, (crop[2], crop[3]), "2026-rebuilt-welded")
+    cal = Calibrator.solve_camera_from_tags(corr, (crop[2], crop[3]), season)
     errs = validate(cal, args.video, crop, fm, n_frames)
     best, worst = (min(errs), max(errs)) if errs else (float("inf"), float("inf"))
     print(f"\nsolved from {len(corr)} tags, rms {cal.rms_error:.2f}px")

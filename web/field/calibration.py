@@ -1,5 +1,7 @@
 """Fisheye camera calibration + field<->image projection."""
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional
 import cv2
@@ -650,9 +652,33 @@ def pose_plausibility(cal: "CameraCalibration", obj_points=None, fm=None, tag_id
     return None
 
 
+# Set by plausibility_gate_off(): the solve-time plausibility gate passes every pose.
+_PLAUSIBILITY_GATE_OFF: ContextVar[bool] = ContextVar("plausibility_gate_off",
+                                                      default=False)
+
+
+@contextmanager
+def plausibility_gate_off():
+    """Within: check_solve_plausible passes every pose, so the solvers return their
+    best-fitting pose even when it is upside down / mirrored / facing away. For a
+    user-confirmed manual calibration of an unusual camera (an offseason broadcast
+    from the far side of the field); the caller re-checks the final pose with
+    ``check_solve_plausible(..., gate=False)`` to tell the user what it overrode."""
+    tok = _PLAUSIBILITY_GATE_OFF.set(True)
+    try:
+        yield
+    finally:
+        _PLAUSIBILITY_GATE_OFF.reset(tok)
+
+
 def check_solve_plausible(cal: "CameraCalibration", correspondences: dict,
-                          season: Optional[str] = None) -> Optional[str]:
-    """pose_plausibility for a solve from ``correspondences`` ({key: (img, obj)})."""
+                          season: Optional[str] = None,
+                          gate: bool = True) -> Optional[str]:
+    """pose_plausibility for a solve from ``correspondences`` ({key: (img, obj)}).
+    ``gate`` (the solvers' use): None inside plausibility_gate_off(); pass False to
+    always get the real verdict."""
+    if gate and _PLAUSIBILITY_GATE_OFF.get():
+        return None
     obj = np.vstack([np.asarray(o, float).reshape(-1, 3) for _, o in correspondences.values()])
     ids = [_tag_id_of_key(k) for k in correspondences]
     return pose_plausibility(cal, obj, _field_model(season or cal.field_season), ids)

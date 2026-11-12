@@ -549,3 +549,64 @@ def test_predicted_tags_route_uses_auto_candidate(tmp_path, monkeypatch):
     assert j["status"] == "failed" and len(j["tags"]) >= 4
     u, v = next(iter(j["tags"].values()))
     assert 0 <= u < 1920 and 0 <= v < 1080
+
+
+def test_solve_tags_implausible_pose_needs_confirm(tmp_path, monkeypatch):
+    """A pose that only fits upside down is not a hard error: solve-tags previews it
+    unsaved with needs_confirm, and saves it (recording the override) once the
+    request carries allow_implausible."""
+    import numpy as np
+    from web.field import store as field_store
+    from web.field.calibration import CameraCalibration
+    from web.field.field_model import FieldModel
+    from tests._field_synth import look_at, project_tag_corners, TRUTH_K_PINHOLE
+    monkeypatch.setattr(field_store, "UPLOAD_DIR", tmp_path)
+
+    fm = FieldModel.load("2026-rebuilt-welded")
+    # far-side camera, rolled 180 deg: every fit of these tags is upside down
+    rvec, tvec = look_at((8.27, 11.0, 6.0), (8.27, 4.03, 0.0), world_up=(0., 0., -1.))
+    cam = CameraCalibration(mode="pinhole", K=TRUTH_K_PINHOLE.copy(),
+                            D=np.array([-0.12, 0.02, 0.0, 0.0, 0.0]), rvec=rvec,
+                            tvec=tvec, image_size=(1920, 1080),
+                            crop_region=(0, 0, 1920, 1080),
+                            field_season="2026-rebuilt-welded")
+    corr = project_tag_corners(cam, fm)
+    assert len(corr) >= 4
+    body = {"event": "evt_flip", "camera": "main", "season": "2026-rebuilt-welded",
+            "image_size": [1920, 1080],
+            "auto_tags": {str(t): corr[t][0].tolist() for t in corr}, "manual_tags": []}
+
+    r = _client().post("/api/calibration/solve-tags", json=body)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["needs_confirm"] is True and j["saved"] is False
+    assert any("upside down" in w for w in j["implausible"])
+    assert j["rms_error"] < 2.0
+    assert field_store.load_versions("evt_flip", "main") == []
+
+    r2 = _client().post("/api/calibration/solve-tags",
+                        json={**body, "allow_implausible": True})
+    assert r2.status_code == 200, r2.text
+    j2 = r2.json()
+    assert j2["needs_confirm"] is False and j2["saved"] is True
+    versions = field_store.load_versions("evt_flip", "main")
+    assert len(versions) == 1
+    assert any("upside down" in w for w in versions[0]["source"]["implausible_override"])
+
+
+def test_plausibility_gate_off_is_scoped():
+    """plausibility_gate_off only relaxes the gate inside its block; gate=False
+    always reports the real verdict."""
+    from web.field.calibration import check_solve_plausible, plausibility_gate_off
+    from web.field.field_model import FieldModel
+    from tests._field_synth import look_at, project_tag_corners, truth_pinhole_camera
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    cam.rvec, cam.tvec = look_at((8.27, -3.0, 6.0), (8.27, 4.03, 0.0),
+                                 world_up=(0., 0., -1.))
+    corr = project_tag_corners(cam, fm)
+    assert check_solve_plausible(cam, corr) is not None
+    with plausibility_gate_off():
+        assert check_solve_plausible(cam, corr) is None
+        assert check_solve_plausible(cam, corr, gate=False) is not None
+    assert check_solve_plausible(cam, corr) is not None

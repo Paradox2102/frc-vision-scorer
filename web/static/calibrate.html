@@ -1254,10 +1254,15 @@ async function solve(opts){
         match_key: currentFrameSource.match_key,
         lens_from: lensFrom, lens_version_id: lensVersion,
         joint_with: jointWith, joint_version_id: jointVersion,
+        allow_implausible: !!opts.allowImplausible,
         dry_run: !!opts.dryRun})});
     const j = await r.json();
     if (j.error){ showFoldWarning(null); setStatus('Solve error: '+j.error,'rms-err'); return; }
-    showFoldWarning(j.warning);
+    // An implausible pose (upside down / mirrored / field behind the camera) is not
+    // blocked: the server previews it unsaved and the save asks for confirmation.
+    const implausibleText = j.implausible ? 'Physically implausible pose — '
+      + j.implausible.join('; ') : null;
+    showFoldWarning([implausibleText, j.warning].filter(Boolean).join(' · ') || null);
     const rms = parseFloat(j.rms_error);
     let cls='rms-good'; if (rms>=20) cls='rms-bad'; else if (rms>=8) cls='rms-warn';
     let msg = `RMS = ${rms.toFixed(2)} px  (${j.n_tags} tags, ${j.n_points} pts)`;
@@ -1287,6 +1292,9 @@ async function solve(opts){
     } else if (opts.dryRun){
       msg += ' · preview of the saved epoch (not re-saved)';
       if (jt) msg += ` — saving would also write a new ${jt.partner} version`;
+    } else if (j.saved === false){
+      msg += ' · NOT saved yet — implausible pose, check the overlay and confirm';
+      cls = 'rms-warn';
     } else {
       msg += startMatch ? ` · saved as new version from ${startMatch} →`
                         : ' · saved as new version (event start)';
@@ -1312,6 +1320,17 @@ async function solve(opts){
     if (j.overlay){ const img=document.getElementById('overlayImg');
       img.src='data:image/jpeg;base64,'+j.overlay; img.style.display='block';
       document.getElementById('noOverlayMsg').style.display='none'; }
+    if (j.needs_confirm && !opts.dryRun){
+      await new Promise(res => setTimeout(res, 150));   // let the overlay paint first
+      const ok = confirm('This calibration solves to a physically implausible camera pose:\n\n  '
+        + j.implausible.join('\n  ')
+        + '\n\nThat is expected only for an unusual camera (e.g. an offseason broadcast '
+        + 'from the far side of the field). An upright camera normally solves upright, '
+        + 'so first check the overlay: if the field wireframe lines up with the video, '
+        + 'save it anyway.\n\nSave this calibration?');
+      if (ok) return solve({...opts, allowImplausible: true});
+      setStatus(msg.replace('check the overlay and confirm', 'you declined to save'), 'rms-warn');
+    }
   } catch(e){ setStatus('Fetch error: '+e.message,'rms-err'); }
 }
 

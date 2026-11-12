@@ -12699,6 +12699,30 @@ def _solve_tags_joint(event: str, camera: str, partner: str, start_match,
     return (res, ep), None
 
 
+def _solve_tags_implausible(camera: str, cal, solve_corr: dict, season: str,
+                            joint, fm) -> list:
+    """["<camera>: <reason>"] for each pose of a gate-off solve that fails the
+    physical plausibility check (this camera; with a joint lens, the partner too)."""
+    from web.field.calibration import check_solve_plausible
+    out = []
+    why = check_solve_plausible(cal, solve_corr, season, gate=False)
+    if why:
+        out.append(f"{camera}: {why}")
+    if joint is not None:
+        jres, pver = joint
+        src = pver.get("source") or {}
+        hold = {int(i) for i in src.get("holdout_ids") or []}
+        pcorr = {k: v for k, v in _tag_corr(fm, src.get("auto_tags"),
+                                            src.get("manual_tags")).items()
+                 if _tag_id_of(k) not in hold}
+        for c, pcal in jres.calibrations.items():
+            if c != camera:
+                why = check_solve_plausible(pcal, pcorr, season, gate=False)
+                if why:
+                    out.append(f"{c}: {why}")
+    return out
+
+
 def _solve_tags_overlay(frame, cl, cal, fm, used, camera) -> Optional[str]:
     """Base64 JPEG of ``cal``'s field wireframe + tag dots on ``camera``'s crop of the
     composite ``frame`` (used tags green, others orange), or None.
@@ -12749,7 +12773,13 @@ async def calibration_solve_tags(request: Request):
     (the sibling's keeps its start_match and inputs; sources carry lens_kind "joint",
     lens_partner, joint_id). Returns ``joint`` with both cameras' results.
     Every solve returns ``fold_ratio`` (calibration.fold_conditioning) and a
-    ``warning`` when it is >= FOLD_RATIO_WARN."""
+    ``warning`` when it is >= FOLD_RATIO_WARN.
+    A pose that only fits physically implausibly (upside down / mirrored / field
+    behind the camera) is not an error: the response carries ``implausible``
+    (["camera: reason"]) and, unless the body sets ``allow_implausible``,
+    ``needs_confirm`` with nothing saved (``saved`` false) — the page previews it and
+    re-posts with ``allow_implausible`` once the user confirms. A saved override is
+    recorded in the version source as ``implausible_override``."""
     body = await request.json()
     event = body.get("event", "test"); camera = body.get("camera", "main")
     season = body.get("season") or _event_layout(event)
@@ -12769,41 +12799,58 @@ async def calibration_solve_tags(request: Request):
     # lens_from: borrow a sibling corner camera's lens and solve only the pose (too
     # few tags to pin down this camera's own lens). Pose only — freeing the focal
     # too lets it trade focal against distance again (2025hop corner_right).
-    lender = None
-    joint = None          # (JointLensResult, partner's input version)
-    if body.get("joint_with"):
-        joint, why = _solve_tags_joint(event, camera, str(body["joint_with"]),
-                                       start_match, body.get("joint_version_id"), fm,
-                                       season, solve_corr, image_size, existing)
-        if joint is None:
-            return JSONResponse(status_code=400, content={"error": why})
-    elif body.get("lens_from"):
-        lender, why = _solve_tags_lender(event, camera, str(body["lens_from"]),
-                                         body.get("start_match"),
-                                         body.get("lens_version_id"))
-        if lender is None:
-            return JSONResponse(status_code=400, content={"error": why})
-    try:
+    def _solve():
+        """(cal, model, spread, joint, lender); CalibrationError on failure."""
+        lender = None
+        joint = None          # (JointLensResult, partner's input version)
+        if body.get("joint_with"):
+            joint, why = _solve_tags_joint(event, camera, str(body["joint_with"]),
+                                           start_match, body.get("joint_version_id"), fm,
+                                           season, solve_corr, image_size, existing)
+            if joint is None:
+                raise CalibrationError(why)
+        elif body.get("lens_from"):
+            lender, why = _solve_tags_lender(event, camera, str(body["lens_from"]),
+                                             body.get("start_match"),
+                                             body.get("lens_version_id"))
+            if lender is None:
+                raise CalibrationError(why)
         if joint is not None:
             cal = joint[0].calibrations[camera]
-            solve_model_used = "joint"
-            solve_spread = auto_calibrate.tag_spread_m(
-                fm, {_tag_id_of(k) for k in solve_corr})
+            model = "joint"
+            spread = auto_calibrate.tag_spread_m(fm, {_tag_id_of(k) for k in solve_corr})
         elif lender is not None:
             from web.field import lens_borrow
             cal = lens_borrow.solve_pose_with_lens(
                 solve_corr, image_size, season,
                 lens_borrow.transfer_lens(lender.calibration, image_size))
-            solve_model_used = "pose"
-            solve_spread = auto_calibrate.tag_spread_m(
-                fm, {_tag_id_of(k) for k in solve_corr})
+            model = "pose"
+            spread = auto_calibrate.tag_spread_m(fm, {_tag_id_of(k) for k in solve_corr})
         else:
             # Constrained lens first, freed only when the tags span the field: a free
             # lens fitted to one hub's tags (+ a couple of clicks) extrapolates wildly.
-            cal, solve_model_used, solve_spread = auto_calibrate.solve_fresh_lens(
+            cal, model, spread = auto_calibrate.solve_fresh_lens(
                 solve_corr, image_size, season, fm)
-    except CalibrationError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return cal, model, spread, joint, lender
+
+    # Physically implausible poses (upside down / mirrored / field behind the camera)
+    # are a confirmable warning, not a hard block: an offseason broadcast camera can
+    # sit somewhere unusual. Strict solve first (it still prefers a plausible minimum);
+    # only when that fails, re-solve with the gate off and — unless the user already
+    # confirmed (allow_implausible) — return a PREVIEW (not saved) asking to confirm.
+    implausible = []      # ["camera: reason"] the saved/previewed pose overrides
+    try:
+        cal, solve_model_used, solve_spread, joint, lender = _solve()
+    except CalibrationError as strict_err:
+        try:
+            from web.field.calibration import plausibility_gate_off
+            with plausibility_gate_off():
+                cal, solve_model_used, solve_spread, joint, lender = _solve()
+        except CalibrationError:
+            return JSONResponse(status_code=400, content={"error": str(strict_err)})
+        implausible = _solve_tags_implausible(camera, cal, solve_corr, season, joint, fm)
+    needs_confirm = bool(implausible) and not body.get("allow_implausible")
+    dry_run = bool(body.get("dry_run")) or needs_confirm
     label = body.get("label")
     if existing is not None:
         cal.masks = existing.masks
@@ -12835,8 +12882,10 @@ async def calibration_solve_tags(request: Request):
         joint_out["partner_fold_ratio"] = None if pfold is None else pfold.to_json()["ratio"]
     # dry_run solves + renders the overlay without persisting — used by the
     # calibrate page to re-preview a saved epoch's stored correspondences.
-    if not body.get("dry_run"):
+    if not dry_run:
         lens_fields = lender.source_fields() if lender is not None else {}
+        if implausible:
+            lens_fields["implausible_override"] = implausible
         if joint is not None:
             # the partner first (its version id goes into this camera's source); it
             # keeps its own epoch, inputs, masks and top crop
@@ -12854,11 +12903,13 @@ async def calibration_solve_tags(request: Request):
                     "lens_kind": "joint", "lens_partner": camera,
                     "lens_partner_input_version_id": pver["version_id"],
                     "joint_id": joint_id,
+                    **({"implausible_override": implausible} if implausible else {}),
                     "joint": {k: joint_out[k] for k in ("f_px", "k1", "rms_px",
                                                         "rms_inlier_px", "outliers")}}))
             _auto_calib_mark_manual(event, partner, partner_vid)
             joint_out["partner_version_id"] = partner_vid
-            lens_fields = {"lens_kind": "joint", "lens_partner": partner,
+            lens_fields = {**lens_fields,
+                           "lens_kind": "joint", "lens_partner": partner,
                            "lens_partner_version_id": partner_vid,
                            "lens_partner_input_version_id": pver["version_id"],
                            "joint_id": joint_id,
@@ -12898,6 +12949,9 @@ async def calibration_solve_tags(request: Request):
             "fold_ratio": None if fold is None else fold.to_json()["ratio"],
             "fold": None if fold is None else fold.to_json(),
             "warning": warning,
+            "implausible": implausible or None,
+            "needs_confirm": needs_confirm,
+            "saved": not dry_run,
             "tag_spread_m": round(solve_spread, 2),
             "predicted_tags": _predicted_tags(cal, fm, image_size)}
 

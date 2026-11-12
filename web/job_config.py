@@ -929,6 +929,12 @@ KNOBS = [
     # (per-camera EMA/anchor/exemplars); no shared camera = not a candidate.
     # Missing per-camera data on either side -> averaged comparison. OFF =
     # today's averaged relink. The always-on fused_ids gauge counts outcomes.
+    # VERDICT Nov 12: keep OFF. Live A/B (corners in): ~99% of assignments are
+    # member-key continuations; of 26-36 new fused ids/match only 0-1 had a
+    # same-camera match above the floor (created_samecam_above_floor), and ON
+    # blocks cross-view relinks that were passing (relinks -1..-6/match).
+    # 2026cur qm8 GT right 60->62%, wrong 2->2%, misID 12.5->14.0 s; 2025hop
+    # qm2 flat, qm4 robots/frame 4.58->4.32, named time 68->62%.
     Knob("fused_per_cam_relink", "FUSED_PER_CAM_RELINK", bool, False,
          section="Identity & votes"),
     # --- cross-camera fusion ---

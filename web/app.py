@@ -415,6 +415,25 @@ OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789"
 MATCH_CLOCK_OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:"
 MATCH_CLOCK_SAMPLE_SECONDS = 0.5
 MATCH_CLOCK_LEAD_SECONDS = 0.5
+# The auto `start_frame` is the last 0.5 s sample still showing 0:20, but the
+# broadcast clock holds 0:20 for 1.0-1.8 s after the real start, so a 0.5 s
+# lead lost the true starting positions and first motion. The auto period is
+# padded with this lead instead (job knob auto_start_lead_seconds; teleop
+# keeps MATCH_CLOCK_LEAD_SECONDS), never earlier than the clock run's first
+# sample.
+MATCH_CLOCK_AUTO_LEAD_SECONDS = 2.5
+# Measured median lag of the auto clock's first tick behind the real start
+# (25 matches, 0.65-1.72 s): the true-start estimate when the scoreboard's
+# start indicator is not available (2025 and earlier broadcasts).
+MATCH_CLOCK_AUTO_START_OFFSET_SECONDS = 1.0
+# 2026 FIRST audience display: two yellow arrows light on the scoreboard the
+# instant auto starts (robot motion follows by 0.15-1.07 s and never precedes
+# it). Boxes (x0, y0, x1, y1) on the FULL 1920x1080 frame, mirror-symmetric
+# about x = 960; scaled by W/1920, H/1080. A box reads ~0.32 yellow once lit,
+# 0.0 before; 2025 broadcasts have no arrows (stays ~0 -> clock fallback).
+AUTO_START_INDICATOR_BOXES_1080P = ((290, 45, 350, 95), (1570, 45, 1630, 95))
+AUTO_START_INDICATOR_THRESHOLD = 0.15
+AUTO_START_INDICATOR_MIN_RUN = 3
 MATCH_CLOCK_TAIL_SECONDS = 3.0
 # Clock scan decode: grab() every frame and retrieve() only the sampled ones
 # instead of seeking per sample (each CAP_PROP_POS_FRAMES seek re-decodes from
@@ -532,6 +551,17 @@ def _find_clock_period(
     ]
     for start_idx in candidates:
         start_frame, start_value = samples[start_idx]
+        # Walk back over readable samples (one unreadable sample tolerated,
+        # as in the countdown walk below) to where the clock appeared.
+        first_idx = start_idx
+        j = start_idx - 1
+        while j >= 0 and samples[j][0] > after_frame:
+            if samples[j][1] is not None:
+                first_idx = j
+            elif j - 1 < 0 or samples[j - 1][1] is None:
+                break
+            j -= 1
+        clock_first_frame = samples[first_idx][0]
         last_value = start_value
         previous_frame = start_frame
         running_start_frame = start_frame
@@ -547,6 +577,12 @@ def _find_clock_period(
                 "end_frame": end_frame,
                 "start_seconds": running_start_value,
                 "end_seconds": last_value,
+                # First sample of the contiguous READABLE clock run that
+                # leads into this period (any value: 2026 holds 0:20 before
+                # the start, 2025 shows 0:00): the earliest frame a lead may
+                # reach and still be on the live broadcast clock rather
+                # than pre-match footage without a clock.
+                "clock_first_frame": clock_first_frame,
             }
 
         for frame, value in samples[start_idx + 1:]:
@@ -602,12 +638,14 @@ def _pad_clock_period(
     total_frames: int,
     lead_frames: int,
     tail_frames: int,
+    floor_frame: Optional[int] = None,
 ) -> dict:
     """Label a raw clock period and add its padded processing window.
 
     Extends the end by any residual clock seconds (the countdown is sampled
     sparsely, so the true end is `end_frame` + `end_seconds`), then pads
-    `lead_frames` before the countdown start and `tail_frames` after.
+    `lead_frames` before the countdown start and `tail_frames` after. With
+    ``floor_frame`` the padded start never goes earlier than it.
     """
     item = dict(period, label=label)
     if item["end_seconds"] > 0:
@@ -617,6 +655,8 @@ def _pad_clock_period(
         )
         item["end_seconds"] = 0
     item["processing_start_frame"] = max(0, period["start_frame"] - lead_frames)
+    if floor_frame is not None:
+        item["processing_start_frame"] = max(item["processing_start_frame"], floor_frame)
     item["processing_end_frame"] = min(
         total_frames - 1, item["end_frame"] + tail_frames
     )
@@ -639,6 +679,7 @@ def compute_active_windows(
     auto_only: bool = False,
     auto_s: float = 20,
     teleop_s: float = 140,
+    auto_lead_seconds: Optional[float] = None,
 ) -> Tuple[List[Tuple[int, int]], List[dict], bool, Optional[str]]:
     """Return merged processing ranges, labeled core periods, and fallback state.
 
@@ -647,6 +688,9 @@ def compute_active_windows(
     don't need teleop, and a clip that ends in auto still locks cleanly.
     ``auto_s`` / ``teleop_s``: the season's countdown starts (2026: 20 / 140;
     2025 and earlier: 15 / 135 — web.field.season).
+    ``auto_lead_seconds``: lead before the auto period only (None = the same
+    ``lead_seconds`` as teleop). Lead beyond ``lead_seconds`` stops at the
+    auto clock run's first sample (``clock_first_frame``).
     """
     full_range = [(0, max(0, total_frames - 1))]
     if not samples or fps <= 0 or total_frames <= 0:
@@ -658,9 +702,24 @@ def compute_active_windows(
 
     lead_frames = int(round(lead_seconds * fps))
     tail_frames = int(round(tail_seconds * fps))
+    auto_lead_frames = (
+        lead_frames if auto_lead_seconds is None
+        else int(round(auto_lead_seconds * fps))
+    )
+    # The clamp only trims the EXTRA auto lead: the legacy lead_seconds pad
+    # is never shortened, so auto_lead_seconds == lead_seconds is unchanged.
+    auto_floor = min(
+        auto.get("clock_first_frame", 0), auto["start_frame"] - lead_frames
+    )
+
+    def pad_auto():
+        return _pad_clock_period(
+            "auto", auto, fps, total_frames, auto_lead_frames, tail_frames,
+            floor_frame=auto_floor,
+        )
 
     if auto_only:
-        item = _pad_clock_period("auto", auto, fps, total_frames, lead_frames, tail_frames)
+        item = pad_auto()
         return (
             [(item["processing_start_frame"], item["processing_end_frame"])],
             [item],
@@ -677,7 +736,10 @@ def compute_active_windows(
     periods = []
     padded = []
     for label, period in (("auto", auto), ("teleop", teleop)):
-        item = _pad_clock_period(label, period, fps, total_frames, lead_frames, tail_frames)
+        item = (
+            pad_auto() if label == "auto"
+            else _pad_clock_period(label, period, fps, total_frames, lead_frames, tail_frames)
+        )
         periods.append(item)
         padded.append((item["processing_start_frame"], item["processing_end_frame"]))
     return _merge_frame_ranges(padded), periods, False, None
@@ -685,6 +747,76 @@ def compute_active_windows(
 
 def frame_in_ranges(frame: int, ranges: List[Tuple[int, int]]) -> bool:
     return any(start <= frame <= end for start, end in ranges)
+
+
+def find_indicator_onset(
+    fractions: List[Tuple[int, float, float]],
+    threshold: float = AUTO_START_INDICATOR_THRESHOLD,
+    min_run: int = AUTO_START_INDICATOR_MIN_RUN,
+) -> Optional[int]:
+    """First frame where BOTH start indicators light and stay lit.
+
+    ``fractions``: ``[(frame, frac_left, frac_right), ...]`` in frame order.
+    Returns the frame starting the first run of ``min_run`` entries with both
+    fractions >= ``threshold``. The window must open with at least ``min_run``
+    entries where both are off: an indicator already lit at the window start
+    gives no onset (the true start may lie before the window), so None.
+    """
+    def lit(entry):
+        return entry[1] >= threshold and entry[2] >= threshold
+
+    def dark(entry):
+        return entry[1] < threshold and entry[2] < threshold
+
+    if min_run < 1 or len(fractions) < 2 * min_run:
+        return None
+    if not all(dark(e) for e in fractions[:min_run]):
+        return None
+    for i in range(min_run, len(fractions) - min_run + 1):
+        if all(lit(e) for e in fractions[i:i + min_run]):
+            return int(fractions[i][0])
+    return None
+
+
+def start_indicator_fractions(frame) -> Tuple[float, float]:
+    """Yellow-pixel fraction in the (left, right) start-indicator boxes of one
+    FULL broadcast frame (boxes scale with the frame size)."""
+    h, w = frame.shape[:2]
+    sx, sy = w / 1920.0, h / 1080.0
+    out = []
+    for x0, y0, x1, y1 in AUTO_START_INDICATOR_BOXES_1080P:
+        crop = frame[int(y0 * sy):int(y1 * sy), int(x0 * sx):int(x1 * sx)]
+        if crop.size == 0:
+            out.append(0.0)
+            continue
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        yellow = (hue > 20) & (hue < 35) & (sat > 150) & (val > 150)
+        out.append(float(yellow.mean()))
+    return out[0], out[1]
+
+
+def detect_start_indicator_onset(
+    video_path, lo: int, hi: int,
+    threshold: float = AUTO_START_INDICATOR_THRESHOLD,
+    min_run: int = AUTO_START_INDICATOR_MIN_RUN,
+) -> Optional[int]:
+    """Decode every frame in [lo, hi] (one seek, sequential reads — the onset
+    needs single-frame resolution, which the 0.5 s clock samples lack) and
+    return ``find_indicator_onset`` over the indicator fractions."""
+    fractions: List[Tuple[int, float, float]] = []
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(lo)))
+        for frame_idx in range(max(0, int(lo)), int(hi) + 1):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            left, right = start_indicator_fractions(frame)
+            fractions.append((frame_idx, left, right))
+    finally:
+        cap.release()
+    return find_indicator_onset(fractions, threshold=threshold, min_run=min_run)
 
 
 def _scan_clock_samples_seek(video_path, total_frames, sample_step,
@@ -5276,7 +5408,34 @@ class InferenceJob:
         except OSError:
             pass
         return samples
-    
+
+    def _detect_auto_start_indicator(self, auto_period: dict) -> Tuple[int, str]:
+        """``(true_start_frame, start_method)`` for the auto period.
+
+        The auto ``start_frame`` is the last sample still reading 0:20, which
+        trails the real start by 0.65-1.72 s. The scoreboard's start arrows
+        (2026) mark the real start to the frame; without them (2025, or an
+        ambiguous window) fall back to ``start_frame`` minus the measured
+        median lag. Never raises: a failure here must not fail the job."""
+        fps = self.video_fps if self.video_fps and self.video_fps > 0 else 30.0
+        start = int(auto_period["start_frame"])
+        first = int(auto_period.get("clock_first_frame", 0))
+        lo = max(first, start - int(round(3.0 * fps)))
+        hi = min(max(0, self.total_frames - 1), start + int(round(1.0 * fps)))
+        try:
+            onset = detect_start_indicator_onset(self.video_path, lo, hi)
+        except Exception as e:  # noqa: BLE001 - optional refinement only
+            print(f"  [timer] auto start indicator detection failed: {e}")
+            onset = None
+        # The arrows can only light at or before the clock's first tick
+        # (start_frame + one 0.5 s sample); a later onset is something else.
+        if onset is not None and lo <= onset <= start + int(round(0.5 * fps)):
+            return int(onset), "indicator"
+        return (
+            max(first, start - int(round(MATCH_CLOCK_AUTO_START_OFFSET_SECONDS * fps))),
+            "clock_offset",
+        )
+
     def update_hub_positions(self, detections: sv.Detections) -> None:
         """Update hub positions and bounding boxes from hub_opening detections.
         If event_hub_positions are set, use them for alliance assignment (static).
@@ -8002,7 +8161,32 @@ class InferenceJob:
                 clock_samples, self.video_fps, self.total_frames,
                 auto_only=self.config.auto_period_only,
                 auto_s=clock_season.auto_s, teleop_s=clock_season.teleop_s,
+                auto_lead_seconds=getattr(
+                    self.config, "auto_start_lead_seconds", MATCH_CLOCK_AUTO_LEAD_SECONDS),
             )
+            # True auto start (start_frame itself keeps its clock meaning for
+            # seeding, auto-calibration and the endgame cutoff); it only moves
+            # where autonomous_paths start recording.
+            auto_period = next(
+                (p for p in self.match_periods if p["label"] == "auto"), None
+            )
+            if auto_period is not None and not self.timer_gate_fallback:
+                try:
+                    true_start, start_method = await asyncio.to_thread(
+                        self._detect_auto_start_indicator, auto_period)
+                except Exception as e:  # noqa: BLE001 - never fail the job
+                    print(f"  [timer] auto true-start estimate failed: {e}")
+                    true_start, start_method = auto_period["start_frame"], "clock"
+                auto_period["true_start_frame"] = int(true_start)
+                auto_period["start_method"] = start_method
+                offset_s = (
+                    (true_start - auto_period["start_frame"]) / self.video_fps
+                    if self.video_fps else 0.0
+                )
+                print(
+                    f"  [timer] auto true start: frame {true_start} ({start_method}), "
+                    f"{offset_s:+.2f} s vs clock start_frame {auto_period['start_frame']}"
+                )
             self.timings["clock_scan"] = round(time.perf_counter() - scan_t0, 2)
             self._raise_if_stopped()  # phase boundary: after clock scan
             if self.timer_gate_fallback:
@@ -9357,9 +9541,12 @@ class InferenceJob:
                 for start, end in self.processing_ranges
                 for frame in range(start, end + 1, self.frame_skip)
             }
+            # Record auto paths from the true start (scoreboard indicator or
+            # clock-lag estimate), not the late clock start_frame, so the
+            # starting positions and first motion are kept.
             auto_core = next(
                 (
-                    (p["start_frame"], p["end_frame"])
+                    (p.get("true_start_frame", p["start_frame"]), p["end_frame"])
                     for p in self.match_periods
                     if p["label"] == "auto"
                 ),

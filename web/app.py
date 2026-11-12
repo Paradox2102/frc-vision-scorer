@@ -145,6 +145,7 @@ from web.field.zones import (
     start_zones,
 )
 from web.replay_recorder import ReplayRecorder
+from web.scouting.api import router as scouting_router
 from web import database
 from web.field.identity import (
     DISRUPTING_BINDING_EVENTS,
@@ -10635,6 +10636,14 @@ async def index():
 @app.get("/calibrate")
 async def calibrate_page():
     return FileResponse(STATIC_DIR / "calibrate.html")
+
+
+@app.get("/scouting")
+async def scouting_page():
+    return FileResponse(STATIC_DIR / "scouting.html")
+
+
+app.include_router(scouting_router)
 
 
 @app.get("/api/job/active")

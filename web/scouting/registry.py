@@ -24,11 +24,16 @@ in ``metrics/__init__.py``.
 """
 from __future__ import annotations
 
+import math
 import threading
+from collections import OrderedDict
 from typing import Optional
 
 _REGISTRY: dict = {}
-_CACHE: dict = {}
+_CACHE: "OrderedDict" = OrderedDict()      # LRU of metric envelopes
+_LOAD_CACHE: "OrderedDict" = OrderedDict() # LRU of loaded events
+_CACHE_MAX = 64
+_LOAD_CACHE_MAX = 8
 _CACHE_LOCK = threading.Lock()
 
 
@@ -39,6 +44,9 @@ class Metric:
     years: Optional[tuple] = None
     description: str = ""
     default_params: dict = {}
+    # {param: (lo, hi)} inclusive bounds for numeric params. Overrides outside
+    # them (or non-finite) are rejected: grid / cell sizes drive array sizes.
+    param_bounds: dict = {}
 
     def applies_to(self, year: int) -> bool:
         return self.years is None or int(year) in self.years
@@ -49,7 +57,8 @@ class Metric:
     def info(self) -> dict:
         return {"key": self.key, "title": self.title, "version": self.version,
                 "years": list(self.years) if self.years else None,
-                "description": self.description, "default_params": dict(self.default_params)}
+                "description": self.description, "default_params": dict(self.default_params),
+                "param_bounds": {k: list(v) for k, v in self.param_bounds.items()}}
 
 
 def register(cls):
@@ -78,7 +87,22 @@ def available_metrics(year: int) -> list:
     return [m for m in all_metrics() if m.applies_to(year)]
 
 
+def check_param(metric: Metric, key: str, value):
+    """``value`` if acceptable for ``key``, else ValueError (non-finite or out of
+    ``metric.param_bounds``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    lo, hi = metric.param_bounds.get(key, (None, None))
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        raise ValueError(f"{key}={value} outside [{lo}, {hi}]")
+    return value
+
+
 def merged_params(metric: Metric, params: Optional[dict]) -> dict:
+    """Defaults overlaid with typed, bounds-checked overrides (ValueError on a
+    bad value)."""
     out = dict(metric.default_params)
     for k, v in (params or {}).items():
         if k not in out or v is None:
@@ -86,10 +110,17 @@ def merged_params(metric: Metric, params: Optional[dict]) -> dict:
         if isinstance(out[k], bool):
             out[k] = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
         elif isinstance(out[k], (int, float)):
-            out[k] = type(out[k])(v)
+            out[k] = check_param(metric, k, type(out[k])(v))
         else:
             out[k] = v
     return out
+
+
+def _lru_put(cache: OrderedDict, key, value, cap: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > cap:
+        cache.popitem(last=False)
 
 
 def run_metric(event_key: str, key: str, params: Optional[dict] = None, db_path=None,
@@ -109,30 +140,29 @@ def run_metric(event_key: str, key: str, params: Optional[dict] = None, db_path=
     ck = (event_key, key, metric.version, tuple(sorted(p.items())), fp, str(db_path))
     with _CACHE_LOCK:
         if use_cache and ck in _CACHE:
+            _CACHE.move_to_end(ck)
             return _CACHE[ck]
     matches, skipped = _load_cached(event_key, fp, db_path, load_event)
     result = metric.compute(matches, p)
     env = envelope(metric, event_key, year, matches, skipped, result, p)
     with _CACHE_LOCK:
-        _CACHE[ck] = env
-        # keep the cache small: drop entries for stale fingerprints of this event
+        # drop entries for stale fingerprints of this event, then bound the LRU
         for k in [k for k in _CACHE if k[0] == event_key and k[4] != fp]:
             _CACHE.pop(k, None)
+        _lru_put(_CACHE, ck, env, _CACHE_MAX)
     return env
-
-
-_LOAD_CACHE: dict = {}
 
 
 def _load_cached(event_key, fp, db_path, load_event) -> tuple:
     k = (event_key, fp, str(db_path))
     with _CACHE_LOCK:
         hit = _LOAD_CACHE.get(k)
-    if hit is not None:
-        return hit
+        if hit is not None:
+            _LOAD_CACHE.move_to_end(k)
+            return hit
     out = load_event(event_key, db_path)
     with _CACHE_LOCK:
         for old in [o for o in _LOAD_CACHE if o[0] == event_key]:
             _LOAD_CACHE.pop(old, None)
-        _LOAD_CACHE[k] = out
+        _lru_put(_LOAD_CACHE, k, out, _LOAD_CACHE_MAX)
     return out

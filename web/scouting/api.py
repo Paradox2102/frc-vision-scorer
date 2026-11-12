@@ -142,13 +142,13 @@ def _params_from_query(metric, query) -> dict:
                     raise ValueError(raw)
                 out[k] = low in _TRUE
             elif isinstance(default, int):
-                out[k] = int(raw)
+                out[k] = registry.check_param(metric, k, int(raw))
             elif isinstance(default, float):
-                out[k] = float(raw)
+                out[k] = registry.check_param(metric, k, float(raw))
             else:
                 out[k] = raw
-        except (TypeError, ValueError):
-            raise HTTPException(400, f"bad value for {k!r}: {raw!r}")
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"bad value for {k!r}: {raw!r} ({e})")
     return out
 
 

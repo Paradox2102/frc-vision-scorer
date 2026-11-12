@@ -223,3 +223,11 @@ def test_bool_query_params_parse():
     assert merged_params(AutoPaths(), {"mirror_aware": "false"})["mirror_aware"] is False
     assert merged_params(AutoPaths(), {"mirror_aware": "1"})["mirror_aware"] is True
     assert merged_params(AutoPaths(), {"threshold_m": "1.2"})["threshold_m"] == 1.2
+
+
+def test_merged_params_rejects_out_of_bounds():
+    from web.scouting.registry import merged_params
+    for k, v in (("grid_s", 0.0001), ("grid_s", float("nan")), ("max_shift_s", 100.0),
+                 ("threshold_m", -1.0), ("min_coverage", 2.0)):
+        with pytest.raises(ValueError):
+            merged_params(AutoPaths(), {k: v})

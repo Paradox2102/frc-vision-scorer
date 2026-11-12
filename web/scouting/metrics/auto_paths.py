@@ -162,6 +162,10 @@ class AutoPaths(Metric):
     default_params = {"threshold_m": 0.9, "grid_s": 0.25, "max_gap_s": 1.5,
                       "max_shift_s": 1.0, "min_overlap_frac": 0.4,
                       "min_overlap_s": 3.0, "min_coverage": 0.25, "mirror_aware": True}
+    param_bounds = {"threshold_m": (0.05, 10.0), "grid_s": (0.05, 2.0),
+                    "max_gap_s": (0.0, 10.0), "max_shift_s": (0.0, 5.0),
+                    "min_overlap_frac": (0.0, 1.0), "min_overlap_s": (0.0, 30.0),
+                    "min_coverage": (0.0, 1.0)}
 
     def compute(self, matches: list, params: dict) -> dict:
         p = {**self.default_params, **(params or {})}

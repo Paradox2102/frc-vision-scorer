@@ -86,6 +86,7 @@ class ShiftHeatmap(Metric):
     description = ("Where each robot spends time per 2026 hub shift (active / inactive / "
                    "endgame, plus auto, transition, unknown), split by driver station.")
     default_params = {"cell_m": 0.5}
+    param_bounds = {"cell_m": (0.1, 5.0)}
 
     def compute(self, matches: list, params: dict) -> dict:
         cell = float(params.get("cell_m") or self.default_params["cell_m"])

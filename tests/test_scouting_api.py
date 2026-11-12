@@ -16,6 +16,7 @@ class FakeMetric(registry.Metric):
     years = None
     description = "per-team sample counts"
     default_params = {"scale": 1.0, "flag": False, "label": "x"}
+    param_bounds = {"scale": (0.1, 10.0)}
 
     def compute(self, matches, params):
         teams = {}
@@ -141,6 +142,21 @@ def test_metric_param_overrides_from_query(client):
     assert env["teams"]["1"]["n"] == 16.0 and env["echo"] == {"flag": True, "label": "hi"}
     assert client.get("/api/scouting/2026tst/metric/fake_metric?scale=abc").status_code == 400
     assert client.get("/api/scouting/2026tst/metric/fake_metric?flag=maybe").status_code == 400
+
+
+def test_out_of_bounds_or_non_finite_params_are_400(client):
+    base = "/api/scouting/2026tst/metric/fake_metric"
+    for bad in ("0.001", "1e9", "nan", "inf", "-inf"):
+        assert client.get(f"{base}?scale={bad}").status_code == 400, bad
+    assert client.get(f"{base}?scale=10").status_code == 200
+
+
+def test_metric_cache_is_bounded(client, monkeypatch):
+    monkeypatch.setattr(registry, "_CACHE_MAX", 3)
+    base = "/api/scouting/2026tst/metric/fake_metric"
+    for i in range(8):
+        assert client.get(f"{base}?scale={1 + i / 10}").status_code == 200
+    assert len(registry._CACHE) <= 3
 
 
 def test_unknown_metric_404_and_wrong_year_400(client):

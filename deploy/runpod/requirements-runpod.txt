@@ -73,3 +73,7 @@ anthropic==0.84.0
 qwen-vl-utils==0.0.14
 # older yt-dlp releases get HTTP 403 from YouTube (Nov 2026)
 yt-dlp==2026.10.26
+
+# --- profiling (`runpod_cli.py tune`: pod_job.py attaches it to the server) ---
+# static binary wheel -> .venv/bin/py-spy
+py-spy==0.4.2

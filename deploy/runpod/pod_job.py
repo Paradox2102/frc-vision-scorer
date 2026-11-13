@@ -16,6 +16,14 @@ local CLI can poll it. Wall times:
                 this is when the match's labelled result actually exists)
 Peak VRAM is the max of ``nvidia-smi memory.used`` sampled every 2 s from
 submit to wall_final (whole card: includes the idle server's resident models).
+
+Profiling (default ON, ``--no-profile`` to skip): from just before submit to
+wall_final (or to the error), ``py-spy record --gil --rate 20`` is attached to
+the app server (whoever LISTENs on the app port) and ``nvidia-smi`` logs GPU
+util/memory at 1 Hz; raw files land next to ``--out`` as
+``<label>.pyspy.txt`` / ``<label>.gpu.csv`` and the summary (profiling.py) is
+written into the result as ``profile`` BEFORE the final status, so the CLI
+sees it the moment it sees "done". A profiler failure is recorded, never fatal.
 """
 from __future__ import annotations
 
@@ -23,14 +31,20 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import profiling  # noqa: E402  (deploy/runpod/profiling.py, stdlib only)
+
+SERVER_PIDFILE = os.environ.get("FRC_LOGS", "/workspace/logs") + "/server.pid"   # serve.sh
 
 
 class Recorder:
@@ -152,6 +166,8 @@ def main() -> int:
     ap.add_argument("--label", default="")
     ap.add_argument("--host", default="127.0.0.1:8004")
     ap.add_argument("--final-timeout", type=float, default=900.0)
+    ap.add_argument("--no-profile", action="store_true", help="skip py-spy + nvidia-smi profiling")
+    ap.add_argument("--pyspy-rate", type=int, default=20)
     a = ap.parse_args()
 
     cfg = json.loads(a.config_json)
@@ -161,6 +177,17 @@ def main() -> int:
     rec = Recorder(out, {"label": a.label, "config": cfg, "match_key": a.match_key,
                          "pid": os.getpid(), "status": "starting", "started_at": time.time()})
     base = f"http://{a.host}"
+    prof = None
+    # setsid'd + nohup'd: SIGHUP never arrives, but a `kill` must still stop
+    # py-spy / nvidia-smi (finally below) instead of orphaning them.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+    def final(**kw) -> None:
+        """Terminal result: profile summary first, then the status the CLI waits on."""
+        if prof is not None:
+            kw["profile"] = prof.summary()
+        rec.update(**kw)
+
     try:
         active = http_json(f"{base}/api/job/active", timeout=30)
         if active.get("job_id"):
@@ -174,6 +201,11 @@ def main() -> int:
 
         sampler = VramSampler()
         sampler.start()
+        if not a.no_profile:
+            label = a.label or out.stem
+            prof = profiling.JobProfiler(out.parent, label, int(a.host.rsplit(":", 1)[1]),
+                                         rate=a.pyspy_rate, pidfile=SERVER_PIDFILE)
+            rec.update(profiler=prof.start())
         t0 = time.time()
         res = subprocess.run(
             ["curl", "-s", "-F", f"video_file=@{a.video}", "-F", f"match_key={a.match_key}",
@@ -183,7 +215,7 @@ def main() -> int:
             job_id = json.loads(res.stdout)["job_id"]
         except (ValueError, KeyError):
             sampler.stop()
-            rec.update(status="error", error=f"submit failed: {res.stdout[:300]} {res.stderr[:200]}")
+            final(status="error", error=f"submit failed: {res.stdout[:300]} {res.stderr[:200]}")
             return 2
         rec.update(status="running", job_id=job_id, t_submit=t0)
         status = asyncio.run(drive(a.host, job_id, rec))
@@ -193,7 +225,7 @@ def main() -> int:
                    peak_vram_mib=sampler.peak)
         if status != "completed":
             sampler.stop()
-            rec.update(status="error", error=rec.data.get("error") or f"job ended: {status}")
+            final(status="error", error=rec.data.get("error") or f"job ended: {status}")
             return 1
         want_wl = bool(cfg.get("window_labels", True))
         deadline = time.time() + a.final_timeout
@@ -213,7 +245,7 @@ def main() -> int:
             summary_wl = (meta.get("summary") or {}).get("window_labels")
         except (OSError, ValueError):
             pass
-        rec.update(
+        final(
             status="done" if ready else "error",
             error=None if ready else f"replay not final after {a.final_timeout:.0f}s",
             wall_final_s=round(time.time() - t0, 1) if ready else None,
@@ -224,9 +256,15 @@ def main() -> int:
                                              "blue_teams", "red_teams", "status")},
         )
         return 0 if ready else 1
-    except Exception as e:  # recorded for the CLI, then re-raised for the log
-        rec.update(status="error", error=f"{type(e).__name__}: {e}"[:500])
+    except BaseException as e:  # recorded for the CLI, then re-raised for the log
+        try:
+            final(status="error", error=f"{type(e).__name__}: {e}"[:500])
+        except Exception:
+            rec.update(status="error", error=f"{type(e).__name__}: {e}"[:500])
         raise
+    finally:
+        if prof is not None:
+            prof.stop()      # idempotent; normally already stopped by final()
 
 
 if __name__ == "__main__":

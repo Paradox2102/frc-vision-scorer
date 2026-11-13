@@ -7,16 +7,39 @@ panels, event-name banners) around and on top of them. The tiling differs per
 event, so a single global layout (data/field/composite_layout.json) breaks
 calibration and tracking elsewhere.
 
-Approach (no templates, no model):
+Approach (no templates, no model, no knowledge of the graphics package):
 
-1. Sample ~40 frames from the in-play window and drop outliers (full-screen
-   graphics, replays) that do not share the dominant frame structure.
-2. Per pixel: the temporal median frame M (colour) and an activity map
-   (mean |frame - median| on a blurred half-res copy). Camera views carry
-   motion (balls, robots, people); broadcast graphics do not.
+1. Frame selection. Sample ~40 frames from the in-play window. Two candidate
+   frame sets are analysed (steps 2-6) and the one giving the most camera
+   views wins (ties keep the first):
+   - all samples less gross outliers (full-screen graphics, replays) that do
+     not share the dominant frame structure (the composite fills the window
+     at most official events);
+   - every sizeable group of one shot type: greedy medoid clustering of
+     64x36 thumbnails (mean |diff| <= GROUP_TAU). Offseason streams can
+     spend most of the window on cutaways (full-screen wide shots,
+     commentators with lower-thirds, results), which would otherwise pollute
+     the median and activity maps; their groups are single full-frame views
+     and lose to the composite group.
+   When the chosen set holds under ~3/4 of the samples, detect_layout_video
+   samples 2 more frames between every two consecutive used samples and
+   runs again (the decorrelation cue below needs ~30+ frames); the topped-up
+   result is kept unless it loses a camera or merely confirms the first.
+2. Per pixel: the temporal median frame M (colour), an activity map
+   (mean |frame - median| on a blurred half-res copy; camera views carry
+   motion, broadcast graphics do not), a bit-identical map, and temporal
+   decorrelation maps: across a row (column) boundary b, the two pixels
+   DECOR_D apart straddling it are "decorrelated" when their temporal
+   correlation is < DECOR_CORR while each side correlates > DECOR_WITHIN
+   with its own neighbour at the same distance. Inside one camera nearby
+   pixels vary together (same objects, shake, exposure); across a boundary
+   between two cameras, or a camera and an animated graphic, they do not.
+   The within-side test drops busy textures (crowds) that decorrelate on
+   their own; low-variance pixels are ignored.
 3. Composite seams are long, perfectly straight horizontal/vertical edges in
    M. For every row (column) boundary, the "seam score" is the fraction of the
-   span where a local-max step edge sits on that boundary (+-1 px).
+   span where a local-max step edge sits on that boundary (+-1 px); the
+   "decor score" is the decorrelated share of the informative pixels.
 4. Recursive XY-cut, alternating axes. Along one axis of a region:
    - a band at either end (scoreboard band, letterbox) needs a near-full-span
      seam (>= SEAM_BAND) with flat, bit-identical graphics on every cross
@@ -31,21 +54,31 @@ Approach (no templates, no model):
      strip-sized reach (the strip's own texture seams barely move the mean).
      Vertical strips take the still run itself less the activity blur bleed,
      snapped to a strong seam nearby;
-   - two busy views tiled with no strip between them split on a very strong
-     seam (>= SEAM_CAMCAM).
+   - two busy pieces tiled with no strip between them (camera | camera, or
+     camera | animated sponsor panel) split on a very strong seam
+     (>= SEAM_CAMCAM, cue "edge"), or on a fairly strong one
+     (>= SEAM_DECOR_EDGE) whose decor score is >= SEAM_DECOR (cue "decor":
+     abutting cameras whose median-frame seam is weak because the two
+     scenes have similar colours there, or the seam is blended).
+   The cut log in diag["cuts"] lists each region's seams as (boundary, seam
+   score, decor score) and each cam<->cam split with the cue that made it.
 5. Leaves are camera views: main = largest, corner_left/right = the outermost
-   views of the row below main (a centre logo/sponsor panel between them is
-   ignored). Views that do not exist are omitted. Confidence = the weakest
-   seam score of the view's edges, scaled down for low motion.
+   views of the row below main (a centre logo/sponsor panel between them,
+   still or animated, is ignored). Views that do not exist are omitted.
+   Confidence = the weakest seam score of the view's edges, scaled down for
+   low motion.
 6. Overlay masks: inside each view, closed + hole-filled components of pixels
    that are bit-for-bit identical across samples, kept only when they look
    like a graphic box (mostly filled bounding box whose sides sit on crisp
-   straight edges). Still, dark camera areas can be identical too but are
-   ragged. Conservative on purpose: a missed mask costs less than masking
-   field.
+   straight edges, with some texture). Still, dark camera areas can be
+   identical too but are ragged. A flat, featureless box is kept only when
+   the view edge cuts it (the plain end of a caption bar laid across two
+   views), after growing it back to its outline. Conservative on purpose: a
+   missed mask costs less than masking field.
 
-Everything here is pure numpy/OpenCV; detect_layout_from_frames() is the
-entry point for tests that build synthetic composites.
+Everything here is pure numpy/OpenCV. detect_layout_video() / detect_layout()
+work on a video file; detect_layout_from_frames() is the entry point for
+tests that build synthetic composites (no top-up there).
 """
 from __future__ import annotations
 
@@ -68,6 +101,18 @@ MIN_VIEW_FRAC = 0.12     # min camera size along the split axis (of frame dim)
 IDENT_DIFF = 2           # |d| <= this between samples counts as "identical"
 IDENT_FRAC = 0.85        # fraction of sample pairs identical -> graphic pixel
 BLEED = 3                # px the blurred half-res activity map bleeds into stills
+# temporal decorrelation (camera<->camera seams with no strip, weak median edge)
+DECOR_D = 5              # px between the two pixels compared across a boundary
+DECOR_CORR = 0.4         # temporal correlation below this = decorrelated
+DECOR_WITHIN = 0.5       # both sides must correlate this well at the same distance
+DECOR_STD = 4.0          # min temporal std (grey levels) of a usable pixel
+DECOR_MIN_VALID = 0.08   # min share of the span with usable pixels
+SEAM_DECOR = 0.8         # decorrelated share of the span for a cam<->cam split ...
+SEAM_DECOR_EDGE = 0.5    # ... on a median-frame seam at least this strong
+# shot grouping (non-match cutaways in the sampled window)
+GROUP_TAU = 20.0         # thumbnail mean |diff| (grey levels) within one shot type
+GROUP_MIN_FRAC = 0.2     # min share of the samples for a group to be analysed
+GROUP_MIN = 6
 
 
 # --------------------------------------------------------------------------
@@ -133,6 +178,101 @@ def _inlier_mask(frames: Sequence[np.ndarray]) -> np.ndarray:
     return keep
 
 
+def _thumbs(frames: Sequence[np.ndarray]) -> np.ndarray:
+    return np.stack([cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (64, 36),
+                                interpolation=cv2.INTER_AREA) for f in frames]).astype(np.float32)
+
+
+def _shot_groups(frames: Sequence[np.ndarray], tau: float = GROUP_TAU) -> list[np.ndarray]:
+    """Partition the samples into groups of one shot type (the match composite,
+    a full-screen wide shot, the commentators, results graphics), largest
+    first. Greedy medoid clustering on 64x36 thumbnails: the frame with the
+    most neighbours within tau takes them, repeat. Graphics-agnostic: needs no
+    knowledge of the broadcast package."""
+    th = _thumbs(frames)
+    d = np.abs(th[:, None] - th[None]).mean(axis=(2, 3))
+    left = np.ones(len(frames), bool)
+    groups = []
+    while left.any():
+        near = (d <= tau) & left[None, :] & left[:, None]
+        cnt = near.sum(axis=1)
+        m = int(np.argmax(cnt))
+        members = np.where(near[m])[0]
+        if len(members) < 2:
+            break
+        groups.append(members)
+        left[members] = False
+    groups.sort(key=lambda g: -len(g))
+    return groups
+
+
+# --------------------------------------------------------------------------
+# temporal decorrelation
+# --------------------------------------------------------------------------
+
+def _decor_maps(gray: np.ndarray, step: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """For every row boundary b (between rows b-1 and b) and every step-th
+    column: low[b, x] = the pixels DECOR_D apart straddling b vary
+    independently over time (temporal correlation < DECOR_CORR) while each
+    side correlates well with its own neighbour at the same distance;
+    valid[b, x] = that test was informative (enough temporal variance and
+    coherent sides).
+
+    Inside one camera, nearby pixels vary together (the same objects, shake,
+    exposure); across a boundary between two cameras, or a camera and an
+    animated graphic, they do not. Busy textures (crowds) decorrelate on
+    their own, so a pixel only counts where both sides are coherent."""
+    D = DECOR_D
+    X = gray[:, :, ::step]
+    N, H, W = X.shape
+    low = np.zeros((H, W), bool)
+    valid = np.zeros((H, W), bool)
+    if N < 3 or H <= 3 * D:
+        return low, valid
+    s = np.empty((H, W), np.float32)
+    c = np.empty((H - D, W), np.float32)            # c[i] = corr(row i, row i + D)
+    for r0 in range(0, H - D, 128):                 # in row chunks: bounded memory
+        r1 = min(H - D, r0 + 128)
+        Xc = X[:, r0:r1 + D].astype(np.float32)
+        sc = Xc.std(axis=0)
+        s[r0:r1 + D] = sc
+        Z = (Xc - Xc.mean(axis=0)) / np.maximum(sc, 1e-3)
+        c[r0:r1] = (Z[:, :-D] * Z[:, D:]).mean(axis=0)
+    ok = (s[:-D] > DECOR_STD) & (s[D:] > DECOR_STD)
+    n = len(c)
+    wa = np.full_like(c, -1.0)
+    wb = np.full_like(c, -1.0)
+    wa[D:] = c[:n - D]                                # rows i-D .. i (above)
+    wb[:n - D] = c[D:]                                # rows i+D .. i+2D (below)
+    v = ok & (wa > DECOR_WITHIN) & (wb > DECOR_WITHIN)
+    k = (D + 1) // 2                                  # rows i, i+D straddle b = i+k
+    low[k:k + n] = v & (c < DECOR_CORR)
+    valid[k:k + n] = v
+    return low, valid
+
+
+def _decor_profile(low: np.ndarray, valid: np.ndarray, lo: int, hi: int,
+                   c0: int, c1: int, step: int = 2) -> np.ndarray:
+    """Decorrelated share of the informative pixels of the cross span [c0, c1)
+    at each boundary in (lo, hi), max over +-1 px (0 where too few pixels are
+    informative)."""
+    n = low.shape[0]
+    prof = np.zeros(n, np.float32)
+    a, b = c0 // step, max(c0 // step + 1, c1 // step)
+    lo, hi = max(1, lo - 1), min(n, hi + 1)
+    if hi <= lo or low.size == 0:
+        return prof
+    L = low[lo:hi, a:b].sum(axis=1).astype(np.float32)
+    V = valid[lo:hi, a:b].sum(axis=1).astype(np.float32)
+    fr = L / np.maximum(V, 1.0)
+    fr[(V < DECOR_MIN_VALID * (b - a)) | (V < 12)] = 0.0
+    prof[lo:hi] = fr
+    out = prof.copy()
+    out[1:] = np.maximum(out[1:], prof[:-1])
+    out[:-1] = np.maximum(out[:-1], prof[1:])
+    return out
+
+
 # --------------------------------------------------------------------------
 # per-pixel statistics
 # --------------------------------------------------------------------------
@@ -140,8 +280,11 @@ def _inlier_mask(frames: Sequence[np.ndarray]) -> np.ndarray:
 def compute_stats(frames: Sequence[np.ndarray]) -> dict:
     """Median frame, activity and identical-pixel maps (all full resolution)."""
     H, W = frames[0].shape[:2]
-    F = np.stack(frames)
-    M = np.partition(F, len(F) // 2, axis=0)[len(F) // 2]          # colour median
+    k = len(frames) // 2
+    M = np.empty_like(frames[0])                                   # colour median
+    for r0 in range(0, H, 120):                                    # row chunks: bounded memory
+        F = np.stack([f[r0:r0 + 120] for f in frames])
+        M[r0:r0 + 120] = np.partition(F, k, axis=0)[k]
     del F
     hw, hh = max(1, W // 2), max(1, H // 2)
     small = np.stack([cv2.blur(cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (hw, hh),
@@ -158,7 +301,13 @@ def compute_stats(frames: Sequence[np.ndarray]) -> dict:
     else:
         ident_s = np.zeros(sub.shape[1:], np.float32)
     ident = cv2.resize(ident_s, (W, H), interpolation=cv2.INTER_NEAREST)
-    return {"M": M, "act": act, "ident": ident}
+    # temporal decorrelation across row boundaries (every 2nd column) and
+    # across column boundaries (every 2nd row)
+    gray = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames])
+    dlow_r, dval_r = _decor_maps(gray, 2)
+    dlow_c, dval_c = _decor_maps(np.ascontiguousarray(gray[:, ::2, :].transpose(0, 2, 1)), 1)
+    return {"M": M, "act": act, "ident": ident,
+            "decor_rows": (dlow_r, dval_r, 2), "decor_cols": (dlow_c, dval_c, 2)}
 
 
 def _edge_map(M: np.ndarray) -> np.ndarray:
@@ -243,7 +392,8 @@ def _mean_jump(Mspan: np.ndarray, i: int, w: int = 4) -> float:
     return float(np.abs(a.mean(axis=0) - b.mean(axis=0)).sum())
 
 
-def _split_axis(e, A, G, lo, hi, c0, c1, full, full_cross=True, Mean=None, trust_run=False):
+def _split_axis(e, A, G, lo, hi, c0, c1, full, full_cross=True, Mean=None, trust_run=False,
+                decor=None):
     """Split [lo, hi) along one axis (the rows of e/A/G) over the cross span
     [c0, c1).
 
@@ -253,12 +403,16 @@ def _split_axis(e, A, G, lo, hi, c0, c1, full, full_cross=True, Mean=None, trust
     pillarbox); an interior run (separator strip, pillar, logo panel) needs a
     seam on at least one side, or a wide, perfectly still core. Active gaps
     between bands are camera views; two views tiled with no separator are
-    split on a very strong seam.
+    split on a very strong seam, or on a fairly strong one across which the
+    pixels decorrelate over time (``decor`` = (low, valid, step) maps from
+    _decor_maps for this axis).
 
     Returns {"cams": [(a, b, conf_a, conf_b)], "statics": [(a, b)], "seams":
-    [...]}, conf_* None where the piece edge is the span edge.
+    [...], "splits": [...]}, conf_* None where the piece edge is the span edge.
     """
     prof = _seam_profile(e, lo, hi, c0, c1)
+    dprof = (_decor_profile(decor[0], decor[1], lo, hi, c0, c1, decor[2])
+             if decor is not None else np.zeros_like(prof))
     Mspan = Mean[lo:hi, c0:c1].mean(axis=1)           # (n, channels) mean colour
     Af = A[lo:hi, c0:c1].mean(axis=1)
     Gf = G[lo:hi, c0:c1].mean(axis=1)
@@ -422,33 +576,49 @@ def _split_axis(e, A, G, lo, hi, c0, c1, full, full_cross=True, Mean=None, trust
     if hi - cur >= 8:
         gaps.append((cur, hi, cconf, None))
     min_len = max(8, int(MIN_VIEW_FRAC * full))
-    cams = []
+    cams, splits = [], []
+
+    def camcam(c):
+        """Cue that splits two abutting busy views at c, or None."""
+        if prof[c] >= SEAM_CAMCAM:
+            return "edge"
+        if prof[c] >= SEAM_DECOR_EDGE and dprof[c] >= SEAM_DECOR:
+            return "decor"
+        return None
+
     for a, b, ca, cb in gaps:
-        inner = [c for c in peaks if a + min_len <= c <= b - min_len and prof[c] >= SEAM_CAMCAM]
+        inner = [c for c in peaks if a + min_len <= c <= b - min_len and camcam(c)]
         start, sconf = a, ca
         for c in inner:
             p = pos(c)
             if p - start >= min_len and b - p >= min_len:
-                cams.append((start, p, sconf, float(prof[c])))
-                start, sconf = p, float(prof[c])
+                conf = max(float(prof[c]), float(dprof[c]) if camcam(c) == "decor" else 0.0)
+                cams.append((start, p, sconf, conf))
+                splits.append({"at": int(p), "cue": camcam(c), "edge": round(float(prof[c]), 3),
+                               "decor": round(float(dprof[c]), 3)})
+                start, sconf = p, conf
         cams.append((start, b, sconf, cb))
     return {"cams": cams, "statics": [(int(a), int(b)) for a, b, _, _ in merged],
-            "seams": [(int(b), round(float(prof[b]), 3)) for b in peaks if prof[b] >= SEAM_SEP]}
+            "seams": [(int(b), round(float(prof[b]), 3), round(float(dprof[b]), 3))
+                      for b in peaks if prof[b] >= SEAM_SEP or
+                      (prof[b] >= SEAM_DECOR_EDGE and dprof[b] >= 0.6)],
+            "splits": splits}
 
 
 def _xycut(ctx, region, axis, tried_other, depth, leaves, log):
-    eH, eV, A, AT, G, GT, H, W, Mh, Mv = ctx
+    eH, eV, A, AT, G, GT, H, W, Mh, Mv, dR, dC = ctx
     y0, y1, x0, x1, conf = region
     if depth > 5 or (y1 - y0) < MIN_VIEW_FRAC * H or (x1 - x0) < MIN_VIEW_FRAC * W:
         leaves.append(region)
         return
     if axis == 0:   # split rows over columns [x0, x1)
-        r = _split_axis(eH, A, G, y0, y1, x0, x1, H, full_cross=(x0 == 0 and x1 == W), Mean=Mh)
+        r = _split_axis(eH, A, G, y0, y1, x0, x1, H, full_cross=(x0 == 0 and x1 == W), Mean=Mh,
+                        decor=dR)
         keys = ("top", "bottom")
         pieces = [(a, b, x0, x1, ca, cb) for a, b, ca, cb in r["cams"]]
     else:           # split columns over rows [y0, y1)
         r = _split_axis(eV, AT, GT, x0, x1, y0, y1, W, full_cross=(y0 == 0 and y1 == H), Mean=Mv,
-                        trust_run=True)
+                        trust_run=True, decor=dC)
         keys = ("left", "right")
         pieces = [(y0, y1, a, b, ca, cb) for a, b, ca, cb in r["cams"]]
     out = []
@@ -461,6 +631,7 @@ def _xycut(ctx, region, axis, tried_other, depth, leaves, log):
         out.append((py0, py1, px0, px1, c))
     log.append({"region": [int(y0), int(y1), int(x0), int(x1)], "axis": "rows" if axis == 0 else "cols",
                 "seams": r["seams"], "statics": [list(s) for s in r["statics"]],
+                "splits": r["splits"],
                 "cams": [[int(p[0]), int(p[1]), int(p[2]), int(p[3])] for p in out]})
     if len(out) == 1 and tuple(out[0][:4]) == (y0, y1, x0, x1):
         if tried_other:
@@ -508,6 +679,21 @@ def _side_edge_frac(g: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
     return float(np.mean(fr))
 
 
+def _grow_flat_box(g: np.ndarray, bx: int, by: int, bw: int, bh: int, v: float,
+                   tol: float = 8.0, reach: int = 8) -> tuple[int, int, int, int]:
+    """Grow each side of a flat box (median grey v) by up to reach px while
+    the next row/column outside it is still the box colour."""
+    H, W = g.shape
+    x0, y0, x1, y1 = bx, by, bx + bw, by + bh
+    gf = g.astype(np.float32)
+    for _ in range(reach):
+        if y0 > 0 and abs(gf[y0 - 1, x0:x1].mean() - v) < tol: y0 -= 1
+        if y1 < H and abs(gf[y1, x0:x1].mean() - v) < tol: y1 += 1
+        if x0 > 0 and abs(gf[y0:y1, x0 - 1].mean() - v) < tol: x0 -= 1
+        if x1 < W and abs(gf[y0:y1, x1].mean() - v) < tol: x1 += 1
+    return x0, y0, x1 - x0, y1 - y0
+
+
 def _overlay_masks(stats: dict, crop: tuple, max_masks: int = 8) -> list[list[int]]:
     """Crop-local [x, y, w, h] rects over static broadcast graphics drawn on
     top of a view (scoreboard boxes, event banner).
@@ -553,11 +739,20 @@ def _overlay_masks(stats: dict, crop: tuple, max_masks: int = 8) -> list[list[in
         bx, by, bw, bh = bx + l0, by + t0, l1 - l0, t1 - t0
         if bw < 16 or bh < 10 or bw * bh < 0.002 * area or filled.mean() < 0.7:
             continue                                   # ragged: not a box
-        if _side_edge_frac(g, bx, by, bx + bw, by + bh) < 0.6:
-            continue                                   # no crisp outline
         gv = g[by:by + bh, bx:bx + bw][filled > 0]
         if gv.std() < 12:
-            continue                                   # flat, featureless
+            # flat and featureless: not a graphic box, unless it is a crisp
+            # bar cut by the view edge (the plain end of a caption bar that
+            # spans two views, its text in the other view or between them).
+            # The seed erodes a flat box's rim: grow it back to its outline.
+            cut = bx <= 2 or by <= 2 or bx + bw >= w - 2 or by + bh >= h - 2
+            if not cut or bh > 0.3 * h:
+                continue
+            bx, by, bw, bh = _grow_flat_box(g, bx, by, bw, bh, float(np.median(gv)))
+            if _side_edge_frac(g, bx, by, bx + bw, by + bh) < 0.7:
+                continue
+        elif _side_edge_frac(g, bx, by, bx + bw, by + bh) < 0.6:
+            continue                                   # no crisp outline
         pad = 2
         rx, ry = max(0, bx - pad), max(0, by - pad)
         out.append([rx, ry, min(w, bx + bw + pad) - rx, min(h, by + bh + pad) - ry])
@@ -629,7 +824,8 @@ def layout_from_stats(stats: dict) -> dict:
     eV = _edge_map(np.ascontiguousarray(M.transpose(1, 0, 2) if M.ndim == 3 else M.T))
     Mf = M.astype(np.float32) if M.ndim == 3 else M.astype(np.float32)[..., None]
     ctx = (eH, eV, A, np.ascontiguousarray(A.T), G, np.ascontiguousarray(G.T), H, W,
-           Mf, np.ascontiguousarray(Mf.transpose(1, 0, 2)))
+           Mf, np.ascontiguousarray(Mf.transpose(1, 0, 2)),
+           stats.get("decor_rows"), stats.get("decor_cols"))
     leaves: list = []
     log: list = []
     _xycut(ctx, (0, H, 0, W, {}), 0, False, 0, leaves, log)
@@ -654,14 +850,123 @@ def detect_layout_from_frames(frames: Sequence[np.ndarray]) -> dict:
     if len(frames) < 3:
         raise ValueError("need at least 3 frames")
     t = time.time()
+    n = len(frames)
+    # candidate frame sets: all samples less gross outliers (the composite
+    # dominates the window at most events), plus every sizeable group of one
+    # shot type (an offseason stream can spend most of the window on
+    # cutaways: wide shots, commentators, results)
     keep = _inlier_mask(frames)
-    used = [f for f, k in zip(frames, keep) if k]
-    stats = compute_stats(used)
-    out = layout_from_stats(stats)
-    out["diag"].update({"n_frames": len(frames), "n_used": len(used),
-                        "rejected": [int(i) for i in np.where(~keep)[0]],
+    cands = [("inliers", np.where(keep)[0])]
+    groups = _shot_groups(frames)
+    for k, g in enumerate(groups):
+        if len(g) < max(3, GROUP_MIN, GROUP_MIN_FRAC * n):
+            continue
+        if any(len(set(g.tolist()) ^ set(c.tolist())) <= 0.1 * n for _, c in cands):
+            continue                                   # same frames as a candidate
+        cands.append((f"group{k}", g))
+    best, best_key, tried = None, None, []
+    for i, (label, idx) in enumerate(cands):
+        out = layout_from_stats(compute_stats([frames[j] for j in idx]))
+        ncam = len(out["cameras"])
+        tried.append({"label": label, "n": int(len(idx)), "n_cams": ncam,
+                      "crops": {k: v["crop"] for k, v in out["cameras"].items()}})
+        # the most camera views wins (a composite over a single full-screen
+        # shot); ties keep the earlier candidate (plain inliers first)
+        if best is None or ncam > best_key:
+            best, best_key, used_idx, chosen = out, ncam, idx, label
+    out = best
+    used_set = set(int(j) for j in used_idx)
+    out["diag"].update({"n_frames": n, "n_used": len(used_idx),
+                        "used_idx": sorted(used_set),
+                        "rejected": [j for j in range(n) if j not in used_set],
+                        "selection": {"chosen": chosen, "candidates": tried,
+                                      "groups": [len(g) for g in groups]},
                         "t_analyse_s": round(time.time() - t, 2)})
     return out
+
+
+def read_frames_at(video_path, times) -> tuple[list, list]:
+    """BGR frames at the given times (s); unreadable ones are skipped."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"cannot open video {video_path}")
+    frames, got = [], []
+    try:
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(t) * 1000.0)
+            ok, f = cap.read()
+            if ok and f is not None:
+                frames.append(f)
+                got.append(float(t))
+    finally:
+        cap.release()
+    return frames, got
+
+
+def _topup_times(times: Sequence[float], used_idx: Sequence[int], per_gap: int = 2) -> list[float]:
+    """Extra sample times inside the stretches the chosen shot group covers:
+    per_gap evenly spaced times between every two consecutive samples that
+    were both used (a gap between two composite samples is almost always
+    composite too)."""
+    used = set(int(i) for i in used_idx)
+    out = []
+    for i in range(len(times) - 1):
+        if i in used and i + 1 in used:
+            a, b = times[i], times[i + 1]
+            out += [a + (b - a) * k / (per_gap + 1) for k in range(1, per_gap + 1)]
+    return out
+
+
+TOPUP_BELOW = 0.75       # chosen group under this share of the samples -> top up
+TOPUP_MIN_USED = 24      # ... or under this many frames
+
+
+def detect_layout_video(video_path, t_window=(20, None), n_frames: int = 40):
+    """Sample, detect, and when the composite holds only part of the window
+    (cutaways, a dead feed), sample more frames between the composite
+    samples and detect again: the decorrelation cue needs ~30+ frames to
+    separate camera seams from natural lines. Returns (detect_layout dict,
+    the frames the chosen result used)."""
+    t = time.time()
+    frames, times, dur = sample_frames(video_path, t_window, n_frames)
+    if len(frames) < 3:
+        raise ValueError(f"could not read frames from {video_path}")
+    out = detect_layout_from_frames(frames)
+    d = out["diag"]
+    used = [frames[i] for i in d["used_idx"]]
+    topup = None
+    if d["n_used"] < max(TOPUP_BELOW * len(frames), min(TOPUP_MIN_USED, len(frames))):
+        extra_t = _topup_times(times, d["used_idx"])
+        if extra_t:
+            extra, got_t = read_frames_at(video_path, extra_t)
+            if extra:
+                base = used
+                out2 = detect_layout_from_frames(base + extra)
+                topup = {"n_extra": len(extra), "first": {
+                    "n_used": d["n_used"], "n_cams": len(out["cameras"]),
+                    "crops": {k: v["crop"] for k, v in out["cameras"].items()}}}
+                # more frames give the sharper cues: keep the topped-up result
+                # unless it lost a camera, or it only confirms the first one
+                # (then the evenly spaced samples' exact edges stand)
+                c1, c2 = out["cameras"], out2["cameras"]
+                same = set(c1) == set(c2) and all(
+                    max(abs(a - b) for a, b in zip(c1[k]["crop"], c2[k]["crop"])) <= 6 for k in c1)
+                if same:
+                    topup["kept"] = False
+                    topup["agrees"] = True
+                elif len(c2) >= len(c1):
+                    allf = base + extra
+                    used = [allf[i] for i in out2["diag"]["used_idx"]]
+                    out = out2
+                    topup["kept"] = True
+                else:
+                    topup["kept"] = False
+    out["diag"].update({"video": str(video_path), "duration_s": round(dur, 2),
+                        "t_window": [round(times[0], 2), round(times[-1], 2)],
+                        "t_total_s": round(time.time() - t, 2)})
+    if topup is not None:
+        out["diag"]["topup"] = topup
+    return out, used
 
 
 def detect_layout(video_path, *, t_window=(20, None), n_frames: int = 40) -> dict:
@@ -671,13 +976,4 @@ def detect_layout(video_path, *, t_window=(20, None), n_frames: int = 40) -> dic
     "masks": [[x, y, w, h], ...]}}, "confidence": {name: 0..1}, "diag": {...}}.
     Masks are crop-local. Cameras that do not exist are omitted.
     """
-    t = time.time()
-    frames, times, dur = sample_frames(video_path, t_window, n_frames)
-    t_read = time.time() - t
-    if len(frames) < 3:
-        raise ValueError(f"could not read frames from {video_path}")
-    out = detect_layout_from_frames(frames)
-    out["diag"].update({"video": str(video_path), "duration_s": round(dur, 2),
-                        "t_window": [round(times[0], 2), round(times[-1], 2)],
-                        "t_read_s": round(t_read, 2), "t_total_s": round(time.time() - t, 2)})
-    return out
+    return detect_layout_video(video_path, t_window, n_frames)[0]

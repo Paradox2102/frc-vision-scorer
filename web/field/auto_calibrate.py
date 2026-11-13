@@ -1452,17 +1452,17 @@ def render_layout_preview(composite_bgr, cams: dict, other: Optional[dict] = Non
 
 
 def detect_with_preview(video):
-    """(detect_layout()-shaped dict, composite median frame) from one sampling pass."""
+    """(detect_layout()-shaped dict, composite median frame) from one sampling pass
+    (topped up with more frames when cutaways fill much of the window). The
+    preview median uses only the frames the detection used (the composite),
+    not the cutaways."""
     from web.field import layout_detect as ld
-    t0 = time.time()
-    frames, times, dur = ld.sample_frames(str(video), (20, None), 40)
-    if len(frames) < 3:
+    try:
+        out, used = ld.detect_layout_video(str(video), (20, None), 40)
+    except ValueError as e:
         raise AutoCalibError(f"could not read frames from {Path(str(video)).name} "
-                             f"for layout detection")
-    out = ld.detect_layout_from_frames(frames)
-    out["diag"].update({"video": str(video), "duration_s": round(dur, 2),
-                        "t_total_s": round(time.time() - t0, 2)})
-    return out, median_of_frames(frames)
+                             f"for layout detection") from e
+    return out, median_of_frames(used)
 
 
 def invalidate_stale_auto_records(event_key: str, old_cams: dict, new_cams: dict,

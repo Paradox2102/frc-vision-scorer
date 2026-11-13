@@ -163,6 +163,150 @@ def test_outlier_frames_are_rejected():
 
 
 # --------------------------------------------------------------------------
+# offseason graphics: abutting views with weak seams, animated panels,
+# cutaway shots (temporal decorrelation + shot grouping)
+# --------------------------------------------------------------------------
+
+def _render_shared(rng, views, n=32, blobs=40, offset_frac=0.7, panels=(), size=(H, W), flicker=8.0):
+    """Views cut from ONE continuous background (so the median frame barely
+    shows the seams): each view only adds a brightness offset on a random
+    offset_frac of 16-px blocks, its own exposure flicker and its own moving
+    blobs. panels: [(x, y, w, h, [slide imgs], frames_per_slide)] animated
+    graphics drawn bit-identically."""
+    import cv2
+    hh, ww = size
+    bg = _camera_scene(rng, hh, ww)
+    offs = {}
+    for k, (x, y, w, h) in views.items():
+        blk = (rng.random((h // 16 + 1, w // 16 + 1)) < offset_frac).astype(np.float32)
+        sign = 1.0 if len(offs) % 2 == 0 else -1.0
+        offs[k] = sign * 22.0 * np.kron(blk, np.ones((16, 16), np.float32))[:h, :w, None]
+    frames = []
+    for i in range(n):
+        f = np.zeros((hh, ww, 3), np.float32)
+        for k, (x, y, w, h) in views.items():
+            tile = bg[y:y + h, x:x + w] + offs[k] + rng.normal(0, flicker)   # exposure flicker
+            for _ in range(blobs):
+                cx, cy = int(rng.integers(0, w)), int(rng.integers(0, h))
+                col = tuple(float(c) for c in rng.integers(150, 255, size=3))
+                cv2.circle(tile, (cx, cy), int(rng.integers(10, 18)), col, -1)
+            tile += rng.normal(0, 3, size=tile.shape)
+            f[y:y + h, x:x + w] = tile
+        f = np.clip(f, 0, 255).astype(np.uint8)
+        for (x, y, w, h, slides, per) in panels:
+            f[y:y + h, x:x + w] = slides[(i // per) % len(slides)]
+        frames.append(f)
+    return frames
+
+
+def _slide(rng, h, w):
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:] = rng.integers(30, 230, size=3)
+    for _ in range(4):                                    # text / logo blocks
+        x0, y0 = int(rng.integers(0, w - 40)), int(rng.integers(0, h - 20))
+        img[y0:y0 + int(rng.integers(8, 20)), x0:x0 + int(rng.integers(20, 40))] = rng.integers(0, 255, size=3)
+    return img
+
+
+def test_abutting_views_split_on_temporal_decorrelation():
+    """No strips anywhere and seams too weak in the median frame for the
+    edge cue alone: the views still split because pixels across a seam vary
+    independently over time."""
+    rng = np.random.default_rng(11)
+    views = {"main": (0, 0, W, 330), "corner_left": (0, 330, 480, H - 330),
+             "corner_right": (480, 330, W - 480, H - 330)}
+    out = ld.detect_layout_from_frames(_render_shared(rng, views))
+    cams = out["cameras"]
+    assert set(cams) == {"main", "corner_left", "corner_right"}, out["diag"]["cuts"]
+    for name, exp in views.items():
+        assert _close(cams[name]["crop"], exp), (name, cams[name]["crop"], exp)
+    cues = [s["cue"] for c in out["diag"]["cuts"] for s in c["splits"]]
+    assert "decor" in cues, out["diag"]["cuts"]
+
+
+def test_animated_centre_panel_between_abutting_corners():
+    """cabl-style lower row: camera | animated sponsor slides | camera, all
+    abutting main with no strips. The panel moves, so it is not a still
+    graphic, but it is not a corner either."""
+    rng = np.random.default_rng(12)
+    views = {"main": (0, 0, W, 360), "corner_left": (0, 360, 320, H - 360),
+             "corner_right": (640, 360, W - 640, H - 360)}
+    slides = [_slide(rng, H - 360, 320) for _ in range(4)]
+    frames = _render_shared(rng, views, panels=[(320, 360, 320, H - 360, slides, 3)])
+    cams = ld.detect_layout_from_frames(frames)["cameras"]
+    assert set(cams) == {"main", "corner_left", "corner_right"}
+    for name, exp in views.items():
+        assert _close(cams[name]["crop"], exp), (name, cams[name]["crop"], exp)
+
+
+def test_composite_found_among_majority_cutaway_shots():
+    """cc-style window: the composite holds under half of the samples, the
+    rest are a full-screen wide shot and a commentator shot. The cutaways
+    must not pollute the analysis."""
+    rng = np.random.default_rng(13)
+    views = {"main": (0, 0, W, 300), "corner_left": (0, 300, 470, H - 300),
+             "corner_right": (470, 300, W - 470, H - 300)}
+    comp = _render_shared(rng, views, n=18, blobs=10, flicker=3.0)
+    wide = _render_shared(rng, {"wide": (0, 0, W, H)}, n=14, blobs=10, flicker=3.0)
+    wide = [np.clip(f.astype(np.int16) + 110, 0, 255).astype(np.uint8) for f in wide]
+    talk = _render_shared(rng, {"talk": (0, 0, W, H)}, n=10, blobs=6)
+    talk = [255 - f for f in talk]
+    frames = []
+    for i in range(max(len(comp), len(wide), len(talk))):     # interleaved in time
+        for src in (comp, wide, talk):
+            if i < len(src):
+                frames.append(src[i])
+    out = ld.detect_layout_from_frames(frames)
+    cams = out["cameras"]
+    assert set(cams) == {"main", "corner_left", "corner_right"}, out["diag"]["selection"]
+    for name, exp in views.items():
+        assert _close(cams[name]["crop"], exp), (name, cams[name]["crop"], exp)
+    sel = out["diag"]["selection"]
+    assert sel["chosen"] != "inliers"
+    assert out["diag"]["n_used"] == len(comp)
+    comp_ids = {id(f) for f in comp}
+    assert all(id(frames[i]) in comp_ids for i in out["diag"]["used_idx"])
+
+
+def test_shot_groups_separate_shot_types():
+    rng = np.random.default_rng(14)
+    a = [np.full((108, 192, 3), 40, np.uint8) + rng.integers(0, 6, (108, 192, 3), dtype=np.uint8)
+         for _ in range(7)]
+    b = [np.full((108, 192, 3), 200, np.uint8) + rng.integers(0, 6, (108, 192, 3), dtype=np.uint8)
+         for _ in range(4)]
+    groups = ld._shot_groups(a + b)
+    assert [sorted(g.tolist()) for g in groups] == [list(range(7)), list(range(7, 11))]
+
+
+def test_topup_times_fill_gaps_between_used_samples_only():
+    times = [0.0, 10.0, 20.0, 30.0, 40.0]
+    assert ld._topup_times(times, [0, 1, 3], per_gap=1) == [5.0]
+    assert ld._topup_times(times, [1, 2, 3], per_gap=2) == pytest.approx(
+        [10 + 10 / 3, 10 + 20 / 3, 20 + 10 / 3, 20 + 20 / 3])
+    assert ld._topup_times(times, [0, 2, 4]) == []
+
+
+def test_caption_bar_spanning_two_views_is_masked_on_both():
+    """A flat caption bar laid across the lower row (its text sits in the
+    centre panel) leaves plain dark bar ends on each corner: still masked."""
+    rng = np.random.default_rng(15)
+    views = {"main": (0, 0, W, 360), "corner_left": (0, 360, 320, H - 360),
+             "corner_right": (640, 360, W - 640, H - 360)}
+    slides = [_slide(rng, H - 360, 320) for _ in range(4)]
+    frames = _render_shared(rng, views, panels=[(320, 360, 320, H - 360, slides, 3)])
+    bar = (200, 500, 560, 26)                       # x 200..760, crosses both seams
+    for f in frames:
+        f[bar[1]:bar[1] + bar[3], bar[0]:bar[0] + bar[2]] = (28, 28, 28)
+        f[bar[1] + 8:bar[1] + 18, 340:620] = (245, 245, 245)       # text in the centre
+    cams = ld.detect_layout_from_frames(frames)["cameras"]
+    for name in ("corner_left", "corner_right"):
+        cx, cy = cams[name]["crop"][:2]
+        hits = [m for m in cams[name]["masks"]
+                if abs(cy + m[1] - bar[1]) <= 4 and abs(cy + m[1] + m[3] - bar[1] - bar[3]) <= 4]
+        assert hits, (name, cams[name]["masks"])
+
+
+# --------------------------------------------------------------------------
 # per-event layout store
 # --------------------------------------------------------------------------
 

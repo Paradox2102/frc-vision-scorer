@@ -152,15 +152,35 @@ def test_drop_allowance_is_measured_from_last_good_read(bad):
 
 
 @pytest.mark.parametrize("second", [None, 60, 99])
-def test_low_misread_then_second_outlier_is_two_bad_samples(second):
-    # Two bad samples in a row mid-teleop break the walk, exactly as two
-    # None reads do.
+def test_two_bad_samples_in_a_row_are_tolerated_with_fps(clean, second):
+    # 2026cc (Chezy Champs HUD): "1:11" unreadable twice, then "1:09" read
+    # as 109 twice (colon dropped). Two bad reads in a row (1 s since the
+    # last good read) used to break the walk and fall back to the full video.
     first, then = _teleop_frames(69)
-    with_outliers = _match({first: 60, then: second})
-    with_nones = _match({first: None, then: None})
-    auto = _find_clock_period(with_nones, 20, fps=FPS)
-    got = _find_clock_period(with_outliers, 140, after_frame=auto["end_frame"], fps=FPS)
-    want = _find_clock_period(with_nones, 140, after_frame=auto["end_frame"], fps=FPS)
-    assert got is None and want is None
-    _, _, fell_back, reason = _windows(with_outliers)
+    samples = _match({first: 60, then: second})
+    assert _windows(samples)[:2] == clean
+
+
+def test_legacy_finder_still_breaks_on_two_bad_samples():
+    first, then = _teleop_frames(69)
+    samples = _match({first: None, then: None})
+    auto = _find_clock_period(samples, 20)
+    assert _find_clock_period(samples, 140, after_frame=auto["end_frame"]) is None
+
+
+def test_2026cc_qm1_pattern_locks_teleop(clean):
+    # Real qm1 reads: 72, None, None, 70, 70, 109, 109, 68 ...
+    f71 = _teleop_frames(71)
+    f69 = _teleop_frames(69)
+    samples = _match({f71[0]: None, f71[1]: None, f69[0]: 109, f69[1]: 109})
+    ranges, periods, fell_back, reason = _windows(samples)
+    assert not fell_back, reason
+    assert (ranges, periods) == clean
+
+
+def test_bad_run_longer_than_gap_budget_still_breaks():
+    # 3 s of garbage mid-teleop (6 reads) is past the 2 s budget: the walk
+    # gives up and teleop is not found, as before.
+    bad = {f: None for f in _teleop_frames(69) + _teleop_frames(68) + _teleop_frames(67)}
+    _, _, fell_back, reason = _windows(_match(bad))
     assert fell_back and "teleop" in reason

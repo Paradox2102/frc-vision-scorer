@@ -414,6 +414,12 @@ def scale_ocr_regions(video_width: int, overhead_height: int) -> dict:
 OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789"
 MATCH_CLOCK_OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789:"
 MATCH_CLOCK_SAMPLE_SECONDS = 0.5
+# With fps known, the countdown walk keeps going through consecutive bad
+# reads (unreadable, or out of sequence) as long as the last good read is at
+# most this many seconds back. One bad read in a row was the old limit:
+# 2026cc's Chezy Champs HUD lost "1:11" twice and read "1:09" as 109 twice,
+# so teleop was never found and the whole video was processed.
+MATCH_CLOCK_BAD_GAP_SECONDS = float(os.environ.get("MATCH_CLOCK_BAD_GAP_SECONDS", "2.0") or "2.0")
 MATCH_CLOCK_LEAD_SECONDS = 0.5
 # The auto `start_frame` is the last 0.5 s sample still showing 0:20, but the
 # broadcast clock holds 0:20 for 1.0-1.8 s after the real start, so a 0.5 s
@@ -542,7 +548,9 @@ def _find_clock_period(
     seconds elapsed since the last good read, plus slack) is a bad sample
     too: a single digit misread low mid-teleop (69->60) otherwise became the
     running minimum, every true read after it looked like a high outlier, and
-    the match fell back to full-video processing. None = legacy behaviour."""
+    the match fell back to full-video processing. With ``fps`` the walk also
+    survives a RUN of bad samples spanning up to MATCH_CLOCK_BAD_GAP_SECONDS
+    since the last good read. None = legacy behaviour (one bad sample)."""
     candidates = [
         i for i, (frame, value) in enumerate(samples)
         if frame > after_frame
@@ -595,7 +603,14 @@ def _find_clock_period(
                 )
             ):
                 bad_samples += 1
-                if bad_samples > 1:
+                # The gap budget only applies once the clock is ticking: in
+                # the pre-start hold two bad reads still split the run (it
+                # bounds clock_first_frame, the auto lead's floor).
+                give_up = bad_samples > 1 and (
+                    fps is None or fps <= 0 or decreases == 0
+                    or frame - previous_frame > MATCH_CLOCK_BAD_GAP_SECONDS * fps
+                )
+                if give_up:
                     if reached_near_zero:
                         return result()
                     break

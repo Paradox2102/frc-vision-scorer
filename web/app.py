@@ -2908,6 +2908,19 @@ class InferenceJob:
         return bool(getattr(getattr(self, "config", None), "vllm_phase_exclusive", False)
                     and getattr(self, "team_reader", "local") == "vllm")
 
+    def _needs_vllm_ready(self) -> bool:
+        """Bring up / verify the vLLM reader before the analysis loop: every
+        vllm job, phase-exclusive or not.
+
+        With vllm_phase_exclusive off (a resident reader on a big card, e.g.
+        the RunPod pod) ensure_started is a no-op when the job's vlm_model is
+        already serving and cold-starts it otherwise; without this the job
+        would send its vlm_model payload to whatever model happens to be
+        serving (or to nothing). _needs_vllm_server keeps its phase-exclusive
+        meaning ("vLLM reclaims the card after tracking") for the stream
+        prefetch plan, and the STOPs stay gated on the knob."""
+        return getattr(self, "team_reader", "local") == "vllm"
+
     async def _maybe_warn_clef_unavailable(self) -> None:
         """Surface a latched Clef session (quota exhausted / bad credentials) to
         the UI once, like the vLLM-startup-failure path. Reads keep returning
@@ -9583,7 +9596,7 @@ class InferenceJob:
             # server back now. On failure the read path falls back to the
             # in-process Qwen reader — degraded speed, not a dead job.
             self._raise_if_stopped()  # phase boundary: before vLLM startup
-            if self._needs_vllm_server():
+            if self._needs_vllm_ready():
                 from web import vllm_lifecycle
                 # Tracking leaves the CUDA caching allocator holding a large
                 # RESERVED pool (observed 14.5GiB cached over ~4GiB live);

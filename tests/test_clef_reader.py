@@ -721,6 +721,19 @@ def test_vllm_not_started_for_clef_jobs():
     assert job._needs_vllm_server() is True
 
 
+def test_vllm_ready_check_runs_without_phase_exclusive():
+    # Resident reader (big card): the job still verifies/starts its vlm_model,
+    # but the phase-exclusive "reclaims the card" meaning stays off.
+    job = app_module.InferenceJob.__new__(app_module.InferenceJob)
+    job.config = JobConfig({"team_reader": "vllm", "vllm_phase_exclusive": False})
+    job.team_reader = "vllm"
+    assert job._needs_vllm_server() is False
+    assert job._needs_vllm_ready() is True
+    for reader in ("clef", "jev", "local"):
+        job.team_reader = reader
+        assert job._needs_vllm_ready() is False
+
+
 def test_ensure_stopped_is_a_noop_when_no_server():
     from web.vllm_lifecycle import ensure_stopped
 

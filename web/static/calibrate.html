@@ -2191,7 +2191,7 @@ function ldPointerDown(ev){
   if (d.tool === 'mask'){
     const sh = selIt && selIt.kind === 'mask' && ldHandleAt(d, selIt, px, py);
     hit = sh ? {item: selIt, handle: sh} : null;
-  } else if (hit && ldCamUnset(d)) hit = null;   // selected camera has no box yet: a drag draws it
+  } else if (hit && (ldCamUnset(d) || ev.shiftKey)) hit = null;   // no box yet, or Shift: a drag draws it fresh
   d.ui.canvas.setPointerCapture(ev.pointerId);
   if (hit){
     const it = hit.item;
@@ -2412,7 +2412,7 @@ function ldBuildGrid(){
 function renderLayoutDraw(card){
   const d = layoutDraw, u = d.ui = {};
   card.appendChild(_el('div', 'hint',
-    'Pick a camera, then drag on the frame to draw its box. Drag inside a box to move it, drag its edges/corners to ' +
+    'Pick a camera, then drag on the frame to draw its box (Shift+drag redraws it from scratch). Drag inside a box to move it, drag its edges/corners to ' +
     'resize (snaps to the frame border and other boxes; hold Alt to disable). Arrow keys nudge 1 px (Shift 10 px).'));
   const bar = _el('div', 'auto-actions layout-draw-bar');
   u.camBtns = {};

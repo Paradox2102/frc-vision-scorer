@@ -38,7 +38,14 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 #    them so kernel selection falls back to Marlin W8A16, which is how the
 #    FP8 repos (GLM-4.6V-Flash, Qwen3-VL-8B-FP8) ran on vLLM 0.22.1 too.
 export LD_LIBRARY_PATH="$PROJECT_ROOT/.venv-vllm/lib/python3.12/site-packages/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export VLLM_DISABLED_KERNELS=HummingFP8ScaledMMLinearKernel,HummingInt8ScaledMMLinearKernel,HummingLinearKernel
+#    Override from the environment for other GPUs (e.g. SM120 Blackwell on the
+#    RunPod pod, where the SM86 crash may not apply): VLLM_DISABLED_KERNELS=none
+#    disables nothing, any other value is passed through.
+if [ "${VLLM_DISABLED_KERNELS-}" = "none" ]; then
+  unset VLLM_DISABLED_KERNELS
+else
+  export VLLM_DISABLED_KERNELS="${VLLM_DISABLED_KERNELS:-HummingFP8ScaledMMLinearKernel,HummingInt8ScaledMMLinearKernel,HummingLinearKernel}"
+fi
 
 # Mount the dev sleep routes (/sleep, /wake_up, /is_sleeping) that
 # web/vllm_lifecycle.py uses to offload the GPU pool between phases instead

@@ -50,6 +50,16 @@ class VlmModel:
     # The escape prompt makes Qwen3-VL models over-conservative, so it is a
     # per-model choice, not a global switch.
     read_prompt: str = "incumbent"
+    # Absolute vLLM budget in GiB (weights + KV + encoder/activation headroom)
+    # used on cards bigger than the 24 GB reference (see serve_util). None =
+    # gpu_util x 24, i.e. the budget proven on the 3090.
+    vram_gb: Optional[float] = None
+
+
+#: The card gpu_util fractions were tuned on (RTX 3090).
+REFERENCE_CARD_GB = 24.0
+#: Cards below this keep the registry gpu_util fractions untouched.
+_BIG_CARD_GB = 30.0
 
 
 # Order here is the UI order (default first). Every model is served by the same
@@ -126,6 +136,29 @@ _REGISTRY: dict[str, VlmModel] = {
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         read_prompt="escape",
     ),
+    # Big-card readers (>= 48 GB; RunPod RTX PRO 6000 96 GB). They don't fit the
+    # 3090; gpu_util is moot there and only vram_gb matters (serve_util).
+    # Repo ids/sizes checked on HF 2026-11-12; vLLM 0.25.1 registers both
+    # architectures (Qwen3VLMoe / Qwen3_5Moe).
+    "qwen3.6-35b-a3b": VlmModel(
+        key="qwen3.6-35b-a3b",
+        label="Qwen3.6-35B-A3B (FP8, escape prompt, big card)",
+        hf_repo="Qwen/Qwen3.6-35B-A3B-FP8",
+        gpu_util=0.9,
+        notes="MoE, 3B active, official FP8 block-128 (37.5 GB). Pod bench "
+              "2026-11-12 (RTX PRO 6000): 73-75/90 legible, 0-1 wrong, but 6-8% FP "
+              "on junk crops (vs 2% Qwen3.5-4B) -> not the live reader. SM120 needs "
+              "triton MoE (DEEPGEMM OOMs; also set VLLM_USE_DEEP_GEMM=0) and a KV "
+              "cap or vLLM takes ~60 GB. (Qwen3-VL-30B-A3B-FP8 fails to load on "
+              "vLLM 0.25.1: MoE gate/up shape mismatch -> removed.)",
+        approx_gb=37.5,
+        vram_gb=44.0,
+        extra_serve_args=("--dtype", "bfloat16", "--moe-backend", "triton",
+                          "--kv-cache-memory-bytes", "4294967296"),
+        # Qwen3.5-family: thinks by default (see the qwen3.5-4b entry).
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        read_prompt="escape",
+    ),
 }
 
 
@@ -155,6 +188,36 @@ def payload_model(key: str, default: Optional[str] = None) -> str:
 
 def gpu_util(key: str) -> float:
     return get(key).gpu_util
+
+
+def serve_util(key: str, card_gb: Optional[float]) -> float:
+    """The --gpu-memory-utilization to launch ``key`` with on a ``card_gb`` card.
+
+    vLLM's flag is a fraction of the WHOLE card that this one instance may use.
+    The registry fractions were tuned on the 24 GB 3090 (phase-exclusive: vLLM
+    had the card to itself). On a big card the same fraction grabs far more
+    than the reader needs (0.65 x 96 GB = 62 GB for an 11 GB model), leaving no
+    room for SAM3 when vLLM stays resident. So on cards >= 30 GB the budget is
+    absolute: ``VLM_SERVER_GPU_GB`` (env, GiB) when set, else the model's
+    ``vram_gb``, else ``gpu_util x 24`` (the 3090-proven budget), divided by
+    the card size. Smaller cards (or an unknown size) keep ``gpu_util``
+    unchanged unless ``VLM_SERVER_GPU_GB`` is set.
+    """
+    model = get(key)
+    override = os.environ.get("VLM_SERVER_GPU_GB", "").strip()
+    budget: Optional[float] = None
+    if override:
+        try:
+            budget = float(override)
+        except ValueError:
+            budget = None
+    if not card_gb or card_gb <= 0:
+        return model.gpu_util
+    if budget is None:
+        if card_gb < _BIG_CARD_GB:
+            return model.gpu_util
+        budget = model.vram_gb or model.gpu_util * REFERENCE_CARD_GB
+    return round(min(max(budget / card_gb, 0.05), 0.92), 3)
 
 
 def extra_serve_args(key: str) -> list:

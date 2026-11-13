@@ -224,6 +224,21 @@ async def _try_wake(
     return False
 
 
+def _card_total_gib() -> "float | None":
+    """Total VRAM (GiB) of the card vLLM will land on, via nvidia-smi (no torch
+    import). First CUDA_VISIBLE_DEVICES entry, else GPU 0; None on any error."""
+    import subprocess
+    dev = (os.environ.get("CUDA_VISIBLE_DEVICES") or "0").split(",")[0].strip() or "0"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-i", dev, "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True).stdout
+        return float(out.strip().splitlines()[0]) / 1024.0
+    except Exception:
+        return None
+
+
 async def _default_run_script(name: str) -> None:
     """Start/stop the vLLM server for the active model.
 
@@ -232,14 +247,19 @@ async def _default_run_script(name: str) -> None:
     defaulting to the incumbent) plus any per-model extra ``vllm serve`` args
     (e.g. GLM's ``--reasoning-parser glm45``) as trailing script arguments the
     script forwards to ``vllm serve``; "stop" runs stop_vllm.sh (pid-based).
+    The util comes from ``vlm_models.serve_util``: the registry fraction on the
+    24 GB card, an absolute GiB budget on big cards (so a resident reader
+    leaves room for SAM3).
     """
     web_dir = _PROJECT_ROOT / "web"
     if name == "start":
         model = vlm_models.get(_active_model_key)
+        util = vlm_models.serve_util(_active_model_key, _card_total_gib())
+        print(f"  [vllm] starting {model.hf_repo} at gpu-memory-utilization {util}")
         env = {
             **os.environ,
             "VLM_MODEL_NAME": model.hf_repo,
-            "VLM_SERVER_GPU_UTIL": str(model.gpu_util),
+            "VLM_SERVER_GPU_UTIL": str(util),
         }
         args = [str(web_dir / "start_vllm.sh"), *model.extra_serve_args]
     else:

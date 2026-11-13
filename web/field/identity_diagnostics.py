@@ -145,6 +145,36 @@ class IdentityDiagnosticRecorder:
         finally:
             self._context = prev
 
+    def spawn_child(self) -> "IdentityDiagnosticRecorder":
+        """A private recorder for one concurrently-tracked view
+        (``sam3_parallel_views``): same clock and event cap, a COPY of the
+        current ambient context. Record into it from the view's thread, then
+        :meth:`absorb` it back — in view order — so the parent sees the same
+        event order as the sequential per-view loop and no two threads ever
+        share ``_context`` (which ``scoped_context`` mutates)."""
+        child = IdentityDiagnosticRecorder(clock=self.clock,
+                                           max_events=self._max_events)
+        child._context = dict(self._context)
+        return child
+
+    def absorb(self, child: "IdentityDiagnosticRecorder") -> None:
+        """Fold a :meth:`spawn_child` recorder into this one as if its calls
+        had been made here: events appended under this recorder's cap (the
+        overflow counts as dropped), counters summed, gauges overwritten,
+        timings extended. The child's context is not merged (a scope exit
+        would have restored it anyway)."""
+        for ev in child._events:
+            if len(self._events) < self._max_events:
+                self._events.append(ev)
+            else:
+                self._dropped_logs += 1
+        self._dropped_logs += child._dropped_logs
+        for name, amount in child._counters.items():
+            self._counters[name] = self._counters.get(name, 0) + amount
+        self._gauges.update(child._gauges)
+        for stage, durations in child._timings.items():
+            self._timings.setdefault(stage, []).extend(durations)
+
     def increment(self, counter: str, amount: int = 1) -> None:
         """Increment a diagnostic counter."""
         self._counters[counter] = self._counters.get(counter, 0) + amount

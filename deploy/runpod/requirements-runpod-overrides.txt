@@ -1,0 +1,6 @@
+# uv --override file for requirements-runpod.txt.
+# ultralytics depends on the GUI build (opencv-python), and the resolver would
+# pick opencv-python 5.x, whose cv2 would shadow the headless 4.10 build the
+# app runs on locally. Pin it to the same version; bootstrap.sh then removes
+# it and force-reinstalls opencv-python-headless so cv2 needs no libGL.
+opencv-python==4.10.0.84

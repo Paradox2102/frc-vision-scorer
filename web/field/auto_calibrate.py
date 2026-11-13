@@ -250,8 +250,9 @@ def download_match_video(video_key: str, out_path: Path) -> Path:
         "quiet": True,
         "noprogress": True,
     }
+    from web.ytdlp_cookies import with_cookies  # YTDLP_COOKIES_FILE (datacenter IPs)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(with_cookies(opts)) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_key}"])
     except Exception as e:  # yt_dlp.utils.DownloadError and friends
         raise AutoCalibError(f"download of {video_key} failed: {str(e)[:300]}")

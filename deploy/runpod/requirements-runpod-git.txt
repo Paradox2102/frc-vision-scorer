@@ -1,0 +1,11 @@
+# Installed AFTER requirements-runpod.txt with
+#   SAM2_BUILD_CUDA=0 uv pip install --no-deps --no-build-isolation -r requirements-runpod-git.txt
+# --no-deps: sam3 declares numpy<2 (runs fine on 2.3.5, as locally) and every
+#   real runtime dep is pinned in requirements-runpod.txt.
+# --no-build-isolation: sam2's build-system requires torch; without this uv
+#   would download a second (non-cu128) torch into the build sandbox.
+# SAM2_BUILD_CUDA=0: skip the optional connected-components CUDA extension
+#   (sam2 falls back to its Python path; only used when tracking_backend=sam2).
+# Commits pinned in pyproject.toml.
+sam2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4
+sam3 @ git+https://github.com/facebookresearch/sam3.git@8e451d5eb43c817b64ae7577fb7b9ae223db88a9

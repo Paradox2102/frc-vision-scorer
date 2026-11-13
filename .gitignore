@@ -171,3 +171,11 @@ data/eval/event_lineup
 # Teacher-distillation harvest: downloaded prior-season videos + crops/manifests (local only)
 data/prior_years/
 data/teacher/
+
+# RunPod deployment (deploy/runpod): local pod state, per-pod ssh host keys,
+# tuning results, and everything pulled back from a pod.
+deploy/runpod/.state.json
+deploy/runpod/.state.*.json
+deploy/runpod/.known_hosts_*
+deploy/runpod/tune_results/
+data/runpod_pull/

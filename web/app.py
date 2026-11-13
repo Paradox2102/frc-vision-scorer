@@ -57,6 +57,7 @@ from web.embedder import (
     thresholds_for,
 )
 from web.job_config import JobConfig
+from web.ytdlp_cookies import with_cookies as with_ytdlp_cookies
 from web import clef_reader
 from web import jev_reader
 from web import job_config as job_config_registry
@@ -11310,7 +11311,7 @@ async def grab_frame(request: Request):
             'format_sort': ['res:1080', 'vcodec:h264'],
             'quiet': True,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(with_ytdlp_cookies(ydl_opts)) as ydl:
             info = ydl.extract_info(url, download=False)
             stream_url = info.get('url')
             if not stream_url:
@@ -11560,7 +11561,7 @@ def _match_stream_url(match_key: str):
         'quiet': True,
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(with_ytdlp_cookies(ydl_opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={vk}",
                                     download=False)
         stream_url = info.get('url')
@@ -15197,7 +15198,7 @@ async def infer(
                 'outtmpl': str(video_path),
                 'quiet': True
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(with_ytdlp_cookies(ydl_opts)) as ydl:
                 ydl.download([youtube_url])
         
         else:

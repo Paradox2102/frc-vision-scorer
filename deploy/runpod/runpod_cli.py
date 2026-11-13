@@ -57,6 +57,7 @@ POD_WS = "/workspace"
 POD_APP = f"{POD_WS}/frc"
 POD_TUNE = f"{POD_WS}/tune"
 POD_LOG = f"{POD_WS}/logs/server.log"
+POD_PORT = 8004                     # app port on the pod (serve.sh)
 
 # runpod/pytorch: Ubuntu 24.04 (Python 3.12), CUDA 12.8.1, sshd + PUBLIC_KEY
 # handling preconfigured. Its own torch is unused (the app venv pins torch
@@ -569,7 +570,7 @@ def wait_for_ssh(st: dict, timeout_s: float = 900) -> None:
 
 
 def remote_job_active(st: dict) -> str | None:
-    out = ssh_out(st, "curl -s -m 10 http://127.0.0.1:8004/api/job/active || true", check=False).strip()
+    out = ssh_out(st, f"curl -s -m 10 http://127.0.0.1:{POD_PORT}/api/job/active || true", check=False).strip()
     try:
         return json.loads(out).get("job_id")
     except ValueError:
@@ -614,7 +615,8 @@ def push_bundle(st: dict, plan: BundlePlan, scratch: Path, *, replace_code: bool
         # never touches .venv, .env, profile.env, frc_scorer.db, web/uploads,
         # web/replays, web/logs or weights.
         clear = (f"cd {POD_APP} && rm -rf src web/field web/scouting web/static web/students data/field && "
-                 "find web -maxdepth 1 -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.md' \\) -delete && ")
+                 "{ [ ! -d web ] || find web -maxdepth 1 -type f "
+                 "\\( -name '*.py' -o -name '*.sh' -o -name '*.md' \\) -delete; } && ")
     t0 = time.time()
     with open(tar_path, "rb") as f:
         ssh_run(st, f"mkdir -p {POD_APP} && {clear}tar -xf - -C {POD_APP} --no-same-owner", stdin_file=f)
@@ -674,7 +676,7 @@ def tunnel_cmd(st: dict, port: int) -> list:
             "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={kh}",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
             "-o", "ExitOnForwardFailure=yes",
-            "-L", f"{port}:127.0.0.1:8004", f"root@{st['ssh_host']}"]
+            "-L", f"{port}:127.0.0.1:{POD_PORT}", f"root@{st['ssh_host']}"]
 
 
 # --------------------------------------------------------------------------
@@ -997,6 +999,7 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
         launch = (f"mkdir -p {POD_TUNE}/jobs && cd {POD_APP} && setsid nohup .venv/bin/python "
                   f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {TUNE_MATCH_KEY} "
                   f"--event {TUNE_EVENT} --label {rung.name} --config-json {shlex.quote(cfg)} "
+                  f"--host 127.0.0.1:{POD_PORT} "
                   f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null & echo started")
         ssh_run(st, f"rm -f {out}; " + launch)
         print(f"  [{rung.name}] launched {cfg}", flush=True)

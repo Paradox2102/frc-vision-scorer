@@ -746,13 +746,16 @@ def test_window_labels_reader_knob_default_student_only(monkeypatch):
     assert knob.choices == ("jev", "student", "student_only")
     monkeypatch.setenv("WINDOW_LABELS_READER", "jev")
     assert JobConfig().window_labels_reader == "jev"
-def test_sam3_skip_detector_heads_knob_default_off(monkeypatch):
-    # Backbone-only partial path: byte-identical offline but DEFAULT OFF
-    # pending a live A/B (see web/job_config.py comment).
+
+
+def test_sam3_skip_detector_heads_knob_default_on(monkeypatch):
+    # Backbone-only partial path: byte-identical offline; DEFAULT ON since the
+    # 2026-11-12 live A/B (see web/job_config.py comment).
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.sam3_skip_detector_heads is False
+    assert cfg.sam3_skip_detector_heads is True
+    assert "sam3_skip_detector_heads" not in cfg.non_defaults()
 
 
 def test_sam3_skip_detector_heads_knob_env_and_override(monkeypatch):
@@ -763,11 +766,11 @@ def test_sam3_skip_detector_heads_knob_env_and_override(monkeypatch):
     assert cfg2.sam3_skip_detector_heads is False
 
 
-def test_sam3_retire_culled_knob_default_off(monkeypatch):
+def test_sam3_retire_culled_knob_default_on(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.sam3_retire_culled is False
+    assert cfg.sam3_retire_culled is True
 
 
 def test_sam3_retire_culled_knob_env_and_override(monkeypatch):
@@ -778,12 +781,12 @@ def test_sam3_retire_culled_knob_env_and_override(monkeypatch):
     assert cfg2.sam3_retire_culled is False
 
 
-def test_selective_segmented_knobs_default_off(monkeypatch):
+def test_selective_segmented_knobs_defaults(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     cfg = JobConfig()
-    assert cfg.selective_retire_closed is False
-    assert cfg.selective_lazy_seed is False
+    assert cfg.selective_retire_closed is True
+    assert cfg.selective_lazy_seed is False   # never live A/B'd
 
 
 def test_selective_segmented_knobs_env_and_override(monkeypatch):

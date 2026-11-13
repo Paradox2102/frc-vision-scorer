@@ -169,17 +169,18 @@ KNOBS = [
     # discards the detections; only the tracker backbone features are used.
     # ON computes backbone + tracker neck only. Offline 2026-11-06 (qm11 v_main,
     # 9 objs): byte-identical masks, -36 ms/frame
-    # (docs/sam3-per-frame-profile-2026-11-06.md). DEFAULT OFF pending live A/B.
-    Knob("sam3_skip_detector_heads", "SAM3_SKIP_DETECTOR_HEADS", bool, False,
+    # (docs/sam3-per-frame-profile-2026-11-06.md). DEFAULT ON since 2026-11-12
+    # (live A/B: qm8 GT tracking identical, see selective_retire_closed).
+    Knob("sam3_skip_detector_heads", "SAM3_SKIP_DETECTOR_HEADS", bool, True,
          section="Tracking backend"),
     # Retire culled/evicted tracks from the SAM3 session (remove_object)
     # instead of only filtering their outputs. Today a culled hijack keeps its
     # last_box fresh, so the adapter re-anchors it every window and re-seeds
     # it at every chunk boundary: tracked forever at ~42 ms/frame. Offline
     # 2026-11-06: -~42 ms/frame per retired object, survivors' masks
-    # byte-identical. Bookkeeping-only under sam3_multiplex. DEFAULT OFF
-    # pending live A/B.
-    Knob("sam3_retire_culled", "SAM3_RETIRE_CULLED", bool, False,
+    # byte-identical. Bookkeeping-only under sam3_multiplex. DEFAULT ON since
+    # 2026-11-12 (live A/B, see selective_retire_closed).
+    Knob("sam3_retire_culled", "SAM3_RETIRE_CULLED", bool, True,
          section="Tracking backend"),
     # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
     # skip full-frame mask propagation for a tracked object while its match is
@@ -287,8 +288,11 @@ KNOBS = [
     # `refine` action, no new prompt). Outcome-preserving: the ExitMachine
     # never reads a fully-closed oid's masks (kill pairs and settles only
     # involve open windows). SAM3 base model only (SAM2 / multiplex keep the
-    # single-pass episode). DEFAULT OFF pending live A/B.
-    Knob("selective_retire_closed", "SELECTIVE_RETIRE_CLOSED", bool, False,
+    # single-pass episode). DEFAULT ON since 2026-11-12: with the two SAM3 levers
+    # above, live A/B cc qm1 14.6 -> 9.1 min, hop qm45 main view 753 -> 423
+    # ms/frame (busy matches chain windows into 1-2 episodes), qm8 9.5 -> 8.0
+    # min with GT tracking identical and labels within run-to-run noise.
+    Knob("selective_retire_closed", "SELECTIVE_RETIRE_CLOSED", bool, True,
          section="Tracking backend"),
     # Lazy seeding for selective episodes. Today every oid is prompted up
     # front at its own seed frame and propagated from the EPISODE start, so a

@@ -182,6 +182,16 @@ KNOBS = [
     # 2026-11-12 (live A/B, see selective_retire_closed).
     Knob("sam3_retire_culled", "SAM3_RETIRE_CULLED", bool, True,
          section="Tracking backend"),
+    # Threads for SAM3 chunk-session frame loading. Upstream decodes+resizes
+    # every chunk JPEG one at a time with PIL (the session-open bottleneck on
+    # many-core / slow-single-thread hosts); this fans upstream's own
+    # per-frame loader over a shared thread pool (PIL releases the GIL).
+    # 0 = auto (min(16, effective CPUs), <=1 -> off), 1 = upstream
+    # single-thread loader, N>1 = N threads. Byte-identical masks, so DEFAULT
+    # ON (auto): Nov 12 RunPod microbench session open 8.3 s -> 1.2 s at 16
+    # threads, masks byte-identical (est. -100-130 s/job on the pod).
+    Knob("sam3_frame_load_workers", "SAM3_FRAME_LOAD_WORKERS", int, 0,
+         min=0, max=64, section="Tracking backend"),
     # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
     # skip full-frame mask propagation for a tracked object while its match is
     # comfortably inside selective_margin_entry (in 1 - expanded-IoU cost

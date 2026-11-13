@@ -781,6 +781,25 @@ def test_sam3_retire_culled_knob_env_and_override(monkeypatch):
     assert cfg2.sam3_retire_culled is False
 
 
+def test_sam3_frame_load_workers_knob_default_auto(monkeypatch):
+    # Byte-identical threaded frame loader: DEFAULT ON via auto (0).
+    for knob in KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+    cfg = JobConfig()
+    assert cfg.sam3_frame_load_workers == 0
+    assert "sam3_frame_load_workers" not in cfg.non_defaults()
+    knob = next(k for k in KNOBS if k.name == "sam3_frame_load_workers")
+    assert knob.type is int and knob.section == "Tracking backend"
+
+
+def test_sam3_frame_load_workers_knob_env_and_override(monkeypatch):
+    monkeypatch.setenv("SAM3_FRAME_LOAD_WORKERS", "8")
+    cfg = JobConfig()
+    assert cfg.sam3_frame_load_workers == 8
+    cfg2 = JobConfig({"sam3_frame_load_workers": "1"})
+    assert cfg2.sam3_frame_load_workers == 1
+
+
 def test_selective_segmented_knobs_defaults(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)

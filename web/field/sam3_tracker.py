@@ -69,9 +69,12 @@ it's what lets a target keep propagating across a reverse chunk boundary.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
 import tempfile
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -408,6 +411,147 @@ def install_skip_detector_heads(model: Any) -> bool:
     return True
 
 
+# ── sam3_frame_load_workers: threaded chunk-session frame loader ──────────
+#
+# Every chunk session open (start_session -> io_utils.load_resource_as_video_
+# frames -> load_video_frames -> load_video_frames_from_image_folder, all
+# resolved through io_utils module globals at call time) decodes + resizes the
+# chunk's JPEGs one at a time with PIL. PIL decode/resize release the GIL, so
+# fanning upstream's own per-frame ``_load_img_as_tensor`` over a thread pool
+# is byte-identical and much faster on many-core hosts (Nov 12 RunPod
+# microbench: session open 8.3 s -> 1.2 s at 16 threads).
+
+_FRAME_LOAD_POOL: Any = None
+_FRAME_LOAD_POOL_WORKERS = 0
+_FRAME_LOAD_POOL_LOCK = threading.Lock()
+_ORIG_LOAD_FROM_IMAGE_FOLDER: Any = None
+
+
+def _frame_load_pool(workers: int) -> Any:
+    """Module-shared executor, created lazily and reused across sessions;
+    recreated only when a larger worker count is requested."""
+    global _FRAME_LOAD_POOL, _FRAME_LOAD_POOL_WORKERS
+    with _FRAME_LOAD_POOL_LOCK:
+        if _FRAME_LOAD_POOL is None or workers > _FRAME_LOAD_POOL_WORKERS:
+            old = _FRAME_LOAD_POOL
+            _FRAME_LOAD_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="sam3-frame-load")
+            _FRAME_LOAD_POOL_WORKERS = workers
+            if old is not None:
+                old.shutdown(wait=False)
+        return _FRAME_LOAD_POOL
+
+
+def _make_threaded_loader(orig: Any, workers: int) -> Any:
+    from sam3.model import io_utils
+
+    def load_video_frames_from_image_folder(
+        image_folder,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        async_loading_frames,
+    ):
+        # Lazy (async) loader: upstream path unchanged.
+        if async_loading_frames:
+            return orig(
+                image_folder=image_folder,
+                image_size=image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=img_mean,
+                img_std=img_std,
+                async_loading_frames=async_loading_frames,
+            )
+        import torch
+
+        # Below mirrors upstream exactly except the per-frame map.
+        frame_names = [
+            p
+            for p in os.listdir(image_folder)
+            if os.path.splitext(p)[-1].lower() in io_utils.IMAGE_EXTS
+        ]
+        try:
+            frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        except ValueError:
+            io_utils.logger.warning(
+                f'frame names are not in "<frame_index>.<img_ext>" format: '
+                f"{frame_names[:5]=}, falling back to lexicographic sort."
+            )
+            frame_names.sort()
+        num_frames = len(frame_names)
+        if num_frames == 0:
+            raise RuntimeError(f"no images found in {image_folder}")
+        img_paths = [os.path.join(image_folder, n) for n in frame_names]
+        img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+        img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+        images = torch.zeros(num_frames, 3, image_size, image_size,
+                             dtype=torch.float16)
+        video_height, video_width = None, None
+        pool = _frame_load_pool(workers)
+        load_one = io_utils._load_img_as_tensor
+        for n, (img, video_height, video_width) in enumerate(
+            pool.map(lambda p: load_one(p, image_size), img_paths)
+        ):
+            images[n] = img
+        if not offload_video_to_cpu:
+            images = images.cuda()
+            img_mean = img_mean.cuda()
+            img_std = img_std.cuda()
+        images -= img_mean
+        images /= img_std
+        return images, video_height, video_width
+
+    load_video_frames_from_image_folder._frc_threaded_loader = True
+    load_video_frames_from_image_folder._frc_workers = workers
+    return load_video_frames_from_image_folder
+
+
+def install_threaded_frame_loader(workers: int) -> bool:
+    """Monkeypatch ``sam3.model.io_utils.load_video_frames_from_image_folder``
+    with a byte-identical thread-pooled version (the
+    ``sam3_frame_load_workers`` knob). Idempotent; a later call with more
+    workers re-installs with the larger pool. ``workers <= 1`` = no install.
+    Returns True when the threaded loader is in place."""
+    global _ORIG_LOAD_FROM_IMAGE_FOLDER
+    workers = int(workers or 0)
+    if workers <= 1:
+        return False
+    try:
+        from sam3.model import io_utils
+    except Exception as exc:
+        print(f"  [SAM3] threaded frame loader: sam3 not importable ({exc!r}) "
+              "— not installed")
+        return False
+    current = io_utils.load_video_frames_from_image_folder
+    if getattr(current, "_frc_threaded_loader", False):
+        if int(getattr(current, "_frc_workers", 0)) >= workers:
+            return True
+    else:
+        _ORIG_LOAD_FROM_IMAGE_FOLDER = current
+    io_utils.load_video_frames_from_image_folder = _make_threaded_loader(
+        _ORIG_LOAD_FROM_IMAGE_FOLDER, workers)
+    return True
+
+
+def _uninstall_threaded_frame_loader() -> None:
+    """Test helper: restore upstream's loader and drop the shared pool."""
+    global _ORIG_LOAD_FROM_IMAGE_FOLDER, _FRAME_LOAD_POOL, _FRAME_LOAD_POOL_WORKERS
+    try:
+        from sam3.model import io_utils
+    except Exception:
+        return
+    if _ORIG_LOAD_FROM_IMAGE_FOLDER is not None:
+        io_utils.load_video_frames_from_image_folder = _ORIG_LOAD_FROM_IMAGE_FOLDER
+        _ORIG_LOAD_FROM_IMAGE_FOLDER = None
+    with _FRAME_LOAD_POOL_LOCK:
+        if _FRAME_LOAD_POOL is not None:
+            _FRAME_LOAD_POOL.shutdown(wait=True)
+        _FRAME_LOAD_POOL = None
+        _FRAME_LOAD_POOL_WORKERS = 0
+
+
 def _list_frame_paths(frames_dir: str) -> list[str]:
     names = [n for n in sorted(os.listdir(frames_dir))
              if n.lower().endswith((".jpg", ".jpeg", ".png"))]
@@ -453,6 +597,10 @@ class Sam3PredictorAdapter:
         # box prompt. Sam3FieldTracker sets False for multiplex (its objects
         # share bucketed states; the bare-refine path is unverified there).
         self.refine_resume = True
+        # Session-open wall time (start_session = frame load + init_state),
+        # accumulated across chunks; shown as ``open=`` on chunk-closed lines.
+        self.session_open_s_total = 0.0
+        self.session_open_count = 0
 
     # ── SAM2-protocol surface ────────────────────────────────────────
 
@@ -732,6 +880,7 @@ class Sam3PredictorAdapter:
             os.symlink(os.path.abspath(src), os.path.join(tmp_dir, f"{i:08d}.jpg"))
 
         offload_video, offload_state = state["offload"]
+        t_open = time.perf_counter()
         response = self._predictor.handle_request(
             {
                 "type": "start_session",
@@ -740,11 +889,15 @@ class Sam3PredictorAdapter:
                 "offload_state_to_cpu": offload_state,
             }
         )
+        open_s = time.perf_counter() - t_open
+        self.session_open_s_total += open_s
+        self.session_open_count += 1
         state["chunk"] = {
             "session_id": response["session_id"],
             "lo": lo,
             "hi": hi,
             "dir": tmp_dir,
+            "open_s": open_s,
             # obj_ids prompted since the last propagate request in this
             # session; consumed (cleared) by each _stream_chunk call.
             "prompted": set(),
@@ -798,6 +951,8 @@ class Sam3PredictorAdapter:
             retired = int(chunk.get("retired", 0) or 0)
             if retired:
                 refused_note += f" retired_objects={retired}"
+            open_s = chunk.get("open_s")
+            open_note = f" open={open_s:.2f}s" if open_s is not None else ""
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -805,7 +960,7 @@ class Sam3PredictorAdapter:
                     reserved = torch.cuda.memory_reserved() / 2**30
                     print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']}) "
                           f"VRAM allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB"
-                          f"{refused_note}")
+                          f"{open_note}{refused_note}")
                 elif refused_note:
                     print(f"  [SAM3] chunk closed [{chunk['lo']},{chunk['hi']})"
                           f"{refused_note}")
@@ -968,6 +1123,7 @@ class Sam3FieldTracker(Sam2FieldTracker):
         multiplex: bool = SAM3_MULTIPLEX,
         skip_detector_heads: bool = False,
         retire_culled: bool = False,
+        frame_load_workers: int = 0,
     ) -> None:
         if device != "cuda":
             raise RuntimeError("SAM 3 video model currently requires CUDA")
@@ -1028,6 +1184,15 @@ class Sam3FieldTracker(Sam2FieldTracker):
             if self.skip_detector_heads_active:
                 print("  [SAM3] skip_detector_heads: partial-path detector heads "
                       "disabled (backbone + tracker neck only)")
+
+        # sam3_frame_load_workers: thread-pooled chunk frame loader
+        # (byte-identical to upstream; patches sam3.model.io_utils globally).
+        self.frame_load_workers_active = 0
+        if int(frame_load_workers or 0) > 1:
+            if install_threaded_frame_loader(int(frame_load_workers)):
+                self.frame_load_workers_active = int(frame_load_workers)
+                print(f"  [SAM3] threaded frame loader: "
+                      f"{self.frame_load_workers_active} workers")
 
         adapter = Sam3PredictorAdapter(
             predictor,

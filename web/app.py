@@ -8618,7 +8618,15 @@ class InferenceJob:
                         # awaits this task before seeding uses the tracker.
                         if self.tracking_backend == "sam3":
                             from web.field.sam3_tracker import Sam3FieldTracker
+                            from web.cpu_budget import effective_cpu_count
 
+                            # sam3_frame_load_workers: 0 = auto
+                            # (min(16, effective CPUs)); <=1 = upstream loader.
+                            _frame_load_workers = int(self.config.sam3_frame_load_workers or 0)
+                            if _frame_load_workers <= 0:
+                                _frame_load_workers = min(16, effective_cpu_count())
+                            if _frame_load_workers <= 1:
+                                _frame_load_workers = 0
                             tracker = Sam3FieldTracker(
                                 checkpoint=SAM3_CHECKPOINT,
                                 device=device,
@@ -8631,6 +8639,7 @@ class InferenceJob:
                                 multiplex=self.config.sam3_multiplex,
                                 skip_detector_heads=self.config.sam3_skip_detector_heads,
                                 retire_culled=self.config.sam3_retire_culled,
+                                frame_load_workers=_frame_load_workers,
                             )
                             detail = (
                                 f"video model w/ instance prompts, "
@@ -8639,7 +8648,8 @@ class InferenceJob:
                                 f"multiplex={self.config.sam3_multiplex}, "
                                 f"skip_detector_heads={self.config.sam3_skip_detector_heads}"
                                 f"(active={tracker.skip_detector_heads_active}), "
-                                f"retire_culled={self.config.sam3_retire_culled}"
+                                f"retire_culled={self.config.sam3_retire_culled}, "
+                                f"frame_load_workers={tracker.frame_load_workers_active}"
                             )
                         else:
                             from web.field.sam2_tracker import Sam2FieldTracker
@@ -11062,6 +11072,14 @@ async def startup():
     """Initialize database on startup."""
     from database import init_db
     await init_db()
+    # Clamp torch's intra-op pool to the CPUs this container can really use
+    # (cgroup quota on RunPod); only ever lowers it. Once per process, early,
+    # before job worker threads initialise their OpenMP pools.
+    try:
+        from web.cpu_budget import clamp_torch_threads
+        print(f"[startup] {clamp_torch_threads()}")
+    except Exception as e:
+        print(f"[startup] cpu budget check failed: {e}")
     try:
         swept = await _sweep_stale_renders()
         if swept["requeued"] or swept["failed"]:

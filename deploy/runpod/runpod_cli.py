@@ -660,8 +660,14 @@ def install_secrets(st: dict, secrets: dict) -> None:
 
 def gather_secrets(args) -> dict:
     loc = local_env()
-    if getattr(args, "secrets_from_env", False) or getattr(args, "yes", False):
+    # Keys always come from the operator: their own local .env (only with the
+    # explicit --secrets-from-env) or typed at the prompt. Nothing in the repo
+    # or the bundle carries a key, and --yes alone never reads .env.
+    if getattr(args, "secrets_from_env", False):
         return select_secrets(loc, interactive=False)
+    if getattr(args, "yes", False):
+        raise SystemExit("--yes skips prompts, so the pod's API keys need --secrets-from-env "
+                         "(reads YOUR local .env) or run without --yes to type them")
     print("\nSecrets for the pod (written over ssh to /workspace/frc/.env, chmod 600):")
     return select_secrets(loc, interactive=True, input_fn=lambda p: getpass.getpass(p))
 
@@ -1287,8 +1293,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-download-mbps", type=float)
     p.add_argument("--network-volume-id")
     p.add_argument("--cookies", help="YouTube cookies.txt to upload (sets YTDLP_COOKIES_FILE)")
-    p.add_argument("--yes", action="store_true", help="non-interactive (implies --secrets-from-env)")
-    p.add_argument("--secrets-from-env", action="store_true", help="take secrets from the local .env, no prompts")
+    p.add_argument("--yes", action="store_true", help="skip the rent/confirm prompts (keys still need --secrets-from-env)")
+    p.add_argument("--secrets-from-env", action="store_true", help="take the pod API keys from YOUR local .env instead of prompting")
     p.add_argument("--dry-run", action="store_true", help="print the API body + bundle manifest; create nothing")
     p.add_argument("--keep-bundle", metavar="PATH", help="with --dry-run: also write the tarball here")
     p.add_argument("--overwrite-db", action="store_true",

@@ -314,3 +314,19 @@ def test_requirements_pins():
     pyproject = (REPO / "pyproject.toml").read_text()
     for commit in ("2b90b9f5ceec907a1c18123530e92e794ad901a4", "8e451d5eb43c817b64ae7577fb7b9ae223db88a9"):
         assert commit in git_req and commit in pyproject
+
+
+def test_yes_alone_never_reads_local_env(monkeypatch):
+    """--yes skips prompts but must not silently ship the operator's .env keys."""
+    import argparse
+    monkeypatch.setattr(cli, "local_env", lambda: dict(LOCAL))
+    with pytest.raises(SystemExit, match="secrets-from-env"):
+        cli.gather_secrets(argparse.Namespace(yes=True, secrets_from_env=False))
+    got = cli.gather_secrets(argparse.Namespace(yes=True, secrets_from_env=True))
+    assert got["TBA_API_KEY"] == "tba-key-9999" and "RUNPOD_API" not in got
+
+
+def test_repo_ships_no_key_defaults():
+    """No secret spec carries a baked-in default value."""
+    for s in cli.SECRET_SPECS:
+        assert not getattr(s, "default", None)

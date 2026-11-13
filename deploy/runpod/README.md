@@ -12,6 +12,12 @@ alias rp='.venv/bin/python deploy/runpod/runpod_cli.py'
 The CLI reads `RUNPOD_API` from the main checkout's `.env`. That key never
 leaves your machine.
 
+
+> **API keys are never in the repo or the bundle.** The pod's keys come from
+> whoever runs the CLI: typed at the `up`/`secrets` prompt, or — only with the
+> explicit `--secrets-from-env` flag — read from *your own* local `.env`.
+> `--yes` skips the rent prompt but never reads `.env` by itself.
+
 ## 1. Pick a GPU
 
 ```bash

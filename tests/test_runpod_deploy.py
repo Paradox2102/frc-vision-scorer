@@ -330,3 +330,26 @@ def test_repo_ships_no_key_defaults():
     """No secret spec carries a baked-in default value."""
     for s in cli.SECRET_SPECS:
         assert not getattr(s, "default", None)
+
+
+def test_multiplex_arm_layers_on_base_rung():
+    tier = profiles.tier_for_vram(97887)
+    base = profiles.rung_by_name(tier, "R1")
+    arms = {a.tag: a for a in profiles.ARMS}
+    assert arms["M"].knobs == {"sam3_multiplex": True}
+    r = profiles.arm_rung(base, arms["M"])
+    assert r.name == "R1M"
+    assert r.knobs == {**base.knobs, "sam3_multiplex": True}
+    assert r.delta == {"sam3_multiplex": True}
+    # arms are never ladder rungs (never recommended / applied)
+    assert all(not x.name.endswith("M") for x in profiles.ladder(tier))
+
+
+def test_arm_base_prefers_recommendation_then_r1():
+    import runpod_cli as cli
+    rungs = profiles.ladder(profiles.tier_for_vram(97887))
+    done = {"status": "done"}
+    assert cli.arm_base(rungs, {"R0": done, "R1": done, "R2": done}, "R2").name == "R2"
+    assert cli.arm_base(rungs, {"R0": done, "R1": done, "R2": done}, None).name == "R1"
+    assert cli.arm_base(rungs, {"R0": done}, None).name == "R0"
+    assert cli.arm_base(rungs, {}, None) is None

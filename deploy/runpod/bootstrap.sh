@@ -133,6 +133,13 @@ def sam3():
     p = download_ckpt_from_hf("sam3")
     print(f"       {p} ({Path(p).stat().st_size / 1e9:.2f} GB)")
 
+def sam3_1():
+    # tune's experimental arm R<n>M (sam3_multiplex) loads SAM 3.1; separate
+    # gated repo, so a missing grant only skips that arm (soft attempt below).
+    from sam3.model_builder import download_ckpt_from_hf
+    p = download_ckpt_from_hf("sam3.1")
+    print(f"       {p} ({Path(p).stat().st_size / 1e9:.2f} GB)")
+
 def dinov3():
     import timm
     timm.create_model("timm/vit_small_patch16_dinov3.lvd1689m", pretrained=True, num_classes=0)
@@ -142,6 +149,11 @@ def easyocr_models():
     easyocr.Reader(["en"], gpu=False, verbose=False)
 
 attempt("SAM3 checkpoint (facebook/sam3, gated)", sam3)
+try:
+    sam3_1()
+    print("  ok   SAM3.1 multiplex checkpoint (facebook/sam3.1, gated; tune arm M)")
+except Exception as e:
+    print(f"  WARN SAM3.1 multiplex checkpoint (tune arm M will fail): {type(e).__name__}: {str(e)[:200]}")
 attempt("DINOv3 ViT-S (S4 backbone fallback / dinov3 embedder)", dinov3)
 attempt("EasyOCR en", easyocr_models)
 if not ok:

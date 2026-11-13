@@ -179,6 +179,37 @@ def ladder(tier: Tier) -> list[Rung]:
     return rungs
 
 
+# ---------------------------------------------------------------------------
+# Experimental arms: measured by `tune` AFTER the ladder, each on top of the
+# recommended rung (R1 if none), named <rung><tag> (e.g. R1M). Never
+# recommended or applied automatically -- the table shows them next to their
+# base rung so the A/B is read by eye. Skip with `tune --no-arms`.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Arm:
+    tag: str
+    knobs: dict
+    rationale: str = ""
+
+
+ARMS = (
+    Arm("M", {"sam3_multiplex": True},
+        "SAM 3.1 Object Multiplex (sam3.1_multiplex.pt): objects propagated "
+        "jointly in shared buckets instead of one tracker pass each. Nov 6 on "
+        "the 24 GB 3090: +26% slower and OOM on a full match -> knob OFF. The "
+        "pod profile (Nov 12) is per-object launch/sync bound (~5.5 ms per "
+        "object-frame, ~640 kernels + ~20 .item() each, GPU ~60% busy) with "
+        "VRAM to spare, which is exactly what multiplex batching targets -- "
+        "re-measure on a big card before writing it off."),
+)
+
+
+def arm_rung(base: Rung, arm: Arm) -> Rung:
+    """``base`` + ``arm.knobs`` as a measurable rung named ``base.name + tag``."""
+    return Rung(base.name + arm.tag, {**base.knobs, **arm.knobs}, dict(arm.knobs),
+                f"{base.name} + arm {arm.tag}: {arm.rationale}")
+
+
 def rung_by_name(tier: Tier, name: str) -> Rung:
     name = name.upper()
     for r in ladder(tier):

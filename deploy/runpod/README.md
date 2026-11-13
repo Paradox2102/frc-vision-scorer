@@ -132,7 +132,16 @@ rp tune                    # R0 upwards, stops at the first rung over 8.0 min
 rp tune --budget-min 7 --start R2
 rp tune --show             # table only
 rp tune --apply R3         # write that rung into profile.env + restart
+rp tune --arms-only        # only the experimental arms, on the measured recommendation
 ```
+
+After the climb, `tune` also measures the **experimental arms** in
+`profiles.ARMS` on top of the recommended rung (R1 if none), as `<rung><tag>`
+rows in the same table — currently `M` = `sam3_multiplex` (SAM 3.1 Object
+Multiplex; lost on the 24 GB 3090, re-measured on big cards). Arms are never
+recommended or applied; `--no-arms` skips them. The 3.1 checkpoint
+(`facebook/sam3.1`, gated separately) is prefetched by bootstrap with a warning,
+not a failure, if the HF token lacks access.
 
 Each rung is one **full-match** run of 2026cur qm8 (the cached local video,
 uploaded once to `/workspace/tune`; no YouTube), submitted with the rung's

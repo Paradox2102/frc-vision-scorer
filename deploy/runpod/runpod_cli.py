@@ -1147,6 +1147,46 @@ def _table_order(res: dict, order: list) -> list:
     return list(dict.fromkeys(list(order) + sorted(res.get("rungs", {}))))
 
 
+def arm_base(rungs: list, rows: dict, rec: str | None) -> "profiles.Rung | None":
+    """Rung the experimental arms sit on: the recommendation, else R1, else
+    the highest rung that finished."""
+    by = {r.name: r for r in rungs}
+    if rec in by:
+        return by[rec]
+    done = [r for r in rungs if (rows.get(r.name) or {}).get("status") == "done"]
+    if "R1" in by and any(r.name == "R1" for r in done):
+        return by["R1"]
+    return done[-1] if done else None
+
+
+def run_arms(st: dict, res: dict, rungs: list, rec: str | None, remote_video: str,
+             local_video: Path, args) -> None:
+    """Measure profiles.ARMS on top of the base rung (never recommended or
+    applied; a failed arm doesn't stop the others)."""
+    base = arm_base(rungs, res["rungs"], rec)
+    if base is None:
+        print("no finished rung to run the experimental arms on; skipping arms")
+        return
+    arm_rungs = [profiles.arm_rung(base, a) for a in profiles.ARMS]
+    print(f"\nexperimental arms on {base.name}: {', '.join(r.name for r in arm_rungs)}")
+    for rung in arm_rungs:
+        prev = res["rungs"].get(rung.name)
+        if prev and prev.get("status") == "done" and not args.redo:
+            print(f"  [{rung.name}] already measured (skip; --redo to re-run)")
+            continue
+        print(f"  [{rung.name}] {rung.rationale[:120]}")
+        state = run_rung_remote(st, rung, remote_video)
+        row = {"knobs": rung.knobs, "delta": rung.delta, "arm_of": base.name, **{k: state.get(k) for k in (
+            "status", "error", "job_id", "wall_job_s", "wall_final_s", "peak_vram_mib",
+            "timings", "replay", "window_labels_aborted")}}
+        if row["status"] == "done":
+            print(f"  [{rung.name}] scoring replay {row['job_id'][:8]} locally...", flush=True)
+            row["scores"] = score_locally(st, row, local_video, args.score_shift)
+        res["rungs"][rung.name] = row
+        save_tune(res)
+    print_tune_table(res, _table_order(res, [r.name for r in rungs]), args.budget_min, args.budget_on)
+
+
 def cmd_tune(args) -> int:
     st = load_state()
     pod_id = require_pod(st)
@@ -1179,9 +1219,11 @@ def cmd_tune(args) -> int:
     sfx = (args.tag or "X") if extra else ""
     start = order.index(args.start.upper() + sfx)
     stop = order.index(args.stop.upper() + sfx) if args.stop else len(order) - 1
-    print(f"tuning on {st.get('gpu_name')} ({tier.name}); budget {args.budget_min} min "
-          f"({args.budget_on}); rungs {order[start]}..{order[stop]}")
-    for rung in rungs[start:stop + 1]:
+    climb = [] if getattr(args, "arms_only", False) else rungs[start:stop + 1]
+    if climb:
+        print(f"tuning on {st.get('gpu_name')} ({tier.name}); budget {args.budget_min} min "
+              f"({args.budget_on}); rungs {order[start]}..{order[stop]}")
+    for rung in climb:
         prev = res["rungs"].get(rung.name)
         if prev and prev.get("status") == "done" and not args.redo:
             print(f"  [{rung.name}] already measured (skip; --redo to re-run)")
@@ -1206,6 +1248,8 @@ def cmd_tune(args) -> int:
     rec = recommend(res["rungs"], order, args.budget_min, args.budget_on)
     res["recommended"] = rec
     save_tune(res)
+    if not extra and not getattr(args, "no_arms", False):
+        run_arms(st, res, rungs, rec, remote_video, local_video, args)
     print(f"\nresults -> {tune_results_path(pod_id)}")
     if rec:
         print(f"recommended: {rec}  (apply: {Path(__file__).name} tune --apply {rec})")
@@ -1384,6 +1428,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--with", dest="with_json", metavar="JSON",
                    help='extra per-job knobs merged into every rung, e.g. \'{"sam3_parallel_views": true}\'')
     p.add_argument("--tag", help="suffix for --with rung names (default X): R1 -> R1P")
+    p.add_argument("--no-arms", action="store_true",
+                   help="skip the experimental arms (profiles.ARMS, e.g. R1M = sam3_multiplex) "
+                        "measured after the ladder on the recommended rung")
+    p.add_argument("--arms-only", action="store_true",
+                   help="skip the ladder climb; only run the experimental arms on the "
+                        "already-measured recommended rung")
     p.add_argument("--video", help="local copy of the qm8 video (default: main checkout web/uploads)")
     p.add_argument("--score-shift", type=float, default=0.475,
                    help="GT scoring half-robot shift (scripts/score_ground_truth.py --score-shift)")

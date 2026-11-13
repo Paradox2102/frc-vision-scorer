@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pod-side bootstrap for the FRC vision scorer (runs ON the RunPod pod).
 #
-#   bash /workspace/frc/deploy/runpod/bootstrap.sh [--no-start] [--no-prefetch]
+#   bash /workspace/frc/deploy/runpod/bootstrap.sh [--no-start] [--no-prefetch] [--no-vllm]
 #
 # Idempotent and safe to re-run (runpod_cli.py `up` runs it after every push,
 # and after a pod stop/start the container disk is fresh again):
@@ -11,6 +11,8 @@
 #      when the requirement files' hash matches the last successful install
 #   4. prefetch SAM3 (gated, needs HF_TOKEN in .env) / DINOv3 / EasyOCR weights
 #      into /workspace/cache
+#   4b. vLLM reader venv + reader weights (setup_vllm.sh; SOFT: only tune arm Q
+#      needs it; --no-vllm skips)
 #   5. import smoke test (CUDA usable on this GPU arch, `import web.app`)
 #   6. profile.env from the GPU's VRAM tier (kept if it already exists)
 #   7. (re)start the server and wait for HTTP 200 on localhost:8004
@@ -22,10 +24,12 @@ source "$HERE/pod_env.sh"
 
 START=1
 PREFETCH=1
+VLLM=1
 for arg in "$@"; do
   case "$arg" in
     --no-start) START=0 ;;
     --no-prefetch) PREFETCH=0 ;;
+    --no-vllm) VLLM=0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -162,6 +166,17 @@ if not ok:
           "/workspace/frc/deploy/runpod/bootstrap.sh`")
     sys.exit(1)
 PYEOF
+fi
+
+# ---------------------------------------------------------------- 4b. vLLM reader (soft)
+if [ "$VLLM" = 1 ]; then
+  step "vLLM reader venv + weights (soft; tune arm Q)"
+  if bash "$HERE/setup_vllm.sh" > "$FRC_LOGS/vllm-setup.log" 2>&1; then
+    tail -n 3 "$FRC_LOGS/vllm-setup.log"; echo "  ok   vLLM reader"
+  else
+    tail -n 15 "$FRC_LOGS/vllm-setup.log"
+    echo "  WARN vLLM reader setup failed (tune arm Q will fail; log $FRC_LOGS/vllm-setup.log)"
+  fi
 fi
 
 # ---------------------------------------------------------------- 5. smoke test

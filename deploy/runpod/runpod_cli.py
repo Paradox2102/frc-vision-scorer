@@ -1234,6 +1234,30 @@ def arm_base(rungs: list, rows: dict, rec: str | None) -> "profiles.Rung | None"
     return done[-1] if done else None
 
 
+def arm_vllm_model(rung: "profiles.Rung") -> str | None:
+    """vlm_model key a rung needs served by a resident vLLM reader, else None."""
+    k = rung.knobs
+    return (k.get("vlm_model") or "qwen3-vl-4b") if k.get("team_reader") == "vllm" else None
+
+
+def vllm_ctl_remote(st: dict, cmd: str, timeout: float = 1500) -> dict:
+    """Run deploy/runpod/vllm_ctl.py on the pod with the server's environment
+    (pod_env.sh + profile.env, as serve.sh exports them); returns its JSON."""
+    remote = (f"cd {POD_APP} && source deploy/runpod/pod_env.sh && set -a && "
+              f"{{ [ -f profile.env ] && . ./profile.env || true; }} && set +a && "
+              f".venv/bin/python deploy/runpod/vllm_ctl.py {cmd}")
+    try:
+        out = ssh_out(st, remote, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"vllm_ctl {cmd} timed out after {timeout:.0f}s"}
+    for line in reversed(out.strip().splitlines()):
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return {"ok": False, "error": out[-400:]}
+
+
 def run_arms(st: dict, res: dict, rungs: list, rec: str | None, remote_video: str,
              local_video: Path, args) -> None:
     """Measure profiles.ARMS on top of the base rung (never recommended or
@@ -1250,10 +1274,32 @@ def run_arms(st: dict, res: dict, rungs: list, rec: str | None, remote_video: st
             print(f"  [{rung.name}] already measured (skip; --redo to re-run)")
             continue
         print(f"  [{rung.name}] {rung.rationale[:120]}")
-        state = run_rung_remote(st, rung, remote_video, profile=not getattr(args, "no_profile", False))
+        vmodel = arm_vllm_model(rung)
+        pre = None
+        if vmodel:
+            # Start the resident reader BEFORE the job (idle GPU for vLLM's
+            # memory profiling; cold start + first download outside the
+            # measured wall). The job's own ensure_started then finds it up.
+            print(f"  [{rung.name}] pre-starting vLLM reader {vmodel} ...", flush=True)
+            pre = vllm_ctl_remote(st, f"start {shlex.quote(vmodel)}")
+            print(f"  [{rung.name}] vLLM: {pre}", flush=True)
+            if not pre.get("ok"):
+                res["rungs"][rung.name] = {"knobs": rung.knobs, "delta": rung.delta, "arm_of": base.name,
+                                           "status": "error", "vllm_prestart": pre,
+                                           "error": f"vLLM pre-start failed: {pre.get('error') or pre}"}
+                save_tune(res)
+                continue
+        try:
+            state = run_rung_remote(st, rung, remote_video, profile=not getattr(args, "no_profile", False))
+        finally:
+            if vmodel:  # free the card for later arms/rungs (phase-exclusive is off on the pod)
+                print(f"  [{rung.name}] stopping vLLM: {vllm_ctl_remote(st, 'stop', timeout=120)}", flush=True)
         row = {"knobs": rung.knobs, "delta": rung.delta, "arm_of": base.name, **{k: state.get(k) for k in (
             "status", "error", "job_id", "wall_job_s", "wall_final_s", "peak_vram_mib",
             "timings", "replay", "window_labels_aborted", "profile")}}
+        if pre is not None:
+            # peak_vram_mib is whole-card nvidia-smi, so it includes the reader.
+            row["vllm_prestart"] = pre
         if row["status"] == "done":
             print(f"  [{rung.name}] scoring replay {row['job_id'][:8]} locally...", flush=True)
             row["scores"] = score_locally(st, row, local_video, args.score_shift)

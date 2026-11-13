@@ -141,8 +141,15 @@ rows in the same table — currently `M` = `sam3_multiplex` (SAM 3.1 Object
 Multiplex; lost on the 24 GB 3090, re-measured on big cards), `P` =
 `sam3_parallel_views` (thread-parallel views, re-measured after the GIL fixes)
 and `Q` = the resident Qwen3.5-4B vLLM team reader instead of Jev
-(`team_reader=vllm`, `vlm_model=qwen3.5-4b`; needs `/workspace/frc/.venv-vllm`,
-and vLLM already up so the arm's wall excludes its ~106 s cold start). Arms are never
+(`team_reader=vllm`, `vlm_model=qwen3.5-4b`). Bootstrap builds
+`/workspace/frc/.venv-vllm` (vLLM 0.25.1, ~9 GB) and prefetches every arm's
+reader weights via `setup_vllm.sh` — a soft step (`--no-vllm` skips; log in
+`/workspace/logs/vllm-setup.log`). Before a reader arm, `tune` starts vLLM
+through the app's own lifecycle (`vllm_ctl.py start <model>`: same served
+model, GPU budget and serve args as a job) so the arm's wall excludes the
+~106 s cold start and vLLM profiles memory on an idle card; it stops vLLM after
+the arm. A failed pre-start marks only that arm as an error. The Q row's
+peak VRAM is whole-card, so it includes the reader's ~13 GB. Arms are never
 recommended or applied; `--no-arms` skips them. The 3.1 checkpoint
 (`facebook/sam3.1`, gated separately) is prefetched by bootstrap with a warning,
 not a failure, if the HF token lacks access.

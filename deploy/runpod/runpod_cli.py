@@ -636,9 +636,9 @@ def run_bootstrap(st: dict, poll_s: float = 10) -> None:
     """Run bootstrap.sh DETACHED on the pod (a dropped ssh session must not
     kill a half-done venv install) and stream its log until it exits."""
     log = f"{POD_WS}/logs/bootstrap.log"
-    ssh_run(st, f"mkdir -p {POD_WS}/logs && : > {log} && setsid nohup bash -c "
+    ssh_run(st, f"mkdir -p {POD_WS}/logs && : > {log} && setsid -f nohup bash -c "
                 f"'bash {POD_APP}/deploy/runpod/bootstrap.sh; echo BOOTSTRAP_EXIT=$?' "
-                f">> {log} 2>&1 < /dev/null &")
+                f">> {log} 2>&1 < /dev/null")
     seen = 0
     while True:
         time.sleep(poll_s)
@@ -1048,11 +1048,14 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
         if jid:
             raise SystemExit(f"pod is busy with job {jid}; tune waits for an idle server")
         cfg = json.dumps(rung.config())
-        launch = (f"mkdir -p {POD_TUNE}/jobs && cd {POD_APP} && setsid nohup .venv/bin/python "
+        # setsid -f forks and returns at once; with a trailing `&` the list
+        # ran in a background subshell that held ssh's stdout open, so ssh
+        # never returned (Nov 12 R0 launch hit the 120 s timeout).
+        launch = (f"mkdir -p {POD_TUNE}/jobs && cd {POD_APP} && setsid -f nohup .venv/bin/python "
                   f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {TUNE_MATCH_KEY} "
                   f"--event {TUNE_EVENT} --label {rung.name} --config-json {shlex.quote(cfg)} "
                   f"--host 127.0.0.1:{POD_PORT} "
-                  f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null & echo started")
+                  f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null; echo started")
         ssh_out(st, f"rm -f {out}; " + launch)
         print(f"  [{rung.name}] launched {cfg}", flush=True)
     else:

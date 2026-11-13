@@ -83,19 +83,54 @@ class _FakeTorch:
         self.n = n
 
 
-def test_clamp_lowers_when_over_budget(monkeypatch):
+def _fake_torch(monkeypatch, n, phys=6):
+    fake = _FakeTorch(n)
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake)
+    monkeypatch.setattr(cpu_budget, "_physical_cores", lambda: phys)
+    monkeypatch.delenv("FRC_TORCH_THREADS", raising=False)
+    return fake
+
+
+def test_configure_lowers_to_quota(monkeypatch):
     _fake_files(monkeypatch, {V2: "200000 100000"})
-    fake = _FakeTorch(16)
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake)
-    msg = cpu_budget.clamp_torch_threads()
+    fake = _fake_torch(monkeypatch, 16, phys=32)
+    msg = cpu_budget.configure_torch_threads()
     assert fake.set_calls == [2]
-    assert "clamped" in msg and "quota=2" in msg and "effective=2" in msg
+    assert "quota=2" in msg and "effective=2" in msg and "16->2" in msg
 
 
-def test_clamp_never_raises(monkeypatch):
+def test_configure_restores_import_pin_to_physical(monkeypatch):
+    # ultralytics' OMP_NUM_THREADS=1 left torch at 1 thread
     _fake_files(monkeypatch, {V2: "max 100000"}, affinity=12)
-    fake = _FakeTorch(6)
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake)
-    msg = cpu_budget.clamp_torch_threads()
+    fake = _fake_torch(monkeypatch, 1, phys=6)
+    msg = cpu_budget.configure_torch_threads()
+    assert fake.set_calls == [6]
+    assert "1->6" in msg
+
+
+def test_configure_unchanged_when_on_target(monkeypatch):
+    _fake_files(monkeypatch, {V2: "max 100000"}, affinity=12)
+    fake = _fake_torch(monkeypatch, 6, phys=6)
+    msg = cpu_budget.configure_torch_threads()
     assert fake.set_calls == []
-    assert msg == "cpus: affinity=12 quota=none effective=12 torch_threads=6 (unchanged)"
+    assert msg.endswith("torch_threads=6 (unchanged)")
+
+
+def test_env_override(monkeypatch):
+    _fake_files(monkeypatch, {V2: "max 100000"}, affinity=12)
+    fake = _fake_torch(monkeypatch, 6, phys=6)
+    monkeypatch.setenv("FRC_TORCH_THREADS", "3")
+    cpu_budget.configure_torch_threads()
+    assert fake.set_calls == [3]
+
+
+def test_seed_omp_env_respects_existing(monkeypatch):
+    _fake_files(monkeypatch, {V2: "200000 100000"})
+    monkeypatch.setattr(cpu_budget, "_physical_cores", lambda: 6)
+    monkeypatch.delenv("FRC_TORCH_THREADS", raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    assert cpu_budget.seed_omp_env() is False
+    assert cpu_budget.os.environ["OMP_NUM_THREADS"] == "4"
+    monkeypatch.delenv("OMP_NUM_THREADS")
+    assert cpu_budget.seed_omp_env() is True
+    assert cpu_budget.os.environ["OMP_NUM_THREADS"] == "2"

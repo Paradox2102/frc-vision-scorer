@@ -9,6 +9,12 @@ Clean rebuild focused on per-robot scoring attribution
 # explicit shell/.env value still wins.
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# ultralytics/__init__.py sets OMP_NUM_THREADS=1 when unset, pinning torch's CPU
+# ops to one thread for the whole server; seed it (cgroup-aware) first.
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # see below
+from web.cpu_budget import seed_omp_env as _seed_omp_env  # noqa: E402
+_seed_omp_env()
 
 import asyncio
 import base64
@@ -11072,12 +11078,12 @@ async def startup():
     """Initialize database on startup."""
     from database import init_db
     await init_db()
-    # Clamp torch's intra-op pool to the CPUs this container can really use
-    # (cgroup quota on RunPod); only ever lowers it. Once per process, early,
-    # before job worker threads initialise their OpenMP pools.
+    # Size torch's intra-op pool to min(physical cores, CPUs this container can
+    # really use) -- cgroup quota on RunPod; undoes an import-time pin to 1.
+    # Once per process, early, before job worker threads init OpenMP pools.
     try:
-        from web.cpu_budget import clamp_torch_threads
-        print(f"[startup] {clamp_torch_threads()}")
+        from web.cpu_budget import configure_torch_threads
+        print(f"[startup] {configure_torch_threads()}")
     except Exception as e:
         print(f"[startup] cpu budget check failed: {e}")
     try:

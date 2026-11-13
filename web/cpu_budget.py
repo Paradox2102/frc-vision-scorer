@@ -5,7 +5,8 @@ vCPUs while a cgroup quota caps what this process may actually run. Torch's
 default intra-op pool sizes itself from the physical core count, so it can
 oversubscribe the quota and get CFS-throttled. ``effective_cpu_count`` folds
 the sched affinity mask and the cgroup quota (v2, then v1) into one number;
-``clamp_torch_threads`` lowers torch's pool to it (never raises).
+``configure_torch_threads`` sets torch's pool to min(physical cores,
+that count); ``seed_omp_env`` stops ultralytics pinning OpenMP to 1 thread.
 """
 
 from __future__ import annotations
@@ -79,21 +80,59 @@ def effective_cpu_count() -> int:
     return _budget()[2]
 
 
-def clamp_torch_threads() -> str:
-    """Lower torch's intra-op thread count to ``effective_cpu_count()`` if it
-    exceeds it (oversubscribing a cgroup quota = throttling). Never raises the
-    count, so hosts whose quota covers every core are untouched. Returns a
-    one-line description for logging."""
+def _physical_cores() -> int | None:
+    try:
+        import psutil
+        n = psutil.cpu_count(logical=False)
+        return int(n) if n else None
+    except Exception:
+        return None
+
+
+def torch_thread_target() -> int:
+    """Torch intra-op threads we want: ``FRC_TORCH_THREADS`` if set, else
+    min(physical cores, effective CPUs) -- torch's own default (physical
+    cores), capped by the cgroup quota/affinity. Never < 1."""
+    override = os.environ.get("FRC_TORCH_THREADS", "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    eff = effective_cpu_count()
+    phys = _physical_cores() or max(1, math.ceil(_budget()[0] / 2))
+    return max(1, min(eff, phys))
+
+
+def seed_omp_env() -> bool:
+    """Set ``OMP_NUM_THREADS`` to ``torch_thread_target()`` if unset.
+
+    Must run before ultralytics (or torch) is first imported:
+    ``ultralytics/__init__.py`` sets OMP_NUM_THREADS=1 when it is unset ("for
+    training"), which pins torch's CPU ops -- and every other OpenMP user in
+    the process -- to a single thread for the server's lifetime. An explicit
+    shell value still wins. Returns True when it set the variable."""
+    if os.environ.get("OMP_NUM_THREADS"):
+        return False
+    os.environ["OMP_NUM_THREADS"] = str(torch_thread_target())
+    return True
+
+
+def configure_torch_threads() -> str:
+    """Set torch's intra-op pool to ``torch_thread_target()`` (lowers it under
+    a cgroup quota -- oversubscription = CFS throttling -- and restores it if an
+    import pinned it to 1). Returns a one-line description for logging."""
     aff, quota, eff = _budget()
     quota_s = "none" if quota is None else str(quota)
+    head = f"cpus: affinity={aff} quota={quota_s} effective={eff}"
     try:
         import torch
     except Exception:
-        return f"cpus: affinity={aff} quota={quota_s} effective={eff} torch=unavailable"
+        return f"{head} torch=unavailable"
+    target = torch_thread_target()
     before = int(torch.get_num_threads())
-    if before > eff:
-        torch.set_num_threads(eff)
-        return (f"cpus: affinity={aff} quota={quota_s} effective={eff} "
-                f"torch_threads={before}->{eff} (clamped)")
-    return (f"cpus: affinity={aff} quota={quota_s} effective={eff} "
-            f"torch_threads={before} (unchanged)")
+    omp = os.environ.get("OMP_NUM_THREADS", "unset")
+    if before != target:
+        torch.set_num_threads(target)
+        return f"{head} omp={omp} torch_threads={before}->{target} (set)"
+    return f"{head} omp={omp} torch_threads={before} (unchanged)"

@@ -9,6 +9,7 @@ See deploy/runpod/README.md for the weekend runbook.
     runpod_cli.py tunnel                       # http://localhost:8014 -> pod :8004
     runpod_cli.py status | logs | ssh | restart
     runpod_cli.py tune [--start R0] [--budget-min 8] [--apply R2]
+    runpod_cli.py tune --profile-report R1     # GIL top frames + GPU util of a rung
     runpod_cli.py push [--ref main]            # re-ship code, restart server
     runpod_cli.py secrets                      # re-prompt + install pod .env
     runpod_cli.py pull                         # DB + replays -> data/runpod_pull/<podId>/
@@ -43,6 +44,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import profiles  # noqa: E402
+import profiling  # noqa: E402
 
 STATE_PATH = HERE / ".state.json"
 TUNE_DIR = HERE / "tune_results"
@@ -1020,6 +1022,74 @@ def recommend(rows: dict, order: list, budget_min: float, on: str = "final") -> 
     return best
 
 
+HOST_BENCH_SECONDS = 8
+
+
+def parse_host_bench_output(text: str) -> dict:
+    """Last JSON object line of host_bench.py's stdout."""
+    for line in reversed((text or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return {"error": f"no JSON from host_bench.py: {(text or '').strip()[-200:]!r}"}
+
+
+def ensure_host(st: dict, res: dict, redo: bool = False) -> dict:
+    """Host fingerprint (CPU model / affinity / cgroup quota / RAM / GPU +
+    single-thread CPU score), measured once per pod on the idle server and
+    cached in the tune results under "host" (``--redo`` re-measures). Never
+    fails the tune."""
+    host = res.get("host") or {}
+    if host and not host.get("error") and not redo:
+        print(profiling.format_host_line(host) + "  (cached; --redo re-measures)")
+        return host
+    jid = remote_job_active(st)
+    if jid:
+        print(f"host: fingerprint skipped (job {jid} running; measured on the next tune)")
+        return host
+    print(f"host: measuring CPU/GPU fingerprint on the pod (~{HOST_BENCH_SECONDS} s)...", flush=True)
+    try:
+        out = ssh_out(st, f"mkdir -p {POD_TUNE} && cd {POD_APP} && .venv/bin/python "
+                          f"deploy/runpod/host_bench.py --seconds {HOST_BENCH_SECONDS} 2>/dev/null "
+                          f"| tee {POD_TUNE}/host.json", timeout=240, check=False)
+        host = parse_host_bench_output(out)
+    except subprocess.TimeoutExpired:
+        host = {"error": "host_bench.py timed out"}
+    res["host"] = host
+    save_tune(res)
+    print(profiling.format_host_line(host), flush=True)
+    return host
+
+
+def profile_report(target: str, pod_id: str | None) -> tuple[str, dict]:
+    """(name, profile) for ``tune --profile-report``: a rung in the results
+    file (re-summarised from the pulled raw py-spy file when the row has no
+    gil_top), or a local collapsed-stack file path."""
+    p = Path(target)
+    if p.is_file():
+        prof = profiling.summarise_pyspy(p.read_text(errors="replace"))
+        gpu = p.with_name(p.name.replace(".pyspy.txt", ".gpu.csv"))
+        if gpu != p and gpu.is_file():
+            prof.update(profiling.summarise_gpu(profiling.parse_gpu_samples(gpu.read_text(errors="replace"))))
+        return p.name, prof
+    if not pod_id:
+        raise SystemExit("no pod in state: pass --pod-id <podId> (tune_results/<podId>.json) or a file path")
+    rows = load_tune(pod_id).get("rungs", {})
+    name = target if target in rows else target.upper()
+    row = rows.get(name)
+    if row is None:
+        raise SystemExit(f"no rung {target!r} in {tune_results_path(pod_id)} (have: {', '.join(sorted(rows)) or '-'})")
+    prof = dict(row.get("profile") or {})
+    if not prof.get("gil_top"):
+        raw = PULL_ROOT / pod_id / "tune" / "jobs" / f"{name}.pyspy.txt"
+        if raw.is_file():
+            prof.update(profiling.summarise_pyspy(raw.read_text(errors="replace")))
+    return name, prof
+
+
 def ensure_test_video(st: dict, local_video: Path) -> str:
     remote = f"{POD_TUNE}/{TUNE_MATCH_KEY}.mp4"
     size = local_video.stat().st_size
@@ -1032,9 +1102,12 @@ def ensure_test_video(st: dict, local_video: Path) -> str:
     return remote
 
 
-def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 20) -> dict:
+def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 20,
+                    profile: bool = True) -> dict:
     """Launch (or re-attach to) the detached pod_job.py for this rung and
-    poll its result file until it finishes."""
+    poll its result file until it finishes. With ``profile`` (default) the
+    pod-side driver also runs py-spy + nvidia-smi for the job's lifetime
+    (profiling.JobProfiler) and the result carries a ``profile`` summary."""
     out = f"{POD_TUNE}/jobs/{rung.name}.json"
     cur = ssh_out(st, f"cat {out} 2>/dev/null || true", check=False).strip()
     state = json.loads(cur) if cur else None
@@ -1054,7 +1127,7 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
         launch = (f"mkdir -p {POD_TUNE}/jobs && cd {POD_APP} && setsid -f nohup .venv/bin/python "
                   f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {TUNE_MATCH_KEY} "
                   f"--event {TUNE_EVENT} --label {rung.name} --config-json {shlex.quote(cfg)} "
-                  f"--host 127.0.0.1:{POD_PORT} "
+                  f"--host 127.0.0.1:{POD_PORT} {'' if profile else '--no-profile '}"
                   f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null; echo started")
         ssh_out(st, f"rm -f {out}; " + launch)
         print(f"  [{rung.name}] launched {cfg}", flush=True)
@@ -1117,7 +1190,7 @@ def _pct(v):
 
 def print_tune_table(res: dict, order: list, budget_min: float, on: str) -> None:
     print(f"\n{'rung':<4} {'fps':>4} {'cs':>3} {'chunk':>5} {'job':>6} {'final':>6} {'peakVRAM':>9} "
-          f"{'aggNN':>6} {'GTcov':>6} {'errMed':>6} {'lblOK':>6} {'wrong':>6} {'misID':>6}  note")
+          f"{'aggNN':>6} {'GTcov':>6} {'errMed':>6} {'lblOK':>6} {'wrong':>6} {'misID':>6} {'gpu%':>5}  note")
     for name in order:
         r = res["rungs"].get(name)
         if not r:
@@ -1129,6 +1202,8 @@ def print_tune_table(res: dict, order: list, budget_min: float, on: str) -> None
         wj = f"{r['wall_job_s'] / 60:.1f}m" if r.get("wall_job_s") else "-"
         wf = f"{r['wall_final_s'] / 60:.1f}m" if r.get("wall_final_s") else "-"
         vr = f"{r['peak_vram_mib'] / 1024:.1f}G" if r.get("peak_vram_mib") else "-"
+        gu = (r.get("profile") or {}).get("gpu_util_mean")
+        gu = "-" if gu is None else f"{gu:.0f}"
         note = "OVER BUDGET" if r.get("status") == "done" and over_budget(r, budget_min, on) else ""
         if r.get("status") != "done":
             note = f"{r.get('status')}: {str(r.get('error'))[:60]}"
@@ -1139,7 +1214,7 @@ def print_tune_table(res: dict, order: list, budget_min: float, on: str) -> None
               f"{m.get('agg_meanNN', '-'):>6} {_pct(g.get('coverage')):>6} "
               f"{g.get('err_median_m') if g.get('err_median_m') is not None else '-':>6} "
               f"{_pct(g.get('label_correct')):>6} {_pct(g.get('label_wrong')):>6} "
-              f"{g.get('misid_s') if g.get('misid_s') is not None else '-':>6}  {note}")
+              f"{g.get('misid_s') if g.get('misid_s') is not None else '-':>6} {gu:>5}  {note}")
 
 
 def _table_order(res: dict, order: list) -> list:
@@ -1175,10 +1250,10 @@ def run_arms(st: dict, res: dict, rungs: list, rec: str | None, remote_video: st
             print(f"  [{rung.name}] already measured (skip; --redo to re-run)")
             continue
         print(f"  [{rung.name}] {rung.rationale[:120]}")
-        state = run_rung_remote(st, rung, remote_video)
+        state = run_rung_remote(st, rung, remote_video, profile=not getattr(args, "no_profile", False))
         row = {"knobs": rung.knobs, "delta": rung.delta, "arm_of": base.name, **{k: state.get(k) for k in (
             "status", "error", "job_id", "wall_job_s", "wall_final_s", "peak_vram_mib",
-            "timings", "replay", "window_labels_aborted")}}
+            "timings", "replay", "window_labels_aborted", "profile")}}
         if row["status"] == "done":
             print(f"  [{rung.name}] scoring replay {row['job_id'][:8]} locally...", flush=True)
             row["scores"] = score_locally(st, row, local_video, args.score_shift)
@@ -1189,6 +1264,10 @@ def run_arms(st: dict, res: dict, rungs: list, rec: str | None, remote_video: st
 
 def cmd_tune(args) -> int:
     st = load_state()
+    if getattr(args, "profile_report", None):     # offline: results file / pulled raw file
+        name, prof = profile_report(args.profile_report, getattr(args, "pod_id", None) or st.get("pod_id"))
+        print(profiling.format_profile_report(name, prof))
+        return 0
     pod_id = require_pod(st)
     refresh_endpoint(st)
     tier = remote_tier(st)
@@ -1216,6 +1295,7 @@ def cmd_tune(args) -> int:
     if not local_video.exists():
         raise SystemExit(f"test video not found: {local_video}")
     remote_video = ensure_test_video(st, local_video)
+    ensure_host(st, res, redo=args.redo)
     sfx = (args.tag or "X") if extra else ""
     start = order.index(args.start.upper() + sfx)
     stop = order.index(args.stop.upper() + sfx) if args.stop else len(order) - 1
@@ -1228,10 +1308,10 @@ def cmd_tune(args) -> int:
         if prev and prev.get("status") == "done" and not args.redo:
             print(f"  [{rung.name}] already measured (skip; --redo to re-run)")
         else:
-            state = run_rung_remote(st, rung, remote_video)
+            state = run_rung_remote(st, rung, remote_video, profile=not getattr(args, "no_profile", False))
             row = {"knobs": rung.knobs, "delta": rung.delta, **{k: state.get(k) for k in (
                 "status", "error", "job_id", "wall_job_s", "wall_final_s", "peak_vram_mib",
-                "timings", "replay", "window_labels_aborted")}}
+                "timings", "replay", "window_labels_aborted", "profile")}}
             if row["status"] == "done":
                 print(f"  [{rung.name}] scoring replay {row['job_id'][:8]} locally...", flush=True)
                 row["scores"] = score_locally(st, row, local_video, args.score_shift)
@@ -1261,6 +1341,34 @@ def cmd_tune(args) -> int:
 
 
 # ----------------------------------------------------------------- pull / stop
+TUNE_PULL_PATHS = ("tune/jobs", "tune/host.json")
+
+
+def tune_member_ok(name: str) -> bool:
+    """Members of the tune tarball that `pull` extracts (no video, no traversal)."""
+    return (name.startswith("tune/") and ".." not in name.split("/")
+            and not name.endswith((".mp4", ".tmp", ".part")))
+
+
+def pull_tune_files(st: dict, dest: Path) -> int:
+    paths = " ".join(TUNE_PULL_PATHS)
+    p = subprocess.Popen(ssh_base(st) + [
+        f"cd {POD_WS} && ls -d {paths} 2>/dev/null | xargs -r tar -cf - --exclude='*.mp4' --exclude='*.tmp'"],
+        stdout=subprocess.PIPE)
+    n = 0
+    try:
+        with tarfile.open(fileobj=p.stdout, mode="r|") as tf:
+            for m in tf:
+                if tune_member_ok(m.name) and (m.isfile() or m.isdir()):
+                    tf.extract(m, dest, set_attrs=False,
+                               **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+                    n += m.isfile()
+    except tarfile.ReadError:
+        pass  # no tune dir on this pod
+    p.wait()
+    return n
+
+
 def cmd_pull(args) -> int:
     st = load_state()
     pod_id = require_pod(st)
@@ -1300,6 +1408,10 @@ def cmd_pull(args) -> int:
     print(f"replays: {len(new)} new ({len(listing)} on pod) -> {dest / 'web' / 'replays'}"
           + ("" if args.with_video else " (HUD videos skipped; --with-video to include)"))
     print(f"event state -> {dest / 'web' / 'uploads'}")
+    # 3. tune results: per-rung job JSON/log + raw profiles (<rung>.pyspy.txt,
+    #    <rung>.pyspy.log, <rung>.gpu.csv) + host fingerprint (small; always re-copied)
+    n = pull_tune_files(st, dest)
+    print(f"tune jobs/profiles: {n} files -> {dest / 'tune'}")
     print("Local frc_scorer.db and web/replays were NOT touched.")
     return 0
 
@@ -1434,6 +1546,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--arms-only", action="store_true",
                    help="skip the ladder climb; only run the experimental arms on the "
                         "already-measured recommended rung")
+    p.add_argument("--no-profile", action="store_true",
+                   help="don't run py-spy (--gil, 20 Hz) + nvidia-smi on the server during each job")
+    p.add_argument("--profile-report", metavar="RUNG|FILE",
+                   help="print a rung's profile (GIL top frames, GPU util) from the results file, "
+                        "or summarise a local py-spy raw file; no pod needed")
+    p.add_argument("--pod-id", help="with --profile-report: results of this pod (default: current state)")
     p.add_argument("--video", help="local copy of the qm8 video (default: main checkout web/uploads)")
     p.add_argument("--score-shift", type=float, default=0.475,
                    help="GT scoring half-robot shift (scripts/score_ground_truth.py --score-shift)")

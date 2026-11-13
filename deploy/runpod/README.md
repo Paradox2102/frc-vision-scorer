@@ -171,6 +171,95 @@ time. The recommendation is the highest rung that finished within budget.
 Read the scores before applying: qm8 label metrics swing a few points between
 identical runs.
 
+### Host fingerprint and per-rung profiles
+
+Before the first rung, `tune` runs `deploy/runpod/host_bench.py` on the pod
+(app venv, idle server, about 10 s, CPU only) and prints one line (numbers
+illustrative):
+
+```
+host: AMD EPYC ... (max 3800 MHz) | 16/128 cpus, quota 16 | 1007.6 GB RAM (cgroup 180.0 GB) | NVIDIA RTX PRO 6000 ... drv 570.x | 1T: py 14 Mops/s, SAM3 frame load 54 ms (PIL 20 ms); 16T load 9.5x
+```
+
+It reports the CPU model and max clock, the sched affinity vs. logical CPU
+count, the cgroup CPU quota (v2 `cpu.max` or v1 `cfs_quota_us`), RAM (host and
+cgroup limit), and the GPU name and driver. It also runs three single-thread
+benchmarks, because per-thread speed matters more to this pipeline than core
+count:
+
+* `py_mops`: a pure-Python integer loop.
+* `load_ms_per_frame`: the SAM3 frame-loader op, exactly as
+  `sam3 io_utils._load_img_as_tensor` runs it (PIL decode of a deterministic
+  960x540 JPEG, RGB, `TF.resize` to 1008x1008, `TF.to_tensor`).
+  `pil_ms_per_frame` is the decode and resize alone.
+* `thread_speedup`: the same op on `min(16, affinity)` threads.
+
+The Nov 12 EPYC pod ran the loader op at about 54 ms per frame. A Ryzen 7600X
+runs it at about 20 ms, with `py_mops` about 24. The result is stored under
+`host` in the results JSON and cached per pod; `--redo` re-measures it. The
+raw line is also kept at `/workspace/tune/host.json`.
+
+Every job, ladder rungs and arms alike, is **profiled by default**
+(`--no-profile` turns it off). `pod_job.py`, the detached driver on the pod,
+starts two processes right before it submits the job and stops them when the
+job's final result exists (or when it fails):
+
+* `py-spy record --gil --rate 20 --format raw`, attached to the server PID
+  (the process LISTENing on :8004, found through `/proc`, with serve.sh's
+  `server.pid` as a fallback). It is stopped with SIGINT, which makes py-spy
+  flush the file. If attaching fails (ptrace not allowed), the driver retries
+  with `--nonblocking`. If that fails too, the error is recorded and the rung
+  still runs. `--duration 7200` caps an orphaned py-spy, and a new job
+  SIGINTs any stale profiler for the same files.
+* `nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used -l 1`.
+
+Because the profilers belong to the pod-side driver, they follow the job, not
+your ssh session: re-running `tune` re-attaches to the same driver and its
+profilers. The summary is written into the rung's row as `profile`, before
+the final status:
+
+| key | meaning |
+|---|---|
+| `gpu_util_mean`, `gpu_util_p50` | GPU utilization over the job (1 Hz) |
+| `gpu_busy_frac` | fraction of samples at or above 50% |
+| `gpu_mem_peak_mib` | peak memory.used |
+| `pyspy_samples`, `gil_held_frac` | GIL-held samples (`--gil` drops the rest); their share of wall × rate |
+| `server_cpu_cores_mean` | server CPU time / wall (avg cores busy, incl. reaped children) |
+| `gil_top` | top 15 project/sam3 functions by **inclusive** share of GIL samples. Each function counts at most once per stack, line numbers are stripped, and pure pass-through wrappers are hidden. `self_share` is shown alongside. |
+| `self_top`, `project_self_top` | top 10 leaf frames (any code), and the innermost project frame of each stack |
+| `pyspy_error`, `gpu_error` | why a half of the profile is missing |
+
+The table shows `gpu%` (util mean) per rung. For one rung's full breakdown:
+
+```bash
+rp tune --profile-report R1                 # from tune_results/<podId>.json
+rp tune --profile-report R1 --pod-id 1wjnhb11v7bgle   # an old (terminated) pod
+rp tune --profile-report data/runpod_pull/<podId>/tune/jobs/R1.pyspy.txt   # any raw file
+```
+
+Raw files on the pod: `/workspace/tune/jobs/<rung>.pyspy.txt` (collapsed
+stacks, about 2-3 MB), `<rung>.pyspy.log`, `<rung>.gpu.csv`, next to
+`<rung>.json` and `<rung>.log`. `rp pull` copies `tune/jobs/` and
+`tune/host.json` to `data/runpod_pull/<podId>/tune/` (videos excluded). A
+re-summarised report also works offline from those files.
+
+**Overhead.** In its default blocking mode, py-spy pauses the server for
+each sample while it walks every thread's stack. Measured locally (py-spy
+0.4.2, CPU-bound loop, 31 threads, 40-frame stack), the slowdown was:
+
+| mode | slowdown |
+|---|---|
+| 20 Hz | about 1.5-2% |
+| 100 Hz | about 8-10% |
+| `--nonblocking` | under 1% |
+
+Expect about 2% on a rung at 20 Hz, which is within run-to-run noise. Use
+`--no-profile` for a clean wall-time A/B. nvidia-smi at 1 Hz costs nothing
+measurable. py-spy needs ptrace on the server process. On Nov 12 it worked as
+root in the RunPod container, but `py-spy dump` once returned "Permission
+denied". If `pyspy_error` shows that, the GPU half of the profile is still
+recorded.
+
 ### The ladder (cumulative; `profiles.py` has the full rationale)
 
 | rung | change | why |
@@ -215,7 +304,8 @@ costs a 5 s sleep per job. That setting does not change output.
   in the UI.
 * `rp pull` regularly (and **always before terminate**). It copies a
   consistent DB snapshot, new replays (`--with-video` for the HUD mp4s), and
-  the event-state files (calibrations made at the event) into
+  the event-state files (calibrations made at the event), plus the tune job
+  results and raw profiles (`tune/jobs/`, `tune/host.json`), into
   `data/runpod_pull/<podId>/`. It never touches your local `frc_scorer.db` or
   `web/replays`. Scouting metrics are computed from replays, so pulling
   replays and the DB is enough.
@@ -240,7 +330,7 @@ and run `up` again.
 | /workspace/cache | yes | HF (SAM3, DINOv3), EasyOCR, uv, torch caches |
 | /workspace/tools | yes | uv, deno, uv-managed Python |
 | /workspace/logs | yes | `server.log`, `server.pid`, `bootstrap.log` |
-| /workspace/tune | yes | test video, `jobs/R<n>.json` + logs |
+| /workspace/tune | yes | test video, `host.json`, `jobs/R<n>.json` + logs + profiles (`.pyspy.txt`, `.gpu.csv`) |
 | apt packages, /root | no | reinstalled by bootstrap |
 
 ## Troubleshooting

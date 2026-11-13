@@ -148,24 +148,24 @@ _STEPS = (
      "tuned at 8 fps and are NOT rescaled for fps (ab_qm8.py 'speed' note), so "
      "this also puts selective back on its tuned time scale. Cost: ~+60% SAM "
      "frames on every view."),
-    ("R3", {"sam3_chunk_frames": None},
-     "Bigger SAM3 session windows (tier cap): fewer chunk boundaries, each of "
-     "which drops SAM3's appearance memory and fails to re-seed occluded "
-     "objects (identity risk). VRAM-bound, roughly time-neutral (fewer session "
-     "opens). UNVALIDATED beyond 400 frames — the tuner's GT/Manta scores and "
-     "peak VRAM are the check."),
-    ("R4", {"sam2_track_fps": 10.0},
-     "10 fps: denser SAM evidence through fast motion and crossings (more "
-     "measured frames per slot, shorter coasts). No A/B evidence above 8 fps; "
-     "cost ~+25% SAM frames over R3."),
-    ("R5", {"corner_track_stride": 1},
-     "Full-rate corners. Last because the Oct 31 A/B measured NO per-slot "
-     "identity gain of stride 1 over stride 2, for ~2x corner propagation cost."),
+    ("R3", {"sam3_chunk_frames": None, "sam2_track_fps": 10.0},
+     "BIG JUMP (Nov 12, Nick: big GPUs sit mostly idle at R1/R2 -- GPU util "
+     "0-77% spiky, CPU idle, peak 12 GB of 96). Tier-cap SAM3 chunks (fewer "
+     "chunk boundaries, each drops SAM3 appearance memory; VRAM-bound, roughly "
+     "time-neutral; UNVALIDATED beyond 400 frames) + 10 fps (denser evidence "
+     "through crossings; no A/B above 8 fps). Cost ~+25% SAM frames over R2."),
+    ("R4", {"corner_track_stride": 1},
+     "Full-rate corners. Oct 31 A/B found no per-slot identity gain of stride 1 "
+     "over stride 2 at 8 fps, for ~2x corner propagation -- measured again "
+     "here at 10 fps because corners are the cheap views (~70-90 ms/frame)."),
+    ("R5", {"sam2_track_fps": 15.0},
+     "15 fps: the ceiling probe. Only reachable inside 8 min if views run "
+     "concurrently or the card is much faster per frame than the 3090."),
 )
 
 
 def ladder(tier: Tier) -> list[Rung]:
-    """Cumulative rungs R0..R5 for ``tier``. R0 = repo defaults."""
+    """Cumulative rungs R0..R5 for ``tier``. R0 = repo defaults; R3+ jump harder."""
     rungs = [Rung("R0", dict(REPO_DEFAULTS), {},
                   "Repo defaults (Nov 12 2026: 5 fps, corner stride 3, 200-frame "
                   "SAM3 chunks) — what :8004 runs on the 3090.")]

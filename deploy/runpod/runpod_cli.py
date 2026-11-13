@@ -70,7 +70,15 @@ DEFAULT_GPUS = [
     "NVIDIA A100-SXM4-80GB",
     "NVIDIA A100 80GB PCIe",
 ]
-ALLOWED_CUDA = ["12.8", "12.9", "13.0"]
+ALLOWED_CUDA = ["12.8", "12.9", "13.0", "13.1", "13.2"]
+
+
+def needs_cuda_filter(gpus) -> bool:
+    """cu128 torch needs a CUDA>=12.8 host driver. Every Blackwell host already
+    has one, and RunPod's allowedCudaVersions filter can hide real stock (Nov 12:
+    "no instances" for RTX PRO 6000 with 10 DCs in stock), so only filter when a
+    pre-Blackwell card is in the priority list."""
+    return any("Blackwell" not in g and "B200" not in g for g in gpus)
 DEFAULT_TUNNEL_PORT = 8014
 QM8_VIDEO_NAME = "ff4be1d9-b8e5-49ff-ac78-4a6a0e77a697.mp4"   # cached 2026cur qm8 (web/uploads)
 TUNE_MATCH_KEY = "2026cur_qm8"
@@ -465,12 +473,13 @@ def build_create_body(*, name: str, gpus: list, cloud: str, image: str, volume_g
         "volumeMountPath": POD_WS,
         "ports": ["22/tcp"],
         "env": {"PUBLIC_KEY": pubkey.strip()},
-        "allowedCudaVersions": list(ALLOWED_CUDA),
         "supportPublicIp": True,
         "interruptible": False,
         "minVCPUPerGPU": int(min_vcpu),
         "minRAMPerGPU": int(min_ram),
     }
+    if needs_cuda_filter(gpus):
+        body["allowedCudaVersions"] = list(ALLOWED_CUDA)
     if data_centers:
         body["dataCenterIds"] = list(data_centers)
         body["dataCenterPriority"] = "custom"

@@ -140,27 +140,21 @@ _REGISTRY: dict[str, VlmModel] = {
     # 3090; gpu_util is moot there and only vram_gb matters (serve_util).
     # Repo ids/sizes checked on HF 2026-11-12; vLLM 0.25.1 registers both
     # architectures (Qwen3VLMoe / Qwen3_5Moe).
-    "qwen3-vl-30b-a3b": VlmModel(
-        key="qwen3-vl-30b-a3b",
-        label="Qwen3-VL-30B-A3B (FP8, big card)",
-        hf_repo="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
-        gpu_util=0.9,
-        notes="MoE, 3B active, official FP8 block-128 (32.3 GB). Needs a >= 48 GB "
-              "card; 42 GiB vLLM budget. Unbenched.",
-        approx_gb=32.3,
-        vram_gb=42.0,
-        extra_serve_args=("--dtype", "bfloat16"),
-    ),
     "qwen3.6-35b-a3b": VlmModel(
         key="qwen3.6-35b-a3b",
         label="Qwen3.6-35B-A3B (FP8, escape prompt, big card)",
         hf_repo="Qwen/Qwen3.6-35B-A3B-FP8",
         gpu_util=0.9,
-        notes="MoE, 3B active, official FP8 block-128 (37.5 GB), Qwen3.5 "
-              "architecture. Needs a >= 48 GB card; 48 GiB vLLM budget. Unbenched.",
+        notes="MoE, 3B active, official FP8 block-128 (37.5 GB). Pod bench "
+              "2026-11-12 (RTX PRO 6000): 73-75/90 legible, 0-1 wrong, but 6-8% FP "
+              "on junk crops (vs 2% Qwen3.5-4B) -> not the live reader. SM120 needs "
+              "triton MoE (DEEPGEMM OOMs; also set VLLM_USE_DEEP_GEMM=0) and a KV "
+              "cap or vLLM takes ~60 GB. (Qwen3-VL-30B-A3B-FP8 fails to load on "
+              "vLLM 0.25.1: MoE gate/up shape mismatch -> removed.)",
         approx_gb=37.5,
-        vram_gb=48.0,
-        extra_serve_args=("--dtype", "bfloat16"),
+        vram_gb=44.0,
+        extra_serve_args=("--dtype", "bfloat16", "--moe-backend", "triton",
+                          "--kv-cache-memory-bytes", "4294967296"),
         # Qwen3.5-family: thinks by default (see the qwen3.5-4b entry).
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         read_prompt="escape",

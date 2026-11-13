@@ -104,14 +104,14 @@ def test_qwen35_4b_appended_after_existing_entries():
     assert keys[0] == vlm_models.DEFAULT_KEY
     assert keys.index("qwen3.5-4b") > keys.index("lfm2.5-vl")
     # Big-card readers come after every 24 GB-capable entry.
-    assert keys[-2:] == ("qwen3-vl-30b-a3b", "qwen3.6-35b-a3b")
+    assert keys[-1] == "qwen3.6-35b-a3b"
+    assert "qwen3-vl-30b-a3b" not in keys  # fails to load on vLLM 0.25.1
 
 
 def test_read_prompt_helper():
     # Only Qwen3.5-4B uses the escape prompt (it makes Qwen3-VL over-conservative).
     assert vlm_models.read_prompt("qwen3.5-4b") == "escape"
-    for k in ("qwen3-vl-4b", "glm-4.6v-flash", "qwen3-vl-8b", "lfm2.5-vl",
-              "qwen3-vl-30b-a3b"):
+    for k in ("qwen3-vl-4b", "glm-4.6v-flash", "qwen3-vl-8b", "lfm2.5-vl"):
         assert vlm_models.read_prompt(k) == "incumbent"
     assert vlm_models.read_prompt("qwen3.6-35b-a3b") == "escape"
     # Unknown keys never change the read prompt.
@@ -131,14 +131,11 @@ def test_vlm_model_knob_choices_include_qwen35():
 
 
 def test_big_card_entries():
-    vl = vlm_models.get("qwen3-vl-30b-a3b")
-    assert vl.hf_repo == "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-    assert vl.vram_gb == 42.0
-    assert vlm_models.extra_serve_args("qwen3-vl-30b-a3b") == ["--dtype", "bfloat16"]
-    assert vlm_models.extra_body("qwen3-vl-30b-a3b") == {}
     q = vlm_models.get("qwen3.6-35b-a3b")
     assert q.hf_repo == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert q.vram_gb == 48.0
+    assert q.vram_gb == 44.0
+    args = vlm_models.extra_serve_args("qwen3.6-35b-a3b")
+    assert "--moe-backend" in args and "--kv-cache-memory-bytes" in args
     assert vlm_models.extra_body("qwen3.6-35b-a3b") == {
         "chat_template_kwargs": {"enable_thinking": False}}
     assert vlm_models.served_matches("qwen3.6-35b-a3b", "Qwen/Qwen3.6-35B-A3B-FP8")
@@ -160,8 +157,7 @@ def test_serve_util_is_absolute_on_big_cards(monkeypatch):
     assert vlm_models.serve_util("qwen3-vl-8b", card) == round(0.65 * 24 / card, 3)
     assert vlm_models.serve_util("qwen3.5-4b", card) == round(0.5 * 24 / card, 3)
     # vram_gb wins when set.
-    assert vlm_models.serve_util("qwen3.6-35b-a3b", card) == round(48.0 / card, 3)
-    assert vlm_models.serve_util("qwen3-vl-30b-a3b", card) == round(42.0 / card, 3)
+    assert vlm_models.serve_util("qwen3.6-35b-a3b", card) == round(44.0 / card, 3)
 
 
 def test_serve_util_env_override(monkeypatch):
@@ -197,5 +193,5 @@ def test_lifecycle_start_exports_serve_util(monkeypatch):
     finally:
         vllm_lifecycle.set_active_model(prev)
     assert seen["env"]["VLM_MODEL_NAME"] == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert seen["env"]["VLM_SERVER_GPU_UTIL"] == str(round(48.0 / 95.6, 3))
+    assert seen["env"]["VLM_SERVER_GPU_UTIL"] == str(round(44.0 / 95.6, 3))
     assert seen["args"][-2:] == ("--dtype", "bfloat16")

@@ -429,16 +429,21 @@ _ORIG_LOAD_FROM_IMAGE_FOLDER: Any = None
 
 def _frame_load_pool(workers: int) -> Any:
     """Module-shared executor, created lazily and reused across sessions;
-    recreated only when a larger worker count is requested."""
+    recreated only when a larger worker count is requested.
+
+    The replaced pool is NOT shut down: under sam3_parallel_views several
+    views open chunk sessions concurrently, and another thread may hold the
+    old pool between fetching it and (or during) ``pool.map``'s submit loop
+    — ``shutdown`` there raises "cannot schedule new futures after
+    shutdown" and loses that view. Dropping the reference is enough: once
+    the last in-flight map releases it, the executor is garbage-collected
+    and its weakref callback wakes the idle workers to exit."""
     global _FRAME_LOAD_POOL, _FRAME_LOAD_POOL_WORKERS
     with _FRAME_LOAD_POOL_LOCK:
         if _FRAME_LOAD_POOL is None or workers > _FRAME_LOAD_POOL_WORKERS:
-            old = _FRAME_LOAD_POOL
             _FRAME_LOAD_POOL = concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="sam3-frame-load")
             _FRAME_LOAD_POOL_WORKERS = workers
-            if old is not None:
-                old.shutdown(wait=False)
         return _FRAME_LOAD_POOL
 
 

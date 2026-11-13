@@ -101,7 +101,7 @@ class VisionScorer {
 
         // Upload form
         document.getElementById('uploadForm').addEventListener('submit', (e) => this.handleSubmit(e));
-        this.populateSam2Models();
+        this.populateTrackerModels();
         this.populateVlmModels();
         this.initTeamReaderControls();
         this.rejoinActiveJob();
@@ -1168,12 +1168,12 @@ class VisionScorer {
 
     // --- Video Inference (existing logic) ---
 
-    async populateSam2Models() {
+    async populateTrackerModels() {
         const select = document.getElementById('sam2ModelSize');
         const backendSelect = document.getElementById('trackingBackend');
         if (!select || !backendSelect) return;
         try {
-            const resp = await fetch('/api/sam2_models');
+            const resp = await fetch('/api/tracker_models');
             const data = await resp.json();
             backendSelect.replaceChildren();
             for (const backend of data.backends || []) {
@@ -1316,7 +1316,7 @@ class VisionScorer {
         // server's TEAM_READER (jev via start_all.sh) applies.
         const vramBudget = parseInt(document.getElementById('sam2MaxGpuFrames')?.value, 10);
         if (Number.isFinite(vramBudget) && vramBudget > 0) {
-            formData.append('sam2_max_gpu_frames', vramBudget);
+            formData.append('sam3_max_gpu_frames', vramBudget);
         }
         const trackingBackend = document.getElementById('trackingBackend')?.value;
         if (trackingBackend) {
@@ -2071,12 +2071,16 @@ class VisionScorer {
     // Render a processing-time breakdown from a timings object (seconds per phase).
     renderTimings(timings) {
         if (!timings || timings.total == null) return '<p class="empty-state">No timing data</p>';
+        // Replays recorded before the Nov 2026 rename carry 'sam2_tracking'.
+        if (timings.sam3_tracking == null && timings.sam2_tracking != null) {
+            timings = { ...timings, sam3_tracking: timings.sam2_tracking };
+        }
         const labels = {
             model_load: 'Model load', frame_export: 'Frame export',
-            sam2_tracking: 'Tracker propagation', analysis_loop: 'Analysis loop',
+            sam3_tracking: 'Tracker propagation', analysis_loop: 'Analysis loop',
             bumper_vlm: '↳ Bumper VLM',
         };
-        const topLevel = ['model_load', 'frame_export', 'sam2_tracking', 'analysis_loop'];
+        const topLevel = ['model_load', 'frame_export', 'sam3_tracking', 'analysis_loop'];
         const total = timings.total;
         const known = topLevel.reduce((a, k) => a + (timings[k] || 0), 0);
         const rowHtml = (label, val, sub) => {
@@ -2088,7 +2092,7 @@ class VisionScorer {
             </div>`;
         };
         let rows = '';
-        for (const k of ['model_load', 'frame_export', 'sam2_tracking', 'analysis_loop', 'bumper_vlm']) {
+        for (const k of ['model_load', 'frame_export', 'sam3_tracking', 'analysis_loop', 'bumper_vlm']) {
             if (timings[k] != null) rows += rowHtml(labels[k], timings[k], k === 'bumper_vlm');
         }
         const other = Math.max(0, total - known);

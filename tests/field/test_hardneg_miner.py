@@ -34,6 +34,6 @@ def test_miner_exports_frames_for_cull_events(tmp_path):
     assert len(jsons) == 2
     import json
     m = json.loads(jsons[0].read_text())
-    # SAM2-space box [2,2,10,10] at scale 0.5 -> full-res [4,4,20,20]
+    # Tracker-space box [2,2,10,10] at scale 0.5 -> full-res [4,4,20,20]
     assert m["rejected"][0]["box"] == [4.0, 4.0, 20.0, 20.0]
     assert m["rejected"][0]["reason"] == "size_prior_violation"

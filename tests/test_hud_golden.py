@@ -65,12 +65,12 @@ def scene():
     job.calib = None
     job.field_model = None
     job.config = SimpleNamespace(field_wireframe_overlay=False)
-    job.use_sam2 = True
-    job.sam2_source_to_local = {FRAME_NUM: 0}
+    job.use_mask_tracker = True
+    job.tracker_source_to_local = {FRAME_NUM: 0}
     job.field_tracker = SimpleNamespace(_id_to_slot={7: 0})
     mask2d = np.zeros((120, 320), np.uint8)
     cv2.ellipse(mask2d, (65, 57), (16, 18), 0, 0, 360, 1, -1)
-    job.sam2_raw = {"main": {0: {3: {"mask": mask2d.astype(bool)}}}}
+    job.tracker_raw = {"main": {0: {3: {"mask": mask2d.astype(bool)}}}}
     job.hubs = [DetectedHub(x=200.0, y=120.0, alliance="blue", x1=182, y1=102, x2=218, y2=138),
                 DetectedHub(x=440.0, y=60.0, alliance="red", x1=425, y1=45, x2=455, y2=75)]
     job.ocr_regions = {"blue_score": (20, 10, 60, 20), "red_score": (560, 10, 60, 20),

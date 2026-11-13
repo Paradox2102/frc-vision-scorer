@@ -58,7 +58,7 @@ class StreamPlan:
         return self.ocr or self.gpu
 
 
-def stream_analysis_plan(*, enabled: bool, use_sam2: bool, device: str,
+def stream_analysis_plan(*, enabled: bool, use_mask_tracker: bool, device: str,
                          needs_vllm: bool, vram_fit: bool) -> StreamPlan:
     """Resolve the knob against the job: OFF -> nothing at all. No SAM pass
     -> nothing to overlap (sequential path). GPU detectors only on CUDA, and
@@ -67,7 +67,7 @@ def stream_analysis_plan(*, enabled: bool, use_sam2: bool, device: str,
     plan = StreamPlan()
     if not enabled:
         return plan
-    if not use_sam2:
+    if not use_mask_tracker:
         plan.notes.append("no SAM pass to overlap -> sequential")
         return plan
     plan.ocr = True
@@ -80,7 +80,7 @@ def stream_analysis_plan(*, enabled: bool, use_sam2: bool, device: str,
         plan.notes.append("vLLM reader reclaims VRAM after tracking -> OCR prefetch only")
     if vram_fit:
         plan.gpu = False
-        plan.notes.append("sam2_max_gpu_frames VRAM-fit -> OCR prefetch only")
+        plan.notes.append("sam3_max_gpu_frames VRAM-fit -> OCR prefetch only")
     return plan
 
 

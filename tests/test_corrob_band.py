@@ -1,4 +1,4 @@
-"""_sam2_robot_candidates corroborate-only band (corrob_conf_floor).
+"""_robot_seed_candidates corroborate-only band (corrob_conf_floor).
 
 At re-prompt/seed boundaries the bumper detector normally runs at ``conf``
 (or ``det_conf_floor`` when motion/zone-gated). corrob_conf_floor pushes the
@@ -61,7 +61,7 @@ def test_corrob_floor_zero_yields_empty_band_and_unchanged_result():
 
     with patch("supervision.Detections.from_ultralytics",
                side_effect=[person_from_ultralytics(None), dets]):
-        result = job._sam2_robot_candidates(frame, conf=0.4)
+        result = job._robot_seed_candidates(frame, conf=0.4)
         # Legacy call shape: a plain list, no band.
         assert isinstance(result, list)
         assert len(result) == 1
@@ -69,7 +69,7 @@ def test_corrob_floor_zero_yields_empty_band_and_unchanged_result():
 
     with patch("supervision.Detections.from_ultralytics",
                side_effect=[person_from_ultralytics(None), dets]):
-        result2, band = job._sam2_robot_candidates(
+        result2, band = job._robot_seed_candidates(
             frame, conf=0.4, corrob_floor=0.0, with_corrob_band=True)
         assert band == []
         assert result2 == result
@@ -84,7 +84,7 @@ def test_corrob_floor_captures_sub_conf_band_not_admitted_elsewhere():
 
     with patch("supervision.Detections.from_ultralytics",
                side_effect=[person_from_ultralytics(None), dets]):
-        result, band = job._sam2_robot_candidates(
+        result, band = job._robot_seed_candidates(
             frame, conf=0.4, corrob_floor=0.1, with_corrob_band=True)
 
     # Strong candidate still comes back through the normal tiered list.
@@ -114,7 +114,7 @@ def test_corrob_band_excludes_already_strong_detection():
 
     with patch("supervision.Detections.from_ultralytics",
                side_effect=[person_from_ultralytics(None), dets]):
-        result, band = job._sam2_robot_candidates(
+        result, band = job._robot_seed_candidates(
             frame, conf=0.4, corrob_floor=0.1, with_corrob_band=True)
 
     assert len(result) == 1
@@ -132,7 +132,7 @@ def test_corrob_band_excludes_detections_below_floor():
 
     with patch("supervision.Detections.from_ultralytics",
                side_effect=[person_from_ultralytics(None), dets]):
-        result, band = job._sam2_robot_candidates(
+        result, band = job._robot_seed_candidates(
             frame, conf=0.4, corrob_floor=0.1, with_corrob_band=True)
 
     assert len(result) == 1

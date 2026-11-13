@@ -36,7 +36,7 @@ def test_ocr_frames_match_loop_rule():
 # Plan / fallback conditions
 # ---------------------------------------------------------------------------
 def _plan(**kw):
-    base = dict(enabled=True, use_sam2=True, device="cuda",
+    base = dict(enabled=True, use_mask_tracker=True, device="cuda",
                 needs_vllm=False, vram_fit=False)
     base.update(kw)
     return stream_analysis_plan(**base)
@@ -53,7 +53,7 @@ def test_plan_full_on_cuda():
 
 
 def test_plan_no_sam_falls_back_to_sequential():
-    p = _plan(use_sam2=False)
+    p = _plan(use_mask_tracker=False)
     assert not p.active
     assert any("sequential" in n for n in p.notes)
 
@@ -213,7 +213,7 @@ def test_speed_profile_arms_validate():
     for name, cfg in arms.items():
         c = JobConfig(cfg)  # raises on an invalid / unknown knob
         assert c.team_reader == "jev" and c.read_census and c.read_keep_evicted
-        assert c.sam2_track_fps == 5 and c.corner_track_stride == 3
+        assert c.sam3_track_fps == 5 and c.corner_track_stride == 3
     assert JobConfig(arms["B3-+stream"]).stream_analysis is True
     assert JobConfig(arms["B2-+selective"]).selective_mask_prop is True
     assert JobConfig(arms["B2-+selective"]).selective_app_weight == 0.3
@@ -222,14 +222,14 @@ def test_speed_profile_arms_validate():
 # ---------------------------------------------------------------------------
 # App seam: knob OFF never builds a prefetcher
 # ---------------------------------------------------------------------------
-def _stub_job(stream: bool, use_sam2: bool = True):
+def _stub_job(stream: bool, use_mask_tracker: bool = True):
     from web.app import InferenceJob
     job = InferenceJob.__new__(InferenceJob)
     job.config = types.SimpleNamespace(
         stream_analysis=stream, vllm_phase_exclusive=False)
     job.team_reader = "jev"
-    job.use_sam2 = use_sam2
-    job.sam2_max_gpu_frames = 0
+    job.use_mask_tracker = use_mask_tracker
+    job.sam3_max_gpu_frames = 0
     job._stopped = False
     job._analysis_prefetch = None
     job._analysis_prefetch_task = None
@@ -254,7 +254,7 @@ def test_app_knob_off_starts_nothing():
 
 
 def test_app_knob_on_without_sam_starts_nothing():
-    job = _stub_job(stream=True, use_sam2=False)
+    job = _stub_job(stream=True, use_mask_tracker=False)
 
     async def go():
         return job._start_analysis_prefetch([1, 2, 3], "cuda")

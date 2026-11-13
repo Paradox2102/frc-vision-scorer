@@ -1,6 +1,6 @@
 """Phase 2 (SP-T.2) offline driver: per-view SAM2 -> fused stable ids -> SlotMapper.
 
-Runs Sam2FieldTracker per calibrated camera view over the sidecar segment,
+Runs MaskFieldTracker per calibrated camera view over the sidecar segment,
 projects each view's mask bottom-centers to shared field coords, fuses
 cross-camera tracklets (SP3 fuse_detections), assigns ONE stable fused track_id
 per physical robot (FusedTrackRegistry), and feeds the Phase-1 FieldTracker.
@@ -133,9 +133,9 @@ def main():
     # ------------------------------------------------------------------
     # 2. Per-view SAM2 propagation (one predictor reused across views)
     # ------------------------------------------------------------------
-    from web.field.sam2_tracker import Sam2FieldTracker  # lazy: torch/SAM2 only here
-    print("[driver] Building Sam2FieldTracker (real GPU) ...")
-    sam2 = Sam2FieldTracker()
+    from web.field.mask_tracker import MaskFieldTracker  # lazy: torch/SAM2 only here
+    print("[driver] Building MaskFieldTracker (real GPU) ...")
+    sam2 = MaskFieldTracker()  # SAM2 predictor
 
     raw: dict[str, dict] = {}    # view_name -> {local_idx: {obj_id: {"box","mask"}}}
     total_prop, total_elapsed = 0, 0.0

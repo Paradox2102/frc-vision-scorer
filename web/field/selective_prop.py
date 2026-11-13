@@ -58,7 +58,7 @@ class SelectiveConfig:
     starve_trigger: int = 7        # min dark-tail frames (to sequence end)
     starve_max_frames: int = 0     # starve-window frame cap; 0 = uncapped
     starve_min_obs: int = 30       # min observed frames to starve-trigger; 0 = gate off
-    # Segmented episode propagation (Sam2FieldTracker.track_selective, SAM3
+    # Segmented episode propagation (MaskFieldTracker.track_selective, SAM3
     # adapter only; both False = today's single-pass episode, exact no-op).
     retire_closed: bool = False    # remove an oid from SAM once all its windows close
     lazy_seed: bool = False        # prompt an oid only when propagation reaches its seed
@@ -287,7 +287,7 @@ class TbdTracker:
 
 
 # ==========================================================================
-# Task 3: offline window construction, exit state machine, sam2_raw merge.
+# Task 3: offline window construction, exit state machine, tracker_raw merge.
 #
 # All three surfaces are pure logic over the completed TBD ``history`` /
 # ``gap_reappearances`` produced above -- no predictor, no torch. Task 4
@@ -813,7 +813,7 @@ class ExitMachine:
                 for w in self._wins]
 
 
-# -- merge into the sam2_raw schema ------------------------------------------
+# -- merge into the tracker_raw schema ---------------------------------------
 def _apply_renames(results, events):
     """Relabel oids in-place per the SWAP rename events.
 
@@ -895,7 +895,7 @@ def _coast_reclaim_margin(coasted_box, frame_obs, cfg: SelectiveConfig):
 
 
 # Diagnostics from the most recent _apply_kill_coast call. Single-view
-# pipeline: sam2_tracker reads this right after merge_selective_results and
+# pipeline: mask_tracker reads this right after merge_selective_results and
 # folds it into selective_stats, so the per-view log line shows whether the
 # coast actually wrote entries (kills, no_seed, entries written, and a
 # per-kill (oid, seed_frame, written, end_reason) breakdown).
@@ -960,7 +960,7 @@ def _apply_kill_coast(results, history, outcomes, cfg: SelectiveConfig):
 
 
 def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
-    """Build the sam2_raw-schema result stream from the TBD history plus the
+    """Build the tracker_raw-schema result stream from the TBD history plus the
     window outcomes.
 
     Returns ``(results, renames)`` where ``results`` is
@@ -983,10 +983,10 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
     mask=None) instead of leaving it on raw TBD -- see :func:`_apply_kill_coast`.
     Off (the default) this is a no-op and the killed path is byte-identical.
     """
-    # mask_to_box lives in sam2_tracker; import lazily so this module stays
-    # torch-free at import time (sam2_tracker's pure helpers are torch-free, but
+    # mask_to_box lives in mask_tracker; import lazily so this module stays
+    # torch-free at import time (mask_tracker's pure helpers are torch-free, but
     # a function-level import keeps that guarantee independent of that module).
-    from web.field.sam2_tracker import mask_to_box
+    from web.field.mask_tracker import mask_to_box
 
     results: dict[int, dict[int, dict]] = {}
     for f in sorted(history):

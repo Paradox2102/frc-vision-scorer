@@ -3,7 +3,7 @@ import pytest
 
 from web.field.smoother import apply_smoothed_paths, rts_smooth_segment, smooth_history
 
-DT = 0.125  # 8 fps, the default SAM2_TRACK_FPS
+DT = 0.125  # 8 fps, the default SAM3_TRACK_FPS
 
 
 def _rec(fn, z, r_scale=1.0, seed=False, corner_only=False, dt=DT):

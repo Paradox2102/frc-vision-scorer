@@ -173,14 +173,14 @@ identical runs.
 |---|---|---|
 | R0 | repo defaults: 5 fps, corner stride 3, 200-frame SAM3 chunks | what :8004 runs on the 3090 (qm8 about 8 min there) |
 | R1 | corner_track_stride 2 | Oct 31 validated default. The Nov 6 "B3" stride 3 lost auto coverage on 4/4 held-out matches. |
-| R2 | sam2_track_fps 8 | Pre-B3 rate (held-out agg meanNN 0.47 vs 0.73 m). Also the rate selective_mask_prop was tuned at, since its frame-denominated knobs are not fps-rescaled. |
+| R2 | sam3_track_fps 8 | Pre-B3 rate (held-out agg meanNN 0.47 vs 0.73 m). Also the rate selective_mask_prop was tuned at, since its frame-denominated knobs are not fps-rescaled. |
 | R3 | sam3_chunk_frames = tier cap | Fewer SAM3 chunk boundaries. Each boundary drops appearance memory and does not re-seed occluded objects. VRAM-bound; untested above 400. |
-| R4 | sam2_track_fps 10 | Denser evidence through crossings. No A/B evidence above 8 fps. |
+| R4 | sam3_track_fps 10 | Denser evidence through crossings. No A/B evidence above 8 fps. |
 | R5 | corner_track_stride 1 | Last: the Oct 31 A/B found no identity gain over stride 2 at about 2x the corner cost. |
 
-Not on the ladder: `sam2_export_scale` (the code says export resolution is not
+Not on the ladder: `sam3_export_scale` (the code says export resolution is not
 a lever because SAM resizes to a fixed square, and the Nov 11 coverage study
-agrees), `sam2_max_gpu_frames` (can only lower the tracked frame rate),
+agrees), `sam3_max_gpu_frames` (can only lower the tracked frame rate),
 `sam3_multiplex` and `sam3_compile` (A/B'd slower or no win).
 `selective_mask_prop` and the output-identical SAM3 speed levers stay ON.
 

@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import cv2
 
-from web.app import InferenceJob, _restore_sam2_mask_to_view
+from web.app import InferenceJob, _restore_mask_to_view
 from web.job_config import JobConfig
 
 # These tests exercise the SAM2 path specifically; pin the backend so the
@@ -69,14 +69,14 @@ def test_inference_job_defaults_vram_budget_from_env_constant():
     """Per-job VRAM frame budget defaults to the module env constant."""
     import web.app as app_mod
     job = app_mod.InferenceJob("j", "/mock/video.mp4")
-    assert job.sam2_max_gpu_frames == app_mod.SAM2_MAX_GPU_FRAMES
+    assert job.sam3_max_gpu_frames == app_mod.SAM3_MAX_GPU_FRAMES
 
 
-def test_restore_sam2_mask_reinserts_top_crop_without_vertical_shift():
+def test_restore_mask_reinserts_top_crop_without_vertical_shift():
     mask = np.zeros((4, 6), dtype=bool)
     mask[1:3, 2:5] = True
 
-    restored = _restore_sam2_mask_to_view(
+    restored = _restore_mask_to_view(
         mask,
         (10, 12, 3),
         top_offset_px=2,
@@ -91,10 +91,10 @@ def test_restore_sam2_mask_reinserts_top_crop_without_vertical_shift():
     assert xs.max() == 9
 
 
-def test_restore_sam2_mask_without_crop_fills_full_view():
+def test_restore_mask_without_crop_fills_full_view():
     mask = np.ones((2, 3), dtype=bool)
 
-    restored = _restore_sam2_mask_to_view(mask, (4, 6, 3))
+    restored = _restore_mask_to_view(mask, (4, 6, 3))
 
     assert restored.all()
 
@@ -132,19 +132,19 @@ class TestSAM2Streaming(unittest.TestCase):
         job.extract_team_numbers = MagicMock()
         job._scan_match_clock = MagicMock(return_value=[])
         
-        # Simulate Sam2FieldTracker raising an ImportError (e.g. no torch/sam2 installed)
-        with patch("web.field.sam2_tracker.Sam2FieldTracker", side_effect=ImportError("no torch")):
+        # Simulate MaskFieldTracker raising an ImportError (e.g. no torch/sam2 installed)
+        with patch("web.field.mask_tracker.MaskFieldTracker", side_effect=ImportError("no torch")):
             with patch("cv2.VideoCapture", return_value=mock_cap):
                 import asyncio
                 asyncio.run(job.process_video())
                 
-                # Check that use_sam2 is False and it ran fallback path
-                assert job.use_sam2 is False
+                # Check that use_mask_tracker is False and it ran fallback path
+                assert job.use_mask_tracker is False
                 assert not hasattr(job, "fused_registry")
 
     @patch("web.app.YOLO")
     @patch("web.app.RobotEmbedder")
-    @patch("web.field.sam2_tracker.Sam2FieldTracker")
+    @patch("web.field.mask_tracker.MaskFieldTracker")
     def test_sam2_precomputation_and_lookup(self, mock_sam2_tracker_cls, mock_embedder_cls, mock_yolo):
         """Verify the SAM2 pre-computation pass runs and lookups are performed in the loop."""
         # Force YOLO calls to return our MockBoxes
@@ -297,14 +297,14 @@ class TestSAM2Streaming(unittest.TestCase):
             asyncio.run(job.process_video())
             
             # Print state for debugging if it fails
-            print(f"DEBUG: use_sam2 = {job.use_sam2}")
-            if hasattr(job, "sam2_raw"):
-                print(f"DEBUG: sam2_raw keys = {list(job.sam2_raw.keys())}")
-                if "main" in job.sam2_raw:
-                    print(f"DEBUG: sam2_raw['main'] keys = {list(job.sam2_raw['main'].keys())}")
+            print(f"DEBUG: use_mask_tracker = {job.use_mask_tracker}")
+            if hasattr(job, "tracker_raw"):
+                print(f"DEBUG: tracker_raw keys = {list(job.tracker_raw.keys())}")
+                if "main" in job.tracker_raw:
+                    print(f"DEBUG: tracker_raw['main'] keys = {list(job.tracker_raw['main'].keys())}")
             
-            # Check that use_sam2 is True
-            assert job.use_sam2 is True
+            # Check that use_mask_tracker is True
+            assert job.use_mask_tracker is True
             assert hasattr(job, "fused_registry")
             # Verify SAM2 tracker was called
             mock_sam2_tracker.track.assert_called_once()

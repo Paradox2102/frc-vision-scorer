@@ -30,9 +30,9 @@ export TEAM_READER="${TEAM_READER:-jev}"
 # expandable_segments) were clean. Until the instrumented chunk-VRAM logs
 # attribute the growth, run yesterday's known-good behavior profile. The
 # features stay in the tree and re-enable per job via config_json for
-# A/B-ing the leak.
-export SAM2_DARK_REANCHOR_ENABLED="${SAM2_DARK_REANCHOR_ENABLED:-0}"
-export SAM2_EVICT_DARK_FRAMES="${SAM2_EVICT_DARK_FRAMES:-99999}"
-export SAM2_EVICT_MIN_ABSENCES="${SAM2_EVICT_MIN_ABSENCES:-99}"
+# A/B-ing the leak. (A caller's legacy SAM2_* name is still honoured.)
+export SAM3_DARK_REANCHOR_ENABLED="${SAM3_DARK_REANCHOR_ENABLED:-${SAM2_DARK_REANCHOR_ENABLED:-0}}"
+export SAM3_EVICT_DARK_FRAMES="${SAM3_EVICT_DARK_FRAMES:-${SAM2_EVICT_DARK_FRAMES:-99999}}"
+export SAM3_EVICT_MIN_ABSENCES="${SAM3_EVICT_MIN_ABSENCES:-${SAM2_EVICT_MIN_ABSENCES:-99}}"
 
 "$PROJECT_ROOT/web/start.sh"

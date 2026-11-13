@@ -38,6 +38,12 @@ class Knob:
     min: Optional[float] = None
     max: Optional[float] = None
     section: str = "misc"           # settings-UI grouping; see KNOBS comments
+    # Legacy names still accepted (Nov 2026 sam2_* -> sam3_* rename): old
+    # override keys (persisted config_json / replay configs, A/B profiles,
+    # runtime overrides) and old env vars (operator .env files). The canonical
+    # name wins when both are given. Never listed by describe_knobs().
+    aliases: tuple = ()
+    env_aliases: tuple = ()
 
 
 KNOBS = [
@@ -46,25 +52,29 @@ KNOBS = [
          choices=("sam2", "sam3"), section="Tracking backend"),
     Knob("sam2_model_size", "SAM2_MODEL_SIZE", str, "small",
          choices=("tiny", "small", "base_plus", "large"), section="Tracking backend"),
-    # Nov 6 2026 interim live-event defaults ("B3"): sam2_track_fps 5,
+    # Nov 6 2026 interim live-event defaults ("B3"): sam3_track_fps 5,
     # corner_track_stride 3, selective_mask_prop + selective_app_weight 0.3,
     # stream_analysis, team_reader jev + read_census + read_keep_evicted.
     # Full match 8.9 min (qm8) / 11.3 min (qm11) vs ~25 min; costs some auto
     # coverage on a few robots. Superseded once SAM 3.1 multiplex works.
-    Knob("sam2_track_fps", "SAM2_TRACK_FPS", float, 5.0, min=0.5, max=60.0,
-         section="Tracking backend"),
-    # Floor 0.25: below that SAM2 is starved of pixels; above 1.0 only
+    Knob("sam3_track_fps", "SAM3_TRACK_FPS", float, 5.0, min=0.5, max=60.0,
+         section="Tracking backend",
+         aliases=("sam2_track_fps",), env_aliases=("SAM2_TRACK_FPS",)),
+    # Floor 0.25: below that SAM is starved of pixels; above 1.0 only
     # upsamples (no information) and inflates mask RAM.
-    Knob("sam2_export_scale", "SAM2_EXPORT_SCALE", float, 0.5, min=0.25, max=1.0,
-         section="Tracking backend"),
-    Knob("sam2_max_gpu_frames", "SAM2_MAX_GPU_FRAMES", int, 0, min=0,
-         section="Tracking backend"),
+    Knob("sam3_export_scale", "SAM3_EXPORT_SCALE", float, 0.5, min=0.25, max=1.0,
+         section="Tracking backend",
+         aliases=("sam2_export_scale",), env_aliases=("SAM2_EXPORT_SCALE",)),
+    Knob("sam3_max_gpu_frames", "SAM3_MAX_GPU_FRAMES", int, 0, min=0,
+         section="Tracking backend",
+         aliases=("sam2_max_gpu_frames",), env_aliases=("SAM2_MAX_GPU_FRAMES",)),
     # Seed at the active-period open (0.0) rather than +3s: the +3s single seed
     # left clock 0:20->0:17 untracked and missed robots still en route. Validated
     # 2026-07-06 as lever 2 across qm8/10/11/12 (agg meanNN improved on every
     # match; 6800/870 late-start robots now seed at ~0 lag).
-    Knob("sam2_prompt_offset_seconds", "SAM2_PROMPT_OFFSET_SECONDS", float, 0.0,
-         min=0.0, section="Seeding & re-seeding"),
+    Knob("sam3_prompt_offset_seconds", "SAM3_PROMPT_OFFSET_SECONDS", float, 0.0,
+         min=0.0, section="Seeding & re-seeding",
+         aliases=("sam2_prompt_offset_seconds",), env_aliases=("SAM2_PROMPT_OFFSET_SECONDS",)),
     Knob("reprompt_seconds", "REPROMPT_SECONDS", float, 2.0, min=0.1,
          section="Seeding & re-seeding"),
     # qm12 0:20-0:16 — during the first `opening_window_seconds` of active
@@ -87,13 +97,15 @@ KNOBS = [
     # seeds anyway, and may evict a stationary once-absent object from a
     # capped roster (qm11: sprinting robot starved by already_tracked/
     # roster_cap against equipment-parked masks). DEFAULT OFF pending A/B.
-    Knob("motion_override", "SAM2_MOTION_OVERRIDE_ENABLED", bool, False,
-         section="Seeding & re-seeding"),
+    Knob("motion_override", "SAM3_MOTION_OVERRIDE_ENABLED", bool, False,
+         section="Seeding & re-seeding",
+         env_aliases=("SAM2_MOTION_OVERRIDE_ENABLED",)),
     # Min mean-abs-gray-diff (normalized /255) inside the candidate box, one
     # track_fps step apart, to count as "moving". Static-scene JPEG noise is
     # <0.01; a robot sweeping its own box scores >0.06.
-    Knob("motion_energy_thresh", "SAM2_MOTION_ENERGY_THRESH", float, 0.04,
-         min=0.0, max=1.0, section="Seeding & re-seeding"),
+    Knob("motion_energy_thresh", "SAM3_MOTION_ENERGY_THRESH", float, 0.04,
+         min=0.0, max=1.0, section="Seeding & re-seeding",
+         env_aliases=("SAM2_MOTION_ENERGY_THRESH",)),
     # Motion-gated low-confidence admission: run the bumper detector down to
     # det_conf_floor at seed/re-prompt frames and admit the sub-threshold band
     # only when the box shows pixel motion (qm11 6800: dark blurred bumper
@@ -138,10 +150,11 @@ KNOBS = [
     # structure from birth. DEFAULT ON — validated 2026-07-08 (qm8/9/10 auto
     # A/B): neutral on the easy matches, big qm10 win (aggNN 0.644->0.509,
     # rescued blue 59 coverage 24%->94%), no regressions. Module env default
-    # (SAM2_NEG_POINT_PROMPTS) stays off for direct/library callers; the
+    # (SAM3_NEG_POINT_PROMPTS) stays off for direct/library callers; the
     # pipeline passes this Knob value into track().
-    Knob("neg_point_prompts", "SAM2_NEG_POINT_PROMPTS", bool, True,
-         section="Seeding & re-seeding"),
+    Knob("neg_point_prompts", "SAM3_NEG_POINT_PROMPTS", bool, True,
+         section="Seeding & re-seeding",
+         env_aliases=("SAM2_NEG_POINT_PROMPTS",)),
     Knob("sam2_vos_optimized", "SAM2_VOS_OPTIMIZED", bool, False,
          section="Tracking backend"),
     # SAM3 chunked sessions: frames per GPU-resident window (~14 MB/frame).
@@ -353,7 +366,7 @@ KNOBS = [
     # at local frame 40/727 pins the safe horizon at ~3% of the match), so the
     # loop still starts after the last view. GPU prefetch is skipped (OCR
     # only) without CUDA, for vLLM-reader jobs (VRAM handoff) and under the
-    # sam2_max_gpu_frames VRAM-fit mode. DEFAULT OFF -> unchanged path.
+    # sam3_max_gpu_frames VRAM-fit mode. DEFAULT OFF -> unchanged path.
     Knob("stream_analysis", "STREAM_ANALYSIS", bool, True,
          section="Tracking backend"),
     Knob("cull_hijack_enabled", "CULL_HIJACK_ENABLED", bool, False,
@@ -367,8 +380,9 @@ KNOBS = [
     # Person-overlap veto: cull a stationary mask that spends consecutive
     # boundaries mostly inside a person detection — a positive hijack signal,
     # independent of the absence cull (qm11: R3 spent all of auto on a ref).
-    Knob("person_veto_enabled", "SAM2_PERSON_VETO_ENABLED", bool, False,
-         section="Track hygiene"),
+    Knob("person_veto_enabled", "SAM3_PERSON_VETO_ENABLED", bool, False,
+         section="Track hygiene",
+         env_aliases=("SAM2_PERSON_VETO_ENABLED",)),
     # Zone-blind corroboration: detections whose ground contact lies inside a
     # static-structure zone (UNinflated rects) never count as mask
     # corroboration, so a bumper-lookalike FP on equipment (2026cur OVERFLOW
@@ -424,18 +438,22 @@ KNOBS = [
     # judge; revisit then.
     Knob("vote_prob_weight", "VLM_VOTE_PROB_WEIGHT", bool, False,
          section="Identity & votes"),
-    Knob("reanchor_enabled", "SAM2_REANCHOR_ENABLED", bool, False,
-         section="Track hygiene"),
+    Knob("reanchor_enabled", "SAM3_REANCHOR_ENABLED", bool, False,
+         section="Track hygiene",
+         env_aliases=("SAM2_REANCHOR_ENABLED",)),
     # Evidence-ranked roster: re-prompt a dark object claimed by a fresh
     # detection in place, and let weak-evidence roster members (dark or
     # repeatedly detector-orphaned) lose their slot to detector-backed
     # newcomers. The roster holds the 6 objects most likely to be robots.
-    Knob("dark_reanchor_enabled", "SAM2_DARK_REANCHOR_ENABLED", bool, True,
-         section="Track hygiene"),
-    Knob("evict_dark_frames", "SAM2_EVICT_DARK_FRAMES", int, 8, min=1,
-         section="Track hygiene"),
-    Knob("evict_min_absences", "SAM2_EVICT_MIN_ABSENCES", int, 2, min=1,
-         section="Track hygiene"),
+    Knob("dark_reanchor_enabled", "SAM3_DARK_REANCHOR_ENABLED", bool, True,
+         section="Track hygiene",
+         env_aliases=("SAM2_DARK_REANCHOR_ENABLED",)),
+    Knob("evict_dark_frames", "SAM3_EVICT_DARK_FRAMES", int, 8, min=1,
+         section="Track hygiene",
+         env_aliases=("SAM2_EVICT_DARK_FRAMES",)),
+    Knob("evict_min_absences", "SAM3_EVICT_MIN_ABSENCES", int, 2, min=1,
+         section="Track hygiene",
+         env_aliases=("SAM2_EVICT_MIN_ABSENCES",)),
     # Misaligned-mask re-anchor: the common drift case between dark (total
     # mask loss) and sliver (area collapse) re-anchor — a healthy-size,
     # color-consistent mask that slid off its robot until detection overlap
@@ -444,14 +462,17 @@ KNOBS = [
     # SAME id at the detection box instead of churning a new id or hitting
     # the roster cap. DEFAULT ON — validated 2026-07-08 (qm8/9/10 auto A/B):
     # neutral on the easy matches, big qm10 win (aggNN 0.644->0.520), no
-    # regressions. Module env default (SAM2_MISALIGN_REANCHOR) stays off for
+    # regressions. Module env default (SAM3_MISALIGN_REANCHOR) stays off for
     # direct/library callers; the pipeline passes this Knob value into track().
-    Knob("misalign_reanchor", "SAM2_MISALIGN_REANCHOR", bool, True,
-         section="Track hygiene"),
-    Knob("misalign_ios_min", "SAM2_MISALIGN_IOS_MIN", float, 0.2, min=0.05, max=0.5,
-         section="Track hygiene"),
-    Knob("misalign_boundaries", "SAM2_MISALIGN_BOUNDARIES", int, 2, min=1, max=10,
-         section="Track hygiene"),
+    Knob("misalign_reanchor", "SAM3_MISALIGN_REANCHOR", bool, True,
+         section="Track hygiene",
+         env_aliases=("SAM2_MISALIGN_REANCHOR",)),
+    Knob("misalign_ios_min", "SAM3_MISALIGN_IOS_MIN", float, 0.2, min=0.05, max=0.5,
+         section="Track hygiene",
+         env_aliases=("SAM2_MISALIGN_IOS_MIN",)),
+    Knob("misalign_boundaries", "SAM3_MISALIGN_BOUNDARIES", int, 2, min=1, max=10,
+         section="Track hygiene",
+         env_aliases=("SAM2_MISALIGN_BOUNDARIES",)),
     # Seed-box plausibility gate: a detection box taller than this aspect
     # (h/w) may not seed, re-anchor, or evict at SAM reprompt boundaries; 0
     # disables. qm12 hub-face sliver (aspect 4.47) evicted a real track.
@@ -473,8 +494,9 @@ KNOBS = [
     # (a robot arm, or a robot split by hub/ball occlusion) is preserved.
     # Unconditional largest-component regressed qm10/qm12 by dropping those
     # halves. DEFAULT OFF pending re-validation.
-    Knob("mask_leak_cleanup", "SAM2_MASK_LEAK_CLEANUP", bool, False,
-         section="Track hygiene"),
+    Knob("mask_leak_cleanup", "SAM3_MASK_LEAK_CLEANUP", bool, False,
+         section="Track hygiene",
+         env_aliases=("SAM2_MASK_LEAK_CLEANUP",)),
     # Derive a robot's field position from the centroid of its SAM mask's
     # carpet-contact band instead of the tracked box bottom-center. An extended
     # intake/arm stretches the box, shifting the box bottom-center off the
@@ -519,10 +541,12 @@ KNOBS = [
     # (itself off), so it was untestable standalone. evict_prob_immune A/B'd
     # qm8/9/10 auto + qm11 full — tiny mixed deltas with small coverage
     # regressions (qm8 2724 41->37, qm9 1024 81->72), no net benefit. Kept off.
-    Knob("cull_low_prob_max", "SAM2_CULL_LOW_PROB_MAX", float, 0.0, min=0.0, max=1.0,
-         section="Track hygiene"),
-    Knob("evict_prob_immune", "SAM2_EVICT_PROB_IMMUNE", float, 0.0, min=0.0, max=1.0,
-         section="Track hygiene"),
+    Knob("cull_low_prob_max", "SAM3_CULL_LOW_PROB_MAX", float, 0.0, min=0.0, max=1.0,
+         section="Track hygiene",
+         env_aliases=("SAM2_CULL_LOW_PROB_MAX",)),
+    Knob("evict_prob_immune", "SAM3_EVICT_PROB_IMMUNE", float, 0.0, min=0.0, max=1.0,
+         section="Track hygiene",
+         env_aliases=("SAM2_EVICT_PROB_IMMUNE",)),
     # Per-boundary detection archive (pure telemetry, no behavior change):
     # every re-prompt boundary's detections, all views, full-res view coords,
     # to detections.jsonl beside diagnostics. Feeds det-gated VLM reads and
@@ -566,14 +590,16 @@ KNOBS = [
     # start-lags -> 0), ~+20% auto-job wall time. The apparent 4786 coverage
     # drop is a Hungarian pairing flip in compare_manta over identical
     # physical tracks, not lost tracking. Module env default
-    # (SAM2_LATE_SEED_BACKFILL) stays off for direct/library callers; the
+    # (SAM3_LATE_SEED_BACKFILL) stays off for direct/library callers; the
     # pipeline passes this Knob value into track().
-    Knob("late_seed_backfill", "SAM2_LATE_SEED_BACKFILL", bool, True,
-         section="Track hygiene"),
+    Knob("late_seed_backfill", "SAM3_LATE_SEED_BACKFILL", bool, True,
+         section="Track hygiene",
+         env_aliases=("SAM2_LATE_SEED_BACKFILL",)),
     # How far back to recover, in wall-clock seconds (converted to frames the
     # same way reprompt_seconds is, and rescaled for decimated corner views).
-    Knob("backfill_seconds", "SAM2_BACKFILL_SECONDS", float, 4.0,
-         min=0.5, max=20.0, section="Track hygiene"),
+    Knob("backfill_seconds", "SAM3_BACKFILL_SECONDS", float, 4.0,
+         min=0.5, max=20.0, section="Track hygiene",
+         env_aliases=("SAM2_BACKFILL_SECONDS",)),
     # Offline RTS smoothing of exported 2D paths (web/field/smoother.py):
     # re-filter each slot's recorded measurements forward (no coast decay)
     # and smooth backward, then rewrite autonomous_paths field_pos and fill
@@ -994,7 +1020,7 @@ KNOBS = [
     Knob("identity_per_cam_appearance", "IDENTITY_PER_CAM_APPEARANCE", bool, True,
          section="Identity & votes"),
     # Per-camera appearance for the FUSED-ID relink (FusedTrackRegistry, the
-    # SAM2 tracklet path): a cluster whose member keys are all new relinks onto
+    # mask-tracker tracklet path): a cluster whose member keys are all new relinks onto
     # an inactive fused id on appearance; the averaged multi-camera embedding
     # rarely matches across views (main-vs-corner same-robot cosine ~0.62), so
     # the miss becomes a new fused id -> slot track change + crop-buffer flush.
@@ -1216,6 +1242,42 @@ KNOBS = [
 ]
 
 _BY_NAME = {k.name: k for k in KNOBS}
+# Legacy override key -> canonical knob name.
+_ALIASES = {a: k.name for k in KNOBS for a in k.aliases}
+
+
+def canonical_knob_name(name: str) -> str:
+    """The canonical knob name for ``name`` (itself unless it is a legacy
+    alias such as ``sam2_track_fps``)."""
+    return _ALIASES.get(name, name)
+
+
+def normalize_overrides(overrides: Optional[dict]) -> dict:
+    """Rewrite legacy alias keys in an override/config dict to canonical knob
+    names. A canonical key wins over its alias when both are present; keys
+    that are neither (unknown knobs, unrelated fields) pass through."""
+    overrides = dict(overrides or {})
+    out = {k: v for k, v in overrides.items() if k not in _ALIASES}
+    for key, value in overrides.items():
+        canon = _ALIASES.get(key)
+        if canon is not None and canon not in out:
+            out[canon] = value
+    return out
+
+
+def knob_default(name: str) -> Any:
+    """Code default of the knob named ``name`` (canonical or legacy alias)."""
+    return _BY_NAME[canonical_knob_name(name)].default
+
+
+def _env_value(knob: Knob) -> Optional[str]:
+    """The knob's env value: its canonical variable, else the first set legacy
+    alias (empty strings count as unset, as before)."""
+    for var in (knob.env, *knob.env_aliases):
+        val = os.environ.get(var)
+        if val not in (None, ""):
+            return val
+    return None
 
 # Runtime overrides set from the settings UI. They sit between per-job
 # overrides and the environment: job override > runtime > env > default.
@@ -1232,6 +1294,7 @@ def set_runtime_override(name: str, value: Any) -> Any:
     Returns the coerced value (or None when cleared). Raises ValueError on an
     unknown knob or invalid value.
     """
+    name = canonical_knob_name(name)
     knob = _BY_NAME.get(name)
     if knob is None:
         raise ValueError(
@@ -1251,8 +1314,8 @@ def reset_runtime_overrides() -> None:
 
 def _resolve_launch(knob: Knob) -> tuple[Any, str]:
     """Resolve a knob ignoring runtime overrides: (value, 'env'|'default')."""
-    env_val = os.environ.get(knob.env)
-    if env_val not in (None, ""):
+    env_val = _env_value(knob)
+    if env_val is not None:
         return env_val, "env"
     return knob.default, "default"
 
@@ -1316,7 +1379,7 @@ class JobConfig:
     """Resolved knob values for one inference job: override > env > default."""
 
     def __init__(self, overrides: Optional[dict] = None):
-        overrides = dict(overrides or {})
+        overrides = normalize_overrides(overrides)
         unknown = sorted(set(overrides) - set(_BY_NAME))
         if unknown:
             raise ValueError(
@@ -1329,8 +1392,8 @@ class JobConfig:
             elif knob.name in _runtime_overrides:
                 raw = _runtime_overrides[knob.name]
             else:
-                env_val = os.environ.get(knob.env)
-                raw = env_val if env_val not in (None, "") else knob.default
+                env_val = _env_value(knob)
+                raw = env_val if env_val is not None else knob.default
             try:
                 value = _coerce(knob, raw)
                 _validate(knob, value)

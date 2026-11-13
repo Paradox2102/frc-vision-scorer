@@ -1134,7 +1134,7 @@ def print_tune_table(res: dict, order: list, budget_min: float, on: str) -> None
             note = f"{r.get('status')}: {str(r.get('error'))[:60]}"
         elif g.get("error") or m.get("error"):
             note += f" score err: {str(g.get('error') or m.get('error'))[:60]}"
-        print(f"{name:<4} {k.get('sam2_track_fps', '-'):>4} {k.get('corner_track_stride', '-'):>3} "
+        print(f"{name:<4} {k.get('sam3_track_fps', k.get('sam2_track_fps', '-')):>4} {k.get('corner_track_stride', '-'):>3} "
               f"{k.get('sam3_chunk_frames', '-'):>5} {wj:>6} {wf:>6} {vr:>9} "
               f"{m.get('agg_meanNN', '-'):>6} {_pct(g.get('coverage')):>6} "
               f"{g.get('err_median_m') if g.get('err_median_m') is not None else '-':>6} "

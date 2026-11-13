@@ -1,6 +1,6 @@
 """Job-slot serialization and jobs-dict hygiene.
 
-One job runs at a time by default (SAM2+VLM saturate the GPU; concurrent
+One job runs at a time by default (SAM+VLM saturate the GPU; concurrent
 jobs offload state to CPU and confound A/B timing). Extra submissions queue:
 the client gets "queued" heartbeats, stop/disconnect while queued abandons
 the run, and finished jobs are pruned so they stop holding YOLO models.

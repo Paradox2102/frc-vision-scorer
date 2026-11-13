@@ -54,7 +54,7 @@ re-anchor, not a cold re-seed.
 Late-seed backward backfill (solo_ids)
 ---------------------------------------
 
-``sam2_tracker.Sam2FieldTracker.track`` (shared by this adapter) can, after
+``mask_tracker.MaskFieldTracker.track`` (shared by this adapter) can, after
 its forward loop finishes, re-prompt a late-seeded object at its own seed
 frame and propagate BACKWARD to recover history YOLO missed. Doing that
 naively would hit both roster-carry loops above (``_open_chunk_for`` and
@@ -79,7 +79,7 @@ from typing import Any
 
 import numpy as np
 
-from web.field.sam2_tracker import Sam2FieldTracker
+from web.field.mask_tracker import MaskFieldTracker
 
 # Frames per SAM3 session window. ~14 MB GPU/frame: 200 frames ≈ 2.8 GB video
 # residency, leaving headroom for the model and a co-resident vLLM reader.
@@ -631,7 +631,7 @@ class Sam3PredictorAdapter:
             # [(global_idx, obj_id, box, neg_points)]
             "pending": [],
             "closed": False,
-            # Late-seed backward backfill scoping (sam2_tracker.py): when set
+            # Late-seed backward backfill scoping (mask_tracker.py): when set
             # to a set of obj_ids, the roster-carry loops below re-prompt
             # ONLY those ids instead of the whole live roster. None (default)
             # is the normal full-roster behavior.
@@ -921,7 +921,7 @@ class Sam3PredictorAdapter:
             if obj_id in prompted_ids:
                 continue
             if solo is not None and obj_id not in solo:
-                # Late-seed backfill (sam2_tracker.py): during a reverse
+                # Late-seed backfill (mask_tracker.py): during a reverse
                 # backfill pass this loop would otherwise re-seed the WHOLE
                 # live roster across the boundary — wasted compute, and it
                 # would drag every other object's `last_box` backward too.
@@ -1085,12 +1085,12 @@ class Sam3PredictorAdapter:
             yield from self._stream_chunk(state, next_global, lo, hi, reverse=False)
 
 
-class Sam3FieldTracker(Sam2FieldTracker):
+class Sam3FieldTracker(MaskFieldTracker):
     """Run the field tracker with Meta's SAM3 video model (instance prompts,
     chunked sessions).
 
     ``track(..., should_stop=...)`` (cooperative user-STOP abort) is inherited
-    from ``Sam2FieldTracker`` and works here too: the shared loop polls the
+    from ``MaskFieldTracker`` and works here too: the shared loop polls the
     predicate once per propagated frame of the adapter's stream and raises
     ``TrackStopped``; the ``finally`` cleanup calls this adapter's
     ``reset_state``, which closes the live chunk session and removes its

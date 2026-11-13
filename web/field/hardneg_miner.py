@@ -1,7 +1,7 @@
 """Post-job hard-negative export from tracker diagnostics.
 
 Equipment hijacks are detector-corroborated (YOLO false-fires on the
-equipment itself — see the size-prior comment in sam2_tracker.py), so culls
+equipment itself — see the size-prior comment in mask_tracker.py), so culls
 can only ever treat symptoms; retraining the detector on its own confusers is
 the fix. The diagnostics stream already names them: size-prior culls, person
 vetoes, static-structure and implausible-aspect seed rejections all carry a

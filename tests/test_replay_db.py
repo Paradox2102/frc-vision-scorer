@@ -71,8 +71,8 @@ def test_init_db_migrates_old_replays_table_and_roundtrips_timings(tmp_path, mon
 
     row = _sample_row("job-t")
     row["processing_sec"] = 197.9
-    row["timings"] = _json.dumps({"total": 197.9, "sam2_tracking": 120.0, "analysis_loop": 60.0})
+    row["timings"] = _json.dumps({"total": 197.9, "sam3_tracking": 120.0, "analysis_loop": 60.0})
     asyncio.run(database.insert_replay(row))
     got = asyncio.run(database.get_replay("job-t"))
     assert got["processing_sec"] == 197.9
-    assert _json.loads(got["timings"])["sam2_tracking"] == 120.0
+    assert _json.loads(got["timings"])["sam3_tracking"] == 120.0

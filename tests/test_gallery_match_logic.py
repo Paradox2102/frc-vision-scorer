@@ -71,7 +71,7 @@ def test_current_match_deposit_is_not_added_to_query_gallery():
     job.event_key = "2026x"
     job.match_key = "2026x_qm2"
     job.job_id = "job-2"
-    job.use_sam2 = True
+    job.use_mask_tracker = True
     job._pending_gallery_rows = []
 
     robot = FakeTrack("blue", _unit(1, 0, 0))

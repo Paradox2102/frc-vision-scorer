@@ -1,6 +1,6 @@
-"""Stable cross-camera fused track ids for the SAM2 tracklet path.
+"""Stable cross-camera fused track ids for the mask-tracker tracklet path.
 
-SAM2 emits per-camera object ids that collide across cameras and restart per
+The SAM mask tracker emits per-camera object ids that collide across cameras and restart per
 prompt. SP3 fusion clusters per-camera detections of one physical robot; this
 registry gives each such cluster ONE integer id that is stable across frames,
 so the Phase-1 FieldTracker sticky binding turns it into a fixed slot.
@@ -30,7 +30,7 @@ shared no camera with it) and created_samecam_below_floor /
 created_samecam_above_floor (best same-camera cosine vs a plausible inactive
 id, below / at-or-above app_floor).
 
-Pure: no torch / SAM2 / cv2 imports."""
+Pure: no torch / SAM / cv2 imports."""
 from __future__ import annotations
 import numpy as np
 from collections import Counter

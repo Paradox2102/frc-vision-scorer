@@ -228,7 +228,7 @@ class CameraCalibration:
     mode: str = "camera"                 # "camera" (fisheye), "homography", or "pinhole"
     H: Optional[np.ndarray] = None       # (3,3) ground-plane homography (image->field)
     masks: list[tuple] = field(default_factory=list) # crop-local coordinates (x, y, w, h)
-    robot_track_top_crop: float = 0.0    # fraction (0.0–0.5) of frame top excluded from SAM2 robot tracking
+    robot_track_top_crop: float = 0.0    # fraction (0.0–0.5) of frame top excluded from SAM robot tracking
 
     def to_json(self) -> dict:
         return {

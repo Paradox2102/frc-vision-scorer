@@ -39,7 +39,7 @@ def test_make_frame_detect_fn_returns_export_boxes_and_records(tmp_path):
     job.detection_archive = MagicMock()
     # The cascade already runs on the export-scale JPEG, so its box is in
     # EXPORT coords. One firm (strong=True) candidate.
-    job._sam2_robot_candidates = MagicMock(
+    job._robot_seed_candidates = MagicMock(
         return_value=[((10.0, 20.0, 30.0, 40.0), "red", True)])
 
     view = SimpleNamespace(name="main", calibration=MagicMock())
@@ -72,7 +72,7 @@ def test_make_frame_detect_fn_applies_top_crop_y_offset(tmp_path):
     job.field_dims = (16.54, 8.21)
     job.field_model = None
     job.detection_archive = MagicMock()
-    job._sam2_robot_candidates = MagicMock(
+    job._robot_seed_candidates = MagicMock(
         return_value=[((10.0, 20.0, 30.0, 40.0), "blue", True)])
 
     view = SimpleNamespace(name="corner", calibration=MagicMock())
@@ -97,7 +97,7 @@ def test_make_frame_detect_fn_swallows_errors_with_first_only_warning(capsys):
     job.field_model = None
     job.detection_archive = MagicMock()
     # imread returns None for a missing path -> the cascade never runs.
-    job._sam2_robot_candidates = MagicMock(side_effect=RuntimeError("cascade boom"))
+    job._robot_seed_candidates = MagicMock(side_effect=RuntimeError("cascade boom"))
 
     view = SimpleNamespace(name="main", calibration=MagicMock())
     view_plan = SimpleNamespace(source_frames=[1, 2])
@@ -188,14 +188,14 @@ def test_gate_off_never_references_track_selective():
     tracker.track_selective.assert_not_called()
     tracker.track.assert_called_once_with(**track_kwargs)
     # Timing still accrues to the uniform path.
-    assert "sam2_tracking" in job.timings
+    assert "sam3_tracking" in job.timings
 
 
 def test_gate_on_fallback_runs_track_and_logs(capsys):
     job = _make_job()
     job.config.selective_mask_prop = True
     job.timings = {}
-    job.sam2_obj_color = {}
+    job.tracker_obj_color = {}
     sentinel = {0: {}, 1: {}}
     tracker = _tracker_stub(sentinel)
     tracker.track_selective.side_effect = RuntimeError("boom")
@@ -220,7 +220,7 @@ def test_gate_on_success_logs_stats_and_registers_colors(capsys):
     job = _make_job()
     job.config.selective_mask_prop = True
     job.timings = {}
-    job.sam2_obj_color = {}
+    job.tracker_obj_color = {}
     tracks = {0: {1: {}}, 1: {1: {}}}
     tracker = _tracker_stub({"unused": True})
     tracker.track_selective.return_value = tracks
@@ -244,7 +244,7 @@ def test_gate_on_success_logs_stats_and_registers_colors(capsys):
     # by TBD oid and INCLUDING None values (so a colorless oid reads back as
     # "unknown" via evidence_build's ``.get(oid) or "unknown"`` rather than a
     # stale prompt-seed color left at a colliding integer key).
-    assert job.sam2_obj_color["main"] == {1: "red", 2: None, 3: "blue"}
+    assert job.tracker_obj_color["main"] == {1: "red", 2: None, 3: "blue"}
 
     out = capsys.readouterr().out
     assert ("[selective] view=main: frames=100 windows=3 sam_frames=25 "
@@ -441,7 +441,7 @@ def test_gate_on_success_log_includes_episodes_and_dropped(capsys):
     job = _make_job()
     job.config.selective_mask_prop = True
     job.timings = {}
-    job.sam2_obj_color = {}
+    job.tracker_obj_color = {}
     tracks = {0: {1: {}}, 1: {1: {}}}
     tracker = _tracker_stub({"unused": True})
     tracker.track_selective.return_value = tracks

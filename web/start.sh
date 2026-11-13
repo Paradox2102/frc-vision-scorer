@@ -1,8 +1,8 @@
 #!/bin/bash
 # Start FRC Vision Scorer web application
 
-# Run from the PROJECT ROOT: SAM2 checkpoints and model paths resolve relative
-# to it; starting from web/ silently degraded SAM2 to Kalman tracking.
+# Run from the PROJECT ROOT: SAM checkpoints and model paths resolve relative
+# to it; starting from web/ silently degraded mask tracking to Kalman tracking.
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 

@@ -33,14 +33,14 @@ TRACKER_SIDE = {"merge_main_guard": True, "sticky_max_dist_m": 2.5}
 # Validated qm11 sprint recipe (meanNN 1.105->0.738): seed at the auto-period
 # open, motion override + motion-gated low-conf admission, whole-robot union
 # seed extents. Shared by the endgame profiles and the backfill A/B below.
-SPRINT = {"sam2_prompt_offset_seconds": 0.0, "motion_override": True,
+SPRINT = {"sam3_prompt_offset_seconds": 0.0, "motion_override": True,
           "motion_gated_conf": True, "seed_union_extent": True}
 # Reader base for the qwen35-escape profile: local vLLM reader with the Oct 31
 # Clef combo's census + keep-evicted read settings (see that profile).
 _QWEN35_R = {"team_reader": "vllm", "read_census": True, "read_keep_evicted": True}
 # Reader base for the "speed" profile: the "jev" profile's reader config.
 _SPEED_R = {"team_reader": "jev", "read_census": True, "read_keep_evicted": True}
-_SPEED_B2 = {**_SPEED_R, "sam2_track_fps": 5, "corner_track_stride": 3,
+_SPEED_B2 = {**_SPEED_R, "sam3_track_fps": 5, "corner_track_stride": 3,
              "selective_mask_prop": True, "selective_app_weight": 0.3}
 _S4_AB = {"team_reader": "jev", "window_labels": True, "vllm_phase_exclusive": False}
 PROFILES = {
@@ -145,16 +145,16 @@ PROFILES = {
     # masks), motion-gated low-conf admission, motion override, and
     # detector-independent diff-blob candidates.
     "sprint-fix": [
-        ("dual-seed", {"sam2_prompt_offset_seconds": 0.0,
+        ("dual-seed", {"sam3_prompt_offset_seconds": 0.0,
                        "motion_override": True, "motion_gated_conf": True}),
-        ("dual-seed+blobs", {"sam2_prompt_offset_seconds": 0.0,
+        ("dual-seed+blobs", {"sam3_prompt_offset_seconds": 0.0,
                              "motion_override": True, "motion_gated_conf": True,
                              "motion_seed_blobs": True}),
     ],
     # Blob taming: blobs scoped to the first motion_blob_window_s (6s) of the
     # active period — keeps the sprint rescue, drops the match-long churn.
     "blob-window": [
-        ("dual-seed+blobs6s", {"sam2_prompt_offset_seconds": 0.0,
+        ("dual-seed+blobs6s", {"sam3_prompt_offset_seconds": 0.0,
                                "motion_override": True, "motion_gated_conf": True,
                                "motion_seed_blobs": True}),
     ],
@@ -209,10 +209,10 @@ PROFILES = {
     # whole-robot union extents (a 24px sliver prompt on a blurred robot
     # dies in propagation; the union box is the prompt SAM can hold onto).
     "seed-quality": [
-        ("union", {"sam2_prompt_offset_seconds": 0.0,
+        ("union", {"sam3_prompt_offset_seconds": 0.0,
                    "motion_override": True, "motion_gated_conf": True,
                    "seed_union_extent": True}),
-        ("union+blobs6s", {"sam2_prompt_offset_seconds": 0.0,
+        ("union+blobs6s", {"sam3_prompt_offset_seconds": 0.0,
                            "motion_override": True, "motion_gated_conf": True,
                            "motion_seed_blobs": True,
                            "seed_union_extent": True}),
@@ -234,7 +234,7 @@ PROFILES = {
     # 2s boundary; lever-1 gates keep static junk out of the freed roster slots.
     "seed-open": [
         ("lever1+2", {"seed_box_max_aspect": 3.0, "evict_requires_motion": True,
-                      "sam2_prompt_offset_seconds": 0.0,
+                      "sam3_prompt_offset_seconds": 0.0,
                       "opening_reprompt_seconds": 0.5, "opening_window_seconds": 6.0}),
     ],
     # Full A/B pair (baseline + lever1+2) for cross-match regression checking
@@ -244,7 +244,7 @@ PROFILES = {
     "seed-open-ab": [
         ("baseline", {}),
         ("lever1+2", {"seed_box_max_aspect": 3.0, "evict_requires_motion": True,
-                      "sam2_prompt_offset_seconds": 0.0,
+                      "sam3_prompt_offset_seconds": 0.0,
                       "opening_reprompt_seconds": 0.5, "opening_window_seconds": 6.0}),
     ],
     # qm11/qm10/qm12 gated leak cleanup: mask leaked onto a bump; the gated
@@ -614,7 +614,7 @@ PROFILES = {
     ],
     # Live-event speed A/B (2026-11-05): full-match wall NEED < 12 min, WANT
     # < 8 min (from ~24 min) without a meaningful accuracy drop. Arm A is the
-    # "jev" profile run above (same code, all defaults: sam2_track_fps 8,
+    # "jev" profile run above (same code, all defaults: sam3_track_fps 8,
     # corner_track_stride 2) -- not re-run here. Every arm shares the jev
     # reader config, so only the speed levers differ:
     #   B1  track at 5 fps, corners at stride 3 (dense head unchanged);
@@ -627,17 +627,17 @@ PROFILES = {
     #   B3  + stream_analysis (loop's OCR / main YOLO / person det prefetched
     #       during SAM propagation; web/analysis_prefetch.py).
     # Run with --full-match. Wall time per stage (timings.total,
-    # timings.sam2_tracking, timings.analysis_loop, stream.*) lands in each
+    # timings.sam3_tracking, timings.analysis_loop, stream.*) lands in each
     # result row's "timings", read from the replays table by job_id.
     "speed": [
-        ("B1-fps5-cs3", {**_SPEED_R, "sam2_track_fps": 5, "corner_track_stride": 3}),
+        ("B1-fps5-cs3", {**_SPEED_R, "sam3_track_fps": 5, "corner_track_stride": 3}),
         ("B2-+selective", _SPEED_B2),
         ("B3-+stream", {**_SPEED_B2, "stream_analysis": True}),
     ],
     # Nov 6: selective cut auto coverage at fps5 (qm8 2724 100->32%), so
     # trade it for a lower track rate instead: fps4 + corner stride 3 + stream.
     "speed-b4": [
-        ("B4-fps4-cs3-stream", {**_SPEED_R, "sam2_track_fps": 4,
+        ("B4-fps4-cs3-stream", {**_SPEED_R, "sam3_track_fps": 4,
                                 "corner_track_stride": 3, "stream_analysis": True}),
     ],
     # Nov 6: B4 + SAM 3.1 Object Multiplex (joint multi-object propagation).
@@ -646,14 +646,14 @@ PROFILES = {
     # lever toward < 8 min. Compare against speed-b4 (qm8 754 s / 0.795,
     # qm11 704 s / 0.751). Run with --full-match --restart-between.
     "speed-mux": [
-        ("B4-mux", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+        ("B4-mux", {**_SPEED_R, "sam3_track_fps": 4, "corner_track_stride": 3,
                     "stream_analysis": True, "sam3_multiplex": True}),
     ],
     # Full-match multiplex OOMs at the default 200-frame chunk (10-12
     # singleton object states per session); 100-frame chunks halve the
     # per-session accumulation.
     "speed-mux-c100": [
-        ("B4-mux-c100", {**_SPEED_R, "sam2_track_fps": 4, "corner_track_stride": 3,
+        ("B4-mux-c100", {**_SPEED_R, "sam3_track_fps": 4, "corner_track_stride": 3,
                          "stream_analysis": True, "sam3_multiplex": True,
                          "sam3_chunk_frames": 100}),
     ],
@@ -765,8 +765,9 @@ def _wait_window_labels(job_id: str, timeout_s: float = 600.0, delay: float = 2.
 
 # Per-stage wall-time keys copied from the replay's timings JSON into each
 # result row (prefix match for the stream_analysis "stream.*" stats).
-TIMING_KEYS = ("total", "sam2_tracking", "analysis_loop", "frame_export",
-               "model_load")
+# "sam2_tracking" is the pre-rename name of "sam3_tracking" (older replays).
+TIMING_KEYS = ("total", "sam3_tracking", "sam2_tracking", "analysis_loop",
+               "frame_export", "model_load")
 
 
 def replay_timings(job_id: str | None) -> dict:

@@ -1,23 +1,23 @@
-"""sam2_raw entries may carry mask=None in selective mode (Design-decision-3):
+"""tracker_raw entries may carry mask=None in selective mode (Design-decision-3):
 outside ambiguous windows, entries are pure-TBD boxes with no mask. These
 tests pin the None-tolerant contract for the app.py consumers of
-entry["mask"] -- _restore_sam2_mask_to_view and the extracted ground_uv
+entry["mask"] -- _restore_mask_to_view and the extracted ground_uv
 uv-selection helper -- plus a smoke check that the embedder's embed_batch
 (already None-aware) doesn't choke when handed a None mask.
 """
 import numpy as np
 
-from web.app import _restore_sam2_mask_to_view, ground_uv
-from web.field.sam2_tracker import mask_bottom_center
+from web.app import _restore_mask_to_view, ground_uv
+from web.field.mask_tracker import mask_bottom_center
 
 
-def test_restore_sam2_mask_to_view_none_input_returns_none():
-    assert _restore_sam2_mask_to_view(None, (10, 12, 3)) is None
+def test_restore_mask_to_view_none_input_returns_none():
+    assert _restore_mask_to_view(None, (10, 12, 3)) is None
 
 
-def test_restore_sam2_mask_to_view_real_mask_still_works():
+def test_restore_mask_to_view_real_mask_still_works():
     mask = np.ones((2, 3), dtype=bool)
-    restored = _restore_sam2_mask_to_view(mask, (4, 6, 3))
+    restored = _restore_mask_to_view(mask, (4, 6, 3))
     assert restored.all()
 
 
@@ -34,7 +34,7 @@ def test_ground_uv_box_bottom_center_when_footprint_disabled():
 
 def test_ground_uv_uses_mask_footprint_when_present_and_enabled():
     # Asymmetric mask: wide top (extended intake) + narrow bottom contact band,
-    # same shape used in test_sam2_tracker's mask_bottom_center coverage.
+    # same shape used in test_mask_tracker's mask_bottom_center coverage.
     mask = np.zeros((10, 12), dtype=bool)
     mask[2:7, 0:11] = True
     mask[7:9, 8:11] = True

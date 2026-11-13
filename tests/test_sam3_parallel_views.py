@@ -477,3 +477,32 @@ def test_run_view_tracking_without_hooks_never_uses_stream_helper():
             tracker, SimpleNamespace(name="main"), {"frames_dir": "/f"},
             lambda i, p: [], lambda a, b: None))
     assert out == {0: {}}
+
+
+def test_triton_autotune_lock_serializes_concurrent_runs():
+    """Two threads in Autotuner.run must not overlap (shared self.nargs race)."""
+    import threading, time
+    triton_at = pytest.importorskip("triton.runtime.autotuner")
+    from web.field import parallel_views as pv
+
+    assert pv.install_triton_autotune_lock() is True
+    assert pv.install_triton_autotune_lock() is True  # idempotent
+    run = triton_at.Autotuner.run
+    assert getattr(run, "_frc_locked", False)
+    inner = run.__wrapped__
+    state = {"in": 0, "max": 0}
+
+    def fake(self, *a, **k):
+        state["in"] += 1
+        state["max"] = max(state["max"], state["in"])
+        time.sleep(0.02)
+        state["in"] -= 1
+
+    # call the lock wrapper around a fake body via the same lock
+    def locked(self, *a, **k):
+        with pv._TRITON_LOCK:
+            return fake(self, *a, **k)
+    ts = [threading.Thread(target=locked, args=(None,)) for _ in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert state["max"] == 1
+    assert inner is not run

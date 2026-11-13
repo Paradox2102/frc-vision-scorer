@@ -155,6 +155,42 @@ def reorder_view_keys(d: dict, view_names: Sequence[str], pre_keys: Sequence) ->
 
 _SKIPPED = object()
 
+_TRITON_LOCK = threading.RLock()
+_triton_lock_installed = False
+
+
+def install_triton_autotune_lock() -> bool:
+    """Serialize ``triton.runtime.autotuner.Autotuner.run`` process-wide.
+
+    Autotuner.run stashes the call's args on the SHARED kernel object
+    (``self.nargs = ...``) and clears it afterwards, so two views tuning the
+    same SAM3 kernel at once (perflib connected_components, first call per
+    shape) race: one thread's reset makes the other's ``{**self.nargs}`` fail
+    with "'NoneType' object is not a mapping" (pod qm8 Nov 12: main view lost).
+    Launches are async, so holding the lock costs microseconds once tuned.
+    Idempotent; returns False when triton isn't importable."""
+    global _triton_lock_installed
+    if _triton_lock_installed:
+        return True
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except Exception:
+        return False
+    orig = Autotuner.run
+    if getattr(orig, "_frc_locked", False):
+        _triton_lock_installed = True
+        return True
+
+    @functools.wraps(orig)
+    def run(self, *args, **kwargs):
+        with _TRITON_LOCK:
+            return orig(self, *args, **kwargs)
+
+    run._frc_locked = True
+    Autotuner.run = run
+    _triton_lock_installed = True
+    return True
+
 
 async def run_views_concurrently(
     items: Sequence[tuple[int, Any]],
@@ -176,6 +212,8 @@ async def run_views_concurrently(
     """
     if not workers:
         raise ValueError("run_views_concurrently needs at least one worker")
+    if len(workers) > 1:
+        install_triton_autotune_lock()
     pool: asyncio.Queue = asyncio.Queue()
     for w in workers:
         pool.put_nowait(w)

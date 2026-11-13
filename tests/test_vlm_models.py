@@ -194,4 +194,5 @@ def test_lifecycle_start_exports_serve_util(monkeypatch):
         vllm_lifecycle.set_active_model(prev)
     assert seen["env"]["VLM_MODEL_NAME"] == "Qwen/Qwen3.6-35B-A3B-FP8"
     assert seen["env"]["VLM_SERVER_GPU_UTIL"] == str(round(44.0 / 95.6, 3))
-    assert seen["args"][-2:] == ("--dtype", "bfloat16")
+    assert seen["args"][-6:] == ("--dtype", "bfloat16", "--moe-backend", "triton",
+                                 "--kv-cache-memory-bytes", "4294967296")

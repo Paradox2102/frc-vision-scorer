@@ -12556,6 +12556,71 @@ async def calibration_layout_preview(event: str):
     return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
+def _layout_reference_video(event: str):
+    """Footage for the layout drawing canvas: the layout record's diag.video when it
+    is a file under the footage dirs, else the event's local reference match. Never
+    a caller-supplied path."""
+    from web.field import composite_layout as _cl
+    roots = [Path(d).resolve() for d in (*auto_calibrate.FOOTAGE_DIRS,
+                                         auto_calibrate.DOWNLOAD_DIR)]
+    rec = _cl.load_event_layout_record(event) or {}
+    vid = (rec.get("diag") or {}).get("video")
+    if vid:
+        try:
+            p = Path(vid).resolve()
+            if p.is_file() and any(r == p.parent or r in p.parents for r in roots):
+                return p
+        except (OSError, ValueError):
+            pass
+    matches = (current_event.get("matches") or []
+               if current_event and current_event.get("event_key") == event else [])
+    try:
+        _mk, path, _dl = auto_calibrate.pick_reference_match(event, matches)
+    except Exception:
+        return None
+    return Path(path) if path else None
+
+
+@app.get("/api/calibration/layout/frame")
+async def calibration_layout_frame(event: str, t: float = 60.0, saved: bool = False):
+    """Full-resolution composite JPEG (no crops drawn) of the event's reference
+    footage at ``t`` seconds (clamped to the duration), for drawing the layout by
+    hand. ``X-Video-Duration`` / ``X-Video-Time`` headers carry the duration and the
+    time actually used. ``saved=true`` (or no footage) serves the saved median frame;
+    404 when there is nothing."""
+    from web.field import composite_layout as _cl
+    if not event or _cl._safe(event) != event:
+        return JSONResponse(status_code=400, content={"error": "bad event key"})
+    hdr = {"Cache-Control": "no-store"}
+    video = None if saved else _layout_reference_video(event)
+    if video is not None:
+        def _grab():
+            cap = cv2.VideoCapture(str(video))
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                n = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                dur = (n / fps) if n > 0 else 0.0
+                tt = max(0.0, min(float(t), max(0.0, dur - 1.0 / fps))) if dur else max(0.0, float(t))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(tt * fps))
+                ok, fr = cap.read()
+                return (fr if ok else None), dur, tt
+            finally:
+                cap.release()
+        frame, dur, tt = await asyncio.to_thread(_grab)
+        if frame is not None:
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if ok:
+                return Response(buf.tobytes(), media_type="image/jpeg", headers={
+                    **hdr, "X-Video-Duration": f"{dur:.2f}", "X-Video-Time": f"{tt:.2f}",
+                    "X-Frame-Source": "video"})
+    fp = auto_calibrate.layout_frame_path(event)
+    if fp.is_file():
+        return FileResponse(str(fp), media_type="image/jpeg",
+                            headers={**hdr, "X-Video-Duration": "0", "X-Video-Time": "0",
+                                     "X-Frame-Source": "saved"})
+    return JSONResponse(status_code=404, content={"error": "no footage or saved frame"})
+
+
 @app.post("/api/calibration/layout")
 async def calibration_layout_save(request: Request):
     """Manual layout correction. Body: {event, cameras: {name: {crop, masks?}},

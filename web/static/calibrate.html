@@ -102,6 +102,10 @@
   .layout-edit { display:grid; grid-template-columns:max-content repeat(4, 64px); gap:4px 6px;
                  align-items:center; font-size:12px; }
   .layout-edit input { width:60px; font-family:monospace; font-size:12px; }
+  .layout-draw-bar button { padding:3px 9px; font-size:12px; }
+  .layout-canvas-wrap { width:100%; }
+  .layout-canvas { display:block; border:1px solid #234; border-radius:4px; background:#0a0a14;
+                   touch-action:none; cursor:crosshair; max-width:100%; }
   .auto-msg { font-size:12px; color:#a0c4ff; }
   .auto-msg.err { color:#ff8080; }
   /* ---- Per-match corner calibrations ---- */
@@ -1864,6 +1868,7 @@ async function pmAction(kind, cam, mk){
 
 // ---- Broadcast layout card (where each camera sits in the composite frame) ----
 let layoutData = null, layoutEditing = false, layoutExpanded = false, layoutMsg = null;
+let layoutDrawing = false, layoutDraw = null;
 async function loadLayout(){
   const event = autoEvent();
   if (!event){ layoutData = null; renderLayoutCard(); return; }
@@ -1874,7 +1879,7 @@ async function loadLayout(){
     layoutData = j;
   } catch(e){ /* keep the last one */ }
   if (event !== autoEvent()) return;
-  if (!layoutEditing) renderLayoutCard();
+  if (!layoutEditing && !layoutDrawing) renderLayoutCard();
 }
 function layoutBadge(rec){
   const st = rec ? rec.status : null;
@@ -1901,7 +1906,8 @@ function renderLayoutCard(){
   card.appendChild(_el('div', 'layout-crops', Object.entries(cams).map(([n, c]) =>
     `${n} [${c.crop.join(', ')}]` + (c.masks && c.masks.length ? ` +${c.masks.length} mask(s)` : '')
   ).join(' · ')));
-  if (layoutData.has_preview){
+  if (layoutDrawing && layoutDraw && layoutDraw.event === layoutData.event) renderLayoutDraw(card);
+  else if (layoutData.has_preview){
     const img = _el('img', 'auto-preview');
     img.src = '/api/calibration/layout/preview?event=' + encodeURIComponent(layoutData.event)
               + '&t=' + encodeURIComponent((rec && rec.saved_at) || '');
@@ -1924,18 +1930,31 @@ function renderLayoutCard(){
     card.appendChild(grid);
   }
   const act = _el('div', 'auto-actions');
-  const edit = _el('button', null, layoutEditing ? 'Cancel' : 'Edit');
-  edit.onclick = () => { layoutEditing = !layoutEditing; layoutMsg = null; renderLayoutCard(); };
-  act.appendChild(edit);
-  if (layoutEditing){
+  if (layoutDrawing){
     const save = _el('button', null, 'Save');
     save.onclick = () => saveLayout(false);
     act.appendChild(save);
+    const cancel = _el('button', null, 'Cancel');
+    cancel.onclick = cancelLayoutDraw;
+    act.appendChild(cancel);
+  } else {
+    const draw = _el('button', null, 'Draw');
+    draw.title = 'Draw the camera boxes on a real frame of the broadcast';
+    draw.onclick = startLayoutDraw;
+    act.appendChild(draw);
+    const edit = _el('button', null, layoutEditing ? 'Cancel' : 'Edit');
+    edit.onclick = () => { layoutEditing = !layoutEditing; layoutMsg = null; renderLayoutCard(); };
+    act.appendChild(edit);
+    if (layoutEditing){
+      const save = _el('button', null, 'Save');
+      save.onclick = () => saveLayout(false);
+      act.appendChild(save);
+    }
+    const redet = _el('button', null, 'Re-detect');
+    redet.disabled = autoAnyRunning();
+    redet.onclick = redetectLayout;
+    act.appendChild(redet);
   }
-  const redet = _el('button', null, 'Re-detect');
-  redet.disabled = autoAnyRunning();
-  redet.onclick = redetectLayout;
-  act.appendChild(redet);
   if (layoutMsg) act.appendChild(_el('span', 'auto-msg' + (layoutMsg.err ? ' err' : ''), layoutMsg.text));
   card.appendChild(act);
 }
@@ -1943,12 +1962,21 @@ async function saveLayout(force){
   const event = layoutData && layoutData.event;
   if (!event || event !== autoEvent()){     // never post one event's cameras to another
     layoutMsg = {text: 'The event changed — reload the layout before saving.', err: true};
-    layoutEditing = false; renderLayoutCard(); loadLayout(); return;
+    layoutEditing = false; layoutDrawing = false; layoutDraw = null;
+    renderLayoutCard(); loadLayout(); return;
   }
-  const cams = JSON.parse(JSON.stringify((layoutData.effective || {}).cameras || {}));
-  document.querySelectorAll('#layoutCard .layout-edit input').forEach(inp => {
-    cams[inp.dataset.cam].crop[Number(inp.dataset.idx)] = parseInt(inp.value, 10);
-  });
+  let cams;
+  if (layoutDrawing){
+    if (!layoutDraw || layoutDraw.event !== event) return cancelLayoutDraw();
+    cams = {};
+    for (const [n, c] of Object.entries(layoutDraw.cams)) if (c.crop)
+      cams[n] = {crop: c.crop.map(v => Math.round(v)), masks: (c.masks || []).map(m => m.map(v => Math.round(v)))};
+  } else {
+    cams = JSON.parse(JSON.stringify((layoutData.effective || {}).cameras || {}));
+    document.querySelectorAll('#layoutCard .layout-edit input').forEach(inp => {
+      cams[inp.dataset.cam].crop[Number(inp.dataset.idx)] = parseInt(inp.value, 10);
+    });
+  }
   layoutMsg = {text: 'Saving…'}; renderLayoutCard();
   try {
     const r = await fetch('/api/calibration/layout', {method:'POST',
@@ -1963,7 +1991,8 @@ async function saveLayout(force){
     } else if (!r.ok){
       layoutMsg = {text: j.error || 'Save failed', err: true};
     } else {
-      layoutData = j; layoutEditing = false; layoutMsg = {text: 'Layout saved (confirmed).'};
+      layoutData = j; layoutEditing = false; layoutDrawing = false; layoutDraw = null;
+      layoutMsg = {text: 'Layout saved (confirmed).'};
     }
   } catch(e){ layoutMsg = {text: 'Save failed: ' + e, err: true}; }
   renderLayoutCard();
@@ -1977,11 +2006,464 @@ async function redetectLayout(){
     const j = await r.json();
     if (event !== autoEvent()) return;
     if (!r.ok) layoutMsg = {text: j.error || 'Re-detect failed', err: true};
-    else { layoutData = j; layoutEditing = false; layoutMsg = {text: 'Layout re-detected.'}; }
+    else { layoutData = j; layoutEditing = false; layoutDrawing = false; layoutDraw = null;
+           layoutMsg = {text: 'Layout re-detected.'}; }
   } catch(e){ layoutMsg = {text: 'Re-detect failed: ' + e, err: true}; }
   renderLayoutCard();
 }
 
+
+// ---- Draw mode: drag the camera boxes (and mask boxes) on a real composite frame ----
+const LD_COLORS = {main:'#4da3ff', corner_left:'#ffb347', corner_right:'#6be28b'};
+const LD_TOL_PX = 8, LD_SNAP = 6, LD_MIN = 4;
+function ldColor(n){ return LD_COLORS[n] || '#d28bff'; }
+function ldFrameSize(){
+  const d = layoutDraw;
+  if (d && d.img) return [d.img.width, d.img.height];
+  const fs = (layoutData && layoutData.frame_size) || [1920, 1080];
+  return [fs[0], fs[1]];
+}
+function startLayoutDraw(){
+  const event = autoEvent();
+  if (!layoutData || !event || event !== layoutData.event) return;
+  layoutDrawing = true; layoutEditing = false; layoutMsg = null;
+  layoutDraw = {event, cams: JSON.parse(JSON.stringify((layoutData.effective || {}).cameras || {})),
+                sel: {cam: 'main', mask: null}, tool: 'cam', img: null, dur: 0, t: null,
+                saved: false, seq: 0, drag: null, ui: {}, status: 'Loading frame…'};
+  renderLayoutCard();
+  ldLoadFrame(null);
+}
+function cancelLayoutDraw(){
+  layoutDrawing = false; layoutDraw = null; layoutMsg = null; renderLayoutCard();
+}
+async function ldLoadFrame(t){
+  const d = layoutDraw; if (!d) return;
+  const seq = ++d.seq;
+  d.status = 'Loading frame…'; ldUpdateUI();
+  const url = '/api/calibration/layout/frame?event=' + encodeURIComponent(d.event)
+          + (d.saved ? '&saved=true' : '') + (t != null ? '&t=' + encodeURIComponent(t) : '')
+          + '&_=' + Date.now();
+  try {
+    const r = await fetch(url);
+    if (!layoutDraw || layoutDraw !== d || seq !== d.seq || d.event !== autoEvent()) return;
+    if (!r.ok){
+      d.status = r.status === 404 ? 'No footage or saved frame for this event.' : 'Frame load failed.';
+      ldUpdateUI(); return;
+    }
+    const dur = parseFloat(r.headers.get('X-Video-Duration')) || 0;
+    const tt = parseFloat(r.headers.get('X-Video-Time')) || 0;
+    const src = r.headers.get('X-Frame-Source');
+    const blob = await r.blob();
+    const img = new Image();
+    const u = URL.createObjectURL(blob);
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = u; });
+    URL.revokeObjectURL(u);
+    if (!layoutDraw || layoutDraw !== d || seq !== d.seq) return;
+    d.img = img; d.dur = dur; d.t = tt;
+    d.status = src === 'saved' ? 'Showing the saved median frame (no footage scrubbing).' : '';
+    ldSizeCanvas(); ldUpdateUI();
+  } catch(e){
+    if (layoutDraw === d && seq === d.seq){ d.status = 'Frame load failed: ' + e; ldUpdateUI(); }
+  }
+}
+function ldSizeCanvas(){
+  const d = layoutDraw, cv = d && d.ui.canvas; if (!cv) return;
+  const [fw, fh] = ldFrameSize();
+  const cssW = Math.max(300, cv.parentElement.clientWidth || 900);
+  const cssH = Math.round(cssW * fh / fw);
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = cssW + 'px'; cv.style.height = cssH + 'px';
+  cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssH * dpr);
+  d.scale = cssW / fw; d.dpr = dpr;
+}
+// --- geometry helpers (all frame px; cam crop = [x,y,w,h]; masks stored crop-relative)
+function ldRect(d, it){
+  const cam = d.cams[it.cam], c = cam && cam.crop;
+  if (!c) return null;
+  if (it.kind === 'cam') return c.slice();
+  const m = cam.masks[it.idx]; if (!m) return null;
+  return [c[0] + m[0], c[1] + m[1], m[2], m[3]];
+}
+function ldSetRect(d, it, r){
+  r = r.map(v => Math.round(v));
+  if (it.kind === 'cam') d.cams[it.cam].crop = r;
+  else { const c = d.cams[it.cam].crop; d.cams[it.cam].masks[it.idx] = [r[0] - c[0], r[1] - c[1], r[2], r[3]]; }
+}
+function ldBounds(d, it){
+  if (it.kind === 'cam'){ const [fw, fh] = ldFrameSize(); return [0, 0, fw, fh]; }
+  return d.cams[it.cam].crop.slice();
+}
+function ldSnapLines(d, it){
+  const b = ldBounds(d, it), xs = [b[0], b[0] + b[2]], ys = [b[1], b[1] + b[3]];
+  if (it.kind === 'cam'){
+    for (const [n, c] of Object.entries(d.cams)) if (n !== it.cam && c.crop){
+      xs.push(c.crop[0], c.crop[0] + c.crop[2]); ys.push(c.crop[1], c.crop[1] + c.crop[3]);
+    }
+  } else {
+    const c = d.cams[it.cam].crop;
+    d.cams[it.cam].masks.forEach((m, i) => { if (i !== it.idx){
+      xs.push(c[0] + m[0], c[0] + m[0] + m[2]); ys.push(c[1] + m[1], c[1] + m[1] + m[3]);
+    }});
+  }
+  return {xs, ys, b};
+}
+function ldSnap1(v, lines, off){
+  if (off) return v;
+  let best = v, bd = LD_SNAP + 1e-9;
+  for (const l of lines){ const dd = Math.abs(l - v); if (dd < bd){ bd = dd; best = l; } }
+  return best;
+}
+// snap a moved box: whichever of its two edges is closest to a snap line wins
+function ldSnapMove(lo, size, lines, off){
+  const a = ldSnap1(lo, lines, off), b = ldSnap1(lo + size, lines, off);
+  const da = Math.abs(a - lo), db = Math.abs(b - (lo + size));
+  const hitA = a !== lo, hitB = b !== lo + size;
+  if (hitA && (!hitB || da <= db)) return a;
+  if (hitB) return b - size;
+  return lo;
+}
+function ldClampEdges(l, t, r, b, bd){
+  const cx = v => Math.max(bd[0], Math.min(bd[0] + bd[2], v));
+  const cy = v => Math.max(bd[1], Math.min(bd[1] + bd[3], v));
+  return [cx(l), cy(t), cx(r), cy(b)];
+}
+function ldClipMasks(d, cam){
+  const c = d.cams[cam]; if (!c || !c.crop) return;
+  const w = c.crop[2], h = c.crop[3];
+  c.masks = (c.masks || []).map(m => {
+    const l = Math.max(0, m[0]), t = Math.max(0, m[1]);
+    const r = Math.min(w, m[0] + m[2]), b = Math.min(h, m[1] + m[3]);
+    return (r - l >= 1 && b - t >= 1) ? [l, t, r - l, b - t] : null;
+  }).filter(Boolean);
+  if (d.sel.cam === cam && d.sel.mask != null && d.sel.mask >= c.masks.length) d.sel.mask = null;
+}
+function ldItems(d){
+  const cams = [], masks = [];
+  for (const n of Object.keys(d.cams)) if (d.cams[n].crop){
+    cams.push({kind: 'cam', cam: n});
+    (d.cams[n].masks || []).forEach((m, i) => masks.push({kind: 'mask', cam: n, idx: i}));
+  }
+  cams.sort((a, b) => { const ra = d.cams[a.cam].crop, rb = d.cams[b.cam].crop;
+                        return ra[2] * ra[3] - rb[2] * rb[3]; });
+  return {cams, masks};
+}
+function ldHandleAt(d, it, px, py){
+  const r = ldRect(d, it); if (!r) return null;
+  const s = d.scale, tol = LD_TOL_PX;
+  const l = r[0] * s, t = r[1] * s, rr = (r[0] + r[2]) * s, b = (r[1] + r[3]) * s;
+  if (px < l - tol || px > rr + tol || py < t - tol || py > b + tol) return null;
+  const nl = Math.abs(px - l) <= tol, nr = Math.abs(px - rr) <= tol;
+  const nt = Math.abs(py - t) <= tol, nb = Math.abs(py - b) <= tol;
+  const h = (nt ? 'n' : nb ? 's' : '') + (nl ? 'w' : nr ? 'e' : '');
+  return h || null;
+}
+function ldInside(d, it, px, py){
+  const r = ldRect(d, it); if (!r) return false;
+  const s = d.scale;
+  return px >= r[0] * s && px <= (r[0] + r[2]) * s && py >= r[1] * s && py <= (r[1] + r[3]) * s;
+}
+function ldSelItem(d){
+  if (d.sel.mask != null) return {kind: 'mask', cam: d.sel.cam, idx: d.sel.mask};
+  return d.cams[d.sel.cam] && d.cams[d.sel.cam].crop ? {kind: 'cam', cam: d.sel.cam} : null;
+}
+function ldHit(d, px, py){
+  const sel = ldSelItem(d), {cams, masks} = ldItems(d);
+  if (sel){ const h = ldHandleAt(d, sel, px, py); if (h) return {item: sel, handle: h}; }
+  for (const it of [...masks].reverse()){ const h = ldHandleAt(d, it, px, py); if (h) return {item: it, handle: h}; }
+  for (const it of cams){ const h = ldHandleAt(d, it, px, py); if (h) return {item: it, handle: h}; }
+  for (const it of [...masks].reverse()) if (ldInside(d, it, px, py)) return {item: it, handle: null};
+  for (const it of cams) if (ldInside(d, it, px, py)) return {item: it, handle: null};
+  return null;
+}
+const LD_CURSOR = {n:'ns-resize', s:'ns-resize', e:'ew-resize', w:'ew-resize',
+                   ne:'nesw-resize', sw:'nesw-resize', nw:'nwse-resize', se:'nwse-resize'};
+function ldPoint(d, ev){
+  const rc = d.ui.canvas.getBoundingClientRect();
+  return [ev.clientX - rc.left, ev.clientY - rc.top];
+}
+function ldCamUnset(d){ return !(d.cams[d.sel.cam] && d.cams[d.sel.cam].crop); }
+function ldPointerDown(ev){
+  const d = layoutDraw; if (!d || !d.img || ev.button !== 0) return;
+  const [px, py] = ldPoint(d, ev);
+  const fx = px / d.scale, fy = py / d.scale;
+  let hit = ldHit(d, px, py);
+  const selIt = ldSelItem(d);
+  if (d.tool === 'mask'){
+    const sh = selIt && selIt.kind === 'mask' && ldHandleAt(d, selIt, px, py);
+    hit = sh ? {item: selIt, handle: sh} : null;
+  } else if (hit && ldCamUnset(d)) hit = null;   // selected camera has no box yet: a drag draws it
+  d.ui.canvas.setPointerCapture(ev.pointerId);
+  if (hit){
+    const it = hit.item;
+    d.sel = {cam: it.cam, mask: it.kind === 'mask' ? it.idx : null};
+    d.drag = {mode: hit.handle ? 'resize' : 'move', item: it, handle: hit.handle,
+              sx: fx, sy: fy, orig: ldRect(d, it)};
+  } else if (d.tool === 'mask'){
+    const cam = d.cams[d.sel.cam];
+    if (!cam || !cam.crop){ d.status = 'Draw this camera first, then add masks.'; ldUpdateUI(); return; }
+    cam.masks = cam.masks || [];
+    cam.masks.push([0, 0, 1, 1]);
+    const it = {kind: 'mask', cam: d.sel.cam, idx: cam.masks.length - 1};
+    d.sel = {cam: it.cam, mask: it.idx};
+    d.drag = {mode: 'draw', item: it, sx: fx, sy: fy, orig: null, isNew: true};
+  } else {
+    d.sel = {cam: d.sel.cam, mask: null};
+    const it = {kind: 'cam', cam: d.sel.cam};
+    d.drag = {mode: 'draw', item: it, sx: fx, sy: fy, orig: ldRect(d, it), isNew: !d.cams[it.cam]};
+    if (!d.cams[it.cam]) d.cams[it.cam] = {crop: null, masks: []};
+  }
+  ev.preventDefault();
+  ldUpdateUI();
+}
+function ldPointerMove(ev){
+  const d = layoutDraw; if (!d || !d.img) return;
+  const [px, py] = ldPoint(d, ev);
+  const g = d.drag;
+  if (!g){
+    const hit = (d.tool === 'mask') ? null : ldHit(d, px, py);
+    d.ui.canvas.style.cursor = d.tool === 'mask' ? 'crosshair'
+      : hit ? (hit.handle ? LD_CURSOR[hit.handle] : (ldCamUnset(d) ? 'crosshair' : 'move')) : 'crosshair';
+    return;
+  }
+  const fx = px / d.scale, fy = py / d.scale, it = g.item;
+  const {xs, ys, b} = ldSnapLines(d, it), off = ev.altKey;
+  if (g.mode === 'move'){
+    const w = g.orig[2], h = g.orig[3];
+    let x = ldSnapMove(g.orig[0] + (fx - g.sx), w, xs, off);
+    let y = ldSnapMove(g.orig[1] + (fy - g.sy), h, ys, off);
+    x = Math.max(b[0], Math.min(b[0] + b[2] - w, x));
+    y = Math.max(b[1], Math.min(b[1] + b[3] - h, y));
+    ldSetRect(d, it, [x, y, w, h]);
+  } else {
+    let L, T, R, B;
+    if (g.mode === 'resize'){
+      L = g.orig[0]; T = g.orig[1]; R = L + g.orig[2]; B = T + g.orig[3];
+      const dx = fx - g.sx, dy = fy - g.sy, h = g.handle;
+      if (h.includes('w')) L = ldSnap1(L + dx, xs, off);
+      if (h.includes('e')) R = ldSnap1(R + dx, xs, off);
+      if (h.includes('n')) T = ldSnap1(T + dy, ys, off);
+      if (h.includes('s')) B = ldSnap1(B + dy, ys, off);
+      [L, T, R, B] = ldClampEdges(L, T, R, B, b);
+      if (R - L < LD_MIN){ if (h.includes('w')) L = R - LD_MIN; else R = L + LD_MIN; }
+      if (B - T < LD_MIN){ if (h.includes('n')) T = B - LD_MIN; else B = T + LD_MIN; }
+    } else {   // draw a fresh box from the press point to the pointer
+      L = Math.min(fx, g.sx); R = Math.max(fx, g.sx); T = Math.min(fy, g.sy); B = Math.max(fy, g.sy);
+      L = ldSnap1(L, xs, off); R = ldSnap1(R, xs, off); T = ldSnap1(T, ys, off); B = ldSnap1(B, ys, off);
+      [L, T, R, B] = ldClampEdges(L, T, R, B, b);
+      if (R - L < 1) R = L + 1;
+      if (B - T < 1) B = T + 1;
+    }
+    ldSetRect(d, it, [L, T, R - L, B - T]);
+  }
+  ldUpdateUI();
+}
+function ldPointerUp(ev){
+  const d = layoutDraw; if (!d || !d.drag) return;
+  const g = d.drag; d.drag = null;
+  try { d.ui.canvas.releasePointerCapture(ev.pointerId); } catch(e){}
+  const it = g.item;
+  if (g.mode === 'draw'){
+    const r = ldRect(d, it);
+    if (!r || r[2] < 8 || r[3] < 8){                 // a click, not a box: undo
+      if (it.kind === 'mask'){ d.cams[it.cam].masks.pop(); d.sel.mask = null; }
+      else if (g.isNew){ delete d.cams[it.cam]; }
+      else d.cams[it.cam].crop = g.orig;
+    } else if (it.kind === 'cam') ldClipMasks(d, it.cam);
+    if (it.kind === 'mask') d.tool = 'cam';
+  } else if (it.kind === 'cam' && g.mode === 'resize') ldClipMasks(d, it.cam);
+  ldUpdateUI();
+}
+function ldNudge(ev){
+  const d = layoutDraw;
+  if (!layoutDrawing || !d || !d.img) return;
+  const tg = ev.target && ev.target.tagName;
+  if (tg === 'INPUT' || tg === 'TEXTAREA' || tg === 'SELECT') return;
+  const k = {ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1]}[ev.key];
+  if (!k) return;
+  const it = ldSelItem(d); if (!it) return;
+  const step = ev.shiftKey ? 10 : 1, r = ldRect(d, it), b = ldBounds(d, it);
+  const x = Math.max(b[0], Math.min(b[0] + b[2] - r[2], r[0] + k[0] * step));
+  const y = Math.max(b[1], Math.min(b[1] + b[3] - r[3], r[1] + k[1] * step));
+  ldSetRect(d, it, [x, y, r[2], r[3]]);
+  ev.preventDefault(); ldUpdateUI();
+}
+function ldDelete(){
+  const d = layoutDraw; if (!d) return;
+  if (d.sel.mask != null){
+    d.cams[d.sel.cam].masks.splice(d.sel.mask, 1); d.sel.mask = null; d.status = '';
+  } else if (d.sel.cam === 'main'){
+    d.status = 'The main camera cannot be removed.';
+  } else if (d.cams[d.sel.cam]){
+    delete d.cams[d.sel.cam]; d.status = d.sel.cam + ' removed.';
+  }
+  ldUpdateUI();
+}
+let _ldHatch = null;
+function ldHatch(ctx){
+  if (_ldHatch) return _ldHatch;
+  const c = document.createElement('canvas'); c.width = c.height = 8;
+  const g = c.getContext('2d');
+  g.strokeStyle = 'rgba(255,60,60,0.9)'; g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(0, 8); g.lineTo(8, 0); g.moveTo(-2, 2); g.lineTo(2, -2);
+  g.moveTo(6, 10); g.lineTo(10, 6); g.stroke();
+  _ldHatch = ctx.createPattern(c, 'repeat');
+  return _ldHatch;
+}
+function ldPaint(){
+  const d = layoutDraw, cv = d && d.ui.canvas; if (!cv || !d.scale) return;
+  const ctx = cv.getContext('2d'), s = d.scale * d.dpr;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#0a0a14'; ctx.fillRect(0, 0, cv.width, cv.height);
+  if (d.img) ctx.drawImage(d.img, 0, 0, cv.width, cv.height);
+  for (const [n, c] of Object.entries(d.cams)){
+    if (!c.crop) continue;
+    const [x, y, w, h] = c.crop, col = ldColor(n), isSel = d.sel.cam === n && d.sel.mask == null;
+    ctx.fillStyle = col + '22'; ctx.fillRect(x * s, y * s, w * s, h * s);
+    ctx.strokeStyle = col; ctx.lineWidth = (isSel ? 3 : 2) * d.dpr;
+    ctx.strokeRect(x * s, y * s, w * s, h * s);
+    ctx.font = (13 * d.dpr) + 'px sans-serif'; ctx.textBaseline = 'top';
+    const tw = ctx.measureText(n).width + 8 * d.dpr;
+    ctx.fillStyle = col; ctx.fillRect(x * s, y * s, tw, 17 * d.dpr);
+    ctx.fillStyle = '#000'; ctx.fillText(n, x * s + 4 * d.dpr, y * s + 2 * d.dpr);
+    (c.masks || []).forEach((m, i) => {
+      const mx = (x + m[0]) * s, my = (y + m[1]) * s, mw = m[2] * s, mh = m[3] * s;
+      ctx.fillStyle = 'rgba(255,0,0,0.25)'; ctx.fillRect(mx, my, mw, mh);
+      ctx.fillStyle = ldHatch(ctx); ctx.fillRect(mx, my, mw, mh);
+      const ms = d.sel.cam === n && d.sel.mask === i;
+      ctx.strokeStyle = ms ? '#ffe600' : '#ff4040'; ctx.lineWidth = (ms ? 3 : 1.5) * d.dpr;
+      ctx.strokeRect(mx, my, mw, mh);
+    });
+  }
+  const sel = ldSelItem(d), r = sel && ldRect(d, sel);
+  if (r){
+    const hs = 4 * d.dpr;
+    const xs = [r[0], r[0] + r[2] / 2, r[0] + r[2]], ys = [r[1], r[1] + r[3] / 2, r[1] + r[3]];
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+    xs.forEach((xx, i) => ys.forEach((yy, j) => {
+      if (i === 1 && j === 1) return;
+      ctx.fillRect(xx * s - hs, yy * s - hs, 2 * hs, 2 * hs);
+      ctx.strokeRect(xx * s - hs, yy * s - hs, 2 * hs, 2 * hs);
+    }));
+  }
+}
+function ldReadout(d){
+  const it = ldSelItem(d);
+  if (d.sel.mask != null && it){
+    const m = d.cams[d.sel.cam].masks[d.sel.mask], r = ldRect(d, it);
+    return `${d.sel.cam} mask ${d.sel.mask + 1}: x ${m[0]}  y ${m[1]}  w ${m[2]}  h ${m[3]}` +
+           `  (crop-relative; in frame x ${r[0]} y ${r[1]})`;
+  }
+  if (!it) return `${d.sel.cam}: not set — drag on the frame to draw it`;
+  const r = ldRect(d, it), nm = (d.cams[d.sel.cam].masks || []).length;
+  return `${d.sel.cam}: x ${r[0]}  y ${r[1]}  w ${r[2]}  h ${r[3]}` + (nm ? `  · ${nm} mask(s)` : '');
+}
+function ldUpdateUI(){
+  const d = layoutDraw; if (!d) return;
+  ldPaint();
+  const u = d.ui;
+  if (u.readout) u.readout.textContent = ldReadout(d);
+  if (u.status) u.status.textContent = d.status || '';
+  if (u.time){
+    u.time.value = d.t != null ? Math.round(d.t * 10) / 10 : '';
+    u.slider.max = d.dur || 0; u.slider.value = d.t || 0;
+    u.slider.disabled = u.time.disabled = u.minus.disabled = u.plus.disabled = !d.dur;
+    u.dur.textContent = d.dur ? '/ ' + d.dur.toFixed(0) + ' s' : '';
+  }
+  for (const [n, b] of Object.entries(u.camBtns || {})){
+    const on = d.sel.cam === n && d.sel.mask == null;
+    b.style.outline = on ? '2px solid ' + ldColor(n) : 'none';
+    b.style.opacity = d.cams[n] && d.cams[n].crop ? 1 : 0.6;
+  }
+  if (u.maskBtn) u.maskBtn.style.outline = d.tool === 'mask' ? '2px solid #ffe600' : 'none';
+  if (u.grid){
+    // keep the numeric grid in sync with the drawn boxes (rebuilt when cameras appear/vanish)
+    const have = Object.keys(d.cams).filter(n => d.cams[n].crop).join(',');
+    if (u.gridKeys !== have) ldBuildGrid();
+    else u.grid.querySelectorAll('input').forEach(inp => {
+      const c = d.cams[inp.dataset.cam];
+      if (c && c.crop && document.activeElement !== inp) inp.value = c.crop[Number(inp.dataset.idx)];
+    });
+  }
+}
+function ldBuildGrid(){
+  const d = layoutDraw, g = d.ui.grid; if (!g) return;
+  g.replaceChildren();
+  ['camera', 'x', 'y', 'w', 'h'].forEach(h => g.appendChild(_el('span', 'hint', h)));
+  const names = Object.keys(d.cams).filter(n => d.cams[n].crop);
+  d.ui.gridKeys = names.join(',');
+  for (const n of names){
+    g.appendChild(_el('span', 'auto-cam', n));
+    d.cams[n].crop.forEach((v, i) => {
+      const inp = document.createElement('input');
+      inp.type = 'number'; inp.value = v; inp.dataset.cam = n; inp.dataset.idx = i;
+      inp.onchange = () => {
+        const val = parseInt(inp.value, 10);
+        if (!isNaN(val) && d.cams[n] && d.cams[n].crop){
+          d.cams[n].crop[i] = val; ldClipMasks(d, n);
+        }
+        inp.value = d.cams[n].crop[i];
+        ldUpdateUI();
+      };
+      g.appendChild(inp);
+    });
+  }
+}
+function renderLayoutDraw(card){
+  const d = layoutDraw, u = d.ui = {};
+  card.appendChild(_el('div', 'hint',
+    'Pick a camera, then drag on the frame to draw its box. Drag inside a box to move it, drag its edges/corners to ' +
+    'resize (snaps to the frame border and other boxes; hold Alt to disable). Arrow keys nudge 1 px (Shift 10 px).'));
+  const bar = _el('div', 'auto-actions layout-draw-bar');
+  u.camBtns = {};
+  const names = ['main', 'corner_left', 'corner_right'];
+  Object.keys(d.cams).forEach(n => { if (!names.includes(n)) names.push(n); });
+  for (const n of names){
+    const b = _el('button', null, n);
+    b.style.borderLeft = '4px solid ' + ldColor(n);
+    b.onclick = () => { d.sel = {cam: n, mask: null}; d.tool = 'cam'; ldUpdateUI(); };
+    u.camBtns[n] = b; bar.appendChild(b);
+  }
+  u.maskBtn = _el('button', null, '+ mask');
+  u.maskBtn.title = 'Then drag inside the selected camera to draw a blanked-out overlay region';
+  u.maskBtn.onclick = () => { d.tool = d.tool === 'mask' ? 'cam' : 'mask'; ldUpdateUI(); };
+  bar.appendChild(u.maskBtn);
+  const del = _el('button', null, 'Delete');
+  del.title = 'Remove the selected mask, or the selected corner camera (main cannot be removed)';
+  del.onclick = ldDelete;
+  bar.appendChild(del);
+  card.appendChild(bar);
+  const tb = _el('div', 'auto-actions layout-draw-bar');
+  u.minus = _el('button', null, '−10 s'); u.plus = _el('button', null, '+10 s');
+  u.time = document.createElement('input'); u.time.type = 'number'; u.time.step = '0.5'; u.time.min = '0';
+  u.time.style.width = '70px';
+  u.slider = document.createElement('input'); u.slider.type = 'range'; u.slider.min = 0; u.slider.step = 0.5;
+  u.slider.style.width = '260px';
+  u.dur = _el('span', 'hint', '');
+  const go = t => { d.saved = false; u.savedCb.checked = false; ldLoadFrame(Math.max(0, t)); };
+  u.minus.onclick = () => go((d.t || 0) - 10);
+  u.plus.onclick = () => go((d.t || 0) + 10);
+  u.time.onchange = () => { const v = parseFloat(u.time.value); if (!isNaN(v)) go(v); };
+  u.slider.oninput = () => { u.time.value = u.slider.value; };
+  u.slider.onchange = () => go(parseFloat(u.slider.value));
+  const lab = document.createElement('label'); lab.className = 'hint';
+  u.savedCb = document.createElement('input'); u.savedCb.type = 'checkbox'; u.savedCb.checked = d.saved;
+  u.savedCb.onchange = () => { d.saved = u.savedCb.checked; ldLoadFrame(d.saved ? null : (d.t != null ? d.t : null)); };
+  lab.append(u.savedCb, ' saved median frame');
+  tb.append(_el('span', 'hint', 'Frame at'), u.minus, u.time, u.plus, u.slider, u.dur, lab);
+  card.appendChild(tb);
+  const wrap = _el('div', 'layout-canvas-wrap');
+  u.canvas = document.createElement('canvas'); u.canvas.className = 'layout-canvas';
+  wrap.appendChild(u.canvas); card.appendChild(wrap);
+  u.canvas.onpointerdown = ldPointerDown; u.canvas.onpointermove = ldPointerMove;
+  u.canvas.onpointerup = ldPointerUp; u.canvas.onpointercancel = ldPointerUp;
+  u.readout = _el('div', 'layout-crops', ''); card.appendChild(u.readout);
+  u.status = _el('div', 'auto-msg', ''); card.appendChild(u.status);
+  u.grid = _el('div', 'layout-edit'); card.appendChild(u.grid);
+  ldBuildGrid(); ldSizeCanvas(); ldUpdateUI();
+}
+document.addEventListener('keydown', ldNudge);
+window.addEventListener('resize', () => { if (layoutDrawing && layoutDraw){ ldSizeCanvas(); ldPaint(); } });
 function _el(tag, cls, text){
   const e = document.createElement(tag);
   if (cls) e.className = cls;

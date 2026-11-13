@@ -624,6 +624,33 @@ def push_bundle(st: dict, plan: BundlePlan, scratch: Path, *, replace_code: bool
     tar_path.unlink(missing_ok=True)
 
 
+def run_bootstrap(st: dict, poll_s: float = 10) -> None:
+    """Run bootstrap.sh DETACHED on the pod (a dropped ssh session must not
+    kill a half-done venv install) and stream its log until it exits."""
+    log = f"{POD_WS}/logs/bootstrap.log"
+    ssh_run(st, f"mkdir -p {POD_WS}/logs && : > {log} && setsid nohup bash -c "
+                f"'bash {POD_APP}/deploy/runpod/bootstrap.sh; echo BOOTSTRAP_EXIT=$?' "
+                f">> {log} 2>&1 < /dev/null &")
+    seen = 0
+    while True:
+        time.sleep(poll_s)
+        try:
+            out = ssh_out(st, f"tail -n +{seen + 1} {log}", check=False, timeout=60)
+        except subprocess.TimeoutExpired:
+            continue
+        lines = out.splitlines()
+        for ln in lines:
+            print("  | " + ln, flush=True)
+        seen += len(lines)
+        done = [ln for ln in lines if ln.startswith("BOOTSTRAP_EXIT=")]
+        if done:
+            code = done[-1].split("=", 1)[1].strip()
+            if code != "0":
+                raise SystemExit(f"bootstrap failed (exit {code}); full log: {log} "
+                                 f"(fix, then `push --bootstrap` or re-run `up`)")
+            return
+
+
 def install_secrets(st: dict, secrets: dict) -> None:
     text = render_dotenv(secrets).encode()
     ssh_run(st, f"umask 077 && mkdir -p {POD_APP} && cat > {POD_APP}/.env.tmp && "
@@ -778,12 +805,23 @@ def cmd_up(args) -> int:
             save_state(st)
             print(f"created pod {pod['id']} at ${pod.get('costPerHr')}/h")
         wait_for_ssh(st)
+        jid = remote_job_active(st)
+        if jid:
+            raise SystemExit(f"job {jid} is running on the pod; `up` would restart the server. "
+                             f"Wait for it (or use `push --force`).")
+        has_db =ssh_run(st, f"test -f {POD_APP}/frc_scorer.db", check=False).returncode == 0
+        if has_db and not args.overwrite_db:
+            # a re-run of `up` mid-event must never clobber the pod's DB or the
+            # calibrations/layouts made on the pod
+            plan.extra = [e for e in plan.extra if e[2] not in ("db", "event_state")]
+            print("pod already has frc_scorer.db: keeping the pod's DB + event state "
+                  "(--overwrite-db to replace them with the local copy)")
         push_bundle(st, plan, td, replace_code=True)
         install_secrets(st, secrets)
         if args.cookies:
             upload_cookies(st, args.cookies)
         print("bootstrapping (first boot: ~10-15 min for venv + ~3.5 GB SAM3 download)...", flush=True)
-        ssh_run(st, f"bash {POD_APP}/deploy/runpod/bootstrap.sh 2>&1 | tee -a {POD_WS}/logs/bootstrap.log")
+        run_bootstrap(st)
     st["pushed_ref"] = args.ref
     save_state(st)
     print(f"\nServer is up. Open the tunnel:\n  {Path(__file__).name} tunnel   "
@@ -808,7 +846,7 @@ def cmd_push(args) -> int:
         print_plan(plan)
         push_bundle(st, plan, Path(td), replace_code=True)
     if args.bootstrap:
-        ssh_run(st, f"bash {POD_APP}/deploy/runpod/bootstrap.sh 2>&1 | tee -a {POD_WS}/logs/bootstrap.log")
+        run_bootstrap(st)
     else:
         restart_server(st, force=True)
     st["pushed_ref"] = args.ref
@@ -1001,7 +1039,7 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
                   f"--event {TUNE_EVENT} --label {rung.name} --config-json {shlex.quote(cfg)} "
                   f"--host 127.0.0.1:{POD_PORT} "
                   f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null & echo started")
-        ssh_run(st, f"rm -f {out}; " + launch)
+        ssh_out(st, f"rm -f {out}; " + launch)
         print(f"  [{rung.name}] launched {cfg}", flush=True)
     else:
         print(f"  [{rung.name}] re-attached to running job {state.get('job_id')}", flush=True)
@@ -1022,7 +1060,7 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
         except ValueError:
             continue
         el = time.time() - (state.get("t_submit") or t0)
-        print(f"  [{rung.name}] {state.get('status'):<11} {el / 60:5.1f} min  "
+        print(f"  [{rung.name}] {str(state.get('status')):<11} {el / 60:5.1f} min  "
               f"{state.get('progress') or ''}% {str(state.get('message') or '')[:70]}", flush=True)
         if state.get("status") in ("done", "error"):
             return state
@@ -1254,6 +1292,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--secrets-from-env", action="store_true", help="take secrets from the local .env, no prompts")
     p.add_argument("--dry-run", action="store_true", help="print the API body + bundle manifest; create nothing")
     p.add_argument("--keep-bundle", metavar="PATH", help="with --dry-run: also write the tarball here")
+    p.add_argument("--overwrite-db", action="store_true",
+                   help="reusing a pod that already has a DB: replace it (and event state) with the local copy")
     p.add_argument("--scratch", default=None, help="temp dir for the bundle (default system temp)")
     _common_bundle_flags(p)
     p.set_defaults(fn=cmd_up)

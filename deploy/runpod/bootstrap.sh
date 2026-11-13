@@ -87,7 +87,7 @@ REQ_OVR="$HERE/requirements-runpod-overrides.txt"
 want_hash="$(cat "$REQ" "$REQ_GIT" "$REQ_OVR" | sha256sum | cut -c1-16)"
 have_hash="$(cat "$FRC_APP/.venv/.frc-req-hash" 2>/dev/null || true)"
 if [ ! -x "$FRC_APP/.venv/bin/python" ]; then
-  uv venv --python 3.12 "$FRC_APP/.venv"
+  uv venv --managed-python --python 3.12 "$FRC_APP/.venv"   # interpreter on the volume
   have_hash=""
 fi
 if [ "$want_hash" != "$have_hash" ]; then

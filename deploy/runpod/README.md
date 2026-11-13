@@ -64,7 +64,9 @@ rp up --gpu "NVIDIA H100 80GB HBM3" --yes  # non-interactive: secrets from local
    ships the weights below, the event state from `web/uploads` (calibrations,
    camera layouts, zones, season overrides, clock-scan cache), and a
    consistent snapshot of `frc_scorer.db`. `--no-db` skips the DB and the event
-   state for a fresh start.
+   state for a fresh start. Re-running `up` against a pod that already has a
+   DB keeps the pod's DB and event state (`--overwrite-db` to replace them),
+   and `up` refuses to run while a job is processing.
 4. **Install secrets**: asks for each var (`[local .env: ****abcd]`,
    Enter=keep, paste=replace, `-`=skip) and writes them over ssh to
    `/workspace/frc/.env` (chmod 600). Required: `JEV_TYPESAFE_API_TOKEN`,
@@ -77,7 +79,9 @@ rp up --gpu "NVIDIA H100 80GB HBM3" --yes  # non-interactive: secrets from local
    (`facebook/sam3`, ~3.5 GB, gated) / DINOv3 / EasyOCR into
    `/workspace/cache`, an import smoke test (CUDA kernels for this GPU arch,
    `import web.app`), `profile.env` from the VRAM tier, then the server
-   (`serve.sh`, log `/workspace/logs/server.log`).
+   (`serve.sh`, log `/workspace/logs/server.log`). It runs detached on the
+   pod and `up` streams `/workspace/logs/bootstrap.log`, so a dropped ssh
+   session does not kill a half-finished install. Re-running it is safe.
 
 First boot takes about 10-15 min (venv about 5 GB, SAM3 download). A re-run
 after a stop/start only reinstalls the apt packages.

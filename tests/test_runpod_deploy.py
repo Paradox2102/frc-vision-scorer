@@ -345,6 +345,51 @@ def test_multiplex_arm_layers_on_base_rung():
     assert all(not x.name.endswith("M") for x in profiles.ladder(tier))
 
 
+def test_parallel_views_and_qwen_reader_arms(monkeypatch):
+    monkeypatch.delenv("VLM_SERVER_GPU_GB", raising=False)
+    tier = profiles.tier_for_vram(97887)
+    base = profiles.rung_by_name(tier, "R1")
+    arms = {a.tag: a for a in profiles.ARMS}
+    assert [a.tag for a in profiles.ARMS][:3] == ["M", "P", "Q"]
+    assert arms["P"].knobs == {"sam3_parallel_views": True}
+    assert arms["Q"].knobs == {"team_reader": "vllm", "vlm_model": "qwen3.5-4b",
+                               "vllm_phase_exclusive": False}
+    for tag in ("P", "Q"):
+        r = profiles.arm_rung(base, arms[tag])
+        assert r.name == "R1" + tag
+        assert r.knobs == {**base.knobs, **arms[tag].knobs}
+        assert r.delta == arms[tag].knobs
+        assert arms[tag].rationale
+    # Q's reader really is the escape-prompt / thinking-off Qwen3.5-4B entry,
+    # and on the 96 GB card its default absolute budget is the 12 GiB the pod
+    # bench ran (util 0.126), leaving the card to SAM3.
+    from web import vlm_models
+    assert vlm_models.read_prompt("qwen3.5-4b") == "escape"
+    assert vlm_models.extra_body("qwen3.5-4b") == {
+        "chat_template_kwargs": {"enable_thinking": False}}
+    assert vlm_models.get("qwen3.5-4b").hf_repo == "Qwen/Qwen3.5-4B"
+    assert vlm_models.serve_util("qwen3.5-4b", 95.6) == pytest.approx(12.0 / 95.6, abs=1e-3)
+
+
+def test_every_arm_knob_is_a_real_job_config_knob():
+    """A knob rename (e.g. sam2 -> sam3) must not silently turn an arm into a
+    no-op: arm knobs use canonical names (not aliases), and the per-job
+    config the pod submits resolves to the arm's values."""
+    from web.job_config import KNOBS, JobConfig
+    names = {k.name for k in KNOBS}
+    tier = profiles.tier_for_vram(97887)
+    base = profiles.rung_by_name(tier, "R1")
+    tags = [a.tag for a in profiles.ARMS]
+    assert len(tags) == len(set(tags))
+    for arm in profiles.ARMS:
+        assert arm.knobs, arm.tag
+        for k in arm.knobs:
+            assert k in names, f"arm {arm.tag}: {k!r} is not a web.job_config knob"
+        cfg = JobConfig({**profiles.arm_rung(base, arm).config(), "auto_period_only": False})
+        for k, v in arm.knobs.items():
+            assert getattr(cfg, k) == v, (arm.tag, k)
+
+
 def test_arm_base_prefers_recommendation_then_r1():
     import runpod_cli as cli
     rungs = profiles.ladder(profiles.tier_for_vram(97887))

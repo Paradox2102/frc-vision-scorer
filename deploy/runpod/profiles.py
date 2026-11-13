@@ -201,6 +201,30 @@ ARMS = (
         "object-frame, ~640 kernels + ~20 .item() each, GPU ~60% busy) with "
         "VRAM to spare, which is exactly what multiplex batching targets -- "
         "re-measure on a big card before writing it off."),
+    Arm("P", {"sam3_parallel_views": True},
+        "Thread-parallel SAM3 views (one predictor + CUDA stream per view, "
+        "web/field/parallel_views.py). Nov 12 pod R1P gained nothing (6.6 -> "
+        "6.5 min): the GIL serialised the Python-heavy per-frame work. A py-spy "
+        "--gil profile put the scalar hub-occlusion test at ~33% of GIL-held "
+        "time; it is now vectorised (~40x) on main, and chunk frame loading is "
+        "thread-pooled (sam3_frame_load_workers) -- re-measure."),
+    # The resident Qwen3.5-4B reader: the scripts/ab_qm8.py "qwen35-escape" arm
+    # (team_reader=vllm + vlm_model=qwen3.5-4b; read_census / read_keep_evicted
+    # are already the defaults). The escape prompt and thinking-off come from
+    # the web/vlm_models.py registry entry, not knobs. vllm_phase_exclusive is
+    # explicit (BASE_ENV sets it too) so the reader stays resident beside SAM3
+    # instead of being stopped/cold-started (~106 s on the pod) every job. Its
+    # VRAM budget needs no pod value: on a >= 30 GB card serve_util makes it
+    # absolute, gpu_util 0.5 x 24 = 12 GiB (util 0.126 on the 96 GB card) --
+    # exactly what the pod bench ran (12.5 GB up, 13.4 GB after reads).
+    Arm("Q", {"team_reader": "vllm", "vlm_model": "qwen3.5-4b",
+              "vllm_phase_exclusive": False},
+        "Resident Qwen3.5-4B team reader (vLLM, escape prompt, no-think) instead "
+        "of Jev for live reads. 200-crop reader bench on the pod: 71/0 wrong of "
+        "90 legible, 2% FP, 13 GB vs Jev 59/0, 2%; the live full-match A/B has "
+        "never been run. The big card has the VRAM to keep it resident beside "
+        "SAM3 (R1 peak ~12 GB). Needs .venv-vllm on the pod; start vLLM before "
+        "this arm so its wall time excludes the cold start."),
 )
 
 

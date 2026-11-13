@@ -138,7 +138,11 @@ rp tune --arms-only        # only the experimental arms, on the measured recomme
 After the climb, `tune` also measures the **experimental arms** in
 `profiles.ARMS` on top of the recommended rung (R1 if none), as `<rung><tag>`
 rows in the same table — currently `M` = `sam3_multiplex` (SAM 3.1 Object
-Multiplex; lost on the 24 GB 3090, re-measured on big cards). Arms are never
+Multiplex; lost on the 24 GB 3090, re-measured on big cards), `P` =
+`sam3_parallel_views` (thread-parallel views, re-measured after the GIL fixes)
+and `Q` = the resident Qwen3.5-4B vLLM team reader instead of Jev
+(`team_reader=vllm`, `vlm_model=qwen3.5-4b`; needs `/workspace/frc/.venv-vllm`,
+and vLLM already up so the arm's wall excludes its ~106 s cold start). Arms are never
 recommended or applied; `--no-arms` skips them. The 3.1 checkpoint
 (`facebook/sam3.1`, gated separately) is prefetched by bootstrap with a warning,
 not a failure, if the HF token lacks access.

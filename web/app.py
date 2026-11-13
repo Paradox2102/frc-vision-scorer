@@ -33,6 +33,7 @@ import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from types import SimpleNamespace
 from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,6 +120,7 @@ from web.field.detect_schema import (
     select_gap_fills,
 )
 from web.field.selective_prop import SelectiveConfig
+from web.field.parallel_views import call_on_cuda_stream, serialized
 from web.analysis_prefetch import MISS as _PREFETCH_MISS
 from web.field.hard_negatives import HardNegativeLogger
 from web.field.detection_archive import DetectionArchive
@@ -2524,8 +2526,51 @@ class InferenceJob:
 
         return embed_frame_fn
 
+    def _build_parallel_view_trackers(self, make_tracker, device: str) -> list:
+        """sam3_parallel_views: build the EXTRA SAM3 trackers (one per
+        additional concurrently-propagated view) after the primary tracker
+        is resident. Returns [] — the sequential path — when the knob caps
+        at one view, the device isn't CUDA, free VRAM can't hold another
+        predictor + session (web/field/parallel_views.plan_parallel_views),
+        or the first extra build fails. Runs on the model-load worker
+        thread."""
+        from web.field.parallel_views import plan_parallel_views
+
+        n_views = len(getattr(self, "views", None) or [])
+        free_bytes = None
+        if device == "cuda":
+            try:
+                import torch
+                free_bytes = int(torch.cuda.mem_get_info(0)[0])
+            except Exception as e:
+                print(f"  [SAM3] parallel views: VRAM probe failed ({e})")
+        else:
+            n_views = min(n_views, 1)  # never parallel off-GPU
+        n, reason = plan_parallel_views(
+            n_views, self.config.sam3_parallel_max, free_bytes,
+            self.config.sam3_chunk_frames)
+        if n < 2:
+            print(f"  [SAM3] parallel views: falling back to sequential — {reason}")
+            return []
+        extras = []
+        for _ in range(n - 1):
+            try:
+                extras.append(make_tracker())
+            except Exception as e:
+                print(f"  [SAM3] parallel views: extra predictor build failed "
+                      f"({type(e).__name__}: {e}); keeping {len(extras) + 1}")
+                break
+        if not extras:
+            print("  [SAM3] parallel views: falling back to sequential — "
+                  "no extra predictor could be built")
+            return []
+        print(f"  [SAM3] parallel views: {len(extras) + 1} predictors resident "
+              f"({reason})")
+        return extras
+
     async def _run_view_tracking(self, sam2_tracker, view, track_kwargs,
-                                 frame_detect_fn, progress_cb):
+                                 frame_detect_fn, progress_cb, *,
+                                 call_lock=None, cuda_stream=None):
         """Run one view's SAM propagation, honoring ``selective_mask_prop``.
 
         With the knob OFF this is byte-for-byte the historical
@@ -2536,7 +2581,18 @@ class InferenceJob:
         ``track`` call, so a bad selective run can never lose a view. Timing
         accrues to ``timings['sam2_tracking']`` for whichever path produced the
         tracks, and the per-view ms/frame line is printed here.
+
+        ``call_lock`` / ``cuda_stream`` are the sam3_parallel_views hooks
+        (both None on the sequential path, which then runs exactly as
+        above): the lock serialises the shared embedder model across
+        concurrently-tracked views, and the stream becomes the worker
+        thread's current CUDA stream for the whole propagation.
         """
+        def _in_thread(fn, **kwargs):
+            if cuda_stream is None:
+                return asyncio.to_thread(fn, **kwargs)
+            return asyncio.to_thread(call_on_cuda_stream, cuda_stream, fn, **kwargs)
+
         t0 = time.perf_counter()
         view_tracks = None
         if self.config.selective_mask_prop:
@@ -2561,14 +2617,14 @@ class InferenceJob:
                     retire_closed=self.config.selective_retire_closed,
                     lazy_seed=self.config.selective_lazy_seed,
                 )
-                view_tracks = await asyncio.to_thread(
+                view_tracks = await _in_thread(
                     sam2_tracker.track_selective,
                     frames_dir=track_kwargs["frames_dir"],
                     detect_frame_fn=frame_detect_fn,
                     cfg=cfg,
                     progress_cb=progress_cb,
                     should_stop=lambda: self._stopped,
-                    embed_frame_fn=(self.make_embed_frame_fn()
+                    embed_frame_fn=(serialized(self.make_embed_frame_fn(), call_lock)
                                     if self.config.selective_app_weight > 0.0
                                     else None),
                 )
@@ -2622,7 +2678,7 @@ class InferenceJob:
                     sam2_tracker, "selective_obj_colors", None) or {}
                 self.sam2_obj_color[view.name] = dict(obj_colors)
         if view_tracks is None:
-            view_tracks = await asyncio.to_thread(
+            view_tracks = await _in_thread(
                 sam2_tracker.track, **track_kwargs)
         elapsed = time.perf_counter() - t0
         self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
@@ -2630,6 +2686,67 @@ class InferenceJob:
         print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames "
               f"in {elapsed:.2f}s ({elapsed / max(1, n) * 1000:.1f} ms/frame)")
         return view_tracks
+
+    async def _track_views_parallel(self, track_one_view, trackers, export_pct: float):
+        """sam3_parallel_views dispatcher: propagate the camera views
+        concurrently, one predictor (+ CUDA stream) per in-flight view.
+
+        ``track_one_view(view_idx, view, tracker, _par)`` is the precompute
+        Phase 2 per-view coroutine. Output is merged exactly as the
+        sequential loop would leave it: per-view diagnostics are recorded
+        into child recorders and absorbed in view order, and the per-view
+        result dicts (sam2_raw / sam2_obj_color / _view_mine_info) are
+        re-keyed into view order. All started views are awaited before the
+        first failure (in view order) re-raises; the extra predictors are
+        released on every exit path.
+        """
+        import torch
+        from web.field.parallel_views import (
+            ParallelProgress, reorder_view_keys, run_views_concurrently)
+
+        views = list(self.views)
+        names = [v.name for v in views]
+        trackers = list(trackers)[:max(1, len(views))]
+        cuda = torch.cuda.is_available()
+        use_streams = bool(self.config.sam3_parallel_streams) and cuda
+        streams = [torch.cuda.Stream() if use_streams else None for _ in trackers]
+        if cuda:
+            # Weights/state built on the default stream must be complete
+            # before other streams read them.
+            torch.cuda.synchronize()
+        lock = threading.RLock()
+        progress = ParallelProgress(names, export_pct, 100.0 - export_pct)
+        diags = {name: self.identity_diagnostics.spawn_child() for name in names}
+        view_dicts = (self.sam2_raw, self.sam2_obj_color, self._view_mine_info)
+        pre_keys = [list(d.keys()) for d in view_dicts]
+        sum0 = self.timings.get("sam2_tracking", 0.0)
+        print(f"  [{self.tracker_tag}] parallel views: {len(trackers)} concurrent "
+              f"({len(views)} views, cuda_streams={use_streams})")
+
+        def run_one(view_idx, view, worker):
+            tracker, stream = worker
+            return track_one_view(view_idx, view, tracker, SimpleNamespace(
+                diag=diags[view.name], lock=lock, stream=stream,
+                progress=progress))
+
+        t0 = time.perf_counter()
+        try:
+            await run_views_concurrently(
+                list(enumerate(views)), run_one, list(zip(trackers, streams)),
+                before_start=self._raise_if_stopped)
+        finally:
+            for name in names:
+                self.identity_diagnostics.absorb(diags[name])
+            for d, keys in zip(view_dicts, pre_keys):
+                reorder_view_keys(d, names, keys)
+            self._sam3_extra_trackers = []
+            trackers = streams = None
+            wall = time.perf_counter() - t0
+            self.timings["sam_views_wall"] = self.timings.get("sam_views_wall", 0.0) + wall
+            views_sum = self.timings.get("sam2_tracking", 0.0) - sum0
+            print(f"  [{self.tracker_tag}] parallel views: total SAM wall {wall:.2f}s "
+                  f"(sum of per-view {views_sum:.2f}s, "
+                  f"{views_sum / max(wall, 1e-6):.2f}x overlap)")
 
     def _start_analysis_prefetch(self, analysis_frames, device: str):
         """stream_analysis: start the SAM-independent loop-work prefetch on a
@@ -8505,6 +8622,7 @@ class InferenceJob:
             self.sam2_raw = {}
             self._view_mine_info = {}
             self.sam2_obj_color = {}
+            self._sam3_extra_trackers = []  # sam3_parallel_views predictors
             self._replay = self._new_replay_recorder()
             self.robot_embedder = None
             
@@ -8619,19 +8737,22 @@ class InferenceJob:
                         if self.tracking_backend == "sam3":
                             from web.field.sam3_tracker import Sam3FieldTracker
 
-                            tracker = Sam3FieldTracker(
-                                checkpoint=SAM3_CHECKPOINT,
-                                device=device,
-                                offload_video_to_cpu=offload_vid,
-                                offload_state_to_cpu=offload_st,
-                                compile_model=(self.config.sam3_compile and device == "cuda"),
-                                max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
-                                use_fa3=SAM3_USE_FA3,
-                                chunk_frames=self.config.sam3_chunk_frames,
-                                multiplex=self.config.sam3_multiplex,
-                                skip_detector_heads=self.config.sam3_skip_detector_heads,
-                                retire_culled=self.config.sam3_retire_culled,
-                            )
+                            def _make_sam3_tracker():
+                                return Sam3FieldTracker(
+                                    checkpoint=SAM3_CHECKPOINT,
+                                    device=device,
+                                    offload_video_to_cpu=offload_vid,
+                                    offload_state_to_cpu=offload_st,
+                                    compile_model=(self.config.sam3_compile and device == "cuda"),
+                                    max_objects=max(MAX_TRACKED_ROBOTS * 3, 20),
+                                    use_fa3=SAM3_USE_FA3,
+                                    chunk_frames=self.config.sam3_chunk_frames,
+                                    multiplex=self.config.sam3_multiplex,
+                                    skip_detector_heads=self.config.sam3_skip_detector_heads,
+                                    retire_culled=self.config.sam3_retire_culled,
+                                )
+
+                            tracker = _make_sam3_tracker()
                             detail = (
                                 f"video model w/ instance prompts, "
                                 f"chunk={self.config.sam3_chunk_frames} frames, "
@@ -8661,6 +8782,14 @@ class InferenceJob:
                         embedder = make_robot_embedder(self.embed_backend)
                         print(f"  [embedder] backend={self.embed_backend} "
                               f"model={embedder.model_name} thresholds={self._emb_thr()}")
+                        # sam3_parallel_views (default OFF): extra predictors,
+                        # one per additional concurrent view, sized against the
+                        # free VRAM left after the primary tracker + embedder.
+                        if (self.tracking_backend == "sam3"
+                                and self.config.sam3_parallel_views):
+                            self._sam3_extra_trackers = \
+                                self._build_parallel_view_trackers(
+                                    _make_sam3_tracker, device)
                         self.timings["model_load"] = self.timings.get("model_load", 0.0) + (time.perf_counter() - _t_load)
                         return tracker, detail, embedder
 
@@ -8967,7 +9096,14 @@ class InferenceJob:
                 # Returns None with the knob OFF.
                 self._start_analysis_prefetch(all_frames, device)
                 # ----- Phase 2: per-view SAM2 propagation over the exported frames.
-                for view_idx, view in enumerate(self.views):
+                # One view's whole propagation step. The sequential loop below
+                # calls it once per view in order (_par None: the historical
+                # loop body, unchanged). sam3_parallel_views calls it
+                # concurrently with _par carrying that view's private
+                # predictor/stream, a child diagnostics recorder, the shared-
+                # model lock and the aggregate progress bar.
+                async def _track_one_view(view_idx, view, sam2_tracker, _par=None):
+                    _diag = self.identity_diagnostics if _par is None else _par.diag
                     tmp_dir_obj = view_dirs[view.name]
                     view_plan = view_plans[view.name]
                     # Effective average stride over the (possibly mixed-rate)
@@ -9014,17 +9150,21 @@ class InferenceJob:
                         )
                         await safe_send_status(
                             f"[{self.tracker_tag}] View '{view.name}': waiting for first robot...",
-                            base_pct,
+                            base_pct if _par is None else _par.progress.update(view.name, 0.0),
                         )
 
                     _detect_caps: list = []  # detect_fn VideoCaptures, released in finally
-                    with self.identity_diagnostics.scoped_context(view=view.name):
+                    with _diag.scoped_context(view=view.name):
                         try:
                             def make_progress_cb(b_pct, sp_pct, v_name):
                                 throttle = {"last": 0.0}
 
                                 def progress_cb(current, total):
-                                    pct = b_pct + (current / max(1, total)) * sp_pct
+                                    if _par is None:
+                                        pct = b_pct + (current / max(1, total)) * sp_pct
+                                    else:
+                                        pct = _par.progress.update(
+                                            v_name, current / max(1, total))
                                     msg = f"[{self.tracker_tag}] View '{v_name}': tracking frame {current}/{total}..."
                                     loop.call_soon_threadsafe(
                                         lambda: asyncio.create_task(safe_send_status(msg, pct))
@@ -9432,7 +9572,7 @@ class InferenceJob:
                                 max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
                                 propagate_backward=True,
                                 progress_cb=progress_cb,
-                                diagnostics=self.identity_diagnostics,
+                                diagnostics=_diag,
                                 project_fn=_project_fn,
                                 seed_gate_fn=_seed_gate_fn,
                                 corrob_gate_fn=_corrob_gate_fn,
@@ -9504,17 +9644,32 @@ class InferenceJob:
                             # track() call above unchanged; knob ON swaps in
                             # track_selective with a per-frame detector, falling
                             # back to the uniform call on any failure.
+                            _frame_detect_fn = self.make_frame_detect_fn(
+                                view, view_plan, _sam2_scale, _y_off)
+                            _par_hooks = {}
+                            if _par is not None:
+                                # Shared YOLO/person/embedder models: one
+                                # caller at a time across views (ultralytics
+                                # predictors are not thread-safe).
+                                for _k in ("detect_fn", "person_fn"):
+                                    track_kwargs[_k] = serialized(
+                                        track_kwargs[_k], _par.lock)
+                                _frame_detect_fn = serialized(
+                                    _frame_detect_fn, _par.lock)
+                                _par_hooks = dict(call_lock=_par.lock,
+                                                  cuda_stream=_par.stream)
                             view_tracks = await self._run_view_tracking(
                                 sam2_tracker, view, track_kwargs,
-                                self.make_frame_detect_fn(
-                                    view, view_plan, _sam2_scale, _y_off),
+                                _frame_detect_fn,
                                 progress_cb,
+                                **_par_hooks,
                             )
                             self.sam2_raw[view.name] = view_tracks
 
                             await safe_send_status(
                                 f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
-                                base_pct + span_pct,
+                                (base_pct + span_pct) if _par is None
+                                else _par.progress.update(view.name, 1.0),
                             )
                         except TrackStopped:
                             # User stop — NOT a tracker failure. The finally below
@@ -9548,6 +9703,17 @@ class InferenceJob:
                     # catches one set in the window after track() returned so we
                     # never start seeding/propagating the next view.
                     self._raise_if_stopped()
+
+                if not self._sam3_extra_trackers:
+                    for view_idx, view in enumerate(self.views):
+                        await _track_one_view(view_idx, view, sam2_tracker)
+                else:
+                    # sam3_parallel_views: releases the extra predictors itself
+                    # (self._sam3_extra_trackers) on every exit path.
+                    await self._track_views_parallel(
+                        _track_one_view,
+                        [sam2_tracker] + list(self._sam3_extra_trackers),
+                        EXPORT_PCT)
 
                 if not self.sam2_raw:
                     await self._warn_degraded(
@@ -10674,6 +10840,9 @@ class InferenceJob:
                 except Exception:
                     pass
             self._view_export_dirs = None
+            # sam3_parallel_views: drop extra predictors a mid-phase stop or
+            # exception left resident (normal runs already cleared them).
+            self._sam3_extra_trackers = []
             # Clef usage for errored/stopped runs that never reached the
             # success-path call (idempotent; no-op for other readers).
             try:

@@ -182,6 +182,27 @@ KNOBS = [
     # 2026-11-12 (live A/B, see selective_retire_closed).
     Knob("sam3_retire_culled", "SAM3_RETIRE_CULLED", bool, True,
          section="Tracking backend"),
+    # Propagate the SAM3 camera views (main + corners) CONCURRENTLY instead of
+    # one after another: one predictor per in-flight view (~3.5 GB weights +
+    # its chunk session each) on worker threads, each on its own CUDA stream
+    # (sam3_parallel_streams), shared YOLO/embedder calls serialised, results
+    # merged in view order (same output as sequential). Batch-1 SAM3 is
+    # overhead-bound (2026-11-12 RTX PRO 6000 96 GB pod, qm8: util 0-77%,
+    # 9-12 GB peak; main 170 s + corners 33 s + 24 s run back to back), so SAM
+    # wall should drop from sum(views) towards max(view). For >=48 GB cards:
+    # a free-VRAM check after the first predictor loads caps the concurrency
+    # (sam3_parallel_max is the ceiling) and falls back to sequential with a
+    # log line when even 2 don't fit (a 24 GB card always does at chunk 200).
+    # DEFAULT OFF until validated on the pod. See web/field/parallel_views.py.
+    Knob("sam3_parallel_views", "SAM3_PARALLEL_VIEWS", bool, False,
+         section="Tracking backend"),
+    Knob("sam3_parallel_max", "SAM3_PARALLEL_MAX", int, 3, min=1, max=8,
+         section="Tracking backend"),
+    # Per-view CUDA streams under sam3_parallel_views (no effect when it is
+    # off). OFF = all views share the default stream: CPU-side overhead still
+    # overlaps but kernels serialise — the fallback if streams misbehave.
+    Knob("sam3_parallel_streams", "SAM3_PARALLEL_STREAMS", bool, True,
+         section="Tracking backend"),
     # Selective SAM3 mask propagation (arXiv 2606.13033 re-implementation):
     # skip full-frame mask propagation for a tracked object while its match is
     # comfortably inside selective_margin_entry (in 1 - expanded-IoU cost

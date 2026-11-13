@@ -1,4 +1,4 @@
-"""Parity test: the SAM2 cull's project_fn offset must match the result
+"""Parity test: the mask-tracker cull's project_fn offset must match the result
 consumer's field projection for nonzero top-crop. Pure algebra; no app import."""
 
 

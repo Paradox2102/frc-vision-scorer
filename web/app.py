@@ -63,6 +63,7 @@ from web.embedder import (
     thresholds_for,
 )
 from web.job_config import JobConfig
+from web.env_compat import sam3_env
 from web.ytdlp_cookies import with_cookies as with_ytdlp_cookies
 from web import clef_reader
 from web import jev_reader
@@ -72,7 +73,7 @@ from web.bumper_register import deinterlace_crop
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
 from web.field import store as field_store
-from web.field.sam2_tracker import TrackStopped
+from web.field.mask_tracker import TrackStopped
 from web.field.match_order import select_epoch
 from web.field.field_model import FieldModel
 from web.field import season as field_season_mod
@@ -249,14 +250,14 @@ def _on_field(xy, dims, margin=1.0):
     return -margin <= xy[0] <= L + margin and -margin <= xy[1] <= W + margin
 
 
-def _restore_sam2_mask_to_view(
+def _restore_mask_to_view(
     mask2d: Optional[np.ndarray],
     view_shape,
     top_offset_px: int = 0,
 ) -> Optional[np.ndarray]:
-    """Map a SAM2 mask from its top-cropped frame back into full-view pixels.
+    """Map a tracker mask from its top-cropped frame back into full-view pixels.
 
-    Returns None when ``mask2d`` is None (selective mode's TBD-only sam2_raw
+    Returns None when ``mask2d`` is None (selective mode's TBD-only tracker_raw
     entries carry no mask) so callers can distinguish "no mask" from "an
     empty mask" instead of silently getting an all-False array.
     """
@@ -282,22 +283,22 @@ def ground_uv(box, mask: Optional[np.ndarray], use_footprint: bool):
 
     Returns the box bottom-center when ``mask`` is None, ``use_footprint`` is
     False, or the mask is empty (no footprint to find). Returns the mask's
-    carpet-contact footprint (:func:`web.field.sam2_tracker.mask_bottom_center`)
+    carpet-contact footprint (:func:`web.field.mask_tracker.mask_bottom_center`)
     only when a mask exists AND ``use_footprint`` is True.
 
     ``box`` and ``mask`` must share the same coordinate space -- the caller is
     responsible for scaling the returned point into whatever space it needs
-    (e.g. from SAM2's 0.5x top-cropped export space to full-frame pixels).
+    (e.g. from the tracker's 0.5x top-cropped export space to full-frame pixels).
     """
     x1, _y1, x2, y2 = box
     if mask is not None and use_footprint:
-        from web.field.sam2_tracker import mask_bottom_center
+        from web.field.mask_tracker import mask_bottom_center
         mp = mask_bottom_center(mask)
         if mp is not None:
             return mp
     # Box bottom-center in export space; the caller scales it into full-frame
     # pixels (avg-then-divide). Byte-identical to the pre-refactor scale-then-
-    # average uv at a power-of-two sam2_export_scale (default 0.5); at a
+    # average uv at a power-of-two sam3_export_scale (default 0.5); at a
     # non-power-of-two scale the two orders differ by <=1 ULP, negligible into
     # the homography.
     return ((x1 + x2) / 2.0, float(y2))
@@ -971,7 +972,7 @@ GALLERY_WEAK_VOTE_WEIGHT = float(os.environ.get("GALLERY_WEAK_VOTE_WEIGHT", "0.4
 # auto-deposited ones so corrections reliably override bad OCR.
 GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGHT", "2.0"))
 
-# SAM2 periodic re-prompting: re-run the detector every REPROMPT_SECONDS of
+# SAM periodic re-prompting: re-run the detector every REPROMPT_SECONDS of
 # tracked footage to catch robots that start occluded (e.g. behind the hub) and
 # emerge mid-match. This is the new-robot ACQUISITION LATENCY: a robot is
 # invisible until the next boundary. Env-tunable for A/B; note the cull and
@@ -980,24 +981,27 @@ GALLERY_VERIFIED_VOTE_WEIGHT = float(os.environ.get("GALLERY_VERIFIED_VOTE_WEIGH
 REPROMPT_SECONDS = float(os.environ.get("REPROMPT_SECONDS", "2.0") or "2.0")
 # Seed after robots have begun moving out of their often-obscured starting
 # positions, then run the initial SAM propagation backward to the active start.
-SAM2_PROMPT_OFFSET_SECONDS = max(
+# Legacy module default; jobs read the sam3_prompt_offset_seconds knob.
+SAM3_PROMPT_OFFSET_SECONDS = max(
     0.0,
-    float(os.environ.get("SAM2_PROMPT_OFFSET_SECONDS", "3.0") or "3.0"),
+    float(sam3_env("PROMPT_OFFSET_SECONDS", "3.0") or "3.0"),
 )
 MAX_TRACKED_ROBOTS = 6         # FRC match maximum (3 per alliance); caps phantom tracks
 
-# Resolution of the JPEG frames exported for SAM2 tracking, as a fraction of the
-# view-crop resolution. SAM2 resizes every input to a fixed 1024² square, so this
-# does NOT change SAM2's compute or VRAM — but 0.5 hands SAM2 a ~960px-wide image,
+# Resolution of the JPEG frames exported for SAM tracking, as a fraction of the
+# view-crop resolution. SAM resizes every input to a fixed square (SAM2 1024²,
+# SAM3 1008²), so this does NOT change its compute or VRAM — but 0.5 hands it a
+# ~960px-wide image,
 # *below* its native input, discarding detail for small/far robots (sliver-prone
 # masks past midfield). Raising it costs only export disk/decode time plus mask
-# RAM in sam2_raw (output masks come back at export resolution: 1.0 is 4x the
-# bool-mask memory of 0.5). Env-tunable for A/B.
-SAM2_EXPORT_SCALE = float(os.environ.get("SAM2_EXPORT_SCALE", "0.5") or "0.5")
+# RAM in tracker_raw (output masks come back at export resolution: 1.0 is 4x the
+# bool-mask memory of 0.5). Legacy module default; jobs read the
+# sam3_export_scale knob.
+SAM3_EXPORT_SCALE = float(sam3_env("EXPORT_SCALE", "0.5") or "0.5")
 
 # Honor the per-camera calibrated top exclusion by default. This prevents stands,
 # outposts, and other above-field structures from becoming robot tracks. It remains
-# disableable for camera layouts where cropping materially hurts SAM2.
+# disableable for camera layouts where cropping materially hurts SAM tracking.
 ROBOT_TRACK_TOP_CROP_ENABLED = os.environ.get(
     "ROBOT_TRACK_TOP_CROP_ENABLED", "1"
 ) not in ("0", "false", "False")
@@ -1021,7 +1025,7 @@ ZONE_RAY_GATE_CAM_Z_M = float(os.environ.get("ZONE_RAY_GATE_CAM_Z_M", "1.5") or 
 # "large" model (which ran ~650-730 ms/frame, i.e. ~hours per match).  Override via
 # `SAM2_MODEL_SIZE=large python web/app.py` when maximum mask fidelity is needed.
 # All variants resize every frame to a 1024² square, so per-frame VRAM (and thus the
-# SAM2_MAX_GPU_FRAMES budget below) is identical across sizes — only compute differs.
+# SAM3_MAX_GPU_FRAMES budget below) is identical across sizes — only compute differs.
 # sam3 default since the June 10 A/B: better identity (qm24 6/6, qm72 5/6 vs
 # 4/3 and 4/4), identical scores, half the wall-clock on both matches.
 TRACKING_BACKEND = os.environ.get("TRACKING_BACKEND", "sam3").lower()
@@ -1067,22 +1071,24 @@ SAM2_VOS_OPTIMIZED = os.environ.get("SAM2_VOS_OPTIMIZED", "0") not in ("0", "fal
 SAM3_USE_FA3 = os.environ.get("SAM3_USE_FA3", "0") not in ("0", "false", "False")
 SAM3_CHECKPOINT = os.environ.get("SAM3_CHECKPOINT") or None
 
-# SAM2 tracking frame rate — the single biggest *controllable* speed lever.  Total SAM2
+# SAM tracking frame rate — the single biggest *controllable* speed lever.  Total SAM
 # time is near-linear in the number of tracked frames, and frame count = source_fps /
 # this value.  Robots move slowly relative to frame rate and the field tracker
 # interpolates between samples, so 8 fps tracks them fine while a 60 fps match drops from
-# ~4223 to ~1100 tracked frames.  Override via SAM2_TRACK_FPS.  (Previously this was
+# ~4223 to ~1100 tracked frames.  Override via SAM3_TRACK_FPS.  (Previously this was
 # implicitly forced to 20 fps whenever VRAM >= 16 GB — exactly backwards for speed.)
-SAM2_TRACK_FPS = float(os.environ.get("SAM2_TRACK_FPS", "8.0") or "8.0")
+# Legacy module default; jobs read the sam3_track_fps knob.
+SAM3_TRACK_FPS = float(sam3_env("TRACK_FPS", "8.0") or "8.0")
 
-# VRAM-fit tunable knob (speed/quality experiment).  When > 0, the SAM2 pass keeps
+# VRAM-fit tunable knob (speed/quality experiment).  When > 0, the SAM pass keeps
 # all video + state tensors on the GPU (no CPU offload, which removes the per-frame
 # host->device copy that dominates runtime) and raises frame_skip so the tracked
 # segment stays within this many frames.  Trades temporal resolution for speed.
-# Set via env, e.g. `SAM2_MAX_GPU_FRAMES=1200 python web/app.py`.  0 = disabled.
-SAM2_MAX_GPU_FRAMES = int(os.environ.get("SAM2_MAX_GPU_FRAMES", "0") or "0")
-# SAM2 stores each frame as float32 (3 x 1024 x 1024) = 12.0 MiB of GPU memory.
-SAM2_FRAME_GPU_MIB = 12.0
+# Set via env, e.g. `SAM3_MAX_GPU_FRAMES=1200 python web/app.py`.  0 = disabled.
+SAM3_MAX_GPU_FRAMES = int(sam3_env("MAX_GPU_FRAMES", "0") or "0")
+# Per-frame GPU video memory for the VRAM-fit estimate: SAM2 stores each frame as
+# float32 (3 x 1024 x 1024) = 12.0 MiB (SAM3 is ~14 MB/frame at 1008²).
+TRACKER_FRAME_GPU_MIB = 12.0
 
 
 def _hud_flag(name: str, default: str) -> bool:
@@ -1090,12 +1096,12 @@ def _hud_flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) not in ("0", "false", "False")
 
 
-# HUD overlay toggles.  Now that SAM2 masks highlight each robot's silhouette, the
+# HUD overlay toggles.  Now that SAM masks highlight each robot's silhouette, the
 # extra per-robot bounding box, ground-contact plane, and velocity arrow are redundant
 # clutter (see the busy overlay), so they default OFF.  The mask highlight, alliance
 # bumper band, and team/slot label carry the useful information and stay ON.  Flip any
 # of these back via env (e.g. `HUD_DRAW_ROBOT_BOX=1 python web/app.py`).
-HUD_DRAW_ROBOT_MASK     = _hud_flag("HUD_DRAW_ROBOT_MASK", "1")      # SAM2 silhouette highlight
+HUD_DRAW_ROBOT_MASK     = _hud_flag("HUD_DRAW_ROBOT_MASK", "1")      # SAM mask silhouette highlight
 HUD_DRAW_BUMPER_BAND    = _hud_flag("HUD_DRAW_BUMPER_BAND", "1")     # alliance-color bumper band
 HUD_DRAW_ROBOT_LABEL    = _hud_flag("HUD_DRAW_ROBOT_LABEL", "1")     # team #/slot/confidence text
 HUD_DRAW_ROBOT_BOX      = _hud_flag("HUD_DRAW_ROBOT_BOX", "0")       # full bounding box (redundant w/ mask)
@@ -1179,7 +1185,7 @@ def _apply_vlm_model(key: str) -> None:
 # Match-start calibration drift check: sample a few in-match frames from the main
 # view, auto-detect AprilTags, and verify the selected calibration epoch still
 # reprojects them accurately. If the camera moved/zoomed since calibration the job
-# aborts (needs recalibration) BEFORE the expensive SAM2 pass.
+# aborts (needs recalibration) BEFORE the expensive SAM tracking pass.
 CALIB_CHECK_ENABLED = os.environ.get("CALIB_CHECK_ENABLED", "1") not in ("0", "false", "False")
 CALIB_DRIFT_MAX_M = float(os.environ.get("CALIB_DRIFT_MAX_M", "0.5"))
 CALIB_CHECK_MIN_TAGS = int(os.environ.get("CALIB_CHECK_MIN_TAGS", "2"))
@@ -1255,8 +1261,8 @@ app = FastAPI(title="FRC Vision Scorer")
 # Global state for inference jobs
 jobs: Dict[str, "InferenceJob"] = {}
 
-# One job runs at a time by default: SAM2 + the VLM saturate the GPU, and a
-# concurrent job forces SAM2 state offload to CPU (5-6x slower corners) and
+# One job runs at a time by default: SAM + the VLM saturate the GPU, and a
+# concurrent job forces SAM state offload to CPU (5-6x slower corners) and
 # confounds A/B timing. Extra submissions queue FIFO-ish and the waiting
 # client gets "queued" heartbeats. Raise for multi-GPU / spare-VRAM setups.
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1") or "1")
@@ -1734,11 +1740,11 @@ class InferenceJob:
         self._clock_samples: List[Tuple[int, Optional[int]]] = []
         self._match_season = None
         self.endgame_cutoff: Optional[dict] = None
-        self.sam2_source_to_local: Dict[int, int] = {}
+        self.tracker_source_to_local: Dict[int, int] = {}
         # Per-view source-frame -> tracker-local-index maps. Corner views may
         # be decimated (corner_track_stride), so each view has its own index
-        # space; main's map equals sam2_source_to_local.
-        self.sam2_view_source_to_local: Dict[str, Dict[int, int]] = {}
+        # space; main's map equals tracker_source_to_local.
+        self.tracker_view_source_to_local: Dict[str, Dict[int, int]] = {}
         self.autonomous_paths: Dict[str, List[dict]] = defaultdict(list)
         # Analysis-loop stage accumulators. Also (re)initialized in the run loop
         # next to self.timings, but declared here so crop-encode timers work when
@@ -1751,9 +1757,9 @@ class InferenceJob:
         # Per-job A/B knobs, all resolved through self.config (override > env >
         # default). The attributes survive because downstream plumbing and the
         # job-control endpoints read them directly.
-        self.sam2_max_gpu_frames = self.config.sam2_max_gpu_frames
+        self.sam3_max_gpu_frames = self.config.sam3_max_gpu_frames
         self.model_size = self.config.sam2_model_size
-        self.sam2_export_scale = self.config.sam2_export_scale
+        self.sam3_export_scale = self.config.sam3_export_scale
         # JobConfig consults the same env vars the tracker defaults read, so
         # passing these explicitly is equivalent to the old None-defers logic.
         self.cull_hijack_enabled: Optional[bool] = self.config.cull_hijack_enabled
@@ -1776,9 +1782,9 @@ class InferenceJob:
             confident_margin=self._emb_thr().confident_margin)
         self.co_occlusion_tracker = CoOcclusionTracker()
         # max_events raised well above a full multi-view match's event volume so
-        # late-match diagnostics (e.g. sam2.object_culled) aren't truncated — the
+        # late-match diagnostics (e.g. sam3.object_culled) aren't truncated — the
         # detailed record needed to compare cull on/off runs. The uncapped
-        # "sam2_objects_culled" counter is the truncation-proof backstop.
+        # "<sam3|sam2>_objects_culled" counter is the truncation-proof backstop.
         self.identity_diagnostics = IdentityDiagnosticRecorder(max_events=100000)
         self.identity_diagnostics.set_context(job_id=self.job_id)
         self.robot_identities = self.identity_registry.identities
@@ -1816,7 +1822,7 @@ class InferenceJob:
         # collected only with slot_boundary_log / identity_segment_resolve.
         self._slot_boundaries: list[dict] = []
         self._boundary_prev_corner: Dict[int, bool] = {}
-        self.sam2_obj_color: dict[str, dict[int, str | None]] = {}
+        self.tracker_obj_color: dict[str, dict[int, str | None]] = {}
         self.bytetrack_to_canonical: Dict[int, int] = {}
         self.next_canonical_id = 0
         
@@ -2146,7 +2152,7 @@ class InferenceJob:
             return crop_b64, score
 
     def _masked_robot_crop_b64(self, frame: np.ndarray, box, mask=None):
-        """Crop the whole SAM2-detected robot (background blacked out via `mask`),
+        """Crop the whole SAM-tracked robot (background blacked out via `mask`),
         upscale, and JPEG/base64 encode it for the appearance gallery image.
 
         This is the image *behind* the appearance signature — the same region
@@ -2201,11 +2207,11 @@ class InferenceJob:
                 ball_boxes.append(box)
         return (valid_boxes, ball_boxes) if with_balls else valid_boxes
 
-    def _sam2_robot_candidates(self, frame: np.ndarray, conf: float = 0.4,
+    def _robot_seed_candidates(self, frame: np.ndarray, conf: float = 0.4,
                                motion_grays=None, blobs_allowed: bool = False,
                                zone_probe=None, corrob_floor: float = 0.0,
                                with_corrob_band: bool = False):
-        """Shared SAM2 seeding/re-prompt detection cascade on a full-res view
+        """Shared SAM seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
         whole-robot gap fills, person candidates vetoed.
@@ -2368,7 +2374,7 @@ class InferenceJob:
         return result
 
     def _make_start_zone_probe(self, view, top_crop_px, elapsed_s):
-        """zone_probe(box)->bool for _sam2_robot_candidates: True when the
+        """zone_probe(box)->bool for _robot_seed_candidates: True when the
         box's ground contact projects inside a starting band, only while the
         opening window is open. Boxes are in the view's top-cropped space."""
         if (not self.config.start_zone_seed
@@ -2388,7 +2394,7 @@ class InferenceJob:
             return xy is not None and point_in_zones(xy, zones)
         return _probe
 
-    def make_frame_detect_fn(self, view, view_plan, sam2_scale, y_off):
+    def make_frame_detect_fn(self, view, view_plan, export_scale, y_off):
         """Per-frame detector for the selective-mask-propagation path (Task 5).
 
         Sibling of ``make_detect_fn`` for ``track_selective``: instead of
@@ -2426,18 +2432,18 @@ class InferenceJob:
                     return []
                 # Firm boxes only: default cascade (no motion pair, no zone
                 # probe, no corrob band) on the export-scale frame.
-                merged = self._sam2_robot_candidates(img)
+                merged = self._robot_seed_candidates(img)
                 export_h, export_w = img.shape[:2]
                 # Reconstruct the full-res (non-top-cropped) view frame shape the
                 # field filter expects for its box-fraction backstop: export ->
                 # top-cropped full-res is /scale, then the excluded top-crop rows
                 # (y_off) are added back.
-                cropped_full_h = int(round(export_h / sam2_scale))
-                full_w = int(round(export_w / sam2_scale))
+                cropped_full_h = int(round(export_h / export_scale))
+                full_w = int(round(export_w / export_scale))
                 full_h = cropped_full_h + y_off
                 full_boxes = [
-                    (b[0] / sam2_scale, b[1] / sam2_scale + y_off,
-                     b[2] / sam2_scale, b[3] / sam2_scale + y_off)
+                    (b[0] / export_scale, b[1] / export_scale + y_off,
+                     b[2] / export_scale, b[3] / export_scale + y_off)
                     for b, _c, _strong in merged
                 ]
                 keep = filter_field_robot_boxes(
@@ -2530,17 +2536,17 @@ class InferenceJob:
 
         return embed_frame_fn
 
-    async def _run_view_tracking(self, sam2_tracker, view, track_kwargs,
+    async def _run_view_tracking(self, mask_tracker, view, track_kwargs,
                                  frame_detect_fn, progress_cb):
         """Run one view's SAM propagation, honoring ``selective_mask_prop``.
 
         With the knob OFF this is byte-for-byte the historical
-        ``await asyncio.to_thread(sam2_tracker.track, **track_kwargs)`` call.
+        ``await asyncio.to_thread(mask_tracker.track, **track_kwargs)`` call.
         With it ON, ``track_selective`` (per-frame TBD, SAM only inside
         ambiguous windows) runs in its place; ANY failure logs
         ``[selective] FALLBACK`` and falls through to the identical uniform
         ``track`` call, so a bad selective run can never lose a view. Timing
-        accrues to ``timings['sam2_tracking']`` for whichever path produced the
+        accrues to ``timings['sam3_tracking']`` for whichever path produced the
         tracks, and the per-view ms/frame line is printed here.
         """
         t0 = time.perf_counter()
@@ -2568,7 +2574,7 @@ class InferenceJob:
                     lazy_seed=self.config.selective_lazy_seed,
                 )
                 view_tracks = await asyncio.to_thread(
-                    sam2_tracker.track_selective,
+                    mask_tracker.track_selective,
                     frames_dir=track_kwargs["frames_dir"],
                     detect_frame_fn=frame_detect_fn,
                     cfg=cfg,
@@ -2592,7 +2598,7 @@ class InferenceJob:
                 # stats print / color assignment must surface as a real error
                 # rather than trip a spurious [selective] FALLBACK plus a wasted
                 # full-uniform re-run of the whole view.
-                stats = getattr(sam2_tracker, "selective_stats", None) or {}
+                stats = getattr(mask_tracker, "selective_stats", None) or {}
                 frames = stats.get("frames", 0)
                 sam_frames = stats.get("sam_frames", 0)
                 pct = 100.0 * sam_frames / max(frames, 1)
@@ -2625,13 +2631,13 @@ class InferenceJob:
                 # track_kwargs at ~app.py:6538 — so the uniform fallback path
                 # stays byte-identical.
                 obj_colors = getattr(
-                    sam2_tracker, "selective_obj_colors", None) or {}
-                self.sam2_obj_color[view.name] = dict(obj_colors)
+                    mask_tracker, "selective_obj_colors", None) or {}
+                self.tracker_obj_color[view.name] = dict(obj_colors)
         if view_tracks is None:
             view_tracks = await asyncio.to_thread(
-                sam2_tracker.track, **track_kwargs)
+                mask_tracker.track, **track_kwargs)
         elapsed = time.perf_counter() - t0
-        self.timings["sam2_tracking"] = self.timings.get("sam2_tracking", 0.0) + elapsed
+        self.timings["sam3_tracking"] = self.timings.get("sam3_tracking", 0.0) + elapsed
         n = len(view_tracks)
         print(f"  [{self.tracker_tag}] View {view.name}: propagated {n} frames "
               f"in {elapsed:.2f}s ({elapsed / max(1, n) * 1000:.1f} ms/frame)")
@@ -2647,10 +2653,10 @@ class InferenceJob:
 
         plan = stream_analysis_plan(
             enabled=bool(getattr(self.config, "stream_analysis", False)),
-            use_sam2=bool(self.use_sam2),
+            use_mask_tracker=bool(self.use_mask_tracker),
             device=device,
             needs_vllm=self._needs_vllm_server(),
-            vram_fit=bool(getattr(self, "sam2_max_gpu_frames", 0) > 0),
+            vram_fit=bool(getattr(self, "sam3_max_gpu_frames", 0) > 0),
         )
         for note in plan.notes:
             print(f"  [stream] {note}")
@@ -3586,7 +3592,7 @@ class InferenceJob:
         The query gallery is a frozen snapshot of previous matches. Current-match
         deposits must never be added to it, or a robot can confirm itself.
         """
-        if self.gallery is None or robot is None or not getattr(self, "use_sam2", False):
+        if self.gallery is None or robot is None or not getattr(self, "use_mask_tracker", False):
             return
         color = robot.alliance if robot.alliance in ("red", "blue") else None
         if color is None or not robot.team_number or robot.appearance_embedding is None:
@@ -3675,7 +3681,7 @@ class InferenceJob:
     def apply_gallery_matches(self, ocr_crops: list) -> None:
         """Query the gallery for unconfirmed tracks, cast votes, and annotate any
         matching ocr_crops cards so the UI distinguishes appearance recovery."""
-        if self.gallery is None or not getattr(self, "use_sam2", False):
+        if self.gallery is None or not getattr(self, "use_mask_tracker", False):
             return
         by_slot = {c["robot_id"]: c for c in ocr_crops}
         for slot_id, robot in self.robot_tracks.items():
@@ -5237,7 +5243,7 @@ class InferenceJob:
         await self._stop_ws_senders(drain=drain)
 
     async def _warn_degraded(self, component: str, message: str) -> None:
-        """Surface a quality-degrading failure (SAM2 fallback, gallery disabled,
+        """Surface a quality-degrading failure (tracker fallback, gallery disabled,
         evidence loss) to the client. One websocket message per component;
         repeats only bump the count so a per-frame failure can't spam."""
         warnings = getattr(self, "degradation_warnings", None)
@@ -5670,7 +5676,7 @@ class InferenceJob:
 
     def _live_main_mask(self, slot_id, frame_num, fused, view_shape) -> Optional[np.ndarray]:
         """The slot's SAM mask in main-view pixels this frame, or None."""
-        local_idx = self.sam2_source_to_local.get(frame_num)
+        local_idx = self.tracker_source_to_local.get(frame_num)
         registry_track_id = next(
             (track_id for track_id, mapped_slot in self.field_tracker._id_to_slot.items()
              if mapped_slot == slot_id),
@@ -5683,9 +5689,9 @@ class InferenceJob:
             return None
         mask = None
         for camera, det_id in obs.members:
-            if camera != "main" or "main" not in self.sam2_raw:
+            if camera != "main" or "main" not in self.tracker_raw:
                 continue
-            entry = self.sam2_raw["main"].get(local_idx, {}).get(det_id)
+            entry = self.tracker_raw["main"].get(local_idx, {}).get(det_id)
             if entry is not None:
                 mask2d = entry.get("mask")
                 if mask2d is not None:
@@ -5696,7 +5702,7 @@ class InferenceJob:
                             getattr(main_view.calibration, "robot_track_top_crop", 0.0) or 0.0
                         ) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
                         top_offset_px = int(view_shape[0] * top_crop_frac)
-                    mask = _restore_sam2_mask_to_view(mask2d, view_shape, top_offset_px)
+                    mask = _restore_mask_to_view(mask2d, view_shape, top_offset_px)
             break
         return mask
 
@@ -5748,7 +5754,7 @@ class InferenceJob:
             label, _confirmed = self._team_hud_label(robot, self._slot_label(slot_id))
             track = track_by_slot.get(slot_id)
             mask = (self._live_main_mask(slot_id, frame_num, fused, overhead_frame.shape)
-                    if self.use_sam2 else None)
+                    if self.use_mask_tracker else None)
             hud_draw.draw_robot(
                 annotated_frame, box, robot.alliance, label, flags, slot_id=slot_id,
                 cal=self.calib, field_pos=(track.pos if track else robot.field_position),
@@ -6420,7 +6426,7 @@ class InferenceJob:
         )
 
     def _build_fused_registry(self) -> FusedTrackRegistry:
-        """The job's cross-camera FusedTrackRegistry (SAM2 tracklet path)."""
+        """The job's cross-camera FusedTrackRegistry (mask-tracker tracklet path)."""
         cfg = self.config
         return FusedTrackRegistry(
             app_floor=self._emb_thr().relink_floor,
@@ -6431,7 +6437,7 @@ class InferenceJob:
     def _record_fused_ids_summary(self) -> None:
         """End-of-job fused-id outcome counts (FusedTrackRegistry.stats): one
         log line + the ``fused_ids`` diagnostics gauge. No-op without a
-        registry (Kalman / non-SAM2 path)."""
+        registry (Kalman / no-mask-tracker path)."""
         reg = getattr(self, "fused_registry", None)
         if reg is None:
             return
@@ -8488,7 +8494,7 @@ class InferenceJob:
             # WebSocket keepalive while it runs.
             if not await asyncio.to_thread(self._verify_calibration_alignment):
                 # _verify_calibration_alignment set self.status="error", self.error,
-                # self.needs_calibration. Notify the client and stop before the SAM2 pass
+                # self.needs_calibration. Notify the client and stop before the SAM pass
                 # (mirrors the _init_field_tracking abort at the top of process_video).
                 if self.websocket:
                     try:
@@ -8506,11 +8512,11 @@ class InferenceJob:
             # re-solve+adopt / drop each corner view before tracking uses it.
             await asyncio.to_thread(self._corner_per_match_step)
             self._raise_if_stopped()  # phase boundary: after corner calibration
-            # ----- SAM2 PRE-COMPUTATION PASS -----
-            self.use_sam2 = False
-            self.sam2_raw = {}
+            # ----- SAM3 (mask tracker) PRE-COMPUTATION PASS -----
+            self.use_mask_tracker = False
+            self.tracker_raw = {}
             self._view_mine_info = {}
-            self.sam2_obj_color = {}
+            self.tracker_obj_color = {}
             self._replay = self._new_replay_recorder()
             self.robot_embedder = None
             
@@ -8529,14 +8535,19 @@ class InferenceJob:
             if active_frame_count <= 1 or prompt_source_frame >= self.total_frames:
                 print(
                     f"  [{self.tracker_tag}] Active video is too short ({active_frame_count} frames) "
-                    f"for prompt frame {prompt_source_frame}. Disabling SAM2."
+                    f"for prompt frame {prompt_source_frame}. Disabling {self.tracker_tag}."
                 )
             else:
                 try:
                     import torch
                     
                     device = "cuda" if torch.cuda.is_available() else "cpu"
-                    backend_label = "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
+                    # SAM 3.1 weights load only with the sam3_multiplex knob;
+                    # production runs the base SAM3 model (tracker_tag).
+                    backend_label = (
+                        "SAM3.1" if self.tracking_backend == "sam3" and self.config.sam3_multiplex
+                        else self.tracker_tag
+                    )
 
                     # Phase exclusivity: a resident vLLM server (~11GB pool)
                     # plus SAM3 propagation (~11GB peak) OOMs the 24GB card —
@@ -8568,14 +8579,14 @@ class InferenceJob:
 
                     offload_vid = True
                     offload_st = True
-                    # Target FPS is a fixed speed knob (SAM2_TRACK_FPS), independent of
+                    # Target FPS is a fixed speed knob (SAM3_TRACK_FPS), independent of
                     # VRAM.  A per-job override (self.target_tracking_fps) still wins.
                     # VRAM only decides whether tracker state can stay on the GPU (small
                     # latency win); it no longer inflates the frame rate.
                     target_tracking_fps = (
                         self.target_tracking_fps
                         if self.target_tracking_fps is not None
-                        else self.config.sam2_track_fps
+                        else self.config.sam3_track_fps
                     )
                     if device == "cuda":
                         try:
@@ -8600,17 +8611,17 @@ class InferenceJob:
 
                     # VRAM-fit override: keep all tensors on the GPU and raise
                     # frame_skip so the tracked segment fits within the budget.
-                    if self.sam2_max_gpu_frames > 0 and active_frame_count:
+                    if self.sam3_max_gpu_frames > 0 and active_frame_count:
                         source_frames = max(1, active_frame_count)
                         self.frame_skip = max(
                             self.frame_skip,
-                            math.ceil(source_frames / self.sam2_max_gpu_frames),
+                            math.ceil(source_frames / self.sam3_max_gpu_frames),
                         )
                         seg_frames = math.ceil(source_frames / self.frame_skip)
                         offload_vid = False
                         offload_st = False
-                        est_gib = seg_frames * SAM2_FRAME_GPU_MIB / 1024.0
-                        print(f"  [{self.tracker_tag}] VRAM-fit: budget={self.sam2_max_gpu_frames} frames -> "
+                        est_gib = seg_frames * TRACKER_FRAME_GPU_MIB / 1024.0
+                        print(f"  [{self.tracker_tag}] VRAM-fit: budget={self.sam3_max_gpu_frames} frames -> "
                               f"frame_skip={self.frame_skip}, ~{seg_frames} tracked frames "
                               f"(~{est_gib:.1f} GiB video on GPU, no CPU offload)")
 
@@ -8658,11 +8669,11 @@ class InferenceJob:
                                 f"frame_load_workers={tracker.frame_load_workers_active}"
                             )
                         else:
-                            from web.field.sam2_tracker import Sam2FieldTracker
+                            from web.field.mask_tracker import MaskFieldTracker
 
                             # Per-job encoder size (UI override); falls back to the env default.
                             job_config, job_checkpoint = _resolve_sam2_model(self.model_size)
-                            tracker = Sam2FieldTracker(
+                            tracker = MaskFieldTracker(  # SAM2 predictor
                                 config=job_config,
                                 checkpoint=job_checkpoint,
                                 device=device,
@@ -8687,32 +8698,33 @@ class InferenceJob:
                     await asyncio.sleep(0)
                     # Optimistic: the plan/export phase needs no tracker; the
                     # barrier after the export downgrades on load failure.
-                    self.use_sam2 = True
+                    self.use_mask_tracker = True
                 except Exception as e:
                     backend_label = (
-                        "SAM3.1" if self.tracking_backend == "sam3" else "SAM2"
+                        "SAM3.1" if self.tracking_backend == "sam3" and self.config.sam3_multiplex
+                        else self.tracker_tag
                     )
                     await self._warn_degraded(
                         self.tracker_tag.lower(),
                         f"[{backend_label}] Failed to initialize tracker/embedder: "
                         f"{e}. Falling back to Kalman tracking.",
                     )
-                    self.use_sam2 = False
+                    self.use_mask_tracker = False
                     self.robot_embedder = None
 
-            if self.use_sam2:
+            if self.use_mask_tracker:
                 print(f"  [{self.tracker_tag}] Running pre-computation pass over {len(self.views)} views...")
                 all_frames = [
                     frame
                     for start, end in self.processing_ranges
                     for frame in range(start, end + 1, self.frame_skip)
                 ]
-                self.sam2_source_to_local = {
+                self.tracker_source_to_local = {
                     source_frame: local_idx
                     for local_idx, source_frame in enumerate(all_frames)
                 }
                 prompt_target_frame = prompt_source_frame + int(
-                    round(self.config.sam2_prompt_offset_seconds * max(self.video_fps, 0.0))
+                    round(self.config.sam3_prompt_offset_seconds * max(self.video_fps, 0.0))
                 )
                 prompt_local_idx = min(
                     range(len(all_frames)),
@@ -8721,11 +8733,11 @@ class InferenceJob:
                 prompt_frame = all_frames[prompt_local_idx]
                 print(
                     f"  [{self.tracker_tag}] Seeding at source frame {prompt_frame} "
-                    f"(~{self.config.sam2_prompt_offset_seconds:.1f}s after active start), "
+                    f"(~{self.config.sam3_prompt_offset_seconds:.1f}s after active start), "
                     "then propagating backward."
                 )
-                SAM2_SCALE = self.sam2_export_scale
-                print(f"  [{self.tracker_tag}] Frame-export scale: {SAM2_SCALE}")
+                export_scale = self.sam3_export_scale
+                print(f"  [{self.tracker_tag}] Frame-export scale: {export_scale}")
 
                 # Corner-cam decimation: corner views are tracked at
                 # track_fps/stride (less signal there, and propagation cost
@@ -8754,7 +8766,7 @@ class InferenceJob:
                     )
                     for v in self.views
                 }
-                self.sam2_view_source_to_local = {
+                self.tracker_view_source_to_local = {
                     name: plan.source_to_local
                     for name, plan in view_plans.items()
                 }
@@ -8825,15 +8837,15 @@ class InferenceJob:
                                     crop = view.extract(fr)
                                     # Exclude the airspace at the top of the view from robot
                                     # tracking (robots can't be there) — a false-positive
-                                    # filter.  NOTE: this does NOT save SAM2 VRAM/compute:
-                                    # SAM2 hard-resizes every frame to a fixed image_size
+                                    # filter.  NOTE: this does NOT save SAM VRAM/compute:
+                                    # SAM hard-resizes every frame to a fixed image_size
                                     # square, so fewer input rows
                                     top_crop_frac = (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
                                     top_crop_px = int(crop.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
                                     if top_crop_px > 0:
                                         crop = crop[top_crop_px:, :]
-                                    new_w = int(crop.shape[1] * SAM2_SCALE)
-                                    new_h = int(crop.shape[0] * SAM2_SCALE)
+                                    new_w = int(crop.shape[1] * export_scale)
+                                    new_h = int(crop.shape[0] * export_scale)
                                     small = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
                                     fname = os.path.join(view_dirs[view.name].name, f"{view_local_idx:05d}.jpg")
                                     cv2.imwrite(fname, small, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -8852,10 +8864,10 @@ class InferenceJob:
                                             view_prev_gray[view.name] = cv2.cvtColor(
                                                 crop, cv2.COLOR_BGR2GRAY)
 
-                                    # Seed SAM2 from expanded bumper detections so masks
+                                    # Seed SAM from expanded bumper detections so masks
                                     # cover whole robots while color stays class-derived.
                                     if is_prompt:
-                                        merged = self._sam2_robot_candidates(
+                                        merged = self._robot_seed_candidates(
                                             crop, motion_grays=seed_motion_grays,
                                             blobs_allowed=blob_window_open(
                                                 max(0.0,
@@ -8924,14 +8936,14 @@ class InferenceJob:
                                         for box, color, strong in merged:
                                             if strong and color != "unknown":
                                                 view_prompt_boxes[view.name].append(
-                                                    tuple(v * SAM2_SCALE for v in box)
+                                                    tuple(v * export_scale for v in box)
                                                 )
                                                 view_prompt_colors[view.name].append(color)
 
                                         for idx in keep_indices:
                                             box, color = pool_entries[idx]
                                             view_prompt_boxes[view.name].append(
-                                                tuple(v * SAM2_SCALE for v in box)
+                                                tuple(v * export_scale for v in box)
                                             )
                                             view_prompt_colors[view.name].append(color)
                                 except Exception as e:
@@ -8965,7 +8977,7 @@ class InferenceJob:
                 # resident before seeding. On failure, degrade to Kalman
                 # exactly as the old inline load did.
                 try:
-                    sam2_tracker, model_detail, self.robot_embedder = await model_load_task
+                    mask_tracker, model_detail, self.robot_embedder = await model_load_task
                     print(f"  [{backend_label}] Loaded field tracker ({model_detail}) "
                           f"and RobotEmbedder on {device}")
                 except Exception as e:
@@ -8974,15 +8986,15 @@ class InferenceJob:
                         f"[{backend_label}] Failed to initialize tracker/embedder: "
                         f"{e}. Falling back to Kalman tracking.",
                     )
-                    self.use_sam2 = False
+                    self.use_mask_tracker = False
                     self.robot_embedder = None
-            if self.use_sam2:
+            if self.use_mask_tracker:
                 self._raise_if_stopped()  # phase boundary: after model load
                 # stream_analysis: precompute the loop's SAM-independent work
                 # (OCR / main YOLO / person det) while the views propagate.
                 # Returns None with the knob OFF.
                 self._start_analysis_prefetch(all_frames, device)
-                # ----- Phase 2: per-view SAM2 propagation over the exported frames.
+                # ----- Phase 2: per-view SAM propagation over the exported frames.
                 for view_idx, view in enumerate(self.views):
                     tmp_dir_obj = view_dirs[view.name]
                     view_plan = view_plans[view.name]
@@ -8997,7 +9009,7 @@ class InferenceJob:
                                  max(1, sum(1 for f in all_frames if f < view_until)))
                     view_stride = view_span / max(1, len(view_plan.source_frames))
                     prompt_boxes_scaled = view_prompt_boxes[view.name]
-                    self.sam2_obj_color[view.name] = {
+                    self.tracker_obj_color[view.name] = {
                         i + 1: color
                         for i, color in enumerate(view_prompt_colors[view.name])
                     }
@@ -9068,10 +9080,10 @@ class InferenceJob:
                             # boundaries so robots that start occluded (e.g. behind the
                             # hub) get picked up once they emerge.  Detection runs on the
                             # FULL-RESOLUTION source frame (decoded on demand — one seek
-                            # per ~2s of footage), not the 0.5x JPEG export SAM2 tracks:
+                            # per ~2s of footage), not the 0.5x JPEG export SAM tracks:
                             # the re-acquisition path exists for the hard cases, so it
                             # must not have the worst recall of the three detect paths.
-                            # Returned boxes are scaled into SAM2 (0.5x, top-cropped)
+                            # Returned boxes are scaled into tracker space (0.5x, top-cropped)
                             # coords to match the masks.
                             def make_detect_fn(detect_caps):
                                 state = {"cap": None, "pos": None}
@@ -9125,7 +9137,7 @@ class InferenceJob:
                                         0.0,
                                         (source_frame - prompt_source_frame)
                                         / max(self.video_fps, 1e-6))
-                                    merged = self._sam2_robot_candidates(
+                                    merged = self._robot_seed_candidates(
                                         crop, motion_grays=motion_grays,
                                         blobs_allowed=blob_window_open(
                                             elapsed,
@@ -9206,13 +9218,13 @@ class InferenceJob:
                                         ground_offset_m=self.config.ground_center_offset_m,
                                     ) if corrob_full else []
                                     out = [
-                                        (tuple(v * SAM2_SCALE for v in merged[idx][0]),
+                                        (tuple(v * export_scale for v in merged[idx][0]),
                                          merged[idx][1])
                                         for idx in keep
                                         if merged[idx][2] or idx in kept_motion
                                     ]
                                     out += [
-                                        (tuple(v * SAM2_SCALE for v in corrob_band[i][0]),
+                                        (tuple(v * export_scale for v in corrob_band[i][0]),
                                          corrob_band[i][1], True)
                                         for i in corrob_keep
                                     ]
@@ -9249,17 +9261,17 @@ class InferenceJob:
                             # default the same way evict_dark_frames is below.
                             backfill_max_frames = max(1, int(round(
                                 self.config.backfill_seconds * eff_fps)))
-                            from web.field.sam2_tracker import BACKFILL_MIN_LIVED_FRAMES
+                            from web.field.mask_tracker import BACKFILL_MIN_LIVED_FRAMES
                             backfill_min_lived_frames = scale_frame_knob(
                                 BACKFILL_MIN_LIVED_FRAMES, view_stride)
 
-                            # Build a projector mapping a SAM2 mask box (tracker/0.5x
+                            # Build a projector mapping a SAM mask box (tracker/0.5x
                             # top-cropped pixel coords) to field meters, for the
                             # mask-hijack cull's stationarity test. Exported frames are
                             # ALREADY top-cropped, so we recover the CROPPED full-res
                             # height and reconstruct the consumer's offset
                             # (original_h * tc) via cropped_full_h * tc / (1 - tc).
-                            _sam2_scale = self.sam2_export_scale
+                            _export_scale = self.sam3_export_scale
                             _top_crop = (
                                 (getattr(view.calibration, "robot_track_top_crop", 0.0) or 0.0)
                                 if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
@@ -9272,7 +9284,7 @@ class InferenceJob:
                             if _exported:
                                 _img0 = cv2.imread(os.path.join(tmp_dir_obj.name, _exported[0]))
                                 if _img0 is not None:
-                                    _cropped_full_h = int(round(_img0.shape[0] / _sam2_scale))
+                                    _cropped_full_h = int(round(_img0.shape[0] / _export_scale))
                             _y_off = (
                                 int(_cropped_full_h * _top_crop / max(1.0 - _top_crop, 1e-6))
                                 if (_cropped_full_h is not None and _top_crop > 0) else 0
@@ -9297,26 +9309,26 @@ class InferenceJob:
                             # as filter_field_robot_boxes). Identical when the
                             # offset is 0.
                             _project_fn = _make_project_fn(
-                                view.calibration, _y_off, _sam2_scale,
+                                view.calibration, _y_off, _export_scale,
                                 self.config.ground_center_offset_m)
                             _project_contact_fn = (
-                                _make_project_fn(view.calibration, _y_off, _sam2_scale)
+                                _make_project_fn(view.calibration, _y_off, _export_scale)
                                 if self.config.ground_center_offset_m > 0
                                 else _project_fn)
 
                             # Hard-negative mining (post-job, best-effort): capture
                             # the pieces mine_hard_negatives needs to map a cull
-                            # event's SAM2-space box back to a full-res frame —
-                            # frame_idx -> source video frame, the SAM2 export
+                            # event's tracker-space box back to a full-res frame —
+                            # frame_idx -> source video frame, the tracker export
                             # scale/crop offset, and this view's extract() crop.
                             self._view_mine_info[view.name] = {
                                 "source_frames": list(view_plan.source_frames),
-                                "scale": _sam2_scale, "y_off": _y_off,
+                                "scale": _export_scale, "y_off": _y_off,
                                 "extract": view.extract,
                             }
 
                             # Seed gate: a detection projecting into a static zone
-                            # cannot found a NEW SAM2 object (a robot is never born
+                            # cannot found a NEW SAM object (a robot is never born
                             # inside a field element) but still corroborates masks.
                             # Low cameras also test the viewing ray beyond the
                             # contact — an occluded structure base projects short
@@ -9350,9 +9362,9 @@ class InferenceJob:
                             )
 
                             # Size-prior hijack cull (A/B knob): expected robot pixel
-                            # width at a field position, in SAM2 export pixel space.
+                            # width at a field position, in tracker export pixel space.
                             # Width is invariant to the top-crop y-offset, so only
-                            # _sam2_scale matters (unlike _project_fn, which needs
+                            # _export_scale matters (unlike _project_fn, which needs
                             # _y_off). Independent of the corroboration machinery:
                             # equipment hijacks are detector-corroborated.
                             _expected_px_fn = None
@@ -9367,7 +9379,7 @@ class InferenceJob:
                                         return None if px is None else px * scale
                                     return _fn
                                 _expected_px_fn = _make_expected_px_fn(
-                                    view.calibration, _sam2_scale)
+                                    view.calibration, _export_scale)
 
                             # Motion override (A/B knob): frame-diff motion probe
                             # over this view's exported frames; boxes at boundaries
@@ -9375,7 +9387,7 @@ class InferenceJob:
                             # jpgs, so no coordinate translation is needed.
                             _motion_fn = None
                             if self.config.motion_override:
-                                from web.field.sam2_tracker import make_frame_diff_motion_fn
+                                from web.field.mask_tracker import make_frame_diff_motion_fn
                                 _motion_fn = make_frame_diff_motion_fn(
                                     tmp_dir_obj.name,
                                     self.config.motion_energy_thresh,
@@ -9418,7 +9430,7 @@ class InferenceJob:
                             # Main-view cull scoping: corner views are the qm24
                             # false-cull victims; None still defers to env knobs
                             # on the main view.
-                            from web.field.sam2_tracker import cull_enabled_for_view
+                            from web.field.mask_tracker import cull_enabled_for_view
                             _cull_enabled = cull_enabled_for_view(
                                 self.cull_hijack_enabled, view.name,
                                 self.config.cull_main_view_only)
@@ -9439,10 +9451,10 @@ class InferenceJob:
                                 detect_fn=make_detect_fn(_detect_caps),
                                 motion_fn=_motion_fn,
                                 person_fn=_person_fn,
-                                object_metadata=self.sam2_obj_color[view.name],
+                                object_metadata=self.tracker_obj_color[view.name],
                                 max_objects=MAX_TRACKED_ROBOTS,
                                 max_active_objects=MAX_TRACKED_ROBOTS,
-                                # Capped-roster eviction (sam2_tracker) re-seeds robots
+                                # Capped-roster eviction (mask_tracker) re-seeds robots
                                 # under fresh ids, so lifetime id churn is higher than the
                                 # old 3x budget; qm24 hit 20 ids by the final frame.
                                 max_lifetime_objects=max(MAX_TRACKED_ROBOTS * 6, 36),
@@ -9521,12 +9533,12 @@ class InferenceJob:
                             # track_selective with a per-frame detector, falling
                             # back to the uniform call on any failure.
                             view_tracks = await self._run_view_tracking(
-                                sam2_tracker, view, track_kwargs,
+                                mask_tracker, view, track_kwargs,
                                 self.make_frame_detect_fn(
-                                    view, view_plan, _sam2_scale, _y_off),
+                                    view, view_plan, _export_scale, _y_off),
                                 progress_cb,
                             )
-                            self.sam2_raw[view.name] = view_tracks
+                            self.tracker_raw[view.name] = view_tracks
 
                             await safe_send_status(
                                 f"[{self.tracker_tag}] View '{view.name}': tracking complete.",
@@ -9565,22 +9577,22 @@ class InferenceJob:
                     # never start seeding/propagating the next view.
                     self._raise_if_stopped()
 
-                if not self.sam2_raw:
+                if not self.tracker_raw:
                     await self._warn_degraded(
                         self.tracker_tag.lower(),
                         "No views produced tracklets — falling back to Kalman tracking.",
                     )
-                    self.use_sam2 = False
+                    self.use_mask_tracker = False
                 else:
                     self.fused_registry = self._build_fused_registry()
 
                 # Every tracklet the analysis loop will ever read is already
-                # in self.sam2_raw (CPU); the SAM predictor weights and any
+                # in self.tracker_raw (CPU); the SAM predictor weights and any
                 # session state are dead VRAM from here on. Drop the last
                 # reference so the cache release below can actually hand the
                 # memory to the vLLM server (empty_cache cannot free live
                 # tensors).
-                del sam2_tracker
+                del mask_tracker
 
                 if self.config.hardneg_mine:
                     try:
@@ -9872,29 +9884,29 @@ class InferenceJob:
                     # clef_multiframe: lazy crops also carry their source so
                     # the crop buffer can cut the raw band crop (see _LazyCrop).
                     _mf_src = self._clef_mf_enabled()
-                    if self.use_sam2:
-                        SAM2_SCALE = self.sam2_export_scale
+                    if self.use_mask_tracker:
+                        export_scale = self.sam3_export_scale
                         for view in frame_views:
                             paired = []
-                            view_raw = self.sam2_raw.get(view.name, {})
+                            view_raw = self.tracker_raw.get(view.name, {})
                             # Per-view index space: a decimated corner view has no
                             # entry for dropped frames -> clean gap (same as
                             # occlusion), never a stale-box reuse.
-                            local_idx = self.sam2_view_source_to_local.get(
+                            local_idx = self.tracker_view_source_to_local.get(
                                 view.name, {}).get(frame_num)
                         
                             view_frame = view.extract(frame)
                             cal = view.calibration
-                            # SAM2 tracked a top-cropped view; add the excluded rows back
+                            # SAM tracked a top-cropped view; add the excluded rows back
                             # so box y-coords are in full-crop space (what cal/masks expect).
                             top_crop_frac = (getattr(cal, "robot_track_top_crop", 0.0) or 0.0) if ROBOT_TRACK_TOP_CROP_ENABLED else 0.0
-                            sam2_y_offset = int(view_frame.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
+                            tracker_y_offset = int(view_frame.shape[0] * top_crop_frac) if top_crop_frac > 0 else 0
                         
                             # Prepare small frame for DINOv2 embedding if robot_embedder is loaded
                             small_frame = None
                             if self.robot_embedder is not None:
-                                new_w = int(view_frame.shape[1] * SAM2_SCALE)
-                                new_h = int(view_frame.shape[0] * SAM2_SCALE)
+                                new_w = int(view_frame.shape[1] * export_scale)
+                                new_h = int(view_frame.shape[0] * export_scale)
                                 small_frame = cv2.resize(view_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
                             with self._stage("loop.person_det"):
@@ -9916,8 +9928,8 @@ class InferenceJob:
                             embed_candidates = []
                             for obj_id, info in view_raw.get(local_idx, {}).items():
                                 x1, y1, x2, y2 = info["box"]  # 0.5x top-cropped coords
-                                fx1, fy1, fx2, fy2 = (x1 / SAM2_SCALE, y1 / SAM2_SCALE + sam2_y_offset,
-                                                      x2 / SAM2_SCALE, y2 / SAM2_SCALE + sam2_y_offset)
+                                fx1, fy1, fx2, fy2 = (x1 / export_scale, y1 / export_scale + tracker_y_offset,
+                                                      x2 / export_scale, y2 / export_scale + tracker_y_offset)
                                 cx = (fx1 + fx2) / 2.0
                                 cy = (fy1 + fy2) / 2.0
                                 is_masked = False
@@ -9961,8 +9973,8 @@ class InferenceJob:
                                     (x1, y1, x2, y2), info.get("mask"),
                                     self.config.mask_footprint_pos,
                                 )
-                                uv = (mu / SAM2_SCALE,
-                                      mv / SAM2_SCALE + sam2_y_offset)
+                                uv = (mu / export_scale,
+                                      mv / export_scale + tracker_y_offset)
                                 # ground_center_offset_m: the contact point is
                                 # the robot's NEAR edge from this camera; push
                                 # to the footprint centre (no-op when 0).
@@ -9976,7 +9988,7 @@ class InferenceJob:
                                     continue
                             
                                 color = (
-                                    self.sam2_obj_color.get(view.name, {}).get(obj_id)
+                                    self.tracker_obj_color.get(view.name, {}).get(obj_id)
                                     or "unknown"
                                 )
 
@@ -9986,9 +9998,9 @@ class InferenceJob:
                                     # small_frame is the full-crop at 0.5x; index it with the
                                     # offset-corrected box scaled back to 0.5x (== raw box when
                                     # no top-crop is configured).
-                                    box_s = (fx1 * SAM2_SCALE, fy1 * SAM2_SCALE,
-                                             fx2 * SAM2_SCALE, fy2 * SAM2_SCALE)
-                                    # SAM2 mask is in raw 0.5x top-cropped coords (same space
+                                    box_s = (fx1 * export_scale, fy1 * export_scale,
+                                             fx2 * export_scale, fy2 * export_scale)
+                                    # SAM mask is in raw 0.5x top-cropped coords (same space
                                     # as info["box"]); slice the box region out as a box-local
                                     # mask so the signature covers the robot, not the field.
                                     mask2d = info.get("mask")
@@ -10105,7 +10117,7 @@ class InferenceJob:
                               f"{sum(len(d) for d in per_camera.values())} raw dets")
                 
                     ev_list = []
-                    if self.use_sam2:
+                    if self.use_mask_tracker:
                         ev_list = self.fused_registry.assign(fused)
                         # A fused track_id is one physical robot; collapse any same-id
                         # split (e.g. a duplicate corner-camera mask whose projection
@@ -10227,7 +10239,7 @@ class InferenceJob:
                     slot_to_embedding = {}
                     slot_to_robot_crop = {}  # slot -> latest masked whole-robot crop (main cam)
                     fresh_emb_slots = set()  # slots whose embedding was refreshed THIS frame
-                    if self.use_sam2 and self.field_tracker is not None:
+                    if self.use_mask_tracker and self.field_tracker is not None:
                         for tid, slot in self.field_tracker._id_to_slot.items():
                             emb = self.fused_registry.get_embedding(tid)
                             if emb is not None:
@@ -11158,8 +11170,9 @@ async def set_setting(body: dict):
         job_config_registry.set_runtime_override(name, body.get("value"))
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    canonical = job_config_registry.canonical_knob_name(name)
     knob = next(k for k in job_config_registry.describe_knobs()
-                if k["name"] == name)
+                if k["name"] == canonical)
     return {"ok": True, "knob": knob}
 
 
@@ -11435,7 +11448,7 @@ async def save_calibration_masks(request: Request):
 async def save_robot_track_top_crop(request: Request):
     """Body: {event, camera?, robot_track_top_crop: float}.
 
-    Fraction (0.0–0.5) of the top of this view excluded from the SAM2 robot
+    Fraction (0.0–0.5) of the top of this view excluded from the SAM robot
     tracking pass — robots cannot be in the airspace above the field.  Stored
     per camera/event; preserves any existing calibration (masks, intrinsics).
     """
@@ -15004,9 +15017,11 @@ async def get_diagnostic(key: str):
     return StreamingResponse(iter_file(), media_type="application/x-ndjson")
 
 
-@app.get("/api/sam2_models")
-async def sam2_models():
-    """List selectable SAM2 encoder sizes and whether each checkpoint is downloaded.
+@app.get("/api/tracker_models")
+@app.get("/api/sam2_models")  # legacy path (pre-rename UI builds)
+async def tracker_models():
+    """List the tracking backends (SAM3 default, SAM2 fallback), the selectable
+    SAM2 encoder sizes and whether each checkpoint is downloaded.
 
     The UI uses `available` to disable sizes whose .pt file is missing, since picking
     one would silently degrade to Kalman tracking.
@@ -15109,10 +15124,13 @@ async def infer(
     video_file: Optional[UploadFile] = File(None),
     youtube_url: Optional[str] = Form(None),
     team_reader: str = Form("local"),
-    sam2_max_gpu_frames: Optional[int] = Form(None),
+    sam3_max_gpu_frames: Optional[int] = Form(None),
     tracking_backend: Optional[str] = Form(None),
     model_size: Optional[str] = Form(None),
     match_key: Optional[str] = Form(None),
+    sam3_export_scale: Optional[float] = Form(None),
+    # Pre-rename form field names, still accepted (new name wins).
+    sam2_max_gpu_frames: Optional[int] = Form(None),
     sam2_export_scale: Optional[float] = Form(None),
     cull_hijack_enabled: Optional[bool] = Form(None),
     reanchor_enabled: Optional[bool] = Form(None),
@@ -15129,16 +15147,20 @@ async def infer(
 
     # Resolve and validate the job config BEFORE touching the video source.
     overrides: dict = {}
+    if sam3_max_gpu_frames is None:
+        sam3_max_gpu_frames = sam2_max_gpu_frames
+    if sam3_export_scale is None:
+        sam3_export_scale = sam2_export_scale
     if team_reader and team_reader != "local":
         overrides["team_reader"] = team_reader
-    if sam2_max_gpu_frames is not None:
-        overrides["sam2_max_gpu_frames"] = sam2_max_gpu_frames
+    if sam3_max_gpu_frames is not None:
+        overrides["sam3_max_gpu_frames"] = sam3_max_gpu_frames
     if tracking_backend:
         overrides["tracking_backend"] = tracking_backend.lower()
     if model_size:
         overrides["sam2_model_size"] = model_size.lower()
-    if sam2_export_scale is not None:
-        overrides["sam2_export_scale"] = sam2_export_scale
+    if sam3_export_scale is not None:
+        overrides["sam3_export_scale"] = sam3_export_scale
     if cull_hijack_enabled is not None:
         overrides["cull_hijack_enabled"] = cull_hijack_enabled
     if reanchor_enabled is not None:
@@ -15152,7 +15174,9 @@ async def infer(
         if not isinstance(extra, dict):
             return JSONResponse(status_code=400,
                                 content={"error": "config_json must be a JSON object"})
-        overrides.update(extra)
+        # Legacy keys (sam2_track_fps, ...) -> canonical before merging, so
+        # config_json still wins over a named field for the same knob.
+        overrides.update(job_config_registry.normalize_overrides(extra))
     try:
         job_config = JobConfig(overrides)
     except ValueError as e:

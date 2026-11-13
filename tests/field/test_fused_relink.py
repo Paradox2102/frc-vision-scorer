@@ -27,7 +27,7 @@ def test_relink_lost_track_by_embedding():
 
     # Frame 2: robot is not seen (main:1 is absent).
 
-    # Frame 3: robot re-appears on corner_left:2 (new SAM2 ID).
+    # Frame 3: robot re-appears on corner_left:2 (new SAM ID).
     # Its embedding is highly similar to A (cosine = 1.0).
     f3 = _obs([("corner_left", 2)], embedding=emb_a)
     reg.assign([f3])

@@ -5,7 +5,7 @@ DiagnosticEvents schema only listed "sam2.*" names — so every SAM3 seeding /
 re-prompt / cull decision record was silently counted as a dropped log
 (qm10: dropped_logs=201 while we debugged corner seeding blind)."""
 from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-from web.field.sam2_tracker import Sam2FieldTracker
+from web.field.mask_tracker import MaskFieldTracker
 from web.field.sam3_tracker import Sam3FieldTracker
 
 

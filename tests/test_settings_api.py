@@ -122,6 +122,22 @@ class TestSettingsEndpoints:
         assert JobConfig().reprompt_seconds == 2.0
         assert JobConfig().corner_track_stride == 3
 
+    def test_post_legacy_sam2_name_sets_sam3_knob(self, client):
+        # Pre-rename knob names still work; the reply names the new knob.
+        r = client.post("/api/settings",
+                        json={"name": "sam2_track_fps", "value": 7.0})
+        assert r.status_code == 200
+        knob = r.json()["knob"]
+        assert knob["name"] == "sam3_track_fps" and knob["effective"] == 7.0
+        assert JobConfig().sam3_track_fps == 7.0
+        names = {k["name"] for k in client.get("/api/settings").json()["knobs"]}
+        assert "sam3_track_fps" in names and "sam2_track_fps" not in names
+
+    def test_tracker_models_route_keeps_legacy_path(self):
+        from web.app import app
+        paths = {getattr(r, "path", None) for r in app.routes}
+        assert {"/api/tracker_models", "/api/sam2_models"} <= paths
+
 
 class TestVlmModelsDefaultReader:
     """/api/vlm_models names the server's default team_reader so the UI's

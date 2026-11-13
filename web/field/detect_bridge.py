@@ -39,7 +39,7 @@ CORNER_MIDLINE_MARGIN_M = float(os.environ.get("CORNER_MIDLINE_MARGIN_M", "1.0")
 # Range-stable width backstop. The footprint check above is disabled past
 # DET_FIELD_WIDTH_MAX_RANGE_M because back-projecting box corners to the carpet is
 # ill-conditioned near the horizon — which leaves long-range boxes with NO width
-# sanity. A SAM2 mask that leaks horizontally onto adjacent field structure then
+# sanity. A SAM mask that leaks horizontally onto adjacent field structure then
 # passes as a robot far wider than physically possible. Instead, FORWARD-project a
 # max-robot-width carpet segment at the detection's field position (well-conditioned
 # at any range) and reject a box wider than this factor times that expected width.
@@ -161,7 +161,7 @@ def _expected_robot_pixel_width(field_xy, calibration, robot_width_m):
     return ((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5
 
 
-# Public alias: the size-prior hijack cull (sam2 wiring in app.py) consumes the
+# Public alias: the size-prior hijack cull (mask-tracker wiring in app.py) consumes the
 # forward-projected expectation; keep the private name for in-module callers.
 expected_robot_pixel_width = _expected_robot_pixel_width
 
@@ -231,7 +231,7 @@ def to_field_detections(robot_boxes, calibration, field_dims, colors,
     inside a zone are KEPT: zones gate slot *seeding* (FieldTracker._assign),
     not detection. Dropping here killed existing tracks that drove into a zone
     and starved zone-parked robots of the detector corroboration that protects
-    them from the SAM2 hijack cull / capped-roster eviction."""
+    them from the SAM hijack cull / capped-roster eviction."""
     del blocked_zones  # seed-time concern; see docstring
     out = []
     for idx, box in enumerate(robot_boxes):
@@ -268,7 +268,7 @@ def filter_field_robot_boxes(
     """Return indices of boxes whose ground contact is a plausible field robot.
 
     This is the geometry-only counterpart to ``to_field_detections`` for paths
-    such as SAM2 prompting that must retain their original box/color metadata.
+    such as SAM prompting that must retain their original box/color metadata.
 
     ``ray_blocked_zones``: zones additionally tested along the viewing ray
     BEYOND the contact point (see ``zones.ray_enters_zones``). Pass only for

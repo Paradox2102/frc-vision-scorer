@@ -174,7 +174,7 @@ def test_color_vote_resolves_unknown():
 
 
 def test_members_single_camera():
-    # per-camera FieldDetection carries its SAM2 obj id as track_id
+    # per-camera FieldDetection carries its SAM obj id as track_id
     d = FieldDetection(pos=(1.0, 2.0), color="blue", box=(0, 0, 10, 10), track_id=1)
     per_cam = {"main": [(d, b"crop")]}
     fused = fuse_detections(per_cam, weights={"main": 1.0}, radius_m=0.6)

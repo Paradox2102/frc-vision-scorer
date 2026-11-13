@@ -1,5 +1,5 @@
 """Tests for the selective-mask-propagation window finder, exit state machine,
-and sam2_raw merge (Task 3).
+and tracker_raw merge (Task 3).
 
 Pure numpy / synthetic boxes and masks; no GPU, no torch. Masks are small
 ``np.zeros((H, W), bool)`` rectangles built to match / mismatch the TBD boxes

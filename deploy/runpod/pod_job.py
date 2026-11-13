@@ -5,7 +5,7 @@ closed laptop never kills the job driver (the job runs inside the websocket
 handler of the connection that claimed it — scripts/ab_qm8.py drive()).
 
     .venv/bin/python deploy/runpod/pod_job.py --video /workspace/tune/2026cur_qm8.mp4 \
-        --match-key 2026cur_qm8 --event 2026cur --config-json '{"sam2_track_fps": 8}' \
+        --match-key 2026cur_qm8 --event 2026cur --config-json '{"sam3_track_fps": 8}' \
         --out /workspace/tune/jobs/R2.json
 
 Writes ``--out`` atomically and repeatedly (status / progress / timings), so the

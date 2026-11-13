@@ -84,7 +84,7 @@ def test_merge_into_embeddingless_winner_adopts_loser_embedding():
 
 
 def test_bridging_two_prior_ids_collapses_to_one():
-    # Two tracklets that were separate clusters become one cluster (e.g. SAM2 had
+    # Two tracklets that were separate clusters become one cluster (e.g. SAM had
     # split a robot across cameras, now they're within radius). They must collapse
     # to a single fused id, not keep two.
     reg = FusedTrackRegistry()

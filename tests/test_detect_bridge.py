@@ -83,7 +83,7 @@ def test_oversized_image_fraction_dropped():
 
 
 def test_far_leaked_wide_box_dropped():
-    """A SAM2 mask that leaks horizontally onto adjacent field structure produces a
+    """A SAM mask that leaks horizontally onto adjacent field structure produces a
     box several times wider than any robot could appear at that range. Beyond the
     near-range footprint cutoff and under 50% of frame, the OLD checks let it through.
     The forward-projected expected-width check (well-conditioned at range) rejects it.
@@ -164,7 +164,7 @@ def test_missing_color_becomes_unknown():
 def test_detection_inside_blocked_structure_zone_is_kept():
     """Zones gate SEEDING (FieldTracker._assign), not detection: a robot that
     drives into a zone must keep feeding its existing track, and a zone-parked
-    robot must keep corroborating its SAM2 mask (else eviction would see it as
+    robot must keep corroborating its SAM mask (else eviction would see it as
     detector-absent). Zone hits are also NOT logged to rejected_out — a parked
     robot logged as a hard negative would poison the mining set."""
     fm = FieldModel.load("2026-rebuilt-welded")
@@ -411,7 +411,7 @@ def test_uncalibrated_mode_still_applies_backstop_without_pose():
 
 def test_expected_robot_pixel_width_public_alias():
     """expected_robot_pixel_width is a public re-export of the private
-    _expected_robot_pixel_width, for use by the sam2 size-prior hijack cull."""
+    _expected_robot_pixel_width, for use by the mask-tracker size-prior hijack cull."""
     from web.field.detect_bridge import (
         expected_robot_pixel_width,
         _expected_robot_pixel_width,

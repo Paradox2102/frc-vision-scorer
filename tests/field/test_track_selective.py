@@ -1,4 +1,4 @@
-"""End-to-end tests for ``Sam2FieldTracker.track_selective`` (Task 4).
+"""End-to-end tests for ``MaskFieldTracker.track_selective`` (Task 4).
 
 The orchestrator glues the pure Task 2/3 logic (``TbdTracker`` -> ``find_windows``
 -> ``ExitMachine`` -> ``merge_selective_results``) to the real SAM predictor
@@ -14,7 +14,7 @@ import os
 import cv2
 import numpy as np
 
-from web.field.sam2_tracker import Sam2FieldTracker
+from web.field.mask_tracker import MaskFieldTracker
 from web.field.selective_prop import SelectiveConfig
 
 # Two 20x20 boxes far enough apart that neither their raw boxes (no witness
@@ -138,7 +138,7 @@ def _detect_fn(script):
 def test_track_selective_clean_settle(tmp_path):
     _write_frames(tmp_path, 11)
     pred = StubSelectivePredictor(lambda f, oid: L, emit_probs=True, prob=0.8)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     progress = []
     results = tracker.track_selective(
@@ -192,7 +192,7 @@ def test_track_selective_swap_renames_from_entry(tmp_path):
     # physical robot to R -- where TBD (wrongly) calls it oid2 -> swap.
     pred = StubSelectivePredictor(lambda f, oid: L if f <= 3 else R,
                                   emit_probs=False)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     results = tracker.track_selective(
         str(tmp_path), _detect_fn(_SWAP_DETS), _cfg())
@@ -227,7 +227,7 @@ def test_track_selective_swap_renames_from_entry(tmp_path):
 def test_track_selective_predictor_raises_propagates(tmp_path):
     _write_frames(tmp_path, 11)
     pred = StubSelectivePredictor(lambda f, oid: L, raise_after=2)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     import pytest
     with pytest.raises(RuntimeError):
@@ -244,7 +244,7 @@ def test_track_selective_predictor_raises_propagates(tmp_path):
 def test_track_selective_should_stop_returns_tbd_partial(tmp_path):
     _write_frames(tmp_path, 11)
     pred = StubSelectivePredictor(lambda f, oid: L, emit_probs=True)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     calls = {"n": 0}
 
@@ -280,7 +280,7 @@ def test_track_selective_no_windows_pure_tbd(tmp_path):
     # window is ever opened.
     dets = {f: [(L, None)] for f in range(4)}
     pred = StubSelectivePredictor(lambda f, oid: L)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     results = tracker.track_selective(str(tmp_path), _detect_fn(dets), _cfg())
 
@@ -341,7 +341,7 @@ def test_track_selective_two_windows_one_episode(tmp_path):
     # clean on their own oid (no swap).
     pred = StubSelectivePredictor(lambda f, oid: L if oid == 1 else R,
                                   emit_probs=True, prob=0.8)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     results = tracker.track_selective(
         str(tmp_path), _detect_fn(_TWO_WIN_DETS), _cfg())
@@ -381,7 +381,7 @@ def test_track_selective_two_windows_one_episode(tmp_path):
 def test_track_selective_budget_precheck_drops_episode(tmp_path):
     _write_frames(tmp_path, 19)
     pred = StubSelectivePredictor(lambda f, oid: L)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     # budget = round(0.55 * 19) = 10. Episode 1 (windows (1,3)) settles clean at
     # frame 8 -> sam_used=8. Episode 2's conservative min cost (12-10)+2=4 makes
@@ -409,7 +409,7 @@ def test_track_selective_budget_precheck_drops_episode(tmp_path):
 def test_track_selective_budget_stops_mid_episode(tmp_path):
     _write_frames(tmp_path, 16)
     pred = StubSelectivePredictor(lambda f, oid: L)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     # budget = round(0.3125 * 16) = 5. The lone window (seed1, entry3) would
     # settle clean at frame 8, but the budget is hit after feeding frame 5, so
@@ -441,7 +441,7 @@ def test_track_selective_budget_stops_mid_episode(tmp_path):
 def test_track_selective_episodes_stat_counts_runs(tmp_path):
     _write_frames(tmp_path, 19)
     pred = StubSelectivePredictor(lambda f, oid: L)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     # Default budget (frac 1.0 -> 19 frames) fits both episodes: both settle
     # clean, so episodes counts 2 and nothing is dropped.
@@ -469,7 +469,7 @@ def test_track_selective_phase_a_embed_stats(tmp_path):
     # predictor untouched. Keeps the scenario to the Phase A loop itself
     # rather than the window machinery.
     pred = StubSelectivePredictor(lambda f, oid: L if oid == 1 else R)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
     cfg = _cfg()
     cfg.app_weight = 1.0
 
@@ -501,7 +501,7 @@ def test_track_selective_phase_a_embed_wrong_length_discarded(tmp_path):
     in selective_stats["app"] advances."""
     _write_frames(tmp_path, 4)
     pred = StubSelectivePredictor(lambda f, oid: L)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
     cfg = _cfg()
     cfg.app_weight = 1.0
 
@@ -555,7 +555,7 @@ def test_track_selective_passes_frame_hw_and_reports_triggers(tmp_path):
     # starve scan only fires because track_selective passes frame_hw into
     # find_windows (the off-border check); without it, no window -> no trigger.
     pred = StubSelectivePredictor(lambda f, oid: L, emit_probs=True, prob=0.8)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
 
     results = tracker.track_selective(
         str(tmp_path), _detect_fn(_STARVE_DETS), _cfg_starve())
@@ -654,7 +654,7 @@ def _run_seg(tmp_path, pred, cfg, monkeypatch=None):
             fed.append(int(frame_idx))
             return orig(self, frame_idx, masks_by_oid, probs_by_oid)
         monkeypatch.setattr(sp.ExitMachine, "step", step)
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
     results = tracker.track_selective(str(tmp_path), _detect_fn(_SEG_DETS), cfg)
     return tracker, results, fed
 
@@ -803,7 +803,7 @@ def test_segmented_respects_budget(tmp_path):
     pred = RemovableStubPredictor(_home_box, emit_probs=True)
     cfg = _cfg_seg(retire=True, lazy=True)
     cfg.sam_budget_frac = 10 / 21               # budget = 10 frames
-    tracker = Sam2FieldTracker(predictor=pred)
+    tracker = MaskFieldTracker(predictor=pred)
     tracker.track_selective(str(tmp_path), _detect_fn(_SEG_DETS), cfg)
     stats = tracker.selective_stats
     assert stats["sam_frames"] == 10

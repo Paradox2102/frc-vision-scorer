@@ -169,7 +169,7 @@ def _inset_box(box, w: int, h: int):
 
 
 def _apply_mask(crop_bgr: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
-    """Black out pixels outside `mask` (the SAM2 robot segmentation).
+    """Black out pixels outside `mask` (the SAM robot segmentation).
 
     `mask` is box-local (covers the same region as the crop) but may be at a
     different resolution; it's nearest-resized to the crop. Returns `crop_bgr`
@@ -246,7 +246,7 @@ class RobotEmbedder:
     def embed(self, frame: np.ndarray, box, mask: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """Return an L2-normalized embedding for the crop, or None if invalid/unavailable.
 
-        When `mask` (a box-local SAM2 segmentation) is given, background pixels
+        When `mask` (a box-local SAM segmentation) is given, background pixels
         are blacked out so the signature describes the robot, not the field.
         """
         return self.embed_batch(frame, [box], masks=[mask])[0]
@@ -256,7 +256,7 @@ class RobotEmbedder:
 
         Returns a list aligned with `boxes`; entries are None for invalid crops.
         `masks`, when provided, is aligned with `boxes`; each entry is either a
-        box-local boolean SAM2 mask or None. Masked crops skip the background
+        box-local boolean SAM mask or None. Masked crops skip the background
         inset (the mask already sheds background); unmasked crops keep the inset.
         """
         h, w = frame.shape[:2]

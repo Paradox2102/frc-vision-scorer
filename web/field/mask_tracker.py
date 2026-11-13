@@ -1,13 +1,21 @@
-"""SAM2 offline video-predictor tracker helpers and wrapper class.
+"""Mask-propagation tracker helpers and the backend-neutral wrapper class.
 
 The module is split into two tiers:
 
 1. Pure, GPU-free helpers (``mask_to_box``, ``bottom_center``, ``_ios``,
-   ``match_new_detections``) — importable with no torch/sam2 on the path.
+   ``match_new_detections``) — importable with no torch/SAM on the path.
 
-2. ``Sam2FieldTracker`` — a stateful wrapper around SAM2's offline video
-   predictor.  torch/sam2 are imported *lazily* inside the class so that
+2. ``MaskFieldTracker`` — a stateful wrapper around a SAM video predictor
+   (seeding, re-prompting, culls, eviction, backfill). It holds the tracking
+   logic shared by both backends: ``Sam3FieldTracker`` (web/field/
+   sam3_tracker.py, the production backend) subclasses it, and on its own it
+   builds the SAM2 predictor (the ``tracking_backend="sam2"`` fallback).
+   torch and the SAM packages are imported *lazily* inside the class so that
    the pure helpers remain torch-free.
+
+Formerly ``web/field/sam2_tracker.py`` / ``Sam2FieldTracker``; that module is
+now a compat alias of this one. Module-level tuning constants read ``SAM3_*``
+env vars, falling back to the legacy ``SAM2_*`` names (web/env_compat.py).
 """
 from __future__ import annotations
 
@@ -19,9 +27,11 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+from web.env_compat import sam3_env
+
 
 class TrackStopped(Exception):
-    """Raised by ``Sam2FieldTracker.track`` when ``should_stop`` returns True.
+    """Raised by ``MaskFieldTracker.track`` when ``should_stop`` returns True.
 
     Propagation runs on a worker thread (via ``asyncio.to_thread`` in the web
     app) and cannot be killed from outside, so the loop polls a caller-supplied
@@ -29,17 +39,17 @@ class TrackStopped(Exception):
     The web app treats it as a user stop, NOT as a tracker failure.
     """
 
-# Mask-shape plausibility knobs. A robot's SAM2 mask is a compact blob that
+# Mask-shape plausibility knobs. A robot's SAM mask is a compact blob that
 # stands on the carpet — roughly as wide as it is tall and widest near its
 # base. Field fixtures (radio/antenna on a stand) segment as a blob-on-a-stick:
 # tall, thin, and *top*-heavy. We only reject a mask when it is BOTH tall-thin
 # AND top-heavy, so a legitimately tall-but-bottom-heavy robot (e.g. a raised
 # climber hook) is never dropped.
-MASK_MAX_ASPECT = float(os.environ.get("SAM2_MASK_MAX_ASPECT", "2.0"))
-MASK_MIN_BASE_RATIO = float(os.environ.get("SAM2_MASK_MIN_BASE_RATIO", "0.35"))
-MASK_BASE_BAND_FRAC = float(os.environ.get("SAM2_MASK_BASE_BAND_FRAC", "0.2"))
+MASK_MAX_ASPECT = float(sam3_env("MASK_MAX_ASPECT", "2.0"))
+MASK_MIN_BASE_RATIO = float(sam3_env("MASK_MIN_BASE_RATIO", "0.35"))
+MASK_BASE_BAND_FRAC = float(sam3_env("MASK_BASE_BAND_FRAC", "0.2"))
 
-# Hijack-cull knobs (detector-absence + stationary). A SAM2 object whose mask has
+# Hijack-cull knobs (detector-absence + stationary). A SAM object whose mask has
 # drifted onto a static field structure stays "visible" forever, so the existing
 # absence-based retirement never fires. These drive a second retirement trigger.
 # See docs/superpowers/specs/2026-06-08-sam2-mask-hijack-cull-design.md.
@@ -72,16 +82,16 @@ CULL_STATIONARY_M = float(os.environ.get("CULL_STATIONARY_M", "0.5"))
 # absence+stationarity cannot tell static junk from a robot parked in a
 # corner detector blind spot; the tracker's OWN confidence is the missing
 # positive discriminator — junk masks hold low prob, real robots high.
-CULL_LOW_PROB_MAX = float(os.environ.get("SAM2_CULL_LOW_PROB_MAX", "0"))     # 0 disables
-EVICT_PROB_IMMUNE = float(os.environ.get("SAM2_EVICT_PROB_IMMUNE", "0"))    # 0 disables
+CULL_LOW_PROB_MAX = float(sam3_env("CULL_LOW_PROB_MAX", "0"))     # 0 disables
+EVICT_PROB_IMMUNE = float(sam3_env("EVICT_PROB_IMMUNE", "0"))    # 0 disables
 
 # Person-overlap veto: a stationary mask that sits mostly inside a person
 # detection for consecutive boundaries is a hijacked track — a robot is never
 # a person, so this is the POSITIVE hijack signal the absence-based cull
 # lacks (qm24's false culls were absence-only; qm11's R3 spent all of auto
 # parked on a referee's orange vest). Enabled by passing person_fn to track().
-PERSON_VETO_COVERAGE = float(os.environ.get("SAM2_PERSON_VETO_COVERAGE", "0.5"))
-PERSON_VETO_BOUNDARIES = int(os.environ.get("SAM2_PERSON_VETO_BOUNDARIES", "2"))
+PERSON_VETO_COVERAGE = float(sam3_env("PERSON_VETO_COVERAGE", "0.5"))
+PERSON_VETO_BOUNDARIES = int(sam3_env("PERSON_VETO_BOUNDARIES", "2"))
 
 # Size-prior hijack cull: a tracked mask whose pixel width, at its projected
 # field position, is far wider than a robot could appear (or far narrower) for
@@ -103,13 +113,13 @@ SIZE_PRIOR_BOUNDARIES = int(os.environ.get("SIZE_PRIOR_BOUNDARIES", "3"))
 # (>= CULL_UNCORROBORATED_REPROMPTS absences in the window AND stationary), but
 # is triggered on demand by concrete new evidence rather than spontaneously, so
 # it is safe to default on while the spontaneous cull stays opt-in.
-EVICT_WHEN_CAPPED = os.environ.get("SAM2_EVICT_WHEN_CAPPED", "1") not in ("0", "false", "False")
+EVICT_WHEN_CAPPED = sam3_env("EVICT_WHEN_CAPPED", "1") not in ("0", "false", "False")
 
 # A tracked mask may only claim (suppress) a fresh detection when its area is at
 # least this fraction of the detection box's area. IoS-over-smaller scores 1.0
 # for a degenerate sliver mask sitting inside a full-size detection, which let a
 # collapsed mask block its own replacement.
-SEED_MIN_MASK_AREA_FRAC = float(os.environ.get("SAM2_SEED_MIN_MASK_AREA_FRAC", "0.1"))
+SEED_MIN_MASK_AREA_FRAC = float(sam3_env("SEED_MIN_MASK_AREA_FRAC", "0.1"))
 
 # Re-anchoring: a tracked mask that has collapsed to a sliver (area below
 # SEED_MIN_MASK_AREA_FRAC of an overlapping fresh detection's box) is
@@ -118,40 +128,40 @@ SEED_MIN_MASK_AREA_FRAC = float(os.environ.get("SAM2_SEED_MIN_MASK_AREA_FRAC", "
 # source (SAM2 re-conditions its memory on the fresh prompt) where the sliver
 # guard / cull / eviction only treat the symptom. Color-conflicting detections
 # never re-anchor. DEFAULT OFF pending A/B.
-REANCHOR_ENABLED = os.environ.get("SAM2_REANCHOR_ENABLED", "0") not in ("0", "false", "False")
+REANCHOR_ENABLED = sam3_env("REANCHOR_ENABLED", "0") not in ("0", "false", "False")
 # Min IoS (over smaller) of the degraded mask vs the detection box to re-anchor.
 # A sliver inside the box scores ~1.0; this floor exists so a sliver that has
 # drifted AWAY from the detection (different robot) is not captured.
-REANCHOR_IOS = float(os.environ.get("SAM2_REANCHOR_IOS", "0.5"))
+REANCHOR_IOS = float(sam3_env("REANCHOR_IOS", "0.5"))
 # v2 guards (qm72 v1 failure: SAM2 never deletes retired objects, so a dead
 # object's mask can flicker back as a noise sliver ANYWHERE and capture a live
 # robot's detection — all 3 v1 re-anchors were such zombie identity transfers).
 # Recency: the object must have had a stored mask within this many boundaries
 # (a genuine collapse is fresh; a zombie has been sliver/absent for many).
-REANCHOR_MAX_BOUNDARY_GAP = int(os.environ.get("SAM2_REANCHOR_MAX_BOUNDARY_GAP", "1"))
+REANCHOR_MAX_BOUNDARY_GAP = int(sam3_env("REANCHOR_MAX_BOUNDARY_GAP", "1"))
 # Locality: the detection must be near the object's last recorded extent —
 # field meters when a projector is available, else tracker pixels. Over one
 # 2s boundary gap a fast robot can outrun 2 m; those churn (safe) by design.
-REANCHOR_MAX_JUMP_M = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_M", "2.0"))
-REANCHOR_MAX_JUMP_PX = float(os.environ.get("SAM2_REANCHOR_MAX_JUMP_PX", "100"))
+REANCHOR_MAX_JUMP_M = float(sam3_env("REANCHOR_MAX_JUMP_M", "2.0"))
+REANCHOR_MAX_JUMP_PX = float(sam3_env("REANCHOR_MAX_JUMP_PX", "100"))
 
 # Dark-mask re-anchor: a fresh detection claimed by an object whose mask has
-# not been emitted for >= SAM2_DARK_REANCHOR_FRAMES is a robot the tracker has
+# not been emitted for >= SAM3_DARK_REANCHOR_FRAMES is a robot the tracker has
 # effectively lost — the stale mask blocks seeding ("already_tracked") while
 # producing no output. Re-prompt that SAME object id at the detection box
 # instead of dropping the detection. Unlike the sliver re-anchor above this
 # acts only on detections the matcher itself attributed to the object, so the
 # identity-transfer risk that kept REANCHOR_ENABLED off does not apply.
-DARK_REANCHOR_ENABLED = os.environ.get(
-    "SAM2_DARK_REANCHOR_ENABLED", "1") not in ("0", "false", "False")
-DARK_REANCHOR_FRAMES = int(os.environ.get("SAM2_DARK_REANCHOR_FRAMES", "2"))
+DARK_REANCHOR_ENABLED = sam3_env(
+    "DARK_REANCHOR_ENABLED", "1") not in ("0", "false", "False")
+DARK_REANCHOR_FRAMES = int(sam3_env("DARK_REANCHOR_FRAMES", "2"))
 # Consecutive re-anchor attempts allowed while an object stays dark. Every
 # prompt accumulates per-object session state in the predictor; re-prompting
 # a never-reviving object at every boundary grew SAM3 video sessions until
 # they OOM'd a full 24GB card. After the cap, the detection seeds a NEW id
 # (identity machinery re-binds it) and the zombie ages into retirement.
 DARK_REANCHOR_MAX_ATTEMPTS = int(
-    os.environ.get("SAM2_DARK_REANCHOR_MAX_ATTEMPTS", "3"))
+    sam3_env("DARK_REANCHOR_MAX_ATTEMPTS", "3"))
 
 # Misaligned-mask re-anchor: dark re-anchor needs total mask loss and the
 # sliver re-anchor needs area collapse, but the COMMON drift case is a
@@ -162,28 +172,28 @@ DARK_REANCHOR_MAX_ATTEMPTS = int(
 # boundaries, re-prompt that SAME id at the detection box. Consecutiveness +
 # the [ios_min, match-threshold) band keep one-boundary flybys and true new
 # robots out. DEFAULT OFF pending A/B.
-MISALIGN_REANCHOR = os.environ.get(
-    "SAM2_MISALIGN_REANCHOR", "0") not in ("0", "false", "False")
-MISALIGN_IOS_MIN = float(os.environ.get("SAM2_MISALIGN_IOS_MIN", "0.2"))
-MISALIGN_BOUNDARIES = int(os.environ.get("SAM2_MISALIGN_BOUNDARIES", "2"))
+MISALIGN_REANCHOR = sam3_env(
+    "MISALIGN_REANCHOR", "0") not in ("0", "false", "False")
+MISALIGN_IOS_MIN = float(sam3_env("MISALIGN_IOS_MIN", "0.2"))
+MISALIGN_BOUNDARIES = int(sam3_env("MISALIGN_BOUNDARIES", "2"))
 
 # Capped-roster eviction, dark tier: an object whose mask has been absent for
 # >= this many frames (yet not retired) may be evicted for a fresh unmatched
 # detection even without the full stationary-absence evidence bar.
-EVICT_DARK_FRAMES = int(os.environ.get("SAM2_EVICT_DARK_FRAMES", "8"))
+EVICT_DARK_FRAMES = int(sam3_env("EVICT_DARK_FRAMES", "8"))
 # Capped-roster eviction, least-corroborated tier: minimum windowed detector
 # absences before ANY object (moving included) may be evicted for a fresh
 # detection. The roster should hold the objects most likely to be robots; an
 # object the bumper detector repeatedly fails to back (referee, field clutter)
 # loses its slot to a detector-backed newcomer.
-EVICT_MIN_ABSENCES = int(os.environ.get("SAM2_EVICT_MIN_ABSENCES", "2"))
+EVICT_MIN_ABSENCES = int(sam3_env("EVICT_MIN_ABSENCES", "2"))
 
 # Color backfill: an object whose metadata color is unknown (seeded from a
 # colorless whole-robot gap-fill) inherits the color of the bumper detections
 # that corroborate its mask on this many CONSECUTIVE colored boundaries.
 # Mirrors the team-lock n_override pattern: one read can be a neighbor's
 # bumper clipping the mask; two agreeing in a row is deliberate evidence.
-COLOR_BACKFILL_VOTES = int(os.environ.get("SAM2_COLOR_BACKFILL_VOTES", "2"))
+COLOR_BACKFILL_VOTES = int(sam3_env("COLOR_BACKFILL_VOTES", "2"))
 
 # Seed-box aspect gate + motion-required eviction (qm12 static-sliver fix).
 # In match 86d6e154 qm12 a static vertical sliver detection on the blue hub
@@ -199,8 +209,8 @@ COLOR_BACKFILL_VOTES = int(os.environ.get("SAM2_COLOR_BACKFILL_VOTES", "2"))
 #      STATIC detection can never displace a tracked robot.
 # Both DEFAULT OFF pending an A/B gate — the existing behavior is unchanged
 # until a per-job override or env var turns them on.
-SEED_BOX_MAX_ASPECT = float(os.environ.get("SAM2_SEED_BOX_MAX_ASPECT", "0"))   # <=0 disables
-EVICT_REQUIRES_MOTION = os.environ.get("SAM2_EVICT_REQUIRES_MOTION", "0") not in ("0", "false", "False")
+SEED_BOX_MAX_ASPECT = float(sam3_env("SEED_BOX_MAX_ASPECT", "0"))   # <=0 disables
+EVICT_REQUIRES_MOTION = sam3_env("EVICT_REQUIRES_MOTION", "0") not in ("0", "false", "False")
 
 # Opening-window dense reprompt (qm12 0:20-0:16 fix). Robots stream into the
 # center during the first couple seconds after the active period opens, but the
@@ -210,8 +220,8 @@ EVICT_REQUIRES_MOTION = os.environ.get("SAM2_EVICT_REQUIRES_MOTION", "0") not in
 # OPENING_WINDOW_FRAMES of tracking use the smaller OPENING_REPROMPT_EVERY step
 # so those robots seed within a fraction of a second; after the window the
 # normal reprompt_every resumes. Both 0 (default) leaves behavior byte-identical.
-OPENING_REPROMPT_EVERY = int(os.environ.get("SAM2_OPENING_REPROMPT_EVERY", "0"))   # 0 disables
-OPENING_WINDOW_FRAMES = int(os.environ.get("SAM2_OPENING_WINDOW_FRAMES", "0"))
+OPENING_REPROMPT_EVERY = int(sam3_env("OPENING_REPROMPT_EVERY", "0"))   # 0 disables
+OPENING_WINDOW_FRAMES = int(sam3_env("OPENING_WINDOW_FRAMES", "0"))
 
 # Largest-connected-component mask reduction (qm11 stretched-box fix). A robot
 # is one blob; when SAM leaks the mask onto adjacent structure (a bump/ramp
@@ -223,12 +233,12 @@ OPENING_WINDOW_FRAMES = int(os.environ.get("SAM2_OPENING_WINDOW_FRAMES", "0"))
 # arm, or a robot split by hub/ball occlusion into two blobs). DEFAULT OFF
 # pending re-validation. Unconditional largest-component (the earlier attempt)
 # regressed qm10/qm12 by dropping those legitimate halves.
-MASK_LEAK_CLEANUP = os.environ.get("SAM2_MASK_LEAK_CLEANUP", "0") not in ("0", "false", "False")
+MASK_LEAK_CLEANUP = sam3_env("MASK_LEAK_CLEANUP", "0") not in ("0", "false", "False")
 # Gating thresholds for the leak cleaner. A component is dropped only when it is
 # BOTH small (area < MASK_LEAK_MAX_FRAC * largest_area) AND detached (Chebyshev
 # bbox gap from the largest component > MASK_LEAK_GAP_PX px).
-MASK_LEAK_MAX_FRAC = float(os.environ.get("SAM2_MASK_LEAK_MAX_FRAC", "0.15"))
-MASK_LEAK_GAP_PX = float(os.environ.get("SAM2_MASK_LEAK_GAP_PX", "10"))
+MASK_LEAK_MAX_FRAC = float(sam3_env("MASK_LEAK_MAX_FRAC", "0.15"))
+MASK_LEAK_GAP_PX = float(sam3_env("MASK_LEAK_GAP_PX", "10"))
 
 # Late-seed backward backfill. YOLO seeds an object only at the prompt frame
 # or a later reprompt boundary; a robot first detected at +6s was forward-only,
@@ -240,25 +250,25 @@ MASK_LEAK_GAP_PX = float(os.environ.get("SAM2_MASK_LEAK_GAP_PX", "10"))
 # earlier/original object already occupies). The pipeline knob
 # (late_seed_backfill in job_config.py) defaults ON since 2026-07-18 (qm11
 # validated); this module env default stays OFF for direct/library callers.
-LATE_SEED_BACKFILL = os.environ.get(
-    "SAM2_LATE_SEED_BACKFILL", "0") not in ("0", "false", "False")
+LATE_SEED_BACKFILL = sam3_env(
+    "LATE_SEED_BACKFILL", "0") not in ("0", "false", "False")
 # Max frames to propagate backward from an object's seed frame.
-BACKFILL_MAX_FRAMES = int(os.environ.get("SAM2_BACKFILL_MAX_FRAMES", "32"))
+BACKFILL_MAX_FRAMES = int(sam3_env("BACKFILL_MAX_FRAMES", "32"))
 # Minimum lived span (last_visible_frame - first_prompted_frame) required
 # before an object is worth backfilling — a short-lived seed is frequently
 # roster pollution from a static structure (qm12 seed/roster pollution), and
 # spending a reverse propagation pass on it is wasted compute.
-BACKFILL_MIN_LIVED_FRAMES = int(os.environ.get("SAM2_BACKFILL_MIN_LIVED", "8"))
+BACKFILL_MIN_LIVED_FRAMES = int(sam3_env("BACKFILL_MIN_LIVED", "8"))
 # Consecutive frames with NO target mask recovered during backward propagation
 # before giving up on the group — the object either didn't exist yet at that
 # point in the video, or backward propagation lost it; stopping early keeps it
 # from latching onto background.
-BACKFILL_DARK_STOP = int(os.environ.get("SAM2_BACKFILL_DARK_STOP", "4"))
+BACKFILL_DARK_STOP = int(sam3_env("BACKFILL_DARK_STOP", "4"))
 # Max IoS (over smaller) a recovered mask may score against another object's
 # mask already stored in that frame. Above this the "late seed" is most likely
 # a re-detection of an already-tracked robot under a new id — storing it would
 # double-count the same robot in fusion.
-BACKFILL_OVERLAP_IOS = float(os.environ.get("SAM2_BACKFILL_OVERLAP_IOS", "0.5"))
+BACKFILL_OVERLAP_IOS = float(sam3_env("BACKFILL_OVERLAP_IOS", "0.5"))
 
 
 def mask_to_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -733,10 +743,10 @@ def normalize_detections(items):
 # conditions against bleeding onto a neighboring robot / adjacent structure
 # from birth — prevention at the prompt, where the culls above only treat
 # symptoms. DEFAULT OFF pending A/B.
-NEG_POINT_PROMPTS = os.environ.get(
-    "SAM2_NEG_POINT_PROMPTS", "0") not in ("0", "false", "False")
-NEG_POINT_MAX = int(os.environ.get("SAM2_NEG_POINT_MAX", "4"))
-NEG_POINT_INFLATE = float(os.environ.get("SAM2_NEG_POINT_INFLATE", "1.5"))
+NEG_POINT_PROMPTS = sam3_env(
+    "NEG_POINT_PROMPTS", "0") not in ("0", "false", "False")
+NEG_POINT_MAX = int(sam3_env("NEG_POINT_MAX", "4"))
+NEG_POINT_INFLATE = float(sam3_env("NEG_POINT_INFLATE", "1.5"))
 
 
 def negative_points_for(target_box, other_boxes, max_points: int = None,
@@ -981,7 +991,7 @@ def pick_evictable(active_objects, corroboration_history, field_pos_window,
 
 
 # ---------------------------------------------------------------------------
-# Stateful SAM2 wrapper
+# Stateful mask-tracker wrapper (SAM2 predictor by default; SAM3 subclass)
 # ---------------------------------------------------------------------------
 
 #: Default SAM2 config (relative to the project root, used by SAM2 itself).
@@ -1007,10 +1017,12 @@ def _maybe_autocast(device: str):
         yield
 
 
-class Sam2FieldTracker:
-    """Offline SAM2 mask-propagation tracker.
+class MaskFieldTracker:
+    """Offline mask-propagation tracker (shared base of both backends).
 
-    Wraps SAM2's ``build_sam2_video_predictor`` flow:
+    Built without a *predictor* it wraps SAM2's ``build_sam2_video_predictor``
+    flow (the ``tracking_backend="sam2"`` fallback); ``Sam3FieldTracker``
+    swaps in a SAM3 session adapter speaking the same protocol:
 
     1. ``init_state`` — point the predictor at a directory of numbered JPEG
        frames.
@@ -1034,8 +1046,8 @@ class Sam2FieldTracker:
     Single-prompt offline propagation is the only supported mode.
     """
 
-    #: Tags for log lines and diagnostics event names; the SAM3 subclass
-    #: overrides both so runs label themselves with the backend in use.
+    #: Tags for log lines and diagnostics event names (the SAM2 backend's);
+    #: the SAM3 subclass overrides both so runs label themselves with the backend in use.
     LOG_TAG = "SAM2"
     DIAG_PREFIX = "sam2"
 
@@ -1076,7 +1088,7 @@ class Sam2FieldTracker:
             self._real_torch = False  # stub path — skip autocast
         else:
             # Lazy import: only touch torch/sam2 when actually building a real
-            # predictor.  This keeps `from web.field.sam2_tracker import
+            # predictor.  This keeps `from web.field.mask_tracker import
             # mask_to_box` fast and torch-free.
             import torch  # noqa: F401 — imported for side-effects (device check)
             from sam2.build_sam import build_sam2_video_predictor  # type: ignore[import]
@@ -1174,7 +1186,7 @@ class Sam2FieldTracker:
         diagnostics: Optional[Any] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> dict[int, dict[int, dict]]:
-        """Run offline SAM2 propagation over a directory of frames.
+        """Run offline mask propagation over a directory of frames.
 
         Args:
             frames_dir: Path to a directory of zero-padded JPEG frames (e.g.
@@ -1292,7 +1304,7 @@ class Sam2FieldTracker:
                 object stops early after :data:`BACKFILL_DARK_STOP` consecutive
                 frames with no recovered mask. The pipeline knob defaults ON
                 since 2026-07-18 (qm11 validated); the module env default
-                (SAM2_LATE_SEED_BACKFILL) stays off for library callers.
+                (SAM3_LATE_SEED_BACKFILL) stays off for library callers.
             backfill_max_frames: Max frames to propagate backward from an
                 object's seed frame. ``None``-like knobs resolve to
                 :data:`BACKFILL_MAX_FRAMES`.
@@ -1818,7 +1830,7 @@ class Sam2FieldTracker:
                     # detector could not run (detect_fn raised or returned None);
                     # such boundaries contribute NO absence evidence. The detector
                     # ALWAYS runs at a boundary: one YOLO pass per chunk is
-                    # negligible next to SAM2 propagation, corroboration evidence
+                    # negligible next to SAM propagation, corroboration evidence
                     # must accumulate even while the roster is capped, and a
                     # capped boundary must log what it rejects. (Skipping it while
                     # capped once hid a match-long seeding blackout: stale masks
@@ -2773,7 +2785,7 @@ class Sam2FieldTracker:
                 passed.
 
         Returns:
-            A ``sam2_raw``-schema dict ``{frame: {oid: {"box", "mask",
+            A ``tracker_raw``-schema dict ``{frame: {oid: {"box", "mask",
             "evidence"}}}`` (see :func:`merge_selective_results`).
 
         Side effects:
@@ -3159,3 +3171,7 @@ class Sam2FieldTracker:
             else:
                 probs_by_oid[oid] = None
         return masks_by_oid, probs_by_oid
+
+
+#: Legacy name of :class:`MaskFieldTracker` (pre-rename imports / pickles).
+Sam2FieldTracker = MaskFieldTracker

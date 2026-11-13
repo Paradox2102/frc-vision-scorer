@@ -1,4 +1,4 @@
-"""SP-T.2 end-to-end (pure): per-camera SAM2 tracklets -> fuse -> stable fused id
+"""SP-T.2 end-to-end (pure): per-camera SAM tracklets -> fuse -> stable fused id
 -> FieldTracker sticky slot. No GPU; tracklets are hand-built field detections."""
 from web.field.fusion import fuse_detections
 from web.field.fused_track_id import FusedTrackRegistry
@@ -52,7 +52,7 @@ def test_corner_only_when_main_occluded_keeps_slot():
         "corner_left": [(_det(4.2, 2.0, 1), b"c")],
     })
     assert slot in [o.slot_id for o in outs2]
-    # frame 3: main re-acquires (SAM2 id persists as 1) — still the same slot
+    # frame 3: main re-acquires (SAM id persists as 1) — still the same slot
     outs3 = _step(tracker, reg, {
         "main": [(_det(4.3, 2.0, 1), b"m")],
         "corner_left": [(_det(4.4, 2.0, 1), b"c")],
@@ -69,7 +69,7 @@ def test_two_distinct_robots_two_slots():
     assert len({o.slot_id for o in outs}) == 2
 
 
-def test_duplicate_sam2_masks_on_one_robot_use_one_slot():
+def test_duplicate_masks_on_one_robot_use_one_slot():
     tracker = FieldTracker(FIELD_LEN)
     reg = FusedTrackRegistry()
     outs = _step(tracker, reg, {
@@ -86,7 +86,7 @@ def test_duplicate_sam2_masks_on_one_robot_use_one_slot():
 def test_abrupt_position_swap_keeps_slot_by_track_id():
     # The real teeth: two BLUE robots (same alliance -> same matching pool) swap
     # positions ABRUPTLY in one frame — the constant-velocity model can't predict
-    # it (a scrum/occlusion proxy, the exact case SAM2 stable ids fix). Plain
+    # it (a scrum/occlusion proxy, the exact case SAM stable ids fix). Plain
     # distance matching steals each slot to the now-nearest robot (a swap); stable
     # fused track_ids must pin each robot to its ORIGINAL slot.
     # last_det_to_slot[i] is the slot the i-th fused detection got; fused order
@@ -95,7 +95,7 @@ def test_abrupt_position_swap_keeps_slot_by_track_id():
     reg = FusedTrackRegistry()
 
     def frame(ax, bx):
-        # A is SAM2 id 1, B is SAM2 id 2, both seen only by main.
+        # A is SAM id 1, B is SAM id 2, both seen only by main.
         per_cam = {"main": [(_det(ax, 3.0, 1), b"a"), (_det(bx, 3.0, 2), b"b")]}
         fused = fuse_detections(per_cam, weights=WEIGHTS, radius_m=0.6)
         reg.assign(fused)
@@ -133,7 +133,7 @@ def test_lost_track_relink_retains_slot_by_embedding():
     assert outs2[0].state == "coasting"
 
     # Frame 3: Robot A re-appears at a completely different position (beyond the position gate),
-    # and under a new SAM2 ID (main:2), but carries the same embedding A.
+    # and under a new SAM ID (main:2), but carries the same embedding A.
     det3 = _det(8.0, 8.0, 2)
     det3.embedding = emb_a
     per_cam3 = {"main": [(det3, b"a")]}

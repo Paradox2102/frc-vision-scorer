@@ -7,7 +7,7 @@ color vote) is what the tracker consumes; the FusedObservation also carries the
 raw evidence so the identity step can read each camera's bumper crop with its
 source weight and that camera's own projected field position.
 
-SAM2 can occasionally propagate two object masks onto the same robot. Same-camera
+SAM can occasionally propagate two object masks onto the same robot. Same-camera
 detections are therefore also merged when their image boxes overlap strongly.
 Requiring both field proximity and image overlap avoids collapsing merely-adjacent
 robots.
@@ -350,7 +350,7 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     evidence = [(cam, crop, w, (float(det.pos[0]), float(det.pos[1])))
                 for (cam, det, crop, w) in cluster]
     # Keep one deterministic member key per camera. Same-camera duplicates are a
-    # per-frame suppression signal, not proof that two SAM2 IDs should be aliased
+    # per-frame suppression signal, not proof that two SAM IDs should be aliased
     # forever: two real robots can briefly overlap during contact.
     members = []
     member_cameras = set()

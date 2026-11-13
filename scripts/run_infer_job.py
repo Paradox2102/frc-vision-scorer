@@ -25,7 +25,7 @@ async def run(job_id: str, blue: list[str], red: list[str], host: str) -> int:
     uri = f"ws://{host}/ws/infer/{job_id}"
     last_beat = 0.0
     final_payloads = []
-    # Job runs can stream for an hour with quiet stretches during SAM2
+    # Job runs can stream for an hour with quiet stretches during SAM
     # propagation; rely on server completion rather than a recv timeout.
     async with websockets.connect(uri, max_size=None, ping_interval=20,
                                   ping_timeout=600) as ws:

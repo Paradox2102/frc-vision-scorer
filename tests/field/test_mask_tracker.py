@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from web.field.sam2_tracker import (
+from web.field.mask_tracker import (
     mask_to_box,
     bottom_center,
     mask_bottom_center,
@@ -60,28 +60,28 @@ def test_match_new_detections_flags_unmatched():
 
 
 def test_mask_corroborated_true_when_box_overlaps():
-    from web.field.sam2_tracker import mask_corroborated
+    from web.field.mask_tracker import mask_corroborated
     mask = np.zeros((20, 60), bool)
     mask[2:6, 6:10] = True
     assert mask_corroborated(mask, [(6, 2, 10, 6)], (60, 20), ios_thresh=0.3) is True
 
 
 def test_mask_corroborated_false_when_no_box_overlaps():
-    from web.field.sam2_tracker import mask_corroborated
+    from web.field.mask_tracker import mask_corroborated
     mask = np.zeros((20, 60), bool)
     mask[2:6, 6:10] = True
     assert mask_corroborated(mask, [(40, 2, 44, 6)], (60, 20), ios_thresh=0.3) is False
 
 
 def test_mask_corroborated_false_when_no_boxes():
-    from web.field.sam2_tracker import mask_corroborated
+    from web.field.mask_tracker import mask_corroborated
     mask = np.zeros((20, 60), bool)
     mask[2:6, 6:10] = True
     assert mask_corroborated(mask, [], (60, 20), ios_thresh=0.3) is False
 
 
 def test_mask_corroborated_ignores_color_conflicting_box():
-    from web.field.sam2_tracker import mask_corroborated
+    from web.field.mask_tracker import mask_corroborated
     mask = np.zeros((20, 60), bool)
     mask[2:6, 6:10] = True
     box = (6, 2, 10, 6)
@@ -96,7 +96,7 @@ def _rect_mask(x1, y1, x2, y2, wh=(10, 10)):
 
 
 # ---------------------------------------------------------------------------
-# Task 1.2 — Sam2FieldTracker stub tests
+# Task 1.2 — MaskFieldTracker stub tests
 # ---------------------------------------------------------------------------
 
 class FakeTensor:
@@ -129,7 +129,7 @@ def _make_mask_array(H: int, W: int, rects: list[tuple[int, int, int, int]]) -> 
 
 
 class StubPredictor:
-    """GPU-free SAM2 predictor stub for unit testing Sam2FieldTracker."""
+    """GPU-free SAM2 predictor stub for unit testing MaskFieldTracker."""
 
     H = 20
     W = 30
@@ -224,10 +224,10 @@ class RepromptStubPredictor:
 
 def test_reprompt_adds_new_robot_and_tracks_it_forward():
     """A robot detected at a chunk boundary becomes a new tracked object."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     # detect_fn always reports: one box overlapping obj 1 (already tracked) and
     # one box at obj 3's location (a genuinely new robot).
@@ -268,10 +268,10 @@ def test_reprompt_adds_new_robot_and_tracks_it_forward():
 def test_reprompt_respects_max_objects_cap():
     """No new objects are added once the cap is reached and the tracked
     objects are corroborated (healthy masks are never evicted)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         # Corroborate both tracked objects; report one genuinely new robot.
@@ -311,7 +311,7 @@ def _new_obj_seed_frame(add_calls, obj_id):
 def test_opening_dense_reprompt_seeds_new_robot_sooner():
     """During the opening window a smaller reprompt step seeds a newly
     detected robot at an EARLIER frame than the normal reprompt interval."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     overlap_box = RepromptStubPredictor()._rect_for(1)  # matches tracked obj 1
     new_box = RepromptStubPredictor()._rect_for(3)      # unmatched -> new robot
@@ -329,7 +329,7 @@ def test_opening_dense_reprompt_seeds_new_robot_sooner():
 
     def run(dense):
         stub = RepromptStubPredictor()
-        tracker = Sam2FieldTracker(predictor=stub)
+        tracker = MaskFieldTracker(predictor=stub)
         kwargs = dict(
             frames_dir="ignored_by_stub",
             prompt_idx=0,
@@ -357,10 +357,10 @@ def test_opening_window_reverts_after_window():
     """The dense step applies only while (cursor-bootstrap_idx) <
     opening_window_frames; later chunks fall back to reprompt_every."""
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = _LongRepromptStub()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diagnostics = IdentityDiagnosticRecorder()
 
     tracker.track(
@@ -391,11 +391,11 @@ def test_opening_dense_disabled_by_default():
     """With the feature off (default kwargs) the add_calls and chunk boundaries
     are byte-identical to a run that never knew about the feature."""
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     def run(**extra):
         stub = _LongRepromptStub()
-        tracker = Sam2FieldTracker(predictor=stub)
+        tracker = MaskFieldTracker(predictor=stub)
         diagnostics = IdentityDiagnosticRecorder()
         tracker.track(
             frames_dir="ignored_by_stub",
@@ -424,13 +424,13 @@ def test_opening_dense_disabled_by_default():
 
 
 def test_empty_initial_prompt_bootstraps_from_later_detection(tmp_path):
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     for idx in range(RepromptStubPredictor.NUM_FRAMES):
         (tmp_path / f"{idx:05d}.jpg").touch()
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     calls = []
 
     def detect_fn(local_idx, frame_path):
@@ -459,10 +459,10 @@ def test_empty_initial_prompt_bootstraps_from_later_detection(tmp_path):
 
 
 def test_initial_prompt_propagates_backward_before_forward():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     result = tracker.track(
         frames_dir="ignored_by_stub",
@@ -480,10 +480,10 @@ def test_initial_prompt_propagates_backward_before_forward():
 
 def test_capped_boundary_does_not_reference_uninitialized_detections():
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diagnostics = IdentityDiagnosticRecorder()
 
     tracker.track(
@@ -499,10 +499,10 @@ def test_capped_boundary_does_not_reference_uninitialized_detections():
 
 def test_no_reprompt_when_detect_fn_absent_is_single_pass():
     """Without reprompt_every/detect_fn, track() runs a single-pass propagation."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = StubPredictor()  # original single-pass stub: propagate_in_video(state)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     result = tracker.track(
         frames_dir="ignored_by_stub",
@@ -514,12 +514,12 @@ def test_no_reprompt_when_detect_fn_absent_is_single_pass():
     assert set(result[0].keys()) == {1, 2}
 
 
-def test_sam2_field_tracker_returns_correct_structure():
-    """Sam2FieldTracker with a stub predictor produces the expected nested dict."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+def test_mask_field_tracker_returns_correct_structure():
+    """MaskFieldTracker with a stub predictor produces the expected nested dict."""
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = StubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     # prompt_boxes: two arbitrary boxes (values don't matter; stub ignores them)
     prompt_boxes = [(2, 2, 6, 6), (15, 3, 20, 8)]
@@ -605,8 +605,8 @@ class AbsentStubPredictor:
         pass
 
 
-def test_sam2_tracker_active_vs_lifetime_limits():
-    from web.field.sam2_tracker import Sam2FieldTracker
+def test_mask_tracker_active_vs_lifetime_limits():
+    from web.field.mask_tracker import MaskFieldTracker
     
     # 6 objects prompted initially at frame 0.
     # schedule:
@@ -626,7 +626,7 @@ def test_sam2_tracker_active_vs_lifetime_limits():
     }
     
     stub = AbsentStubPredictor(schedule, num_frames=7)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     
     def detect_fn(local_idx, frame_path):
         return [((42, 2, 46, 6), "blue")]
@@ -648,8 +648,8 @@ def test_sam2_tracker_active_vs_lifetime_limits():
     assert 7 in result[6]
 
 
-def test_sam2_tracker_evidence_generation():
-    from web.field.sam2_tracker import Sam2FieldTracker
+def test_mask_tracker_evidence_generation():
+    from web.field.mask_tracker import MaskFieldTracker
     
     # schedule:
     # Frame 0: obj 1, 2 visible
@@ -667,7 +667,7 @@ def test_sam2_tracker_evidence_generation():
     }
     
     stub = AbsentStubPredictor(schedule, num_frames=6)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     
     def detect_fn(local_idx, frame_path):
         # At frame 2, report a new box at position 3
@@ -738,11 +738,11 @@ class ProbsFourTupleStub:
         pass
 
 
-def test_sam2_tracker_carries_tracker_prob_from_four_tuples():
-    from web.field.sam2_tracker import Sam2FieldTracker
+def test_mask_tracker_carries_tracker_prob_from_four_tuples():
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = ProbsFourTupleStub()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     result = tracker.track(
         frames_dir="ignored_by_stub",
         prompt_idx=0,
@@ -754,7 +754,7 @@ def test_sam2_tracker_carries_tracker_prob_from_four_tuples():
 
 
 def test_sam2_diagnostics_logging():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
     
     schedule = {
@@ -767,7 +767,7 @@ def test_sam2_diagnostics_logging():
     }
     
     stub = AbsentStubPredictor(schedule, num_frames=6)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = IdentityDiagnosticRecorder()
     
     def detect_fn(local_idx, frame_path):
@@ -841,9 +841,9 @@ class CullStubPredictor:
 
 
 def test_detector_runs_at_capped_boundary_when_cull_enabled():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     calls = []
 
     def detect_fn(local_idx, frame_path):
@@ -863,9 +863,9 @@ def test_detector_runs_at_capped_boundary_even_when_cull_disabled():
     """The detector always runs at chunk boundaries. Skipping it while the
     roster was capped (the old behavior) made the tracker blind to new robots
     for as long as stale masks pinned the active set — with zero diagnostics."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     calls = []
 
     def detect_fn(local_idx, frame_path):
@@ -884,16 +884,16 @@ def test_detector_runs_at_capped_boundary_even_when_cull_disabled():
 def test_capped_unmatched_detection_logs_roster_cap_rejection():
     """With the roster capped by corroborated (healthy) objects, an unmatched
     detection is rejected with a visible roster_cap diagnostic — not silently."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
         # Corroborate both tracked objects; report one unmatched new robot.
         return [stub._rect_for(1), stub._rect_for(2), stub._rect_for(15)]
 
-    from web.field.sam2_tracker import bottom_center
+    from web.field.mask_tracker import bottom_center
     tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
         prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
@@ -910,9 +910,9 @@ def test_capped_unmatched_detection_logs_roster_cap_rejection():
 def test_eviction_frees_slot_for_uncorroborated_stationary_object():
     """An unmatched fresh detection evicts the least-corroborated stationary
     object when the roster is capped — even with the spontaneous cull disabled."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -944,9 +944,9 @@ def test_moving_uncorroborated_object_evicted_after_min_absences():
     the detector repeatedly fails to back (a referee hijack) loses its slot to
     a fresh detector-backed newcomer — but never on its first absence, and a
     higher min_absences bar restores the old keep-moving-objects behavior."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor(moving={2})
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -975,7 +975,7 @@ def test_moving_uncorroborated_object_evicted_after_min_absences():
 
     # With the bar raised out of reach, the moving object keeps its slot.
     stub2 = CullStubPredictor(moving={2})
-    tracker2 = Sam2FieldTracker(predictor=stub2)
+    tracker2 = MaskFieldTracker(predictor=stub2)
     diag2 = _ident_diag()
     tracker2.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -992,9 +992,9 @@ def test_moving_uncorroborated_object_evicted_after_min_absences():
 
 
 def test_eviction_disabled_via_flag():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1016,7 +1016,7 @@ def test_eviction_disabled_via_flag():
 
 def test_pick_evictable_prefers_most_absent_stationary():
     from collections import deque
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     hist = {
         1: deque([True, True, True], maxlen=5),          # corroborated
         2: deque([False, False, False], maxlen=5),        # absent, stationary
@@ -1059,9 +1059,9 @@ def test_match_new_detections_small_mask_still_claims_small_box():
 def test_seed_gate_fn_blocks_seeding_with_diagnostic():
     """A detection failing seed_gate_fn (e.g. inside a static-structure zone)
     is never seeded as a new object, with a visible static_structure rejection."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     gated_box = stub._rect_for(3)
 
@@ -1086,9 +1086,9 @@ def test_color_backfill_after_two_consecutive_corroborations():
     """An unknown-colored object inherits the color of the bumper detections
     that corroborate its mask on 2 consecutive evidence boundaries — so a robot
     seeded from a colorless whole-robot gap-fill stops being 'unknown' forever."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     metadata = {1: "blue", 2: "unknown"}
 
@@ -1111,9 +1111,9 @@ def test_color_backfill_after_two_consecutive_corroborations():
 
 def test_color_backfill_requires_two_votes():
     """A single colored corroboration is not enough to commit a color."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     metadata = {1: "blue", 2: "unknown"}
     calls = {"n": 0}
 
@@ -1134,9 +1134,9 @@ def test_color_backfill_requires_two_votes():
 
 def test_color_backfill_conflict_resets_votes():
     """Alternating colors (two robots overlapping the mask) never backfill."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     # Objects 1 and 2 prompted; obj 2 is the unknown one under test.
     metadata = {1: "blue", 2: "unknown"}
     calls = {"n": 0}
@@ -1156,9 +1156,9 @@ def test_color_backfill_conflict_resets_votes():
 
 
 def test_color_backfill_never_overrides_definite_color():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     metadata = {1: "red", 2: "blue"}
 
     def detect_fn(local_idx, frame_path):
@@ -1177,9 +1177,9 @@ def test_color_backfill_never_overrides_definite_color():
 def test_seed_gated_box_still_corroborates_mask():
     """A gate-blocked detection must still corroborate an existing mask —
     a robot parked inside a zone is detector-PRESENT, never cull/evict bait."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1203,10 +1203,10 @@ def test_detector_exception_is_unavailable_no_candidates_no_seed():
     """A detect_fn that raises is treated as detector-unavailable: no reprompt
     candidates are logged and no new objects are seeded that boundary."""
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = IdentityDiagnosticRecorder()
 
     def detect_fn(local_idx, frame_path):
@@ -1246,9 +1246,9 @@ def _culled_ids(diagnostics):
 
 
 def test_cull_removes_uncorroborated_stationary_object():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1273,9 +1273,9 @@ def test_cull_removes_uncorroborated_stationary_object():
 
 
 def test_cull_spares_moving_object_even_if_uncorroborated():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor(moving={2})
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     result = tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -1289,9 +1289,9 @@ def test_cull_spares_moving_object_even_if_uncorroborated():
 
 
 def test_cull_spares_corroborated_stationary_object():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     result = tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -1306,9 +1306,9 @@ def test_cull_spares_corroborated_stationary_object():
 
 
 def test_cull_fires_despite_one_early_corroboration():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     seen = {"n": 0}
 
@@ -1327,9 +1327,9 @@ def test_cull_fires_despite_one_early_corroboration():
 
 
 def test_detector_outage_does_not_cull():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     result = tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -1344,9 +1344,9 @@ def test_detector_outage_does_not_cull():
 
 
 def test_cull_frees_active_slot_and_real_robot_reseeds():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor(moving={3})
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1367,9 +1367,9 @@ def test_cull_frees_active_slot_and_real_robot_reseeds():
 
 
 def test_cull_does_not_reseed_when_lifetime_capped():
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor(moving={3})
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1390,9 +1390,9 @@ def test_cull_does_not_reseed_when_lifetime_capped():
 
 
 def test_none_projection_is_conservative():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -1406,7 +1406,7 @@ def test_none_projection_is_conservative():
 
 # ---------------------------------------------------------------------------
 # Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
-# SAM2 mask is geometrically impossible for a robot.
+# SAM mask is geometrically impossible for a robot.
 # ---------------------------------------------------------------------------
 
 
@@ -1442,80 +1442,80 @@ def _climber_robot_mask(H: int = 60, W: int = 30) -> np.ndarray:
 
 
 def test_is_stationary_true_for_fixed_positions():
-    from web.field.sam2_tracker import is_stationary
+    from web.field.mask_tracker import is_stationary
     assert is_stationary([(10.0, 5.0), (10.1, 5.0), (9.95, 5.05)], 0.5) is True
 
 
 def test_is_stationary_false_for_moving_positions():
-    from web.field.sam2_tracker import is_stationary
+    from web.field.mask_tracker import is_stationary
     assert is_stationary([(10.0, 5.0), (11.0, 5.0), (12.0, 5.0)], 0.5) is False
 
 
 def test_is_stationary_false_when_insufficient_known_positions():
-    from web.field.sam2_tracker import is_stationary
+    from web.field.mask_tracker import is_stationary
     assert is_stationary([(10.0, 5.0)], 0.5) is False
     assert is_stationary([None, (10.0, 5.0)], 0.5) is False
     assert is_stationary([None, None], 0.5) is False
 
 
 def test_is_stationary_ignores_none_entries():
-    from web.field.sam2_tracker import is_stationary
+    from web.field.mask_tracker import is_stationary
     assert is_stationary([(10.0, 5.0), None, (10.2, 5.1)], 0.5) is True
 
 
 def test_absent_enough_true_for_persistent_absence():
-    from web.field.sam2_tracker import absent_enough
+    from web.field.mask_tracker import absent_enough
     assert absent_enough([False, False, False], k=3) is True
     assert absent_enough([False, False, False, False], k=3) is True
 
 
 def test_absent_enough_true_despite_one_intermittent_hit():
-    from web.field.sam2_tracker import absent_enough
+    from web.field.mask_tracker import absent_enough
     assert absent_enough([True, False, False, False], k=3) is True
 
 
 def test_absent_enough_false_when_mostly_corroborated():
-    from web.field.sam2_tracker import absent_enough
+    from web.field.mask_tracker import absent_enough
     assert absent_enough([True, True, True], k=3) is False
     assert absent_enough([True, True, False, True], k=3) is False
 
 
 def test_absent_enough_false_before_window_fills():
-    from web.field.sam2_tracker import absent_enough
+    from web.field.mask_tracker import absent_enough
     assert absent_enough([False, False], k=3) is False
 
 
 # ---------------------------------------------------------------------------
 # Mask-shape plausibility — reject field fixtures (radio-on-a-stand) whose
-# SAM2 mask is geometrically impossible for a robot.
+# SAM mask is geometrically impossible for a robot.
 # ---------------------------------------------------------------------------
 
 
 def test_plausible_robot_mask_accepts_solid_blob():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     assert plausible_robot_mask(_solid_robot_mask()) is True
 
 
 def test_plausible_robot_mask_accepts_small_distant_robot():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     m = np.zeros((20, 20), bool)
     m[8:12, 8:12] = True  # tiny solid square — far-away robot
     assert plausible_robot_mask(m) is True
 
 
 def test_plausible_robot_mask_rejects_radio_tadpole():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     assert plausible_robot_mask(_tadpole_mask()) is False
 
 
 def test_plausible_robot_mask_accepts_climbing_robot():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     # Tall and thin overall, but bottom-heavy — a real robot climbing.
     assert plausible_robot_mask(_climber_robot_mask()) is True
 
 
 def test_plausible_robot_mask_accepts_solid_vertical_sliver():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     # A robot mostly occluded to a tall thin strip is still solid (well-filled)
     # and uniform-width, not a top-heavy stalk.
     m = np.zeros((60, 30), bool)
@@ -1524,7 +1524,7 @@ def test_plausible_robot_mask_accepts_solid_vertical_sliver():
 
 
 def test_plausible_robot_mask_empty_is_implausible():
-    from web.field.sam2_tracker import plausible_robot_mask
+    from web.field.mask_tracker import plausible_robot_mask
     assert plausible_robot_mask(np.zeros((10, 10), bool)) is False
 
 
@@ -1555,11 +1555,11 @@ class MaskStubPredictor:
 
 
 def test_tracker_drops_implausible_mask_object():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
 
     stub = MaskStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = IdentityDiagnosticRecorder()
 
     result = tracker.track(
@@ -1642,9 +1642,9 @@ def _reanchored_ids(diagnostics):
 
 
 def test_reanchor_restores_collapsed_mask_under_same_id():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1676,9 +1676,9 @@ def test_reanchor_restores_collapsed_mask_under_same_id():
 def test_reanchor_disabled_seeds_replacement_id():
     """Without re-anchoring the sliver cannot claim the detection
     (SEED_MIN_MASK_AREA_FRAC), so the box churns a NEW object id."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1698,9 +1698,9 @@ def test_reanchor_disabled_seeds_replacement_id():
 
 
 def test_reanchor_refuses_color_conflicting_detection():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=2)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1720,9 +1720,9 @@ def test_reanchor_refuses_color_conflicting_detection():
 
 
 def test_reanchor_leaves_healthy_masks_alone():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ReanchorStubPredictor(collapse_oid=99, collapse_after=99)  # nothing collapses
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1811,9 +1811,9 @@ def test_reanchor_refuses_zombie_resurrection():
     """A long-dead object's noise sliver must NOT capture a live robot's
     detection — the v1 failure mode (qm72: retired obj re-anchored 900+
     frames later onto a robot across the frame)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ZombieStubPredictor(gone_from=3, sliver_from=9, sliver_x=80)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1836,7 +1836,7 @@ def test_reanchor_refuses_zombie_resurrection():
 def test_reanchor_refuses_drifted_sliver():
     """A sliver that drifted far from the object's last healthy position must
     not capture a detection there, even if the collapse is recent."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     class DriftStub(ZombieStubPredictor):
         def _rect_for(self, oid, f):
@@ -1849,7 +1849,7 @@ def test_reanchor_refuses_drifted_sliver():
             return (self.sliver_x, 2, self.sliver_x + 4, 6)
 
     stub = DriftStub(sliver_x=80)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1871,9 +1871,9 @@ def test_reanchor_refuses_drifted_sliver():
 def test_reanchor_in_place_collapse_still_rescued():
     """The guards must not break the intended case: a fresh in-place collapse
     (healthy one boundary ago, detection at the same spot) re-anchors."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
     stub = ReanchorStubPredictor(collapse_oid=1, collapse_after=4)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -1910,7 +1910,7 @@ def test_match_new_detections_with_claims_returns_claimant():
 def test_dark_mask_reanchor_reprompts_same_object():
     """A detection overlapping a dark object's stale mask re-prompts that
     object in place instead of being dropped as already_tracked."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     # obj 1 always visible; obj 2 visible only frames 0-1, dark afterwards.
     schedule = {
@@ -1918,7 +1918,7 @@ def test_dark_mask_reanchor_reprompts_same_object():
         2: [1], 3: [1], 4: [1], 5: [1], 6: [1],
     }
     stub = AbsentStubPredictor(schedule, num_frames=7)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         # The detector still sees both robots at their fixed spots.
@@ -1946,11 +1946,11 @@ def test_dark_mask_reanchor_reprompts_same_object():
 def test_visible_object_detection_not_dark_reanchored():
     """A detection over a currently-visible object stays a plain dedup: no
     extra re-prompt is issued for it."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     schedule = {f: [1, 2] for f in range(7)}  # both always visible
     stub = AbsentStubPredictor(schedule, num_frames=7)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         return [(6, 2, 10, 6), (12, 2, 16, 6)]
@@ -1973,7 +1973,7 @@ def test_pick_evictable_evicts_dark_uncorroborated_object():
     whose stale mask drew no detector support is evictable even when the
     stationary-absence bar (tier 1) is not met."""
     from collections import deque
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
 
     hist = {7: deque([True, False], maxlen=6)}     # only 1 absence -> tier 1 (k=3) can't fire
     window = {7: [(1.0, 1.0), (4.0, 5.0)]}          # moving -> old rule can't fire either
@@ -1988,7 +1988,7 @@ def test_pick_evictable_evicts_moving_never_corroborated():
     """Tier 3: a moving object the detector repeatedly fails to back (e.g. a
     referee hijack) is evictable despite its motion."""
     from collections import deque
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
 
     hist = {3: deque([False, False, True, False], maxlen=6)}
     window = {3: [(1.0, 1.0), (6.0, 4.0)]}          # moving
@@ -2003,7 +2003,7 @@ def test_pick_evictable_never_evicts_just_corroborated():
     """An object the detector backed at the latest boundary is never evicted,
     whatever its history."""
     from collections import deque
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
 
     hist = {5: deque([False, False, False, True], maxlen=6)}
     window = {5: [(1.0, 1.0), (1.0, 1.1)]}          # stationary
@@ -2018,7 +2018,7 @@ def test_pick_evictable_prefers_stationary_absent_over_dark():
     """Tier order: the classic stationary+absent victim wins over a merely
     dark one."""
     from collections import deque
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
 
     hist = {
         1: deque([False, False, False], maxlen=6),   # stationary + absent (tier 1)
@@ -2038,7 +2038,7 @@ def test_pick_evictable_prefers_stationary_absent_over_dark():
 def test_capped_roster_evicts_dark_zombie_for_new_detection():
     """A capped roster holding a dark, detector-orphaned object gives up that
     slot to a fresh detection of a real robot."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     # obj 2 goes dark at frame 2 and the detector NEVER sees anything there.
     schedule = {
@@ -2046,7 +2046,7 @@ def test_capped_roster_evicts_dark_zombie_for_new_detection():
         2: [1], 3: [1], 4: [1], 5: [1], 6: [1],
     }
     stub = AbsentStubPredictor(schedule, num_frames=7)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         # obj 1 corroborated; a NEW robot at a fresh spot (x=30..34).
@@ -2075,14 +2075,14 @@ def test_dark_reanchor_attempts_capped_then_new_seed():
     attempts; afterwards the detection seeds a NEW object id instead of
     re-prompting forever (every prompt accumulates session state — unbounded
     re-prompting OOM'd full-card SAM3 runs)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     # obj 2 visible only at frames 0-1, dark for the rest of a long video.
     schedule = {0: [1, 2], 1: [1, 2]}
     for f in range(2, 12):
         schedule[f] = [1]
     stub = AbsentStubPredictor(schedule, num_frames=12)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         return [(6, 2, 10, 6), (12, 2, 16, 6)]
@@ -2113,7 +2113,7 @@ def test_dark_reanchor_attempts_capped_then_new_seed():
 
 
 def test_box_motion_energy_high_for_moving_object_low_for_static():
-    from web.field.sam2_tracker import box_motion_energy
+    from web.field.mask_tracker import box_motion_energy
     prev = np.zeros((20, 200), np.uint8)
     cur = np.zeros((20, 200), np.uint8)
     # A bright robot-blob that moves 6 px between frames inside the box.
@@ -2131,9 +2131,9 @@ def test_motion_override_seeds_new_object_over_static_claimant():
     """A detection claimed by a STATIONARY mask ("already_tracked") seeds a
     new object anyway when motion_fn proves the detection is moving — the
     static claimant is equipment/hijack, the mover is a robot."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2156,9 +2156,9 @@ def test_motion_override_seeds_new_object_over_static_claimant():
 def test_motion_override_spares_moving_claimant():
     """A claimant mask that is itself moving is a robot following its own
     detection — the override must NOT fire (no duplicate ids)."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor(moving={1})
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2183,9 +2183,9 @@ def test_motion_override_spares_moving_claimant():
 def test_motion_override_ignored_when_candidate_static():
     """motion_fn says the candidate shows no pixel motion: the claimed
     detection stays already_tracked (a parked robot is not equipment)."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2207,9 +2207,9 @@ def test_motion_override_ignored_when_candidate_static():
 
 def test_motion_fn_exception_treated_as_static():
     """A crashing motion_fn must degrade to no-override, never kill tracking."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2237,7 +2237,7 @@ def test_pick_evictable_moving_candidate_relaxes_absence_bar():
     backed recently is immune), even when min_absences/k put every normal
     tier out of reach. Without the moving-candidate flag the same evidence
     evicts nobody."""
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     from collections import deque
     hist = {1: deque([True, False, False]), 2: deque([True, True])}
     window = {1: [(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)],
@@ -2253,7 +2253,7 @@ def test_moving_candidate_evicts_stationary_absentee_when_capped():
     """Roster capped, every normal eviction tier out of reach: an unmatched
     detection that PROVES motion still claims a seat from a stationary object
     the detector failed to back; without motion proof it stays roster_cap."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
 
     def make_detect(stub):
         # Corroborate obj 1 every boundary; obj 2 never; one new mover at 15.
@@ -2269,7 +2269,7 @@ def test_moving_candidate_evicts_stationary_absentee_when_capped():
     )
 
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -2284,7 +2284,7 @@ def test_moving_candidate_evicts_stationary_absentee_when_capped():
     assert any(oid == 3 for (_f, oid) in stub.add_calls)
 
     stub2 = CullStubPredictor()
-    tracker2 = Sam2FieldTracker(predictor=stub2)
+    tracker2 = MaskFieldTracker(predictor=stub2)
     diag2 = _ident_diag()
     tracker2.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -2304,7 +2304,7 @@ def test_make_frame_diff_motion_fn_reads_exported_frames(tmp_path):
     True where pixels moved between local_idx-1 and local_idx, False in
     static regions, False (never raising) when a frame is missing."""
     import cv2
-    from web.field.sam2_tracker import make_frame_diff_motion_fn
+    from web.field.mask_tracker import make_frame_diff_motion_fn
     prev = np.zeros((20, 200, 3), np.uint8)
     cur = np.zeros((20, 200, 3), np.uint8)
     prev[4:12, 60:80] = 200
@@ -2325,7 +2325,7 @@ def test_pick_evictable_motion_never_evicts_recently_corroborated():
     last two boundaries is immune to motion-driven (tier 2.5) eviction — a
     parked robot missing one boundary read must not lose its seat to a
     motion-only candidate (ball cluster / misread)."""
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     from collections import deque
     hist = {1: deque([False, True, False]),   # corroborated one boundary ago
             2: deque([True, False, False])}   # absent last TWO boundaries
@@ -2347,8 +2347,8 @@ def test_pick_evictable_motion_never_evicts_recently_corroborated():
 # ---------------------------------------------------------------------------
 
 def _track_with_person_fn(stub, person_fn, **overrides):
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
-    tracker = Sam2FieldTracker(predictor=stub)
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     kwargs = dict(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -2429,7 +2429,7 @@ def test_cull_enabled_for_view_scopes_to_main():
     """Main-view scoping: mid-field equipment is fully visible to main-view
     YOLO (absence there is strong evidence); corner-view objects are the
     qm24 false-cull victims and stay exempt."""
-    from web.field.sam2_tracker import cull_enabled_for_view
+    from web.field.mask_tracker import cull_enabled_for_view
     assert cull_enabled_for_view(True, "main", main_only=True) is True
     assert cull_enabled_for_view(True, "corner_left", main_only=True) is False
     assert cull_enabled_for_view(True, "corner_left", main_only=False) is True
@@ -2451,9 +2451,9 @@ def test_zone_gated_detection_does_not_corroborate():
     """Object 2 is stationary and 'detected' every boundary, but the gate
     rejects those detections (equipment zone) -> absence accumulates -> the
     cull fires exactly as if the detector had never seen it."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2481,9 +2481,9 @@ def test_zone_gated_detection_does_not_corroborate():
 def test_corrob_gate_error_fails_open():
     """A crashing corrob_gate_fn must degrade to normal corroboration (no
     cull) — never to mass blinding."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def corrob_gate_fn(box):
@@ -2508,9 +2508,9 @@ def test_corrob_only_detection_survives_gate_filter():
     corroboration — the gate filter runs over the combined (seedable +
     corrob-only) evidence, so a gate-passing corrob-only box keeps its
     object alive instead of being silently dropped."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2552,32 +2552,32 @@ def test_corrob_only_detection_survives_gate_filter():
 
 
 def test_plausible_seed_box_rejects_tall_thin_sliver():
-    from web.field.sam2_tracker import plausible_seed_box
+    from web.field.mask_tracker import plausible_seed_box
     # The qm12 sliver: 13.7w x 61.1h, aspect 4.47 — rejected at max_aspect=3.0.
     assert plausible_seed_box((320.8, 145.0, 334.5, 206.1), 3.0) is False
 
 
 def test_plausible_seed_box_keeps_square_box():
-    from web.field.sam2_tracker import plausible_seed_box
+    from web.field.mask_tracker import plausible_seed_box
     # A 4x4 robot box (aspect 1.0) is kept.
     assert plausible_seed_box((10, 2, 14, 6), 3.0) is True
 
 
 def test_plausible_seed_box_keeps_wide_box():
-    from web.field.sam2_tracker import plausible_seed_box
+    from web.field.mask_tracker import plausible_seed_box
     # A wide box (aspect < 1) is kept.
     assert plausible_seed_box((10, 2, 40, 10), 3.0) is True
 
 
 def test_plausible_seed_box_rejects_degenerate_box():
-    from web.field.sam2_tracker import plausible_seed_box
+    from web.field.mask_tracker import plausible_seed_box
     assert plausible_seed_box((10, 2, 10, 6), 3.0) is False   # zero width
     assert plausible_seed_box((10, 6, 14, 6), 3.0) is False   # zero height
     assert plausible_seed_box((14, 6, 10, 2), 3.0) is False   # inverted
 
 
 def test_plausible_seed_box_keeps_tall_box_just_under_threshold():
-    from web.field.sam2_tracker import plausible_seed_box
+    from web.field.mask_tracker import plausible_seed_box
     # 4w x 11h -> aspect 2.75 < 3.0 -> kept.
     assert plausible_seed_box((10, 2, 14, 13), 3.0) is True
 
@@ -2590,9 +2590,9 @@ _SLIVER_BOX = (150, 2, 154, 30)
 def test_implausible_seed_box_never_seeds_or_evicts():
     """A tall-thin static detection must not seed a new object NOR evict a real
     track, even when the roster is capped and the sliver is unmatched."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2627,9 +2627,9 @@ def test_implausible_seed_box_never_seeds_or_evicts():
 def test_seed_box_gate_disabled_by_default():
     """With the gate off (default kwargs) the identical scenario evicts obj 2
     and seeds obj 3 — proves default behavior is unchanged."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2656,11 +2656,11 @@ def test_static_candidate_cannot_evict_when_motion_required():
     """With evict_requires_motion=True and a motion_fn reporting the candidate
     static, eviction is skipped (candidate falls through to roster_cap). With
     motion_fn reporting motion, eviction proceeds."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
 
     # --- static candidate: no eviction ---
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2691,7 +2691,7 @@ def test_static_candidate_cannot_evict_when_motion_required():
 
     # --- moving candidate: eviction proceeds ---
     stub2 = CullStubPredictor()
-    tracker2 = Sam2FieldTracker(predictor=stub2)
+    tracker2 = MaskFieldTracker(predictor=stub2)
     diag2 = _ident_diag()
     tracker2.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -2713,9 +2713,9 @@ def test_static_candidate_cannot_evict_when_motion_required():
 def test_evict_requires_motion_noop_without_motion_fn():
     """evict_requires_motion=True with motion_fn=None must NOT disable eviction
     — the gate only blocks when motion evidence is actually available."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
 
     def detect_fn(local_idx, frame_path):
@@ -2744,13 +2744,13 @@ def test_evict_requires_motion_noop_without_motion_fn():
 def test_bootstrap_rejects_implausible_seed_box(tmp_path):
     """The bootstrap seeding path also filters implausible boxes: a tall-thin
     box in the first detection is skipped while a plausible box is seeded."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     for idx in range(CullStubPredictor.NUM_FRAMES):
         (tmp_path / f"{idx:05d}.jpg").touch()
 
     stub = CullStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         if local_idx == 0:
@@ -2794,7 +2794,7 @@ def test_bootstrap_rejects_implausible_seed_box(tmp_path):
 
 
 def test_leak_cleanup_drops_small_far_blob():
-    from web.field.sam2_tracker import clean_disconnected_leaks
+    from web.field.mask_tracker import clean_disconnected_leaks
     mask = np.zeros((40, 60), bool)
     mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
     mask[2:5, 50:55] = True     # small (15px < 15% of 400) + far (gap > 10px)
@@ -2812,7 +2812,7 @@ def test_leak_cleanup_keeps_large_far_blob():
     wrongly dropped this component, shifting box bottom-center. area >= 15% of
     the largest keeps it despite the gap.
     """
-    from web.field.sam2_tracker import clean_disconnected_leaks
+    from web.field.mask_tracker import clean_disconnected_leaks
     mask = np.zeros((40, 60), bool)
     mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
     mask[10:26, 44:54] = True   # 16x10 = 160px (>= 15% of 400) but far (gap>10)
@@ -2826,7 +2826,7 @@ def test_leak_cleanup_keeps_large_far_blob():
 def test_leak_cleanup_keeps_small_adjacent_blob():
     """A small blob touching/near the body (a robot arm) is KEPT — small but
     NOT detached (bbox gap <= gap_px)."""
-    from web.field.sam2_tracker import clean_disconnected_leaks
+    from web.field.mask_tracker import clean_disconnected_leaks
     mask = np.zeros((40, 60), bool)
     mask[10:30, 10:30] = True   # big blob (400px), bbox (10,10,30,30)
     # Small 4x3 = 12px (< 15% of 400) but only ~2px from the body's right edge.
@@ -2837,7 +2837,7 @@ def test_leak_cleanup_keeps_small_adjacent_blob():
 
 
 def test_leak_cleanup_single_blob_unchanged():
-    from web.field.sam2_tracker import clean_disconnected_leaks
+    from web.field.mask_tracker import clean_disconnected_leaks
     mask = np.zeros((20, 20), bool)
     mask[3:9, 4:11] = True
     cleaned = clean_disconnected_leaks(mask)
@@ -2845,7 +2845,7 @@ def test_leak_cleanup_single_blob_unchanged():
 
 
 def test_leak_cleanup_empty_unchanged():
-    from web.field.sam2_tracker import clean_disconnected_leaks
+    from web.field.mask_tracker import clean_disconnected_leaks
     mask = np.zeros((10, 10), bool)
     cleaned = clean_disconnected_leaks(mask)
     assert not cleaned.any()
@@ -2909,10 +2909,10 @@ class _LeakStubPredictor(RepromptStubPredictor):
 def test_mask_leak_cleanup_untangles_stretched_box():
     """With the knob on, object 1's emitted box tightens to its primary blob;
     the union box that spans the small, detached leak is gone."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = _LeakStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     result = tracker.track(
         frames_dir="ignored_by_stub",
@@ -2937,10 +2937,10 @@ def test_mask_leak_cleanup_untangles_stretched_box():
 def test_mask_leak_cleanup_runs_without_error_on_plain_stub():
     """The knob on a normal single-blob stub runs without error and still
     produces the expected boxes (no-crash regression)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     result = tracker.track(
         frames_dir="ignored_by_stub",
         prompt_idx=0,
@@ -2959,11 +2959,11 @@ def test_mask_leak_cleanup_runs_without_error_on_plain_stub():
 def test_mask_leak_cleanup_default_off_byte_identical():
     """Default kwargs and explicit mask_leak_cleanup=False produce
     identical results and add_calls (back-compat)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     def run(**extra):
         stub = _LeakStubPredictor()
-        tracker = Sam2FieldTracker(predictor=stub)
+        tracker = MaskFieldTracker(predictor=stub)
         result = tracker.track(
             frames_dir="ignored_by_stub",
             prompt_idx=0,
@@ -3015,8 +3015,8 @@ def test_size_prior_violation_band():
 # ---------------------------------------------------------------------------
 
 def _track_with_expected_px(stub, expected_px_fn, **overrides):
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
-    tracker = Sam2FieldTracker(predictor=stub)
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
+    tracker = MaskFieldTracker(predictor=stub)
     diag = _ident_diag()
     kwargs = dict(
         frames_dir="ignored_by_stub", prompt_idx=0,
@@ -3107,10 +3107,10 @@ def test_size_prior_cull_requires_sustained_violation():
 def test_track_should_stop_aborts_forward_propagation():
     """When ``should_stop`` returns True the forward pass raises TrackStopped
     at the next per-frame poll instead of running to the end of the video."""
-    from web.field.sam2_tracker import Sam2FieldTracker, TrackStopped
+    from web.field.mask_tracker import MaskFieldTracker, TrackStopped
 
     stub = StubPredictor()  # 3 frames, 2 objects, forward-only (no reprompt)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     seen = {"n": 0}
 
@@ -3132,10 +3132,10 @@ def test_track_should_stop_aborts_forward_propagation():
 
 def test_track_should_stop_none_runs_to_completion():
     """Default (should_stop=None) is a no-op — full propagation, no raise."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = StubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     result = tracker.track(
         frames_dir="ignored_by_stub",
         prompt_idx=0,
@@ -3147,12 +3147,12 @@ def test_track_should_stop_none_runs_to_completion():
 
 def test_track_should_stop_resets_predictor_state_on_abort():
     """The ``finally`` cleanup (reset_state) still runs when should_stop fires."""
-    from web.field.sam2_tracker import Sam2FieldTracker, TrackStopped
+    from web.field.mask_tracker import MaskFieldTracker, TrackStopped
 
     stub = StubPredictor()
     reset = {"called": False}
     stub.reset_state = lambda state: reset.__setitem__("called", True)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     with pytest.raises(TrackStopped):
         tracker.track(
@@ -3165,7 +3165,7 @@ def test_track_should_stop_resets_predictor_state_on_abort():
 
 
 def test_normalize_detections_accepts_corrob_only_triples():
-    from web.field.sam2_tracker import normalize_detections
+    from web.field.mask_tracker import normalize_detections
     items = [((1, 2, 3, 4), "red"), ((5, 6, 7, 8), "blue", True), (9, 10, 11, 12)]
     boxes, meta, corrob_only = normalize_detections(items)
     assert boxes == [(1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12)]
@@ -3177,10 +3177,10 @@ def test_corrob_only_detection_never_seeds_but_corroborates():
     """A corrob-only box at a new location must NOT create an object, but a
     corrob-only box over a tracked mask must count as corroboration (no
     absence accrues)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     new_box = stub._rect_for(3)       # unmatched location
     overlap_box = stub._rect_for(1)   # over tracked obj 1
 
@@ -3203,13 +3203,13 @@ def test_corrob_only_detection_never_seeds_but_corroborates():
 # tracker_prob bookkeeping: low-prob cull gate + eviction immunity
 # --------------------------------------------------------------------------- #
 def test_mean_or_none():
-    from web.field.sam2_tracker import mean_or_none
+    from web.field.mask_tracker import mean_or_none
     assert mean_or_none([]) is None
     assert mean_or_none([0.5, None, 0.7]) == 0.6
 
 
 def test_pick_evictable_prob_immunity_spares_high_prob_object():
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     from collections import deque
     # obj 1: 2 absences (tier-3 evictable). With high mean prob + immunity
     # threshold it must be spared; without immunity it is the victim.
@@ -3226,7 +3226,7 @@ def test_pick_evictable_prob_immunity_spares_high_prob_object():
 
 
 def test_pick_evictable_prob_immunity_spares_tier1():
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     from collections import deque
     # obj 1: stationary + 3 windowed absences with k=3 -> classic tier-1
     # victim (min_absences left at its permissive default so tier 3 would
@@ -3242,7 +3242,7 @@ def test_pick_evictable_prob_immunity_spares_tier1():
 
 
 def test_pick_evictable_prob_immunity_spares_tier25():
-    from web.field.sam2_tracker import pick_evictable
+    from web.field.mask_tracker import pick_evictable
     from collections import deque
     # obj 1: stationary, hist[-2] is False (unproven at the prior boundary)
     # and hist[-1] is False (absent now), but only 3 absences against an
@@ -3261,7 +3261,7 @@ def test_pick_evictable_prob_immunity_spares_tier25():
 
 
 def test_negative_points_for_picks_nearby_neighbor_centers():
-    from web.field.sam2_tracker import negative_points_for
+    from web.field.mask_tracker import negative_points_for
     target = (10, 10, 20, 20)
     others = [
         (21, 10, 27, 20),    # adjacent -> center (24, 15) inside 1.5x inflation
@@ -3272,7 +3272,7 @@ def test_negative_points_for_picks_nearby_neighbor_centers():
 
 
 def test_negative_points_for_caps_and_orders_by_distance():
-    from web.field.sam2_tracker import negative_points_for
+    from web.field.mask_tracker import negative_points_for
     target = (0, 0, 10, 10)
     others = [(10 + i, 0, 12 + i, 4) for i in range(6)]  # 6 near neighbors
     pts = negative_points_for(target, others, max_points=4)
@@ -3285,7 +3285,7 @@ def test_negative_points_for_caps_and_orders_by_distance():
 def test_prompt_with_negatives_falls_back_when_predictor_lacks_points():
     """Stub predictors (and legacy paths) accept only box=; the helper must
     degrade to a box-only prompt instead of crashing."""
-    from web.field.sam2_tracker import _prompt_with_negatives
+    from web.field.mask_tracker import _prompt_with_negatives
 
     class BoxOnly:
         def __init__(self): self.calls = []
@@ -3301,7 +3301,7 @@ def test_prompt_with_negatives_propagates_real_error_from_supporting_predictor()
     """A predictor whose add_new_points_or_box accepts points/labels but
     raises for an internal reason must have that error propagate -- it must
     NOT be swallowed and silently retried as a box-only call."""
-    from web.field.sam2_tracker import _prompt_with_negatives
+    from web.field.mask_tracker import _prompt_with_negatives
 
     class BuggyPointsPredictor:
         def __init__(self): self.calls = []
@@ -3340,7 +3340,7 @@ def _hw_rect_mask(H, W, r):
 
 
 def test_best_partial_claimant_finds_drifted_healthy_mask():
-    from web.field.sam2_tracker import best_partial_claimant
+    from web.field.mask_tracker import best_partial_claimant
     H, W = 20, 60
     # healthy mask at x 0-10; detection box at x 6-16 -> partial overlap
     mask = _hw_rect_mask(H, W, (0, 2, 10, 12))
@@ -3353,7 +3353,7 @@ def test_best_partial_claimant_finds_drifted_healthy_mask():
 
 
 def test_best_partial_claimant_rejects_color_conflict_and_slivers():
-    from web.field.sam2_tracker import best_partial_claimant
+    from web.field.mask_tracker import best_partial_claimant
     H, W = 20, 60
     mask = _hw_rect_mask(H, W, (0, 2, 10, 12))
     box_mask = _hw_rect_mask(H, W, (6, 2, 16, 12))
@@ -3373,7 +3373,7 @@ def test_misalign_drift_box_ios_lands_in_band():
     """Sanity-check the RepromptStubPredictor geometry used below: the drift
     box's IoS over obj 1's static rect (6,2,10,6) must land in [0.2, 0.5) —
     inside the misalign band and below new_obj_ios_thresh (0.5)."""
-    from web.field.sam2_tracker import _ios
+    from web.field.mask_tracker import _ios
     H, W = 20, 60
     obj1 = _hw_rect_mask(H, W, (6, 2, 10, 6))
     drift_box = _hw_rect_mask(H, W, (9, 2, 15, 6))
@@ -3384,10 +3384,10 @@ def test_misalign_drift_box_ios_lands_in_band():
 def test_misalign_reanchor_reprompts_same_id_after_streak():
     """A detection persistently half-overlapping a healthy tracked mask must
     re-prompt that SAME object id (no new id churn) once the streak is met."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     # obj 1's stub mask sits at x in [6,10); a box at x 9-15 overlaps it
     # at IoS 0.25 -- inside [0.2, 0.5) per the sanity check above.
     drift_box = (9, 2, 15, 6)
@@ -3409,13 +3409,13 @@ def test_misalign_reanchor_reprompts_same_id_after_streak():
 def test_misalign_reanchor_disabled_by_default_is_inert():
     """misalign_reanchor defaults OFF: the same drifting-detection scenario
     produces byte-identical add_calls whether or not the kwarg is mentioned."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     drift_box = (9, 2, 15, 6)
 
     def run(**extra):
         stub = RepromptStubPredictor()
-        tracker = Sam2FieldTracker(predictor=stub)
+        tracker = MaskFieldTracker(predictor=stub)
 
         def detect_fn(local_idx, frame_path):
             return [(drift_box, "blue")]
@@ -3496,10 +3496,10 @@ def test_late_seed_backfill_default_off_no_early_frames():
     """Without late_seed_backfill, a late-seeded object has no history before
     the boundary it was seeded at — the pre-existing forward-only behavior is
     byte-identical."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     stub = RepromptStubPredictor()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     overlap_box = stub._rect_for(1)
     new_box = stub._rect_for(3)
 
@@ -3522,12 +3522,12 @@ def test_late_seed_backfill_recovers_pre_seed_history_without_clobbering():
     """ON: masks appear before the seed frame with evidence type
     'backfilled', and pre-existing objects' entries in those same frames are
     left untouched (merge, never clobber)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
     back_visible = {3: {0, 1, 2, 3, 4}}
     stub = BackfillStubPredictor(rects, back_visible, num_frames=8)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         if local_idx == 4:
@@ -3560,7 +3560,7 @@ def test_late_seed_backfill_stops_at_dark_streak():
     """Backward propagation gives up after BACKFILL_DARK_STOP consecutive
     frames with no recovered mask, even though an earlier frame in the
     requested span could (per the stub) still produce one."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (40, 2, 45, 7)}
     # Visible at the seed frame (8) and one before (7); dark for the next 4
@@ -3568,7 +3568,7 @@ def test_late_seed_backfill_stops_at_dark_streak():
     # before reaching frame 1, even though frame 1 is (per the stub) visible.
     back_visible = {3: {8, 7, 1}}
     stub = BackfillStubPredictor(rects, back_visible, num_frames=14)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         if local_idx == 8:
@@ -3597,12 +3597,12 @@ def test_late_seed_backfill_skips_short_lived_object():
     """An object whose lived span (last_visible - first_prompted) is below
     backfill_min_lived_frames is never backfilled — short-lived seeds are
     frequently roster pollution from a static structure (qm12)."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
     back_visible = {3: {0, 1, 2, 3, 4}}   # fully recoverable per the stub
     stub = BackfillStubPredictor(rects, back_visible, num_frames=8)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         if local_idx == 4:
@@ -3626,7 +3626,7 @@ def test_late_seed_backfill_skips_culled_object():
     a hijacked/junk track, and it must not even reach the reverse-propagate
     call (CullStubPredictor.propagate_in_video doesn't accept ``reverse=``, so
     reaching it for this object would raise instead of silently no-op'ing)."""
-    from web.field.sam2_tracker import Sam2FieldTracker, bottom_center
+    from web.field.mask_tracker import MaskFieldTracker, bottom_center
 
     stub = CullStubPredictor()
     new_box = (150, 2, 154, 6)  # unmatched -> seeds a NEW object (id 3)
@@ -3637,7 +3637,7 @@ def test_late_seed_backfill_skips_culled_object():
         return [stub._rect_for(1), stub._rect_for(2)]  # obj 3 never re-corroborated
 
     diag = _ident_diag()
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
     tracker.track(
         frames_dir="ignored_by_stub", prompt_idx=0,
         prompt_boxes=[stub._rect_for(1), stub._rect_for(2)],
@@ -3661,7 +3661,7 @@ def test_late_seed_backfill_overlap_guard_drops_double_counted_mask():
     stored in that frame is dropped — it is most likely a re-detection of the
     already-tracked robot under a new id, and storing it would double-count
     the same robot in fusion."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     rects = {1: (2, 2, 6, 6), 2: (15, 3, 20, 8), 3: (30, 2, 35, 7)}
     back_visible = {3: {0, 1, 2, 3, 4}}
@@ -3669,7 +3669,7 @@ def test_late_seed_backfill_overlap_guard_drops_double_counted_mask():
     # on top of object 1's mask (full overlap, IoS 1.0 > BACKFILL_OVERLAP_IOS).
     back_rects = {(3, 1): rects[1]}
     stub = BackfillStubPredictor(rects, back_visible, back_rects, num_frames=8)
-    tracker = Sam2FieldTracker(predictor=stub)
+    tracker = MaskFieldTracker(predictor=stub)
 
     def detect_fn(local_idx, frame_path):
         if local_idx == 4:

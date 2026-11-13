@@ -334,7 +334,7 @@
   <h2>Robot-tracking top crop <span style="font-weight:normal;color:#c89b3c;font-size:.8em;">— disabled, under review</span></h2>
   <p class="hint">
     <b>Currently disabled.</b> Cropping the top airspace would block false positives up there, but
-    because SAM2 resizes every frame to a fixed square it also distorts robot aspect ratio (squished),
+    because SAM resizes every frame to a fixed square it also distorts robot aspect ratio (squished),
     which may hurt tracking. Parked until we can evaluate that trade-off. The setting still saves, but
     has no effect on tracking while disabled. (For speed, use the VRAM budget on the main page.)
   </p>
@@ -859,7 +859,7 @@ function redrawFrame(){
     ctx.fillText('mask ' + (i+1), x + 3, y + 12);
   });
 
-  // Robot-tracking top-crop band: the airspace SAM2 ignores during tracking.
+  // Robot-tracking top-crop band: the airspace SAM ignores during tracking.
   const cropEl = document.getElementById('topCropRange');
   const cropFrac = cropEl ? (parseFloat(cropEl.value) || 0) : 0;
   if (cropFrac > 0) {

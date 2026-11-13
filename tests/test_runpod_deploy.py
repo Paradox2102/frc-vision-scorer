@@ -56,8 +56,8 @@ def test_knob_env_matches_job_config_registry():
         assert by_name[name].default == profiles.REPO_DEFAULTS[name], name
     # every BASE_ENV knob var is a real knob env (except TEAM_READER's own knob, also real)
     envs = {k.env for k in KNOBS}
-    for var in ("VLLM_PHASE_EXCLUSIVE", "TEAM_READER", "SAM2_DARK_REANCHOR_ENABLED",
-                "SAM2_EVICT_DARK_FRAMES", "SAM2_EVICT_MIN_ABSENCES"):
+    for var in ("VLLM_PHASE_EXCLUSIVE", "TEAM_READER", "SAM3_DARK_REANCHOR_ENABLED",
+                "SAM3_EVICT_DARK_FRAMES", "SAM3_EVICT_MIN_ABSENCES"):
         assert var in envs and var in profiles.BASE_ENV
 
 
@@ -79,11 +79,11 @@ def test_ladder_is_cumulative_and_starts_at_repo_defaults():
         assert cur.knobs == {**prev.knobs, **cur.delta}
         assert cur.delta and cur.rationale
     top = rungs[-1].knobs
-    assert top["corner_track_stride"] == 1 and top["sam2_track_fps"] == 15.0
+    assert top["corner_track_stride"] == 1 and top["sam3_track_fps"] == 15.0
     assert top["sam3_chunk_frames"] == tier.chunk_cap
     # quality only goes up: fps never drops, stride never rises, chunk never shrinks
     for prev, cur in zip(rungs, rungs[1:]):
-        assert cur.knobs["sam2_track_fps"] >= prev.knobs["sam2_track_fps"]
+        assert cur.knobs["sam3_track_fps"] >= prev.knobs["sam3_track_fps"]
         assert cur.knobs["corner_track_stride"] <= prev.knobs["corner_track_stride"]
         assert cur.knobs["sam3_chunk_frames"] >= prev.knobs["sam3_chunk_frames"]
 
@@ -93,7 +93,7 @@ def test_rung_config_validates_against_jobconfig():
     for tier in profiles.TIERS:
         for r in profiles.ladder(tier):
             cfg = JobConfig({**r.config(), "auto_period_only": False})
-            assert cfg.sam2_track_fps == r.knobs["sam2_track_fps"]
+            assert cfg.sam3_track_fps == r.knobs["sam3_track_fps"]
             assert cfg.sam3_chunk_frames == r.knobs["sam3_chunk_frames"]
 
 
@@ -104,7 +104,7 @@ def test_profile_env_render_roundtrip():
     parsed = profiles.parse_env_file(profiles.render_profile_env(env, "hdr"))
     assert parsed == {k: str(v) for k, v in env.items()}
     assert parsed["SAM3_CHUNK_FRAMES"] == str(tier.chunk_cap)
-    assert parsed["SAM2_TRACK_FPS"] == "10.0" and parsed["CORNER_TRACK_STRIDE"] == "2"
+    assert parsed["SAM3_TRACK_FPS"] == "10.0" and parsed["CORNER_TRACK_STRIDE"] == "2"
     assert parsed["VLLM_PHASE_EXCLUSIVE"] == "0" and parsed["FRC_PROFILE_RUNG"] == "R3"
     with pytest.raises(ValueError):
         profiles.render_profile_env({"X": "a b"})

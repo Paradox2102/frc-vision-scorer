@@ -1,4 +1,4 @@
-"""Task 1.4 offline driver: Sam2FieldTracker -> FieldTracker(track_id) end-to-end.
+"""Task 1.4 offline driver: MaskFieldTracker -> FieldTracker(track_id) end-to-end.
 
 Runs real SAM2 GPU tracking over the sidecar segment, feeds the stable track_id
 path through FieldTracker, asserts fixed-6 invariants, and compares continuity
@@ -26,7 +26,7 @@ from ultralytics import YOLO
 from web.field import store as field_store
 from web.field.field_model import FieldModel
 from web.field.tracker import FieldDetection, FieldTracker
-from web.field.sam2_tracker import Sam2FieldTracker
+from web.field.mask_tracker import MaskFieldTracker  # builds the SAM2 predictor
 from web.field.spike_metrics import continuity_stats
 from web.app import MODEL_PATH, OVERHEAD_CROP_RATIO
 
@@ -47,7 +47,7 @@ def _on_field(xy, dims, margin=1.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sam2FieldTracker -> FieldTracker end-to-end driver")
+    parser = argparse.ArgumentParser(description="MaskFieldTracker -> FieldTracker end-to-end driver")
     parser.add_argument("--labels", default=str(DEFAULT_LABELS), help="Spike labels JSON sidecar")
     args = parser.parse_args()
 
@@ -144,10 +144,10 @@ def main():
               "SAM2 has nothing to track.")
 
     # ------------------------------------------------------------------
-    # 3. Build Sam2FieldTracker and run .track()
+    # 3. Build MaskFieldTracker and run .track()
     # ------------------------------------------------------------------
-    print("[driver] Building Sam2FieldTracker (real GPU) ...")
-    sam2_tracker = Sam2FieldTracker()  # will auto-select CUDA if available
+    print("[driver] Building MaskFieldTracker (real GPU) ...")
+    sam2_tracker = MaskFieldTracker()  # SAM2 predictor; will auto-select CUDA if available
 
     print("[driver] Running SAM2 propagation ...")
     import time

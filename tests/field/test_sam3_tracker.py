@@ -288,7 +288,7 @@ def test_add_prompt_forwards_negative_points_as_label_zero(tmp_path):
 
 
 def test_add_prompt_accepts_ndarray_points_and_labels(tmp_path):
-    """_prompt_with_negatives (sam2_tracker) passes points/labels as ndarrays,
+    """_prompt_with_negatives (mask_tracker) passes points/labels as ndarrays,
     which the real SAM2 predictor takes natively. The adapter's old
     ``points or []`` raised "truth value of an array ... is ambiguous" on any
     multi-element ndarray — with neg_point_prompts default-ON that killed a
@@ -453,12 +453,12 @@ def test_sam3_field_tracker_preserves_existing_result_contract(tmp_path):
 def test_sam3_tracker_uses_sam3_tags_for_logs_and_diagnostics(tmp_path):
     """SAM3 runs must label themselves sam3 in diagnostics events (and the
     log tag), not inherit the literal 'sam2.*' names from the base class."""
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
     assert Sam3FieldTracker.DIAG_PREFIX == "sam3"
     assert Sam3FieldTracker.LOG_TAG == "SAM3"
-    assert Sam2FieldTracker.DIAG_PREFIX == "sam2"
-    assert Sam2FieldTracker.LOG_TAG == "SAM2"
+    assert MaskFieldTracker.DIAG_PREFIX == "sam2"
+    assert MaskFieldTracker.LOG_TAG == "SAM2"
 
     class _Diag:
         def __init__(self):
@@ -491,7 +491,7 @@ def test_sam3_tracker_should_stop_aborts_and_closes_chunk_session(tmp_path):
     the inherited ``track()`` and aborts propagation mid-stream. The chunk
     session must still be torn down (close_session + temp dir removed) by the
     ``finally: predictor.reset_state(state)`` cleanup."""
-    from web.field.sam2_tracker import TrackStopped
+    from web.field.mask_tracker import TrackStopped
 
     _write_frames(tmp_path, 8)
     raw = ActionHistoryStubPredictor()
@@ -1332,7 +1332,7 @@ def test_remove_object_without_session_introspection_tries_request(tmp_path):
 def _retire_tracker(retire_culled):
     """Sam3FieldTracker whose adapter is swapped for a SAM2-protocol cull stub
     that records remove_object calls (the hook's only contract)."""
-    from tests.field.test_sam2_tracker import CullStubPredictor
+    from tests.field.test_mask_tracker import CullStubPredictor
 
     class _RecordingCullStub(CullStubPredictor):
         def __init__(self):
@@ -1358,7 +1358,7 @@ def _culled(diag):
 @pytest.mark.parametrize("retire", [False, True])
 def test_retire_hook_fires_on_absent_stationary_cull_only_when_on(retire):
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import bottom_center
+    from web.field.mask_tracker import bottom_center
 
     tracker, stub = _retire_tracker(retire)
     diag = IdentityDiagnosticRecorder()
@@ -1379,7 +1379,7 @@ def test_retire_hook_fires_on_absent_stationary_cull_only_when_on(retire):
 @pytest.mark.parametrize("retire", [False, True])
 def test_retire_hook_fires_on_eviction_only_when_on(retire):
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import bottom_center
+    from web.field.mask_tracker import bottom_center
 
     tracker, stub = _retire_tracker(retire)
     diag = IdentityDiagnosticRecorder()
@@ -1406,7 +1406,7 @@ def test_retire_hook_fires_on_eviction_only_when_on(retire):
 @pytest.mark.parametrize("retire", [False, True])
 def test_retire_hook_fires_on_person_veto_only_when_on(retire):
     from web.field.identity_diagnostics import IdentityDiagnosticRecorder
-    from web.field.sam2_tracker import bottom_center
+    from web.field.mask_tracker import bottom_center
 
     tracker, stub = _retire_tracker(retire)
     diag = IdentityDiagnosticRecorder()
@@ -1425,7 +1425,7 @@ def test_retire_hook_fires_on_person_veto_only_when_on(retire):
 
 
 def test_retire_hook_failure_does_not_kill_track(capsys):
-    from web.field.sam2_tracker import bottom_center
+    from web.field.mask_tracker import bottom_center
 
     tracker, stub = _retire_tracker(True)
 
@@ -1449,9 +1449,9 @@ def test_retire_hook_failure_does_not_kill_track(capsys):
 
 
 def test_sam2_retire_hook_is_noop():
-    from web.field.sam2_tracker import Sam2FieldTracker
+    from web.field.mask_tracker import MaskFieldTracker
 
-    tracker = Sam2FieldTracker(predictor=object())
+    tracker = MaskFieldTracker(predictor=object())
     assert tracker._retire_object({}, 3) is None
 
 

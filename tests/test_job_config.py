@@ -15,8 +15,8 @@ def test_defaults_without_env(monkeypatch):
     cfg = JobConfig()
     assert cfg.tracking_backend == "sam3"
     assert cfg.sam2_model_size == "small"
-    assert cfg.sam2_track_fps == 5.0
-    assert cfg.sam2_export_scale == 0.5
+    assert cfg.sam3_track_fps == 5.0
+    assert cfg.sam3_export_scale == 0.5
     assert cfg.reprompt_seconds == 2.0
     assert cfg.cull_hijack_enabled is False
     assert cfg.reanchor_enabled is False
@@ -24,37 +24,37 @@ def test_defaults_without_env(monkeypatch):
 
 
 def test_env_provides_defaults(monkeypatch):
-    monkeypatch.setenv("SAM2_TRACK_FPS", "4.0")
+    monkeypatch.setenv("SAM3_TRACK_FPS", "4.0")
     monkeypatch.setenv("CULL_HIJACK_ENABLED", "1")
     cfg = JobConfig()
-    assert cfg.sam2_track_fps == 4.0
+    assert cfg.sam3_track_fps == 4.0
     assert cfg.cull_hijack_enabled is True
 
 
 def test_overrides_beat_env(monkeypatch):
-    monkeypatch.setenv("SAM2_TRACK_FPS", "4.0")
-    cfg = JobConfig({"sam2_track_fps": 12})
-    assert cfg.sam2_track_fps == 12.0
+    monkeypatch.setenv("SAM3_TRACK_FPS", "4.0")
+    cfg = JobConfig({"sam3_track_fps": 12})
+    assert cfg.sam3_track_fps == 12.0
 
 
 def test_string_overrides_are_coerced():
     # Form fields arrive as strings; JSON may send real types. Accept both.
     cfg = JobConfig({
-        "sam2_track_fps": "6.5",
+        "sam3_track_fps": "6.5",
         "cull_hijack_enabled": "1",
         "reanchor_enabled": "false",
-        "sam2_max_gpu_frames": "300",
+        "sam3_max_gpu_frames": "300",
     })
-    assert cfg.sam2_track_fps == 6.5
+    assert cfg.sam3_track_fps == 6.5
     assert cfg.cull_hijack_enabled is True
     assert cfg.reanchor_enabled is False
-    assert cfg.sam2_max_gpu_frames == 300
+    assert cfg.sam3_max_gpu_frames == 300
 
 
 def test_unknown_key_rejected_with_name():
     with pytest.raises(ValueError) as exc:
-        JobConfig({"sam2_trak_fps": 6.0})
-    assert "sam2_trak_fps" in str(exc.value)
+        JobConfig({"sam3_trak_fps": 6.0})
+    assert "sam3_trak_fps" in str(exc.value)
 
 
 def test_choice_validation():
@@ -66,25 +66,25 @@ def test_choice_validation():
 
 def test_range_validation():
     with pytest.raises(ValueError):
-        JobConfig({"sam2_export_scale": 0})
+        JobConfig({"sam3_export_scale": 0})
     with pytest.raises(ValueError):
         JobConfig({"frame_stream_jpeg_quality": 101})
     with pytest.raises(ValueError):
-        JobConfig({"sam2_track_fps": -1})
+        JobConfig({"sam3_track_fps": -1})
 
 
 def test_bad_value_names_the_knob():
     with pytest.raises(ValueError) as exc:
-        JobConfig({"sam2_track_fps": "fast"})
-    assert "sam2_track_fps" in str(exc.value)
+        JobConfig({"sam3_track_fps": "fast"})
+    assert "sam3_track_fps" in str(exc.value)
 
 
 def test_non_defaults_for_ab_provenance(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
-    cfg = JobConfig({"sam2_track_fps": 12, "reanchor_enabled": True})
+    cfg = JobConfig({"sam3_track_fps": 12, "reanchor_enabled": True})
     nd = cfg.non_defaults()
-    assert nd == {"sam2_track_fps": 12.0, "reanchor_enabled": True}
+    assert nd == {"sam3_track_fps": 12.0, "reanchor_enabled": True}
     # Env-sourced values count as non-default too: they differ from code
     # defaults and matter for cross-run comparisons.
     monkeypatch.setenv("REPROMPT_SECONDS", "1.0")
@@ -108,7 +108,7 @@ def test_seed_gate_knobs_default_on(monkeypatch):
     cfg = JobConfig()
     assert cfg.seed_box_max_aspect == 3.0
     assert cfg.evict_requires_motion is True
-    assert cfg.sam2_prompt_offset_seconds == 0.0
+    assert cfg.sam3_prompt_offset_seconds == 0.0
     assert cfg.opening_reprompt_seconds == 0.5
     assert cfg.opening_window_seconds == 6.0
 
@@ -182,7 +182,7 @@ def test_mask_leak_cleanup_default_and_override(monkeypatch):
         monkeypatch.delenv(knob.env, raising=False)
     assert JobConfig().mask_leak_cleanup is False
     # Env var flips the default on.
-    monkeypatch.setenv("SAM2_MASK_LEAK_CLEANUP", "1")
+    monkeypatch.setenv("SAM3_MASK_LEAK_CLEANUP", "1")
     assert JobConfig().mask_leak_cleanup is True
     # Per-job override (form checkbox arrives as a string) beats env.
     assert JobConfig({"mask_leak_cleanup": "1"}).mask_leak_cleanup is True
@@ -818,3 +818,131 @@ def test_selective_segmented_knobs_env_and_override(monkeypatch):
                       "selective_lazy_seed": False})
     assert cfg2.selective_retire_closed is False
     assert cfg2.selective_lazy_seed is False
+
+
+# --- sam2_* -> sam3_* rename (Nov 2026): legacy names keep working ---------
+
+_RENAMED = {
+    "sam2_track_fps": ("sam3_track_fps", 7.0),
+    "sam2_export_scale": ("sam3_export_scale", 0.75),
+    "sam2_max_gpu_frames": ("sam3_max_gpu_frames", 900),
+    "sam2_prompt_offset_seconds": ("sam3_prompt_offset_seconds", 1.5),
+}
+
+
+def _clear_knob_env(monkeypatch):
+    for knob in KNOBS:
+        for var in (knob.env, *knob.env_aliases):
+            monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize("old", sorted(_RENAMED))
+def test_legacy_override_key_resolves_to_new_knob(monkeypatch, old):
+    _clear_knob_env(monkeypatch)
+    new, value = _RENAMED[old]
+    cfg = JobConfig({old: value})            # persisted config_json / A/B arm
+    assert getattr(cfg, new) == value
+    assert not hasattr(cfg, old)
+    assert cfg.non_defaults() == {new: value}
+    assert old not in cfg.to_dict() and new in cfg.to_dict()
+
+
+def test_new_override_key_wins_over_legacy_alias(monkeypatch):
+    _clear_knob_env(monkeypatch)
+    cfg = JobConfig({"sam2_track_fps": 4.0, "sam3_track_fps": 9.0})
+    assert cfg.sam3_track_fps == 9.0
+    cfg = JobConfig({"sam3_track_fps": 9.0, "sam2_track_fps": 4.0})
+    assert cfg.sam3_track_fps == 9.0
+
+
+def test_legacy_alias_value_is_validated_under_new_name(monkeypatch):
+    _clear_knob_env(monkeypatch)
+    with pytest.raises(ValueError) as exc:
+        JobConfig({"sam2_track_fps": -1})
+    assert "sam3_track_fps" in str(exc.value)
+
+
+def test_legacy_env_var_still_read(monkeypatch):
+    _clear_knob_env(monkeypatch)
+    monkeypatch.setenv("SAM2_TRACK_FPS", "4.0")
+    monkeypatch.setenv("SAM2_DARK_REANCHOR_ENABLED", "0")
+    cfg = JobConfig()
+    assert cfg.sam3_track_fps == 4.0
+    assert cfg.dark_reanchor_enabled is False
+
+
+def test_new_env_var_wins_over_legacy(monkeypatch):
+    _clear_knob_env(monkeypatch)
+    monkeypatch.setenv("SAM2_TRACK_FPS", "4.0")
+    monkeypatch.setenv("SAM3_TRACK_FPS", "6.0")
+    assert JobConfig().sam3_track_fps == 6.0
+    # An empty canonical var counts as unset (same rule as before the rename).
+    monkeypatch.setenv("SAM3_TRACK_FPS", "")
+    assert JobConfig().sam3_track_fps == 4.0
+
+
+def test_settings_api_lists_new_names_only(monkeypatch):
+    _clear_knob_env(monkeypatch)
+    monkeypatch.setenv("SAM2_EVICT_DARK_FRAMES", "99999")
+    entries = {e["name"]: e for e in describe_knobs()}
+    for old, (new, _) in _RENAMED.items():
+        assert new in entries and old not in entries
+    assert not any(e["name"].startswith("sam2_") and e["name"] not in (
+        "sam2_model_size", "sam2_vos_optimized") for e in entries.values())
+    assert not any(e["env"].startswith("SAM2_") and e["name"] not in (
+        "sam2_model_size", "sam2_vos_optimized") for e in entries.values())
+    # The launch value still honours the legacy env var.
+    ev = entries["evict_dark_frames"]
+    assert ev["env"] == "SAM3_EVICT_DARK_FRAMES"
+    assert ev["launch_value"] == 99999 and ev["source"] == "env"
+
+
+def test_runtime_override_accepts_legacy_name(monkeypatch):
+    from web import job_config as jc
+    _clear_knob_env(monkeypatch)
+    try:
+        assert jc.set_runtime_override("sam2_track_fps", "3") == 3.0
+        assert JobConfig().sam3_track_fps == 3.0
+        entry = next(e for e in describe_knobs() if e["name"] == "sam3_track_fps")
+        assert entry["source"] == "runtime"
+        jc.set_runtime_override("sam2_track_fps", None)   # clear via old name
+        assert JobConfig().sam3_track_fps == 5.0
+    finally:
+        jc.reset_runtime_overrides()
+
+
+def test_normalize_overrides_and_helpers():
+    from web.job_config import canonical_knob_name, knob_default, normalize_overrides
+    assert canonical_knob_name("sam2_export_scale") == "sam3_export_scale"
+    assert canonical_knob_name("reprompt_seconds") == "reprompt_seconds"
+    assert canonical_knob_name("not_a_knob") == "not_a_knob"
+    assert knob_default("sam2_track_fps") == knob_default("sam3_track_fps") == 5.0
+    assert normalize_overrides({"sam2_track_fps": 8, "bogus": 1}) == {
+        "sam3_track_fps": 8, "bogus": 1}
+    assert normalize_overrides(None) == {}
+    # Unknown keys still fail JobConfig validation.
+    with pytest.raises(ValueError):
+        JobConfig({"sam2_bogus": 1})
+
+
+def test_only_sam2_backend_knobs_keep_sam2_names():
+    # sam2_model_size / sam2_vos_optimized only reach the SAM2 predictor build.
+    sam2_named = sorted(k.name for k in KNOBS if "sam2" in k.name)
+    assert sam2_named == ["sam2_model_size", "sam2_vos_optimized"]
+    for knob in KNOBS:
+        if knob.name not in sam2_named:
+            assert not knob.env.startswith("SAM2_"), knob.name
+        for alias in knob.env_aliases:
+            assert alias.startswith("SAM2_") and alias[5:] == knob.env[5:]
+
+
+def test_module_env_constants_read_legacy_names(monkeypatch):
+    from web.env_compat import env_get, sam3_env
+    monkeypatch.delenv("SAM3_X_TEST", raising=False)
+    monkeypatch.delenv("SAM2_X_TEST", raising=False)
+    assert sam3_env("X_TEST", "d") == "d"
+    monkeypatch.setenv("SAM2_X_TEST", "old")
+    assert sam3_env("X_TEST", "d") == "old"
+    monkeypatch.setenv("SAM3_X_TEST", "new")
+    assert sam3_env("X_TEST", "d") == "new"
+    assert env_get("NOPE_X_TEST", "z", legacy=("SAM3_X_TEST",)) == "new"

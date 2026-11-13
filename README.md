@@ -196,7 +196,7 @@ in-process fallback if the server won't start).
 On the tracking side, mask export resolution turns out not to be a speed
 lever at all — SAM resizes every frame to a fixed internal square, so cost
 scales with frames-per-view, making per-view frame rate
-(`SAM2_TRACK_FPS`) the real knob. Combined with the read-skipping above, a
+(`SAM3_TRACK_FPS`) the real knob. Combined with the read-skipping above, a
 match lands under the 15-minute budget on a 3090.
 
 ## Limitations
@@ -383,7 +383,8 @@ documentation lives in `web/job_config.py`. Frequently used:
 | Variable | Purpose |
 |----------|---------|
 | `TRACKING_BACKEND` | `sam3` (default) or `sam2` |
-| `SAM2_TRACK_FPS` / `SAM2_MODEL_SIZE` | tracking speed-vs-quality tradeoffs |
+| `SAM3_TRACK_FPS` | tracking speed-vs-quality tradeoff (legacy `SAM2_*` names of renamed knobs/env vars are still accepted) |
+| `SAM2_MODEL_SIZE` | SAM2-backend encoder size (`TRACKING_BACKEND=sam2` only) |
 | `TEAM_READER` | `vllm` (what `start_all.sh` sets), `local` (in-process), or `clef` (Cloudflare Workers AI; needs `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`, model via `CLEF_MODEL`) |
 | `VLM_MODEL_NAME` | reader model (default `Qwen/Qwen3-VL-4B-Instruct`) |
 | `GALLERY_ENABLED` | appearance-gallery identity assists |
@@ -395,7 +396,8 @@ web/                  FastAPI app, job runner, UI
   app.py              API + pipeline orchestration
   field/              the vision pipeline
     calibration.py    tag-anchored pinhole resection
-    sam3_tracker.py   SAM 3.1 tracking backend (sam2_tracker.py: SAM 2.1)
+    mask_tracker.py   shared mask-tracker logic; builds SAM 2.1 for TRACKING_BACKEND=sam2
+    sam3_tracker.py   SAM3 tracking backend (default; SAM 3.1 with sam3_multiplex)
     tracker.py        field-space Kalman tracking
     fusion.py         cross-view fusion
     identity.py       team-number voting / locking

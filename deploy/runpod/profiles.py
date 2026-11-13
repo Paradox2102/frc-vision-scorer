@@ -11,7 +11,7 @@ can still try a rung per job via ``config_json`` without restarting.
 
 Base env (every tier)
 ---------------------
-* The three ``SAM2_*`` lines mirror web/start_all.sh (the 2026-06-11 known-good
+* The three ``SAM3_*`` lines mirror web/start_all.sh (the 2026-06-11 known-good
   OOM-containment profile) so the pod runs exactly what :8004 runs locally.
 * ``TEAM_READER=jev`` mirrors start_all.sh too (hosted reader, no vLLM).
 * ``VLLM_PHASE_EXCLUSIVE=0``: there is no vLLM on the pod. With the knob on, every
@@ -32,10 +32,10 @@ What VRAM does and does not buy (read from the code, Nov 12 2026)
   rung, and the tier only sets how big that rung may go.
 * Tracker state stays on the GPU automatically when >= 16 GB is free
   (web/app.py VRAM probe) — every pod tier already gets that.
-* ``sam2_max_gpu_frames`` (VRAM-fit mode) can only RAISE frame_skip (fewer
+* ``sam3_max_gpu_frames`` (VRAM-fit mode) can only RAISE frame_skip (fewer
   tracked frames) and disables the stream_analysis GPU prefetch: never useful
   on a big card, left at 0.
-* ``sam2_export_scale`` is left at 0.5: "export resolution is NOT a lever — the
+* ``sam3_export_scale`` is left at 0.5: "export resolution is NOT a lever — the
   model resizes everything to a fixed square" (job_config corner_track_stride
   comment), and the Nov 11 tracking-coverage study found export resolution is
   not a factor in missed boxes. Costs export time + mask RAM for no evidence of
@@ -59,23 +59,23 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 KNOB_ENV = {
     "corner_track_stride": "CORNER_TRACK_STRIDE",
-    "sam2_track_fps": "SAM2_TRACK_FPS",
+    "sam3_track_fps": "SAM3_TRACK_FPS",
     "sam3_chunk_frames": "SAM3_CHUNK_FRAMES",
 }
 
 # Current repo defaults for the ladder knobs (web/job_config.py, Nov 12 2026).
 REPO_DEFAULTS = {
     "corner_track_stride": 3,
-    "sam2_track_fps": 5.0,
+    "sam3_track_fps": 5.0,
     "sam3_chunk_frames": 200,
 }
 
 BASE_ENV = {
     # web/start_all.sh parity
     "TEAM_READER": "jev",
-    "SAM2_DARK_REANCHOR_ENABLED": "0",
-    "SAM2_EVICT_DARK_FRAMES": "99999",
-    "SAM2_EVICT_MIN_ABSENCES": "99",
+    "SAM3_DARK_REANCHOR_ENABLED": "0",
+    "SAM3_EVICT_DARK_FRAMES": "99999",
+    "SAM3_EVICT_MIN_ABSENCES": "99",
     # no vLLM on the pod (see module docstring)
     "VLLM_PHASE_EXCLUSIVE": "0",
 }
@@ -141,14 +141,14 @@ _STEPS = (
      "coverage' (job_config) and the Nov 6 held-out A/B lost auto coverage on "
      "4/4 matches vs pre-B3. Cost: corner propagation +~50% (~+25-35% job wall "
      "on the 3090)."),
-    ("R2", {"sam2_track_fps": 8.0},
+    ("R2", {"sam3_track_fps": 8.0},
      "Back to the pre-B3 tracking rate (8 fps). Held-out Nov 6: B3 (5 fps + "
      "stride 3) agg meanNN 0.47 -> 0.73 m vs pre-B3, and selective_mask_prop's "
      "frame-denominated knobs (gap_trigger 7, min_streak 5, window_max 120) were "
      "tuned at 8 fps and are NOT rescaled for fps (ab_qm8.py 'speed' note), so "
      "this also puts selective back on its tuned time scale. Cost: ~+60% SAM "
      "frames on every view."),
-    ("R3", {"sam3_chunk_frames": None, "sam2_track_fps": 10.0},
+    ("R3", {"sam3_chunk_frames": None, "sam3_track_fps": 10.0},
      "BIG JUMP (Nov 12, Nick: big GPUs sit mostly idle at R1/R2 -- GPU util "
      "0-77% spiky, CPU idle, peak 12 GB of 96). Tier-cap SAM3 chunks (fewer "
      "chunk boundaries, each drops SAM3 appearance memory; VRAM-bound, roughly "
@@ -158,7 +158,7 @@ _STEPS = (
      "Full-rate corners. Oct 31 A/B found no per-slot identity gain of stride 1 "
      "over stride 2 at 8 fps, for ~2x corner propagation -- measured again "
      "here at 10 fps because corners are the cheap views (~70-90 ms/frame)."),
-    ("R5", {"sam2_track_fps": 15.0},
+    ("R5", {"sam3_track_fps": 15.0},
      "15 fps: the ceiling probe. Only reachable inside 8 min if views run "
      "concurrently or the card is much faster per frame than the 3090."),
 )
@@ -251,7 +251,7 @@ def describe_ladder(tier: Tier) -> str:
     rows = [f"tier {tier.name}: {tier.note} (chunk cap {tier.chunk_cap})"]
     for r in ladder(tier):
         k = r.knobs
-        rows.append(f"  {r.name}: fps={k['sam2_track_fps']:g} corner_stride={k['corner_track_stride']} "
+        rows.append(f"  {r.name}: fps={k['sam3_track_fps']:g} corner_stride={k['corner_track_stride']} "
                     f"chunk={k['sam3_chunk_frames']}  (+{r.delta or 'defaults'})")
     return "\n".join(rows)
 

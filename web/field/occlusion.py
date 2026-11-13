@@ -129,29 +129,96 @@ def _expand_polygon(poly, margin):
 _HUB_MARGIN_M = 0.35  # footprint expansion: tag ring sits at inner hub edge; accounts for surrounding frame/netting
 
 
+# Per-footprint geometry cache for occluded_by_hub. Keyed on the footprint's
+# bytes/shape/dtype + margin (never id(prism): prisms are rebuilt per job and ids
+# get reused), so a mutated or recreated footprint simply misses. Values are
+# computed with exactly the same NumPy operations the scalar path used, so they
+# are bit-identical. Bounded: cleared when it grows past _HUB_GEOM_CACHE_MAX.
+_HUB_GEOM_CACHE: dict = {}
+_HUB_GEOM_CACHE_MAX = 64
+
+
+def _hub_geometry(footprint, margin):
+    """(hub_center, xi, yi, yj, dx, den, ymin, ymax) for the expanded footprint.
+
+    Edge arrays reproduce _point_in_poly's pairing (edge i joins vertex i to
+    j = i-1, starting j = n-1): dx = xj - xi, den = yj - yi + 1e-12 -- the same
+    sub-expressions the scalar loop evaluates, so cached values are identical."""
+    fp = footprint if isinstance(footprint, np.ndarray) else np.asarray(footprint)
+    key = (fp.tobytes(), fp.shape, fp.dtype.str, float(margin))
+    hit = _HUB_GEOM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    hub_center = fp.mean(axis=0)
+    expanded = _expand_polygon(fp, margin)
+    xs = expanded[:, 0]; ys = expanded[:, 1]
+    xj = np.roll(xs, 1); yj = np.roll(ys, 1)          # j = i - 1 (j = n-1 for i = 0)
+    dx = xj - xs
+    den = yj - ys + 1e-12
+    geom = (hub_center, xs.copy(), ys.copy(), yj, dx, den,
+            float(ys.min()) if len(ys) else np.inf,
+            float(ys.max()) if len(ys) else -np.inf)
+    for a in geom[:6]:
+        a.setflags(write=False)
+    if len(_HUB_GEOM_CACHE) >= _HUB_GEOM_CACHE_MAX:
+        _HUB_GEOM_CACHE.clear()
+    _HUB_GEOM_CACHE[key] = geom
+    return geom
+
+
+_LINSPACE_CACHE: dict = {}
+
+
+def _unit_linspace_col(n):
+    """np.linspace(0, 1, n) as an (n, 1) read-only column, cached per n."""
+    col = _LINSPACE_CACHE.get(n)
+    if col is None:
+        col = np.linspace(0.0, 1.0, n)[:, None]
+        col.setflags(write=False)
+        if len(_LINSPACE_CACHE) >= _HUB_GEOM_CACHE_MAX:
+            _LINSPACE_CACHE.clear()
+        _LINSPACE_CACHE[n] = col
+    return col
+
+
 def occluded_by_hub(cam_center, prism, track_xy, n=100, margin=_HUB_MARGIN_M):
     """Does the hub prism block the line-of-sight from cam_center to track_xy?
 
     Uses a 2-D ground-plane shadow check on a slightly expanded footprint.
     We also verify the hub is closer to the camera than the target so we don't
     flag robots that are on the near side.
+
+    Vectorised (all n samples x all edges in one NumPy pass) but
+    decision-identical to the original per-sample _point_in_poly loop: same
+    sample formula, same edge pairing, same float64 expression per (sample,
+    edge); see tests/test_occlusion_vectorised.py for the randomized
+    equivalence check against a verbatim copy of the scalar version.
     """
     cam_xy = np.asarray(cam_center, float)[:2]
     tgt_xy = np.array([track_xy[0], track_xy[1]], float)
 
+    hub_center, xi, yi, yj, dx, den, ymin, ymax = _hub_geometry(prism.footprint, margin)
+
     # Hub must be closer to the camera than the target
-    hub_center = prism.footprint.mean(axis=0)
     d_hub = np.linalg.norm(cam_xy - hub_center)
     d_target = np.linalg.norm(cam_xy - tgt_xy)
     if d_hub >= d_target:
         return False
 
-    expanded = _expand_polygon(prism.footprint, margin)
-    for t in np.linspace(0.0, 1.0, n):
-        p = cam_xy + (tgt_xy - cam_xy) * t
-        if _point_in_poly(p, expanded):
-            return True
-    return False
+    pts = cam_xy + (tgt_xy - cam_xy) * _unit_linspace_col(n)   # (n, 2), same per-row ops
+    x = pts[:, 0:1]; y = pts[:, 1:2]                        # (n, 1)
+    # Exact prefilter on the computed samples: a sample with y > ymax has
+    # (yi > y) == (yj > y) == False on every edge, one with y < ymin has both
+    # True -- no crossing either way, so it can never test inside.
+    ys = pts[:, 1]
+    if not ((ys >= ymin) & (ys <= ymax)).any():
+        return False
+    ytest = (yi > y) != (yj > y)                            # (n, E)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        xint = dx * (y - yi) / den + xi
+    cross = ytest & (x < xint)                              # masked like the scalar `and`
+    inside = (np.count_nonzero(cross, axis=1) & 1).astype(bool)
+    return bool(inside.any())
 
 
 def camera_distance(cam_center, ground_xy):
@@ -192,6 +259,7 @@ def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
         for p in hub_prisms:
             if occluded_by_hub(cc, p, t["pos"]):
                 view = True; cause = cause or "hub"
+                break   # further hub hits change nothing (view already True, cause "hub")
         for pb in person_boxes:
             if box_overlap(box, pb) / area > 0.5:
                 view = True; cause = cause or "person"

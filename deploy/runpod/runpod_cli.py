@@ -1142,12 +1142,24 @@ def print_tune_table(res: dict, order: list, budget_min: float, on: str) -> None
               f"{g.get('misid_s') if g.get('misid_s') is not None else '-':>6}  {note}")
 
 
+def _table_order(res: dict, order: list) -> list:
+    """Every measured rung (plain + tagged A/B arms), ladder order first."""
+    return list(dict.fromkeys(list(order) + sorted(res.get("rungs", {}))))
+
+
 def cmd_tune(args) -> int:
     st = load_state()
     pod_id = require_pod(st)
     refresh_endpoint(st)
     tier = remote_tier(st)
     rungs = profiles.ladder(tier)
+    extra = json.loads(args.with_json) if getattr(args, "with_json", None) else {}
+    if extra:
+        # A/B any knob against the ladder: R1 + {"sam3_parallel_views": true}
+        # is measured as R1<tag>, next to the plain rungs in the same table.
+        tag = args.tag or "X"
+        rungs = [profiles.Rung(r.name + tag, {**r.knobs, **extra}, {**r.delta, **extra},
+                               r.rationale + f" + {extra}") for r in rungs]
     order = [r.name for r in rungs]
     res = load_tune(pod_id)
     res.update({"gpu": st.get("gpu_name"), "vram_mib": st.get("vram_mib"), "tier": tier.name,
@@ -1158,14 +1170,15 @@ def cmd_tune(args) -> int:
         save_tune(res)
         return 0
     if args.show:
-        print_tune_table(res, order, args.budget_min, args.budget_on)
+        print_tune_table(res, _table_order(res, order), args.budget_min, args.budget_on)
         return 0
     local_video = Path(args.video) if args.video else main_checkout() / "web" / "uploads" / QM8_VIDEO_NAME
     if not local_video.exists():
         raise SystemExit(f"test video not found: {local_video}")
     remote_video = ensure_test_video(st, local_video)
-    start = order.index(args.start.upper())
-    stop = order.index(args.stop.upper()) if args.stop else len(order) - 1
+    sfx = (args.tag or "X") if extra else ""
+    start = order.index(args.start.upper() + sfx)
+    stop = order.index(args.stop.upper() + sfx) if args.stop else len(order) - 1
     print(f"tuning on {st.get('gpu_name')} ({tier.name}); budget {args.budget_min} min "
           f"({args.budget_on}); rungs {order[start]}..{order[stop]}")
     for rung in rungs[start:stop + 1]:
@@ -1183,7 +1196,7 @@ def cmd_tune(args) -> int:
             res["rungs"][rung.name] = row
             save_tune(res)
         r = res["rungs"][rung.name]
-        print_tune_table(res, order, args.budget_min, args.budget_on)
+        print_tune_table(res, _table_order(res, order), args.budget_min, args.budget_on)
         if r.get("status") != "done":
             print(f"rung {rung.name} failed; stopping (fix, then re-run `tune --start {rung.name}`)")
             break
@@ -1368,6 +1381,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", help="write rung R<n> into profile.env and restart")
     p.add_argument("--auto-apply", action="store_true", help="apply the recommended rung at the end")
     p.add_argument("--show", action="store_true", help="print the results table only")
+    p.add_argument("--with", dest="with_json", metavar="JSON",
+                   help='extra per-job knobs merged into every rung, e.g. \'{"sam3_parallel_views": true}\'')
+    p.add_argument("--tag", help="suffix for --with rung names (default X): R1 -> R1P")
     p.add_argument("--video", help="local copy of the qm8 video (default: main checkout web/uploads)")
     p.add_argument("--score-shift", type=float, default=0.475,
                    help="GT scoring half-robot shift (scripts/score_ground_truth.py --score-shift)")

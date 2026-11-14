@@ -317,6 +317,62 @@ costs a 5 s sleep per job. That setting does not change output.
   `web/replays`. Scouting metrics are computed from replays, so pulling
   replays and the DB is enough.
 
+## Vast.ai (single host)
+
+For benchmarking on a high-clock desktop CPU (RTX 5090 / 4090 hosts on Ryzen
+/ Core CPUs), `up` can rent ONE vast.ai instance instead of a RunPod pod. The
+CLI reads `VASTAI_API` from the main checkout's `.env` (it never goes to the
+instance). Code: `deploy/runpod/vast.py`.
+
+```bash
+rp vast-offers                                  # read-only: 1x RTX 5090/4090, verified, CUDA>=12.8,
+                                                # direct ssh port, >=120 GB disk, reliability>=0.97,
+                                                # >=8 effective cores; sorted by cpu_ghz desc, then $/h
+rp vast-offers --min-ghz 5 --max-dph 0.8 --gpu "RTX 5090"   # --include-unverified, --min-cores, --json
+rp up --provider vast --offer 1234567 --dry-run --secrets-from-env   # exact create body; rents NOTHING
+rp up --provider vast --offer 1234567           # type "rent"; --disk-gb (default 120)
+```
+
+`up --provider vast` checks that `~/.ssh/id_ed25519.pub` (or
+`$RUNPOD_SSH_KEY.pub`) is registered on the vast account (vast injects the
+ACCOUNT's ssh keys into the container; there is no per-instance key in the
+create body — register it under console > Keys first, `--skip-ssh-key-check`
+to override), shows the offer and your credit, asks for `rent`, then
+`PUT /api/v0/asks/<offer>/` with the image below, `runtype "ssh_direc
+ssh_proxy"` and an empty `env`. The default image is vast's own
+`vastai/base-image:@vastai-automatic-tag`: the RunPod image has no ssh host keys,
+so under vast's launcher sshd exits ("no hostkeys available") and port 22
+refuses (seen Nov 14 2026; an onstart `ssh-keygen -A` is also set as a backstop).
+After that it is the same flow as RunPod:
+wait for ssh (direct IP:port, falling back to vast's ssh proxy), ship the
+bundle, install secrets over ssh, bootstrap. `.state.json` gets
+`"provider": "vast"`, and `tune`, `pull`, `status`, `ssh`, `logs`, `tunnel`,
+`push`, `stop` and `terminate` (= destroy) then work exactly as usual.
+
+Differences from RunPod:
+
+* Measured Nov 14 2026 (RTX 5090 + Core Ultra 9 285K, $0.77/h): ssh in 43 s,
+  bootstrap ~5 min, qm8 R0 5.1 / R1 5.4 / R2 7.1 min vs 5.8 / 6.0 / 7.4 on the
+  RunPod EPYC 9554 pod (single-thread Python +43%). A whole night (tune +
+  27 GT-scored sweep jobs) cost ~$4.30.
+* Container RAM is capped by the host's cgroup (127.6 GiB on that box), not by
+  the GPU. Sweep config Q2 (`sam3_chunk_frames` 1000 + `selective_mask_prop`
+  off) was OOM-killed by it on a 2:40 match (`oom_kill 1` in
+  `/sys/fs/cgroup/memory.events`; the server just disappears, no traceback).
+  Check `cpu_ram` on the offer, or keep chunks smaller, for full-tracking arms.
+* There is no separate volume: `/workspace` is a directory on the container
+  disk (`--disk-gb`), which survives `stop`/start (billed for storage while
+  stopped) and is deleted by `terminate`.
+* `status` shows the host CPU, `$`/h, an uptime-based cost estimate and your
+  account credit. Bandwidth is billed separately per TB (`vast-offers` shows
+  the host's `$`/TB down/up; a first boot downloads the venv, SAM3 and the vLLM reader, tens of GB).
+* A stopped instance can only restart on the same host; if its GPU was
+  rented meanwhile, start waits. `pull`, `terminate`, rent another offer.
+* The vLLM reader (tune arm Q) needs a CUDA 13 driver: `vast-offers --min-cuda 13`.
+* **Marketplace hosts are third-party machines.** The host operator can read
+  the container, including `/workspace/frc/.env` (Jev, HF, TBA keys) and the
+  DB. Use keys you can rotate, prefer verified hosts, and `terminate` when done.
+
 ## Swarm: batch-process a past event
 
 One pod per job, many cheap pods. On Nov 13 an RTX PRO 6000 pod ran a full

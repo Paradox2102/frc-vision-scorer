@@ -15,11 +15,15 @@ See deploy/runpod/README.md for the weekend runbook.
     runpod_cli.py pull                         # DB + replays -> data/runpod_pull/<podId>/
     runpod_cli.py stop | terminate             # typed confirmation
     runpod_cli.py swarm <up|plan|run|status|pull|import|stop|terminate> --name N   # many pods (swarm.py)
+    runpod_cli.py vast-offers [--gpu "RTX 5090"] [--min-ghz 5]   # vast.ai offers (read-only)
+    runpod_cli.py up --provider vast --offer ID [--dry-run]       # ONE vast.ai instance (vast.py)
 
 State (pod id, ssh endpoint) lives in deploy/runpod/.state.json (gitignored).
 Secrets go to the pod ONLY over ssh into /workspace/frc/.env (chmod 600) —
 never through RunPod's pod `env` field (stored in RunPod metadata) and never
-RUNPOD_API / CLOUDFLARE_* / ROBOFLOW_API.
+RUNPOD_API / VASTAI_API / CLOUDFLARE_* / ROBOFLOW_API. With `up --provider vast`
+the state carries provider "vast" and every single-pod command drives that
+vast.ai instance instead (state without "provider" = RunPod, as before).
 """
 from __future__ import annotations
 
@@ -49,6 +53,7 @@ sys.path.insert(0, str(HERE))
 sys.modules.setdefault("runpod_cli", sys.modules[__name__])
 import profiles  # noqa: E402
 import profiling  # noqa: E402
+import vast  # noqa: E402
 
 STATE_PATH = HERE / ".state.json"
 TUNE_DIR = HERE / "tune_results"
@@ -116,8 +121,8 @@ SECRET_SPECS = (
                "only team_reader=deepseek (not default)"),
 )
 # Never shipped to the pod, whatever the caller passes.
-NEVER_SEND_EXACT = {"RUNPOD_API", "ROBOFLOW_API", "MANTA_API"}
-NEVER_SEND_PREFIXES = ("CLOUDFLARE_", "RUNPOD_")
+NEVER_SEND_EXACT = {"RUNPOD_API", "VASTAI_API", "ROBOFLOW_API", "MANTA_API"}
+NEVER_SEND_PREFIXES = ("CLOUDFLARE_", "RUNPOD_", "VASTAI_")
 
 
 def never_send(name: str) -> bool:
@@ -522,6 +527,23 @@ def require_pod(st: dict) -> str:
     return st["pod_id"]
 
 
+PROVIDERS = ("runpod", "vast")
+
+
+def provider(st: dict) -> str:
+    """Who hosts the pod in ``st``: "runpod" when absent (older state files,
+    swarm members), "vast" for `up --provider vast`."""
+    return st.get("provider") or "runpod"
+
+
+def fetch_pod(st: dict) -> dict:
+    """The provider's view of the pod, RunPod-shaped (vast.pod_view maps a
+    vast instance onto desiredStatus / publicIp / portMappings / ...)."""
+    if provider(st) == "vast":
+        return vast.pod_view(vast.show_instance(st["pod_id"]))
+    return get_pod(st["pod_id"])
+
+
 def ssh_key_path() -> Path:
     return Path(os.environ.get("RUNPOD_SSH_KEY", Path.home() / ".ssh" / "id_ed25519"))
 
@@ -559,7 +581,7 @@ def refresh_endpoint(st: dict, save=None) -> dict:
     """Refresh status/cost/ssh endpoint from the API into ``st``. ``save``
     persists ``st`` (default: the single-pod .state.json; swarm members pass
     their own callback so they never touch it)."""
-    pod = get_pod(st["pod_id"])
+    pod = fetch_pod(st)
     st["desired_status"] = pod.get("desiredStatus")
     st["cost_per_hr"] = pod.get("adjustedCostPerHr") or pod.get("costPerHr")
     st["gpu"] = (pod.get("gpu") or {}).get("displayName") or (pod.get("gpu") or {}).get("id") or st.get("gpu")
@@ -767,6 +789,24 @@ def cmd_gpus(args) -> int:
     return 0
 
 
+def cmd_vast_offers(args) -> int:
+    """Read-only vast.ai offer search (POST /bundles/): single-GPU hosts,
+    sorted by CPU clock then price."""
+    q = vast.offer_query(gpus=args.gpu or ["RTX 5090", "RTX 4090"], verified=not args.include_unverified,
+                         min_cuda=args.min_cuda, min_disk=args.min_disk, min_reliability=args.min_reliability,
+                         min_ghz=args.min_ghz, min_cores=args.min_cores, max_dph=args.max_dph,
+                         limit=args.limit)
+    offers = vast.search_offers(q)
+    if args.json:
+        print(json.dumps(offers, indent=2))
+        return 0
+    print(vast.format_offers(offers))
+    print(f"\n{len(offers)} offer(s). $/h includes {args.min_disk:.0f} GB disk; bandwidth is extra "
+          f"($/TB columns). Rent one: {Path(__file__).name} up --provider vast --offer <id> "
+          f"[--disk-gb {args.min_disk:.0f}]")
+    return 0
+
+
 def _common_bundle_flags(ap):
     ap.add_argument("--ref", default="main", help="git ref to ship (default main)")
     ap.add_argument("--no-db", action="store_true",
@@ -793,6 +833,14 @@ def warn_dirty(ref: str) -> None:
 
 def cmd_up(args) -> int:
     st = load_state()
+    prov = getattr(args, "provider", None) or provider(st)
+    if st.get("pod_id") and provider(st) != prov:
+        raise SystemExit(f"deploy/runpod/.state.json already holds a {provider(st)} pod ({st['pod_id']}); "
+                         f"`pull` + `terminate` it before `up --provider {prov}`")
+    if prov == "vast":
+        args.image = args.image or vast.DEFAULT_IMAGE
+        return cmd_up_vast(args, st)
+    args.image = args.image or DEFAULT_IMAGE
     gpus = args.gpu or DEFAULT_GPUS
     pubkey_path = Path(str(ssh_key_path()) + ".pub")
     pubkey = pubkey_path.read_text() if pubkey_path.exists() else "ssh-ed25519 <missing ~/.ssh/id_ed25519.pub>"
@@ -843,30 +891,139 @@ def cmd_up(args) -> int:
                   "cost_per_hr": pod.get("costPerHr"), "image": args.image}
             save_state(st)
             print(f"created pod {pod['id']} at ${pod.get('costPerHr')}/h")
-        wait_for_ssh(st)
-        jid = remote_job_active(st)
-        if jid:
-            raise SystemExit(f"job {jid} is running on the pod; `up` would restart the server. "
-                             f"Wait for it (or use `push --force`).")
-        has_db =ssh_run(st, f"test -f {POD_APP}/frc_scorer.db", check=False).returncode == 0
-        if has_db and not args.overwrite_db:
-            # a re-run of `up` mid-event must never clobber the pod's DB or the
-            # calibrations/layouts made on the pod
-            plan.extra = [e for e in plan.extra if e[2] not in ("db", "event_state")]
-            print("pod already has frc_scorer.db: keeping the pod's DB + event state "
-                  "(--overwrite-db to replace them with the local copy)")
-        push_bundle(st, plan, td, replace_code=True)
-        install_secrets(st, secrets)
-        if args.cookies:
-            upload_cookies(st, args.cookies)
-        print("bootstrapping (first boot: ~10-15 min for venv + ~3.5 GB SAM3 download)...", flush=True)
-        run_bootstrap(st)
+        deploy_to_pod(st, args, plan, td, secrets)
+    return finish_up(st, args)
+
+
+def deploy_to_pod(st: dict, args, plan: BundlePlan, td: Path, secrets: dict) -> None:
+    """Shared tail of `up` (RunPod and vast): wait for ssh, ship the bundle,
+    install secrets, bootstrap."""
+    # vast pulls the image on a marketplace host (no RunPod image cache): allow longer
+    wait_for_ssh(st, **({"timeout_s": 1800} if provider(st) == "vast" else {}))
+    if provider(st) == "vast":
+        # vast: /workspace is a plain directory on the container disk (no
+        # separate volume) and login shells auto-attach tmux without this file.
+        ssh_run(st, vast.ONSTART)
+    jid = remote_job_active(st)
+    if jid:
+        raise SystemExit(f"job {jid} is running on the pod; `up` would restart the server. "
+                         f"Wait for it (or use `push --force`).")
+    has_db =ssh_run(st, f"test -f {POD_APP}/frc_scorer.db", check=False).returncode == 0
+    if has_db and not args.overwrite_db:
+        # a re-run of `up` mid-event must never clobber the pod's DB or the
+        # calibrations/layouts made on the pod
+        plan.extra = [e for e in plan.extra if e[2] not in ("db", "event_state")]
+        print("pod already has frc_scorer.db: keeping the pod's DB + event state "
+              "(--overwrite-db to replace them with the local copy)")
+    push_bundle(st, plan, td, replace_code=True)
+    install_secrets(st, secrets)
+    if args.cookies:
+        upload_cookies(st, args.cookies)
+    print("bootstrapping (first boot: ~10-15 min for venv + ~3.5 GB SAM3 download)...", flush=True)
+    run_bootstrap(st)
+
+
+def finish_up(st: dict, args) -> int:
     st["pushed_ref"] = args.ref
     save_state(st)
     print(f"\nServer is up. Open the tunnel:\n  {Path(__file__).name} tunnel   "
           f"(then browse http://localhost:{DEFAULT_TUNNEL_PORT})")
     print("  raw: " + " ".join(shlex.quote(c) for c in tunnel_cmd(st, DEFAULT_TUNNEL_PORT)))
     return 0
+
+
+def local_pubkey() -> str | None:
+    p = Path(str(ssh_key_path()) + ".pub")
+    return p.read_text().strip() if p.exists() else None
+
+
+def check_vast_ssh_key(pubkey: str | None) -> None:
+    """vast injects the ACCOUNT's registered ssh keys; without ours, ssh never
+    works and the instance bills for nothing. Read-only GET /ssh/."""
+    if not pubkey:
+        raise SystemExit(f"no public key at {ssh_key_path()}.pub (RUNPOD_SSH_KEY=/path/key to pick another); "
+                         f"register it on the vast account (console > Keys) before renting")
+    keys = vast.account_ssh_keys()
+    if not keys:
+        print("WARNING: could not read any ssh key from the vast account (GET /ssh/); make sure "
+              f"{ssh_key_path()}.pub is registered (console > Keys) or ssh will be refused")
+        return
+    if not vast.key_registered(pubkey, keys):
+        raise SystemExit(f"{ssh_key_path()}.pub is not among the vast account's {len(keys)} ssh key(s); "
+                         f"vast only injects account keys. Add it (console > Keys, or "
+                         f"`vastai create ssh-key {ssh_key_path()}.pub`), or --skip-ssh-key-check")
+
+
+def cmd_up_vast(args, st: dict) -> int:
+    """`up --provider vast --offer ID`: rent ONE vast.ai instance (or reuse
+    the one in state), then the same ssh -> bundle -> secrets -> bootstrap
+    flow as RunPod."""
+    if not st.get("pod_id") and not args.offer:
+        raise SystemExit("--provider vast needs --offer ID (pick one with `vast-offers`)")
+    name = args.name or f"frc-vision-{_dt.date.today().isoformat()}"
+    body = vast.build_create_body(image=args.image, disk_gb=args.disk_gb, label=name)
+    warn_dirty(args.ref)
+    with tempfile.TemporaryDirectory(dir=args.scratch) as td:
+        td = Path(td)
+        plan = plan_bundle(args.ref, include_db=not args.no_db, include_event_state=not args.no_db,
+                           include_sam2=not args.no_sam2_fallback, scratch=td)
+        if args.dry_run:
+            if st.get("pod_id"):
+                print(f"DRY RUN — nothing is created. `up` would REUSE vast instance {st['pod_id']} "
+                      f"(start it if stopped); a new rent would PUT {vast.API}/asks/<offer>/ with body:")
+            else:
+                print(f"DRY RUN — nothing is created. PUT {vast.API}/asks/{args.offer}/ with body:")
+            print(json.dumps(redact_body(body), indent=2))
+            print(f"ssh: vast injects the account's registered keys; this machine uses {ssh_key_path()}")
+            print_plan(plan)
+            if args.keep_bundle:
+                out = Path(args.keep_bundle)
+                size = write_bundle(plan, out)
+                print(f"bundle tarball written to {out} ({fmt_mb(size)})")
+            secrets = select_secrets(local_env(), interactive=False)
+            print("\nsecrets that would be installed over ssh (from local .env): "
+                  + ", ".join(f"{k}={mask(v)}" for k, v in sorted(secrets.items())))
+            return 0
+
+        secrets = gather_secrets(args)
+        if st.get("pod_id"):
+            pod = refresh_endpoint(st)
+            print(f"reusing vast instance {st['pod_id']} ({pod.get('desiredStatus')}, {st.get('gpu')}, "
+                  f"${st.get('cost_per_hr')}/h)")
+            if pod.get("desiredStatus") == "EXITED":
+                if not args.yes and not confirm("Instance is stopped; starting it resumes GPU billing "
+                                                "(and may wait if the host's GPU was rented meanwhile).",
+                                                "start"):
+                    return 1
+                vast.start_instance(st["pod_id"])
+        else:
+            if not args.skip_ssh_key_check:
+                check_vast_ssh_key(local_pubkey())
+            offer = vast.get_offer(args.offer, storage_gb=args.disk_gb)
+            if offer:
+                print(vast.offer_summary(offer))
+            else:
+                print(f"WARNING: offer {args.offer} not found in a search (taken?); create will fail if it is gone")
+            try:
+                credit = vast.current_user().get("credit")
+                print(f"vast account credit: ${float(credit):.2f}")
+            except (SystemExit, TypeError, ValueError):
+                pass
+            print(json.dumps(redact_body(body), indent=2))
+            price = f"${offer.get('dph_total'):.3f}/h" if offer and offer.get("dph_total") is not None else "per hour"
+            if not args.yes and not confirm(
+                    f"This RENTS vast.ai offer {args.offer} ({(offer or {}).get('gpu_name', '?')}, {price}, "
+                    f"{args.disk_gb} GB disk) on a THIRD-PARTY host and bills until you stop/terminate it "
+                    f"(bandwidth billed separately).", "rent"):
+                return 1
+            made = vast.create_instance(args.offer, image=args.image, disk_gb=args.disk_gb, label=name)
+            st = {"provider": "vast", "pod_id": str(made["id"]), "offer_id": int(args.offer),
+                  "created_at": time.time(), "cost_per_hr": (offer or {}).get("dph_total"),
+                  "gpu": (offer or {}).get("gpu_name"), "image": args.image}
+            save_state(st)
+            print(f"created vast instance {made['id']} at ${st['cost_per_hr']}/h")
+        deploy_to_pod(st, args, plan, td, secrets)
+    return finish_up(st, args)
 
 
 def cmd_push(args) -> int:
@@ -932,10 +1089,46 @@ def cmd_tunnel(args) -> int:
         time.sleep(5)
 
 
+STATUS_REMOTE = (
+    "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader; "
+    f"bash {POD_APP}/deploy/runpod/serve.sh status; "
+    f"grep -E '^FRC_(GPU_TIER|PROFILE_RUNG)=|^SAM|^CORNER' {POD_APP}/profile.env 2>/dev/null | tr '\\n' ' '; echo; "
+    f"cat {POD_APP}/deploy/runpod/BUNDLE_INFO.json 2>/dev/null; echo; df -h {POD_WS} | tail -1")
+
+
+def cmd_status_vast(st: dict, pod: dict) -> int:
+    inst = pod.get("vast") or {}
+    cost = float(st.get("cost_per_hr") or 0)
+    print(f"vast instance {st['pod_id']}  {pod.get('desiredStatus')}  {st.get('gpu')}  ${cost:.3f}/h  "
+          f"image {pod.get('image')}")
+    print(f"  host: {inst.get('cpu_name') or '?'} ({inst.get('cpu_cores_effective') or '?'} eff cores, "
+          f"{(inst.get('cpu_ram') or 0) / 1000:.0f} GB RAM), {inst.get('geolocation') or '?'}, "
+          f"driver {inst.get('driver_version') or '?'}, CUDA {inst.get('cuda_max_good') or '?'}"
+          + (f"  [{inst.get('status_msg').strip()[:80]}]" if inst.get("status_msg") else ""))
+    started = inst.get("start_date")
+    if started:
+        up_h = max(0.0, time.time() - float(started)) / 3600
+        print(f"  up {up_h:.1f} h since {pod.get('lastStartedAt')} -> ~${up_h * cost:.2f} at the current $/h "
+              f"(estimate: GPU+disk only; bandwidth billed separately, stopped time bills disk only)")
+    try:
+        credit = vast.current_user().get("credit")
+        print(f"  vast account credit: ${float(credit):.2f}")
+    except (SystemExit, TypeError, ValueError):
+        pass
+    if pod.get("desiredStatus") != "RUNNING" or not st.get("ssh_host"):
+        return 0
+    _, _, kind = vast.ssh_endpoint(inst)
+    print(f"  ssh root@{st['ssh_host']} -p {st['ssh_port']} ({kind})  (pushed ref: {st.get('pushed_ref')})")
+    print(ssh_out(st, STATUS_REMOTE + "; df -h /dev/shm | tail -1", check=False))
+    return 0
+
+
 def cmd_status(args) -> int:
     st = load_state()
     require_pod(st)
     pod = refresh_endpoint(st)
+    if provider(st) == "vast":
+        return cmd_status_vast(st, pod)
     cost = float(st.get("cost_per_hr") or 0)
     started = pod.get("lastStartedAt")
     t = parse_ts(started)
@@ -948,12 +1141,7 @@ def cmd_status(args) -> int:
     if pod.get("desiredStatus") != "RUNNING" or not st.get("ssh_host"):
         return 0
     print(f"  ssh root@{st['ssh_host']} -p {st['ssh_port']}  (pushed ref: {st.get('pushed_ref')})")
-    remote = (
-        "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader; "
-        f"bash {POD_APP}/deploy/runpod/serve.sh status; "
-        f"grep -E '^FRC_(GPU_TIER|PROFILE_RUNG)=|^SAM|^CORNER' {POD_APP}/profile.env 2>/dev/null | tr '\\n' ' '; echo; "
-        f"cat {POD_APP}/deploy/runpod/BUNDLE_INFO.json 2>/dev/null; echo; df -h {POD_WS} | tail -1")
-    print(ssh_out(st, remote, check=False))
+    print(ssh_out(st, STATUS_REMOTE, check=False))
     return 0
 
 
@@ -1591,10 +1779,18 @@ def cmd_stop(args) -> int:
     jid = remote_job_active(st) if pod.get("desiredStatus") == "RUNNING" and st.get("ssh_host") else None
     msg = (f"STOP pod {pod_id} ({st.get('gpu')}). GPU billing stops; the /workspace volume is kept "
            f"(and billed for storage). Starting again may land on a machine without a free GPU.")
+    if provider(st) == "vast":
+        msg = (f"STOP vast instance {pod_id} ({st.get('gpu')}). GPU billing stops; the container disk "
+               f"(/workspace: venv, caches, DB, replays) is kept and billed for storage. Starting again "
+               f"waits if the host's GPU was rented to someone else meanwhile.")
     if jid:
         msg += f"\nA job is RUNNING ({jid}) and will be killed."
     if not confirm(msg, "stop"):
         return 1
+    if provider(st) == "vast":
+        vast.stop_instance(pod_id)
+        print("stop requested")
+        return 0
     _request("POST", f"{REST}/pods/{pod_id}/stop")
     print("stop requested")
     return 0
@@ -1608,9 +1804,16 @@ def cmd_terminate(args) -> int:
     msg = (f"TERMINATE pod {pod_id}: the pod AND its /workspace volume (DB, replays, calibrations, "
            f"venv, caches) are DELETED permanently.\n"
            + ("Last `pull` exists locally." if pulled else "You have NOT run `pull` for this pod!"))
+    if provider(st) == "vast":
+        msg = (f"DESTROY vast instance {pod_id}: the instance AND its disk (/workspace: DB, replays, "
+               f"calibrations, venv, caches) are DELETED permanently.\n"
+               + ("Last `pull` exists locally." if pulled else "You have NOT run `pull` for this pod!"))
     if not confirm(msg, f"terminate {pod_id}"):
         return 1
-    _request("DELETE", f"{REST}/pods/{pod_id}")
+    if provider(st) == "vast":
+        vast.destroy_instance(pod_id)
+    else:
+        _request("DELETE", f"{REST}/pods/{pod_id}")
     st["terminated_at"] = time.time()
     STATE_PATH.rename(HERE / f".state.{pod_id}.terminated.json")
     print("terminated; state archived")
@@ -1629,12 +1832,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_gpus)
 
     p = sub.add_parser("up", help="create (or reuse) the pod, ship, install secrets, bootstrap, start")
+    p.add_argument("--provider", choices=PROVIDERS, default=None,
+                   help="runpod (default) or vast (one vast.ai instance from --offer); "
+                        "defaults to the provider of the pod already in state")
+    p.add_argument("--offer", type=int, help="vast: offer id to rent (from `vast-offers`)")
+    p.add_argument("--disk-gb", type=int, default=vast.DEFAULT_DISK_GB,
+                   help=f"vast: container disk GB (holds /workspace; default {vast.DEFAULT_DISK_GB})")
+    p.add_argument("--skip-ssh-key-check", action="store_true",
+                   help="vast: rent even if the local public key is not found on the vast account")
     p.add_argument("--gpu", action="append", help="gpuTypeId; repeat for a priority list "
                                                   f"(default: {', '.join(DEFAULT_GPUS)})")
     p.add_argument("--cloud", default="SECURE", choices=("SECURE", "COMMUNITY"))
     p.add_argument("--volume-gb", type=int, default=150)
     p.add_argument("--container-gb", type=int, default=40)
-    p.add_argument("--image", default=DEFAULT_IMAGE)
+    p.add_argument("--image", default=None,
+                   help=f"container image (default: {DEFAULT_IMAGE} on RunPod, "
+                        f"{vast.DEFAULT_IMAGE} on vast)")
     p.add_argument("--name")
     p.add_argument("--min-vcpu", type=int, default=8)
     p.add_argument("--min-ram", type=int, default=32, help="GB RAM per GPU")
@@ -1725,6 +1938,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GT scoring half-robot shift (scripts/score_ground_truth.py --score-shift)")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_tune)
+
+    p = sub.add_parser("vast-offers", help="vast.ai single-GPU offers by CPU clock (read-only)")
+    p.add_argument("--gpu", action="append", help='vast gpu_name, repeatable (default "RTX 5090", "RTX 4090")')
+    p.add_argument("--include-unverified", action="store_true", help="drop the verified-host filter")
+    p.add_argument("--min-cuda", type=float, default=12.8, help="cuda_max_good floor (13.0 for the vLLM arm Q)")
+    p.add_argument("--min-disk", type=float, default=vast.DEFAULT_DISK_GB, help="GB free disk (also prices $/h)")
+    p.add_argument("--min-reliability", type=float, default=0.97)
+    p.add_argument("--min-ghz", type=float, default=0.0, help="cpu_ghz floor")
+    p.add_argument("--min-cores", type=float, default=8, help="cpu_cores_effective floor")
+    p.add_argument("--max-dph", type=float, help="max $/h (dph_total)")
+    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--json", action="store_true", help="dump the raw offers")
+    p.set_defaults(fn=cmd_vast_offers)
 
     p = sub.add_parser("pull", help="copy pod DB + replays + event state to data/runpod_pull/<podId>/")
     p.add_argument("--with-video", action="store_true", help="include replay HUD mp4s")

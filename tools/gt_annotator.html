@@ -167,10 +167,24 @@ const video = $("vid"), ov = $("ov"), octx = ov.getContext("2d");
 const tl = $("timeline"), tctx = tl.getContext("2d");
 const mapC = $("map"), mctx = mapC.getContext("2d");
 const MAX_SPEED_MPS = 6.0, JUMP_SLACK_M = 0.5, REANCHOR_N = 10, DECIMATE = 2;
-const TRAIL_S = 2.0, OTHER_GAP_S = 1.0, AUTO_S = 20, FULL_S = 166, TELEOP_S = 24, PAD_S = 3;
-// 2026 match timeline measured off the qm8 broadcast clock (t0 = auto start):
-// auto 0–20 s, clock frozen at 2:20 until teleop starts ~24 s, 0:00 at ~166 s.
+const TRAIL_S = 2.0, OTHER_GAP_S = 1.0, PAD_S = 3;
+// Match timeline (t0 = auto start), set per match from the event's season by
+// setSeasonClock(). 2026 was measured off the qm8 broadcast clock: auto 0–20 s,
+// clock frozen at 2:20 until teleop starts ~24 s, 0:00 at ~166 s. Older games
+// (15 s auto / 135 s teleop) use the usual ~3 s FMS pause between periods.
 // Presets pad PAD_S on both sides so the opening and the buzzer are never clipped.
+let AUTO_S = 20, TELEOP_S = 24, FULL_S = 166;
+function setSeasonClock(info) {
+  const auto = (info && info.auto_s) || 20, tele = (info && info.teleop_s) || 140;
+  const year = (info && info.year) || 2026;
+  AUTO_S = auto;
+  TELEOP_S = auto + (year >= 2026 ? 4 : 3);
+  FULL_S = TELEOP_S + tele + 2;
+  for (const [p, end] of [["auto", AUTO_S], ["full", FULL_S]]) {
+    const b = document.querySelector(`.rp[data-p="${p}"]`);
+    if (b) b.textContent = `${p === "auto" ? "Auto" : "Full match"} (t0−${PAD_S} → +${end + PAD_S} s)`;
+  }
+}
 const HAS_RVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
 const S = {
@@ -512,15 +526,25 @@ window.addEventListener("beforeunload", (e) => {
 });
 
 // ------------------------------------------------------------- loading ---
-// AdvantageScope 2026 Field2d drawing (hub, trench, bumps, depot, tower,
-// outpost) under the map; the server ships it pre-rotated to blue-left.
-async function loadField2d() {
-  try {
-    const cfg = await api("GET", "/api/field2d?season=2026");
-    const img = new Image();
-    img.onload = () => { S.field2d = { cfg, img }; S.dataVersion++; };
-    img.src = cfg.image_url;
-  } catch (e) { /* plain map fallback */ }
+// AdvantageScope Field2d drawing for the match's season (2026 hub/trench/
+// bumps, 2025 reef/barge, ...) under the map; the server ships it pre-rotated
+// to blue-left and picks the AndyMark drawing for an AndyMark-layout season.
+const field2dCache = {};
+async function loadField2d(season) {
+  const key = String(season || "2026");
+  S.field2dKey = key;
+  if (!(key in field2dCache)) {
+    field2dCache[key] = (async () => {
+      const cfg = await api("GET", `/api/field2d?season=${enc(key)}`);
+      const img = new Image();
+      await new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; img.src = cfg.image_url; });
+      return { cfg, img };
+    })().catch(() => null);
+  }
+  const f = await field2dCache[key];
+  if (S.field2dKey !== key) return;           // the user moved on to another match
+  S.field2d = f;                              // null: plain map fallback
+  S.mapVersion = -1; S.dataVersion++; requestDraw();
 }
 async function init() {
   $("annotator").value = LS.get("gt.annotator", "");
@@ -529,7 +553,6 @@ async function init() {
   S.preset = LS.get("gt.preset", "full");
   S.loupe = LS.get("gt.loupe", false);
   S.boxScale = clamp(LS.get("gt.boxScale", 1), 0.8, 1.4);
-  loadField2d();
   let data;
   try { data = await api("GET", "/api/matches"); }
   catch (e) { $("empty").textContent = "failed to load matches: " + e.message; return; }
@@ -561,6 +584,10 @@ async function selectMatch(mk, wantTeam) {
   S.boxGrid = boxes ? boxes.grid : null;
   if (views) { S.views = views.views; S.grid = views.grid || null; S.field = views.field; S.margin = views.on_field_margin_m; S.calib = views.calibration; }
   else { S.views = []; S.grid = null; }
+  // the event's season: field drawing + period timings (2025 = 15 s auto, ...)
+  const yr = /^\d{4}/.test(m.event_key) ? m.event_key.slice(0, 4) : "2026";
+  setSeasonClock(views && views.season_info);
+  loadField2d((views && views.season) || yr);
   for (const d of gtd.docs) S.docs[d.team] = d;
   // video: prefer the one existing GT was made on
   const vs = $("videoSel"); vs.innerHTML = "";

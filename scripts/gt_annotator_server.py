@@ -35,7 +35,8 @@ from web.field.camera_view import load_views  # noqa: E402
 from web.field.composite_layout import load_layout  # noqa: E402
 from web.field.field_model import FieldModel  # noqa: E402
 from web.field.match_order import select_epoch  # noqa: E402
-from web.field.season import DEFAULT_LAYOUT, layout_for_event  # noqa: E402
+from web.field.season import (DEFAULT_LAYOUT, layout_for_event,  # noqa: E402
+                               season_for_event, season_for_layout)
 
 HTML_PATH = ROOT / "tools" / "gt_annotator.html"
 DB_PATH = Path(os.environ.get("GT_ANNOTATOR_DB", ROOT / "frc_scorer.db"))
@@ -356,21 +357,28 @@ FIELD2D_DIR = ROOT / "data" / "field" / "advantagescope"
 
 
 def _field2d_paths(season: str):
-    year = str(season)[:4]
+    """Drawing files for ``season``: a year ("2025"), a tag-layout stem
+    ("2025-reefscape-andymark") or a drawing name ("2025_andymark"). The
+    AndyMark variant gets its own drawing when one exists, else the welded one."""
+    s = str(season)
+    year = s[:4]
     if not year.isdigit():
         raise HTTPException(400, "bad season")
-    return FIELD2D_DIR / f"{year}_field2d.json", FIELD2D_DIR / f"{year}_field2d.jpg", year
+    name = year
+    if "andymark" in s.lower() and (FIELD2D_DIR / f"{year}_andymark_field2d.json").is_file():
+        name = f"{year}_andymark"
+    return FIELD2D_DIR / f"{name}_field2d.json", FIELD2D_DIR / f"{name}_field2d.jpg", name
 
 
 @app.get("/api/field2d")
 def api_field2d(season: str = "2026"):
     """Top-down field drawing (AdvantageScope Field2d, pre-rotated to the
     WPILib blue-left frame) + the pixel rect of the field carpet in it."""
-    cfg_p, img_p, year = _field2d_paths(season)
+    cfg_p, img_p, name = _field2d_paths(season)
     if not cfg_p.is_file() or not img_p.is_file():
-        raise HTTPException(404, f"no field drawing for {year}")
+        raise HTTPException(404, f"no field drawing for {name}")
     cfg = json.loads(cfg_p.read_text())
-    cfg["image_url"] = f"/api/field2d/{year}.jpg"
+    cfg["image_url"] = f"/api/field2d/{name}.jpg"
     return cfg
 
 
@@ -405,7 +413,9 @@ def api_views(event_key: str, match_key: Optional[str] = None, grid: bool = Fals
     except ValueError as e:
         raise HTTPException(400, str(e))
     views, sel, dims, season = views_for(event_key, match_key)
+    info = season_for_layout(season) or season_for_event(event_key)
     out = {"event_key": event_key, "match_key": match_key, "season": season,
+           "season_info": info.public(),
            "field": {"length_m": dims[0], "width_m": dims[1]},
            "on_field_margin_m": gt.ON_FIELD_MARGIN_M,
            "calibration": sel,

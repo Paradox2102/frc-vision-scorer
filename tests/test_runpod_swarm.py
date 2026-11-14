@@ -1169,3 +1169,23 @@ def test_import_path_is_one_module():
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert "ONE_MODULE_OK" in res.stdout, res.stdout[-800:] + res.stderr[-1500:]
     assert asyncio  # (imported for pod_job's asyncio.run in the closed-ws test)
+
+
+def test_plan_before_up_creates_state_without_pods_and_up_still_needs_count(monkeypatch):
+    """Videos download BEFORE renting: `plan` makes the swarm state; `up` then still
+    treats it as new (no members) and refuses without --count."""
+    import argparse
+    monkeypatch.setattr(swarm, "build_plan", lambda *a, **k: {
+        "event": "2026tst", "spec": "all", "items": [], "skipped": [], "missing": []})
+    monkeypatch.setattr(cli, "main_checkout", lambda *a, **k: Path("/nonexistent"))
+    args = argparse.Namespace(name="pre", event="2026tst", matches="all", videos=None,
+                              download=False, cache_dir=None, redo=False)
+    assert swarm.cmd_plan(args) == 0
+    sw = swarm.Swarm.load("pre")
+    assert sw.members == [] and sw.data["plan"]["event"] == "2026tst"
+    upargs = argparse.Namespace(name="pre", count=None, add=None, gpu=None, cloud=None, image=cli.DEFAULT_IMAGE,
+                                volume_gb=80, container_gb=40, min_vcpu=8, min_ram=32, data_center=None,
+                                with_vllm=False, ref="main", dry_run=True, scratch=None,
+                                no_sam2_fallback=True, secrets_from_env=False)
+    with pytest.raises(SystemExit, match="needs --count"):
+        swarm.cmd_up(upargs)

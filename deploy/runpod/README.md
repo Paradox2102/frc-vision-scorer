@@ -346,9 +346,9 @@ is billed on every pod. `--terminate-when-done` stops each pod's billing as
 soon as it has nothing left to do.
 
 ```bash
+rp swarm plan --name cur --event 2026cur --download            # FIRST, before renting: schedule order; videos fetched HERE (home IP)
 rp swarm up --name cur --count 8 --dry-run --secrets-from-env  # bodies, bundle manifest, $/h; creates NOTHING
 rp swarm up --name cur --count 8 --secrets-from-env            # ONE "rent" prompt for all 8; parallel setup
-rp swarm plan --name cur --event 2026cur --download            # schedule order; videos fetched HERE (home IP)
 rp swarm run --name cur --terminate-when-done                  # dispatch; Ctrl-C and re-run re-attaches
 rp swarm status --name cur                                     # members, RunPod state, $ so far, progress
 rp swarm pull --name cur                                       # (only if not terminated by run)
@@ -371,7 +371,8 @@ rp swarm terminate --name cur                                  # whatever is lef
   `--videos DIR`, then `data/videos`, then `data/test_footage`. With
   `--download`, missing videos are fetched via TBA video key + yt-dlp into
   `data/videos/` (`--cache-dir`) **from this machine**: YouTube blocks
-  datacenter IPs as bots. A download can run while `swarm up` bootstraps.
+  datacenter IPs as bots. Plan (and download) **before** `swarm up`: `plan` creates the
+  swarm state without any pods, so nothing bills while videos download.
   Matches that already have a complete replay (local DB, a previous
   `data/runpod_pull/*` pull, or this swarm's run) are skipped unless you pass
   `--redo`.

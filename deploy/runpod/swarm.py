@@ -280,8 +280,9 @@ def _pubkey() -> str:
 
 def cmd_up(args) -> int:
     name = check_name(args.name)
-    exists = Swarm.path_for(name).exists()
     sw = Swarm.load(name, create=True)
+    # a swarm made by `swarm plan` has no members yet: it is still "new" here
+    exists = Swarm.path_for(name).exists() and bool(sw.members)
     gpus = args.gpu or sw.data.get("gpu_priority") or DEFAULT_SWARM_GPUS
     cloud = args.cloud or sw.data.get("cloud") or "SECURE"
     live = live_members(sw)
@@ -549,7 +550,9 @@ def _run_active(run: dict | None) -> bool:
 
 
 def cmd_plan(args) -> int:
-    sw = Swarm.load(args.name)
+    # Planning (incl. --download) comes BEFORE renting: a swarm with no pods yet
+    # is created here so pods never bill while match videos download.
+    sw = Swarm.load(check_name(args.name), create=True)
     if _run_active(sw.data.get("run")):
         raise SystemExit("a run has jobs in flight: finish it (`swarm run`) before re-planning")
     main = cli.main_checkout()

@@ -168,6 +168,9 @@ def main() -> int:
     ap.add_argument("--final-timeout", type=float, default=900.0)
     ap.add_argument("--no-profile", action="store_true", help="skip py-spy + nvidia-smi profiling")
     ap.add_argument("--pyspy-rate", type=int, default=20)
+    ap.add_argument("--allow-busy", action="store_true",
+                    help="submit even if another job is active (concurrency test; "
+                         "needs MAX_CONCURRENT_JOBS > 1 on the server)")
     a = ap.parse_args()
 
     cfg = json.loads(a.config_json)
@@ -190,7 +193,7 @@ def main() -> int:
 
     try:
         active = http_json(f"{base}/api/job/active", timeout=30)
-        if active.get("job_id"):
+        if active.get("job_id") and not a.allow_busy:
             rec.update(status="error", error=f"server busy with job {active['job_id']}")
             return 2
         rec.update(status="loading_event")

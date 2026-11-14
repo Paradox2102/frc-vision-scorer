@@ -2,20 +2,26 @@
 from __future__ import annotations
 import cv2
 import numpy as np
-from pupil_apriltags import Detector
 
-# Module-level singleton holding C-level state — not thread-safe. Fine for the
-# sequential calibration UI and single-job inference; do not call detect_tags /
-# detect_tags_in_roi concurrently from multiple threads.
+# A pupil_apriltags Detector holds C-level state and is NOT thread-safe: with
+# MAX_CONCURRENT_JOBS=2 two jobs ran the per-match calibration check at once
+# through the old module-level singleton and the server died with no traceback
+# (Nov 13 pod). Each thread now gets its own detector (tag_locator's immortal
+# per-thread cache; same params -> identical detections).
 # quad_decimate=1: the default (2) halves the image before finding tag outlines and
 # misses small tags (distant corner-camera tags ~25 px wide decode only at 1).
-_detector = Detector(families="tag36h11", quad_decimate=1.0)
+_DETECTOR_PARAMS = {"quad_decimate": 1.0}
+
+
+def _detector():
+    from web.field.tag_locator import thread_detector  # lazy: tag_locator imports calibration
+    return thread_detector(**_DETECTOR_PARAMS)
 
 
 def detect_tags(frame_bgr: np.ndarray) -> dict[int, np.ndarray]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     out: dict[int, np.ndarray] = {}
-    for d in _detector.detect(gray):
+    for d in _detector().detect(gray):
         out[int(d.tag_id)] = np.asarray(d.corners, dtype=float)  # (4,2)
     return out
 

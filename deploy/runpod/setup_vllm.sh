@@ -15,12 +15,17 @@ VLLM_VERSION="${FRC_VLLM_VERSION:-0.25.1}"   # the version start_vllm.sh is tune
 VENV="$FRC_APP/.venv-vllm"
 APP_PY="$FRC_APP/.venv/bin/python"
 
-have="$("$VENV/bin/python" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || true)"
-if [ "$have" != "$VLLM_VERSION" ]; then
-  [ -x "$VENV/bin/python" ] || uv venv --managed-python --python 3.12 "$VENV"
+[ -x "$VENV/bin/python" ] || uv venv --managed-python --python 3.12 "$VENV"
+# Always run (a no-op when satisfied): it also repairs a venv whose vLLM
+# dependencies drifted. The lock holds the Nov 12 known-good set; a
+# non-default FRC_VLLM_VERSION installs unconstrained.
+LOCK="$HERE/requirements-vllm-lock.txt"
+if [ "$VLLM_VERSION" = "0.25.1" ] && [ -f "$LOCK" ]; then
+  uv pip install --python "$VENV/bin/python" "vllm==$VLLM_VERSION" -c "$LOCK"
+else
   uv pip install --python "$VENV/bin/python" "vllm==$VLLM_VERSION"
 fi
-"$VENV/bin/python" -c 'import vllm; print("vllm", vllm.__version__)'
+"$VENV/bin/python" -c 'import vllm, transformers; print("vllm", vllm.__version__, "transformers", transformers.__version__)'
 [ -x "$VENV/bin/vllm" ] || { echo "missing $VENV/bin/vllm" >&2; exit 1; }
 
 # Reader weights for every vlm_model key a tune arm uses (public repos).

@@ -274,6 +274,38 @@ async def _default_run_script(name: str) -> None:
     await proc.wait()
 
 
+#: start_vllm.sh writes the launched ``vllm serve`` PID here (stop_vllm.sh reads it).
+_VLLM_PID_FILE = Path("/tmp/frc-vllm.pid")
+
+
+def _default_alive() -> "bool | None":
+    """Is the launched vLLM process still running? None when unknown (no PID file).
+
+    A crashed engine (e.g. a processor error during memory profiling) takes the
+    API server down within seconds; without this the readiness loop would keep
+    polling a dead server until ``ready_timeout`` (20 min wasted on the Nov 13
+    pod). Zombies (exited, unreaped -- start_vllm.sh backgrounds the server and
+    exits) count as dead.
+    """
+    try:
+        pid = int(_VLLM_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                return "Z" not in line.split(":", 1)[1].split()[0]
+    except OSError:
+        pass
+    return True
+
+
 async def ensure_started(
     *,
     check_fn: Callable[[], bool] = _default_check,
@@ -284,8 +316,14 @@ async def ensure_started(
     http_fn: HttpFn = _default_http,
     should_stop: Callable[[], bool] | None = None,
     served_model_fn: ServedModelFn = _default_served_model,
+    alive_fn: "Callable[[], bool | None] | None" = None,
 ) -> bool:
     """Bring the requested reader model up; True when serving, False on timeout.
+
+    ``alive_fn`` reports whether the launched process is still running (None =
+    unknown); a confirmed-dead launch returns False at once instead of waiting
+    out ``ready_timeout``. Defaults to the PID-file check only when the real
+    launch script is used (injected ``run_script`` test doubles get no check).
 
     Model-aware: if a server is up but serving the WRONG model (confirmed via
     the served-model probe), stop it and cold-start with the requested model's
@@ -319,6 +357,8 @@ async def ensure_started(
             await run_script("stop")
 
     await run_script("start")
+    if alive_fn is None and run_script is _default_run_script:
+        alive_fn = _default_alive
     clock = now or asyncio.get_event_loop().time
     deadline = clock() + ready_timeout
     while clock() < deadline:
@@ -326,6 +366,10 @@ async def ensure_started(
             return False
         if check_fn():
             return True
+        if alive_fn is not None and alive_fn() is False:
+            print("  [vllm] server process exited during startup "
+                  "(see /tmp/frc-vllm.log)")
+            return False
         await sleep(_POLL_SECONDS)
     return False
 

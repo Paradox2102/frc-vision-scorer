@@ -320,3 +320,63 @@ def test_ensure_started_should_stop_none_polls_to_ready():
     ))
     assert result is True
     assert launches == ["start"]
+
+
+def test_ensure_started_returns_false_at_once_when_launch_dies():
+    """A crashed engine must not be waited out to ready_timeout (Nov 13 pod: 20 min)."""
+    async def run_script(_name):
+        pass
+
+    clock = {"t": 0.0}
+
+    async def sleep(seconds):
+        clock["t"] += seconds
+
+    alive = iter([None, True, False])
+    result = asyncio.run(ensure_started(
+        check_fn=lambda: False,
+        run_script=run_script,
+        sleep=sleep,
+        ready_timeout=1200,
+        now=lambda: clock["t"],
+        alive_fn=lambda: next(alive),
+    ))
+    assert result is False
+    assert clock["t"] < 10  # two polls, not 1200 s
+
+
+def test_ensure_started_unknown_liveness_keeps_polling_to_ready():
+    async def run_script(_name):
+        pass
+
+    ready = iter([False, False, True])
+    result = asyncio.run(ensure_started(
+        check_fn=lambda: next(ready),
+        run_script=run_script,
+        sleep=_noop_sleep(),
+        ready_timeout=60,
+        alive_fn=lambda: None,
+    ))
+    assert result is True
+
+
+def test_default_alive_reads_pid_file(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from web import vllm_lifecycle as vl
+
+    pid_file = tmp_path / "frc-vllm.pid"
+    monkeypatch.setattr(vl, "_VLLM_PID_FILE", pid_file)
+    assert vl._default_alive() is None  # no PID file -> unknown
+    pid_file.write_text(f"{os.getpid()}\n")
+    assert vl._default_alive() is True
+    proc = subprocess.Popen(["true"])
+    proc.wait()  # reaped -> gone
+    pid_file.write_text(str(proc.pid))
+    assert vl._default_alive() is False
+    zombie = subprocess.Popen(["true"])
+    import time
+    time.sleep(0.3)  # exited, NOT reaped -> zombie counts as dead
+    pid_file.write_text(str(zombie.pid))
+    assert vl._default_alive() is False
+    zombie.wait()

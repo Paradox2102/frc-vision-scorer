@@ -420,7 +420,8 @@ def score_sweep(sw: swarm.Swarm, *, audit: bool = False, rescore: bool = False, 
         want_audit = audit and "hand_gt" not in truths
         if cache.exists() and not rescore:
             rec = json.loads(cache.read_text())
-            if rec.get("job_id") == it.get("job_id") and (not want_audit or (rec.get("score") or {}).get("audit")):
+            if (rec.get("job_id") == it.get("job_id") and not score_error(rec)
+                    and (not want_audit or (rec.get("score") or {}).get("audit"))):
                 recs[key] = rec
                 continue
         row, meta = locate_replay(sw, it)
@@ -441,6 +442,19 @@ def score_sweep(sw: swarm.Swarm, *, audit: bool = False, rescore: bool = False, 
         cache.write_text(json.dumps(rec, indent=1))
         recs[key] = rec
     return recs
+
+
+def score_error(rec: dict) -> str | None:
+    """Why a cached score record failed (scorer crash, or no GT score for a
+    match that HAS hand GT), else None. Failed records are re-scored and
+    listed in the report instead of silently dropping out of the metrics."""
+    sc = rec.get("score") or {}
+    if sc.get("error"):
+        return str(sc["error"])[-200:]
+    gt = sc.get("gt") or {}
+    if "hand_gt" in (rec.get("truths") or []) and (gt.get("error") or not gt):
+        return f"GT score failed: {str(gt.get('error') or 'no gt result')[:200]}"
+    return None
 
 
 def cmd_score(args) -> int:
@@ -585,11 +599,13 @@ def build_report(recs: list, configs: list, baselines: list, *, expected: dict |
     base_matches = set(aggs[present[0]]["gt_matches"]) if present else set()
     order = sorted(configs, key=lambda c: rank_key(aggs[c]))
     table = []
+    errors = {c: [{"match_key": r.get("match_key"), "error": score_error(r)} for r in recs
+                  if r.get("config_id") == c and score_error(r)] for c in configs}
     for i, c in enumerate(order, 1):
         v = verdict(c, aggs[c], bands, baselines, base_matches, min_band)
         done = {r["match_key"] for r in by_cfg[c]}
         miss = sorted(set((expected or {}).get(c) or []) - done)
-        table.append({"rank": i, "config_id": c, **aggs[c], **v, "missing": miss})
+        table.append({"rank": i, "config_id": c, **aggs[c], **v, "missing": miss, "errors": errors[c]})
     matches = sorted({r["match_key"] for r in rows}, key=lambda k: (k.split("_")[0], swarm.key_rank(k) or (9,)))
     per_match = {mk: {c: next((r for r in by_cfg[c] if r["match_key"] == mk), None) for c in configs}
                  for mk in matches}
@@ -629,7 +645,8 @@ def report_rows(rep: dict) -> tuple:
                      _num(t["misid_s"], "{:.1f}"), _pct(t["cov"]), _num(t["err"]), _num(t["manta"]),
                      _pct(t["audit_misid"]), _num(t["wall_s"] / 60 if t["wall_s"] else None, "{:.1f}"),
                      _num(t["vram_max_mib"] / 1024 if t["vram_max_mib"] else None, "{:.1f}"),
-                     f"{len(t['gt_matches'])}" + (f" (missing {len(t['missing'])})" if t["missing"] else "")])
+                     f"{len(t['gt_matches'])}" + (f" (missing {len(t['missing'])})" if t["missing"] else "")
+                     + (f" (errors {len(t['errors'])})" if t.get("errors") else "")])
     return hdr, rows
 
 
@@ -665,7 +682,10 @@ def render_text(rep: dict) -> str:
             _fmt_table(mh, mrows)]
     for t in rep["configs"]:
         if t["missing"]:
-            out.append(f"  {t['config_id']}: no score for {', '.join(t['missing'])}")
+            out.append(f"  {t['config_id']}: no score for {', '.join(t['missing'])} (not finished / not pulled)")
+        for e in t.get("errors") or []:
+            out.append(f"  {t['config_id']}: SCORE ERROR {e['match_key']}: {e['error']} "
+                       f"(re-run `swarm sweep score`)")
     return "\n".join(out)
 
 
@@ -682,6 +702,9 @@ def render_md(rep: dict, title: str) -> str:
            "| match | " + " | ".join(cfgs) + " |", "|" + "---|" * (len(cfgs) + 1)]
     md += ["| " + mk + " | " + " | ".join(_cell(rep["per_match"][mk].get(c)) for c in cfgs) + " |"
            for mk in rep["matches"]]
+    errs = [(t["config_id"], e) for t in rep["configs"] for e in t.get("errors") or []]
+    if errs:
+        md += ["", "## Score errors", ""] + [f"- {c} {e['match_key']}: {e['error']}" for c, e in errs]
     return "\n".join(md) + "\n"
 
 

@@ -78,10 +78,16 @@ class TbaSource:
     arrival "<mk>@r<n>" only with ``reprocess_replayed``; otherwise it is
     logged once and ignored."""
 
-    def __init__(self, event: str, fetch, seen: dict, *, reprocess_replayed: bool = False, log=print):
+    def __init__(self, event: str, fetch, seen: dict, *, reprocess_replayed: bool = False, log=print,
+                 already=None):
         self.event, self.fetch, self.seen = event, fetch, seen
         self.reprocess = reprocess_replayed
         self.log = log
+        # already(set of match keys) -> {match_key: where}: matches that have
+        # a finished result already (an earlier live day, a batch run, the
+        # local DB). Their current videos are recorded as seen, not queued;
+        # only a NEW video id of theirs counts (as a replay).
+        self.already = already
         self.exhausted = False
 
     def poll(self, now: float) -> list:
@@ -91,11 +97,18 @@ class TbaSource:
             self.log(f"[tba] poll failed (retried next time): {e}")
             return []
         new = []
+        unseen = {r["match_key"] for r in rows if r["videos"] and r["match_key"] not in self.seen}
+        done = (self.already(unseen) or {}) if (self.already and unseen) else {}
         for r in rows:
             if not r["videos"]:
                 continue
             mk = r["match_key"]
             s = self.seen.get(mk)
+            if s is None and mk in done:
+                self.seen[mk] = {"videos": list(r["videos"]), "first_seen": now, "n": 1,
+                                 "skipped": f"already processed ({done[mk]})"}
+                self.log(f"[tba] {mk}: already processed ({done[mk]}); not queued again")
+                continue
             if s is None:
                 self.seen[mk] = {"videos": list(r["videos"]), "first_seen": now, "n": 1}
                 new.append({"key": mk, "match_key": mk, "video_key": r["videos"][0], "available_at": now,
@@ -360,14 +373,23 @@ class AutoImporter:
     per live session; while a local job runs the import waits (retried after
     the next finished match)."""
 
-    def __init__(self, sw: swarm.Swarm, *, active_job=swarm.local_active_job, pull=None, out=print):
+    def __init__(self, sw: swarm.Swarm, run: dict | None = None, *, active_job=swarm.local_active_job,
+                 pull=None, post=None, out=print):
         main = cli.main_checkout()
-        self.sw = sw
+        self.sw, self.run = sw, run if run is not None else sw.data.get("run") or {}
         self.local_db, self.replays = main / "frc_scorer.db", main / "web" / "replays"
         self.uploads = main / "web" / "uploads"
         self.active_job, self.pull = active_job, pull or swarm.pull_member
+        self.post = post or swarm._post_render
         self.backup = None
         self.lock = threading.Lock()
+
+    def wanted(self) -> set:
+        """Job ids of THIS live run's finished items: the only replays it
+        imports (never earlier batch / sweep / rehearsal runs on the same
+        pods, nor failed attempts)."""
+        return {it["job_id"] for it in self.run.get("items", {}).values()
+                if it.get("status") == "done" and it.get("job_id")}
 
     def __call__(self, ctx, m: dict, key: str, ok: bool, state: dict) -> int:
         if not ok or not swarm.is_pod(m):
@@ -380,7 +402,9 @@ class AutoImporter:
                 return 0
             imp = swarm.plan_import(self.sw, local_db=self.local_db, replays_dir=self.replays,
                                     pull_root=cli.PULL_ROOT, uploads_dir=self.uploads)
-            add = [e for e in imp["entries"] if e["action"] == "add"]
+            want = self.wanted()
+            entries = [e for e in imp["entries"] if e["id"] in want]
+            add = [e for e in entries if e["action"] == "add"]
             if not add:
                 return 0
             jid = self.active_job()
@@ -390,8 +414,11 @@ class AutoImporter:
             if self.backup is None:
                 self.backup = swarm.backup_db(self.local_db, f"{self.sw.name}-live")
                 ctx.event(f"[import] backup (once per session): {self.backup}")
-            n = swarm.apply_import(imp["entries"], local_db=self.local_db, replays_dir=self.replays)
+            n = swarm.apply_import(entries, local_db=self.local_db, replays_dir=self.replays)
             ctx.event(f"[import] {n} replay(s) imported ({', '.join(e.get('match_key') or e['id'] for e in add)})")
+            for e in add:
+                if e.get("render"):          # no HUD mp4 pulled: ask the local :8004 to render it now
+                    ctx.event(f"[import] render {e['id'][:8]} ({e.get('match_key')}): {self.post(e['id'])}")
             return n
 
 
@@ -504,8 +531,11 @@ def _cmd_live(args, sw: swarm.Swarm, *, fetch=None, downloader=None) -> int:
             run = swarm.new_run(plan, pods, cfg, policy="live", restart_each=restart)
             run["open"] = True
             base = local_event_state(main / "web" / "uploads")
-            run["live"] = {"mode": mode, "speed": args.speed, "seen": {}, "emitted": [],
+            seen = prior_seen(sw.data.get("run_history") or [], args.event) if mode == "tba" else {}
+            run["live"] = {"mode": mode, "speed": args.speed, "seen": seen, "emitted": [],
                            "t0_real": swarm._now(), "baseline": base, "event_state": dict(base)}
+            if seen:
+                print(f"{len(seen)} match(es) already seen by earlier live runs of {args.event}: not queued again")
             sw.data["plan"], sw.data["run"] = plan, run
             print(f"new live run on {len(pods)} member(s) ({', '.join(pods)}); "
                   f"{'rehearsal x' + str(args.speed) if args.rehearse else 'polling TBA every ' + str(args.poll_s) + ' s'}")
@@ -534,14 +564,15 @@ def _cmd_live(args, sw: swarm.Swarm, *, fetch=None, downloader=None) -> int:
         span = (sched[-1]["actual_time"] - sched[0]["actual_time"]) / args.speed
         print(f"rehearsal: {len(sched)} match(es) over {swarm._fmt_min(span)} (x{args.speed})")
     else:
-        source = TbaSource(args.event, fetch, live["seen"], reprocess_replayed=args.reprocess_replayed)
+        source = TbaSource(args.event, fetch, live["seen"], reprocess_replayed=args.reprocess_replayed,
+                           already=lambda keys: already_processed(sw, keys, main))
     wargs = argparse.Namespace(**vars(args))
     wargs.poll_s = args.job_poll_s
-    wargs.terminate_when_done = False
+    wargs.terminate_when_done = bool(getattr(args, "terminate_when_done", False))
     ctx = swarm.RunCtx(sw, wargs)
     hooks = [EventStateSync(sw, run, swarm.SWARM_DIR / sw.name / "event_state")]
     if args.auto_import and not args.local:
-        hooks.append(AutoImporter(sw))
+        hooks.append(AutoImporter(sw, run))
     elif args.auto_import:
         print("--auto-import ignored with --local (replays are already in the local DB)")
 
@@ -565,7 +596,45 @@ def _cmd_live(args, sw: swarm.Swarm, *, fetch=None, downloader=None) -> int:
     outd.mkdir(parents=True, exist_ok=True)
     (outd / "latency.json").write_text(json.dumps(rep, indent=1))
     print(f"latency report -> {outd / 'latency.json'}")
+    print(billing_line(sw))
     return rc
+
+
+def billing_line(sw: swarm.Swarm) -> str:
+    billing = [m for m in sw.members if swarm.is_pod(m) and m.get("status") in swarm.BILLING_STATUSES]
+    if not billing:
+        return "no pods billing"
+    burn = sum(float(m.get("cost_per_hr") or 0) for m in billing)
+    return (f"{len(billing)} pod(s) still billing ${burn:.2f}/h: `swarm pull --name {sw.name}` then "
+            f"`swarm terminate --name {sw.name}` (or run live with --terminate-when-done)")
+
+
+def prior_seen(history: list, event: str) -> dict:
+    """``seen`` of earlier TBA live runs of ``event`` (merged): a new live run
+    of the same event (next day) does not queue their matches again."""
+    out: dict = {}
+    for h in history:
+        lv = h.get("live") or {}
+        if h.get("policy") != "live" or lv.get("mode") != "tba" or h.get("event") != event:
+            continue
+        for mk, s in (lv.get("seen") or {}).items():
+            cur = out.setdefault(mk, {"videos": [], "first_seen": s.get("first_seen"), "n": 0})
+            cur["videos"] += [v for v in s.get("videos") or [] if v not in cur["videos"]]
+            cur["n"] = max(cur["n"], s.get("n", 1))
+    return out
+
+
+def already_processed(sw: swarm.Swarm, keys: set, main: Path) -> dict:
+    """match_key -> where it already has a finished result: a done item of
+    any earlier run of this swarm, a complete replay in the local DB or in
+    a previous pull."""
+    found = swarm.existing_results(set(keys), main / "frc_scorer.db", cli.PULL_ROOT, None)
+    for h in sw.data.get("run_history") or []:
+        for k, it in (h.get("items") or {}).items():
+            mk = it.get("match_key") or k
+            if mk in keys and it.get("status") == "done" and not it.get("config_id"):
+                found.setdefault(mk, "an earlier run of this swarm")
+    return found
 
 
 def add_parser(ss, named) -> None:
@@ -579,6 +648,10 @@ def add_parser(ss, named) -> None:
     q.add_argument("--auto-import", action="store_true",
                    help="pull + import each finished match into the local app (one DB backup per session)")
     q.add_argument("--hours", type=float, default=None, help="stop polling after this long (then drain)")
+    q.add_argument("--terminate-when-done", action="store_true",
+                   help="once arrivals stop (--hours / rehearsal end) and the queue drains: pull, then "
+                        "terminate each pod (same safety as `swarm run`; the flag is the confirmation)")
+    q.add_argument("--with-video", action="store_true", help="with --terminate-when-done: pull HUD mp4s too")
     q.add_argument("--cache-dir", help="download dir (default main checkout data/videos)")
     q.add_argument("--rehearse", action="store_true", help="replay a PAST event at its real match cadence")
     q.add_argument("--speed", type=float, default=1.0, help="rehearsal speed factor")

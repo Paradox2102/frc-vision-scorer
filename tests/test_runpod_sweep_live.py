@@ -874,20 +874,172 @@ def test_live_rehearsal_end_to_end_with_fake_members(tmp_path, monkeypatch, caps
     assert "latency (video seen -> final)" in capsys.readouterr().out
 
 
-def test_auto_import_backs_up_once_and_waits_for_a_local_job(tmp_path, monkeypatch):
+
+# ----------------------------------------------------------------- review fixes
+def _live_args(name, **kw):
+    a = dict(name=name, event="2026x", poll_s=5, job_poll_s=0, config_json=None, reprocess_replayed=False,
+             auto_import=False, hours=None, cache_dir=None, rehearse=False, speed=1.0, matches="all",
+             videos=None, local=False, local_url=None, local_app_dir=None, restart_each=None,
+             terminate_when_done=False, with_video=False)
+    a.update(kw)
+    return argparse.Namespace(**a)
+
+
+class TickClock:
+    """Every now() call moves time forward 1 s (so --hours can expire)."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def now(self):
+        self.t += 1.0
+        return self.t
+
+
+def test_next_day_live_run_does_not_redispatch_day_one(tmp_path, monkeypatch, capsys):
+    """Day 1 closed by --hours; day 2 `swarm live` for the same event: only the
+    new matches run (day-1 matches, and a match done by an earlier batch run,
+    are neither re-downloaded nor re-dispatched)."""
+    clock = TickClock()
+    monkeypatch.setattr(swarm, "_now", clock.now)
+    monkeypatch.setattr(swarm.time, "sleep", lambda s: None)
+    sw = swarm.Swarm.load("d2", create=True)
+    sw.members.append({"pod_id": "a", "status": "ready", "cost_per_hr": 1, "created_at": 0})
+    day1 = swarm.new_run({"id": "live-1", "kind": "live", "event": "2026x", "items": []}, ["a"], policy="live")
+    day1["live"] = {"mode": "tba", "seen": {"2026x_qm1": {"videos": ["v1"], "first_seen": 1, "n": 1},
+                                           "2026x_qm2": {"videos": ["v2"], "first_seen": 2, "n": 1}}}
+    for k, v in (("2026x_qm1", "v1"), ("2026x_qm2", "v2")):
+        day1["items"][k] = {"video": "/v", "status": "done", "attempts": 1, "avoid": [], "pod": "a",
+                            "match_key": k, "job_id": "J" + k, "video_key": v}
+    day1["open"] = False                         # closed by --hours
+    batch = {"items": {"2026x_qm4": {"video": "/v", "status": "done", "job_id": "B4"}}}
+    sw.data["run_history"] = [batch]
+    sw.data["plan"], sw.data["run"] = {"id": "live-1", "kind": "live", "event": "2026x", "items": []}, day1
+    sw.save()
+    rows = _tba_rows({"2026x_qm1": ["v1"], "2026x_qm2": ["v2"], "2026x_qm3": ["v3"], "2026x_qm4": ["v4"]})
+    downloads, ran = [], []
+
+    def dl(video_key, dest):
+        downloads.append(video_key)
+        return _video(Path(dest), 100)
+
+    def fake_process(ctx, m, key):
+        ran.append(key)
+        return True, {"job_id": "J" + key, "wall_final_s": 100.0}
+    monkeypatch.setattr(swarm, "process_item", fake_process)
+    monkeypatch.setattr(live.EventStateSync, "__call__", lambda *a: [])
+    assert live.cmd_live(_live_args("d2", hours=1e-9, cache_dir=str(tmp_path / "dl")),
+                         fetch=lambda p: rows, downloader=dl) == 0
+    assert ran == ["2026x_qm3"] and downloads == ["v3"]
+    run = swarm.Swarm.load("d2").data["run"]
+    assert set(run["items"]) == {"2026x_qm3"} and run["open"] is False
+    assert "skipped" in run["live"]["seen"]["2026x_qm4"]
+    out = capsys.readouterr().out
+    assert "2 match(es) already seen by earlier live runs" in out and "already processed" in out
+    assert "1 pod(s) still billing $1.00/h" in out and "swarm terminate --name d2" in out
+
+
+def test_live_terminate_when_done_pulls_then_terminates(tmp_path, monkeypatch, capsys):
+    clock = Clock(1000.0)
+    monkeypatch.setattr(swarm, "_now", clock.now)
+    monkeypatch.setattr(swarm.time, "sleep", lambda s: None)
+    keys = ["2026x_qm1", "2026x_qm2"]
+    for k in keys:
+        _video(tmp_path / "vids" / f"{k}.mp4")
+    sw = swarm.Swarm.load("lt", create=True)
+    for p in ("a", "b"):
+        sw.members.append({"pod_id": p, "status": "ready", "cost_per_hr": 1, "created_at": 0})
+    sw.save()
+
+    def fake_process(ctx, m, key):
+        clock.t += 100
+        return True, {"job_id": "J" + key, "wall_final_s": 100.0}
+    monkeypatch.setattr(swarm, "process_item", fake_process)
+    monkeypatch.setattr(live.EventStateSync, "__call__", lambda *a: [])
+    order = []
+    monkeypatch.setattr(swarm, "pull_member", lambda sw_, m, wv=False, out=None: order.append(("pull", m["pod_id"])))
+    monkeypatch.setattr(swarm, "pull_covers", lambda sw_, m: (True, "ok"))
+    monkeypatch.setattr(swarm, "terminate_member", lambda sw_, m, request=None: (
+        order.append(("term", m["pod_id"])), sw_.update(m, status="terminated")))
+    args = _live_args("lt", rehearse=True, speed=1000.0, videos=str(tmp_path / "vids"), terminate_when_done=True)
+    assert live.cmd_live(args, fetch=lambda p: _tba_rows({k: [] for k in keys})) == 0
+    for p in ("a", "b"):
+        assert order.index(("pull", p)) < order.index(("term", p))
+    assert "no pods billing" in capsys.readouterr().out
+
+
+def test_auto_import_only_this_runs_jobs_backs_up_once_and_renders(tmp_path, monkeypatch):
     sw = swarm.Swarm.load("ai", create=True)
-    calls = {"backup": 0, "apply": 0, "pull": 0}
-    monkeypatch.setattr(swarm, "plan_import", lambda sw_, **k: {"entries": [{"action": "add", "id": "R",
-                                                                              "match_key": "m"}]})
+    run = swarm.new_run({"id": "l", "event": "e", "items": []}, ["p"], policy="live")
+    run["items"]["e_qm1"] = {"video": "/v", "status": "done", "job_id": "R1", "attempts": 2, "avoid": []}
+    run["items"]["e_qm2"] = {"video": "/v", "status": "failed", "job_id": "R2bad", "attempts": 2, "avoid": []}
+    entries = [{"action": "add", "id": "R1", "match_key": "e_qm1", "render": True},
+               {"action": "add", "id": "R2bad", "match_key": "e_qm2"},          # failed attempt
+               {"action": "add", "id": "OLD", "match_key": "e_qm9"}]            # earlier batch run on the pod
+    monkeypatch.setattr(swarm, "plan_import", lambda sw_, **k: {"entries": entries})
+    calls = {"backup": 0, "pull": 0}
+    applied, posted = [], []
     monkeypatch.setattr(swarm, "backup_db", lambda db, tag: calls.__setitem__("backup", calls["backup"] + 1) or "bak")
-    monkeypatch.setattr(swarm, "apply_import", lambda e, **k: calls.__setitem__("apply", calls["apply"] + 1) or 1)
+    monkeypatch.setattr(swarm, "apply_import", lambda e, **k: applied.append([x["id"] for x in e]) or
+                        sum(x["action"] == "add" for x in e))
     busy = ["J"]
-    imp = live.AutoImporter(sw, active_job=lambda: busy[0],
+    imp = live.AutoImporter(sw, run, active_job=lambda: busy[0], post=lambda rid: posted.append(rid) or "queued",
                             pull=lambda sw_, m: calls.__setitem__("pull", calls["pull"] + 1))
     ctx = swarm.RunCtx(sw, argparse.Namespace(poll_s=0, terminate_when_done=False))
     m = {"pod_id": "p"}
-    assert imp(ctx, m, "k1", True, {}) == 0 and calls == {"backup": 0, "apply": 0, "pull": 1}
+    assert imp(ctx, m, "e_qm1", True, {}) == 0 and applied == [] and calls == {"backup": 0, "pull": 1}
     busy[0] = None
-    assert imp(ctx, m, "k2", True, {}) == 1 and imp(ctx, m, "k3", True, {}) == 1
-    assert calls == {"backup": 1, "apply": 2, "pull": 3}
-    assert imp(ctx, m, "k4", False, {}) == 0 and imp(ctx, {"pod_id": "local", "backend": "local"}, "k", True, {}) == 0
+    assert imp(ctx, m, "e_qm1", True, {}) == 1
+    assert applied == [["R1"]] and posted == ["R1"] and calls["backup"] == 1
+    assert imp(ctx, m, "e_qm1", True, {}) == 1 and calls["backup"] == 1        # one backup per session
+    assert imp(ctx, m, "x", False, {}) == 0 and imp(ctx, {"pod_id": "local", "backend": "local"}, "k", True, {}) == 0
+    assert any("render R1" in e for e in ctx.events)
+
+
+def test_live_billing_line():
+    sw = swarm.Swarm({"name": "b", "members": [
+        {"pod_id": "a", "status": "ready", "cost_per_hr": 1.09},
+        {"pod_id": "b", "status": "lost", "cost_per_hr": 0.5},
+        {"pod_id": "c", "status": "terminated", "cost_per_hr": 9},
+        {"pod_id": "local", "backend": "local", "status": "ready"}]}, Path("/nonexistent"))
+    assert live.billing_line(sw).startswith("2 pod(s) still billing $1.59/h")
+
+
+def test_sweep_errored_score_is_rescored_and_reported(tmp_path):
+    sw = _sweep_swarm(tmp_path, "er", ["a"], keys=("m_qm1",))
+    run = sw.data["run"] = swarm.new_run(sw.data["plan"], ["a"], policy="pinned")
+    for k, it in run["items"].items():
+        it.update(status="done", job_id="J" + k, pod="a")
+    sw.save()
+    # replays "located" without a pull for this test
+    import sweep as sweep_mod
+    calls = []
+    orig = sweep_mod.locate_replay
+    try:
+        sweep_mod.locate_replay = lambda sw_, it: ({"id": it["job_id"], "match_key": "m_qm1"}, tmp_path / "meta.json")
+        outcome = {"n": 0}
+
+        def runner(argv):
+            calls.append(argv)
+            outcome["n"] += 1
+            if outcome["n"] == 1:
+                return {"error": "Traceback ... boom"}
+            return {"gt": {"n_processed": 10, "label_correct": 0.7, "label_wrong": 0.0, "unlabeled": 0.3,
+                           "misid_s": 0, "coverage": 0.8, "err_median_m": 0.3}}
+        recs = sweep.score_sweep(sw, runner=runner, out=lambda *a: None)
+        assert len(calls) == 3
+        bad = [r for r in recs.values() if sweep.score_error(r)]
+        assert len(bad) == 1
+        rep = sweep.build_report(list(recs.values()), ["Q0a", "Q0b", "Q1"], ["Q0a", "Q0b"])
+        errs = {t["config_id"]: t["errors"] for t in rep["configs"]}
+        bad_cfg = bad[0]["config_id"]
+        assert errs[bad_cfg] and "boom" in errs[bad_cfg][0]["error"]
+        assert "SCORE ERROR m_qm1" in sweep.render_text(rep) and "## Score errors" in sweep.render_md(rep, "er")
+        # the errored record is NOT reused: the next pass re-scores just that item
+        recs = sweep.score_sweep(sw, runner=runner, out=lambda *a: None)
+        assert len(calls) == 4 and not any(sweep.score_error(r) for r in recs.values())
+    finally:
+        sweep_mod.locate_replay = orig
+    # a GT match whose GT score failed counts as an error too; a no-GT match's "no ground truth" does not
+    assert sweep.score_error({"truths": ["hand_gt"], "score": {"gt": {"error": "alignment"}}})
+    assert sweep.score_error({"truths": ["none"], "score": {"gt": {"error": "no ground truth"}}}) is None

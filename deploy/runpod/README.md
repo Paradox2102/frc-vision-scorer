@@ -575,6 +575,7 @@ rp swarm sweep score --name qsl && rp swarm sweep report --name qsl
 rp swarm up --name ev --count 5 --secrets-from-env                     # RENTS: ceil(T_match / cadence) + 1 pods
 rp swarm live --name ev --event 2026xyz --auto-import                  # TBA poll every 60 s; Ctrl-C and re-run re-attaches
 rp swarm live --name ev --event 2026xyz --hours 9                      # stop polling after 9 h, then drain
+rp swarm live --name ev --event 2026xyz --hours 9 --terminate-when-done # ... then pull + terminate each pod
 rp swarm live --name ev --event 2026xyz --reprocess-replayed           # a re-posted (replayed) match runs again as <mk>@r2
 
 # rehearsal of a PAST event at its real cadence (phase 3); --local = no renting, tests the machinery
@@ -589,6 +590,19 @@ rp swarm live --name rehl --event 2026cur --rehearse --speed 10 --matches qm1-qm
   tried again on the next poll. When a known match gets a new video id
   (a replay), it is logged and ignored unless you pass
   `--reprocess-replayed`.
+* **Next day**: a run closed by `--hours` is finished, so the next `swarm
+  live` for the same event starts a new run. That run takes over the
+  earlier live runs' seen matches, and it never queues a match that already
+  has a result: a done item of any earlier run of this swarm, or a complete
+  replay in the local DB or a previous pull. Only a new video id of such a
+  match counts, and only as a replay (`--reprocess-replayed`).
+* **Billing at exit**: without `--terminate-when-done` the pods keep
+  running when live exits. The last line says how many pods are still
+  billing and at what $/h, with the `swarm pull` / `swarm terminate`
+  commands. With the flag, each pod is pulled and then terminated once
+  arrivals have stopped (`--hours` expired, or the rehearsal ended) and its
+  queue is empty. The safety rules are the same as `swarm run`: a pod is
+  never terminated while its last job is unpulled.
 * **Dispatch** (`live` policy): the new match goes to the pod that has been
   idle longest. It never queues two matches on one pod while another pod is
   idle. When every pod is busy, nothing is pre-assigned: the pod that frees
@@ -610,10 +624,16 @@ rp swarm live --name rehl --event 2026cur --rehearse --speed 10 --matches qm1-qm
   max latency, the wait before dispatch, the pod predicted to free next and
   per-pod utilization. At the end it writes
   `data/runpod_pull/live/<name>/latency.json`.
-* **`--auto-import`** pulls each finished match's pod and runs the same
-  import as `swarm import --apply`. The DB is backed up **once per live
-  session**. While local :8004 runs a job, the import waits until the next
-  finished match. It is ignored with `--local`.
+* **`--auto-import`** pulls each finished match's pod and imports, with
+  the `swarm import --apply` rules, only the replays of **this live run's**
+  finished jobs. Replays of earlier batch, sweep or rehearsal runs on the
+  same pods, and failed attempts, are never imported. The DB is backed up
+  **once per live session**. HUD videos are not pulled, so after each
+  import the dispatcher asks the local :8004 to render them (the same
+  request as `swarm import --render`) and logs its answer. If :8004 is
+  down, the replay stays `render_status=queued` until the app's startup
+  sweep renders it. While local :8004 runs a job, the import waits until
+  the next finished match. It is ignored with `--local`.
 * **Rehearsal**: arrival time = now + (TBA `actual_time` − first match's) /
   `--speed`. Videos come from this swarm's earlier plan / runs, then
   `--videos DIR`, then `data/videos` / `data/test_footage` as

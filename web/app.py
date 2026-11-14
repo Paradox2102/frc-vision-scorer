@@ -15,6 +15,13 @@ import sys  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # see below
 from web.cpu_budget import seed_omp_env as _seed_omp_env  # noqa: E402
 _seed_omp_env()
+# Host-RAM ratchet fix: pin glibc's mmap threshold + cap malloc arenas before
+# torch / cv2 / any worker thread exists, so the multi-MB per-frame buffers
+# every job churns go back to the kernel when freed instead of piling up in
+# per-thread arena heaps (10 GiB after one short job; see web/malloc_tune.py).
+from web.malloc_tune import configure_malloc as _configure_malloc  # noqa: E402
+_MALLOC_TUNING = _configure_malloc()
+print(f"  [malloc] glibc tuning: {_MALLOC_TUNING}")
 
 import asyncio
 import base64

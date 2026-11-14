@@ -1086,6 +1086,29 @@ KNOBS = [
     # mean-NN 1.52->0.82) both improved with this + sticky_max_dist_m.
     Knob("merge_main_guard", "MERGE_MAIN_GUARD", bool, True,
          section="Fusion & field position"),
+    # Fused-id far split: in full-SAM3 tracking a corner SAM object lives all
+    # match; when it ends up on a DIFFERENT robot than the one it was first
+    # cross-view-paired with, its (camera, sam_id) key still maps to that
+    # robot's fused id, and the same-id merge above folded the second robot
+    # into the first (2025hop qm2: 103 of 546 lost GT robot-moments, the corner
+    # det absorbed into a fused obs a median 4.8 m away, range 1.5-5.8 m).
+    # ON: (1) FusedTrackRegistry unbinds a key whose id is also claimed this
+    # frame by a cluster farther than fused_split_far_m (the claimant nearest
+    # the id's last position keeps it), so the moved cluster continues /
+    # relinks / gets its own id; (2) merge_same_id_observations no longer
+    # merges a same-id member farther than fused_split_far_m from the retained
+    # member — it gets a fresh fused id. One switch: (1) fixes the source,
+    # (2) is the safety net for residual same-id groups.
+    # fused_split_far_m 2.5: same-robot same-id members differ by corner range
+    # error (~0.3-1 m typical, ~2 m bad) and fusion only pairs views within
+    # 0.6 m (isotropic) / 1.0 m cross-ray; 2.5 m clears a bad corner read with
+    # margin, matches sticky_max_dist_m (the tracker's own "too far to be the
+    # same robot" gate) and sits below the observed absorptions (median 4.8 m).
+    # DEFAULT OFF pending live A/B. See fusion.py / fused_track_id.py.
+    Knob("fused_split_far", "FUSED_SPLIT_FAR", bool, False,
+         section="Fusion & field position"),
+    Knob("fused_split_far_m", "FUSED_SPLIT_FAR_M", float, 2.5, min=0.5,
+         max=20.0, section="Fusion & field position"),
     # --- field tracker position stability (field-map-v2 spec) ---
     # Corner-only measurements (no main-view box) get inflated KF noise —
     # low cameras have poor range; 1.0 restores full-trust updates.

@@ -30,6 +30,22 @@ shared no camera with it) and created_samecam_below_floor /
 created_samecam_above_floor (best same-camera cosine vs a plausible inactive
 id, below / at-or-above app_floor).
 
+Far-key split (``split_far_m`` > 0, job knob ``fused_split_far``, default
+OFF): union-find over member keys assumes a ``(camera, sam_id)`` key stays on
+one robot. In full-SAM3 mode a corner SAM object lives all match and can end
+up on a DIFFERENT robot (SAM object switch, or a wrong cross-view pairing);
+its key then still maps to the first robot's id, and merge_same_id_observations
+folded the second robot into the first (2025hop qm2: 103 lost GT
+robot-moments, median 4.8 m apart). With the knob on, before ids are resolved,
+every fused id claimed this frame by >= 2 clusters keeps one owner — the
+claimant nearest the id's last-known position (fallback: main-backed, then most
+keys bound to the id, then first) — and any other claimant farther than
+``split_far_m`` from the owner has its keys for that id UNBOUND, so it
+continues via its other keys, relinks, or gets a fresh id (and never collapses
+the two ids together). ``split_off`` is the merge-time safety net for residual
+same-id groups. Stats: key_unbound_far (keys), split_far (observations split
+off at merge); ``last_frame_split`` holds this frame's counts.
+
 Pure: no torch / SAM / cv2 imports."""
 from __future__ import annotations
 import numpy as np
@@ -48,7 +64,8 @@ class FusedAssignmentEvidence:
 
 class FusedTrackRegistry:
     def __init__(self, app_floor: float = 0.55, ema_alpha: float = 0.3,
-                 relink_max_dist_m: float = 0.0, per_cam_relink: bool = False) -> None:
+                 relink_max_dist_m: float = 0.0, per_cam_relink: bool = False,
+                 split_far_m: float = 0.0) -> None:
         # member key (camera, per_camera_id) -> fused id
         self._key_to_id: dict[tuple, int] = {}
         self._next_id = 0
@@ -77,6 +94,94 @@ class FusedTrackRegistry:
         self._cam_anchor: dict[int, dict] = {}
         self._cam_exemplars: dict[int, dict] = {}
         self.stats: Counter = Counter()
+        # Far-key split (module docstring); 0 = off.
+        self.split_far_m = float(split_far_m)
+        # This frame's far-split counts (reset by assign): keys unbound in the
+        # pre-pass, observations split off by split_off (merge safety net).
+        self.last_frame_split = {"unbound": 0, "split": 0}
+
+    def _claim_owner(self, fused_id: int, idxs: list, observations: list) -> int:
+        """Owner among the observations claiming ``fused_id`` this frame: the
+        one nearest the id's last-known position; without one, a main-backed
+        claimant, then the one with the most keys bound to the id, then the
+        first."""
+        last = self._id_to_pos.get(fused_id)
+        if last is not None:
+            return min(idxs, key=lambda i: (
+                float(np.hypot(observations[i].detection.pos[0] - last[0],
+                               observations[i].detection.pos[1] - last[1])), i))
+
+        def n_keys(i):
+            return sum(1 for m in observations[i].members
+                       if self._key_to_id.get(tuple(m)) == fused_id)
+        return min(idxs, key=lambda i: (
+            observations[i].detection.box is None, -n_keys(i), i))
+
+    def _unbind_far_keys(self, observations: list) -> int:
+        """Far-key split pre-pass (see module docstring). Returns the number of
+        member keys unbound."""
+        claims: dict[int, list] = {}
+        for i, obs in enumerate(observations):
+            ids = {self._key_to_id[k] for k in (tuple(m) for m in obs.members)
+                   if k in self._key_to_id}
+            for fid in sorted(ids):
+                claims.setdefault(fid, []).append(i)
+        unbound = 0
+        for fid, idxs in claims.items():
+            if len(idxs) < 2:
+                continue
+            owner = self._claim_owner(fid, idxs, observations)
+            ox, oy = observations[owner].detection.pos
+            for i in idxs:
+                if i == owner:
+                    continue
+                px, py = observations[i].detection.pos
+                if float(np.hypot(px - ox, py - oy)) <= self.split_far_m:
+                    continue
+                for m in observations[i].members:
+                    k = tuple(m)
+                    if self._key_to_id.get(k) == fid:
+                        del self._key_to_id[k]
+                        unbound += 1
+        return unbound
+
+    def split_off(self, observations: list, kept_obs=None) -> "FusedAssignmentEvidence":
+        """Merge-time far split (merge_same_id_observations ``on_split``): the
+        given same-id observations sit farther than ``split_far_m`` from the
+        id's retained member, so they are another robot. Stamp ONE fresh fused
+        id on all of them, repoint their member keys to it (so the key
+        continues the new id next frame instead of re-claiming the old one),
+        seed its appearance stores, and restore the old id's last position to
+        the retained member's. Returns the new id's assignment evidence."""
+        fused_id = self._next_id
+        self._next_id += 1
+        ev = FusedAssignmentEvidence(track_id=fused_id, type="newly_created",
+                                     margin=1.0)
+        for obs in observations:
+            obs.track_id = fused_id
+            obs.detection.track_id = fused_id
+            obs.relink_margin = 1.0
+            obs.detection.relink_margin = 1.0
+            obs.relink_evidence = ev
+            obs.detection.relink_evidence = ev
+            for m in obs.members:
+                self._key_to_id[tuple(m)] = fused_id
+            emb = obs.detection.embedding
+            if emb is not None and self._id_to_embedding.get(fused_id) is None:
+                self._id_to_embedding[fused_id] = emb
+                self._id_to_anchor[fused_id] = emb
+                self._recent_exemplars[fused_id] = [emb]
+            self._update_cam_stores(fused_id, obs, False)
+            self.stats["split_far"] += 1
+            self.last_frame_split["split"] += 1
+        ref = next((o for o in observations if o.detection.box is not None),
+                   observations[0])
+        self._id_to_pos[fused_id] = (float(ref.detection.pos[0]),
+                                     float(ref.detection.pos[1]))
+        if kept_obs is not None and kept_obs.track_id is not None:
+            self._id_to_pos[kept_obs.track_id] = (
+                float(kept_obs.detection.pos[0]), float(kept_obs.detection.pos[1]))
+        return ev
 
     def _update_cam_stores(self, fused_id: int, obs, update_ok: bool) -> None:
         """Per-camera mirror of the legacy appearance update (same shape as
@@ -170,6 +275,12 @@ class FusedTrackRegistry:
         Returns a list of FusedAssignmentEvidence corresponding to each observation."""
         active_ids_this_frame = set()
         evidence_list = []
+        if self.split_far_m > 0:
+            self.last_frame_split = {"unbound": 0, "split": 0}
+            n = self._unbind_far_keys(observations)
+            if n:
+                self.stats["key_unbound_far"] += n
+                self.last_frame_split["unbound"] = n
         
         # 1. First pass: Handle observations that have known member keys.
         # We assign them their known fused ID, handle any collapses, and mark the ID as active.

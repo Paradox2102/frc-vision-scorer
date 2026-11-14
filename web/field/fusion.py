@@ -198,7 +198,8 @@ def fuse_detections(
     return [_merge(c, is_hub_occluded=is_hub_occluded) for c in clusters]
 
 
-def merge_same_id_observations(observations, evidence=None, main_guard=False):
+def merge_same_id_observations(observations, evidence=None, main_guard=False,
+                               max_merge_m: float = 0.0, on_split=None):
     """Collapse observations that share a fused ``track_id`` into one per id.
 
     A fused track_id is one physical robot by definition (the registry unifies a
@@ -216,7 +217,25 @@ def merge_same_id_observations(observations, evidence=None, main_guard=False):
     track. ``evidence`` (the per-observation assignment evidence, index-aligned to
     ``observations``) is collapsed in step, taking the retained member's entry.
     Returns ``(merged_observations, merged_evidence)``; ``merged_evidence`` is None
-    when ``evidence`` is None. Observation order is preserved by first appearance."""
+    when ``evidence`` is None. Observation order is preserved by first appearance.
+
+    ``max_merge_m`` (job knob ``fused_split_far``; 0 = off, byte-identical
+    legacy path): a same-id member farther than this from the group's retained
+    (main-backed / first) member is NOT the same robot — typically a full-match
+    corner SAM object whose ``(camera, sam_id)`` key still maps to the id of the
+    robot it was first paired with, now sitting on another robot metres away
+    (2025hop qm2: 103 lost GT robot-moments, median 4.8 m). Such members are
+    split off into their own sub-group(s) (re-applying the same rule among
+    themselves, so two far duplicates of one other robot still merge with each
+    other). Each split sub-group is handed to ``on_split(obs_list, kept_obs)``
+    (FusedTrackRegistry.split_off) which stamps a fresh fused id onto it and
+    returns its assignment evidence; without ``on_split`` the sub-group gets
+    ``track_id=None`` (never the shared id — the tracker's sticky rebind would
+    bind it to the shared id's slot). ``main_guard`` then applies per
+    sub-group."""
+    if max_merge_m and max_merge_m > 0:
+        return _merge_same_id_split_far(observations, evidence, main_guard,
+                                        float(max_merge_m), on_split)
     groups: dict = {}
     order: list = []   # ("id", track_id) or ("obs", index) preserving first-seen order
     for i, o in enumerate(observations):
@@ -256,6 +275,79 @@ def merge_same_id_observations(observations, evidence=None, main_guard=False):
                 [observations[i] for i in idxs], ref_local))
             if merged_ev is not None:
                 merged_ev.append(evidence[idxs[ref_local]])
+    return merged_obs, merged_ev
+
+
+def _split_far_subgroups(observations, idxs, max_merge_m):
+    """Partition a same-id group (observation indices) by distance: the first
+    sub-group is the retained ref member (main-backed when present, else the
+    first) plus every member within ``max_merge_m`` of it; the remainder is
+    partitioned the same way, recursively. Returns ``[(idxs, ref_local), ...]``
+    with ``ref_local`` indexing into that sub-group's ``idxs``."""
+    out = []
+    rest = list(idxs)
+    while rest:
+        ref_i = next((i for i in rest if observations[i].detection.box is not None),
+                     rest[0])
+        rp = np.asarray(observations[ref_i].detection.pos, float)
+        near, far = [], []
+        for i in rest:
+            d = float(np.linalg.norm(
+                np.asarray(observations[i].detection.pos, float) - rp))
+            (near if i == ref_i or d <= max_merge_m else far).append(i)
+        out.append((near, near.index(ref_i)))
+        rest = far
+    return out
+
+
+def _merge_same_id_split_far(observations, evidence, main_guard, max_merge_m,
+                             on_split):
+    """merge_same_id_observations with the far-member distance guard on."""
+    groups: dict = {}
+    order: list = []
+    for i, o in enumerate(observations):
+        tid = o.track_id
+        if tid is None:
+            order.append(("obs", i))
+            continue
+        if tid not in groups:
+            groups[tid] = []
+            order.append(("id", tid))
+        groups[tid].append(i)
+
+    merged_obs = []
+    merged_ev = [] if evidence is not None else None
+    for kind, val in order:
+        if kind == "obs":
+            merged_obs.append(observations[val])
+            if merged_ev is not None:
+                merged_ev.append(evidence[val])
+            continue
+        subgroups = _split_far_subgroups(observations, groups[val], max_merge_m)
+        kept_obs = observations[subgroups[0][0][subgroups[0][1]]]
+        for sg_n, (idxs, ref_local) in enumerate(subgroups):
+            sg_ev = None   # replacement evidence for a split-off sub-group
+            if sg_n > 0:
+                members = [observations[i] for i in idxs]
+                if on_split is not None:
+                    sg_ev = on_split(members, kept_obs)
+                else:
+                    for o in members:
+                        o.track_id = None
+                        o.detection.track_id = None
+            n_main = sum(1 for i in idxs
+                         if observations[i].detection.box is not None)
+            if len(idxs) == 1 or (main_guard and n_main >= 2):
+                for i in idxs:
+                    merged_obs.append(observations[i])
+                    if merged_ev is not None:
+                        merged_ev.append(sg_ev if sg_ev is not None else evidence[i])
+            else:
+                merged_obs.append(_merge_fused_group(
+                    [observations[i] for i in idxs], ref_local))
+                if merged_ev is not None:
+                    merged_ev.append(sg_ev if sg_ev is not None
+                                     else evidence[idxs[ref_local]])
     return merged_obs, merged_ev
 
 

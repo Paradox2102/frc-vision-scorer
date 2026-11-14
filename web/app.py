@@ -6619,6 +6619,8 @@ class InferenceJob:
             app_floor=self._emb_thr().relink_floor,
             relink_max_dist_m=cfg.relink_max_dist_m,
             per_cam_relink=bool(getattr(cfg, "fused_per_cam_relink", False)),
+            split_far_m=(float(cfg.fused_split_far_m)
+                         if getattr(cfg, "fused_split_far", False) else 0.0),
         )
 
     def _record_fused_ids_summary(self) -> None:
@@ -6631,6 +6633,8 @@ class InferenceJob:
         keys = ("continued", "merged", "relinked", "created_with_emb",
                 "created_no_emb", "created_crossview_only",
                 "created_samecam_below_floor", "created_samecam_above_floor")
+        if getattr(reg, "split_far_m", 0.0) > 0:
+            keys += ("key_unbound_far", "split_far")
         counts = {k: int(reg.stats.get(k, 0)) for k in keys}
         counts["per_cam_relink"] = bool(reg.per_cam_relink)
         print("  [fused-ids] " + " ".join(f"{k} {counts[k]}" for k in keys)
@@ -10364,8 +10368,12 @@ class InferenceJob:
                         # slot (the B1<->B3 churn). Corner identity/bearing evidence is
                         # unioned in, and a lone corner obs (main occluded) still
                         # carries the track — so hand-off between cameras is preserved.
+                        _split_m = float(getattr(self.fused_registry, "split_far_m", 0.0))
                         fused, ev_list = merge_same_id_observations(
-                            fused, ev_list, main_guard=self.config.merge_main_guard)
+                            fused, ev_list, main_guard=self.config.merge_main_guard,
+                            max_merge_m=_split_m,
+                            on_split=(self.fused_registry.split_off
+                                      if _split_m > 0 else None))
 
                     field_dets = [obs.detection for obs in fused]
                     if TRACKER_TRACE and getattr(self, "_bc_ready", False):
@@ -10422,6 +10430,12 @@ class InferenceJob:
                             # excluded from this update (key absent when off).
                             **({"gated": list(ft.last_gated_det_indices)}
                                if getattr(ft, "colourless_stationary_gate", False)
+                               else {}),
+                            # fused_split_far: this frame's far-split counts
+                            # (keys unbound / obs split off; absent when off).
+                            **({"fused_split": dict(self.fused_registry.last_frame_split)}
+                               if self.use_mask_tracker and float(getattr(
+                                   self.fused_registry, "split_far_m", 0.0)) > 0
                                else {}),
                             # Raw per-camera detections BEFORE fusion — shows whether a
                             # robot vanished from detection itself (SAM3 gave up / occluded /

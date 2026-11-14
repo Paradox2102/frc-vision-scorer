@@ -770,6 +770,28 @@ def test_swarm_dir_is_gitignored():
 
 
 def test_import_path_is_one_module():
-    # `python runpod_cli.py ...` runs as __main__; swarm must reuse that module
-    assert swarm.cli is sys.modules["runpod_cli"]
+    # `python runpod_cli.py ...` runs as __main__; swarm must reuse that module.
+    # Checked in a fresh interpreter: other test files re-load runpod_cli under
+    # the same name at collection time, so an in-process identity check is
+    # order-dependent.
+    import subprocess
+    path = str(RUNPOD / "runpod_cli.py")
+    # exec the script inside the real __main__ module, exactly like
+    # `python runpod_cli.py swarm --help` (runpy.run_path uses a temp module)
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(RUNPOD)!r})\n"
+        f"sys.argv = [{path!r}, 'swarm', '--help']\n"
+        f"__file__ = {path!r}\n"
+        "try:\n"
+        f"    exec(compile(open({path!r}).read(), {path!r}, 'exec'), globals())\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "main = sys.modules['__main__']\n"
+        "import swarm\n"
+        "assert sys.modules['runpod_cli'] is main, 'second runpod_cli copy'\n"
+        "assert swarm.cli is main, 'swarm bound to a second copy'\n"
+        "print('ONE_MODULE_OK')\n")
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert "ONE_MODULE_OK" in res.stdout, res.stdout[-800:] + res.stderr[-1500:]
     assert asyncio  # (imported for pod_job's asyncio.run in the closed-ws test)

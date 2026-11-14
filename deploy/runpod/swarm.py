@@ -22,9 +22,11 @@ nothing here ever reads or writes the single-pod .state.json.
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -61,6 +63,7 @@ LEVEL_RANK = {"qm": 0, "ef": 1, "qf": 2, "sf": 3, "f": 4}
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 _MATCH_RE = re.compile(r"^(?:[A-Za-z0-9]+_)?(qm|ef|qf|sf|f)(\d+)(?:m(\d+))?$")
 LIVE_STATUSES = ("created", "ssh_wait", "pushing", "secrets", "bootstrapping", "ready", "setup_failed")
+BILLING_STATUSES = LIVE_STATUSES + ("lost",)     # "lost" may still bill: include it in stop/pull/burn
 
 
 def _now() -> float:
@@ -472,7 +475,7 @@ def existing_results(keys: set, local_db: Path, pull_root: Path, run: dict | Non
             rdir = d / "web" / "replays"
             if not (d / "frc_scorer.db").exists() or not rdir.is_dir():
                 continue
-            ids = {p.name for p in rdir.iterdir() if (p / "meta.json").exists()}
+            ids = {p.name for p in rdir.iterdir() if cli.replay_pulled(p)}
             for k in _complete_keys(d / "frc_scorer.db", keys, ids):
                 found.setdefault(k, f"pull {d.name}")
     for mk, it in ((run or {}).get("items") or {}).items():
@@ -808,7 +811,157 @@ def run_counts(run: dict) -> dict:
 # run (I/O)
 # --------------------------------------------------------------------------
 class PodLost(Exception):
-    pass
+    """The RunPod API says the pod is gone or not RUNNING (never raised just
+    because the API or ssh can't be reached)."""
+
+
+class Transport(Exception):
+    """ssh itself failed (exit 255, timeout, no endpoint): network trouble,
+    laptop sleep. Retried without limit (with an API check now and then)."""
+
+
+class RemoteError(Exception):
+    """The remote command ran and exited non-zero (disk full, missing venv,
+    server down...). Retried REMOTE_TRIES times, then RemoteFailed."""
+
+
+class RemoteFailed(Exception):
+    """A remote command kept failing: the item fails instead of the pod
+    retrying forever while it bills."""
+
+
+REMOTE_TRIES = 3
+SSH_TIMEOUT_S = 120
+UPLOAD_TIMEOUT_S = 3600
+
+
+def remote(m: dict, cmd: str, *, timeout: float = SSH_TIMEOUT_S, stdin_path=None) -> str:
+    """Run ``cmd`` on member ``m``: stdout, or Transport (ssh failed: exit 255
+    or timeout) / RemoteError (the command exited non-zero)."""
+    try:
+        base = cli.ssh_base(m)
+    except SystemExit as e:                 # no ssh endpoint yet
+        raise Transport(str(e))
+    f = open(stdin_path, "rb") if stdin_path else None
+    try:
+        r = subprocess.run(base + [cmd], stdin=f if f else subprocess.DEVNULL,
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Transport(f"ssh timed out after {timeout:.0f}s: {cmd[:60]}")
+    except OSError as e:
+        raise Transport(f"ssh: {e}")
+    finally:
+        if f:
+            f.close()
+    err = (r.stderr or b"").decode(errors="replace").strip()[-300:]
+    if r.returncode == 255:
+        raise Transport(f"ssh exit 255: {err}")
+    if r.returncode != 0:
+        raise RemoteError(f"exit {r.returncode} from `{cmd[:80]}`: {err}")
+    return (r.stdout or b"").decode(errors="replace")
+
+
+def read_job_state(m: dict, outp: str) -> tuple[bool, dict | None]:
+    """(launched, state) for one attempt: ``launched`` = its launch marker
+    exists; ``state`` = the driver's out JSON, None when missing (or caught
+    mid-write). ssh failures raise; they never read as "missing"."""
+    q = shlex.quote(outp)
+    txt = remote(m, f"if [ -d {q}.launch ]; then echo L; else echo N; fi; "
+                    f"if [ -f {q} ]; then cat {q}; fi", timeout=60)
+    head, _, body = txt.partition("\n")
+    state = None
+    if body.strip():
+        try:
+            state = json.loads(body)
+        except ValueError:
+            state = None
+    return head.strip() == "L", state
+
+
+def driver_alive(m: dict, state: dict | None, outp: str) -> bool:
+    """Is this attempt's pod_job.py running? By pid once the state has one,
+    else by its --out argument ("[-]-out" so pgrep can't match its own shell)."""
+    if state and state.get("pid"):
+        cmd = f"kill -0 {int(state['pid'])} 2>/dev/null && echo yes || echo no"
+    else:
+        cmd = f"pgrep -f -- {shlex.quote('[-]-out ' + outp)} >/dev/null && echo yes || echo no"
+    return remote(m, cmd, timeout=60).strip() == "yes"
+
+
+def server_active_job(m: dict) -> str | None:
+    """job_id the pod's server is running, None when idle. Unlike
+    runpod_cli.remote_job_active, an ssh failure or a server that doesn't
+    answer is an error (unknown), never "idle"."""
+    txt = remote(m, f"curl -s -m 10 http://127.0.0.1:{cli.POD_PORT}/api/job/active", timeout=60)
+    try:
+        return json.loads(txt).get("job_id")
+    except (ValueError, AttributeError):
+        raise RemoteError(f"/api/job/active did not answer JSON: {txt[:120]!r}")
+
+
+def upload_video(m: dict, local: Path, remote_path: str, out, what: str = "video") -> bool:
+    """Upload unless a same-size file is there (.part + mv). True if uploaded."""
+    q = shlex.quote(remote_path)
+    have = remote(m, f"stat -c %s {q} 2>/dev/null || echo 0", timeout=60).strip()
+    size = Path(local).stat().st_size
+    if have == str(size):
+        return False
+    out(f"uploading {what} {Path(local).name} ({cli.fmt_mb(size)}) -> {remote_path}")
+    parent = shlex.quote(remote_path.rsplit("/", 1)[0])
+    remote(m, f"mkdir -p {parent} && cat > {q}.part && mv {q}.part {q}",
+           timeout=UPLOAD_TIMEOUT_S, stdin_path=local)
+    return True
+
+
+def launch_once(m: dict, outp: str, cmd: str) -> str:
+    """Launch at most once per attempt: the pod creates ``<out>.launch``
+    atomically (mkdir) before starting the driver, so a retry after an ssh
+    drop that hid a successful launch never starts a second pod_job.py."""
+    jobs = shlex.quote(outp.rsplit("/", 1)[0])
+    q = shlex.quote(outp + ".launch")
+    txt = remote(m, f"mkdir -p {jobs} && if mkdir {q} 2>/dev/null; then {cmd}; else echo already; fi")
+    return "already" if "already" in txt else "started"
+
+
+def pod_api_status(m: dict, saver=None) -> str | None:
+    """RunPod's view of the pod: its desiredStatus ("RUNNING", "EXITED", ...),
+    "GONE" when the API says it doesn't exist, None when the API can't be
+    reached (unknown: NOT a reason to give up on the pod)."""
+    try:
+        pod = cli.refresh_endpoint(m, save=saver)
+    except SystemExit as e:
+        return "GONE" if "HTTP 404" in str(e) else None
+    except Exception:
+        return None
+    return pod.get("desiredStatus") or None
+
+
+def _ssh_retry(fn, ctx: "RunCtx", m: dict, out, what: str, tries: int = REMOTE_TRIES):
+    """Call ``fn`` until it succeeds. Transport failures retry without limit;
+    after LOST_AFTER_S of them the API is asked, and only an API answer of
+    "not RUNNING / gone" raises PodLost (an unreachable API keeps retrying).
+    A remote command's real non-zero exit retries ``tries`` times, then
+    RemoteFailed (the item fails; the pod is never stuck on it)."""
+    t0, fails = _now(), 0
+    while True:
+        try:
+            return fn()
+        except RemoteError as e:
+            fails += 1
+            out(f"{what}: {e} ({fails}/{tries})")
+            if fails >= tries:
+                raise RemoteFailed(f"{what}: {e}")
+        except Transport as e:
+            out(f"{what}: ssh: {e}")
+            if _now() - t0 > LOST_AFTER_S:
+                status = pod_api_status(m, ctx.sw.saver(m))
+                if status is not None and status != "RUNNING":
+                    raise PodLost(f"pod is {status}")
+                out(f"{what}: API says {status or 'nothing (unreachable)'}; still retrying")
+                t0 = _now()
+        if ctx.stop.is_set():
+            raise KeyboardInterrupt
+        ctx.sleep(min(30, max(1, ctx.poll_s)))
 
 
 class RunCtx:
@@ -828,57 +981,46 @@ class RunCtx:
         print(msg, flush=True)
 
 
-def _ssh_retry(fn, ctx: RunCtx, m: dict, out, what: str):
-    """Call ``fn`` until it succeeds; after LOST_AFTER_S of failures ask the
-    API whether the pod still exists (laptop sleep / network blips are
-    survived, a deleted or stopped pod raises PodLost)."""
-    t0 = _now()
-    while True:
-        try:
-            return fn()
-        except (subprocess.TimeoutExpired, SystemExit, OSError) as e:
-            out(f"{what}: {type(e).__name__}: {str(e)[:200]}")
-            if _now() - t0 > LOST_AFTER_S:
-                try:
-                    pod = cli.refresh_endpoint(m, save=ctx.sw.saver(m))
-                except (Exception, SystemExit) as e2:
-                    raise PodLost(f"pod unreachable and API failed: {e2}")
-                if pod.get("desiredStatus") != "RUNNING":
-                    raise PodLost(f"pod is {pod.get('desiredStatus')}")
-                t0 = _now()
-            if ctx.stop.is_set():
-                raise
-            ctx.sleep(min(30, max(1, ctx.poll_s)))
+NOTHING_AFTER_S = 300      # a launched driver that never wrote its out file
+
+
+def attempt_paths(mk: str, attempt: int) -> tuple[str, str]:
+    """Per-attempt out/log on the pod (a retry never reuses a file)."""
+    return f"{POD_JOBS}/{mk}.a{attempt}.json", f"{POD_JOBS}/{mk}.a{attempt}.log"
 
 
 def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
     """Upload, launch (or re-attach to) pod_job.py for ``mk`` on member ``m``,
     prefetch the pod's next video, then poll until done/error."""
+    try:
+        return _process_item(ctx, m, mk)
+    except RemoteFailed as e:
+        return False, {"error": str(e)[:400]}
+
+
+def _process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
     run, sw, pod = ctx.run, ctx.sw, m["pod_id"]
     out = sw.logger(m)
     it = run["items"][mk]
     label = f"{mk}.a{it['attempts']}"
     remote_video = f"{POD_VIDEOS}/{mk}.mp4"
-    outp, logp = f"{POD_JOBS}/{mk}.json", f"{POD_JOBS}/{mk}.log"
+    outp, logp = attempt_paths(mk, it["attempts"])
     local = Path(it["video"])
-    state = _ssh_retry(lambda: cli.read_remote_json(m, outp), ctx, m, out, "read job state")
-    if state and state.get("label") != label:
-        state = None                          # an earlier attempt's file
-    if state and state.get("status") == "done":
-        return True, state
-    alive = state is not None and _ssh_retry(lambda: cli.pod_job_alive(m, state), ctx, m, out, "check driver")
-    if alive:
-        out(f"[{mk}] re-attached to running driver (job {state.get('job_id')})")
+
+    def R(fn, what):
+        return _ssh_retry(fn, ctx, m, out, what)
+    launched, state = R(lambda: read_job_state(m, outp), "read job state")
+    if state and state.get("status") in ("done", "error"):
+        return state.get("status") == "done", state
+    if launched:
+        out(f"[{mk}] attempt already launched; re-attaching ({label})")
     else:
-        if state and state.get("status") == "error":
-            return False, state
         if not local.is_file():
             return False, {"error": f"local video missing: {local}"}
-        _ssh_retry(lambda: cli.ensure_remote_file(m, local, remote_video, out=out, what="video"),
-                   ctx, m, out, "upload video")
+        R(lambda: upload_video(m, local, remote_video, out), "upload video")
         waited = _now()
-        while True:   # never start a second job on a server that is busy
-            jid = _ssh_retry(lambda: cli.remote_job_active(m), ctx, m, out, "job/active")
+        while True:   # never start a second job on a busy server (ssh failure = unknown, not idle)
+            jid = R(lambda: server_active_job(m), "job/active")
             if not jid:
                 break
             if _now() - waited > FINAL_TIMEOUT_S:
@@ -891,9 +1033,8 @@ def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
         cmd = cli.pod_job_command(video=remote_video, match_key=mk, event=run["event"], label=label,
                                   config=cfg, out=outp, log=logp, profile=False,
                                   extra=f"--final-timeout {FINAL_TIMEOUT_S:g}")
-        _ssh_retry(lambda: cli.ssh_out(m, f"rm -f {outp}; " + cmd), ctx, m, out, "launch")
-        out(f"[{mk}] launched ({label})")
-        state = None
+        how = R(lambda: launch_once(m, outp, cmd), "launch")
+        out(f"[{mk}] launch: {how} ({label})")
     with sw.lock:
         it["launched_at"] = it.get("launched_at") or _now()
         sw.save()
@@ -903,19 +1044,34 @@ def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
         nloc = Path(run["items"][nxt]["video"])
         try:
             if nloc.is_file():
-                cli.ensure_remote_file(m, nloc, f"{POD_VIDEOS}/{nxt}.mp4", out=out, what="next video")
-        except (Exception, SystemExit) as e:
+                upload_video(m, nloc, f"{POD_VIDEOS}/{nxt}.mp4", out, what="next video")
+        except (Transport, RemoteError, OSError) as e:
             out(f"prefetch {nxt} failed (retried at launch): {e}")
-    t_launch, polls = _now(), 0
+    seen = state is not None
+    window = last_ok = _now()           # "wrote nothing" clock: only while no state was ever seen
+    polls = 0
     while not ctx.stop.is_set():
         ctx.sleep(ctx.poll_s)
         polls += 1
-        state = _ssh_retry(lambda: cli.read_remote_json(m, outp, timeout=60), ctx, m, out, "poll")
-        if state is None or state.get("label") != label:
-            if _now() - t_launch > 300:
-                log = cli.ssh_out(m, f"tail -n 20 {logp} 2>/dev/null", check=False)
-                return False, {"error": f"pod_job.py wrote nothing after 5 min: {log[-300:]}"}
+        _, new = R(lambda: read_job_state(m, outp), "poll")
+        now = _now()
+        if now - last_ok > 3 * ctx.poll_s + 60:
+            window = now                # we were offline (ssh retries / laptop sleep): fresh window
+        last_ok = now
+        if new is None or new.get("label") not in (None, label):
+            if not seen and now - window > NOTHING_AFTER_S:
+                if R(lambda: driver_alive(m, None, outp), "driver check"):
+                    window = now        # alive but slow to write: keep waiting
+                    continue
+                log = ""
+                try:
+                    log = remote(m, f"tail -n 20 {shlex.quote(logp)} 2>/dev/null || true", timeout=60)
+                except (Transport, RemoteError):
+                    pass
+                return False, {"error": f"pod_job.py wrote nothing in {NOTHING_AFTER_S}s and is not "
+                                        f"running: {log[-300:]}"}
             continue
+        state, seen = new, True
         with sw.lock:
             prog = 100 if state.get("status") == "done" else state.get("progress", it.get("progress"))
             it.update(progress=prog, message=str(state.get("message") or "")[:80],
@@ -923,10 +1079,10 @@ def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
             sw.save()
         if state.get("status") in ("done", "error"):
             return state.get("status") == "done", state
-        if polls % 10 == 0 and not _ssh_retry(lambda: cli.pod_job_alive(m, state), ctx, m, out, "alive"):
-            state = cli.read_remote_json(m, outp) or state     # it may have just finished
-            if state.get("status") in ("done", "error"):
-                return state.get("status") == "done", state
+        if polls % 10 == 0 and not R(lambda: driver_alive(m, state, outp), "alive"):
+            _, fin = R(lambda: read_job_state(m, outp), "final read")   # it may have just finished
+            if fin and fin.get("status") in ("done", "error"):
+                return fin.get("status") == "done", fin
             return False, {"error": "pod_job.py driver died", "job_id": state.get("job_id")}
     raise KeyboardInterrupt
 
@@ -939,7 +1095,7 @@ def pull_member(sw: Swarm, m: dict, with_video: bool = False, out=None) -> dict:
     run = sw.data.get("run") or {}
     jobs = [it.get("job_id") for it in run.get("items", {}).values()
             if it.get("pod") == m["pod_id"] and it.get("status") == "done" and it.get("job_id")]
-    covered = [j for j in jobs if (dest / "web" / "replays" / j / "meta.json").exists()]
+    covered = [j for j in jobs if cli.replay_pulled(dest / "web" / "replays" / j)]
     sw.update(m, pulled_at=_now(), pulled_jobs=len(covered), pulled_job_ids=covered,
               pulled_replays_on_pod=len(res["replays_on_pod"]))
     return res
@@ -958,7 +1114,7 @@ def pull_covers(sw: Swarm, m: dict) -> tuple[bool, str]:
         return True, "no finished jobs"
     last = max(done, key=lambda it: it.get("finished_at") or 0)
     pulled = m.get("pulled_at")
-    have = (cli.PULL_ROOT / m["pod_id"] / "web" / "replays" / last["job_id"] / "meta.json").exists()
+    have = cli.replay_pulled(cli.PULL_ROOT / m["pod_id"] / "web" / "replays" / last["job_id"])
     if pulled and pulled >= (last.get("finished_at") or 0) and have:
         return True, f"pulled {len(m.get('pulled_job_ids') or [])} job(s)"
     return False, f"last job {last['job_id'][:8]} not pulled"
@@ -1074,7 +1230,7 @@ def run_table(sw: Swarm, now: float | None = None) -> str:
     remaining = c["pending"] + c["retry"] + sum(
         1 - (items[mk].get("progress") or 0) / 100.0 for mk in run["current"].values() if mk)
     eta = remaining * overall / max(1, len(live)) if live else None
-    burn = sum(float(m.get("cost_per_hr") or 0) for m in sw.members if m.get("status") in LIVE_STATUSES)
+    burn = sum(float(m.get("cost_per_hr") or 0) for m in sw.members if m.get("status") in BILLING_STATUSES)
     total = sum(member_cost(m, now) for m in sw.members)
     rows.append(f"total: done {c['done']}/{c['total']}  failed {c['failed']}  running {c['running']}  "
                 f"retry {c['retry']}  | ETA {_fmt_min(eta)}  | ${total:.2f} so far, burning ${burn:.2f}/h")
@@ -1096,13 +1252,65 @@ def parse_pod_configs(specs) -> dict:
     return out
 
 
+class run_lock:
+    """Exclusive flock on .swarm/<name>.run.lock: one `swarm run` per swarm
+    (two dispatchers would launch every match twice)."""
+
+    def __init__(self, sw: Swarm):
+        self.path = sw.path.with_name(sw.path.name.replace(".json", "") + ".run.lock")
+        self.f = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "a+")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.f.seek(0)
+            holder = self.f.read().strip()
+            self.f.close()
+            raise SystemExit(f"another `swarm run` is already driving this swarm ({holder or 'unknown pid'}; "
+                             f"lock {self.path})")
+        self.f.seek(0)
+        self.f.truncate()
+        self.f.write(f"pid {os.getpid()} since {_dt.datetime.now().isoformat(timespec='seconds')}")
+        self.f.flush()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+        return False
+
+
+def revive_lost(sw: Swarm, status_fn=None) -> list:
+    """Members marked lost whose pod the API now reports RUNNING go back to
+    ready (an API we can't reach changes nothing)."""
+    status_fn = status_fn or pod_api_status
+    back = []
+    for m in sw.members:
+        if m.get("status") == "lost" and status_fn(m, sw.saver(m)) == "RUNNING":
+            sw.update(m, status="ready", error=None)
+            back.append(m["pod_id"])
+    return back
+
+
 def cmd_run(args) -> int:
     sw = Swarm.load(args.name)
+    with run_lock(sw):
+        return _cmd_run(args, sw)
+
+
+def _cmd_run(args, sw: Swarm) -> int:
     plan = sw.data.get("plan")
     if not plan or not plan.get("items"):
         raise SystemExit(f"no plan with work: `swarm plan --name {args.name} --event EV ...` first")
     cfg = json.loads(args.config_json) if args.config_json else None
     pod_cfg = parse_pod_configs(getattr(args, "pod_config", None))
+    for p in revive_lost(sw):
+        print(f"{p}: the API reports it RUNNING again; back in the run")
     run = sw.data.get("run")
     pods = [m["pod_id"] for m in ready_members(sw)]
     with sw.lock:
@@ -1206,7 +1414,7 @@ def cmd_status(args) -> int:
 
 def cmd_pull(args) -> int:
     sw = Swarm.load(args.name)
-    todo = [m for m in sw.members if m.get("status") in LIVE_STATUSES + ("stopped",)
+    todo = [m for m in sw.members if m.get("status") in BILLING_STATUSES + ("stopped",)
             and m.get("status") != "created"]
     if not todo:
         print("no reachable members to pull")
@@ -1289,14 +1497,17 @@ def plan_import(sw: Swarm, *, local_db: Path, replays_dir: Path, pull_root: Path
             pcon = sqlite3.connect(f"file:{pdb}?mode=ro", uri=True)
             try:
                 for d in sorted(rdir.iterdir()):
-                    if not (d / "meta.json").exists():
+                    if not (d / "meta.json").exists() or d.name in seen:
                         continue
                     rid = d.name
-                    e = {"id": rid, "pod_id": m["pod_id"], "src": str(d), "tables": {}, "notes": []}
-                    rows = _rows(pcon, "replays", "id", rid)
-                    if rid in seen:
-                        continue
                     seen.add(rid)
+                    e = {"id": rid, "pod_id": m["pod_id"], "src": str(d), "tables": {}, "notes": []}
+                    if not cli.replay_pulled(d):
+                        e["action"] = "skip"
+                        e["notes"].append("pull not marked complete (old or interrupted pull): `swarm pull` again")
+                        entries.append(e)
+                        continue
+                    rows = _rows(pcon, "replays", "id", rid)
                     if not rows:
                         e["action"] = "skip"
                         e["notes"].append("no replays row in the pulled DB")
@@ -1305,6 +1516,11 @@ def plan_import(sw: Swarm, *, local_db: Path, replays_dir: Path, pull_root: Path
                     row = rows[0]
                     e["match_key"] = row.get("match_key")
                     e["status"] = row.get("status")
+                    if row.get("status") != "complete":
+                        e["action"] = "skip"
+                        e["notes"].append(f"status {row.get('status')!r}: only complete replays are imported")
+                        entries.append(e)
+                        continue
                     if lcon.execute("SELECT 1 FROM replays WHERE id = ?", (rid,)).fetchone():
                         e["action"] = "skip"
                         e["notes"].append("id already in the local DB (never overwritten)")
@@ -1418,8 +1634,8 @@ def apply_import(entries: list, *, local_db: Path, replays_dir: Path) -> int:
             tmp = replays_dir / f".swarm-import-{e['id']}.tmp"
             if tmp.exists():
                 shutil.rmtree(tmp)
-            shutil.copytree(e["src"], tmp)
-            staged.append(tmp)
+            staged.append(tmp)            # before the copy: a copy that dies half-way is cleaned up too
+            shutil.copytree(e["src"], tmp, ignore=shutil.ignore_patterns(cli.PULL_MARKER))
         con.execute("BEGIN IMMEDIATE")
         lcols = {t: set(_columns(con, t)) for t in ("replays",) + tuple(t for t, _ in JOB_TABLES)}
         for e in add:
@@ -1516,7 +1732,7 @@ def _post_render(rid: str) -> str:
 # --------------------------------------------------------------------------
 def cmd_stop(args, request=None) -> int:
     sw = Swarm.load(args.name)
-    todo = [m for m in live_members(sw)]
+    todo = [m for m in sw.members if m.get("status") in BILLING_STATUSES]
     if not todo:
         print("no live members")
         return 0
@@ -1550,7 +1766,9 @@ def cmd_terminate(args, request=None) -> int:
         ok, why = pull_covers(sw, m)
         (allowed if ok or args.force else refused).append((m, why))
     for m, why in refused:
-        print(f"  REFUSED {m['pod_id']}: {why} (`swarm pull --name {sw.name}` first, or --force)")
+        hint = (" - marked lost: the API said it was not RUNNING; start it in the RunPod console and "
+                "`swarm pull`, --force DELETES its unpulled results" if m.get("status") == "lost" else "")
+        print(f"  REFUSED {m['pod_id']}: {why} (`swarm pull --name {sw.name}` first, or --force){hint}")
     if not allowed:
         return 1
     msg = (f"TERMINATE {len(allowed)} pod(s) of swarm {sw.name}: the pods AND their volumes are DELETED.\n"

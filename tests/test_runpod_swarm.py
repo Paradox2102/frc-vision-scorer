@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tarfile
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -21,6 +26,9 @@ import runpod_cli as cli  # noqa: E402
 import swarm  # noqa: E402
 from web.database import SCHEMA  # noqa: E402
 from web.field.event_anchors import DDL as ANCHOR_DDL  # noqa: E402
+
+REAL_REMOTE = swarm.remote      # the autouse fixture replaces it with a tripwire
+REAL_ACTIVE = swarm.server_active_job
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +44,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "ssh_run", no_network)
     monkeypatch.setattr(cli, "ssh_out", no_network)
     monkeypatch.setattr(swarm, "default_downloader", no_network)
+    monkeypatch.setattr(swarm, "remote", no_network)
     return tmp_path
 
 
@@ -238,6 +247,7 @@ def test_build_plan_videos_download_and_skip_existing(tmp_path):
     pull = tmp_path / "pull" / "podA"
     (pull / "web" / "replays" / "r3").mkdir(parents=True)
     (pull / "web" / "replays" / "r3" / "meta.json").write_text("{}")
+    (pull / "web" / "replays" / "r3" / cli.PULL_MARKER).write_text("{}")
     _make_db(pull / "frc_scorer.db")
     pc = sqlite3.connect(pull / "frc_scorer.db")
     pc.execute("INSERT INTO replays (id, match_key, status) VALUES ('r3', '2026tst_qm3', 'complete')")
@@ -418,6 +428,7 @@ def test_cmd_run_end_to_end_with_fake_pods_and_terminate(monkeypatch, tmp_path, 
                 d = cli.PULL_ROOT / m["pod_id"] / "web" / "replays" / it["job_id"]
                 d.mkdir(parents=True, exist_ok=True)
                 (d / "meta.json").write_text("{}")
+                (d / cli.PULL_MARKER).write_text("{}")
     monkeypatch.setattr(swarm, "pull_member", fake_pull)
     monkeypatch.setattr(swarm, "terminate_member",
                         lambda sw_, m, request=None: (killed.append(m["pod_id"]),
@@ -436,47 +447,397 @@ def test_cmd_run_end_to_end_with_fake_pods_and_terminate(monkeypatch, tmp_path, 
     assert "swarm import --name t4 --apply" in capsys.readouterr().out
 
 
-def test_process_item_uploads_launches_prefetches_and_polls(monkeypatch, tmp_path):
-    sw = _ready_swarm("t5", ["a"], KEYS[:2], tmp_path)
+class Clock:
+    """Fake time for the poll loop: sleep() advances now()."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += max(s, 1)
+
+
+class FakePod:
+    """The pod side of the swarm transport: a launch marker, the attempt's
+    out JSON (scripted per poll), the server's active job, and failures
+    injected per helper. Patched in over swarm's ssh helpers."""
+
+    def __init__(self, states=(), launched=False):
+        self.states = list(states)          # successive out-file reads after launch
+        self.launched = launched
+        self.drivers = 0
+        self.uploads, self.active = [], [None]
+        self.fail = {}                      # helper name -> list of exceptions to raise first
+        self.alive = True
+
+    def _maybe_fail(self, name):
+        q = self.fail.get(name)
+        if q:
+            raise q.pop(0)
+
+    def read(self, m, outp):
+        self._maybe_fail("poll" if self.launched else "read")
+        if not self.launched:
+            return False, None
+        st = self.states.pop(0) if len(self.states) > 1 else (self.states[0] if self.states else None)
+        return True, st
+
+    def upload(self, m, local, remote_path, out, what="video"):
+        self._maybe_fail("upload")
+        self.uploads.append(remote_path)
+        return True
+
+    def active_job(self, m):
+        self._maybe_fail("active")
+        return self.active.pop(0) if len(self.active) > 1 else self.active[0]
+
+    def launch(self, m, outp, cmd):
+        self.cmd = cmd
+        first = not self.launched
+        if first:                   # the remote mkdir guard: only the first launch starts a driver
+            self.launched = True
+            self.drivers += 1
+        self._maybe_fail("launch")  # ssh may die AFTER the remote side launched
+        return "started" if first else "already"
+
+    def driver_alive(self, m, state, outp):
+        self._maybe_fail("alive")
+        return self.alive
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(swarm, "read_job_state", self.read)
+        monkeypatch.setattr(swarm, "upload_video", self.upload)
+        monkeypatch.setattr(swarm, "server_active_job", self.active_job)
+        monkeypatch.setattr(swarm, "launch_once", self.launch)
+        monkeypatch.setattr(swarm, "driver_alive", self.driver_alive)
+        return self
+
+
+def _item_ctx(monkeypatch, tmp_path, name, keys=None, poll_s=20):
+    keys = keys or KEYS[:2]
+    sw = _ready_swarm(name, ["a"], keys, tmp_path)
     sw.data["run"] = swarm.new_run(sw.data["plan"], ["a"], {"x": 1})
-    run = sw.data["run"]
-    m = sw.member("a")
-    mk = swarm.next_item(run, "a")
-    uploads, launches = [], []
-    states = iter([None, {"label": f"{mk}.a1", "status": "running", "progress": 40, "pid": 5, "job_id": "J"},
-                   {"label": f"{mk}.a1", "status": "done", "job_id": "J", "wall_final_s": 300.0}])
-    monkeypatch.setattr(cli, "read_remote_json", lambda st, path, timeout=120: next(states))
-    monkeypatch.setattr(cli, "ensure_remote_file",
-                        lambda st, local, remote, out=None, what="": uploads.append(remote) or True)
-    monkeypatch.setattr(cli, "remote_job_active", lambda st: None)
-    monkeypatch.setattr(cli, "pod_job_alive", lambda st, state: True)
-    monkeypatch.setattr(cli, "ssh_out", lambda st, cmd, **k: launches.append(cmd) or "started")
-    ctx = swarm.RunCtx(sw, argparse.Namespace(poll_s=0, terminate_when_done=False), sleep=lambda s: None)
-    ok, state = swarm.process_item(ctx, m, mk)
-    assert ok and state["job_id"] == "J"
-    assert uploads == [f"{swarm.POD_VIDEOS}/{mk}.mp4", f"{swarm.POD_VIDEOS}/{KEYS[1]}.mp4"]   # + prefetch
-    cmd = launches[0]
-    assert cmd.startswith(f"rm -f {swarm.POD_JOBS}/{mk}.json; ") and "setsid -f nohup" in cmd
-    assert f"--label {mk}.a1" in cmd and "--no-profile" in cmd and "--final-timeout 2400" in cmd
-    assert f"--out {swarm.POD_JOBS}/{mk}.json" in cmd and '{"x": 1}' in cmd
-    assert run["items"][mk]["progress"] == 100 and run["items"][mk]["job_id"] == "J"
+    clock = Clock()
+    monkeypatch.setattr(swarm, "_now", clock.now)
+    ctx = swarm.RunCtx(sw, argparse.Namespace(poll_s=poll_s, terminate_when_done=False), sleep=clock.sleep)
+    mk = swarm.next_item(sw.data["run"], "a")
+    return sw, ctx, mk, clock
+
+
+def _st(mk, status, **kw):
+    return {"label": f"{mk}.a1", "status": status, "pid": 5, **kw}
+
+
+def test_process_item_uploads_launches_prefetches_and_polls(monkeypatch, tmp_path):
+    sw, ctx, mk, _ = _item_ctx(monkeypatch, tmp_path, "t5")
+    pod = FakePod([_st(mk, "running", progress=40, job_id="J"),
+                   _st(mk, "done", job_id="J", wall_final_s=300.0)]).install(monkeypatch)
+    ok, state = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok and state["job_id"] == "J" and pod.drivers == 1
+    assert pod.uploads == [f"{swarm.POD_VIDEOS}/{mk}.mp4", f"{swarm.POD_VIDEOS}/{KEYS[1]}.mp4"]   # + prefetch
+    out, log = swarm.attempt_paths(mk, 1)
+    assert out == f"{swarm.POD_JOBS}/{mk}.a1.json"                    # unique per attempt
+    assert f"--label {mk}.a1" in pod.cmd and "--no-profile" in pod.cmd and "--final-timeout 2400" in pod.cmd
+    assert f"--out {out} > {log}" in pod.cmd and '{"x": 1}' in pod.cmd
+    it = sw.data["run"]["items"][mk]
+    assert it["progress"] == 100 and it["job_id"] == "J"
 
 
 def test_process_item_reattaches_without_relaunch(monkeypatch, tmp_path):
-    sw = _ready_swarm("t6", ["a"], KEYS[:1], tmp_path)
-    sw.data["run"] = swarm.new_run(sw.data["plan"], ["a"])
-    mk = swarm.next_item(sw.data["run"], "a")
-    st = {"label": f"{mk}.a1", "status": "running", "pid": 7}
-    states = iter([st, {**st, "status": "done", "job_id": "J"}])
-    monkeypatch.setattr(cli, "read_remote_json", lambda *a, **k: next(states))
-    monkeypatch.setattr(cli, "pod_job_alive", lambda s, state: True)
-    monkeypatch.setattr(cli, "ensure_remote_file", lambda *a, **k: pytest.fail("no upload on re-attach"))
-    ctx = swarm.RunCtx(sw, argparse.Namespace(poll_s=0, terminate_when_done=False), sleep=lambda s: None)
+    sw, ctx, mk, _ = _item_ctx(monkeypatch, tmp_path, "t6", KEYS[:1])
+    pod = FakePod([_st(mk, "running"), _st(mk, "done", job_id="J")], launched=True).install(monkeypatch)
+    pod.upload = lambda *a, **k: pytest.fail("no upload on re-attach")
+    monkeypatch.setattr(swarm, "upload_video", pod.upload)
     ok, state = swarm.process_item(ctx, sw.member("a"), mk)
-    assert ok and state["job_id"] == "J"
+    assert ok and state["job_id"] == "J" and pod.drivers == 0
+    # launched (marker exists) but the driver hasn't written yet: still no relaunch
+    sw2, ctx2, mk2, _ = _item_ctx(monkeypatch, tmp_path, "t6b", KEYS[:1])
+    pod2 = FakePod([None, _st(mk2, "done", job_id="J2")], launched=True).install(monkeypatch)
+    assert swarm.process_item(ctx2, sw2.member("a"), mk2)[0] and pod2.drivers == 0
 
 
-# ----------------------------------------------------------------- import
+# finding 1: a transient ssh failure in the poll loop must not fail a healthy job
+def test_poll_survives_ssh_failures_past_the_nothing_window(monkeypatch, tmp_path):
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f1")
+    pod = FakePod([None, None, _st(mk, "running", progress=10), _st(mk, "done", job_id="J")]).install(monkeypatch)
+    # 20 transport failures = 400+ s of ssh trouble right after launch
+    pod.fail["poll"] = [swarm.Transport("ssh exit 255")] * 20
+    monkeypatch.setattr(swarm, "pod_api_status", lambda m, saver=None: "RUNNING")
+    ok, state = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok and state["job_id"] == "J" and pod.drivers == 1
+
+
+def test_poll_missing_file_rule_only_before_first_state(monkeypatch, tmp_path):
+    # never wrote anything, driver gone after the window -> fail (with the log tail)
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f1b")
+    pod = FakePod([None]).install(monkeypatch)
+    pod.alive = False
+    monkeypatch.setattr(swarm, "remote", lambda m, cmd, **k: "Traceback: venv missing")
+    ok, state = swarm.process_item(ctx, sw.member("a"), mk)
+    assert not ok and "wrote nothing" in state["error"] and "venv missing" in state["error"]
+    assert clock.t - 1000 > swarm.NOTHING_AFTER_S
+    # never wrote anything but the driver is alive: keep waiting, then it finishes
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f1c")
+    states = [None] * 40 + [_st(mk, "done", job_id="J")]
+    pod = FakePod(states).install(monkeypatch)
+    ok, _ = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok
+    # state seen once, then the file reads empty for 15 min (mid-write / glitch): no 5-min failure
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f1d")
+    pod = FakePod([_st(mk, "running")] + [None] * 45 + [_st(mk, "done", job_id="J")]).install(monkeypatch)
+    pod.alive = True
+    ok, _ = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok
+
+
+def test_read_job_state_raises_on_ssh_failure_instead_of_missing(monkeypatch):
+    monkeypatch.setattr(swarm, "remote", REAL_REMOTE)
+    m = {"pod_id": "p", "ssh_host": "1.2.3.4", "ssh_port": 22}
+
+    def fake_run(rc, out=b"", err=b""):
+        return lambda *a, **k: types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+    monkeypatch.setattr(swarm.subprocess, "run", fake_run(255, err=b"Connection reset"))
+    with pytest.raises(swarm.Transport):
+        swarm.read_job_state(m, "/workspace/batch/jobs/x.a1.json")
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", 60)
+    monkeypatch.setattr(swarm.subprocess, "run", timeout)
+    with pytest.raises(swarm.Transport):
+        swarm.read_job_state(m, "/x")
+    monkeypatch.setattr(swarm.subprocess, "run", fake_run(0, b"N\n"))
+    assert swarm.read_job_state(m, "/x") == (False, None)
+    monkeypatch.setattr(swarm.subprocess, "run", fake_run(0, b'L\n{"status": "running"}\n'))
+    assert swarm.read_job_state(m, "/x") == (True, {"status": "running"})
+    monkeypatch.setattr(swarm.subprocess, "run", fake_run(0, b'L\n{"status": "runn'))   # mid-write
+    assert swarm.read_job_state(m, "/x") == (True, None)
+    monkeypatch.setattr(swarm.subprocess, "run", fake_run(1, err=b"No space left on device"))
+    with pytest.raises(swarm.RemoteError, match="No space left"):
+        swarm.upload_video(m, Path(__file__), "/workspace/batch/videos/x.mp4", lambda s: None)
+    with pytest.raises(swarm.Transport):                      # no endpoint yet = transport
+        REAL_REMOTE({"pod_id": "p"}, "true")
+
+
+# finding 2: launch is idempotent and job/active failure is "unknown", not "idle"
+def test_launch_retry_after_hidden_success_starts_one_driver(monkeypatch, tmp_path):
+    sw, ctx, mk, _ = _item_ctx(monkeypatch, tmp_path, "f2")
+    pod = FakePod([_st(mk, "done", job_id="J")]).install(monkeypatch)
+    pod.fail["launch"] = [swarm.Transport("ssh died after the remote launched")]
+    ok, _ = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok and pod.drivers == 1
+
+
+def test_launch_once_command_is_guarded_and_never_deletes(monkeypatch):
+    sent = []
+    monkeypatch.setattr(swarm, "remote", lambda m, cmd, **k: sent.append(cmd) or "already\n")
+    out = "/workspace/batch/jobs/2026tst_qm1.a1.json"
+    assert swarm.launch_once({}, out, "LAUNCH; echo started") == "already"
+    cmd = sent[0]
+    assert f"if mkdir {out}.launch 2>/dev/null; then LAUNCH; echo started; else echo already; fi" in cmd
+    assert "rm -f" not in cmd
+
+
+def test_busy_guard_treats_ssh_failure_as_unknown(monkeypatch, tmp_path):
+    sw, ctx, mk, _ = _item_ctx(monkeypatch, tmp_path, "f2b")
+    pod = FakePod([_st(mk, "done", job_id="J")]).install(monkeypatch)
+    pod.fail["active"] = [swarm.Transport("timeout"), swarm.Transport("timeout")]
+    pod.active = ["OTHER", None]                       # then busy once, then idle
+    seen = []
+    orig = pod.launch
+
+    def launch(m, outp, cmd):
+        seen.append(len(pod.fail["active"]))
+        return orig(m, outp, cmd)
+    monkeypatch.setattr(swarm, "launch_once", launch)
+    ok, _ = swarm.process_item(ctx, sw.member("a"), mk)
+    assert ok and seen == [0] and pod.drivers == 1     # launched only after a real "idle" answer
+    monkeypatch.setattr(swarm, "remote", lambda m, cmd, **k: "curl: (7) Failed to connect")
+    with pytest.raises(swarm.RemoteError):
+        REAL_ACTIVE({})
+    monkeypatch.setattr(swarm, "remote", lambda m, cmd, **k: '{"job_id": null}')
+    assert REAL_ACTIVE({}) is None
+
+
+# finding 3: a deterministic remote failure fails the item, not retried forever
+def test_remote_error_is_bounded_and_fails_the_item(monkeypatch, tmp_path):
+    sw, ctx, mk, _ = _item_ctx(monkeypatch, tmp_path, "f3")
+    pod = FakePod().install(monkeypatch)
+    pod.fail["upload"] = [swarm.RemoteError("exit 1: No space left on device")] * 50
+    ok, state = swarm.process_item(ctx, sw.member("a"), mk)
+    assert not ok and "No space left" in state["error"]
+    assert len(pod.fail["upload"]) == 50 - swarm.REMOTE_TRIES and pod.drivers == 0
+
+
+# finding 4: API failure is not "lost"; only an API verdict is
+def test_pod_api_status_and_lost_only_on_api_verdict(monkeypatch, tmp_path):
+    def raise_(e):
+        def f(*a, **k):
+            raise e
+        return f
+    monkeypatch.setattr(cli, "refresh_endpoint", raise_(SystemExit("RunPod GET -> HTTP 404: not found")))
+    assert swarm.pod_api_status({"pod_id": "p"}) == "GONE"
+    monkeypatch.setattr(cli, "refresh_endpoint", raise_(urllib.error.URLError("offline")))
+    assert swarm.pod_api_status({"pod_id": "p"}) is None
+    monkeypatch.setattr(cli, "refresh_endpoint", raise_(SystemExit("RunPod GET -> HTTP 502: bad gateway")))
+    assert swarm.pod_api_status({"pod_id": "p"}) is None
+    # laptop offline: ssh AND the API fail for > LOST_AFTER_S -> keeps retrying, no PodLost
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f4")
+    pod = FakePod([_st(mk, "done", job_id="J")]).install(monkeypatch)
+    pod.fail["poll"] = [swarm.Transport("no route")] * 100       # ~50 min at 30 s per retry
+    monkeypatch.setattr(swarm, "pod_api_status", lambda m, saver=None: None)
+    assert swarm.process_item(ctx, sw.member("a"), mk)[0]
+    # ... but the API saying the pod is stopped is PodLost
+    sw, ctx, mk, clock = _item_ctx(monkeypatch, tmp_path, "f4b")
+    pod = FakePod().install(monkeypatch)
+    pod.fail["poll"] = [swarm.Transport("no route")] * 100
+    monkeypatch.setattr(swarm, "pod_api_status", lambda m, saver=None: "EXITED")
+    with pytest.raises(swarm.PodLost, match="EXITED"):
+        swarm.process_item(ctx, sw.member("a"), mk)
+
+
+def test_lost_members_are_stopped_pulled_billed_and_revived(monkeypatch, tmp_path):
+    sw = swarm.Swarm.load("f4c", create=True)
+    sw.members.extend([{"pod_id": "a", "status": "lost", "cost_per_hr": 1.0, "created_at": swarm._now()},
+                       {"pod_id": "b", "status": "ready", "cost_per_hr": 1.0, "created_at": swarm._now()}])
+    sw.data["run"] = swarm.new_run(_plan(KEYS[:2]), ["a", "b"])
+    sw.save()
+    assert "burning $2.00/h" in swarm.run_table(sw)
+    calls = []
+    monkeypatch.setattr(cli, "confirm", lambda msg, word: True)
+    swarm.cmd_stop(argparse.Namespace(name="f4c"), request=lambda *a, **k: calls.append(a[1]))
+    assert any("/pods/a/stop" in c for c in calls)
+    pulled = []
+    monkeypatch.setattr(swarm, "pull_member", lambda sw_, m, wv=False, out=None: pulled.append(m["pod_id"])
+                        or {"dest": "d", "new_replays": [], "replays_on_pod": []})
+    swarm.cmd_pull(argparse.Namespace(name="f4c", with_video=False))
+    assert "a" in pulled
+    sw = swarm.Swarm.load("f4c")
+    sw.member("a")["status"] = "lost"
+    assert swarm.revive_lost(sw, status_fn=lambda m, saver: None) == []          # API unknown: unchanged
+    assert swarm.revive_lost(sw, status_fn=lambda m, saver: "RUNNING") == ["a"]
+    assert sw.member("a")["status"] == "ready"
+
+
+# finding 5: a truncated / failed pull is rejected and nothing is marked complete
+def _tar_bytes(files: dict) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in files.items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _fake_pull_pod(monkeypatch, tmp_path, listing, stream: bytes, rc: int, db_ids=("r1",)):
+    db = tmp_path / "poddb.db"
+    if not db.exists():
+        con = sqlite3.connect(db)
+        con.executescript(SCHEMA)
+        for rid in db_ids:
+            con.execute("INSERT INTO replays (id, status) VALUES (?, 'complete')", (rid,))
+        con.commit()
+        con.close()
+    monkeypatch.setattr(cli, "ssh_run", lambda *a, **k: types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(cli, "ssh_out", lambda st, cmd, **k: " ".join(listing) + "\n")
+    monkeypatch.setattr(cli, "pull_tune_files", lambda st, dest: 0)
+
+    def fake_run(cmd, stdout=None, check=False, **k):
+        stdout.write(db.read_bytes())
+        return types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    class P:
+        def __init__(self, *a, **k):
+            self.stdout = io.BytesIO(stream)
+
+        def wait(self):
+            return rc
+
+        def kill(self):
+            pass
+    monkeypatch.setattr(cli.subprocess, "Popen", P)
+
+
+def test_pull_pod_rejects_truncated_stream_and_marks_only_clean(monkeypatch, tmp_path):
+    st = {"pod_id": "pp", "ssh_host": "h", "ssh_port": 1}
+    full = _tar_bytes({"web/replays/r1/meta.json": b"{}", "web/replays/r1/thumb.jpg": b"j" * 5000,
+                       "web/replays/r2/meta.json": b"{}"})
+    _fake_pull_pod(monkeypatch, tmp_path, ["r1", "r2"], full[:2000], 0)         # truncated mid-file
+    with pytest.raises(SystemExit, match="FAILED"):
+        cli.pull_pod(st, out=lambda s: None)
+    rdir = cli.PULL_ROOT / "pp" / "web" / "replays"
+    assert not any(cli.replay_pulled(d) for d in rdir.iterdir()) if rdir.exists() else True
+    _fake_pull_pod(monkeypatch, tmp_path, ["r1", "r2"], full, 255)               # ssh died after the data
+    with pytest.raises(SystemExit, match="exit 255"):
+        cli.pull_pod(st, out=lambda s: None)
+    assert not cli.replay_pulled(rdir / "r1")
+    _fake_pull_pod(monkeypatch, tmp_path, ["r1", "r2"], full, 0)
+    res = cli.pull_pod(st, out=lambda s: None)
+    # r2 has no DB row yet (job still finalizing): pulled but not marked, retried next time
+    assert res["new_replays"] == ["r1"] and res["pending_replays"] == ["r2"]
+    assert cli.replay_pulled(rdir / "r1") and not cli.replay_pulled(rdir / "r2")
+    marker = json.loads((rdir / "r1" / cli.PULL_MARKER).read_text())
+    assert marker["files"] == ["meta.json", "thumb.jpg"]
+    # nothing new and no tar stream at all: fine
+    _fake_pull_pod(monkeypatch, tmp_path, ["r1"], b"", 0)
+    assert cli.pull_pod(st, out=lambda s: None)["new_replays"] == []
+    # nothing new BUT replays expected and an empty stream: failure
+    _fake_pull_pod(monkeypatch, tmp_path, ["r1", "r2"], b"", 0)
+    with pytest.raises(SystemExit):
+        cli.pull_pod(st, out=lambda s: None)
+
+
+def test_pull_covers_requires_the_complete_marker(tmp_path):
+    sw = swarm.Swarm.load("f5", create=True)
+    sw.members.append({"pod_id": "a", "status": "ready", "pulled_at": swarm._now() + 10})
+    sw.data["run"] = swarm.new_run(_plan(KEYS[:1]), ["a"])
+    mk = swarm.next_item(sw.data["run"], "a")
+    swarm.finish_item(sw.data["run"], mk, "a", True, job_id="ja")
+    d = cli.PULL_ROOT / "a" / "web" / "replays" / "ja"
+    d.mkdir(parents=True)
+    (d / "meta.json").write_text("{}")                           # meta.json alone: truncated pull
+    assert not swarm.pull_covers(sw, sw.member("a"))[0]
+    (d / cli.PULL_MARKER).write_text("{}")
+    assert swarm.pull_covers(sw, sw.member("a"))[0]
+
+
+# lower-priority fixes
+def test_import_copy_failure_leaves_no_tmp_dir(import_env, monkeypatch):
+    real = shutil.copytree
+
+    def half_copy(src, dst, **k):
+        Path(dst).mkdir(parents=True)
+        (Path(dst) / "meta.json").write_text("{}")
+        raise OSError("disk full mid-copy")
+    monkeypatch.setattr(swarm.shutil, "copytree", half_copy)
+    before = _dump(import_env.db)
+    with pytest.raises(OSError):
+        _import(import_env, True, active_job=lambda: None)
+    assert not list(import_env.replays.glob(".swarm-import-*")) and _dump(import_env.db) == before
+    monkeypatch.setattr(swarm.shutil, "copytree", real)
+
+
+def test_run_lock_blocks_a_second_dispatcher(tmp_path):
+    sw = swarm.Swarm.load("lk", create=True)
+    sw.save()
+    with swarm.run_lock(sw):
+        with pytest.raises(SystemExit, match="already driving"):
+            with swarm.run_lock(swarm.Swarm.load("lk")):
+                pass
+    with swarm.run_lock(sw):           # released: usable again
+        pass
+
+
+def test_pod_job_command_quotes_paths():
+    cmd = cli.pod_job_command(video="/v/a b.mp4", match_key="k", event="e", label="l", config={},
+                              out="/w/jobs dir/x;rm -rf.json", log="/w/l og.log", profile=False)
+    assert "'/w/jobs dir/x;rm -rf.json'" in cmd and "'/w/l og.log'" in cmd and "mkdir -p '/w/jobs dir'" in cmd
+
+
 def _replay_row(rid, mk, base="/workspace/frc/web/replays"):
     return {"id": rid, "match_key": mk, "event_key": "2026tst", "status": "complete",
             "video_path": f"{base}/{rid}/hud.mp4", "meta_path": f"{base}/{rid}/meta.json",
@@ -509,8 +870,18 @@ def import_env(tmp_path):
         d = pod / "web" / "replays" / rid
         d.mkdir(parents=True)
         (d / "meta.json").write_text("{}")
+        (d / cli.PULL_MARKER).write_text("{}")
         (d / "thumb.jpg").write_bytes(b"jpg")
     _insert(pc, "replays", _replay_row("r-base", "2026tst_qm3"))        # baseline row, no dir pulled
+    # a partial (aborted) replay, and one whose pull never finished (no marker)
+    _insert(pc, "replays", {**_replay_row("r-part", "2026tst_qm4"), "status": "partial"})
+    _insert(pc, "replays", _replay_row("r-nomark", "2026tst_qm5"))
+    for rid, marked in (("r-part", True), ("r-nomark", False)):
+        d = pod / "web" / "replays" / rid
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text("{}")
+        if marked:
+            (d / cli.PULL_MARKER).write_text("{}")
     _insert(pc, "match_robot_identity", {"job_id": "r-new", "identity_id": 3, "slot": 0, "team_number": "254",
                                          "label_share": 0.9})
     _insert(pc, "match_robot_identity", {"job_id": "r-dup", "identity_id": 1, "team_number": "999"})
@@ -562,6 +933,8 @@ def test_import_dry_run_changes_nothing(import_env, capsys):
     assert not (import_env.replays / "r-new").exists()
     assert not list(import_env.db.parent.glob("*.bak-swarm-*"))
     assert "add  r-new" in out and "skip r-dup" in out and "never overwritten" in out
+    assert "skip r-part" in out and "only complete replays" in out
+    assert "skip r-nomark" in out and "not marked complete" in out
     assert "r-base" not in out                                       # baseline rows are not results
     assert "calibration_2026tst_main.json (differs from local)" in out and "zones_2026tst.json (new on pod)" in out
     assert "event_anchors row(s) NOT imported" in out
@@ -635,6 +1008,7 @@ def test_terminate_refuses_unpulled_members(monkeypatch, tmp_path, capsys):
     d = cli.PULL_ROOT / "a" / "web" / "replays" / "ja"
     d.mkdir(parents=True)
     (d / "meta.json").write_text("{}")
+    (d / cli.PULL_MARKER).write_text("{}")
     sw.member("a")["pulled_at"] = swarm._now() + 5
     sw.save()
     assert swarm.pull_covers(sw, sw.member("a"))[0]

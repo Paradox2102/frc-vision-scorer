@@ -383,8 +383,23 @@ rp swarm terminate --name cur                                  # whatever is lef
   if there is one. Per pod, the run uploads the video to
   `/workspace/batch/videos/` (skipped if the same size is already there),
   launches `pod_job.py` detached exactly like `tune` (out
-  `/workspace/batch/jobs/<match_key>.json`, no profiler), and uploads the
-  pod's next video while the job runs. `--config-json` sets knobs for every
+  `/workspace/batch/jobs/<match_key>.a<attempt>.json`, one file per attempt,
+  no profiler), and uploads the pod's next video while the job runs.
+  Only one `swarm run` can drive a swarm at a time (`.swarm/<name>.run.lock`).
+  The launch is guarded on the pod (`mkdir <out>.launch`), so retrying it
+  after a dropped ssh session never starts a second driver. Before
+  launching, the run asks the server for its active job, and an ssh failure
+  counts as "unknown", never as "idle". Failures are handled by kind:
+  * ssh failures (exit 255 or timeout) retry without limit. After 10
+    minutes of them the RunPod API is asked about the pod. Only an API
+    answer of "not RUNNING" or "gone" marks the member `lost`; if the API
+    can't be reached, the run keeps retrying.
+  * A remote command that really fails (disk full, missing venv) fails the
+    match after 3 tries, so the pod doesn't retry it forever while billing.
+  * A job counts as "wrote nothing" only when it has never written a state
+    file for 5 minutes of reachable polling and its driver isn't running.
+
+  `--config-json` sets knobs for every
   job. `--pod-config POD_ID=JSON` overrides knobs on one pod, for example
   for a quality sweep. With `--terminate-when-done`, a pod with nothing left
   to do and nothing to steal is pulled and then terminated (the flag is the
@@ -394,6 +409,18 @@ rp swarm terminate --name cur                                  # whatever is lef
   with a TBA arrival poller can plug in without changing the run loop.
 * **pull**: `pull` for every member, in parallel, into the usual
   `data/runpod_pull/<podId>/`. It records which run jobs each pull covered.
+  This includes `lost` members; an ssh failure there is reported per member.
+  The same rules now apply to the single-pod `pull`:
+  * A pull fails, and marks nothing, when the tar stream is truncated or
+    ssh/tar exits non-zero.
+  * A replay dir counts as pulled only once it has a `.pull_complete` marker.
+    The marker is written after a clean extract, only for replays whose DB
+    row was in the pulled snapshot. With `--with-video`, a replay whose HUD
+    render is still queued or rendering gets no marker.
+  * Replays without the marker are pulled again next time. That includes
+    every replay pulled before this change: it is re-pulled once while its
+    pod exists.
+  * `import` and `terminate` only trust marked dirs.
 * **import**: merges the pulled replays into the local app. The default is a
   dry run. `--apply` refuses while local :8004 reports an active job. It
   backs up `frc_scorer.db` to `frc_scorer.db.bak-swarm-<name>-<time>` first,
@@ -401,7 +428,8 @@ rp swarm terminate --name cur                                  # whatever is lef
   one transaction. Rows come from `replays` plus every per-job table a job
   writes: `match_robot_identity`, `match_robot_crop`,
   `match_robot_identity_segment`, `match_robot_binding`,
-  `appearance_gallery` and `replay_slot_corrections`. Paths are rewritten to
+  `appearance_gallery` and `replay_slot_corrections`. Only `complete`
+  replays from marked pulls are imported. Paths are rewritten to
   the local layout, and the source video points at the local copy. An id
   that already exists is never overwritten (skipped and reported).
   `event_anchors` (event_lineup knob, off by default; tiles not pulled) is
@@ -413,7 +441,11 @@ rp swarm terminate --name cur                                  # whatever is lef
 * **stop / terminate**: one typed confirmation for every member (`stop swarm
   <name>`, `terminate swarm <name>`). `terminate` refuses a member whose last
   finished job is not covered by a pull, or which still has a job running,
-  unless you pass `--force`.
+  unless you pass `--force`. `stop` and the cost figures include `lost`
+  members, which may still be billing. A re-run of `swarm run` puts a lost
+  member back to work when the API reports it RUNNING again. For a lost pod
+  that is stopped, start it in the RunPod console and `swarm pull` before
+  terminating; `--force` deletes its unpulled results.
 
 Caveats:
 

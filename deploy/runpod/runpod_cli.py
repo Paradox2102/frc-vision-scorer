@@ -1142,14 +1142,14 @@ def pod_job_command(*, video: str, match_key: str, event: str, label: str, confi
     setsid -f forks and returns at once; with a trailing `&` the list ran in a
     background subshell that held ssh's stdout open, so ssh never returned
     (Nov 12 R0 launch hit the 120 s timeout)."""
-    jobs_dir = out.rsplit("/", 1)[0]
+    jobs_dir = shlex.quote(out.rsplit("/", 1)[0])   # quote() leaves plain paths unchanged
     return (f"mkdir -p {jobs_dir} && cd {POD_APP} && setsid -f nohup .venv/bin/python "
             f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {shlex.quote(match_key)} "
             f"--event {shlex.quote(event)} --label {shlex.quote(label)} "
             f"--config-json {shlex.quote(json.dumps(config))} "
             f"--host 127.0.0.1:{POD_PORT} {'' if profile else '--no-profile '}"
             f"{extra.strip() + ' ' if extra and extra.strip() else ''}"
-            f"--out {out} > {log} 2>&1 < /dev/null; echo started")
+            f"--out {shlex.quote(out)} > {shlex.quote(log)} 2>&1 < /dev/null; echo started")
 
 
 def read_remote_json(st: dict, path: str, timeout: float = 120) -> dict | None:
@@ -1499,8 +1499,11 @@ def pull_pod(st: dict, with_video: bool = False, out=print) -> dict:
     out(f"DB -> {db_out} ({fmt_mb(db_out.stat().st_size)})")
     # 2. replays not pulled yet (+ event-state files: calibrations made at the event)
     rdir = dest / "web" / "replays"
-    have = {p.name for p in rdir.iterdir() if (p / "meta.json").exists()} if rdir.exists() else set()
-    listing = ssh_out(st, f"ls {POD_APP}/web/replays 2>/dev/null || true", check=False).split()
+    # A replay counts as pulled only with its PULL_MARKER (written below after
+    # a clean tar stream). Older pulls have no marker: they are re-pulled once.
+    have = {p.name for p in rdir.iterdir() if replay_pulled(p)} if rdir.exists() else set()
+    # check=True: an ssh failure here must not look like "no replays on the pod"
+    listing = ssh_out(st, f"ls {POD_APP}/web/replays 2>/dev/null || true").split()
     new = [r for r in listing if r not in have]
     excl = "" if with_video else "--exclude='*.mp4' "
     lst = f"{POD_WS}/.pull_list"
@@ -1508,27 +1511,77 @@ def pull_pod(st: dict, with_video: bool = False, out=print) -> dict:
     pattern = "^(" + "|".join(EVENT_STATE_PREFIXES) + r").*\.(json|jpg|png)$"
     ssh_run(st, f"cd {POD_APP} && cat > {lst} && (ls web/uploads 2>/dev/null | grep -E '{pattern}' "
                 f"| sed 's#^#web/uploads/#' >> {lst}; true)", input_bytes=names)
-    p = subprocess.Popen(ssh_base(st) + [f"cd {POD_APP} && [ -s {lst} ] && tar -cf - {excl}-T {lst}"],
+    p = subprocess.Popen(ssh_base(st) + [f"cd {POD_APP} && if [ -s {lst} ]; then tar -cf - {excl}-T {lst}; fi"],
                          stdout=subprocess.PIPE)
+    err, n_members = None, 0
     try:
         with tarfile.open(fileobj=p.stdout, mode="r|") as tf:
             for m in tf:
+                n_members += 1
                 if m.name.startswith(("web/replays/", "web/uploads/")) and ".." not in m.name \
                         and (m.isfile() or m.isdir()):
                     tf.extract(m, dest, set_attrs=False,
                                **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
-    except tarfile.ReadError:
-        pass  # nothing to pull
-    p.wait()
-    out(f"replays: {len(new)} new ({len(listing)} on pod) -> {dest / 'web' / 'replays'}"
-        + ("" if with_video else " (HUD videos skipped; --with-video to include)"))
+    except (tarfile.TarError, EOFError, OSError) as e:
+        err = e
+        p.kill()
+    rc = p.wait()
+    empty_ok = rc == 0 and n_members == 0 and not new     # nothing to pull: no tar stream at all
+    if rc != 0 or (err is not None and not empty_ok):
+        raise SystemExit(f"pull from {pod_id} FAILED (tar stream: {err or 'ok'}, ssh/tar exit {rc}); "
+                         f"no replay was marked complete, re-run pull")
+    complete = mark_pulled_replays(rdir, new, db_out, with_video)
+    pending = [r for r in new if r not in complete]
+    out(f"replays: {len(complete)} new ({len(listing)} on pod) -> {dest / 'web' / 'replays'}"
+        + ("" if with_video else " (HUD videos skipped; --with-video to include)")
+        + (f"; {len(pending)} not final yet (pulled again next time)" if pending else ""))
     out(f"event state -> {dest / 'web' / 'uploads'}")
     # 3. tune results: per-rung job JSON/log + raw profiles (<rung>.pyspy.txt,
     #    <rung>.pyspy.log, <rung>.gpu.csv) + host fingerprint (small; always re-copied)
     n = pull_tune_files(st, dest)
     out(f"tune jobs/profiles: {n} files -> {dest / 'tune'}")
     out("Local frc_scorer.db and web/replays were NOT touched.")
-    return {"dest": str(dest), "replays_on_pod": listing, "new_replays": new}
+    return {"dest": str(dest), "replays_on_pod": listing, "new_replays": complete,
+            "pending_replays": pending}
+
+
+PULL_MARKER = ".pull_complete"
+
+
+def replay_pulled(d: Path) -> bool:
+    """A pulled replay dir that a clean pull marked complete."""
+    d = Path(d)
+    return (d / PULL_MARKER).is_file() and (d / "meta.json").is_file()
+
+
+def mark_pulled_replays(rdir: Path, ids: list, db_path: Path, with_video: bool) -> list:
+    """Write PULL_MARKER into each freshly extracted replay dir whose job had
+    finished: meta.json present and its row in the pulled DB snapshot (taken
+    before the tar, so the row was there first). With --with-video a replay
+    whose HUD render is queued/rendering is left unmarked (its mp4 may be
+    partial) and is pulled again next time. Returns the marked ids."""
+    rows = {}
+    if ids and Path(db_path).exists():
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            q = ",".join("?" * len(ids))
+            rows = dict(con.execute(f"SELECT id, render_status FROM replays WHERE id IN ({q})", list(ids)))
+        except sqlite3.Error:
+            rows = {}
+        finally:
+            con.close()
+    done = []
+    for r in ids:
+        d = Path(rdir) / r
+        if not (d / "meta.json").is_file() or r not in rows:
+            continue
+        if with_video and rows[r] in ("queued", "rendering"):
+            continue
+        files = sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file() and p.name != PULL_MARKER)
+        (d / PULL_MARKER).write_text(json.dumps({"pulled_at": time.time(), "with_video": with_video,
+                                                 "files": files}))
+        done.append(r)
+    return done
 
 
 def cmd_stop(args) -> int:

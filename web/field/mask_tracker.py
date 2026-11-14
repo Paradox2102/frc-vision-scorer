@@ -1907,6 +1907,46 @@ class MaskFieldTracker:
                                           f"{last_idx} (further errors suppressed): {exc!r}")
                         return motion_cache[j]
 
+                    def _claimant_details(j: int, oid, lv) -> dict:
+                        """Diagnostics-only description of the object that
+                        claimed detection ``j`` as already tracked: is it dark,
+                        parked, on the detection, the same colour? Never raises."""
+                        if oid is None:
+                            return {}
+                        out: dict = {"object_id": int(oid)}
+                        try:
+                            if lv is not None:
+                                out["dark_frames"] = int(last_idx - lv)
+                                rec = results[lv].get(oid)
+                                if rec and rec.get("box") is not None:
+                                    out["claimant_box"] = [round(float(v), 1) for v in rec["box"]]
+                            m = existing.get(oid)
+                            if m is not None:
+                                x1, y1, x2, y2 = (int(v) for v in new_boxes[j])
+                                area = max(1, (x2 - x1) * (y2 - y1))
+                                out["claimant_ios"] = round(
+                                    float(m[max(0, y1):y2, max(0, x1):x2].sum()) / area, 3)
+                                out["claimant_mask_px"] = int(m.sum())
+                            pts = [p for p in field_pos_window.get(oid, []) if p is not None]
+                            if pts:
+                                xs = [p[0] for p in pts]
+                                ys = [p[1] for p in pts]
+                                out["claimant_span_m"] = round(
+                                    ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5, 2)
+                                out["claimant_xy"] = [round(float(pts[-1][0]), 2),
+                                                      round(float(pts[-1][1]), 2)]
+                                out["claimant_n_pos"] = len(pts)
+                            out["claimant_stationary"] = bool(is_stationary(
+                                field_pos_window.get(oid, []), cull_stationary_m))
+                            out["det_moving"] = bool(_candidate_moving(j))
+                            c = existing_colors.get(oid)
+                            out["claimant_color"] = None if c is None else str(c)
+                            if j < len(new_metadata) and new_metadata[j] is not None:
+                                out["det_color"] = str(new_metadata[j])
+                        except Exception as exc:   # never break tracking for a log line
+                            out["details_error"] = repr(exc)[:120]
+                        return out
+
                     # ---- Corroboration bookkeeping (windowed detector-absence +
                     # stationarity), maintained whenever the detector ran. The
                     # spontaneous hijack cull stays gated behind cull_enabled;
@@ -2252,7 +2292,8 @@ class MaskFieldTracker:
                                 diagnostics.record(
                                     f"{self.DIAG_PREFIX}.reprompt_rejected",
                                     reason="already_tracked",
-                                    details={"frame_idx": last_idx, "box": list(box_val)},
+                                    details={"frame_idx": last_idx, "box": list(box_val),
+                                             **_claimant_details(idx, oid, lv)},
                                 )
                         mis_hits: set[int] = set()
                         for j in new_indices:

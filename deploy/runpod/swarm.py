@@ -13,6 +13,11 @@ deployment (same bundle, secrets, bootstrap), driven by the same detached
     swarm pull      --name N [--with-video]
     swarm import    --name N [--apply] [--render]
     swarm stop|terminate --name N [--force]
+    swarm sweep evalset|plan|run|score|report ...   quality sweep (sweep.py)
+    swarm live --name N --event EV [--rehearse] [--local]   live staggered dispatch (live.py)
+
+Every dispatching command takes --local (the local :8004 instead of pods)
+and --restart-each (fresh app server before every job).
 
 State: deploy/runpod/.swarm/<name>.json (gitignored), written atomically after
 every transition; member logs in deploy/runpod/.swarm/<name>/<podId>.log. A
@@ -62,6 +67,7 @@ DEFAULT_JOB_MIN = 7.5            # ETA guess before any job finished (Nov 13 qm8
 LEVEL_RANK = {"qm": 0, "ef": 1, "qf": 2, "sf": 3, "f": 4}
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 _MATCH_RE = re.compile(r"^(?:[A-Za-z0-9]+_)?(qm|ef|qf|sf|f)(\d+)(?:m(\d+))?$")
+LIVE_STALE_S = 300               # live policy: an idle pod that hasn't asked for work this long is skipped
 LIVE_STATUSES = ("created", "ssh_wait", "pushing", "secrets", "bootstrapping", "ready", "setup_failed")
 BILLING_STATUSES = LIVE_STATUSES + ("lost",)     # "lost" may still bill: include it in stop/pull/burn
 
@@ -154,11 +160,12 @@ class Swarm:
 
 
 def live_members(sw: Swarm) -> list:
-    return [m for m in sw.members if m.get("status") in LIVE_STATUSES]
+    """Pod members that exist (the local backend member is never one)."""
+    return [m for m in sw.members if m.get("status") in LIVE_STATUSES and is_pod(m)]
 
 
 def ready_members(sw: Swarm) -> list:
-    return [m for m in sw.members if m.get("status") == "ready"]
+    return [m for m in sw.members if m.get("status") == "ready" and is_pod(m)]
 
 
 # --------------------------------------------------------------------------
@@ -479,8 +486,9 @@ def existing_results(keys: set, local_db: Path, pull_root: Path, run: dict | Non
             ids = {p.name for p in rdir.iterdir() if cli.replay_pulled(p)}
             for k in _complete_keys(d / "frc_scorer.db", keys, ids):
                 found.setdefault(k, f"pull {d.name}")
-    for mk, it in ((run or {}).get("items") or {}).items():
-        if it.get("status") == "done" and mk in keys:
+    for key, it in ((run or {}).get("items") or {}).items():
+        mk = item_match_key(run, key)
+        if it.get("status") == "done" and mk in keys and not it.get("config_id"):
             found.setdefault(mk, "this swarm's run")
     return found
 
@@ -567,6 +575,12 @@ def cmd_plan(args) -> int:
 
 
 def print_plan_summary(plan: dict) -> None:
+    if plan.get("kind") == "sweep":
+        import sweep
+        return sweep.print_sweep_plan(plan)
+    if plan.get("kind") == "live":
+        print(f"live plan {plan['event']}: matches arrive while the run goes (policy live)")
+        return
     items = plan["items"]
     size = sum(i["size"] for i in items)
     print(f"plan {plan['event']} [{plan['spec']}]: {len(items)} match(es) to run "
@@ -601,43 +615,90 @@ def split_blocks(items: list, pods: list) -> dict:
     return out
 
 
+# Item keys. A batch run's items are keyed by match key ("2026cur_qm8"), as
+# before. A quality sweep runs the same match under several configs, so its
+# items are keyed "<config_id>/<match_key>" ("Q3/2026cur_qm8"), and a live
+# run's re-posted video of a match is "<match_key>@r2". Every new item records
+# its real ``match_key`` (+ ``config_id`` / ``knobs`` / ``event`` when it has
+# them); items of runs saved before this (batch state files) have none of
+# these fields, so ``item_match_key`` falls back to the key itself.
+ITEM_FIELDS = ("match_key", "event", "config_id", "knobs", "video_key")
+
+
+def item_key(i: dict) -> str:
+    """The run key of a plan item: its explicit ``key``, else its match key."""
+    return i.get("key") or i["match_key"]
+
+
+def item_match_key(run: dict | None, key: str) -> str:
+    it = ((run or {}).get("items") or {}).get(key) or {}
+    return it.get("match_key") or key
+
+
+def safe_key(key: str) -> str:
+    """An item key as a file-name component ("Q3/2026cur_qm8" -> "Q3__2026cur_qm8")."""
+    return re.sub(r"[^A-Za-z0-9_.@+-]", "_", key.replace("/", "__"))
+
+
+def video_name(key: str) -> str:
+    """The pod-side video file stem of an item: the key without its sweep
+    config prefix, so every config of one match shares one upload
+    ("Q3/2026cur_qm8" -> "2026cur_qm8"), while a live re-posted video keeps
+    its own file ("2026cur_qm8@r2")."""
+    return safe_key(key.split("/", 1)[-1])
+
+
 def _new_item(i: dict) -> dict:
-    return {"video": i["video"], "size": i.get("size"), "status": "pending",
-            "attempts": 0, "avoid": [], "pod": None}
+    it = {"video": i["video"], "size": i.get("size"), "status": "pending",
+          "attempts": 0, "avoid": [], "pod": None}
+    for f in ITEM_FIELDS:
+        if i.get(f) is not None:
+            it[f] = i[f]
+    return it
 
 
 def new_run(plan: dict, pods: list, config: dict | None = None, policy: str = "blocks",
-            pod_config: dict | None = None) -> dict:
+            pod_config: dict | None = None, restart_each: bool = False) -> dict:
     """Run state. ``policy`` names the assignment policy (POLICIES);
-    ``pod_config`` overrides the run config per pod (quality sweeps);
-    ``open`` = more items may still arrive (live sources), so idle pods wait."""
-    run = {"plan_id": plan["id"], "event": plan["event"], "config": config or {},
+    ``pod_config`` overrides the run config per pod; ``open`` = more items
+    may still arrive (live sources), so idle pods wait; ``restart_each`` =
+    restart the member's app server before every job (the ~0.7 GB/job CUDA
+    leak would otherwise make job order a confounder)."""
+    run = {"plan_id": plan["id"], "event": plan.get("event"), "config": config or {},
            "pod_config": dict(pod_config or {}), "policy": policy, "open": False,
+           "restart_each": bool(restart_each),
            "started_at": _now(), "queues": {p: [] for p in pods}, "unassigned": [],
            "current": {p: None for p in pods}, "retry": [], "dead": [], "retired": [],
            "steals": [], "items": {}}
     for i in plan["items"]:
-        run["items"][i["match_key"]] = _new_item(i)
-    get_policy(run).initial(run, [i["match_key"] for i in plan["items"]], list(pods))
+        run["items"][item_key(i)] = _new_item(i)
+    get_policy(run).initial(run, [item_key(i) for i in plan["items"]], list(pods))
     return run
 
 
-def job_config(run: dict, pod: str) -> dict:
-    """The per-job knobs ``pod`` runs with: the run config + its override."""
-    return {**(run.get("config") or {}), **((run.get("pod_config") or {}).get(pod) or {})}
+def job_config(run: dict, pod: str, key: str | None = None) -> dict:
+    """The knobs one job runs with: the run config, then the item's own
+    knobs (a sweep config), then the pod's override."""
+    it = ((run.get("items") or {}).get(key) or {}) if key else {}
+    return {**(run.get("config") or {}), **(it.get("knobs") or {}),
+            **((run.get("pod_config") or {}).get(pod) or {})}
+
+
+def item_event(run: dict, key: str) -> str:
+    return (run["items"].get(key) or {}).get("event") or run.get("event")
 
 
 def add_items(run: dict, items: list) -> list:
-    """Append newly arrived matches ({match_key, video, size}) to a running
-    run; the policy places them. Returns the keys actually added. The run
-    loop picks them up on its next poll (the hook for a live arrival source)."""
+    """Append newly arrived items ({match_key, video, size} [+ key, ...]) to
+    a running run; the policy places them. Returns the keys actually added.
+    The run loop picks them up on its next poll (a live arrival source)."""
     new = []
     for i in items:
-        mk = i["match_key"]
-        if mk in run["items"]:
+        key = item_key(i)
+        if key in run["items"]:
             continue
-        run["items"][mk] = _new_item(i)
-        new.append(mk)
+        run["items"][key] = _new_item(i)
+        new.append(key)
     if new:
         get_policy(run).place(run, new)
     return new
@@ -740,7 +801,169 @@ class BlockPolicy:
         return take[0]
 
 
-POLICIES = {BlockPolicy.name: BlockPolicy()}
+class PinnedPolicy:
+    """Quality sweep: every item of one config runs on ONE pod (config i ->
+    pod i), so pods' different speeds/hosts never mix inside a config. With
+    fewer pods than configs a pod that finishes takes the next whole config
+    not started yet; a dead pod's remaining config is taken over whole by the
+    next pod that runs dry. A failed item is retried on its config's pod
+    (config consistency beats avoiding the pod)."""
+    name = "pinned"
+
+    @staticmethod
+    def _cfg(run: dict, key: str) -> str:
+        return run["items"][key].get("config_id") or "-"
+
+    def _groups(self, run: dict, keys: list) -> list:
+        groups: dict = {}
+        for k in keys:
+            groups.setdefault(self._cfg(run, k), []).append(k)
+        return list(groups.items())
+
+    def initial(self, run: dict, keys: list, pods: list) -> None:
+        run.setdefault("pin", {})
+        run.setdefault("unassigned_groups", [])
+        for j, (cid, ks) in enumerate(self._groups(run, keys)):
+            if j < len(pods):
+                run["pin"][cid] = pods[j]
+                run["queues"][pods[j]] = list(ks)
+            else:
+                run["unassigned_groups"].append([cid, list(ks)])
+
+    def place(self, run: dict, keys: list) -> None:
+        run.setdefault("pin", {})
+        run.setdefault("unassigned_groups", [])
+        for cid, ks in self._groups(run, keys):
+            pod = run["pin"].get(cid)
+            if pod is not None:
+                run["queues"].setdefault(pod, []).extend(ks)
+                continue
+            for g in run["unassigned_groups"]:
+                if g[0] == cid:
+                    g[1].extend(ks)
+                    break
+            else:
+                run["unassigned_groups"].append([cid, list(ks)])
+
+    def pick(self, run: dict, pod: str) -> str | None:
+        pins = run.setdefault("pin", {})
+        q = run["queues"][pod]
+        if q:
+            return q.pop(0)
+        mine = {c for c, p in pins.items() if p == pod}
+        for r in run["retry"]:
+            if self._cfg(run, r) in mine:
+                run["retry"].remove(r)
+                return r
+        gone = set(run["dead"]) | set(run["retired"])
+        for cid, owner in list(pins.items()):        # take over a lost pod's config whole
+            if owner in gone and owner != pod and (
+                    run["queues"].get(owner) or any(self._cfg(run, r) == cid for r in run["retry"])):
+                pins[cid] = pod
+                run["queues"][pod] = [k for k in run["queues"].get(owner, []) if self._cfg(run, k) == cid]
+                run["queues"][owner] = [k for k in run["queues"].get(owner, []) if self._cfg(run, k) != cid]
+                run["steals"].append({"thief": pod, "victim": owner, "config": cid, "at": _now()})
+                return self.pick(run, pod)
+        groups = run.setdefault("unassigned_groups", [])
+        if groups:
+            cid, ks = groups.pop(0)
+            pins[cid] = pod
+            run["queues"][pod] = list(ks)
+            return self.pick(run, pod)
+        if run.get("unassigned"):
+            return run["unassigned"].pop(0)
+        return None
+
+    def peek(self, run: dict, pod: str) -> str | None:
+        q = run["queues"].get(pod) or []
+        return q[0] if q else None
+
+
+class LivePolicy:
+    """Live staggered dispatch: matches arrive one by one (``place`` in
+    arrival order); each goes to an IDLE pod, the one idle longest. Two
+    matches are never queued on one pod while another pod is idle: nothing
+    is pre-assigned, so when every pod is busy the waiting match goes to
+    whichever pod frees first (``predict_free`` names the likely one from
+    elapsed vs median job time, for prefetching its video and for the ETA).
+    Retries (another pod) go before new arrivals."""
+    name = "live"
+
+    def initial(self, run: dict, keys: list, pods: list) -> None:
+        run.setdefault("idle_since", {})
+        for p in pods:
+            run["idle_since"].setdefault(p, _now())
+        self.place(run, keys)
+
+    def place(self, run: dict, keys: list) -> None:
+        run["unassigned"].extend(keys)
+
+    @staticmethod
+    def idle_pods(run: dict) -> list:
+        return [p for p in _live_pods(run) if not run["current"].get(p)]
+
+    def pick(self, run: dict, pod: str) -> str | None:
+        idle_since = run.setdefault("idle_since", {})
+        idle_since.setdefault(pod, _now())
+        polled = run.setdefault("polled", {})
+        polled[pod] = _now()
+        # an idle pod counts only while its worker keeps asking (a member
+        # whose worker isn't running must not hold arrivals back)
+        idle = [p for p in self.idle_pods(run) if _now() - polled.get(p, -1e18) <= LIVE_STALE_S]
+        mk = _take_retry(run, pod, allow_avoided=False)
+        if mk is None and run.get("unassigned"):
+            # only the longest-idle pod takes the next arrival (ties: pod order)
+            order = list(run["queues"])
+            first = min(idle, key=lambda p: (idle_since.get(p, _now()), order.index(p))) if idle else pod
+            if first not in order:
+                first = pod
+            if first == pod:
+                mk = run["unassigned"].pop(0)
+        if mk is None:
+            mk = _take_retry(run, pod, allow_avoided=True)
+        if mk is not None:
+            idle_since.pop(pod, None)
+        return mk
+
+    def peek(self, run: dict, pod: str) -> str | None:
+        """The waiting match this pod should prefetch: the head of the
+        arrival queue when this pod is predicted to free up first."""
+        if not run.get("unassigned"):
+            return None
+        return run["unassigned"][0] if predict_free(run) == pod else None
+
+
+def median_job_s(run: dict, default: float = DEFAULT_JOB_MIN * 60) -> float:
+    w = sorted(x for x in ((it.get("wall_final_s") or 0) for it in run["items"].values()
+                           if it.get("status") == "done") if x > 0)
+    if not w:
+        return default
+    n = len(w)
+    return w[n // 2] if n % 2 else (w[n // 2 - 1] + w[n // 2]) / 2
+
+
+def predict_free(run: dict, now: float | None = None) -> str | None:
+    """The pod expected to free up first: an idle pod (longest idle), else
+    the busy pod with the least (median job time - elapsed) left."""
+    now = _now() if now is None else now
+    live = _live_pods(run)
+    idle = [p for p in live if not run["current"].get(p)]
+    if idle:
+        since = run.get("idle_since") or {}
+        return min(idle, key=lambda p: (since.get(p, now), live.index(p)))
+    if not live:
+        return None
+    med = median_job_s(run)
+
+    def left(p):
+        it = run["items"][run["current"][p]]
+        t0 = now if it.get("assigned_at") is None else it["assigned_at"]
+        return med - (now - t0)
+    return min(live, key=lambda p: (left(p), live.index(p)))
+
+
+POLICIES = {BlockPolicy.name: BlockPolicy(), PinnedPolicy.name: PinnedPolicy(),
+            LivePolicy.name: LivePolicy()}
 
 
 def get_policy(run: dict):
@@ -751,6 +974,10 @@ def get_policy(run: dict):
 
 
 def peek_next(run: dict, pod: str) -> str | None:
+    """The item ``pod`` will most likely run next (its video is prefetched)."""
+    pol = get_policy(run)
+    if hasattr(pol, "peek"):
+        return pol.peek(run, pod)
     q = run["queues"].get(pod) or []
     return q[0] if q else None
 
@@ -939,6 +1166,294 @@ def pod_api_status(m: dict, saver=None) -> str | None:
     return pod.get("desiredStatus") or None
 
 
+# --------------------------------------------------------------------------
+# Members: one transport per kind (RunPod pod over ssh, or the local app)
+# --------------------------------------------------------------------------
+SYNC_EXCLUDE_PREFIXES = ("clockscan_",)       # per-video caches: never synced between pods
+
+
+def sync_selectable(name: str) -> bool:
+    """Event-state files live mode copies between pods: calibrations,
+    camera layouts, zones, season overrides; never clock-scan caches."""
+    return cli.event_state_ok(name) and not name.startswith(SYNC_EXCLUDE_PREFIXES)
+
+
+def is_pod(m: dict) -> bool:
+    return (m.get("backend") or "pod") == "pod"
+
+
+def vllm_model_for(cfg: dict) -> str | None:
+    """vlm_model a job config needs served by a resident vLLM reader."""
+    return (cfg.get("vlm_model") or "qwen3-vl-4b") if cfg.get("team_reader") == "vllm" else None
+
+
+class PodMember:
+    """A RunPod member over ssh. Each method calls the module-level helper
+    by name at call time (the tests patch those)."""
+    kind = "pod"
+
+    def video_path(self, m: dict, mk: str, local: Path) -> str:
+        return f"{POD_VIDEOS}/{mk}.mp4"
+
+    def attempt_paths(self, m: dict, key: str, attempt: int) -> tuple[str, str]:
+        return attempt_paths(key, attempt)
+
+    def read_job_state(self, m, outp):
+        return read_job_state(m, outp)
+
+    def driver_alive(self, m, state, outp):
+        return driver_alive(m, state, outp)
+
+    def active_job(self, m):
+        return server_active_job(m)
+
+    def upload(self, m, local, remote_path, out, what="video"):
+        return upload_video(m, local, remote_path, out, what=what)
+
+    def launch(self, m, outp, logp, *, video, match_key, event, label, config) -> str:
+        cmd = cli.pod_job_command(video=video, match_key=match_key, event=event, label=label,
+                                  config=config, out=outp, log=logp, profile=False,
+                                  extra=f"--final-timeout {FINAL_TIMEOUT_S:g}")
+        return launch_once(m, outp, cmd)
+
+    def restart(self, m, out) -> None:
+        out("restarting the app server before the job (serve.sh restart; waits for :8004)")
+        remote(m, f"bash {cli.POD_APP}/deploy/runpod/serve.sh restart", timeout=600)
+
+    def prepare(self, m, cfg: dict, out) -> None:
+        """Before a job: a config with a resident vLLM reader gets it started
+        first (cold start outside the measured wall; it stays up)."""
+        model = vllm_model_for(cfg)
+        if not model:
+            return
+        txt = remote(m, f"cd {cli.POD_APP} && source deploy/runpod/pod_env.sh && set -a && "
+                        f"{{ [ -f profile.env ] && . ./profile.env || true; }} && set +a && "
+                        f".venv/bin/python deploy/runpod/vllm_ctl.py start {shlex.quote(model)}", timeout=1500)
+        res = None
+        for line in reversed(txt.strip().splitlines()):
+            try:
+                res = json.loads(line)
+                break
+            except ValueError:
+                continue
+        if not (res or {}).get("ok"):
+            raise RemoteError(f"vLLM pre-start of {model} failed: {txt[-200:]}")
+        out(f"vLLM reader {model} up")
+
+    def tail_log(self, m, logp) -> str:
+        return remote(m, f"tail -n 20 {shlex.quote(logp)} 2>/dev/null || true", timeout=60)
+
+    def list_event_state(self, m) -> dict:
+        """{file name: sha1} of the pod's syncable event-state files."""
+        d = shlex.quote(f"{cli.POD_APP}/web/uploads")
+        txt = remote(m, f"cd {d} 2>/dev/null && ls -1 | while read -r f; do "
+                        f"[ -f \"$f\" ] && sha1sum \"$f\"; done; true", timeout=120)
+        out = {}
+        for line in txt.splitlines():
+            h, _, name = line.strip().partition("  ")
+            if name and sync_selectable(name):
+                out[name] = h
+        return out
+
+    def fetch_files(self, m, names: list, dest: Path) -> list:
+        """Copy event-state files from the pod into ``dest`` (base64 tar over ssh)."""
+        import base64
+        import io
+        import tarfile
+        if not names:
+            return []
+        d = shlex.quote(f"{cli.POD_APP}/web/uploads")
+        txt = remote(m, f"cd {d} && tar -cf - {' '.join(shlex.quote(n) for n in names)} | base64 -w0",
+                     timeout=300)
+        got = []
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(base64.b64decode(txt.strip())), mode="r:") as tf:
+            for ti in tf:
+                if ti.isfile() and "/" not in ti.name and sync_selectable(ti.name):
+                    data = tf.extractfile(ti).read()
+                    tmp = dest / f".{ti.name}.tmp"
+                    tmp.write_bytes(data)
+                    os.replace(tmp, dest / ti.name)
+                    got.append(ti.name)
+        return got
+
+    def push_files(self, m, files: list) -> None:
+        """Install files into the pod's web/uploads atomically: extract into
+        a temp dir on the same volume, then mv each into place."""
+        import tarfile
+        if not files:
+            return
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf_:
+            tar_path = tf_.name
+        try:
+            with tarfile.open(tar_path, "w") as tf:
+                for f in files:
+                    tf.add(str(f), arcname=Path(f).name)
+            up = f"{cli.POD_APP}/web/uploads"
+            tmp = f"{up}/.swarm-sync-{os.getpid()}-{int(_now() * 1000)}"
+            names = " ".join(shlex.quote(Path(f).name) for f in files)
+            remote(m, f"mkdir -p {shlex.quote(tmp)} && tar -xf - -C {shlex.quote(tmp)} && "
+                      f"for f in {names}; do mv -f {shlex.quote(tmp)}/\"$f\" {shlex.quote(up)}/\"$f\"; done && "
+                      f"rmdir {shlex.quote(tmp)}", timeout=300, stdin_path=tar_path)
+        finally:
+            os.unlink(tar_path)
+
+
+LOCAL_PIDFILE = "/tmp/frc-vision-dev.pid"
+LOCAL_POD_JOB = None             # pod_job.py the local backend launches (None: deploy/runpod/pod_job.py)
+_LOCAL_PROCS: dict = {}          # out path -> Popen of a local pod_job.py we started
+
+
+def local_start_cmd() -> str:
+    """How the local :8004 is (re)started: the main-server worktree (README
+    memory: it serves main), else the main checkout's start_all.sh."""
+    main = cli.main_checkout()
+    for p in (main / ".worktrees" / "main-server" / "web" / "start_all.sh", main / "web" / "start_all.sh"):
+        if p.exists():
+            return str(p)
+    return str(main / "web" / "start_all.sh")
+
+
+def local_member(name: str, *, app_url: str = LOCAL_APP, app_dir: Path | None = None,
+                 python: str | None = None) -> dict:
+    """The member dict of the LOCAL backend: jobs run against the local app
+    (``app_url``) via pod_job.py as a local subprocess; ``app_dir`` holds the
+    DB + web/replays the app writes (main-server symlinks them to the main
+    checkout)."""
+    main = cli.main_checkout()
+    py = python or str(main / ".venv" / "bin" / "python")
+    if not Path(py).exists():
+        py = sys.executable
+    return {"pod_id": "local", "name": "local", "backend": "local", "status": "ready",
+            "app_url": app_url, "app_dir": str(app_dir or main), "python": py,
+            "pod_job": str(LOCAL_POD_JOB or cli.HERE / "pod_job.py"),
+            "jobs_dir": str(SWARM_DIR / name / "local_jobs"),
+            "pidfile": LOCAL_PIDFILE, "start_cmd": local_start_cmd(),
+            "cost_per_hr": 0, "created_at": _now()}
+
+
+class LocalMember:
+    """The local app as a swarm member: no upload (the video is already
+    here), pod_job.py launched as a local subprocess with the same driver
+    contract, results read from local files, the local DB holds the replay."""
+    kind = "local"
+
+    def video_path(self, m, mk, local: Path) -> str:
+        return str(Path(local).resolve())
+
+    def attempt_paths(self, m, key, attempt):
+        d = m["jobs_dir"]
+        return f"{d}/{safe_key(key)}.a{attempt}.json", f"{d}/{safe_key(key)}.a{attempt}.log"
+
+    def read_job_state(self, m, outp):
+        launched = os.path.isdir(outp + ".launch")
+        state = None
+        try:
+            txt = Path(outp).read_text()
+            state = json.loads(txt) if txt.strip() else None
+        except (OSError, ValueError):
+            state = None
+        return launched, state
+
+    def driver_alive(self, m, state, outp):
+        p = _LOCAL_PROCS.get(outp)
+        if p is not None:
+            return p.poll() is None
+        pid = int((state or {}).get("pid") or 0)
+        if not pid:
+            return False
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def active_job(self, m):
+        try:
+            with urllib.request.urlopen(f"{m['app_url']}/api/job/active", timeout=10) as r:
+                return json.loads(r.read() or b"{}").get("job_id")
+        except (urllib.error.URLError, OSError) as e:
+            raise Transport(f"local app {m['app_url']} not answering: {e}")
+        except ValueError as e:
+            raise RemoteError(f"/api/job/active did not answer JSON: {e}")
+
+    def upload(self, m, local, remote_path, out, what="video"):
+        return False
+
+    def launch(self, m, outp, logp, *, video, match_key, event, label, config) -> str:
+        Path(outp).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(outp + ".launch")          # same at-most-once guard as on a pod
+        except FileExistsError:
+            return "already"
+        hostport = m["app_url"].split("://", 1)[-1].rstrip("/")
+        cmd = [m["python"], m["pod_job"], "--video", video, "--match-key", match_key,
+               "--event", event, "--label", label, "--config-json", json.dumps(config),
+               "--host", hostport, "--no-profile", "--final-timeout", f"{FINAL_TIMEOUT_S:g}",
+               "--app-dir", m["app_dir"], "--out", outp]
+        with open(logp, "ab") as lf:
+            _LOCAL_PROCS[outp] = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                                  stdin=subprocess.DEVNULL, start_new_session=True,
+                                                  cwd=m["app_dir"])
+        return "started"
+
+    def restart(self, m, out) -> None:
+        """kill the local app (pidfile), start it again detached, wait for :8004."""
+        out(f"restarting the LOCAL app server ({m['start_cmd']})")
+        pidf = Path(m.get("pidfile") or LOCAL_PIDFILE)
+        pid = 0
+        try:
+            pid = int(pidf.read_text().strip())
+        except (OSError, ValueError):
+            pid = 0
+        if pid:
+            try:
+                os.kill(pid, 15)
+                for _ in range(60):
+                    os.kill(pid, 0)
+                    time.sleep(0.5)
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        subprocess.run(["setsid", "-f", "bash", m["start_cmd"]], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            try:
+                if self.active_job(m) is None:
+                    out("local app back up")
+                    return
+            except (Transport, RemoteError):
+                pass
+            time.sleep(2)
+        raise RemoteError("local app did not come back on restart within 300 s")
+
+    def prepare(self, m, cfg, out) -> None:
+        return None          # the local app starts its own vLLM on demand
+
+    def tail_log(self, m, logp) -> str:
+        try:
+            return "\n".join(Path(logp).read_text(errors="replace").splitlines()[-20:])
+        except OSError:
+            return ""
+
+    def list_event_state(self, m) -> dict:
+        return {}
+
+    def fetch_files(self, m, names, dest):
+        return []
+
+    def push_files(self, m, files) -> None:
+        return None
+
+
+TRANSPORTS = {"pod": PodMember(), "local": LocalMember()}
+
+
+def transport(m: dict):
+    return TRANSPORTS[(m.get("backend") or "pod")]
+
+
 def _ssh_retry(fn, ctx: "RunCtx", m: dict, out, what: str, tries: int = REMOTE_TRIES):
     """Call ``fn`` until it succeeds. Transport failures retry without limit;
     after LOST_AFTER_S of them the API is asked, and only an API answer of
@@ -956,7 +1471,7 @@ def _ssh_retry(fn, ctx: "RunCtx", m: dict, out, what: str, tries: int = REMOTE_T
                 raise RemoteFailed(f"{what}: {e}")
         except Transport as e:
             out(f"{what}: ssh: {e}")
-            if _now() - t0 > LOST_AFTER_S:
+            if _now() - t0 > LOST_AFTER_S and is_pod(m):
                 status = pod_api_status(m, ctx.sw.saver(m))
                 if status is not None and status != "RUNNING":
                     raise PodLost(f"pod is {status}")
@@ -977,6 +1492,9 @@ class RunCtx:
         self.stop = threading.Event()
         self.sleep = sleep
         self.events: list = []
+        # live mode: called (outside the lock) after each finished item as
+        # on_done(ctx, member, key, ok, state) -- calibration sync, auto-import
+        self.on_done = None
 
     def event(self, msg: str) -> None:
         with self.sw.lock:
@@ -989,7 +1507,8 @@ NOTHING_AFTER_S = 300      # a launched driver that never wrote its out file
 
 def attempt_paths(mk: str, attempt: int) -> tuple[str, str]:
     """Per-attempt out/log on the pod (a retry never reuses a file)."""
-    return f"{POD_JOBS}/{mk}.a{attempt}.json", f"{POD_JOBS}/{mk}.a{attempt}.log"
+    k = safe_key(mk)       # sweep keys "Q3/<mk>" -> "Q3__<mk>" (batch keys unchanged)
+    return f"{POD_JOBS}/{k}.a{attempt}.json", f"{POD_JOBS}/{k}.a{attempt}.log"
 
 
 def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
@@ -1001,53 +1520,61 @@ def process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
         return False, {"error": str(e)[:400]}
 
 
-def _process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
+def _process_item(ctx: RunCtx, m: dict, key: str) -> tuple[bool, dict]:
     run, sw, pod = ctx.run, ctx.sw, m["pod_id"]
     out = sw.logger(m)
-    it = run["items"][mk]
-    label = f"{mk}.a{it['attempts']}"
-    remote_video = f"{POD_VIDEOS}/{mk}.mp4"
-    outp, logp = attempt_paths(mk, it["attempts"])
+    T = transport(m)
+    it = run["items"][key]
+    mk = item_match_key(run, key)
+    label = f"{safe_key(key)}.a{it['attempts']}"
     local = Path(it["video"])
+    remote_video = T.video_path(m, video_name(key), local)
+    outp, logp = T.attempt_paths(m, key, it["attempts"])
 
     def R(fn, what):
         return _ssh_retry(fn, ctx, m, out, what)
-    launched, state = R(lambda: read_job_state(m, outp), "read job state")
+    launched, state = R(lambda: T.read_job_state(m, outp), "read job state")
     if state and state.get("status") in ("done", "error"):
         return state.get("status") == "done", state
     if launched:
-        out(f"[{mk}] attempt already launched; re-attaching ({label})")
+        out(f"[{key}] attempt already launched; re-attaching ({label})")
     else:
         if not local.is_file():
             return False, {"error": f"local video missing: {local}"}
-        R(lambda: upload_video(m, local, remote_video, out), "upload video")
+        R(lambda: T.upload(m, local, remote_video, out), "upload video")
         waited = _now()
         while True:   # never start a second job on a busy server (ssh failure = unknown, not idle)
-            jid = R(lambda: server_active_job(m), "job/active")
+            jid = R(lambda: T.active_job(m), "job/active")
             if not jid:
                 break
             if _now() - waited > FINAL_TIMEOUT_S:
                 return False, {"error": f"server stayed busy with job {jid}"}
-            out(f"[{mk}] server busy with job {jid}; waiting")
+            out(f"[{key}] server busy with job {jid}; waiting")
             ctx.sleep(ctx.poll_s)
-        cfg = job_config(run, pod)
+        cfg = job_config(run, pod, key)
+        if run.get("restart_each"):
+            # fresh server per job: the ~0.7 GB/job CUDA leak shifts tracking
+            # after a few jobs, so job order would confound a config sweep
+            R(lambda: T.restart(m, out), "restart server")
+            with sw.lock:
+                it["restarts"] = it.get("restarts", 0) + 1
+        R(lambda: T.prepare(m, cfg, out), "prepare")
         with sw.lock:
             it["config"] = cfg
-        cmd = cli.pod_job_command(video=remote_video, match_key=mk, event=run["event"], label=label,
-                                  config=cfg, out=outp, log=logp, profile=False,
-                                  extra=f"--final-timeout {FINAL_TIMEOUT_S:g}")
-        how = R(lambda: launch_once(m, outp, cmd), "launch")
-        out(f"[{mk}] launch: {how} ({label})")
+        how = R(lambda: T.launch(m, outp, logp, video=remote_video, match_key=mk,
+                                 event=item_event(run, key), label=label, config=cfg), "launch")
+        out(f"[{key}] launch: {how} ({label})")
     with sw.lock:
         it["launched_at"] = it.get("launched_at") or _now()
         sw.save()
     # prefetch the next video of this pod's block while the job runs
-    nxt = peek_next(run, pod)
+    with sw.lock:
+        nxt = peek_next(run, pod)
     if nxt:
         nloc = Path(run["items"][nxt]["video"])
         try:
             if nloc.is_file():
-                upload_video(m, nloc, f"{POD_VIDEOS}/{nxt}.mp4", out, what="next video")
+                T.upload(m, nloc, T.video_path(m, video_name(nxt), nloc), out, what="next video")
         except (Transport, RemoteError, OSError) as e:
             out(f"prefetch {nxt} failed (retried at launch): {e}")
     seen = state is not None
@@ -1056,19 +1583,19 @@ def _process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
     while not ctx.stop.is_set():
         ctx.sleep(ctx.poll_s)
         polls += 1
-        _, new = R(lambda: read_job_state(m, outp), "poll")
+        _, new = R(lambda: T.read_job_state(m, outp), "poll")
         now = _now()
         if now - last_ok > 3 * ctx.poll_s + 60:
             window = now                # we were offline (ssh retries / laptop sleep): fresh window
         last_ok = now
         if new is None or new.get("label") not in (None, label):
             if not seen and now - window > NOTHING_AFTER_S:
-                if R(lambda: driver_alive(m, None, outp), "driver check"):
+                if R(lambda: T.driver_alive(m, None, outp), "driver check"):
                     window = now        # alive but slow to write: keep waiting
                     continue
                 log = ""
                 try:
-                    log = remote(m, f"tail -n 20 {shlex.quote(logp)} 2>/dev/null || true", timeout=60)
+                    log = T.tail_log(m, logp)
                 except (Transport, RemoteError):
                     pass
                 return False, {"error": f"pod_job.py wrote nothing in {NOTHING_AFTER_S}s and is not "
@@ -1082,8 +1609,8 @@ def _process_item(ctx: RunCtx, m: dict, mk: str) -> tuple[bool, dict]:
             sw.save()
         if state.get("status") in ("done", "error"):
             return state.get("status") == "done", state
-        if polls % 10 == 0 and not R(lambda: driver_alive(m, state, outp), "alive"):
-            _, fin = R(lambda: read_job_state(m, outp), "final read")   # it may have just finished
+        if polls % 10 == 0 and not R(lambda: T.driver_alive(m, state, outp), "alive"):
+            _, fin = R(lambda: T.read_job_state(m, outp), "final read")   # it may have just finished
             if fin and fin.get("status") in ("done", "error"):
                 return fin.get("status") == "done", fin
             return False, {"error": "pod_job.py driver died", "job_id": state.get("job_id")}
@@ -1165,7 +1692,8 @@ def pod_worker(ctx: RunCtx, m: dict) -> None:
             return
         except Exception as e:           # unexpected: count as a failed attempt
             ok, state = False, {"error": f"{type(e).__name__}: {str(e)[:300]}"}
-        info = {k: state.get(k) for k in ("job_id", "wall_job_s", "wall_final_s", "error", "replay")
+        info = {k: state.get(k) for k in ("job_id", "wall_job_s", "wall_final_s", "error", "replay",
+                                          "peak_vram_mib")
                 if state.get(k) is not None}
         with sw.lock:
             st = finish_item(run, mk, pod, ok, **info)
@@ -1173,7 +1701,15 @@ def pod_worker(ctx: RunCtx, m: dict) -> None:
         wall = state.get("wall_final_s")
         ctx.event(f"[{pod}] {mk}: {st}" + (f" in {wall / 60:.1f} min" if wall else "")
                   + (f" ({str(state.get('error'))[:120]})" if not ok else ""))
+        if ctx.on_done is not None:
+            try:
+                ctx.on_done(ctx, m, mk, ok, state)
+            except Exception as e:        # a hook failure never stops the worker
+                ctx.event(f"[{pod}] after-job hook failed: {type(e).__name__}: {str(e)[:200]}")
     if ctx.stop.is_set() or not ctx.terminate_when_done or pod not in run["retired"]:
+        return
+    if not is_pod(m):
+        ctx.event(f"[{pod}] no work left")
         return
     # --terminate-when-done: nothing left for this pod and nothing to steal
     ctx.event(f"[{pod}] no work left: pulling, then terminating (--terminate-when-done)")
@@ -1233,7 +1769,8 @@ def run_table(sw: Swarm, now: float | None = None) -> str:
     remaining = c["pending"] + c["retry"] + sum(
         1 - (items[mk].get("progress") or 0) / 100.0 for mk in run["current"].values() if mk)
     eta = remaining * overall / max(1, len(live)) if live else None
-    burn = sum(float(m.get("cost_per_hr") or 0) for m in sw.members if m.get("status") in BILLING_STATUSES)
+    burn = sum(float(m.get("cost_per_hr") or 0) for m in sw.members
+               if m.get("status") in BILLING_STATUSES and is_pod(m))
     total = sum(member_cost(m, now) for m in sw.members)
     rows.append(f"total: done {c['done']}/{c['total']}  failed {c['failed']}  running {c['running']}  "
                 f"retry {c['retry']}  | ETA {_fmt_min(eta)}  | ${total:.2f} so far, burning ${burn:.2f}/h")
@@ -1294,7 +1831,7 @@ def revive_lost(sw: Swarm, status_fn=None) -> list:
     status_fn = status_fn or pod_api_status
     back = []
     for m in sw.members:
-        if m.get("status") == "lost" and status_fn(m, sw.saver(m)) == "RUNNING":
+        if m.get("status") == "lost" and is_pod(m) and status_fn(m, sw.saver(m)) == "RUNNING":
             sw.update(m, status="ready", error=None)
             back.append(m["pod_id"])
     return back
@@ -1306,16 +1843,85 @@ def cmd_run(args) -> int:
         return _cmd_run(args, sw)
 
 
+def ensure_local_member(sw: Swarm, args) -> dict:
+    """The swarm's LOCAL backend member (created on first use; app URL /
+    dir refreshed from the flags each time)."""
+    want = local_member(sw.name, app_url=getattr(args, "local_url", None) or LOCAL_APP,
+                        app_dir=Path(args.local_app_dir) if getattr(args, "local_app_dir", None) else None)
+    with sw.lock:
+        for m in sw.members:
+            if m["pod_id"] == "local":
+                m.update({k: want[k] for k in ("app_url", "app_dir", "python", "pod_job", "jobs_dir",
+                                               "start_cmd", "backend")}, status="ready")
+                sw.save()
+                return m
+        sw.members.append(want)
+        sw.save()
+    return want
+
+
+def run_pods(sw: Swarm, args) -> list:
+    """The members a run dispatches to: the local app (--local) or the
+    ready pods."""
+    if getattr(args, "local", False):
+        return [ensure_local_member(sw, args)["pod_id"]]
+    return [m["pod_id"] for m in ready_members(sw)]
+
+
+def warn_local_restart(args, restart_each: bool) -> None:
+    if getattr(args, "local", False) and not restart_each:
+        print("WARNING: --local without --restart-each: the local app keeps its ~0.7 GB/job CUDA leak "
+              "between jobs, so job ORDER may confound config comparisons (pass --restart-each to "
+              "restart :8004 before every job)")
+
+
+def drive_run(sw: Swarm, args, run: dict, pods: list, rerun: str, *, ctx: "RunCtx | None" = None,
+              table=None, side_threads: list | None = None) -> int:
+    """One worker thread per member until the run is finished (or Ctrl-C:
+    130). ``side_threads`` (e.g. the live arrival poller) are started too;
+    ``table`` renders the periodic status (default run_table)."""
+    ctx = ctx or RunCtx(sw, args)
+    workers = [threading.Thread(target=pod_worker, args=(ctx, sw.member(p)), daemon=True)
+               for p in run["queues"] if p in pods and p not in run["dead"] and p not in run["retired"]]
+    if not workers and not run_finished(run):
+        raise SystemExit("no ready pod can take the remaining work (`swarm status`; `swarm up --add N`)")
+    for t in workers + list(side_threads or []):
+        t.start()
+    render = table or (lambda: run_table(sw))
+
+    def table() -> str:          # arrivals / workers mutate the run: render under the lock
+        with sw.lock:
+            return render()
+    try:
+        last_print = 0.0
+        while any(t.is_alive() for t in workers):
+            time.sleep(1)
+            if time.time() - last_print >= args.poll_s:
+                print("\n" + table(), flush=True)
+                last_print = time.time()
+    except KeyboardInterrupt:
+        ctx.stop.set()
+        sw.save()
+        print("\ninterrupted: jobs already launched keep running (pods keep billing). "
+              f"Re-run `{rerun}` to re-attach.")
+        return 130
+    ctx.stop.set()                 # side threads (pollers) end with the workers
+    print("\n" + table())
+    return 0
+
+
 def _cmd_run(args, sw: Swarm) -> int:
     plan = sw.data.get("plan")
     if not plan or not plan.get("items"):
         raise SystemExit(f"no plan with work: `swarm plan --name {args.name} --event EV ...` first")
     cfg = json.loads(args.config_json) if args.config_json else None
+    if cfg is None and plan.get("config") is not None:
+        cfg = plan["config"]                    # sweep plans carry their base config
     pod_cfg = parse_pod_configs(getattr(args, "pod_config", None))
     for p in revive_lost(sw):
         print(f"{p}: the API reports it RUNNING again; back in the run")
     run = sw.data.get("run")
-    pods = [m["pod_id"] for m in ready_members(sw)]
+    pods = run_pods(sw, args)
     with sw.lock:
         if not run or run.get("plan_id") != plan["id"]:
             if _run_active(run):
@@ -1323,15 +1929,26 @@ def _cmd_run(args, sw: Swarm) -> int:
             if run:
                 sw.data.setdefault("run_history", []).append(run)
             if not pods:
-                raise SystemExit("no ready members (`swarm up` / `swarm status`)")
+                raise SystemExit("no ready members (`swarm up` / `swarm status`; or --local)")
             unknown = set(pod_cfg) - set(pods)
             if unknown:
                 raise SystemExit(f"--pod-config for pods not ready in this swarm: {', '.join(sorted(unknown))}")
-            run = sw.data["run"] = new_run(plan, pods, cfg, policy=getattr(args, "policy", "blocks"),
-                                           pod_config=pod_cfg)
-            print(f"new run: {len(plan['items'])} match(es) on {len(pods)} pod(s), contiguous blocks: "
-                  + "; ".join(f"{p}: {len(q)}" for p, q in run["queues"].items()))
+            policy = plan.get("policy") or getattr(args, "policy", None) or "blocks"
+            restart_each = getattr(args, "restart_each", None)
+            if restart_each is None:
+                restart_each = bool(plan.get("restart_each")) and not getattr(args, "local", False)
+            warn_local_restart(args, restart_each)
+            run = sw.data["run"] = new_run(plan, pods, cfg, policy=policy, pod_config=pod_cfg,
+                                           restart_each=restart_each)
+            print(f"new run ({policy}{', restart before each job' if restart_each else ''}): "
+                  f"{len(plan['items'])} item(s) on {len(pods)} member(s): "
+                  + "; ".join(f"{p}: {len(q)}" for p, q in run["queues"].items())
+                  + (f"; {len(run.get('unassigned_groups') or [])} config(s) waiting for a free pod"
+                     if run.get("unassigned_groups") else ""))
         else:
+            if getattr(args, "restart_each", None) is not None and args.restart_each != run.get("restart_each"):
+                run["restart_each"] = bool(args.restart_each)
+                print(f"restart before each job now {'ON' if run['restart_each'] else 'OFF'}")
             if cfg is not None and cfg != run.get("config"):
                 print(f"NOTE: this run's config is fixed at {json.dumps(run.get('config'))}; "
                       f"--config-json ignored (re-plan to start a new run)")
@@ -1346,27 +1963,9 @@ def _cmd_run(args, sw: Swarm) -> int:
                     mark_pod_dead(run, p, "member not running")
             print(f"resuming run: {json.dumps(run_counts(run))}")
         sw.save()
-    ctx = RunCtx(sw, args)
-    workers = [threading.Thread(target=pod_worker, args=(ctx, sw.member(p)), daemon=True)
-               for p in run["queues"] if p in pods and p not in run["dead"] and p not in run["retired"]]
-    if not workers and not run_finished(run):
-        raise SystemExit("no ready pod can take the remaining work (`swarm status`; `swarm up --add N`)")
-    for t in workers:
-        t.start()
-    try:
-        last_print = 0.0
-        while any(t.is_alive() for t in workers):
-            time.sleep(1)
-            if time.time() - last_print >= args.poll_s:
-                print("\n" + run_table(sw), flush=True)
-                last_print = time.time()
-    except KeyboardInterrupt:
-        ctx.stop.set()
-        sw.save()
-        print("\ninterrupted: jobs already launched keep running on the pods (and the pods keep "
-              f"billing). Re-run `swarm run --name {args.name}` to re-attach.")
-        return 130
-    print("\n" + run_table(sw))
+    rc = drive_run(sw, args, run, pods, f"swarm run --name {args.name}")
+    if rc == 130:
+        return rc
     c = run_counts(run)
     for mk, it in run["items"].items():
         if it["status"] == "failed":
@@ -1390,7 +1989,7 @@ def cmd_status(args) -> int:
     for m in sw.members:
         rp = "-"
         up_h = None
-        if m.get("status") != "terminated":
+        if m.get("status") != "terminated" and is_pod(m):
             try:
                 pod = cli.refresh_endpoint(m, save=sw.saver(m))
                 rp = pod.get("desiredStatus") or "?"
@@ -1418,7 +2017,7 @@ def cmd_status(args) -> int:
 def cmd_pull(args) -> int:
     sw = Swarm.load(args.name)
     todo = [m for m in sw.members if m.get("status") in BILLING_STATUSES + ("stopped",)
-            and m.get("status") != "created"]
+            and m.get("status") != "created" and is_pod(m)]
     if not todo:
         print("no reachable members to pull")
         return 0
@@ -1486,13 +2085,16 @@ def _rows(con, table: str, key: str, val: str) -> list:
 def plan_import(sw: Swarm, *, local_db: Path, replays_dir: Path, pull_root: Path,
                 uploads_dir: Path | None = None) -> dict:
     """What `import` would add: one entry per pulled replay of every member."""
-    run_videos = {mk: it.get("video") for mk, it in ((sw.data.get("run") or {}).get("items") or {}).items()}
+    run = sw.data.get("run") or {}
+    run_videos = {item_match_key(run, k): it.get("video") for k, it in (run.get("items") or {}).items()}
     for i in (sw.data.get("plan") or {}).get("items") or []:
         run_videos.setdefault(i["match_key"], i["video"])
     lcon = sqlite3.connect(f"file:{local_db}?mode=ro", uri=True)
     entries, seen = [], set()
     try:
         for m in sw.members:
+            if not is_pod(m):
+                continue          # the local backend wrote straight into the local DB
             dest = Path(pull_root) / m["pod_id"]
             rdir, pdb = dest / "web" / "replays", dest / "frc_scorer.db"
             if not rdir.is_dir() or not pdb.exists():
@@ -1586,6 +2188,8 @@ def event_state_diff(sw: Swarm, *, uploads_dir: Path, pull_root: Path) -> list:
     """Pulled event-state files (calibrations etc.) that differ from local."""
     out = []
     for m in sw.members:
+        if not is_pod(m):
+            continue
         up = Path(pull_root) / m["pod_id"] / "web" / "uploads"
         if not up.is_dir():
             continue
@@ -1735,7 +2339,7 @@ def _post_render(rid: str) -> str:
 # --------------------------------------------------------------------------
 def cmd_stop(args, request=None) -> int:
     sw = Swarm.load(args.name)
-    todo = [m for m in sw.members if m.get("status") in BILLING_STATUSES]
+    todo = [m for m in sw.members if m.get("status") in BILLING_STATUSES and is_pod(m)]
     if not todo:
         print("no live members")
         return 0
@@ -1760,7 +2364,7 @@ def cmd_stop(args, request=None) -> int:
 
 def cmd_terminate(args, request=None) -> int:
     sw = Swarm.load(args.name)
-    todo = [m for m in sw.members if m.get("status") not in ("terminated",)]
+    todo = [m for m in sw.members if m.get("status") not in ("terminated",) and is_pod(m)]
     if not todo:
         print("no members left")
         return 0
@@ -1839,6 +2443,7 @@ def add_parser(sub) -> None:
                    help="pull + terminate each pod once it has no work left (the flag is the confirmation)")
     q.add_argument("--with-video", action="store_true", help="with --terminate-when-done: pull HUD mp4s too")
     q.add_argument("--poll-s", type=float, default=20)
+    add_member_flags(q)
     q.set_defaults(fn=cmd_run)
 
     q = named("status", "members (RunPod state, $/h, cost) + run progress")
@@ -1859,3 +2464,24 @@ def add_parser(sub) -> None:
     q = named("terminate", "terminate every member whose results are pulled")
     q.add_argument("--force", action="store_true", help="also members whose last job is not pulled")
     q.set_defaults(fn=cmd_terminate)
+
+    import sweep        # sibling modules; they import this one (no cycle at import time)
+    import live
+    sweep.add_parser(ss, named)
+    live.add_parser(ss, named)
+
+
+def add_member_flags(q) -> None:
+    """Flags shared by every dispatching command (run, sweep run, live)."""
+    q.add_argument("--local", action="store_true",
+                   help="dispatch to the LOCAL app (:8004) instead of pods: pod_job.py runs here as a "
+                        "subprocess, results land in the local DB (nothing rented, nothing pulled)")
+    q.add_argument("--local-url", default=LOCAL_APP, help="local app URL (with --local)")
+    q.add_argument("--local-app-dir", default=None,
+                   help="dir holding the local app's frc_scorer.db + web/replays (default main checkout)")
+    g = q.add_mutually_exclusive_group()
+    g.add_argument("--restart-each", dest="restart_each", action="store_true", default=None,
+                   help="restart the member's app server before EVERY job (the ~0.7 GB/job CUDA leak "
+                        "otherwise shifts tracking after a few jobs). Default: ON for sweeps on pods, "
+                        "OFF otherwise (and OFF for --local: it restarts :8004 itself)")
+    g.add_argument("--no-restart-each", dest="restart_each", action="store_false")

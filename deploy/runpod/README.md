@@ -450,7 +450,7 @@ rp swarm terminate --name cur                                  # whatever is lef
 
 Caveats:
 
-* Each pod's calibration state is independent. Each pod starts from the
+* In batch and sweep runs each pod's calibration state is independent (live mode syncs it). Each pod starts from the
   local event state, and calibrations it re-solves (camera moved) stay on
   that pod.
 * The upload bandwidth from this machine is shared by all pods: the bundle
@@ -458,6 +458,171 @@ Caveats:
 * **Untested on a real swarm yet.** The dispatcher, import and plan are
   unit-tested offline with fakes. The first real run should be small
   (`--count 2 --matches qm1-qm6`).
+
+**Item keys and the local backend (shared by batch, sweep and live).** A batch
+run's items are keyed by match key, as before. A sweep item is keyed
+`<config_id>/<match_key>` (`Q3/2026cur_qm8`), and a live re-posted video is
+`<match_key>@r2`. Each item stores its real `match_key` (plus `config_id`,
+`knobs`, `event` when it has them). Items in state files written before this
+have none of these fields and fall back to the key, so old `.swarm/*.json`
+files still load and resume. Per-job knobs are the run config, then the
+item's knobs, then `--pod-config`. On a pod, job files use the key with `/`
+replaced by `__` (`/workspace/batch/jobs/Q3__2026cur_qm8.a1.json`). Video
+uploads are per match, so every config of one match shares one upload.
+
+* `--restart-each` (any dispatching command) restarts the member's app
+  server before every job (`serve.sh restart`, which waits for :8004). The
+  app leaks about 0.7 GB of CUDA tensors per job, and after a few jobs
+  tracking changes, so without a restart job order confounds a config
+  comparison. It is on by default for sweeps on pods and off otherwise.
+* `--local` (on `run`, `sweep run` and `live`) dispatches to the local app
+  at `http://127.0.0.1:8004` instead of pods. `pod_job.py` runs here as a
+  subprocess (`--no-profile`, `--app-dir` = the main checkout, whose DB and
+  `web/replays` the main-server worktree symlinks), with the same busy
+  guard and launch-once guard. Results stay in the local DB, so nothing is
+  pulled or imported. A local `--restart-each` kills the pid in
+  `/tmp/frc-vision-dev.pid` and runs `setsid -f bash
+  .worktrees/main-server/web/start_all.sh`. It is off by default and the
+  run prints a warning that job order may confound configs. Use `--local`
+  to exercise any of this without renting.
+
+## Quality sweep: pick the max-quality config
+
+Plan: `docs/max-quality-swarm-plan-2026-11.md`. Each config gets one pod (the
+`pinned` policy: config i runs on pod i). Pods differ in speed and host, so
+this keeps those differences out of every within-config comparison. With
+fewer pods than configs, a pod that finishes takes the next whole config.
+A failed item is retried on its own config's pod. If a pod is lost, the
+next pod that runs dry takes over its whole remaining config.
+
+```bash
+rp swarm sweep evalset --out data/eval/sweep_evalset.json --auto            # every hand-GT match (+ --add qm keys)
+#   edit the file if needed: it is plain JSON (video path, truths per match)
+rp swarm sweep plan --name qs --evalset data/eval/sweep_evalset.json \
+                    --configs deploy/runpod/sweep_configs.example.json       # validates every knob; NO renting
+rp swarm up --name qs --count 9 --dry-run --secrets-from-env                 # $/h for one pod per config
+rp swarm up --name qs --count 9 --secrets-from-env [--with-vllm]             # RENTS (needs Nick's go-ahead); --with-vllm for Q4
+rp swarm sweep run --name qs --terminate-when-done                           # restart before each job by default
+rp swarm pull --name qs                                                      # (if not terminated by run)
+rp swarm sweep score --name qs                                               # local scoring, cached per item
+rp swarm sweep score --name qs --audit                                       # + Jev audit for no-GT matches (~$0.25 each; asks)
+rp swarm sweep report --name qs                                              # ranking + noise band -> data/runpod_pull/sweeps/qs/
+
+# the same machinery with nothing rented (local :8004, one job at a time):
+rp swarm sweep plan --name qsl --evalset ... --configs ...
+rp swarm sweep run --name qsl --local [--restart-each]
+rp swarm sweep score --name qsl && rp swarm sweep report --name qsl
+```
+
+* **evalset**: `--auto` takes every match with hand GT in
+  `data/eval/ground_truth/<match_key>/`, so new GT matches from other events
+  and camera setups join on the next refresh. `--add MATCH_KEY` adds a match
+  that has no GT. The video is found by the GT docs' video fingerprint
+  (`web.field.ground_truth.video_fingerprint`; only same-size files in
+  `web/uploads`, `data/videos` and `data/test_footage` are hashed), then by
+  the GT doc's file name, then by `<match_key>.mp4`. Matches without a video
+  are listed under `missing`. Per match the file records its truths:
+  `hand_gt`, `manta` (if `data/manta_cache/<event>_qual_<n>.json` exists), or
+  `none`. Re-running keeps entries you edited by hand.
+* **configs**: `{"base": {...}, "baselines": ["Q0a","Q0b"], "configs": [{"id",
+  "knobs"}]}`. See `sweep_configs.example.json`: Q0a/Q0b/Q1-Q6, with base =
+  R1 (5 fps, corner stride 2, full match). Names and values are checked
+  against `web/job_config.py`'s Knob registry (typos get a did-you-mean).
+  Run the CLI with the main venv for value checks; other interpreters check
+  names only. A config with `team_reader: vllm` gets its vLLM reader
+  pre-started on its pod before each job (`vllm_ctl.py start`), so the cold
+  start stays out of the measured wall time. That needs `swarm up
+  --with-vllm`.
+* **score**: each finished item is scored with `score_pulled.py` under the main
+  venv: hand-GT coverage, error, labels right/wrong/unlabelled and misID s
+  (period `auto` for `auto_period_only` configs), plus the Manta auto meanNN
+  where cached. Pod items need a marked pull (`swarm pull`); local items are
+  read from the local DB. Scores are cached in
+  `data/runpod_pull/sweeps/<name>/scores/` and re-scored only when the job id
+  changes (or with `--rescore`). `--audit` also runs the Jev label audit
+  (`scripts/audit_replay.py` sample + jev + score) for matches **without**
+  hand GT. It prints the estimate (~$0.25 per replay) and asks first.
+* **report**: identity comes first. primary = right − 5 × wrong, in points of
+  hand-GT robot-time, pooled over matches and weighted by each match's
+  processed GT samples. Ties go to misID s per match, then coverage,
+  position error median and Manta auto meanNN. The noise band for each
+  metric is the spread between the baseline repeats (`--baselines`, default
+  from the configs file). Verdicts:
+  * **WIN** only if primary beats the *better* baseline by more than that
+    spread.
+  * **LOSS** if primary is below the *worse* baseline by more than the
+    spread.
+  * **noise** otherwise.
+  * **VETOED** if it would win but coverage, position error or Manta
+    regressed beyond max(spread, 3 pts / 5 cm / 10 cm) against the worse
+    baseline.
+  * **PARTIAL** if its GT matches differ from the baseline's (a failed
+    item).
+
+  With fewer than two baseline results the band is unknown (the report says
+  so). The report also has a per-match table and mean wall time and peak
+  VRAM per config. Outputs: `report.txt`, `report.json` and `report.md`.
+* **Cost** (plan): about 9 pods × about 2.5 h × $2.69/h ≈ $60 on 96 GB cards. A
+  restart adds about 1-1.5 min per job, and a Jev audit about $0.25 per
+  no-GT replay. Nothing is rented by `evalset` / `plan` / `score` / `report`.
+* `event_lineup` (Q5) learns from earlier matches on the same server. A
+  sweep pod sees only the eval matches of its own config, in eval-set
+  order.
+
+## Live mode: staggered dispatch at an event
+
+```bash
+rp swarm up --name ev --count 5 --secrets-from-env                     # RENTS: ceil(T_match / cadence) + 1 pods
+rp swarm live --name ev --event 2026xyz --auto-import                  # TBA poll every 60 s; Ctrl-C and re-run re-attaches
+rp swarm live --name ev --event 2026xyz --hours 9                      # stop polling after 9 h, then drain
+rp swarm live --name ev --event 2026xyz --reprocess-replayed           # a re-posted (replayed) match runs again as <mk>@r2
+
+# rehearsal of a PAST event at its real cadence (phase 3); --local = no renting, tests the machinery
+rp swarm live --name reh --event 2026cur --rehearse --speed 1 --matches qm1-qm30
+rp swarm live --name rehl --event 2026cur --rehearse --speed 10 --matches qm1-qm6 --local
+```
+
+* **Arrivals**: TBA `/event/{key}/matches` (stdlib urllib, `TBA_API_KEY` from
+  the main checkout `.env`), polled every `--poll-s` (default 60). A match
+  with a YouTube video that has not been seen yet is downloaded **here**
+  (`data/videos/`, home IP) and added to the open run. A failed download is
+  tried again on the next poll. When a known match gets a new video id
+  (a replay), it is logged and ignored unless you pass
+  `--reprocess-replayed`.
+* **Dispatch** (`live` policy): the new match goes to the pod that has been
+  idle longest. It never queues two matches on one pod while another pod is
+  idle. When every pod is busy, nothing is pre-assigned: the pod that frees
+  first takes the match. The pod predicted to free first (elapsed time vs
+  median job time) gets the waiting video prefetched. Retries go before new
+  arrivals. `--restart-each` works here too (off by default).
+* **Calibration sync**: after each job, the dispatcher lists the pod's
+  `calibration_*`, `composite_layout_*`, `zones_*` and `field_season_*`
+  files (sha1). It fetches the ones that changed since the starting state
+  (the local files the bundle shipped) and pushes them to every other ready
+  pod that lacks that version. Each push untars into a temp dir in
+  `web/uploads` and then `mv`s every file into place. A pod added mid-event
+  gets the backlog; a failed push is retried after the next job. The last
+  writer wins on a file two pods both changed. `clockscan_` caches are
+  never synced. Every sync is logged in the run (`live.sync_log`) and
+  printed.
+* **Latency**: per match the run records video seen → downloaded →
+  dispatched → launched → final replay. The live table shows p50 / p90 /
+  max latency, the wait before dispatch, the pod predicted to free next and
+  per-pod utilization. At the end it writes
+  `data/runpod_pull/live/<name>/latency.json`.
+* **`--auto-import`** pulls each finished match's pod and runs the same
+  import as `swarm import --apply`. The DB is backed up **once per live
+  session**. While local :8004 runs a job, the import waits until the next
+  finished match. It is ignored with `--local`.
+* **Rehearsal**: arrival time = now + (TBA `actual_time` − first match's) /
+  `--speed`. Videos come from this swarm's earlier plan / runs, then
+  `--videos DIR`, then `data/videos` / `data/test_footage` as
+  `<match_key>.mp4`. Matches without a local video are skipped and listed.
+  Everything else is identical to live. The run closes once the last match
+  has arrived and finished.
+* **Cost** (plan): 5 × L40S ≈ $5.5/h, about $150 for a 3-day event (about 9
+  h/day); 5 × RTX PRO 6000 ≈ $13.5/h. Polling and rehearsing with `--local`
+  rent nothing.
 
 ## 6. Shut down
 

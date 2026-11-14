@@ -185,7 +185,13 @@ def main() -> int:
     ap.add_argument("--allow-busy", action="store_true",
                     help="submit even if another job is active (concurrency test; "
                          "needs MAX_CONCURRENT_JOBS > 1 on the server)")
+    ap.add_argument("--app-dir", default=None,
+                    help="dir holding the server's frc_scorer.db + web/replays (default: this "
+                         "checkout; the swarm's LOCAL backend points it at the local app)")
     a = ap.parse_args()
+    global APP
+    if a.app_dir:
+        APP = Path(a.app_dir).resolve()
 
     cfg = json.loads(a.config_json)
     cfg.setdefault("auto_period_only", False)   # full match

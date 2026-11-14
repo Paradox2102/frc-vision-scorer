@@ -71,6 +71,30 @@ def build_db(db: Path, row: dict, meta: Path, video: Path, main_db: Path) -> Non
     con.close()
 
 
+def run_audit(row: dict, audit_dir: Path, main: Path, *, n: int, ground_center_offset: float) -> dict:
+    """Jev label audit of this replay (scripts/audit_replay.py sample -> jev ->
+    score), inside the throwaway DB set up by main(). Never raises."""
+    import argparse as _ap
+    from scripts import audit_replay as ar
+    ar.REPO = main            # .env (Jev token) + the job's detections file live in the main checkout
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    answers = audit_dir / "answers_jev_multi.jsonl"
+    score = audit_dir / "audit_score.json"
+    try:
+        if not (audit_dir / "items.jsonl").exists():
+            ar.cmd_sample(_ap.Namespace(replay=row["id"], n=n, seed=0, unlabelled_frac=ar.UNLABELLED_FRAC,
+                                        auto_min_share=ar.AUTO_MIN_SHARE,
+                                        ground_center_offset=ground_center_offset,
+                                        out=str(audit_dir), meta=None))
+        if not answers.exists():
+            ar.cmd_jev(_ap.Namespace(audit=str(audit_dir), mode="multi", out=str(answers), limit=0))
+        ar.cmd_score(_ap.Namespace(audit=str(audit_dir), answers=str(answers), min_conf=ar.DEFAULT_MIN_CONF,
+                                   no_gt=True, dump=None, json=str(score)))
+        return json.loads(score.read_text())
+    except (Exception, SystemExit) as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay-json", required=True, help="pod replay row (id, match_key, ...) as JSON file")
@@ -78,6 +102,16 @@ def main() -> int:
     ap.add_argument("--video", required=True, help="local copy of the source video (GT fingerprint/fps)")
     ap.add_argument("--match", type=int, default=8, help="qual match number for the Manta score")
     ap.add_argument("--score-shift", type=float, default=0.475)
+    ap.add_argument("--event", default=None, help="event for the Manta score (default: the match key's)")
+    ap.add_argument("--no-manta", action="store_true", help="skip the Manta score (no cached truth)")
+    ap.add_argument("--period", choices=("full", "auto"), default="full",
+                    help="hand-GT scoring period (auto for auto_period_only jobs)")
+    ap.add_argument("--audit-dir", default=None,
+                    help="ALSO run the Jev label audit (scripts/audit_replay.py sample + jev + score; "
+                         "CALLS THE JEV API, ~$0.25) into this dir")
+    ap.add_argument("--audit-n", type=int, default=150)
+    ap.add_argument("--ground-center-offset", type=float, default=0.0,
+                    help="the job's ground_center_offset_m (audit crops)")
     a = ap.parse_args()
 
     row = json.loads(Path(a.replay_json).read_text())
@@ -113,28 +147,36 @@ def main() -> int:
 
         from scripts import ab_qm8
         ab_qm8.MATCH = a.match
-        try:
-            out["manta"] = ab_qm8.score(expect_replay=row["id"])
-        except Exception as e:
-            out["manta"] = {"error": f"{type(e).__name__}: {e}"}
+        ab_qm8.EVENT_KEY = a.event or row.get("event_key") or row["match_key"].split("_")[0]
+        if a.no_manta:
+            out["manta"] = {"skipped": "no cached Manta truth for this match"}
+        else:
+            try:
+                out["manta"] = ab_qm8.score(expect_replay=row["id"])
+            except Exception as e:
+                out["manta"] = {"error": f"{type(e).__name__}: {e}"}
 
         from web.field.ground_truth import GT_DIR
         gt_dir = GT_DIR if GT_DIR.exists() else main / "data" / "eval" / "ground_truth"
-        res = score_ground_truth.score_replay(row["id"], period="full", gt_dir=gt_dir,
+        res = score_ground_truth.score_replay(row["id"], period=a.period, gt_dir=gt_dir,
                                               score_shift_m=a.score_shift)
         if "error" in res:
             out["gt"] = {"error": res["error"]}
         else:
             h, i = res["headline"], res["identity"]
             out["gt"] = {
-                "n_robots": h["n_robots"], "coverage": h["coverage"],
+                "n_robots": h["n_robots"], "n_processed": h.get("n_processed"),
+                "coverage": h["coverage"],
                 "err_median_m": h["err"]["median"], "err_p90_m": h["err"]["p90"],
                 "label_correct": h["label_correct"], "label_wrong": h["label_wrong"],
                 "unlabeled": h["unlabeled"], "slot_switches": h["slot_switches"],
                 "misid_s": i["misid_s"], "lost_s": i["lost_s"],
                 "warnings": res.get("warnings", []),
-                "score_shift_m": a.score_shift,
+                "score_shift_m": a.score_shift, "period": a.period,
             }
+        if a.audit_dir:
+            out["audit"] = run_audit(row, Path(a.audit_dir), main, n=a.audit_n,
+                                     ground_center_offset=a.ground_center_offset)
     print(json.dumps(out))
     return 0
 

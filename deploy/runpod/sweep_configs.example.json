@@ -1,0 +1,21 @@
+{
+ "_comment": "Quality-sweep configs (docs/max-quality-swarm-plan-2026-11.md). base = R1 (5 fps, corner stride 2), full match. Each config's knobs are merged over base; one config per pod. Knob names/values are checked against web/job_config.py at `swarm sweep plan`. Q0a/Q0b are the same config run twice: their spread is the noise band a config must beat to be a WIN. Q7 (best tracking + best identity) is built from Q1-Q6 results in a second round.",
+ "base": {"sam3_track_fps": 5, "corner_track_stride": 2, "auto_period_only": false},
+ "baselines": ["Q0a", "Q0b"],
+ "configs": [
+  {"id": "Q0a", "knobs": {}, "why": "baseline (R1), repeat 1"},
+  {"id": "Q0b", "knobs": {}, "why": "baseline (R1), repeat 2: noise floor"},
+  {"id": "Q1", "knobs": {"sam3_track_fps": 10, "corner_track_stride": 1, "sam3_chunk_frames": 1000},
+   "why": "denser tracking through crossings, fewer chunk boundaries"},
+  {"id": "Q2", "knobs": {"sam3_track_fps": 10, "corner_track_stride": 1, "sam3_chunk_frames": 1000,
+                         "selective_mask_prop": false},
+   "why": "Q1 + SAM3 on every object every frame (~3.7x base time)"},
+  {"id": "Q3", "knobs": {"read_census_interval_s": 1.0, "window_labels_reader": "jev"},
+   "why": "twice the live census reads + Jev window reads"},
+  {"id": "Q4", "knobs": {"team_reader": "vllm", "vlm_model": "qwen3.5-4b", "vllm_phase_exclusive": false},
+   "why": "resident Qwen3.5-4B local reader (pods need `swarm up --with-vllm`; pre-started per pod)"},
+  {"id": "Q5", "knobs": {"event_lineup": true}, "why": "event-level identity from prior matches"},
+  {"id": "Q6", "knobs": {"window_labels_eliminate": true},
+   "why": "roster elimination fills the last unlabelled slot (wrong-label veto applies)"}
+ ]
+}

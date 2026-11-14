@@ -834,15 +834,15 @@ def score(expect_replay: str | None = None) -> dict:
     mux arm scored the prior gir arm's replay bit-for-bit). Refuse that."""
     # Score ONLY this job's replay: load_our_auto_paths is newest-per-SLOT,
     # so a replay missing a slot silently inherits it from an older run.
-    ours = load_our_auto_paths("2026cur", only_replay=expect_replay)
+    ours = load_our_auto_paths(EVENT_KEY, only_replay=expect_replay)
     if expect_replay is not None:
         rids = {rec["replay_id"] for key, rec in ours.items() if key[0] == MATCH}
         if expect_replay not in rids:
             return {"error": f"stale replay scored (job {expect_replay[:8]} "
                              f"exported no paths; newest with paths: "
                              f"{sorted(r[:8] for r in rids)})"}
-    tbf = {False: load_manta_auto_paths("2026cur", False),
-           True: load_manta_auto_paths("2026cur", True)}
+    tbf = {False: load_manta_auto_paths(EVENT_KEY, False),
+           True: load_manta_auto_paths(EVENT_KEY, True)}
     pairs = []
     for alliance in ("blue", "red"):
         pairs += [dict(p, alliance=alliance)

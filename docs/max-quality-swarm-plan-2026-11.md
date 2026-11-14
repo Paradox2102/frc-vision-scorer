@@ -70,9 +70,15 @@ Identity-only arms (same tracking, so comparable with each other): labels right 
 Q4 67 %, Q5 67 %, Q6 72 % (unlabelled 10 %), all 0 % wrong; Q1 had 6 % wrong /
 5.5 s misID. **Caveat found:** the server leaks ~0.7 GB of live CUDA tensors per job;
 from job 3 on SAM3 offloaded tracker state to CPU, and jobs 4-7 tracked differently
-(cov 81 %) from job 1 with the same tracking config (cov 88 %). Until that is fixed,
-sweep pods must restart the server between jobs (or the leak must be fixed first —
-proposed as its own session), or config comparisons are confounded by job order.
+(cov 81 %) from job 1 with the same tracking config (cov 88 %). **Fixed Nov 13 (branch
+cuda-leak-fix):** the leak was upstream SAM3's never-exited bf16 `torch.autocast` in
+its predictor `__init__`, which pinned a pooled worker thread's autocast weight-cast
+cache (~550 MB of ViT casts per job) plus each finished job's YOLO models (~145 MB).
+SAM3 is now built on a short-lived thread and jobs release their YOLO models. 4
+back-to-back qm8 jobs: allocated after each job 0.10 GiB flat (was 0.83 → 1.56 →
+2.29), job time unchanged, tracking identical across all 4 jobs. Each job logs a
+`[gpu] job … end: allocated=…` line. Sweep pods still restart between jobs by default
+(`--restart-each`); that is now optional.
 
 Not on the list (already measured as losses): multiplex, thread-parallel views,
 `jev_verify_lowconf`, starve windows, `identity_swap_resolve`, the gap-fill detector.

@@ -865,8 +865,11 @@ function updateReadout() {
   $("frameTxt").textContent = `frame ${f}`;
   $("mtTxt").textContent = fmtMatch(f);
   $("vtTxt").textContent = `video ${(f / S.fps).toFixed(3)} s @ ${+S.fps.toFixed(2)} fps`;
-  const k = kfAt(S.kfs, f);
-  $("stateTxt").textContent = k ? `kf: ${k.state} (${k.src || "?"})` : "";
+  // the latest kf at/before f within one Δt step: follow records every
+  // DECIMATE-th frame, so an exact-frame lookup blinked on every other frame
+  const i = lowerBound(S.kfs, f + 1) - 1, k = i >= 0 ? S.kfs[i] : null;
+  const near = k && f - k.frame <= Math.max(DECIMATE, stepFrames());
+  $("stateTxt").textContent = near ? `kf: ${k.state} (${k.src || "?"})` : "";
 }
 function updateProj() {
   const c = S.cursor;
@@ -919,6 +922,12 @@ function interpAt(arr, f, maxGap, useUV) {
   const i = lowerBound(arr, f), k1 = arr[i];
   if (k1 && k1.frame === f) return positioned(k1) ? { k: k1, pt: useUV ? k1.uv : kfXY(k1), state: k1.state, exact: true } : null;
   const k0 = arr[i - 1];
+  // hold the last kf for up to DECIMATE frames past a track's tip (e.g. the
+  // live edge while following), so markers don't blink on the in-between frames
+  if (positioned(k0) && (!k1 || k1.frame - k0.frame > maxGap) && f - k0.frame <= DECIMATE) {
+    const pt = useUV ? k0.uv : kfXY(k0);
+    return pt ? { k: k0, pt, state: k0.state, exact: false } : null;
+  }
   if (!positioned(k0) || !positioned(k1) || k1.frame - k0.frame > maxGap) return null;
   let p0 = useUV ? k0.uv : kfXY(k0), p1 = useUV ? k1.uv : kfXY(k1);
   if (!p0 || !p1) return null;
@@ -980,16 +989,22 @@ function drawOverlay() {
       prev = kf;
     }
     octx.globalAlpha = 1;
-    const cur = kfAt(S.kfs, f);
-    if (cur && positioned(cur)) {
-      octx.beginPath(); octx.arc(cur.uv[0], cur.uv[1], 10 * k, 0, Math.PI * 2);
-      octx.lineWidth = 2.5 * k; octx.strokeStyle = "#fff"; octx.stroke();
-      marker(octx, cur.uv[0], cur.uv[1], 5 * k, ST_COL[cur.state], cur.state, 2 * k);
-    } else if (cur) {
-      octx.fillStyle = ST_COL.unknown; octx.font = `bold ${14 * k}px monospace`; octx.fillText(`${S.team}: UNKNOWN @ this frame`, 10 * k, 40 * k);
-    } else if (!S.recording) {
+    // current position. While following, the live cursor IS the marker (a ring
+    // on the just-recorded kf only exists on every DECIMATE-th frame, so it
+    // blinked a step behind the crosshair). Otherwise frames between densely
+    // spaced follow kfs get the same solid ring, interpolated; only a real
+    // gap (sparse step-mode kfs) gets the dashed "interpolated" ring.
+    if (!S.recording) {
+      const i = lowerBound(S.kfs, f + 1) - 1, prev = i >= 0 ? S.kfs[i] : null, next = S.kfs[i + 1];
+      const dense = prev && (prev.frame === f || (next && next.frame - prev.frame <= 2 * DECIMATE));
       const p = interpAt(S.kfs, f, OTHER_GAP_S * fps, true);
-      if (p) { octx.beginPath(); octx.arc(p.pt[0], p.pt[1], 9 * k, 0, Math.PI * 2); octx.lineWidth = 1.5 * k; octx.strokeStyle = "rgba(255,255,255,.6)"; octx.setLineDash([3 * k, 3 * k]); octx.stroke(); octx.setLineDash([]); }
+      if (p && (p.exact || dense)) {
+        octx.beginPath(); octx.arc(p.pt[0], p.pt[1], 10 * k, 0, Math.PI * 2);
+        octx.lineWidth = 2.5 * k; octx.strokeStyle = "#fff"; octx.stroke();
+        marker(octx, p.pt[0], p.pt[1], 5 * k, ST_COL[p.state], p.state, 2 * k);
+      } else if (dense && !positioned(prev)) {
+        octx.fillStyle = ST_COL.unknown; octx.font = `bold ${14 * k}px monospace`; octx.fillText(`${S.team}: UNKNOWN @ this frame`, 10 * k, 40 * k);
+      } else if (p) { octx.beginPath(); octx.arc(p.pt[0], p.pt[1], 9 * k, 0, Math.PI * 2); octx.lineWidth = 1.5 * k; octx.strokeStyle = "rgba(255,255,255,.6)"; octx.setLineDash([3 * k, 3 * k]); octx.stroke(); octx.setLineDash([]); }
     }
   }
   // cursor: robot-sized box + ground-point crosshair

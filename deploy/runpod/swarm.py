@@ -1971,9 +1971,14 @@ def _cmd_run(args, sw: Swarm) -> int:
         if it["status"] == "failed":
             print(f"  FAILED {mk}: {(it.get('errors') or [{}])[-1].get('error')}")
     print(f"\nrun finished: {c['done']} done, {c['failed']} failed of {c['total']}.")
-    print(f"next: swarm pull --name {args.name}   (if not terminated)\n"
-          f"      swarm import --name {args.name}            (dry run)\n"
-          f"      swarm import --name {args.name} --apply")
+    pull = "" if getattr(args, "local", False) else f"swarm pull --name {args.name}   (if not terminated)\n      "
+    if plan.get("kind") == "sweep":
+        print(f"next: {pull}swarm sweep score --name {args.name}\n      swarm sweep report --name {args.name}")
+    elif getattr(args, "local", False):
+        print("results are in the local DB (local backend: nothing to pull or import)")
+    else:
+        print(f"next: {pull}swarm import --name {args.name}            (dry run)\n"
+              f"      swarm import --name {args.name} --apply")
     return 0 if c["failed"] == 0 and run_finished(run) else 1
 
 

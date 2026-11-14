@@ -559,8 +559,8 @@ rp swarm sweep score --name qsl && rp swarm sweep report --name qsl
   * **PARTIAL** if its GT matches differ from the baseline's (a failed
     item).
 
-  With fewer than two baseline results the band is unknown (the report says
-  so). The report also has a per-match table and mean wall time and peak
+  With fewer than two baseline results the band is unknown: a config that beats
+  the baseline shows as `better?`, never WIN (the report says so). The report also has a per-match table and mean wall time and peak
   VRAM per config. Outputs: `report.txt`, `report.json` and `report.md`.
 * **Cost** (plan): about 9 pods × about 2.5 h × $2.69/h ≈ $60 on 96 GB cards. A
   restart adds about 1-1.5 min per job, and a Jev audit about $0.25 per

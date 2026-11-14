@@ -553,6 +553,8 @@ def verdict(cid: str, agg: dict, bands: dict, baselines: list, base_matches: set
             vetoes.append(k)
     if set(agg.get("gt_matches") or []) != set(base_matches):
         v = "PARTIAL"           # different GT matches than the baseline: not comparable
+    elif delta > band and b["spread"] is None and min_band <= 0:
+        v = "better?"           # no repeat spread (one baseline): never a confirmed WIN
     elif delta > band:
         v = "WIN" if not vetoes else "VETOED"
     elif p < b["worst"] - band:

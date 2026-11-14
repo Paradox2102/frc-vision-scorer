@@ -521,7 +521,7 @@ def test_report_without_two_baselines_never_wins():
     recs = [_rec("Q0a", "m1", 0.5, 0.0), _rec("X", "m1", 0.9, 0.0)]
     rep = sweep.build_report(recs, ["Q0a", "Q0b", "X"], ["Q0a", "Q0b"])
     by = {t["config_id"]: t for t in rep["configs"]}
-    assert by["X"]["verdict"] == "WIN" and not by["X"]["band_known"]
+    assert by["X"]["verdict"] == "better?" and not by["X"]["band_known"]
     assert "noise band: unknown" in sweep.bands_line(rep)
     rep2 = sweep.build_report(recs, ["Q0a", "X"], ["Q0a"], min_band=50)
     assert {t["config_id"]: t for t in rep2["configs"]}["X"]["verdict"] == "noise"

@@ -1206,6 +1206,23 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("dup_reap_updates", "DUP_REAP_UPDATES", int, 8, min=1, max=60,
          section="Fusion & field position"),
+    # colourless_stationary_gate: a colourless (bumper "unknown") fused
+    # detection whose fused track_id has stayed within
+    # colourless_stationary_span_m for the last colourless_stationary_s
+    # seconds (tracker time, fps-independent) is a ghost parked on field
+    # structure; it is excluded from the tracker update (claims no slot, seeds
+    # none). Coloured and track_id-less detections are never gated. Why:
+    # 2025hop_qm2 full SAM3 — main-only colourless objects on the processor /
+    # reef held roster slots of EITHER alliance for most of the match; a static
+    # no-seed zone can't fix it (it takes over existing slots). Offline trace
+    # prefilter (1.0 m / 50 updates at 5 fps): GT coverage 75.6 -> 80.5%, no
+    # robot worse, 96% of dropped obs on no robot. DEFAULT OFF pending live A/B.
+    Knob("colourless_stationary_gate", "COLOURLESS_STATIONARY_GATE", bool, False,
+         section="Fusion & field position"),
+    Knob("colourless_stationary_s", "COLOURLESS_STATIONARY_S", float, 10.0,
+         min=1.0, max=60.0, section="Fusion & field position"),
+    Knob("colourless_stationary_span_m", "COLOURLESS_STATIONARY_SPAN_M", float,
+         1.0, min=0.1, max=5.0, section="Fusion & field position"),
     # bumper_color_read: re-read each main-backed tracker input's bumper colour
     # from the main-view pixels every frame (web/field/bumper_colour.py: push
     # pos 0.475 m from the camera to the robot centre, project a 0.95 m square

@@ -7454,7 +7454,10 @@ class InferenceJob:
                 alliance_by_territory=self.config.alliance_by_territory,
                 dup_seed_guard_m=self.config.dup_seed_guard_m,
                 dup_reap_m=self.config.dup_reap_m,
-                dup_reap_updates=self.config.dup_reap_updates)
+                dup_reap_updates=self.config.dup_reap_updates,
+                colourless_stationary_gate=self.config.colourless_stationary_gate,
+                colourless_stationary_s=self.config.colourless_stationary_s,
+                colourless_stationary_span_m=self.config.colourless_stationary_span_m)
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -10415,6 +10418,11 @@ class InferenceJob:
                             } for t in track_outs],
                             "det_to_slot": {int(k): int(v) for k, v in ft.last_det_to_slot.items()},
                             "events": [dict(e) for e in ft.binding_events],
+                            # colourless_stationary_gate: fused det indices
+                            # excluded from this update (key absent when off).
+                            **({"gated": list(ft.last_gated_det_indices)}
+                               if getattr(ft, "colourless_stationary_gate", False)
+                               else {}),
                             # Raw per-camera detections BEFORE fusion — shows whether a
                             # robot vanished from detection itself (SAM3 gave up / occluded /
                             # left frame) vs was detected but lost in fusion/tracking.

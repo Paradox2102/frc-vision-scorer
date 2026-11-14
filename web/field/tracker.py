@@ -141,7 +141,9 @@ class FieldTracker:
                  reseed_hold_s=1.5, reseed_fresh_cost_m=3.0,
                  corner_dup_radius_m=2.0, assign_partial_fix=False,
                  phys_excess_weight=2.0, alliance_by_territory=True,
-                 dup_seed_guard_m=0.0, dup_reap_m=0.0, dup_reap_updates=8):
+                 dup_seed_guard_m=0.0, dup_reap_m=0.0, dup_reap_updates=8,
+                 colourless_stationary_gate=False, colourless_stationary_s=10.0,
+                 colourless_stationary_span_m=1.0):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -243,6 +245,26 @@ class FieldTracker:
         self.dup_reap_m = float(dup_reap_m)
         self.dup_reap_updates = int(dup_reap_updates)
         self._dup_pair_n: dict = {}
+        # colourless_stationary_gate (default OFF): a colourless ("unknown")
+        # detection whose fused track_id has stayed within
+        # colourless_stationary_span_m (bbox diagonal of its positions) for
+        # the last colourless_stationary_s seconds of tracker time (sum of
+        # update dt, so fps-independent) is a ghost parked on field structure
+        # (2025hop_qm2: main-only colourless SAM objects on the processor /
+        # reef held roster slots for most of the match; being colourless they
+        # can take a slot of EITHER alliance). It is excluded from the update
+        # entirely: it claims no slot and seeds none. Coloured detections and
+        # track_id-less detections are never gated; a gated id is released as
+        # soon as its window spans >= span_m again. last_gated_det_indices
+        # holds this update's gated ORIGINAL detection indices; a
+        # "colourless_stationary" slot_event is logged when non-empty.
+        self.colourless_stationary_gate = bool(colourless_stationary_gate)
+        self.colourless_stationary_s = float(colourless_stationary_s)
+        self.colourless_stationary_span_m = float(colourless_stationary_span_m)
+        self._cs_hist: dict = {}   # track_id -> deque[(elapsed_s, x, y)]
+        self._elapsed_s = 0.0
+        self.last_gated_det_indices: list[int] = []
+        self.gated_det_total = 0
         self._det_history: dict[int, deque] = {}  # track_id -> (frame_idx, pos)
         self._frame_idx = 0
         # Opt-in measurement history for the offline RTS smoothing pass
@@ -301,6 +323,9 @@ class FieldTracker:
             "dup_seed_guard_m": self.dup_seed_guard_m,
             "dup_reap_m": self.dup_reap_m,
             "dup_reap_updates": self.dup_reap_updates,
+            "colourless_stationary_gate": self.colourless_stationary_gate,
+            "colourless_stationary_s": self.colourless_stationary_s,
+            "colourless_stationary_span_m": self.colourless_stationary_span_m,
         }
 
     def _reach_excess(self, t, pos, det_corner, dt) -> float:
@@ -365,6 +390,43 @@ class FieldTracker:
             for tid in [tid for tid, h in self._det_history.items()
                         if h[-1][0] < stale]:
                 del self._det_history[tid]
+
+    def _colourless_stationary_gated(self, detections) -> list[int]:
+        """Record this update's track_id positions and return the ORIGINAL
+        indices of colourless detections whose track_id has sat within
+        colourless_stationary_span_m for the whole colourless_stationary_s
+        window (see __init__). Each id keeps one anchor entry at or before the
+        window start, so "covers the window" is: oldest entry >= window old.
+        A gap longer than the window restarts an id's history (no evidence
+        inside the window); ids unseen for 2 windows are dropped."""
+        now = self._elapsed_s
+        win = self.colourless_stationary_s
+        eps = 1e-9
+        for d in detections:
+            if d.track_id is None:
+                continue
+            h = self._cs_hist.get(d.track_id)
+            if h is None or now - h[-1][0] > win + eps:
+                h = self._cs_hist[d.track_id] = deque()
+            h.append((now, float(d.pos[0]), float(d.pos[1])))
+            while len(h) >= 2 and now - h[1][0] >= win - eps:
+                h.popleft()
+        stale = now - 2.0 * win
+        for tid in [tid for tid, h in self._cs_hist.items() if h[-1][0] < stale]:
+            del self._cs_hist[tid]
+        gated = []
+        for i, d in enumerate(detections):
+            if d.track_id is None or d.color in ALLIANCES:
+                continue
+            h = self._cs_hist.get(d.track_id)
+            if not h or now - h[0][0] < win - eps:
+                continue
+            xs = [e[1] for e in h]
+            ys = [e[2] for e in h]
+            if float(np.hypot(max(xs) - min(xs), max(ys) - min(ys))) \
+                    < self.colourless_stationary_span_m:
+                gated.append(i)
+        return gated
 
     def _det_moving(self, d):
         """Has this detection's track_id displaced >= guard_motion_m within the
@@ -431,6 +493,16 @@ class FieldTracker:
         # detection from seeding slots in both alliances simultaneously.
         half = self.field_length / 2.0
         indexed = list(enumerate(detections))
+        if self.colourless_stationary_gate:
+            self._elapsed_s += float(dt or 0.0)
+            gated = self._colourless_stationary_gated(detections)
+            self.last_gated_det_indices = gated
+            if gated:
+                self.gated_det_total += len(gated)
+                self.slot_events.append({"event": "colourless_stationary",
+                                         "slot_id": None, "det_idx": list(gated)})
+                gs = set(gated)
+                indexed = [(i, d) for i, d in indexed if i not in gs]
         if not self.alliance_by_territory:
             self._assign_territory_free(indexed, dt)
         else:

@@ -78,6 +78,12 @@ BASE_ENV = {
     "SAM3_EVICT_MIN_ABSENCES": "99",
     # no vLLM on the pod (see module docstring)
     "VLLM_PHASE_EXCLUSIVE": "0",
+    # Finished jobs kept in the server's in-memory `jobs` dict (web/app.py).
+    # Nothing on a pod reads old ones (pod_job.py polls the DB + replay files),
+    # and at full-SAM3 settings each retained job pins 4-7 GiB of host RAM:
+    # Nov 14 2026 vast run, Q2/Q9 idle anon climbed 0 -> 31 GiB over 8 jobs
+    # with the default 4.
+    "JOB_RETENTION": "1",
 }
 
 

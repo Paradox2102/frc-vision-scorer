@@ -10,6 +10,8 @@
   {"id": "Q2", "knobs": {"sam3_track_fps": 10, "corner_track_stride": 1, "sam3_chunk_frames": 1000,
                          "selective_mask_prop": false},
    "why": "Q1 + SAM3 on every object every frame (~3.7x base time)"},
+  {"id": "Q8", "knobs": {"selective_mask_prop": false},
+   "why": "base + SAM3 on every object every frame (pre-Nov-6 full-SAM3 tracking at 5 fps): isolates selective vs full SAM3 from Q1's fps/stride changes"},
   {"id": "Q3", "knobs": {"read_census_interval_s": 1.0, "window_labels_reader": "jev"},
    "why": "twice the live census reads + Jev window reads"},
   {"id": "Q4", "knobs": {"team_reader": "vllm", "vlm_model": "qwen3.5-4b", "vllm_phase_exclusive": false},

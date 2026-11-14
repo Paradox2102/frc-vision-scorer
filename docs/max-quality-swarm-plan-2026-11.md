@@ -57,6 +57,7 @@ before renting). Base = R1 (5 fps, corner stride 2) — it had the best labels o
 | Q0a/Q0b | base, run twice | noise floor | — |
 | Q1 | `sam3_track_fps` 10, `corner_track_stride` 1, `sam3_chunk_frames` 1000 | denser tracking through crossings, fewer chunk boundaries (each drops appearance memory) | R3 on qm8: not better (66 % vs 70 %) — single match, inside noise |
 | Q2 | Q1 + `selective_mask_prop` OFF | SAM3 on every object every frame instead of only ambiguous windows | selective was tuned for speed; qm16 suggested it may also *help* — needs the 6-match test |
+| Q8 | `selective_mask_prop` OFF at base fps/stride | full SAM3 tracking as before the Nov 6 speed defaults (YOLO seeds SAM3, SAM3 masks every robot every frame) — isolates selective vs full SAM3 from Q1's fps changes | selective made a full match ~25 → ~9 min and cost some auto coverage (Nov 6); masks now exist on only 1-4 % of drawn robots |
 | Q3 | `read_census_interval_s` 1.0 + `window_labels_reader` jev | twice the live census reads + Jev window reads instead of the local student | student_only was quality-neutral at 4x speed; more reads untested |
 | Q4 | `team_reader` vllm + Qwen3.5-4B resident | free local reader, parity with Jev on qm8 Nov 13 | 71/0 vs Jev 59/0 on the 200-crop bench; live parity |
 | Q5 | `event_lineup` ON | event-level identity from all prior matches | built Nov 10, never evaluated (eval was ~$7 of Jev) |
@@ -86,7 +87,7 @@ Bigger-detector / higher-resolution YOLO is the largest untested quality lever (
 Nov 11 study: missing YOLO boxes are most of the untracked time) but needs training,
 so it is a separate project, not a sweep knob.
 
-**Cost:** ~9 pods × ~2.5 h × ~$2.69/h (96 GB cards, so any config fits, incl. the
+**Cost:** ~10 pods (Q0a/Q0b, Q1-Q6, Q8) × ~2.5 h × ~$2.69/h (96 GB cards, so any config fits, incl. the
 resident reader) ≈ $60. Matches run per pod in schedule order; results are scored
 locally with the existing scorers (`score_pulled.py`, audit).
 

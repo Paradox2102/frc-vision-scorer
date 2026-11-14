@@ -1325,11 +1325,11 @@ async def _run_job_serialized(job: "InferenceJob") -> None:
                                 "progress": 0.0})
         await job.process_video()
     finally:
-        # The appearance embedder is only used by tracking + the analysis
-        # loop; drop its weights so finished jobs (kept JOB_RETENTION deep)
-        # don't pin them.
+        # Drop the job's GPU models (embedder, per-job YOLO detectors, extra
+        # SAM3 predictors) so finished jobs (kept JOB_RETENTION deep) don't
+        # pin them, return the CUDA cache, and log the post-job VRAM line.
         try:
-            job._release_embedder()
+            job._release_gpu()
         except Exception:
             pass
         _job_slots.release()
@@ -1659,9 +1659,11 @@ class InferenceJob:
         self.model = YOLO(str(MODEL_PATH))
         self.bumper_model = None
         self.det_schema = None
+        self.bumper_class_names = None  # /api/status; outlives _release_gpu
         if BUMPER_MODEL_PATH.exists():
             self.bumper_model = YOLO(str(BUMPER_MODEL_PATH))
             self.det_schema = DetectionSchema.from_names(self.bumper_model.names)
+            self.bumper_class_names = dict(self.bumper_model.names)
             print(
                 f"[detect] bumper model={BUMPER_MODEL_PATH.name} "
                 f"classes={self.bumper_model.names} "
@@ -6541,6 +6543,54 @@ class InferenceJob:
             except Exception:
                 pass
 
+    # Per-job GPU module refs dropped at job end (YOLO detectors built in
+    # __init__; ultralytics moves them to the GPU on first predict).
+    _GPU_MODEL_ATTRS = ("model", "bumper_model", "person_model")
+
+    def _release_gpu(self) -> None:
+        """End of job (``_run_job_serialized``'s finally, after process_video
+        returned on success / error / stop): drop this job's GPU models, then
+        ``gc.collect()`` + ``torch.cuda.empty_cache()`` and log one
+        ``[gpu] job <id> end:`` VRAM line so a future ratchet shows in pod
+        logs. Every InferenceJob loads its own YOLO detectors and the server
+        keeps JOB_RETENTION finished jobs, so without this each retained job
+        pinned ~145 MB of YOLO weights.
+
+        Nothing uses these after process_video returns: finalize (window
+        labels, replay save, HUD render enqueue) runs inside process_video;
+        the HUD render is a subprocess keyed by replay id; the analysis
+        prefetcher builds private YOLO instances local to its worker;
+        pause/resume/stop refuse finished jobs; /api/job/{id}/retry builds a
+        fresh InferenceJob; /api/status reads ``bumper_class_names``.
+        Idempotent; never raises."""
+        try:
+            self._release_embedder()
+        except Exception:
+            pass
+        for attr in self._GPU_MODEL_ATTRS:
+            try:
+                setattr(self, attr, None)
+            except Exception:
+                pass
+        try:
+            # sam3_parallel_views extras (process_video's finally already
+            # clears them; belt and braces for paths that skip it).
+            self._sam3_extra_trackers = []
+        except Exception:
+            pass
+        torch_mod = sys.modules.get("torch")  # never import torch just for this
+        try:
+            import gc
+            gc.collect()
+            if torch_mod is not None and torch_mod.cuda.is_available():
+                torch_mod.cuda.empty_cache()
+                alloc = torch_mod.cuda.memory_allocated() / 2**30
+                reserved = torch_mod.cuda.memory_reserved() / 2**30
+                print(f"  [gpu] job {getattr(self, 'job_id', '?')} end: "
+                      f"allocated={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+        except Exception:
+            pass
+
     def _build_identity_registry(self) -> IdentityRegistry:
         """The job's IdentityRegistry, wired to the identity_continuity knobs."""
         cfg = getattr(self, "config", None)
@@ -11392,10 +11442,10 @@ async def debug_tasks():
 async def status():
     """Return model and system status"""
     latest_job = jobs[next(reversed(jobs))] if jobs else None
+    # Snapshot taken at job init: finished jobs drop bumper_model (_release_gpu).
     bumper_classes = (
-        dict(latest_job.bumper_model.names)
-        if latest_job is not None and latest_job.bumper_model is not None
-        else None
+        getattr(latest_job, "bumper_class_names", None)
+        if latest_job is not None else None
     )
     return {
         "model": "YOLO26s Hub-Zone + YOLOv8m Bumpers",

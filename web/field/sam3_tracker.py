@@ -100,6 +100,56 @@ SAM3_MULTIPLEX = os.environ.get("SAM3_MULTIPLEX", "0") not in ("0", "false", "Fa
 SAM3_MULTIPLEX_MAX_OBJECTS = 64
 
 
+def build_on_fresh_thread(fn, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` on a new short-lived thread and return its
+    result (re-raising its exception), so the caller's thread-local torch
+    state comes back exactly as it was.
+
+    Why: upstream SAM3 predictors do ``self.bf16_context =
+    torch.autocast("cuda", bfloat16); self.bf16_context.__enter__()`` in
+    ``__init__`` and never exit it (``Sam3TrackerPredictor``,
+    ``Sam3MultiplexVideoPredictor``, the multiplex base classes). Autocast
+    state and its weight-cast cache are thread-local, so building per job on
+    a pooled ``asyncio.to_thread`` worker left that worker at autocast nesting
+    >= 1 forever: ``torch.autocast.__exit__`` never reached nesting 0, never
+    called ``clear_autocast_cache()``, and every bf16 weight cast later made
+    on that thread (~550 MB of SAM3 ViT casts per job) stayed cached for the
+    life of the process; any other work landing on the poisoned worker (YOLO,
+    embedder) silently ran under bf16 autocast. Built here, the leaked
+    contexts die with the build thread. All SAM3 compute already runs under
+    an explicit autocast (``mask_tracker._propagate`` /
+    ``_selective_propagate``; upstream ``Sam3BasePredictor.add_prompt``).
+
+    The caller's current CUDA device (thread-local in the CUDA runtime) is
+    carried over when CUDA is already initialised, so device-defaulting
+    builders (``torch.cuda.current_device()``) see the same device."""
+    device = None
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            device = torch.cuda.current_device()
+    except Exception:
+        device = None
+
+    out: dict = {}
+
+    def _target() -> None:
+        try:
+            if device is not None:
+                import torch
+                torch.cuda.set_device(device)
+            out["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # re-raised on the caller's thread
+            out["error"] = exc
+
+    t = threading.Thread(target=_target, name="sam3-build", daemon=True)
+    t.start()
+    t.join()
+    if "error" in out:
+        raise out["error"]
+    return out.get("value")
+
+
 def _shim_init_state_drop_state_offload(model: Any) -> None:
     """Sam3BasePredictor.start_session unconditionally forwards
     offload_state_to_cpu into model.init_state(**kwargs), but the 3.1
@@ -1152,7 +1202,10 @@ class Sam3FieldTracker(MaskFieldTracker):
                 # per bucket) stays at its default.
                 from sam3.model_builder import build_sam3_predictor
 
-                predictor = build_sam3_predictor(
+                # Fresh thread: upstream's never-exited bf16_context must not
+                # poison this (pooled) thread — see build_on_fresh_thread.
+                predictor = build_on_fresh_thread(
+                    build_sam3_predictor,
                     version="sam3.1",
                     checkpoint_path=checkpoint,
                     compile=compile_model,
@@ -1166,7 +1219,8 @@ class Sam3FieldTracker(MaskFieldTracker):
             else:
                 from sam3.model_builder import build_sam3_video_predictor
 
-                predictor = build_sam3_video_predictor(
+                predictor = build_on_fresh_thread(
+                    build_sam3_video_predictor,
                     checkpoint_path=checkpoint,
                     compile=compile_model,
                 )

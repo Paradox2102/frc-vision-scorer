@@ -864,7 +864,7 @@ function updateReadout() {
   const f = curFrame();
   $("frameTxt").textContent = `frame ${f}`;
   $("mtTxt").textContent = fmtMatch(f);
-  $("vtTxt").textContent = `video ${(f / S.fps).toFixed(3)} s @ ${S.fps} fps`;
+  $("vtTxt").textContent = `video ${(f / S.fps).toFixed(3)} s @ ${+S.fps.toFixed(2)} fps`;
   const k = kfAt(S.kfs, f);
   $("stateTxt").textContent = k ? `kf: ${k.state} (${k.src || "?"})` : "";
 }

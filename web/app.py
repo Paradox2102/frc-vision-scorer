@@ -101,6 +101,7 @@ from web.field.occlusion import (
     resolve_occlusion,
 )
 from web.field.occlusion_portal import predict_exit, path_crosses_footprint
+from web.field.blind_zone import compute_blind_zone
 from web.field.overlay_geometry import (
     bump_wireframe_edges,
     hub_wireframe_edges,
@@ -1728,6 +1729,12 @@ class InferenceJob:
         self._portal_state: Dict[int, tuple] = {}
         # slot_id -> last-known (x, y), for teleport-suspect logging.
         self._portal_prev_pos: Dict[int, tuple] = {}
+        # blind_zone_coast knob: camera blind zones per active view set
+        # (frozenset of view names -> BlindZone), the one in use, and the
+        # JSON record for logs / the replay summary (None when off).
+        self._blind_zones: dict = {}
+        self._blind_zone = None
+        self._blind_zone_record: Optional[dict] = None
 
         # Video metadata
         self.video_width = 0
@@ -5954,7 +5961,12 @@ class InferenceJob:
                     "slot": self._slot_label(t.slot_id), "alliance": t.alliance,
                     "pos": [float(t.pos[0]), float(t.pos[1])], "state": t.state,
                     "corner_only": bool(t.corner_only),
-                    "trail": [[float(p[0]), float(p[1])] for p in trail]})
+                    "trail": [[float(p[0]), float(p[1])] for p in trail],
+                    # blind_zone_coast: coasting held in a camera blind zone.
+                    **({"blind": True}
+                       if (t.state == "coasting" and getattr(self, "_blind_zones", None)
+                           and (self._occ or {}).get(t.slot_id, {}).get("blind"))
+                       else {})})
         # A slot that vanished re-seeds its trail from scratch.
         for sid in list(self._radar_trails):
             if sid not in radar_seen_slots:
@@ -7457,7 +7469,9 @@ class InferenceJob:
                 dup_reap_updates=self.config.dup_reap_updates,
                 colourless_stationary_gate=self.config.colourless_stationary_gate,
                 colourless_stationary_s=self.config.colourless_stationary_s,
-                colourless_stationary_span_m=self.config.colourless_stationary_span_m)
+                colourless_stationary_span_m=self.config.colourless_stationary_span_m,
+                blind_zone_hold=bool(getattr(self.config, "blind_zone_coast", False)),
+                blind_zone_max_coast=int(getattr(self.config, "blind_zone_max_coast", 0) or 0))
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -7507,6 +7521,67 @@ class InferenceJob:
         print(f"  Field tracking ENABLED: event={self.event_key} camera={self.camera} "
               f"season={cal.field_season} mode={cal.mode}")
         return True
+
+    def _blind_zone_for(self, views):
+        """blind_zone_coast: the BlindZone of this posed view set (cached per
+        set of view names; calibrations are fixed once tracking starts)."""
+        key = frozenset(v.name for v in views)
+        zone = self._blind_zones.get(key)
+        if zone is None:
+            cfg = self.config
+            zone = compute_blind_zone(
+                views, self.field_dims,
+                margin_px=float(cfg.blind_zone_margin_px),
+                corner_min_range_m=float(cfg.blind_corner_min_range_m),
+                margin_m=float(cfg.blind_zone_margin_m),
+                top_crop=ROBOT_TRACK_TOP_CROP_ENABLED,
+                top_probe_m=float(cfg.blind_zone_top_probe_m))
+            self._blind_zones[key] = zone
+        return zone
+
+    def _init_blind_zone(self) -> None:
+        """blind_zone_coast: compute the camera blind zone(s) once the job's
+        views are final (after the per-match corner step), log them and keep a
+        JSON record for the replay summary. A view with active_until_frame
+        (2025 endgame corner re-tile) gives a second, main-only-ish phase."""
+        self._blind_zones = {}
+        self._blind_zone = None
+        self._blind_zone_record = None
+        if (not getattr(self.config, "blind_zone_coast", False)
+                or self.field_tracker is None or not getattr(self, "field_dims", None)):
+            return
+        posed = [v for v in self.views
+                 if v.calibration is not None and v.calibration.camera_center is not None]
+        if not posed:
+            return
+        phases = [(None, posed)]
+        cuts = sorted({u for u in (_view_active_until(v) for v in posed) if u is not None})
+        for cut in cuts:
+            phases.append((cut, [v for v in posed
+                                 if _view_active_until(v) is None or cut < _view_active_until(v)]))
+        rec = {"phases": []}
+        for from_frame, vs in phases:
+            zone = self._blind_zone_for(vs)
+            print(f"  [blind-zone] from frame {from_frame or 0}: {zone.describe()}")
+            rec["phases"].append({"from_frame": from_frame, **zone.summary()})
+        self._blind_zone = self._blind_zone_for(posed)
+        self.field_tracker.blind_zone = self._blind_zone
+        self._blind_zone_record = rec
+
+    def _blind_out_of_view(self, posed, view):
+        """blind_zone_coast: resolve_occlusion's out_of_view callable for
+        ``view`` (None when off). Switches the tracker's zone (re-acquisition
+        gate) when the posed view set changes (endgame corner cutoff)."""
+        if (not getattr(self.config, "blind_zone_coast", False)
+                or not getattr(self, "_blind_zones", None)):
+            return None
+        zone = self._blind_zone_for(posed)
+        if zone is not self._blind_zone:
+            self._blind_zone = zone
+            if self.field_tracker is not None:
+                self.field_tracker.blind_zone = zone
+            print(f"  [blind-zone] active views changed: {zone.describe()}")
+        return lambda pos, _z=zone, _n=view.name: _z.out_of_view(_n, pos)
 
     def _refresh_camera_centers(self) -> None:
         self._camera_centers_xy = {}
@@ -7795,6 +7870,9 @@ class InferenceJob:
         eg = getattr(self, "endgame_cutoff", None)
         if eg:               # endgame_layout_switch season: corners end here
             out["endgame_cutoff"] = dict(eg)
+        bz = getattr(self, "_blind_zone_record", None)
+        if bz:               # blind_zone_coast: the camera blind zone(s) used
+            out["blind_zone"] = bz
         return out
 
     def _new_replay_recorder(self) -> ReplayRecorder:
@@ -8702,6 +8780,15 @@ class InferenceJob:
             # re-solve+adopt / drop each corner view before tracking uses it.
             await asyncio.to_thread(self._corner_per_match_step)
             self._raise_if_stopped()  # phase boundary: after corner calibration
+            try:
+                self._init_blind_zone()   # blind_zone_coast knob (no-op when off)
+            except Exception as e:
+                self._blind_zones = {}
+                self._blind_zone = None
+                self._blind_zone_record = None
+                await self._warn_degraded(
+                    "blind_zone", f"Blind-zone computation failed ({e}); "
+                    "blind_zone_coast is inactive for this run.")
             # ----- SAM3 (mask tracker) PRE-COMPUTATION PASS -----
             self.use_mask_tracker = False
             self.tracker_raw = {}
@@ -10466,7 +10553,8 @@ class InferenceJob:
                     self._occ_by_cam = {
                         v.name: resolve_occlusion(
                             v.calibration, occ_input,
-                            person_boxes_by_cam.get(v.name, []), self.hub_prisms)
+                            person_boxes_by_cam.get(v.name, []), self.hub_prisms,
+                            out_of_view=self._blind_out_of_view(posed, v))
                         for v in posed
                     }
                     self._occ = _merge_occlusion(list(self._occ_by_cam.values()))

@@ -124,6 +124,10 @@ class _Track:
     last_meas_k: Optional[int] = None
     last_meas_corner: bool = False
     expired_k: Optional[int] = None
+    # blind_zone_hold: coasting while out of every camera's useful view (the
+    # occlusion dict's "blind"). Held in place, long budget, and re-acquires
+    # only detections near the blind zone. Cleared on measurement / expiry.
+    blind_coasting: bool = False
 
 
 class FieldTracker:
@@ -143,7 +147,8 @@ class FieldTracker:
                  phys_excess_weight=2.0, alliance_by_territory=True,
                  dup_seed_guard_m=0.0, dup_reap_m=0.0, dup_reap_updates=8,
                  colourless_stationary_gate=False, colourless_stationary_s=10.0,
-                 colourless_stationary_span_m=1.0):
+                 colourless_stationary_span_m=1.0, blind_zone_hold=False,
+                 blind_zone=None, blind_zone_max_coast=0):
         self.gate = gate_m
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
@@ -262,6 +267,19 @@ class FieldTracker:
         self.colourless_stationary_s = float(colourless_stationary_s)
         self.colourless_stationary_span_m = float(colourless_stationary_span_m)
         self._cs_hist: dict = {}   # track_id -> deque[(elapsed_s, x, y)]
+        # blind_zone_hold (default OFF; job knob blind_zone_coast): a missed
+        # slot whose occlusion entry says "blind" (out of every camera's useful
+        # view — web/field/blind_zone.py) is a robot parked in a camera gap
+        # (near-field corners). It coasts on blind_zone_max_coast updates
+        # (0 = max_coast_occluded), its velocity is zeroed so the reported
+        # position stays where it was last seen / settled instead of drifting,
+        # and while held it may only re-acquire a detection within gate_m of
+        # the blind zone (``blind_zone``: object with distance_m(pos); None =
+        # no emerge gate) — a robot re-emerges from the gap, so a detection
+        # elsewhere on the field belongs to someone else.
+        self.blind_zone_hold = bool(blind_zone_hold)
+        self.blind_zone = blind_zone
+        self.blind_zone_max_coast = int(blind_zone_max_coast or 0)
         self._elapsed_s = 0.0
         self.last_gated_det_indices: list[int] = []
         self.gated_det_total = 0
@@ -326,6 +344,11 @@ class FieldTracker:
             "colourless_stationary_gate": self.colourless_stationary_gate,
             "colourless_stationary_s": self.colourless_stationary_s,
             "colourless_stationary_span_m": self.colourless_stationary_span_m,
+            # blind_zone_hold keys only when on (traces of off runs unchanged).
+            # The zone object itself is not serialised.
+            **({"blind_zone_hold": True,
+                "blind_zone_max_coast": self.blind_zone_max_coast}
+               if self.blind_zone_hold else {}),
         }
 
     def _reach_excess(self, t, pos, det_corner, dt) -> float:
@@ -525,12 +548,24 @@ class FieldTracker:
                 continue
             occ = occlusion.get(t.slot_id, {}).get("view_occluded", False)
             budget = self.max_occ if occ else self.max_open
+            blind = (self.blind_zone_hold and occ
+                     and bool(occlusion.get(t.slot_id, {}).get("blind", False)))
+            if blind and self.blind_zone_max_coast > 0:
+                budget = self.blind_zone_max_coast
             if t.missed > 0:
                 t.coasting = True
                 if occ:
                     t.occ_coasting = True
+                if self.blind_zone_hold:
+                    if blind and not t.blind_coasting:
+                        self.slot_events.append({
+                            "event": "blind_hold", "slot_id": t.slot_id,
+                            "missed": int(t.missed),
+                            "pos": t.kf.pos if t.kf is not None else None})
+                    t.blind_coasting = blind
                 if t.kf is not None:
-                    t.kf.decay_velocity(self.coast_vel_decay)
+                    # A blind hold parks the slot: zero velocity, no drift.
+                    t.kf.decay_velocity(0.0 if blind else self.coast_vel_decay)
             if t.missed > budget:
                 self._expire(t)
 
@@ -710,6 +745,7 @@ class FieldTracker:
                     slot.hits += 1
                     slot.coasting = False
                     slot.occ_coasting = False
+                    slot.blind_coasting = False
                     self.last_det_to_slot[orig_idx] = slot.slot_id
                     self.binding_events.append({
                         "event": "slot_rebound",
@@ -771,6 +807,16 @@ class FieldTracker:
                             in_gate = True
                             dist = d_portal + 0.5   # small penalty vs direct matches
                             portal_pairs.add((i, j))
+                    if (in_gate and t.blind_coasting and self.blind_zone is not None
+                            and self.blind_zone.distance_m(d.pos) > self.gate):
+                        # blind_zone_hold: a held slot's robot re-emerges from
+                        # the blind zone; a detection farther than gate_m from
+                        # the zone is a different robot.
+                        self.slot_events.append({
+                            "event": "blind_emerge_reject", "slot_id": t.slot_id,
+                            "missed": int(t.missed), "det_idx": int(idxs[j]),
+                            "zone_dist_m": round(self.blind_zone.distance_m(d.pos), 2)})
+                        continue
                     if in_gate:
                         if self._kin_violates(t, d, dt):
                             # Implied speed exceeds the physical cap: leave
@@ -843,6 +889,7 @@ class FieldTracker:
                     t.hits += 1
                     t.coasting = False
                     t.occ_coasting = False
+                    t.blind_coasting = False
                     matched_slot_indices.add(r)
                     matched_det_indices.add(c)
                     self.last_det_to_slot[idxs[c]] = t.slot_id
@@ -966,6 +1013,7 @@ class FieldTracker:
         t.box = None
         t.coasting = False
         t.occ_coasting = False
+        t.blind_coasting = False
         tids_to_del = [tid for tid, sid in self._id_to_slot.items() if sid == t.slot_id]
         for tid in tids_to_del:
             del self._id_to_slot[tid]

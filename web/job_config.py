@@ -1223,6 +1223,39 @@ KNOBS = [
          min=1.0, max=60.0, section="Fusion & field position"),
     Knob("colourless_stationary_span_m", "COLOURLESS_STATIONARY_SPAN_M", float,
          1.0, min=0.1, max=5.0, section="Fusion & field position"),
+    # blind_zone_coast: at tracking start, compute the field cells NO camera
+    # can usefully see from the calibrations (web/field/blind_zone.py: robot
+    # ground point inside the view inset by blind_zone_margin_px (and, with
+    # blind_zone_top_probe_m > 0, a point that far up too), depth/lens-fold
+    # checks, overlay masks, SAM top crop; non-main views also need >=
+    # blind_corner_min_range_m ground range). Why: some events' main views cut off the near corners and the
+    # 2026 corner cams sit ~0.6-0.9 m outside those corners, so a robot that
+    # drives into the gap is lost by every camera and its slot expired after
+    # max_coast_open updates. With the knob a slot within blind_zone_margin_m
+    # of a camera's dead area is occluded FOR THAT CAMERA (the ALL-cameras
+    # merge then occludes a slot no camera sees); the tracker holds such a
+    # slot in place (no velocity drift) for blind_zone_max_coast updates
+    # (0 = max_coast_occluded) and lets it re-acquire only detections within
+    # gate_m of the zone. Zone logged at job start + replay summary
+    # "blind_zone". blind_corner_min_range_m 3.0: under det_frac_backstop
+    # "always" a 0.6 m-tall robot spans > 50% of the 337-377 px 2026 corner
+    # tile height until ~3.0 m (measured on 2026cur/casnd/hop calibrations).
+    # margin_px 0 / top probe 0: hand GT marks robots "visible" with their
+    # ground point 1-30 px inside main's side edges (2026cur_qm8: 10 px + a
+    # 0.4 m probe put 779 GT-visible keyframes in the zone; 0 px, no probe 61).
+    # DEFAULT OFF pending live A/B.
+    Knob("blind_zone_coast", "BLIND_ZONE_COAST", bool, False,
+         section="Fusion & field position"),
+    Knob("blind_corner_min_range_m", "BLIND_CORNER_MIN_RANGE_M", float, 3.0,
+         min=0.0, max=10.0, section="Fusion & field position"),
+    Knob("blind_zone_margin_px", "BLIND_ZONE_MARGIN_PX", float, 0.0,
+         min=-100.0, max=200.0, section="Fusion & field position"),
+    Knob("blind_zone_top_probe_m", "BLIND_ZONE_TOP_PROBE_M", float, 0.0,
+         min=0.0, max=1.5, section="Fusion & field position"),
+    Knob("blind_zone_margin_m", "BLIND_ZONE_MARGIN_M", float, 0.3,
+         min=0.0, max=2.0, section="Fusion & field position"),
+    Knob("blind_zone_max_coast", "BLIND_ZONE_MAX_COAST", int, 0,
+         min=0, max=3000, section="Fusion & field position"),
     # bumper_color_read: re-read each main-backed tracker input's bumper colour
     # from the main-view pixels every frame (web/field/bumper_colour.py: push
     # pos 0.475 m from the camera to the robot centre, project a 0.95 m square

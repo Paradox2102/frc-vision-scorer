@@ -238,20 +238,34 @@ def _bumper_region(box):
     return (x1, y1 + 0.6 * h, x2, y2)
 
 
-def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
+def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5,
+                      out_of_view=None):
     """tracks: list of {slot_id, pos:(x,y), box:(x1,y1,x2,y2)}.
     Returns {slot_id: {view_occluded, bumper_occluded, cause}}.
 
     robot_h is reserved for future 3-D hub occlusion; the current 2-D shadow
     model inside occluded_by_hub does not use robot height.
+
+    out_of_view (blind_zone_coast knob; None = off, output unchanged): a
+    callable pos -> bool, True when this camera cannot usefully see a robot at
+    pos (web.field.blind_zone). Such a slot is view-occluded for this camera
+    (cause "blind" unless a real occluder is found too) and its entry carries
+    "out_of_view": True, so _merge_occlusion's ALL-cameras rule marks a slot no
+    camera can see as occluded. It never sets bumper_occluded (real occluders
+    only: VLM read gating is unchanged) and it applies to box-less coasting
+    tracks too. With the callable given, every entry has "out_of_view".
     """
     cc = cam.camera_center
     out = {}
     tdist = {t["slot_id"]: camera_distance(cc, t["pos"]) for t in tracks}
     for t in tracks:
         sid = t["slot_id"]; box = t["box"]; view = False; bump = False; cause = None
+        oov = bool(out_of_view(t["pos"])) if out_of_view is not None else None
         if box is None:   # coasting track with no projected box -> nothing to test
             out[sid] = {"view_occluded": False, "bumper_occluded": False, "cause": None}
+            if oov is not None:
+                out[sid].update(view_occluded=oov, cause="blind" if oov else None,
+                                out_of_view=oov)
             continue
         area = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
         bregion = _bumper_region(box)
@@ -274,6 +288,11 @@ def resolve_occlusion(cam, tracks, person_boxes, hub_prisms, robot_h=0.5):
                 if box_overlap(bregion, o["box"]) / barea > 0.3:
                     bump = True; cause = cause or "robot"
         out[sid] = {"view_occluded": view, "bumper_occluded": bump or view, "cause": cause}
+        if oov is not None:
+            out[sid]["out_of_view"] = oov
+            if oov:
+                out[sid]["view_occluded"] = True
+                out[sid]["cause"] = cause or "blind"
     return out
 
 
@@ -293,4 +312,14 @@ def _merge_occlusion(per_cam):
         bump = all(e["bumper_occluded"] for e in entries) if entries else False
         cause = next((e["cause"] for e in entries if e.get("cause")), None)
         out[sid] = {"view_occluded": view, "bumper_occluded": bump, "cause": cause}
+        if any("out_of_view" in e for e in entries):
+            # blind_zone_coast: "blind" = out of every camera's useful view.
+            # A real occluder's cause ("hub" feeds the occlusion portals)
+            # wins over "blind" whenever one camera reported one.
+            out[sid]["blind"] = bool(entries) and all(
+                e.get("out_of_view", False) for e in entries)
+            if cause == "blind":
+                out[sid]["cause"] = next(
+                    (e["cause"] for e in entries
+                     if e.get("cause") and e["cause"] != "blind"), "blind")
     return out

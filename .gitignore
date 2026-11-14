@@ -178,4 +178,5 @@ deploy/runpod/.state.json
 deploy/runpod/.state.*.json
 deploy/runpod/.known_hosts_*
 deploy/runpod/tune_results/
+deploy/runpod/.swarm/
 data/runpod_pull/

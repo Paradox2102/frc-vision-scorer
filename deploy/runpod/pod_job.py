@@ -14,6 +14,10 @@ local CLI can poll it. Wall times:
   wall_final_s  submit -> replay row + meta.json carry the window_labels summary
                 (the finalize relabel stage, default ON, runs after "complete";
                 this is when the match's labelled result actually exists)
+If the websocket drops before "complete" (seen Nov 13 with 2 concurrent jobs)
+the job keeps running on the server, so the driver keeps waiting for the
+final replay (up to --final-timeout) instead of failing; wall_job_s is then
+None and ws_status "closed".
 Peak VRAM is the max of ``nvidia-smi memory.used`` sampled every 2 s from
 submit to wall_final (whole card: includes the idle server's resident models).
 
@@ -124,6 +128,16 @@ def final_ready(job_id: str, want_window_labels: bool) -> bool:
     return "window_labels" in summary
 
 
+def wait_final(job_id: str, want_window_labels: bool, timeout: float, poll_s: float = 2.0) -> bool:
+    """Poll final_ready() until it holds or ``timeout`` seconds pass."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if final_ready(job_id, want_window_labels):
+            return True
+        time.sleep(poll_s)
+    return final_ready(job_id, want_window_labels)
+
+
 async def drive(host: str, job_id: str, rec: Recorder) -> str:
     import websockets  # app venv
     saw_complete = False
@@ -223,17 +237,24 @@ def main() -> int:
         rec.update(status="running", job_id=job_id, t_submit=t0)
         status = asyncio.run(drive(a.host, job_id, rec))
         wall_job = time.time() - t0
-        rec.update(status="finalizing" if status == "completed" else "error",
-                   ws_status=status, wall_job_s=round(wall_job, 1),
-                   peak_vram_mib=sampler.peak)
-        if status != "completed":
+        # "closed": the websocket dropped before "complete" but the job keeps
+        # running on the server (seen Nov 13 with 2 concurrent jobs). Keep
+        # waiting for its replay below (up to --final-timeout) instead of
+        # failing a job that is still working; wall_job_s is then unknown.
+        ok = status in ("completed", "closed")
+        rec.update(status="finalizing" if ok else "error",
+                   ws_status=status, wall_job_s=round(wall_job, 1) if status == "completed" else None,
+                   peak_vram_mib=sampler.peak,
+                   **({"message": "websocket closed; job still running, waiting for its replay"}
+                      if status == "closed" else {}))
+        if not ok:
             sampler.stop()
             final(status="error", error=rec.data.get("error") or f"job ended: {status}")
             return 1
         want_wl = bool(cfg.get("window_labels", True))
-        deadline = time.time() + a.final_timeout
-        while time.time() < deadline and not final_ready(job_id, want_wl):
-            time.sleep(2)
+        if not wait_final(job_id, want_wl, a.final_timeout):
+            if status == "closed":
+                rec.update(error=f"websocket closed and no final replay after {a.final_timeout:.0f}s")
         sampler.stop()
         ready = final_ready(job_id, want_wl)
         row = replay_row(job_id) or {}
@@ -250,7 +271,8 @@ def main() -> int:
             pass
         final(
             status="done" if ready else "error",
-            error=None if ready else f"replay not final after {a.final_timeout:.0f}s",
+            error=None if ready else (rec.data.get("error")
+                                      or f"replay not final after {a.final_timeout:.0f}s"),
             wall_final_s=round(time.time() - t0, 1) if ready else None,
             peak_vram_mib=sampler.peak, vram_samples=sampler.n,
             timings=timings,

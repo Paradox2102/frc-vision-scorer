@@ -14,6 +14,7 @@ See deploy/runpod/README.md for the weekend runbook.
     runpod_cli.py secrets                      # re-prompt + install pod .env
     runpod_cli.py pull                         # DB + replays -> data/runpod_pull/<podId>/
     runpod_cli.py stop | terminate             # typed confirmation
+    runpod_cli.py swarm <up|plan|run|status|pull|import|stop|terminate> --name N   # many pods (swarm.py)
 
 State (pod id, ssh endpoint) lives in deploy/runpod/.state.json (gitignored).
 Secrets go to the pod ONLY over ssh into /workspace/frc/.env (chmod 600) —
@@ -43,6 +44,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
+# `python runpod_cli.py` runs this file as __main__; swarm.py does
+# `import runpod_cli`, which must get THIS module, not a second copy.
+sys.modules.setdefault("runpod_cli", sys.modules[__name__])
 import profiles  # noqa: E402
 import profiling  # noqa: E402
 
@@ -551,7 +555,10 @@ def ssh_out(st: dict, remote: str, timeout: float = 120, check: bool = True) -> 
     return r.stdout.decode(errors="replace")
 
 
-def refresh_endpoint(st: dict) -> dict:
+def refresh_endpoint(st: dict, save=None) -> dict:
+    """Refresh status/cost/ssh endpoint from the API into ``st``. ``save``
+    persists ``st`` (default: the single-pod .state.json; swarm members pass
+    their own callback so they never touch it)."""
     pod = get_pod(st["pod_id"])
     st["desired_status"] = pod.get("desiredStatus")
     st["cost_per_hr"] = pod.get("adjustedCostPerHr") or pod.get("costPerHr")
@@ -559,22 +566,27 @@ def refresh_endpoint(st: dict) -> dict:
     ip, port = pod.get("publicIp"), (pod.get("portMappings") or {}).get("22")
     if ip and port:
         st["ssh_host"], st["ssh_port"] = ip, int(port)
-    save_state(st)
+    if save is None:
+        save_state(st)
+    else:
+        save(st)
     return pod
 
 
-def wait_for_ssh(st: dict, timeout_s: float = 900) -> None:
+def wait_for_ssh(st: dict, timeout_s: float = 900, *, save=None, out=None) -> None:
+    """``save``: see refresh_endpoint. ``out``: progress lines (default print)."""
+    out = out or (lambda m: print(m, flush=True))
     t0 = time.time()
     while time.time() - t0 < timeout_s:
-        pod = refresh_endpoint(st)
+        pod = refresh_endpoint(st, save=save)
         if st.get("ssh_host"):
             r = subprocess.run(ssh_base(st) + ["echo ok"], capture_output=True, timeout=40)
             if r.returncode == 0 and b"ok" in r.stdout:
-                print(f"ssh ready: root@{st['ssh_host']} -p {st['ssh_port']} "
-                      f"({time.time() - t0:.0f}s)")
+                out(f"ssh ready: root@{st['ssh_host']} -p {st['ssh_port']} "
+                    f"({time.time() - t0:.0f}s)")
                 return
-        print(f"  waiting for pod/ssh... status={pod.get('desiredStatus')} "
-              f"ip={pod.get('publicIp') or '-'} ({time.time() - t0:.0f}s)", flush=True)
+        out(f"  waiting for pod/ssh... status={pod.get('desiredStatus')} "
+            f"ip={pod.get('publicIp') or '-'} ({time.time() - t0:.0f}s)")
         time.sleep(10)
     raise SystemExit("ssh not ready in time — see README troubleshooting (`status`, RunPod console logs)")
 
@@ -617,8 +629,17 @@ def confirm(prompt: str, word: str) -> bool:
 # --------------------------------------------------------------------------
 def push_bundle(st: dict, plan: BundlePlan, scratch: Path, *, replace_code: bool) -> None:
     tar_path = scratch / "bundle.tar"
-    size = write_bundle(plan, tar_path)
-    print(f"shipping {fmt_mb(size)} -> {POD_APP} ...", flush=True)
+    write_bundle(plan, tar_path)
+    push_tar(st, tar_path, replace_code=replace_code)
+    tar_path.unlink(missing_ok=True)
+
+
+def push_tar(st: dict, tar_path: Path, *, replace_code: bool, out=None) -> None:
+    """Extract an already-written bundle tarball into POD_APP. Only reads
+    ``tar_path``, so one tarball can be shipped to many pods at once."""
+    out = out or (lambda m: print(m, flush=True))
+    size = Path(tar_path).stat().st_size
+    out(f"shipping {fmt_mb(size)} -> {POD_APP} ...")
     clear = ""
     if replace_code:
         # remove tracked-code dirs first so files deleted upstream don't linger;
@@ -630,27 +651,29 @@ def push_bundle(st: dict, plan: BundlePlan, scratch: Path, *, replace_code: bool
     t0 = time.time()
     with open(tar_path, "rb") as f:
         ssh_run(st, f"mkdir -p {POD_APP} && {clear}tar -xf - -C {POD_APP} --no-same-owner", stdin_file=f)
-    print(f"  shipped in {time.time() - t0:.0f}s")
-    tar_path.unlink(missing_ok=True)
+    out(f"  shipped in {time.time() - t0:.0f}s")
 
 
-def run_bootstrap(st: dict, poll_s: float = 10) -> None:
+def run_bootstrap(st: dict, poll_s: float = 10, *, boot_args: str = "", out=None) -> None:
     """Run bootstrap.sh DETACHED on the pod (a dropped ssh session must not
-    kill a half-done venv install) and stream its log until it exits."""
+    kill a half-done venv install) and stream its log until it exits.
+    ``boot_args``: bootstrap.sh flags (swarm members pass "--no-vllm")."""
+    out = out or (lambda m: print(m, flush=True))
     log = f"{POD_WS}/logs/bootstrap.log"
+    extra = f" {boot_args.strip()}" if boot_args and boot_args.strip() else ""
     ssh_run(st, f"mkdir -p {POD_WS}/logs && : > {log} && setsid -f nohup bash -c "
-                f"'bash {POD_APP}/deploy/runpod/bootstrap.sh; echo BOOTSTRAP_EXIT=$?' "
+                f"'bash {POD_APP}/deploy/runpod/bootstrap.sh{extra}; echo BOOTSTRAP_EXIT=$?' "
                 f">> {log} 2>&1 < /dev/null")
     seen = 0
     while True:
         time.sleep(poll_s)
         try:
-            out = ssh_out(st, f"tail -n +{seen + 1} {log}", check=False, timeout=60)
+            text = ssh_out(st, f"tail -n +{seen + 1} {log}", check=False, timeout=60)
         except subprocess.TimeoutExpired:
             continue
-        lines = out.splitlines()
+        lines = text.splitlines()
         for ln in lines:
-            print("  | " + ln, flush=True)
+            out("  | " + ln)
         seen += len(lines)
         done = [ln for ln in lines if ln.startswith("BOOTSTRAP_EXIT=")]
         if done:
@@ -661,12 +684,12 @@ def run_bootstrap(st: dict, poll_s: float = 10) -> None:
             return
 
 
-def install_secrets(st: dict, secrets: dict) -> None:
+def install_secrets(st: dict, secrets: dict, out=print) -> None:
     text = render_dotenv(secrets).encode()
     ssh_run(st, f"umask 077 && mkdir -p {POD_APP} && cat > {POD_APP}/.env.tmp && "
                 f"mv {POD_APP}/.env.tmp {POD_APP}/.env && chmod 600 {POD_APP}/.env",
             input_bytes=text)
-    print("installed pod .env: " + ", ".join(f"{k}={mask(v)}" for k, v in sorted(secrets.items())))
+    out("installed pod .env: " + ", ".join(f"{k}={mask(v)}" for k, v in sorted(secrets.items())))
 
 
 def gather_secrets(args) -> dict:
@@ -1090,16 +1113,61 @@ def profile_report(target: str, pod_id: str | None) -> tuple[str, dict]:
     return name, prof
 
 
+def ensure_remote_file(st: dict, local: Path, remote: str, *, out=None, what: str = "file") -> bool:
+    """Upload ``local`` to ``remote`` (``.part`` + mv) unless a file of the
+    same size is already there. Returns True when it uploaded."""
+    out = out or (lambda m: print(m, flush=True))
+    local = Path(local)
+    size = local.stat().st_size
+    have = ssh_out(st, f"stat -c %s {remote} 2>/dev/null || echo 0", check=False).strip()
+    if have == str(size):
+        return False
+    out(f"uploading {what} {local.name} ({fmt_mb(size)}) -> {remote}")
+    parent = remote.rsplit("/", 1)[0]
+    with open(local, "rb") as f:
+        ssh_run(st, f"mkdir -p {parent} && cat > {remote}.part && mv {remote}.part {remote}",
+                stdin_file=f)
+    return True
+
+
 def ensure_test_video(st: dict, local_video: Path) -> str:
     remote = f"{POD_TUNE}/{TUNE_MATCH_KEY}.mp4"
-    size = local_video.stat().st_size
-    have = ssh_out(st, f"stat -c %s {remote} 2>/dev/null || echo 0", check=False).strip()
-    if have != str(size):
-        print(f"uploading test video {local_video.name} ({fmt_mb(size)}) -> {remote}", flush=True)
-        with open(local_video, "rb") as f:
-            ssh_run(st, f"mkdir -p {POD_TUNE} && cat > {remote}.part && mv {remote}.part {remote}",
-                    stdin_file=f)
+    ensure_remote_file(st, local_video, remote, what="test video")
     return remote
+
+
+def pod_job_command(*, video: str, match_key: str, event: str, label: str, config: dict,
+                    out: str, log: str, profile: bool = True, extra: str = "") -> str:
+    """Shell command that launches deploy/runpod/pod_job.py DETACHED on the pod.
+    setsid -f forks and returns at once; with a trailing `&` the list ran in a
+    background subshell that held ssh's stdout open, so ssh never returned
+    (Nov 12 R0 launch hit the 120 s timeout)."""
+    jobs_dir = out.rsplit("/", 1)[0]
+    return (f"mkdir -p {jobs_dir} && cd {POD_APP} && setsid -f nohup .venv/bin/python "
+            f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {shlex.quote(match_key)} "
+            f"--event {shlex.quote(event)} --label {shlex.quote(label)} "
+            f"--config-json {shlex.quote(json.dumps(config))} "
+            f"--host 127.0.0.1:{POD_PORT} {'' if profile else '--no-profile '}"
+            f"{extra.strip() + ' ' if extra and extra.strip() else ''}"
+            f"--out {out} > {log} 2>&1 < /dev/null; echo started")
+
+
+def read_remote_json(st: dict, path: str, timeout: float = 120) -> dict | None:
+    """The JSON file at ``path`` on the pod; None when missing, empty or partial."""
+    cur = ssh_out(st, f"cat {path} 2>/dev/null || true", check=False, timeout=timeout).strip()
+    if not cur:
+        return None
+    try:
+        return json.loads(cur)
+    except ValueError:
+        return None
+
+
+def pod_job_alive(st: dict, state: dict | None) -> bool:
+    """Is the pod_job.py driver that wrote ``state`` still running?"""
+    if not state or state.get("status") in ("done", "error"):
+        return False
+    return ssh_run(st, f"kill -0 {int(state.get('pid', 0))} 2>/dev/null", check=False).returncode == 0
 
 
 def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 20,
@@ -1109,28 +1177,20 @@ def run_rung_remote(st: dict, rung: profiles.Rung, video: str, poll_s: float = 2
     pod-side driver also runs py-spy + nvidia-smi for the job's lifetime
     (profiling.JobProfiler) and the result carries a ``profile`` summary."""
     out = f"{POD_TUNE}/jobs/{rung.name}.json"
-    cur = ssh_out(st, f"cat {out} 2>/dev/null || true", check=False).strip()
-    state = json.loads(cur) if cur else None
-    alive = False
-    if state and state.get("status") not in ("done", "error"):
-        alive = ssh_run(st, f"kill -0 {int(state.get('pid', 0))} 2>/dev/null", check=False).returncode == 0
+    state = read_remote_json(st, out)
+    alive = pod_job_alive(st, state)
     if state and state.get("status") == "done":
         return state
     if not alive:
         jid = remote_job_active(st)
         if jid:
             raise SystemExit(f"pod is busy with job {jid}; tune waits for an idle server")
-        cfg = json.dumps(rung.config())
-        # setsid -f forks and returns at once; with a trailing `&` the list
-        # ran in a background subshell that held ssh's stdout open, so ssh
-        # never returned (Nov 12 R0 launch hit the 120 s timeout).
-        launch = (f"mkdir -p {POD_TUNE}/jobs && cd {POD_APP} && setsid -f nohup .venv/bin/python "
-                  f"deploy/runpod/pod_job.py --video {shlex.quote(video)} --match-key {TUNE_MATCH_KEY} "
-                  f"--event {TUNE_EVENT} --label {rung.name} --config-json {shlex.quote(cfg)} "
-                  f"--host 127.0.0.1:{POD_PORT} {'' if profile else '--no-profile '}"
-                  f"--out {out} > {POD_TUNE}/jobs/{rung.name}.log 2>&1 < /dev/null; echo started")
+        cfg = rung.config()
+        launch = pod_job_command(video=video, match_key=TUNE_MATCH_KEY, event=TUNE_EVENT,
+                                 label=rung.name, config=cfg, out=out,
+                                 log=f"{POD_TUNE}/jobs/{rung.name}.log", profile=profile)
         ssh_out(st, f"rm -f {out}; " + launch)
-        print(f"  [{rung.name}] launched {cfg}", flush=True)
+        print(f"  [{rung.name}] launched {json.dumps(cfg)}", flush=True)
     else:
         print(f"  [{rung.name}] re-attached to running job {state.get('job_id')}", flush=True)
     t0 = time.time()
@@ -1417,8 +1477,17 @@ def pull_tune_files(st: dict, dest: Path) -> int:
 
 def cmd_pull(args) -> int:
     st = load_state()
-    pod_id = require_pod(st)
+    require_pod(st)
     refresh_endpoint(st)
+    pull_pod(st, args.with_video)
+    return 0
+
+
+def pull_pod(st: dict, with_video: bool = False, out=print) -> dict:
+    """Copy one pod's DB snapshot, new replays, event-state files and tune
+    results into data/runpod_pull/<podId>/ (never the local DB or
+    web/replays). Returns {"dest", "replays_on_pod", "new_replays"}."""
+    pod_id = st["pod_id"]
     dest = PULL_ROOT / pod_id
     dest.mkdir(parents=True, exist_ok=True)
     # 1. consistent DB snapshot on the pod, then copy
@@ -1427,13 +1496,13 @@ def cmd_pull(args) -> int:
     db_out = dest / "frc_scorer.db"
     with open(db_out, "wb") as f:
         subprocess.run(ssh_base(st) + ["cat /tmp/frc_pull.db && rm -f /tmp/frc_pull.db"], stdout=f, check=True)
-    print(f"DB -> {db_out} ({fmt_mb(db_out.stat().st_size)})")
+    out(f"DB -> {db_out} ({fmt_mb(db_out.stat().st_size)})")
     # 2. replays not pulled yet (+ event-state files: calibrations made at the event)
     rdir = dest / "web" / "replays"
     have = {p.name for p in rdir.iterdir() if (p / "meta.json").exists()} if rdir.exists() else set()
     listing = ssh_out(st, f"ls {POD_APP}/web/replays 2>/dev/null || true", check=False).split()
     new = [r for r in listing if r not in have]
-    excl = "" if args.with_video else "--exclude='*.mp4' "
+    excl = "" if with_video else "--exclude='*.mp4' "
     lst = f"{POD_WS}/.pull_list"
     names = "".join(f"web/replays/{r}\n" for r in new).encode()
     pattern = "^(" + "|".join(EVENT_STATE_PREFIXES) + r").*\.(json|jpg|png)$"
@@ -1451,15 +1520,15 @@ def cmd_pull(args) -> int:
     except tarfile.ReadError:
         pass  # nothing to pull
     p.wait()
-    print(f"replays: {len(new)} new ({len(listing)} on pod) -> {dest / 'web' / 'replays'}"
-          + ("" if args.with_video else " (HUD videos skipped; --with-video to include)"))
-    print(f"event state -> {dest / 'web' / 'uploads'}")
+    out(f"replays: {len(new)} new ({len(listing)} on pod) -> {dest / 'web' / 'replays'}"
+        + ("" if with_video else " (HUD videos skipped; --with-video to include)"))
+    out(f"event state -> {dest / 'web' / 'uploads'}")
     # 3. tune results: per-rung job JSON/log + raw profiles (<rung>.pyspy.txt,
     #    <rung>.pyspy.log, <rung>.gpu.csv) + host fingerprint (small; always re-copied)
     n = pull_tune_files(st, dest)
-    print(f"tune jobs/profiles: {n} files -> {dest / 'tune'}")
-    print("Local frc_scorer.db and web/replays were NOT touched.")
-    return 0
+    out(f"tune jobs/profiles: {n} files -> {dest / 'tune'}")
+    out("Local frc_scorer.db and web/replays were NOT touched.")
+    return {"dest": str(dest), "replays_on_pod": listing, "new_replays": new}
 
 
 def cmd_stop(args) -> int:
@@ -1612,6 +1681,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_stop)
     p = sub.add_parser("terminate", help="terminate the pod + volume (typed confirmation)")
     p.set_defaults(fn=cmd_terminate)
+
+    import swarm  # noqa: E402  (imports this module; see the sys.modules line at the top)
+    swarm.add_parser(sub)
     return ap
 
 

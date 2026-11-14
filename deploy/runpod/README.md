@@ -317,6 +317,115 @@ costs a 5 s sleep per job. That setting does not change output.
   `web/replays`. Scouting metrics are computed from replays, so pulling
   replays and the DB is enough.
 
+## Swarm: batch-process a past event
+
+One pod per job, many cheap pods. On Nov 13 an RTX PRO 6000 pod ran a full
+qm8 job in about 6-7.4 min with the GPU only ~27% busy and ~3.5 CPU cores in
+use. Two jobs in one server process gave only 1.2x. The pipeline is bound by
+serial Python, so a bigger GPU barely helps. To go faster, run more servers
+with one job each. `swarm` (`deploy/runpod/swarm.py`) drives N ordinary pods
+(same bundle, secrets and bootstrap as `up`) from one state file:
+`deploy/runpod/.swarm/<name>.json` (gitignored), with member logs in
+`deploy/runpod/.swarm/<name>/<podId>.log`. It never reads or writes the
+single-pod `.state.json`, so a weekend pod and a swarm can coexist.
+
+**GPU choice.** Cheap 48 GB cards are enough: L40S, RTX A6000, A40 and RTX 6000
+Ada, in that default priority (`--gpu` to override, repeatable). Each pod runs
+one job at a time, and the t48 tier has room for it. Ask for vCPUs
+(`--min-vcpu`, default 8), because the job's CPU work is the bottleneck.
+Members skip the ~9 GB vLLM reader venv (`bootstrap.sh --no-vllm`), since
+the production reader is Jev. Pass `--with-vllm` if you need it. The default
+volume is 80 GB: about 15 GB of venv and caches plus about 116 MB of video
+per match.
+
+**Cost math** (secure prices from the table above): 8 x A40 at $0.59/h =
+$4.72/h. An 80-match event at about 7 min per match is about 560 pod-minutes,
+so 8 pods take about 70 min plus about 15 min of bootstrap, about 1.4 h x
+$4.72 ≈ **$7**. One RTX PRO 6000 would take 9+ h ≈ $25. Bootstrap time
+is billed on every pod. `--terminate-when-done` stops each pod's billing as
+soon as it has nothing left to do.
+
+```bash
+rp swarm up --name cur --count 8 --dry-run --secrets-from-env  # bodies, bundle manifest, $/h; creates NOTHING
+rp swarm up --name cur --count 8 --secrets-from-env            # ONE "rent" prompt for all 8; parallel setup
+rp swarm plan --name cur --event 2026cur --download            # schedule order; videos fetched HERE (home IP)
+rp swarm run --name cur --terminate-when-done                  # dispatch; Ctrl-C and re-run re-attaches
+rp swarm status --name cur                                     # members, RunPod state, $ so far, progress
+rp swarm pull --name cur                                       # (only if not terminated by run)
+rp swarm import --name cur                                     # DRY RUN: what would be added locally
+rp swarm import --name cur --apply                             # backup DB, then merge (--render: HUD videos)
+rp swarm terminate --name cur                                  # whatever is left (refuses un-pulled pods)
+```
+
+* **up**: creates the pods and keeps the ones it got if some fail (no stock).
+  It builds the bundle once (code + weights + a snapshot of the local DB +
+  event state, the same as `up`) and gathers the secrets once. Then every
+  member, in parallel: wait for ssh, ship, install secrets, bootstrap. Re-running
+  resumes members that are not `ready`. `--count K` tops the swarm up to K
+  live pods and `--add K` grows it. The bundle is uploaded from this machine
+  once per pod (about 450 MB each).
+* **plan**: matches come from the local DB `matches` table in schedule order
+  (quals, then playoffs by set). `--matches` takes `all` (default), `qm`,
+  `playoffs`, `sf`, a key `qm8` / `sf1m1` / `f1m2`, a range `qm1-qm40`, or
+  a comma list of these. The video for a match is `<match_key>.mp4` from
+  `--videos DIR`, then `data/videos`, then `data/test_footage`. With
+  `--download`, missing videos are fetched via TBA video key + yt-dlp into
+  `data/videos/` (`--cache-dir`) **from this machine**: YouTube blocks
+  datacenter IPs as bots. A download can run while `swarm up` bootstraps.
+  Matches that already have a complete replay (local DB, a previous
+  `data/runpod_pull/*` pull, or this swarm's run) are skipped unless you pass
+  `--redo`.
+* **run**: each pod gets a **contiguous block** of the schedule. The app's
+  camera-move auto-recalibration and per-match corner calibration carry
+  state from one match to the next on a server, so round-robin would hurt.
+  An idle pod **steals** the tail half of the largest remaining block, or
+  all of a dead pod's block. A failed match is retried once, on another pod
+  if there is one. Per pod, the run uploads the video to
+  `/workspace/batch/videos/` (skipped if the same size is already there),
+  launches `pod_job.py` detached exactly like `tune` (out
+  `/workspace/batch/jobs/<match_key>.json`, no profiler), and uploads the
+  pod's next video while the job runs. `--config-json` sets knobs for every
+  job. `--pod-config POD_ID=JSON` overrides knobs on one pod, for example
+  for a quality sweep. With `--terminate-when-done`, a pod with nothing left
+  to do and nothing to steal is pulled and then terminated (the flag is the
+  confirmation). The assignment is a policy object (`--policy blocks`;
+  `initial` / `place` / `pick` in `swarm.py`). A run can also grow while it
+  is going (`swarm.add_items`, `run["open"]`), so a live staggered policy
+  with a TBA arrival poller can plug in without changing the run loop.
+* **pull**: `pull` for every member, in parallel, into the usual
+  `data/runpod_pull/<podId>/`. It records which run jobs each pull covered.
+* **import**: merges the pulled replays into the local app. The default is a
+  dry run. `--apply` refuses while local :8004 reports an active job. It
+  backs up `frc_scorer.db` to `frc_scorer.db.bak-swarm-<name>-<time>` first,
+  then copies each replay dir to `web/replays/<id>/` and inserts its rows in
+  one transaction. Rows come from `replays` plus every per-job table a job
+  writes: `match_robot_identity`, `match_robot_crop`,
+  `match_robot_identity_segment`, `match_robot_binding`,
+  `appearance_gallery` and `replay_slot_corrections`. Paths are rewritten to
+  the local layout, and the source video points at the local copy. An id
+  that already exists is never overwritten (skipped and reported).
+  `event_anchors` (event_lineup knob, off by default; tiles not pulled) is
+  only reported. HUD mp4s are not pulled by default. An imported replay
+  without one is set to `render_status=queued`, so the local server renders
+  it from the local video (restart :8004, or pass `--render`). Calibration
+  and event-state files from the pods are **not** merged: import lists the
+  ones that differ from local.
+* **stop / terminate**: one typed confirmation for every member (`stop swarm
+  <name>`, `terminate swarm <name>`). `terminate` refuses a member whose last
+  finished job is not covered by a pull, or which still has a job running,
+  unless you pass `--force`.
+
+Caveats:
+
+* Each pod's calibration state is independent. Each pod starts from the
+  local event state, and calibrations it re-solves (camera moved) stay on
+  that pod.
+* The upload bandwidth from this machine is shared by all pods: the bundle
+  once per pod, then about 116 MB per match.
+* **Untested on a real swarm yet.** The dispatcher, import and plan are
+  unit-tested offline with fakes. The first real run should be small
+  (`--count 2 --matches qm1-qm6`).
+
 ## 6. Shut down
 
 ```bash

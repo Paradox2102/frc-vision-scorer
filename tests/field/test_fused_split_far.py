@@ -239,14 +239,16 @@ def test_end_to_end_assign_then_merge_keeps_far_robot():
 
 # ---- knob wiring ------------------------------------------------------------
 
-def test_knob_default_off_and_wired(monkeypatch):
+def test_knob_default_on_and_wired(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     from web.app import InferenceJob
     cfg = JobConfig()
-    assert cfg.fused_split_far is False and cfg.fused_split_far_m == 2.5
+    assert cfg.fused_split_far is True and cfg.fused_split_far_m == 2.5
     job = InferenceJob.__new__(InferenceJob)
     job.config = cfg
+    assert InferenceJob._build_fused_registry(job).split_far_m == 2.5
+    job.config = JobConfig({"fused_split_far": "false"})
     assert InferenceJob._build_fused_registry(job).split_far_m == 0.0
     job.config = JobConfig({"fused_split_far": "true"})
     assert InferenceJob._build_fused_registry(job).split_far_m == 2.5

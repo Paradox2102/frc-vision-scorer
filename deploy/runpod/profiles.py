@@ -73,9 +73,6 @@ REPO_DEFAULTS = {
 BASE_ENV = {
     # web/start_all.sh parity
     "TEAM_READER": "jev",
-    "SAM3_DARK_REANCHOR_ENABLED": "0",
-    "SAM3_EVICT_DARK_FRAMES": "99999",
-    "SAM3_EVICT_MIN_ABSENCES": "99",
     # no vLLM on the pod (see module docstring)
     "VLLM_PHASE_EXCLUSIVE": "0",
     # Finished jobs kept in the server's in-memory `jobs` dict (web/app.py).

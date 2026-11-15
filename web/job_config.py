@@ -1104,8 +1104,10 @@ KNOBS = [
     # 0.6 m (isotropic) / 1.0 m cross-ray; 2.5 m clears a bad corner read with
     # margin, matches sticky_max_dist_m (the tracker's own "too far to be the
     # same robot" gate) and sits below the observed absorptions (median 4.8 m).
-    # DEFAULT OFF pending live A/B. See fusion.py / fused_track_id.py.
-    Knob("fused_split_far", "FUSED_SPLIT_FAR", bool, False,
+    # DEFAULT ON (Nov 14 2026 live A/B, 4 hand-GT matches, R1: cov 85.8->86.6,
+    # misID 8.6->7.6 s, wrong flat; full-SAM3 2025hop_qm2 cov 79->83, labels
+    # right 71->76). See fusion.py / fused_track_id.py.
+    Knob("fused_split_far", "FUSED_SPLIT_FAR", bool, True,
          section="Fusion & field position"),
     Knob("fused_split_far_m", "FUSED_SPLIT_FAR_M", float, 2.5, min=0.5,
          max=20.0, section="Fusion & field position"),
@@ -1266,8 +1268,10 @@ KNOBS = [
     # margin_px 0 / top probe 0: hand GT marks robots "visible" with their
     # ground point 1-30 px inside main's side edges (2026cur_qm8: 10 px + a
     # 0.4 m probe put 779 GT-visible keyframes in the zone; 0 px, no probe 61).
-    # DEFAULT OFF pending live A/B.
-    Knob("blind_zone_coast", "BLIND_ZONE_COAST", bool, False,
+    # DEFAULT ON (Nov 14 2026 live A/B, 4 hand-GT matches, R1: cov 85.8->86.5,
+    # GT-"estimated" (robot unseen) coverage 48.9->52.0, casnd 50->63; wrong /
+    # misID flat).
+    Knob("blind_zone_coast", "BLIND_ZONE_COAST", bool, True,
          section="Fusion & field position"),
     Knob("blind_corner_min_range_m", "BLIND_CORNER_MIN_RANGE_M", float, 3.0,
          min=0.0, max=10.0, section="Fusion & field position"),

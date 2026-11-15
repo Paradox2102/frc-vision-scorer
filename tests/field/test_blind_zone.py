@@ -292,7 +292,7 @@ def test_job_knob_off_is_a_noop_and_on_records_zone(monkeypatch):
     import web.app as app_mod
     from web.job_config import JobConfig
     job = app_mod.InferenceJob.__new__(app_mod.InferenceJob)
-    job.config = JobConfig({})
+    job.config = JobConfig({"blind_zone_coast": False})
     job.field_tracker = FieldTracker(DIMS[0])
     job.field_dims = DIMS
     job.views = list(VIEWS)

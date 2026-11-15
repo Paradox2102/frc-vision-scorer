@@ -24,15 +24,8 @@ PROJECT_ROOT="$(pwd)"
 
 export TEAM_READER="${TEAM_READER:-jev}"
 
-# 2026-06-11 whole-card OOM containment: full-card SAM3 runs OOM'd at ~21GB
-# even with the dark-reanchor attempt cap, while the previous day's runs
-# (same matches, no dark-reanchor / no aggressive eviction / no
-# expandable_segments) were clean. Until the instrumented chunk-VRAM logs
-# attribute the growth, run yesterday's known-good behavior profile. The
-# features stay in the tree and re-enable per job via config_json for
-# A/B-ing the leak. (A caller's legacy SAM2_* name is still honoured.)
-export SAM3_DARK_REANCHOR_ENABLED="${SAM3_DARK_REANCHOR_ENABLED:-${SAM2_DARK_REANCHOR_ENABLED:-0}}"
-export SAM3_EVICT_DARK_FRAMES="${SAM3_EVICT_DARK_FRAMES:-${SAM2_EVICT_DARK_FRAMES:-99999}}"
-export SAM3_EVICT_MIN_ABSENCES="${SAM3_EVICT_MIN_ABSENCES:-${SAM2_EVICT_MIN_ABSENCES:-99}}"
+# Dark re-anchor / dark eviction run on their job_config defaults again
+# (June 11 2026 OOM containment lifted Nov 14 2026: the cause was the
+# per-job VRAM leak fixed Nov 13; live A/B peak 12.7 GB on a 24 GB card).
 
 "$PROJECT_ROOT/web/start.sh"

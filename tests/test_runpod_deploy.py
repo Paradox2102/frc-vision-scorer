@@ -56,8 +56,7 @@ def test_knob_env_matches_job_config_registry():
         assert by_name[name].default == profiles.REPO_DEFAULTS[name], name
     # every BASE_ENV knob var is a real knob env (except TEAM_READER's own knob, also real)
     envs = {k.env for k in KNOBS}
-    for var in ("VLLM_PHASE_EXCLUSIVE", "TEAM_READER", "SAM3_DARK_REANCHOR_ENABLED",
-                "SAM3_EVICT_DARK_FRAMES", "SAM3_EVICT_MIN_ABSENCES"):
+    for var in ("VLLM_PHASE_EXCLUSIVE", "TEAM_READER"):
         assert var in envs and var in profiles.BASE_ENV
 
 

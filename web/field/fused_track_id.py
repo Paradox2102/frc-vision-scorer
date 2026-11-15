@@ -46,6 +46,17 @@ the two ids together). ``split_off`` is the merge-time safety net for residual
 same-id groups. Stats: key_unbound_far (keys), split_far (observations split
 off at merge); ``last_frame_split`` holds this frame's counts.
 
+Evidence order (``evidence_input_order``, job knob
+``fused_evidence_input_order``, default OFF): ``assign`` resolves observations
+pass by pass (direct key matches, then appearance relinks / new-with-embedding,
+then new-without-embedding) and legacy-returns the evidence list in that PASS
+order, while its callers (merge_same_id_observations,
+InferenceJob._sync_identity_registry_frame) index it by input position — so on
+any frame where a new / relinked cluster precedes a continued one, evidence is
+paired with the wrong fused observation. ON returns it in input order (each
+entry is that observation's own ``relink_evidence``). Ids and registry state
+are identical either way; only the returned list's order changes.
+
 Pure: no torch / SAM / cv2 imports."""
 from __future__ import annotations
 import numpy as np
@@ -65,7 +76,8 @@ class FusedAssignmentEvidence:
 class FusedTrackRegistry:
     def __init__(self, app_floor: float = 0.55, ema_alpha: float = 0.3,
                  relink_max_dist_m: float = 0.0, per_cam_relink: bool = False,
-                 split_far_m: float = 0.0) -> None:
+                 split_far_m: float = 0.0,
+                 evidence_input_order: bool = False) -> None:
         # member key (camera, per_camera_id) -> fused id
         self._key_to_id: dict[tuple, int] = {}
         self._next_id = 0
@@ -99,6 +111,9 @@ class FusedTrackRegistry:
         # This frame's far-split counts (reset by assign): keys unbound in the
         # pre-pass, observations split off by split_off (merge safety net).
         self.last_frame_split = {"unbound": 0, "split": 0}
+        # Evidence order (module docstring): True = assign returns evidence
+        # index-aligned to its input; False = legacy pass order.
+        self.evidence_input_order = bool(evidence_input_order)
 
     def _claim_owner(self, fused_id: int, idxs: list, observations: list) -> int:
         """Owner among the observations claiming ``fused_id`` this frame: the
@@ -272,7 +287,10 @@ class FusedTrackRegistry:
     def assign(self, observations: list) -> list[FusedAssignmentEvidence]:
         """Stamp a stable ``track_id`` onto each FusedObservation (and its
         ``detection``), mutating in place. Call once per frame, in order.
-        Returns a list of FusedAssignmentEvidence corresponding to each observation."""
+        Returns a list of FusedAssignmentEvidence: index-aligned to
+        ``observations`` when ``evidence_input_order`` is on, else (legacy) in
+        pass order — direct matches, relinked / new-with-embedding,
+        new-without-embedding (module docstring)."""
         active_ids_this_frame = set()
         evidence_list = []
         if self.split_far_m > 0:
@@ -533,4 +551,8 @@ class FusedTrackRegistry:
                 self._id_to_pos[obs.track_id] = (float(obs.detection.pos[0]),
                                                  float(obs.detection.pos[1]))
 
+        if self.evidence_input_order:
+            # Every pass stamped obs.relink_evidence; read them back in input
+            # order so callers can pair evidence[i] with observations[i].
+            return [obs.relink_evidence for obs in observations]
         return evidence_list

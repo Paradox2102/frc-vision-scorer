@@ -1111,6 +1111,17 @@ KNOBS = [
          section="Fusion & field position"),
     Knob("fused_split_far_m", "FUSED_SPLIT_FAR_M", float, 2.5, min=0.5,
          max=20.0, section="Fusion & field position"),
+    # FusedTrackRegistry.assign returns per-observation assignment evidence in
+    # PASS order (direct key matches, then appearance relinks / new-with-
+    # embedding, then new-without-embedding), but merge_same_id_observations
+    # and the identity-registry sync pair it with fused observations BY INDEX —
+    # on any frame where a new / relinked cluster precedes a continued one, a
+    # slot's identity evidence (continuity type, relink margin) comes from a
+    # different robot. ON returns it in input order. Ids are unchanged; only
+    # which evidence each fused observation carries downstream. DEFAULT OFF
+    # pending live A/B (changes identity outputs with every other knob off).
+    Knob("fused_evidence_input_order", "FUSED_EVIDENCE_INPUT_ORDER", bool,
+         False, section="Fusion & field position"),
     # --- field tracker position stability (field-map-v2 spec) ---
     # Corner-only measurements (no main-view box) get inflated KF noise —
     # low cameras have poor range; 1.0 restores full-trust updates.

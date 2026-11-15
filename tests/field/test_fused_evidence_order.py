@@ -3,8 +3,9 @@
 ``assign`` builds its evidence list pass by pass (direct key matches, then
 appearance relinks / new-with-embedding, then new-without-embedding), but its
 callers (merge_same_id_observations, InferenceJob._sync_identity_registry_frame)
-read it index-aligned to the input observations. With the knob ON the list is
-returned in input order; OFF keeps the legacy pass order byte-identical."""
+read it index-aligned to the input observations. With the knob ON (job default
+since Nov 15 2026) the list is returned in input order; OFF keeps the legacy
+pass order byte-identical."""
 import numpy as np
 
 from web.field.fused_track_id import FusedTrackRegistry
@@ -109,14 +110,14 @@ def test_merge_keeps_retained_members_evidence():
     assert [e.type for e in mev] == ["newly_created", "continued"]
 
 
-def test_knob_default_off_and_wired(monkeypatch):
+def test_knob_default_on_and_wired(monkeypatch):
     for knob in KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
     from web.app import InferenceJob
     cfg = JobConfig()
-    assert cfg.fused_evidence_input_order is False
+    assert cfg.fused_evidence_input_order is True
     job = InferenceJob.__new__(InferenceJob)
     job.config = cfg
-    assert InferenceJob._build_fused_registry(job).evidence_input_order is False
-    job.config = JobConfig({"fused_evidence_input_order": "true"})
     assert InferenceJob._build_fused_registry(job).evidence_input_order is True
+    job.config = JobConfig({"fused_evidence_input_order": "false"})
+    assert InferenceJob._build_fused_registry(job).evidence_input_order is False

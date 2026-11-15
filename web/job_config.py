@@ -1118,10 +1118,12 @@ KNOBS = [
     # on any frame where a new / relinked cluster precedes a continued one, a
     # slot's identity evidence (continuity type, relink margin) comes from a
     # different robot. ON returns it in input order. Ids are unchanged; only
-    # which evidence each fused observation carries downstream. DEFAULT OFF
-    # pending live A/B (changes identity outputs with every other knob off).
+    # which evidence each fused observation carries downstream. DEFAULT ON
+    # since Nov 15 2026: live A/B on the 4 GT matches x2 was neutral to
+    # slightly positive everywhere (misID qm8 10.1->8.5, hop_qm45 23.4->21.9,
+    # 2025hop 5.25->4.25 s, casnd flat; coverage identical).
     Knob("fused_evidence_input_order", "FUSED_EVIDENCE_INPUT_ORDER", bool,
-         False, section="Fusion & field position"),
+         True, section="Fusion & field position"),
     # --- field tracker position stability (field-map-v2 spec) ---
     # Corner-only measurements (no main-view box) get inflated KF noise —
     # low cameras have poor range; 1.0 restores full-trust updates.

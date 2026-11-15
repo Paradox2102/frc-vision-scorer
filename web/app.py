@@ -6634,7 +6634,7 @@ class InferenceJob:
             split_far_m=(float(cfg.fused_split_far_m)
                          if getattr(cfg, "fused_split_far", False) else 0.0),
             evidence_input_order=bool(
-                getattr(cfg, "fused_evidence_input_order", False)),
+                getattr(cfg, "fused_evidence_input_order", True)),
         )
 
     def _record_fused_ids_summary(self) -> None:

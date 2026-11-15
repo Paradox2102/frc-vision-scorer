@@ -47,7 +47,8 @@ same-id groups. Stats: key_unbound_far (keys), split_far (observations split
 off at merge); ``last_frame_split`` holds this frame's counts.
 
 Evidence order (``evidence_input_order``, job knob
-``fused_evidence_input_order``, default OFF): ``assign`` resolves observations
+``fused_evidence_input_order``, DEFAULT ON since Nov 15 2026; the class
+default stays legacy False for direct construction): ``assign`` resolves observations
 pass by pass (direct key matches, then appearance relinks / new-with-embedding,
 then new-without-embedding) and legacy-returns the evidence list in that PASS
 order, while its callers (merge_same_id_observations,

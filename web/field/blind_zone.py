@@ -223,6 +223,21 @@ class BlindZone:
                      "rows": ["".join("#" if b else "." for b in row) for row in self.blind]},
         }
 
+    @classmethod
+    def from_summary(cls, d: dict) -> "BlindZone":
+        """Rebuild a zone from ``summary()`` (TRACKER_TRACE replay). Only the
+        blind grid round-trips: ``distance_m`` / ``contains`` / ``area_m2`` are
+        identical; ``out_of_view`` is not (per-view grids are not recorded)."""
+        cm = float(d["cell_m"])
+        g = d["grid"]
+        blind = np.array([[ch == "#" for ch in row] for row in g["rows"]], dtype=bool)
+        blind = blind.reshape(int(g["ny"]), int(g["nx"]))
+        xs = (np.arange(int(g["nx"])) + 0.5) * cm
+        ys = (np.arange(int(g["ny"])) + 0.5) * cm
+        return cls(xs=xs, ys=ys, cell_m=cm, useful={"_seen": ~blind},
+                   margin_m=float(d.get("margin_m", 0.3)),
+                   params=dict(d.get("params") or {}))
+
     def describe(self) -> str:
         comps = self.components()
         parts = ", ".join(

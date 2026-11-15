@@ -206,8 +206,11 @@ def occlusion_position(trace: list[dict], radius_m: float = 1.5,
 
 def occlusion_traced(trace: list[dict]) -> Callable:
     """Exact occlusion flags from a trace that recorded them (``occ``)."""
-    flags = [{int(s): {"view_occluded": bool(v)} for s, v in rec["occ"].items()}
-             for rec in trace]
+    flags = []
+    for rec in trace:
+        blind = set(int(s) for s in rec.get("occ_blind") or ())
+        flags.append({int(s): {"view_occluded": bool(v), "blind": int(s) in blind}
+                      for s, v in rec["occ"].items()})
 
     def occ(k, prev_out):
         return flags[k]
@@ -250,6 +253,10 @@ def replay(trace: list[dict], tracker: FieldTracker, occ_fn: Callable,
                                     track_id=o.get("tid")) for o in e["dets"]]
             tracker.update(edets, {}, float(e.get("dt", dt)), frame_num=e.get("frame"))
     for k, rec in enumerate(trace):
+        if rec.get("blind_zone") is not None:
+            # blind_zone_hold: the job's zone (re-anchored when it changed).
+            from web.field.blind_zone import BlindZone
+            tracker.blind_zone = BlindZone.from_summary(rec["blind_zone"])
         dets = trace_detections(rec, rng, jitter_m)
         step_dt = float(rec.get("dt", dt))
         portals = ({int(sid): tuple(v) for sid, v in rec["portals"].items()}

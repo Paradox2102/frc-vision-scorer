@@ -10484,6 +10484,16 @@ class InferenceJob:
                         # the occlusion flags this update consumes, dt, portals.
                         _trace_occ = {int(sid): bool((v or {}).get("view_occluded"))
                                       for sid, v in (self._view_flags or {}).items()}
+                        # blind_zone_coast: blind flags + the tracker's zone
+                        # (re-traced whenever it changes) for an exact replay.
+                        _trace_blind = sorted(
+                            int(sid) for sid, v in (self._view_flags or {}).items()
+                            if (v or {}).get("blind"))
+                        _bz = getattr(self.field_tracker, "blind_zone", None)
+                        _trace_bz = None
+                        if _bz is not None and _bz is not getattr(self, "_trace_bz_last", None):
+                            self._trace_bz_last = _bz
+                            _trace_bz = _bz.summary()
                         _trace_portals = ({int(sid): [float(x) for x in p]
                                            for sid, p in portals.items()}
                                           if portals else None)
@@ -10497,6 +10507,8 @@ class InferenceJob:
                             "frame": frame_num,
                             "dt": float(dt),
                             "occ": _trace_occ,
+                            **({"occ_blind": _trace_blind} if _trace_blind else {}),
+                            **({"blind_zone": _trace_bz} if _trace_bz is not None else {}),
                             "portals": _trace_portals,
                             "fused": [{
                                 "pos": [round(float(o.detection.pos[0]), 4),

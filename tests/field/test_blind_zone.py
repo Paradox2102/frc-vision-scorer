@@ -117,6 +117,18 @@ def test_summary_components_and_out_of_view_margin():
     assert zone.distance_m((8.27, 7.0)) > 2.0
 
 
+def test_from_summary_round_trips_distance_for_trace_replay():
+    # TRACKER_TRACE records zone.summary(); the replay rebuilds the zone from
+    # it. The tracker only reads distance_m, which must match cell for cell.
+    zone = compute_blind_zone(VIEWS, DIMS, corner_min_range_m=3.0, margin_m=0.3)
+    back = BlindZone.from_summary(zone.summary())
+    assert back.area_m2 == pytest.approx(zone.area_m2)
+    assert np.array_equal(back.blind, zone.blind)
+    for x in np.linspace(0.05, DIMS[0] - 0.05, 37):
+        for y in np.linspace(0.05, DIMS[1] - 0.05, 17):
+            assert back.distance_m((x, y)) == zone.distance_m((x, y))
+
+
 def test_empty_zone_distance_is_inf():
     xs, ys = field_grid(DIMS)
     zone = BlindZone(xs=xs, ys=ys, cell_m=0.25,

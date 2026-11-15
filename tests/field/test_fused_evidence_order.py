@@ -56,6 +56,13 @@ def test_legacy_evidence_is_in_pass_order_not_input_order():
     # The per-observation stamp is right; only the returned list is misaligned.
     assert [o.relink_evidence.type for o in obs] == [
         "newly_created", "newly_created", "appearance_relinked", "continued"]
+    # Always-on diagnostic counts the mispaired positions (knob-independent).
+    assert reg.stats["evidence_misaligned"] == sum(
+        e is not o.relink_evidence for e, o in zip(ev, obs))
+    assert reg.stats["evidence_misaligned_type"] == sum(
+        (e.type, e.margin) != (o.relink_evidence.type, o.relink_evidence.margin)
+        for e, o in zip(ev, obs))
+    assert reg.stats["evidence_misaligned"] > 0
 
 
 def test_input_order_evidence_aligns_with_observations():

@@ -6646,7 +6646,8 @@ class InferenceJob:
             return
         keys = ("continued", "merged", "relinked", "created_with_emb",
                 "created_no_emb", "created_crossview_only",
-                "created_samecam_below_floor", "created_samecam_above_floor")
+                "created_samecam_below_floor", "created_samecam_above_floor",
+                "evidence_misaligned", "evidence_misaligned_type")
         if getattr(reg, "split_far_m", 0.0) > 0:
             keys += ("key_unbound_far", "split_far")
         counts = {k: int(reg.stats.get(k, 0)) for k in keys}

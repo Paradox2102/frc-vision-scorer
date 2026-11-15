@@ -55,7 +55,10 @@ InferenceJob._sync_identity_registry_frame) index it by input position — so on
 any frame where a new / relinked cluster precedes a continued one, evidence is
 paired with the wrong fused observation. ON returns it in input order (each
 entry is that observation's own ``relink_evidence``). Ids and registry state
-are identical either way; only the returned list's order changes.
+are identical either way; only the returned list's order changes. Stats
+evidence_misaligned / evidence_misaligned_type (always counted) give the
+number of positions the legacy order mispairs / mispairs with a different
+evidence type or margin.
 
 Pure: no torch / SAM / cv2 imports."""
 from __future__ import annotations
@@ -551,6 +554,15 @@ class FusedTrackRegistry:
                 self._id_to_pos[obs.track_id] = (float(obs.detection.pos[0]),
                                                  float(obs.detection.pos[1]))
 
+        # Diagnostic (always on): positions where the legacy pass-order list
+        # pairs evidence with a different observation, and how many of those
+        # hand over a different type / margin (what the identity sync reads).
+        for obs, ev in zip(observations, evidence_list):
+            own = obs.relink_evidence
+            if ev is not own:
+                self.stats["evidence_misaligned"] += 1
+                if (ev.type, ev.margin) != (own.type, own.margin):
+                    self.stats["evidence_misaligned_type"] += 1
         if self.evidence_input_order:
             # Every pass stamped obs.relink_evidence; read them back in input
             # order so callers can pair evidence[i] with observations[i].

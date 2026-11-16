@@ -1144,12 +1144,12 @@ const RANK_TABS = [
      show: t => Object.entries(t.by_station || {}).map(([k, v]) => `${k} ${pct(v.opp_side_frac)} (${v.n_counted})`).join(', ') || '—'},
   ]},
   {key: 'bump_stuck', label: 'Stuck on bump', cols: [
-    {id: 'score', label: 'Stuck s', title: 'Rank score: total seconds beached on a bump (counted matches)',
-     get: t => t.stuck_s_total, show: t => fmtS(t.stuck_s_total), score: true},
-    {id: 'ep', label: 'Episodes', title: 'Episodes > min_stuck_s', get: t => t.episodes, show: t => t.episodes ?? '—'},
-    {id: 'mw', label: 'Matches w/ ep.', title: 'Counted matches with at least one episode', get: t => t.matches_with_episode, show: t => t.matches_with_episode ?? '—'},
-    {id: 'lg', label: 'Longest', title: 'Longest episode', get: t => t.longest_s, show: t => fmtS(t.longest_s)},
-    {id: 'pm', label: 's/match', title: 'Stuck seconds per counted match', get: t => t.stuck_s_per_match, show: t => fmtS(t.stuck_s_per_match)},
+    {id: 'score', label: 'Stuck s/match', title: 'Rank score: seconds per counted match stopped on a bump',
+     get: t => t.stuck_s_per_match, show: t => fmtS(t.stuck_s_per_match), score: true},
+    {id: 'tot', label: 'Total', title: 'Seconds stopped on a bump, all counted matches', get: t => t.stuck_s_total, show: t => fmtS(t.stuck_s_total)},
+    {id: 'ms', label: 'Matches stuck', title: 'Counted matches with at least 1 s stopped on a bump', get: t => t.matches_stuck, show: t => t.matches_stuck ?? '—'},
+    {id: 'ep', label: 'Episodes', title: 'Stretches with >= 2 s stopped on one bump', get: t => t.episodes, show: t => t.episodes ?? '—'},
+    {id: 'lg', label: 'Longest', title: 'Most stopped seconds in one episode', get: t => t.longest_s, show: t => fmtS(t.longest_s)},
     {id: 'list', label: 'Details', title: 'Episodes: match, time, duration, bump', get: () => null, nosort: true,
      show: t => (t.episode_list || []).length
        ? `<button class="sc-ep-btn" data-ep="${t.team_number}" aria-expanded="${S.rankOpen.has(t.team_number)}">${S.rankOpen.has(t.team_number) ? '▾' : '▸'} ${t.episode_list.length}</button>` : '—', html: true},
@@ -1225,7 +1225,7 @@ function episodeRow(t, span) {
   const eps = (t.episode_list || []).map(e => `<div>
       <span class="mk">${esc(matchLabel(e))}</span>${allianceChip(e)}
       <span>${e.period === 'auto' ? 'Auto' : 'Teleop'} clock ${clock(e.remaining_at_start)} (t = ${num(e.t_start, 1)} s)</span>
-      <span><b>${fmtS(e.duration_s)}</b> on the ${esc(e.bump)} bump (${esc(e.bump_field_side)} side of the field)</span>
+      <span><b>${fmtS(e.stopped_s)}</b> stopped over ${fmtS(e.duration_s)} on the ${esc(e.bump)} bump (${esc(e.bump_field_side)} side of the field)</span>
       ${e.counted ? '' : '<span class="sc-badge warn" title="Match has too little valid tracking to count toward the totals">not counted</span>'}</div>`).join('');
   return `<tr class="sc-ep-row"><td colspan="${span}"><div class="sc-ep-list">${eps}</div></td></tr>`;
 }

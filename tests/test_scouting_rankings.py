@@ -183,31 +183,49 @@ def _bump_centre():
     return (x0 + x1) / 2, (y0 + y1) / 2
 
 
-def test_bump_episode_over_five_seconds_counts_four_does_not():
+def test_stopped_on_bump_time_ranks_and_lists_episodes():
     cx, cy = _bump_centre()
     away = [(1.5 + 0.01 * (i % 2), 0.6) for i in range(100)]
-    six = _jitter(30, cx, cy, sigma=0.08, seed=6)                 # 6 s
-    four = _jitter(20, cx, cy, sigma=0.08, seed=7)                # 4 s
+    six = _jitter(30, cx, cy, sigma=0.08, seed=6)                 # 6 s stopped on it
+    two = _jitter(10, cx, cy, sigma=0.08, seed=7)                 # 2 s
     out = _run(BumpStuck(), [_match(1, {3128: _samples(away + six + away),
-                                        254: _samples(away + four + away)})], min_tracked_s=10)
-    t = out["teams"]["3128"]
-    assert t["episodes"] == 1 and t["matches_with_episode"] == 1
-    assert t["stuck_s_total"] == pytest.approx(6.0, abs=0.5)
+                                        254: _samples(away + two + away)})], min_tracked_s=10)
+    t, u = out["teams"]["3128"], out["teams"]["254"]
+    assert t["stuck_s_total"] == pytest.approx(6.0, abs=1.0)
+    assert 0 < u["stuck_s_total"] < t["stuck_s_total"]
+    assert t["stuck_s_per_match"] == t["stuck_s_total"]             # one counted match
+    assert t["episodes"] == 1 and t["matches_stuck"] == 1
     ep = t["episode_list"][0]
     assert ep["match_key"] == "2026tst_qm1" and ep["period"] == "teleop"
-    assert ep["t_start"] == pytest.approx(20.0 + 100 * DT, abs=0.5)
+    assert ep["t_start"] == pytest.approx(20.0 + 100 * DT, abs=1.0)
     assert ep["bump"] == "own right" and ep["bump_field_side"] == "blue"
-    assert out["teams"]["254"]["episodes"] == 0
-    assert out["ranking"][0] == "3128"
+    assert out["ranking"][:2] == ["3128", "254"]
+    assert out["score_key"] == "stuck_s_per_match"
+
+
+def test_wobbling_on_and_off_the_bump_still_adds_up():
+    # a beached robot whose position keeps slipping off the bump outline:
+    # never one long stretch, but the stopped seconds on it still add up
+    cx, cy = _bump_centre()
+    x0, _, x1, _ = RULES.bumps[0]
+    pts = []
+    for k in range(8):                                            # 8 x (1.5 s on, 1 s just off)
+        pts += _jitter(8, cx, cy, sigma=0.05, seed=k)
+        pts += _jitter(5, x0 - 0.3, cy, sigma=0.05, seed=50 + k)
+    away = [(1.5 + 0.01 * (i % 2), 0.6) for i in range(100)]
+    out = _run(BumpStuck(), [_match(1, {3128: _samples(away + pts)})], min_tracked_s=10)
+    assert out["teams"]["3128"]["stuck_s_total"] >= 5.0
 
 
 def test_driving_over_a_bump_and_shooting_at_the_barrier_do_not_count():
-    cx, cy = _bump_centre()
+    _, cy = _bump_centre()
     x0, _, x1, _ = RULES.bumps[0]
     over = [(2.0 + 1.5 * i * DT, cy) for i in range(30)]         # 1.5 m/s across it
-    face = _jitter(100, x0 + 0.05, cy, sigma=0.1, seed=8)         # 20 s on the barrier face
+    # shooting against the barrier: bumper on the face, centre ~0.45 m back
+    face = _jitter(100, x0 - 0.45, cy, sigma=0.1, seed=8)         # 20 s parked there
     out = _run(BumpStuck(), [_match(1, {3128: _samples(over + face)})], min_tracked_s=5)
-    assert out["teams"]["3128"]["episodes"] == 0
+    t = out["teams"]["3128"]
+    assert t["episodes"] == 0 and t["stuck_s_total"] < 0.5
 
 
 def test_held_positions_on_a_bump_do_not_count():

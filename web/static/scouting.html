@@ -866,7 +866,7 @@ function renderHeat() {
     for (const b of order) {
       const bk = tm.by_station[r]?.[b], sm = bk?.summary || {}, secs = bucketSeconds(bk);
       const cap = secs > 0
-        ? `<b>${fmtS(secs)}</b> · own half ${pct(sm.own_half_frac)} / opp ${pct(sm.opp_half_frac)}`
+        ? `<b>${fmtS(secs)}</b> · own ${pct(sm.own_zone_frac)} · neutral ${pct(sm.neutral_zone_frac)} · opp ${pct(sm.opp_zone_frac)}`
         : 'no samples';
       html += `<div class="sc-heat-cell"><canvas data-row="${r}" data-b="${b}"></canvas>
         <div class="sc-heat-cap">${cap}</div></div>`;
@@ -881,7 +881,7 @@ function renderHeat() {
   });
   const layout = h.station_layout || {};
   $('heatNote').innerHTML =
-    `Own alliance wall on the left of every map (alliance perspective, red matches ${h.frame?.symmetry === 'mirror' ? 'mirrored' : 'rotated 180°'}). Colour = time spent in each ${h.grid?.cell_m ?? 0.5} m cell, ` +
+    `Own alliance wall on the left of every map (alliance perspective, red matches ${h.frame?.symmetry === 'mirror' ? 'mirrored' : 'rotated 180°'}). Dashed lines = zone boundaries (own Alliance Zone | Neutral Zone | opponent's Alliance Zone, at the hubs' near faces; bumps, trenches and hubs count as Neutral). Colour = time spent in each ${h.grid?.cell_m ?? 0.5} m cell, ` +
     (mode === 'share' ? "as a share of that map's total, on one scale across maps" : mode === 'row' ? 'in seconds, scaled per row' : 'in seconds, one scale for all maps') +
     `; square-root scale topped at the 98th percentile cell. Coverage = labelled seconds ÷ seconds the team was on the field in that shift — low coverage means a sparse map, not a parked robot. ` +
     `Hub active/inactive comes from TBA auto fuel; ties or missing data go to "Shift unknown". ` +
@@ -906,10 +906,14 @@ function drawMini(cv, bk, row, val, max, fmtV) {
   const ctx = sizeCanvas(cv, cssW, mp.cssH);
   ctx.fillStyle = '#10141f'; ctx.fillRect(0, 0, mp.cssW, mp.cssH);
   if (field.grey) ctx.drawImage(field.grey, 0, 0, mp.cssW, mp.cssH);
-  // halfway line
-  const [hx] = mp.to(L / 2, 0);
+  // zone boundaries: own ALLIANCE ZONE | NEUTRAL ZONE | opponent's ALLIANCE ZONE
+  const z = S.heat.zones || {own_max_x: L / 3, opp_min_x: 2 * L / 3};
   ctx.strokeStyle = 'rgba(232,234,240,0.35)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, mp.cssH); ctx.stroke(); ctx.setLineDash([]);
+  for (const zx of [z.own_max_x, z.opp_min_x]) {
+    const [hx] = mp.to(zx, 0);
+    ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, mp.cssH); ctx.stroke();
+  }
+  ctx.setLineDash([]);
   const cell = g.cell_m || 0.5;
   const cells = bk?.cells || [];
   for (const [ix, iy, s] of cells) {

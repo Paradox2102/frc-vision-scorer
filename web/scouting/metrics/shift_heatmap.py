@@ -5,7 +5,8 @@ perspective, own wall at x=0) of its shift bucket — auto, transition, active,
 inactive, endgame or unknown (``games/rebuilt2026.bucket`` decides; a hub-auto
 tie or missing TBA data leaves the four shifts ``unknown``). Each team gets the
 grid for all its matches ("all") and per TBA driver station ("1".."3", only
-stations it played), plus a per-bucket summary (own/opp half split, mean
+stations it played), plus a per-bucket summary (time split over the three
+zones — own ALLIANCE ZONE, NEUTRAL ZONE, opponent's ALLIANCE ZONE — and mean
 position) and coverage = labelled seconds / expected seconds, so a sparse map
 reads as sparse rather than as "the robot sat still".
 """
@@ -15,6 +16,7 @@ import math
 from collections import defaultdict
 
 from web.field.season import season_for_year
+from web.scouting import field_rules
 from web.scouting.games import rebuilt2026
 from web.scouting.games.rebuilt2026 import BUCKETS, auto_winner, bucket
 from web.scouting.geometry import field_dims
@@ -36,32 +38,36 @@ def _expected_seconds(winner, auto_s: float) -> dict:
 
 class _Acc:
     """Seconds per cell plus the running sums for one (station, bucket)."""
-    __slots__ = ("cells", "seconds", "own_s", "sum_ax", "sum_ay", "n")
+    __slots__ = ("cells", "seconds", "own_s", "opp_s", "sum_ax", "sum_ay", "n")
 
     def __init__(self):
         self.cells = defaultdict(float)
-        self.seconds = self.own_s = self.sum_ax = self.sum_ay = 0.0
+        self.seconds = self.own_s = self.opp_s = self.sum_ax = self.sum_ay = 0.0
         self.n = 0
 
-    def add(self, ix, iy, ax, ay, dt, half):
+    def add(self, ix, iy, ax, ay, dt, zones):
         self.cells[(ix, iy)] += dt
         self.seconds += dt
         self.sum_ax += ax * dt
         self.sum_ay += ay * dt
-        self.own_s += dt if ax < half else 0.0
+        own_max, opp_min = zones
+        self.own_s += dt if ax <= own_max else 0.0
+        self.opp_s += dt if ax >= opp_min else 0.0
         self.n += 1
 
     def to_json(self) -> dict:
         cells = sorted([ix, iy, round(s, 2)] for (ix, iy), s in self.cells.items()
                        if round(s, 2) > 0)
         if self.n and self.seconds > 0:
-            own = self.own_s / self.seconds
-            summary = {"own_half_frac": round(own, 3), "opp_half_frac": round(1 - own, 3),
+            own, opp = self.own_s / self.seconds, self.opp_s / self.seconds
+            summary = {"own_zone_frac": round(own, 3),
+                       "neutral_zone_frac": round(max(0.0, 1 - own - opp), 3),
+                       "opp_zone_frac": round(opp, 3),
                        "mean_ax": round(self.sum_ax / self.seconds, 3),
                        "mean_ay": round(self.sum_ay / self.seconds, 3),
                        "n_samples": self.n}
         else:
-            summary = {"own_half_frac": None, "opp_half_frac": None,
+            summary = {"own_zone_frac": None, "neutral_zone_frac": None, "opp_zone_frac": None,
                        "mean_ax": None, "mean_ay": None, "n_samples": 0}
         return {"seconds": round(self.seconds, 2), "cells": cells, "summary": summary}
 
@@ -81,7 +87,7 @@ def _lineup_teams(md) -> set:
 class ShiftHeatmap(Metric):
     key = "shift_heatmap"
     title = "Shift heatmaps"
-    version = 1
+    version = 2
     years = (2026,)
     description = ("Where each robot spends time per 2026 hub shift (active / inactive / "
                    "endgame, plus auto, transition, unknown), split by driver station.")
@@ -94,6 +100,9 @@ class ShiftHeatmap(Metric):
         L, W = field_dims(year)
         nx, ny = max(1, math.ceil(L / cell)), max(1, math.ceil(W / cell))
         auto_s = float(season_for_year(year).auto_s)
+        rules = field_rules.auto_rules(year)
+        own_max = rules.alliance_zone_x if rules and rules.alliance_zone_x else L / 3
+        zones = (own_max, L - own_max)      # alliance perspective: own wall at x=0
 
         accs: dict = defaultdict(lambda: defaultdict(lambda: {b: _Acc() for b in BUCKETS}))
         expected: dict = defaultdict(lambda: dict.fromkeys(BUCKETS, 0.0))
@@ -121,7 +130,7 @@ class ShiftHeatmap(Metric):
                     ix = min(max(int(math.floor(s.ax / cell)), 0), nx - 1)
                     iy = min(max(int(math.floor(s.ay / cell)), 0), ny - 1)
                     for k in keys:
-                        accs[team][k][b].add(ix, iy, s.ax, s.ay, s.dt, L / 2)
+                        accs[team][k][b].add(ix, iy, s.ax, s.ay, s.dt, zones)
                     secs[b] += s.dt
                 rows[team].append({
                     "match_key": md.match_key, "comp_level": md.comp_level,
@@ -149,6 +158,7 @@ class ShiftHeatmap(Metric):
 
         return {"teams": teams,
                 "grid": {"cell_m": cell, "nx": nx, "ny": ny, "field_m": [L, W]},
+                "zones": {"own_max_x": round(zones[0], 3), "opp_min_x": round(zones[1], 3)},
                 "buckets": list(BUCKETS),
                 "default_buckets": list(DEFAULT_BUCKETS),
                 "station_layout": {str(k): v for k, v in rebuilt2026.STATION_Y_ORDER.items()},

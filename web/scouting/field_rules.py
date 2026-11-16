@@ -52,6 +52,10 @@ class AutoRules:
     start_line_x: float               # alliance-perspective x of the starting line
     obstacles: tuple                  # ((x0, y0, x1, y1), ...) absolute field metres
     field_m: tuple                    # (L, W)
+    # ALLIANCE ZONE depth: own wall to the hub cabinet's near face (the
+    # starting line's far edge); the opponent zone mirrors it, NEUTRAL ZONE
+    # = everything between (bumps / trenches / hubs included)
+    alliance_zone_x: float = 0.0
 
 
 @lru_cache(maxsize=None)
@@ -93,7 +97,7 @@ def auto_rules(year: int) -> Optional[AutoRules]:
     near_face = min(bbox(h)[0] for h in hubs)        # own-side hub's near face
     return AutoRules(start_line_x=round(near_face - TAPE_OFFSET_M, 4),
                      obstacles=tuple(tuple(round(v, 4) for v in r) for r in obstacles),
-                     field_m=(L, W))
+                     field_m=(L, W), alliance_zone_x=round(near_face, 4))
 
 
 # ----------------------------------------------------------------- geometry

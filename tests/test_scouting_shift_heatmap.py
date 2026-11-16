@@ -75,7 +75,7 @@ def test_output_shape_and_every_bucket_present():
     assert set(out["teams"]) == {"1", "2", "3", "5", "6", "3128"}
     empty = out["teams"]["5"]["by_station"]["all"]["active"]
     assert empty == {"seconds": 0.0, "cells": [],
-                     "summary": {"own_half_frac": None, "opp_half_frac": None,
+                     "summary": {"own_zone_frac": None, "neutral_zone_frac": None, "opp_zone_frac": None,
                                  "mean_ax": None, "mean_ay": None, "n_samples": 0}}
     for per in out["teams"]["3128"]["by_station"].values():
         assert set(per) == set(out["buckets"])
@@ -108,16 +108,17 @@ def test_station_split_adds_up():
     assert t["n_matches"] == 2
 
 
-def test_half_fractions_and_means():
+def test_zone_fractions_and_means():
     near = _teleop(2.0, 1.0)[:250]      # remaining 140..90.2: transition + shift1 + part shift2
     far = [Sample(**{**s.__dict__, "ax": L - 2.0, "ay": 7.0, "x": L - 2.0, "y": 7.0})
            for s in _teleop(0, 0)[250:]]
     out = _run([_match(1, samples=near + far)])
     allb = out["teams"]["3128"]["by_station"]["all"]
-    assert allb["transition"]["summary"]["own_half_frac"] == 1.0
-    assert allb["inactive"]["summary"]["own_half_frac"] == 0.5    # shift1 near, shift3 far
-    assert allb["inactive"]["summary"]["opp_half_frac"] == 0.5
-    assert allb["endgame"]["summary"]["opp_half_frac"] == 1.0
+    assert allb["transition"]["summary"]["own_zone_frac"] == 1.0
+    assert allb["inactive"]["summary"]["own_zone_frac"] == 0.5    # shift1 near, shift3 far
+    assert allb["inactive"]["summary"]["opp_zone_frac"] == 0.5
+    assert allb["inactive"]["summary"]["neutral_zone_frac"] == 0.0
+    assert allb["endgame"]["summary"]["opp_zone_frac"] == 1.0
     assert allb["endgame"]["summary"]["mean_ax"] == round(L - 2.0, 3)
     assert allb["endgame"]["summary"]["mean_ay"] == 7.0
     assert allb["endgame"]["summary"]["n_samples"] == 150
@@ -157,3 +158,18 @@ def test_real_event_smoke():
     assert any(t["by_station"]["all"]["active"]["seconds"] > 0
                and t["by_station"]["all"]["inactive"]["seconds"] > 0
                for t in env["teams"].values())
+
+
+
+def test_neutral_zone_between_hub_faces():
+    # alliance zone = own wall .. hub near face (4.029); neutral = up to L - 4.029
+    mid = [Sample(**{**s.__dict__, "ax": 8.0, "ay": 4.0, "x": 8.0, "y": 4.0})
+           for s in _teleop(0, 0)]
+    bump = [Sample(**{**s.__dict__, "ax": 4.6, "ay": 2.5, "x": 4.6, "y": 2.5})
+            for s in _teleop(0, 0)]
+    for samples in (mid, bump):
+        out = _run([_match(1, samples=samples)])
+        sm = out["teams"]["3128"]["by_station"]["all"]["endgame"]["summary"]
+        assert (sm["own_zone_frac"], sm["neutral_zone_frac"], sm["opp_zone_frac"]) == (0.0, 1.0, 0.0)
+    assert out["zones"]["own_max_x"] == pytest.approx(4.029, abs=0.01)
+    assert out["zones"]["opp_min_x"] == pytest.approx(L - 4.029, abs=0.01)

@@ -165,6 +165,7 @@
           <span class="sc-sub" id="autoSub"></span>
           <div class="sc-controls">
             <label id="optMirrorWrap" title="Group a routine with its left/right reflection (same auto run from the other side of the field)"><input type="checkbox" id="optMirror" checked> Group mirrored routines</label>
+            <label title="Off: each path on the side of the field the robot actually drove (red matches on the red side). On: red matches rotated onto the blue side so every match of a team overlays, own alliance wall on the left."><input type="checkbox" id="optCombine"> Combine red + blue on one side</label>
             <label><input type="checkbox" id="optTicks" checked> 5 s ticks</label>
             <label><input type="checkbox" id="optUnclustered" checked> ungrouped paths</label>
           </div>
@@ -176,7 +177,7 @@
           </div>
           <div class="sc-list" id="autoList"></div>
         </div>
-        <p class="sc-note">Field view: each path is drawn where the robot actually drove — blue-alliance matches on the blue (left) side, red-alliance matches on the red (right) side. Routines are still grouped across both alliances, so one routine can appear on both sides. Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Paths are kept out of the hub and the trench support blocks; dotted = inferred movement (not seen — e.g. routed around the hub across a gap, or from the starting line to where the robot was first seen); hollow circle = the start was not seen. Click a routine or match to highlight it; click empty field to clear.</p>
+        <p class="sc-note"><span id="autoViewNote"></span> Click a path (or a match in the list) to replay it: a robot marker drives the route at 3× speed. Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Paths are kept out of the hub and the trench support blocks; dotted = inferred movement (not seen — e.g. routed around the hub across a gap, or from the starting line to where the robot was first seen); hollow circle = the start was not seen. Click a routine or match to highlight it; click empty field to clear.</p>
       </section>
 
       <section class="sc-panel" id="heatPanel" style="display:none">
@@ -217,12 +218,17 @@ const BUCKET_HINT = {
 const LOW_COVERAGE = 0.5;
 const INFERRED_GAP_S = 1.5;      // a segment spanning a longer observation gap is drawn as inferred
 const INFERRED_DASH = [2, 4];
+// auto replay: match-time speed-up, end hold, drawn robot size
+const PLAY_SPEED = 3, PLAY_HOLD_S = 1.5, ROBOT_M = 0.85;
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 
 const S = {
   events: [], event: null, year: null, metrics: [], teams: [], team: null,
   field: {},              // year -> {meta, img, grey}
   auto: null, heat: null, // current envelopes
   sel: null,              // {type:'cluster', id} | {type:'match', key}
+  combine: false,         // auto map: false = real field sides, true = all on own side
+  anim: null, raf: 0,     // auto replay of the selected match: {key, start}
   open: new Set(),        // expanded cluster ids
   buckets: null, hits: [], token: 0,
 };
@@ -466,6 +472,7 @@ function isSelected(m) {
 
 function renderAuto() {
   const p = autoTeam(), list = $('autoList');
+  $('autoViewNote').textContent = viewNote();
   if (S.auto && S.auto.error) {
     $('autoSub').textContent = ''; list.innerHTML = `<div class="sc-empty">Could not compute: ${esc(S.auto.error)}</div>`;
   } else if (!p) {
@@ -557,6 +564,14 @@ $('autoList').addEventListener('click', e => {
   }
 });
 $('optTicks').addEventListener('change', drawAuto);
+try { S.combine = localStorage.getItem('scouting.autoCombine') === '1'; } catch (_) {}
+$('optCombine').checked = S.combine;
+$('optCombine').addEventListener('change', e => {
+  S.combine = e.target.checked;
+  try { localStorage.setItem('scouting.autoCombine', S.combine ? '1' : '0'); } catch (_) {}
+  renderAuto();
+});
+reducedMotion.addEventListener?.('change', drawAuto);
 $('optUnclustered').addEventListener('change', drawAuto);
 
 function drawBackground(ctx, field, mp) {
@@ -579,9 +594,15 @@ function drawBackground(ctx, field, mp) {
   }
 }
 
-// Auto paths are drawn in absolute field coordinates (red autos on the red
-// side); `points` is alliance perspective (used by the export / clustering).
-function fieldPts(m) { return m.points_field || m.points; }
+// Two views: FIELD (absolute coords, red autos on the red side, the default)
+// and COMBINED (`points` = alliance perspective, every match on the own-wall
+// side). Same times / point kinds in both, so hover + ticks work in either.
+function fieldPts(m) { return S.combine ? m.points : (m.points_field || m.points); }
+function viewNote() {
+  return S.combine
+    ? `Combined view: every path is drawn as if the team were blue — own alliance wall on the left, opponents on the right (red matches are ${S.auto?.frame?.symmetry === 'mirror' ? 'mirrored end-to-end' : 'rotated 180°'} onto this side).`
+    : 'Field view: each path is drawn where the robot actually drove — blue-alliance matches on the blue (left) side, red-alliance matches on the red (right) side. Routines are still grouped across both alliances, so one routine can appear on both sides.';
+}
 
 // Time of the first OBSERVED point (an inferred start sits at t=0 before it).
 function firstSeenT(m) {
@@ -615,6 +636,8 @@ function pathStyle(m, p) {
   let width = c ? (rep ? 3.5 : 1.75) : 1.5, alpha = c ? (rep ? 1 : 0.6) : 0.65;
   if (focused) { width += 1; alpha = 1; }
   if (!sel) alpha = 0.12;
+  // while replaying, the full route is a faint guide under the growing trail
+  if (S.anim && S.anim.key === m.match_key) alpha = 0.35;
   return {colour, width, alpha, dash: c ? [] : [6, 5], rep, sel, cluster: c, focused};
 }
 
@@ -659,8 +682,13 @@ function drawAuto() {
   ctx.fillStyle = 'rgba(232,234,240,0.85)';
   ctx.textBaseline = 'top';
   const [wx] = mp.to(0, 0), [ox] = mp.to(L, 0);
-  ctx.textAlign = 'left'; ctx.fillStyle = '#7aa7ff'; ctx.fillText('◀ BLUE WALL', wx + 4, 4);
-  ctx.textAlign = 'right'; ctx.fillStyle = '#ff7a7a'; ctx.fillText('RED WALL ▶', ox - 4, 4);
+  if (S.combine) {
+    ctx.textAlign = 'left'; ctx.fillText('◀ OWN WALL', wx + 4, 4);
+    ctx.textAlign = 'right'; ctx.fillText('OPPONENT WALL ▶', ox - 4, 4);
+  } else {
+    ctx.textAlign = 'left'; ctx.fillStyle = '#7aa7ff'; ctx.fillText('◀ BLUE WALL', wx + 4, 4);
+    ctx.textAlign = 'right'; ctx.fillStyle = '#ff7a7a'; ctx.fillText('RED WALL ▶', ox - 4, 4);
+  }
   S.hits = [];
   const p = autoTeam();
   if (!p) return;
@@ -716,7 +744,73 @@ function drawAuto() {
     ctx.globalAlpha = 1;
     S.hits.push({m, cp, st});
   }
+  const playing = drawn.find(({m}) => S.anim && S.anim.key === m.match_key);
+  if (playing) drawPlayback(ctx, playing.m, playing.st, mp, performance.now());
   S.mapper = mp;
+  syncAnim();
+}
+
+// ---- replay of the selected match ------------------------------------------
+// The selected match's route is replayed in match time (linear: the marker's
+// speed IS the robot's speed, 3x real time), then held 1.5 s and looped.
+// prefers-reduced-motion: no replay, the static highlighted path stays.
+
+function syncAnim() {
+  const key = S.sel && S.sel.type === 'match' && !reducedMotion.matches
+    && $('autoPanel').style.display !== 'none' ? S.sel.key : null;
+  const m = key && autoTeam()?.matches.find(x => x.match_key === key);
+  if (!m || (m.points || []).length < 2) { S.anim = null; return; }
+  if (!S.anim || S.anim.key !== key) S.anim = {key, start: performance.now()};
+  if (!S.raf) S.raf = requestAnimationFrame(() => { S.raf = 0; if (S.anim) drawAuto(); });
+}
+
+function posAt(pts, t) {          // [x, y, segment index] at match time t (clamped)
+  if (t <= pts[0][0]) return [pts[0][1], pts[0][2], 1];
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i][0] >= t) {
+      const [t0, x0, y0] = pts[i - 1], [t1, x1, y1] = pts[i];
+      const f = t1 > t0 ? (t - t0) / (t1 - t0) : 1;
+      return [x0 + f * (x1 - x0), y0 + f * (y1 - y0), i];
+    }
+  }
+  const e = pts[pts.length - 1];
+  return [e[1], e[2], pts.length - 1];
+}
+
+function drawPlayback(ctx, m, st, mp, now) {
+  const pts = fieldPts(m), tS = pts[0][0], tE = pts[pts.length - 1][0];
+  const runS = Math.max(0.01, (tE - tS) / PLAY_SPEED);
+  const el = ((now - S.anim.start) / 1000) % (runS + PLAY_HOLD_S);
+  const t = tS + Math.min(el, runS) * PLAY_SPEED;
+  const [px, py, seg] = posAt(pts, t);
+  // trail: start .. now, seen segments solid, inferred dotted
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (const [colour, w] of [['rgba(10,14,26,0.9)', st.width + 4.5], [st.colour, st.width + 1.5]]) {
+    ctx.strokeStyle = colour; ctx.lineWidth = w;
+    for (let i = 1; i <= seg; i++) {
+      const a = pts[i - 1], b = i < seg ? pts[i] : [t, px, py];
+      ctx.setLineDash(segInferred(m, i) ? INFERRED_DASH : []);
+      ctx.beginPath(); ctx.moveTo(...mp.to(a[1], a[2])); ctx.lineTo(...mp.to(b[1], b[2])); ctx.stroke();
+    }
+  }
+  ctx.setLineDash([]);
+  // robot marker, turned to the direction of travel (kept while stopped)
+  const [ax, ay] = posAt(pts, t - 0.2), [bx, by] = posAt(pts, t + 0.2);
+  if (Math.hypot(bx - ax, by - ay) > 0.05) S.anim.heading = Math.atan2(-(by - ay), bx - ax);
+  const [cx, cy] = mp.to(px, py), pxPerM = mp.to(1, 0)[0] - mp.to(0, 0)[0];
+  const half = Math.max(5, ROBOT_M * pxPerM / 2), unseen = segInferred(m, Math.max(1, seg));
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(S.anim.heading || 0);
+  ctx.beginPath(); ctx.roundRect(-half, -half, 2 * half, 2 * half, half * 0.25);
+  ctx.fillStyle = unseen ? 'rgba(10,14,26,0.85)' : st.colour; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = unseen ? st.colour : '#e8eaf0'; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(half * 0.9, 0); ctx.lineTo(half * 0.2, -half * 0.45); ctx.lineTo(half * 0.2, half * 0.45);
+  ctx.closePath(); ctx.fillStyle = unseen ? st.colour : '#0a0e1a'; ctx.fill();   // front
+  ctx.restore();
+  const lbl = `${t.toFixed(1)} s${unseen ? ' (not seen)' : ''}`;
+  ctx.font = '700 11px Inter, system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,14,26,0.9)';
+  ctx.strokeText(lbl, cx + half + 4, cy - half); ctx.fillStyle = '#e8eaf0'; ctx.fillText(lbl, cx + half + 4, cy - half);
 }
 
 function drawTicks(ctx, pts, mp, colour) {

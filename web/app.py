@@ -77,6 +77,7 @@ from web import clef_reader
 from web import jev_reader
 from web import job_config as job_config_registry
 from web.legibility import legibility_score
+from web.score_ocr_filter import ScoreOcrFilter
 from web.bumper_register import deinterlace_crop
 from web import reid
 from web.diagnostic import DiagnosticRecorder, NullRecorder
@@ -1864,8 +1865,9 @@ class InferenceJob:
             "last_error": None,
         }
         
-        # OCR state (raw reads for authoritative score sync)
-        self._last_ocr = {"blue": None, "red": None}
+        # OCR state (raw reads for authoritative score sync): per-alliance
+        # misread guard that re-syncs after a real jump (score_ocr_filter).
+        self._score_ocr = {"blue": ScoreOcrFilter(), "red": ScoreOcrFilter()}
         self._ball_score_cooldown = {}
         
         # Ball trajectory tracking
@@ -10774,12 +10776,8 @@ class InferenceJob:
                                 ocr_val = self.ocr_score(overhead_frame, alliance)
                             if processed_frame_num <= 50:
                                 print(f"  [DEBUG] OCR {alliance}: {ocr_val}")
+                            ocr_val = self._score_ocr[alliance].accept(ocr_val)
                             if ocr_val is not None:
-                                last_ocr = self._last_ocr.get(alliance)
-                                if last_ocr is not None and abs(ocr_val - last_ocr) > 20:
-                                    continue  # Likely a misread, skip
-                                self._last_ocr[alliance] = ocr_val
-                            
                                 current = self.alliance_scores[alliance]
                                 if ocr_val != current:
                                     if ocr_val > current:

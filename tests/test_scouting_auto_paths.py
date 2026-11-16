@@ -11,7 +11,10 @@ import pytest
 from web.scouting.metrics.auto_paths import AutoPaths, path_distance, resample
 from web.scouting.model import MatchData, Sample, TeamMatch
 
-P = dict(AutoPaths.default_params)
+# Synthetic routes start at x=1.0 (they'd be start-line violations): the
+# clustering tests run without field rules (tests/test_scouting_field_rules.py
+# covers them).
+P = {**AutoPaths.default_params, "field_rules": False}
 AUTO_S = 20.0
 
 
@@ -189,7 +192,8 @@ def test_real_event_smoke():
         pytest.skip(f"DB not usable: {e}")
     if not env["sources"]:
         pytest.skip("no 2026cur replays")
-    assert env["schema_version"] == 1
+    assert env["schema_version"] == 1          # export envelope schema
+    assert env["metric_version"] == AutoPaths.version
     assert len(env["teams"]) >= 10
 
 

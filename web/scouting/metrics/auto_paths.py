@@ -28,10 +28,18 @@ Similarity measure
    (ay -> W - ay) and the smaller distance counts. Each clustered match gets
    ``mirrored`` = whether it is the reflection of its cluster's representative;
    cluster start/end are computed in the representative's orientation.
+
+Field rules (``field_rules``, default on; 2026 only, see ``web/scouting/field_rules``)
+are applied to each path BEFORE resampling: points are clamped out of the hub /
+trench blocks, segments through them are routed around, and the start is checked
+against the starting line (ok / inferred / unseen / violation). Inserted points
+are flagged in ``point_kinds``; a ``violation`` path (very likely another robot)
+is listed but never clustered.
 """
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from statistics import median
 from typing import Optional
 
@@ -40,7 +48,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from web.field.season import season_for_year
-from web.scouting import geometry
+from web.scouting import field_rules, geometry
 from web.scouting.model import MatchData, Sample
 from web.scouting.registry import Metric, register
 
@@ -151,21 +159,51 @@ def _span(grid: np.ndarray) -> tuple:
     return int(idx[0]), int(idx[-1])
 
 
+def _constrain(path: list, rules, p: dict, alliance: Optional[str], year: int) -> tuple:
+    """(constrained Sample path, one-letter point kinds, report) for a
+    time-sorted path. Observed points keep their Sample (moved ones via
+    ``replace``); inserted points copy the time-nearest observed Sample with
+    the new time / position and dt = 0 (they stand for no observed time)."""
+    pts = [(float(s.t_match), float(s.ax), float(s.ay)) for s in path]
+    out, src, report = field_rules.constrain_auto_path_indexed(pts, rules, p)
+    times = [s.t_match for s in path]
+    samples, kinds = [], []
+    for (t, ax, ay, kind), i in zip(out, src):
+        x, y = geometry.to_alliance(ax, ay, alliance or "blue", year)   # self-inverse
+        if i is not None:
+            base = path[i]
+            if kind == field_rules.SEEN:
+                samples.append(base)
+            else:
+                samples.append(replace(base, ax=ax, ay=ay, x=x, y=y))
+        else:
+            j = min(range(len(path)), key=lambda k: abs(times[k] - t))
+            base = path[j]
+            samples.append(replace(base, t_match=t, remaining=base.remaining - (t - base.t_match),
+                                   ax=ax, ay=ay, x=x, y=y, dt=0.0, confirmed=False))
+        kinds.append(field_rules.KIND_CODE[kind])
+    return samples, kinds, report
+
+
 @register
 class AutoPaths(Metric):
     key = "auto_paths"
     title = "Auto paths"
-    version = 1
+    version = 2
     years = None
     description = ("Each team's autonomous path per match (alliance perspective), "
                    "with repeated routines grouped into clusters.")
     default_params = {"threshold_m": 0.9, "grid_s": 0.25, "max_gap_s": 1.5,
                       "max_shift_s": 1.0, "min_overlap_frac": 0.4,
-                      "min_overlap_s": 3.0, "min_coverage": 0.25, "mirror_aware": True}
+                      "min_overlap_s": 3.0, "min_coverage": 0.25, "mirror_aware": True,
+                      "field_rules": True, "obstacle_margin_m": 0.25, "start_tol_m": 0.8,
+                      "start_window_s": 1.5, "start_noise_m": 0.5}
     param_bounds = {"threshold_m": (0.05, 10.0), "grid_s": (0.05, 2.0),
                     "max_gap_s": (0.0, 10.0), "max_shift_s": (0.0, 5.0),
                     "min_overlap_frac": (0.0, 1.0), "min_overlap_s": (0.0, 30.0),
-                    "min_coverage": (0.0, 1.0)}
+                    "min_coverage": (0.0, 1.0), "obstacle_margin_m": (0.0, 1.0),
+                    "start_tol_m": (0.0, 5.0), "start_window_s": (0.0, 20.0),
+                    "start_noise_m": (0.0, 5.0)}
 
     def compute(self, matches: list, params: dict) -> dict:
         p = {**self.default_params, **(params or {})}
@@ -193,9 +231,20 @@ class AutoPaths(Metric):
             else:
                 alliance, station = md.station_of(team)
             auto_s = float(season_for_year(md.year).auto_s)
-            grid = resample(path, auto_s, grid_s, float(p["max_gap_s"]))
-            coverage = float(_valid(grid).mean()) if path else 0.0
             path.sort(key=lambda s: s.t_match)
+            n_obs = len(path)
+            rules = field_rules.auto_rules(md.year) if p.get("field_rules") else None
+            check = {"start_check": None, "start_offset_m": None, "n_clamped": 0, "n_detour": 0}
+            kinds = ["s"] * n_obs
+            if rules is not None and path:
+                path, kinds, check = _constrain(path, rules, p, alliance, md.year)
+            grid = resample(path, auto_s, grid_s, float(p["max_gap_s"]))
+            # coverage = time actually SEEN: inserted detour / start points
+            # would otherwise split long gaps into "interpolable" pieces
+            seen = [s for s, k in zip(path, kinds) if k in ("s", "c")]
+            seen_grid = grid if len(seen) == len(path) else resample(
+                seen, auto_s, grid_s, float(p["max_gap_s"]))
+            coverage = float(_valid(seen_grid).mean()) if seen else 0.0
             runner = tm.auto_runner_up_share if tm and path else None
             entries.append({
                 "match_key": md.match_key, "comp_level": md.comp_level,
@@ -207,13 +256,18 @@ class AutoPaths(Metric):
                 "runner_up_share": _r(runner, 3),
                 "identity_conflict": runner is not None and runner >= _CONFLICT_SHARE,
                 "legacy_labels": md.legacy_labels,
-                "n_samples": len(path),
+                "n_samples": n_obs,
+                "start_check": check["start_check"],
+                "start_offset_m": check["start_offset_m"],
+                "n_clamped": check["n_clamped"], "n_detour": check["n_detour"],
                 "cluster": None,
                 "mirrored": None,
                 "points": [[round(s.t_match, 2), round(s.ax, 2), round(s.ay, 2)] for s in path],
                 "points_norm": [list(geometry.normalise(s.ax, s.ay, md.year)) for s in path],
+                "point_kinds": kinds,
             })
-            if path and coverage >= float(p["min_coverage"]):
+            if (path and coverage >= float(p["min_coverage"])
+                    and check["start_check"] != "violation"):
                 grids.append((len(entries) - 1, grid))
 
         width = geometry.field_dims(mds[0].year)[1] if mds else 0.0

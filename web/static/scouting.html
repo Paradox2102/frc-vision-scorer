@@ -176,7 +176,7 @@
           </div>
           <div class="sc-list" id="autoList"></div>
         </div>
-        <p class="sc-note">Alliance perspective: every path is drawn as if the team were blue — own alliance wall on the left, opponents on the right (red matches are <span id="autoSym">rotated 180°</span> onto this side). Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Click a routine or match to highlight it; click empty field to clear.</p>
+        <p class="sc-note">Alliance perspective: every path is drawn as if the team were blue — own alliance wall on the left, opponents on the right (red matches are <span id="autoSym">rotated 180°</span> onto this side). Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Paths are kept out of the hub and the trench support blocks; dotted = inferred movement (not seen — e.g. routed around the hub across a gap, or from the starting line to where the robot was first seen); hollow circle = the start was not seen. Click a routine or match to highlight it; click empty field to clear.</p>
       </section>
 
       <section class="sc-panel" id="heatPanel" style="display:none">
@@ -215,6 +215,8 @@ const BUCKET_HINT = {
   active:"Shifts when this team's hub is active", inactive:"Shifts when this team's hub is inactive",
   endgame:'Last 30 s, both hubs active', unknown:'Shifts 1–4 when TBA auto fuel is tied or missing'};
 const LOW_COVERAGE = 0.5;
+const INFERRED_GAP_S = 1.5;      // a segment spanning a longer observation gap is drawn as inferred
+const INFERRED_DASH = [2, 4];
 
 const S = {
   events: [], event: null, year: null, metrics: [], teams: [], team: null,
@@ -488,9 +490,15 @@ function matchRowHTML(m, p, opts = {}) {
   if (m.coverage != null && m.coverage < LOW_COVERAGE && !opts.muted) badges.push(`<span class="sc-badge serious" title="Path seen for ${pct(m.coverage)} of auto">low coverage</span>`);
   if (m.legacy_labels) badges.push(`<span class="sc-badge" title="Replay predates window labels (older identity method)">legacy labels</span>`);
   if (m.source === 'frames') badges.push(`<span class="sc-badge" title="No pipeline auto path for this robot; built from per-frame team labels">from labels</span>`);
+  const firstSeen = firstSeenT(m), off = m.start_offset_m != null ? m.start_offset_m.toFixed(2) : '?';
+  if (m.start_check === 'violation') badges.push(`<span class="sc-badge serious" title="Starts ${off} m from the starting line — a robot must start touching it, so this path is probably another robot">off start line</span>`);
+  else if (m.start_check === 'unseen') badges.push(`<span class="sc-badge" title="First seen at ${fmtS(firstSeen)}">start unseen</span>`);
+  else if (m.start_check === 'inferred') badges.push(`<span class="sc-badge" title="First seen ${fmtS(firstSeen)} in, ${off} m from the line; start placed on the line">start inferred</span>`);
   const isRep = opts.rep ? `<span class="rep">typical</span>` : '';
   const sel = S.sel && S.sel.type === 'match' && S.sel.key === m.match_key ? ' sel' : '';
-  const covTitle = `label share ${pct(m.label_share)} · ${m.n_samples} samples`;
+  const fixes = [m.n_clamped ? `${m.n_clamped} point${m.n_clamped === 1 ? '' : 's'} moved out of the hub / trench blocks` : '',
+                 m.n_detour ? `${m.n_detour} detour waypoint${m.n_detour === 1 ? '' : 's'} added` : ''].filter(Boolean);
+  const covTitle = `label share ${pct(m.label_share)} · ${m.n_samples} samples` + (fixes.length ? ` · ${fixes.join(' · ')}` : '');
   if (opts.muted) {
     return `<div class="sc-match muted"><span class="mk">${esc(matchLabel(m))}</span>${allianceChip(m)}<span>${m.n_samples ? `too little seen (${m.n_samples} samples, cov ${pct(m.coverage)})` : 'no auto path seen'}</span>${badges.join('')}</div>`;
   }
@@ -518,7 +526,7 @@ function autoListHTML(p) {
   });
   const loose = p.matches.filter(m => m.cluster == null && (m.points || []).length >= 2);
   if (loose.length) {
-    out.push(`<div class="sc-section-label" title="Paths too short or overlapping too little in time to compare with the others">
+    out.push(`<div class="sc-section-label" title="Paths too short or overlapping too little in time to compare with the others, or starting off the starting line (probably another robot)">
       <span class="sc-swatch dashed" style="display:inline-block;vertical-align:middle;margin-right:0.35rem"></span>Not grouped</div>`);
     out.push(loose.map(m => matchRowHTML(m, p)).join(''));
   }
@@ -571,6 +579,30 @@ function drawBackground(ctx, field, mp) {
     ctx.beginPath(); ctx.moveTo((x0 + x1) / 2, y0); ctx.lineTo((x0 + x1) / 2, y1); ctx.stroke();
     ctx.setLineDash([]);
   }
+}
+
+// Time of the first OBSERVED point (an inferred start sits at t=0 before it).
+function firstSeenT(m) {
+  const kinds = m.point_kinds || [], pts = m.points || [];
+  const i = kinds.findIndex(k => k === 's' || k === 'c');
+  return i >= 0 ? pts[i][0] : (pts.length ? pts[0][0] : null);
+}
+// Segment i-1 -> i is inferred (not seen) when it touches an inserted point
+// (detour waypoint / inferred start) or spans an observation gap.
+function segInferred(m, i) {
+  const k = m.point_kinds || [], pts = m.points;
+  return 'di'.includes(k[i - 1] || 's') || 'di'.includes(k[i] || 's')
+    || pts[i][0] - pts[i - 1][0] > INFERRED_GAP_S;
+}
+// Runs of consecutive segments with the same seen / inferred state.
+function segmentRuns(m) {
+  const runs = [];
+  for (let i = 1; i < m.points.length; i++) {
+    const inf = segInferred(m, i), last = runs[runs.length - 1];
+    if (last && last.inferred === inf) last.to = i;
+    else runs.push({inferred: inf, from: i - 1, to: i});
+  }
+  return runs;
 }
 
 function pathStyle(m, p) {
@@ -641,21 +673,34 @@ function drawAuto() {
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   for (const {m, st} of drawn) {
     const cp = m.points.map(([, x, y]) => mp.to(x, y));
+    const runs = segmentRuns(m);
+    const strokeRuns = () => {     // seen runs in the path's dash, inferred runs dotted
+      for (const r of runs) {
+        ctx.setLineDash(r.inferred ? INFERRED_DASH : st.dash);
+        ctx.beginPath(); ctx.moveTo(...cp[r.from]);
+        for (let i = r.from + 1; i <= r.to; i++) ctx.lineTo(...cp[i]);
+        ctx.stroke();
+      }
+    };
     // surface halo keeps lines legible over the field art
     ctx.globalAlpha = st.alpha * 0.8;
-    ctx.setLineDash(st.dash);
     ctx.strokeStyle = 'rgba(10,14,26,0.85)'; ctx.lineWidth = st.width + 2.5;
-    ctx.beginPath(); cp.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+    strokeRuns();
     ctx.globalAlpha = st.alpha;
     ctx.strokeStyle = st.colour; ctx.lineWidth = st.width;
-    ctx.beginPath(); cp.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+    strokeRuns();
     ctx.setLineDash([]);
     if (st.sel && (st.rep || st.focused || !S.sel || !st.cluster)) {
       const big = st.rep || st.focused;
       const [sx, sy] = cp[0];
       ctx.beginPath(); ctx.arc(sx, sy, big ? 5.5 : 3.5, 0, Math.PI * 2);
-      ctx.fillStyle = st.colour; ctx.fill();
-      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(10,14,26,0.9)'; ctx.stroke();
+      if (m.start_check === 'unseen') {        // hollow: the start was not seen
+        ctx.fillStyle = 'rgba(10,14,26,0.9)'; ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = st.colour; ctx.stroke();
+      } else {
+        ctx.fillStyle = st.colour; ctx.fill();
+        ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(10,14,26,0.9)'; ctx.stroke();
+      }
       drawArrow(ctx, m.points, mp, big ? 9 : 6, st.colour);
       if (st.rep) {            // direct label: routine letter at the start
         ctx.font = '700 12px Inter, system-ui, sans-serif';
@@ -711,8 +756,13 @@ $('autoCanvas').addEventListener('mousemove', e => {
   const m = hit.h.m, pts = m.points;
   const t = pts[hit.i - 1][0] + hit.f * (pts[hit.i][0] - pts[hit.i - 1][0]);
   const routine = m.cluster != null ? `Routine ${clusterName(p, m.cluster)}${m.mirrored ? ' (mirrored)' : ''}` : 'not grouped';
+  const off = m.start_offset_m != null ? m.start_offset_m.toFixed(2) : '?';
+  const start = m.start_check === 'unseen' ? `first seen at ${fmtS(firstSeenT(m))}`
+    : m.start_check === 'inferred' ? `start inferred (first seen ${fmtS(firstSeenT(m))} in, ${off} m from the line)`
+    : m.start_check === 'violation' ? `starts ${off} m from the starting line — probably another robot` : '';
   tip.innerHTML = `<b>${esc(matchLabel(m))}</b> · ${m.alliance === 'red' ? 'Red' : 'Blue'} ${m.station ?? ''} · ${routine}<br>` +
-    `t = ${t.toFixed(1)} s · coverage ${pct(m.coverage)} · label share ${pct(m.label_share)}`;
+    `t = ${t.toFixed(1)} s${segInferred(m, hit.i) ? ' (inferred, not seen)' : ''} · coverage ${pct(m.coverage)} · label share ${pct(m.label_share)}` +
+    (start ? `<br>${esc(start)}` : '');
   tip.style.display = 'block';
   const wrapW = $('autoWrap').clientWidth;
   tip.style.left = `${Math.min(cx + 12, wrapW - tip.offsetWidth - 4)}px`;

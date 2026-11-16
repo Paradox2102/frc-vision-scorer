@@ -10776,7 +10776,8 @@ class InferenceJob:
                                 ocr_val = self.ocr_score(overhead_frame, alliance)
                             if processed_frame_num <= 50:
                                 print(f"  [DEBUG] OCR {alliance}: {ocr_val}")
-                            ocr_val = self._score_ocr[alliance].accept(ocr_val)
+                            ocr_val = self._score_ocr[alliance].accept(
+                                ocr_val, frame_num / self.video_fps)
                             if ocr_val is not None:
                                 current = self.alliance_scores[alliance]
                                 if ocr_val != current:

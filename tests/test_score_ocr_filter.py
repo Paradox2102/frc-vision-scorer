@@ -44,16 +44,56 @@ def test_none_reads_do_not_break_or_build_a_run():
     assert feed(f, [40, None, 44, None, 50]) == [None, None, None, None, 50]
 
 
-def test_repeated_misread_is_corrected_once_true_value_is_read():
+def test_run_far_below_score_never_resyncs_down():
+    # 2026cur_qm76 blue: broadcast cut away from the scoreboard; a run of
+    # garbage 8s pulled the score down from 435. Scores never decrease.
     f = ScoreOcrFilter()
-    feed(f, [180])
-    # Two identical misreads (185 read as 105) and one more: re-sync to 105...
-    assert feed(f, [105, 105, 106]) == [None, None, 106]
-    # ...then consistent true reads pull it back.
-    assert feed(f, [186, 187, 188]) == [None, None, 188]
+    f.last = 435
+    assert feed(f, [8, 8, 8, 8, 8]) == [None] * 5
+    assert f.last == 435 and f.resyncs == 0
+    # Small dips (a 7 misread as 4) are still accepted like before.
+    assert f.accept(431) == 431
 
 
-def test_first_read_accepted():
+def test_low_garbage_does_not_break_an_upward_run():
+    f = ScoreOcrFilter()
+    f.last = 100
+    assert feed(f, [140, 3, 150, 160]) == [None, None, None, 160]
+
+
+def test_fast_end_of_match_climb_resyncs():
+    # 2026cur_qm85 red: 311 then 345, 368, 371 (steps 34, 23, 3). The run used
+    # to reset on the +23 step and the final score stayed at 311 (TBA 375).
+    f = ScoreOcrFilter()
+    f.last = 311
+    assert feed(f, [345, 368, 371]) == [None, None, 371]
+
+
+def test_score_starts_at_zero():
     f = ScoreOcrFilter()
     assert f.accept(None) is None
-    assert f.accept(250) == 250
+    assert f.accept(7) == 7
+    g = ScoreOcrFilter()
+    # A large first read is a jump from 0 and needs confirming.
+    assert feed(g, [250, 0, 1]) == [None, 0, 1]
+    h = ScoreOcrFilter()
+    # Joining mid-match: consistent reads re-sync upward from 0.
+    assert feed(h, [250, 252, 255]) == [None, None, 255]
+
+
+def test_unreachable_garbage_burst_cannot_lock_score_high():
+    # 2026cur_qm85 blue: 75 at t=37, then 661, 689, 689... one second later.
+    # Confirming that run would lock blue at 689 (no downward re-sync).
+    f = ScoreOcrFilter()
+    f.last, f.last_t = 75, 37.0
+    reads = [(661, 38), (689, 39), (689, 40), (689, 41), (88, 42), (95, 43)]
+    assert [f.accept(v, t) for v, t in reads] == [None, None, None, None, 88, 95]
+    assert f.resyncs == 0
+
+
+def test_real_jump_after_a_gap_is_reachable():
+    # qm76-style: score 157 at t=61, scoreboard back at t=190 reading 435.
+    f = ScoreOcrFilter()
+    f.accept(150, 60.0); f.accept(157, 61.0)
+    assert [f.accept(v, t) for v, t in [(435, 190.0), (435, 191.0), (435, 192.0)]] \
+        == [None, None, 435]

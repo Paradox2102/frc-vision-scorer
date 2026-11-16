@@ -235,3 +235,18 @@ def test_merged_params_rejects_out_of_bounds():
                  ("threshold_m", -1.0), ("min_coverage", 2.0)):
         with pytest.raises(ValueError):
             merged_params(AutoPaths(), {k: v})
+
+
+def test_points_field_are_absolute_coordinates():
+    # red autos are drawn on the red side: points_field = absolute field metres,
+    # points = alliance perspective (clustering / export)
+    path = mk_samples(route_a, red=True)
+    md = mk_match(1, {3128: path}, red=[3128])
+    m = AutoPaths().compute([md], P)["teams"]["3128"]["matches"][0]
+    assert len(m["points_field"]) == len(m["points"])
+    (t0, fx, fy), (_, ax, ay) = m["points_field"][0], m["points"][0]
+    assert (fx, fy) == (round(16.541 - ax, 2), round(8.069 - ay, 2))
+    assert fx > 16.541 / 2                     # red side
+    blue = AutoPaths().compute([mk_match(1, {3128: mk_samples(route_a)}, blue=[3128])], P)
+    bm = blue["teams"]["3128"]["matches"][0]
+    assert bm["points_field"] == bm["points"]

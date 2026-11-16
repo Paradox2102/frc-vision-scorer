@@ -264,6 +264,10 @@ class AutoPaths(Metric):
                 "mirrored": None,
                 "points": [[round(s.t_match, 2), round(s.ax, 2), round(s.ay, 2)] for s in path],
                 "points_norm": [list(geometry.normalise(s.ax, s.ay, md.year)) for s in path],
+                # absolute field metres (WPILib, blue wall at x=0): where the
+                # robot really drove, for drawing red autos on the red side
+                "points_field": [[round(s.t_match, 2), round(s.x, 2), round(s.y, 2)]
+                                 for s in path],
                 "point_kinds": kinds,
             })
             if (path and coverage >= float(p["min_coverage"])

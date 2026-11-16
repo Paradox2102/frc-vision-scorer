@@ -176,7 +176,7 @@
           </div>
           <div class="sc-list" id="autoList"></div>
         </div>
-        <p class="sc-note">Alliance perspective: every path is drawn as if the team were blue — own alliance wall on the left, opponents on the right (red matches are <span id="autoSym">rotated 180°</span> onto this side). Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Paths are kept out of the hub and the trench support blocks; dotted = inferred movement (not seen — e.g. routed around the hub across a gap, or from the starting line to where the robot was first seen); hollow circle = the start was not seen. Click a routine or match to highlight it; click empty field to clear.</p>
+        <p class="sc-note">Field view: each path is drawn where the robot actually drove — blue-alliance matches on the blue (left) side, red-alliance matches on the red (right) side. Routines are still grouped across both alliances, so one routine can appear on both sides. Circle = start, arrow = end of the seen path. Thick line = the routine's most typical match. Paths are kept out of the hub and the trench support blocks; dotted = inferred movement (not seen — e.g. routed around the hub across a gap, or from the starting line to where the robot was first seen); hollow circle = the start was not seen. Click a routine or match to highlight it; click empty field to clear.</p>
       </section>
 
       <section class="sc-panel" id="heatPanel" style="display:none">
@@ -466,8 +466,6 @@ function isSelected(m) {
 
 function renderAuto() {
   const p = autoTeam(), list = $('autoList');
-  const sym = S.auto && S.auto.frame && S.auto.frame.symmetry;
-  $('autoSym').textContent = sym === 'mirror' ? 'mirrored end-to-end' : 'rotated 180°';
   if (S.auto && S.auto.error) {
     $('autoSub').textContent = ''; list.innerHTML = `<div class="sc-empty">Could not compute: ${esc(S.auto.error)}</div>`;
   } else if (!p) {
@@ -581,6 +579,10 @@ function drawBackground(ctx, field, mp) {
   }
 }
 
+// Auto paths are drawn in absolute field coordinates (red autos on the red
+// side); `points` is alliance perspective (used by the export / clustering).
+function fieldPts(m) { return m.points_field || m.points; }
+
 // Time of the first OBSERVED point (an inferred start sits at t=0 before it).
 function firstSeenT(m) {
   const kinds = m.point_kinds || [], pts = m.points || [];
@@ -657,8 +659,8 @@ function drawAuto() {
   ctx.fillStyle = 'rgba(232,234,240,0.85)';
   ctx.textBaseline = 'top';
   const [wx] = mp.to(0, 0), [ox] = mp.to(L, 0);
-  ctx.textAlign = 'left'; ctx.fillText('◀ OWN WALL', wx + 4, 4);
-  ctx.textAlign = 'right'; ctx.fillText('OPPONENT WALL ▶', ox - 4, 4);
+  ctx.textAlign = 'left'; ctx.fillStyle = '#7aa7ff'; ctx.fillText('◀ BLUE WALL', wx + 4, 4);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#ff7a7a'; ctx.fillText('RED WALL ▶', ox - 4, 4);
   S.hits = [];
   const p = autoTeam();
   if (!p) return;
@@ -672,7 +674,7 @@ function drawAuto() {
   drawn.sort((a, b) => rank(a) - rank(b));
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   for (const {m, st} of drawn) {
-    const cp = m.points.map(([, x, y]) => mp.to(x, y));
+    const fp = fieldPts(m), cp = fp.map(([, x, y]) => mp.to(x, y));
     const runs = segmentRuns(m);
     const strokeRuns = () => {     // seen runs in the path's dash, inferred runs dotted
       for (const r of runs) {
@@ -701,7 +703,7 @@ function drawAuto() {
         ctx.fillStyle = st.colour; ctx.fill();
         ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(10,14,26,0.9)'; ctx.stroke();
       }
-      drawArrow(ctx, m.points, mp, big ? 9 : 6, st.colour);
+      drawArrow(ctx, fp, mp, big ? 9 : 6, st.colour);
       if (st.rep) {            // direct label: routine letter at the start
         ctx.font = '700 12px Inter, system-ui, sans-serif';
         ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
@@ -709,7 +711,7 @@ function drawAuto() {
         const lbl = clusterName(p, st.cluster.id);
         ctx.strokeText(lbl, sx - 8, sy - 8); ctx.fillStyle = '#e8eaf0'; ctx.fillText(lbl, sx - 8, sy - 8);
       }
-      if (ticks && (st.rep || st.focused)) drawTicks(ctx, m.points, mp, st.colour);
+      if (ticks && (st.rep || st.focused)) drawTicks(ctx, fp, mp, st.colour);
     }
     ctx.globalAlpha = 1;
     S.hits.push({m, cp, st});

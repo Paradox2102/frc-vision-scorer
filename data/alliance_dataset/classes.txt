@@ -1,3 +1,0 @@
-fuel_ball
-hub_opening
-robot

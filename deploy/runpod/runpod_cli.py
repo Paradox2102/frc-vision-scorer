@@ -238,7 +238,7 @@ def git(*args, repo: Path = REPO, binary: bool = False):
 # Bundle
 # --------------------------------------------------------------------------
 # Tracked paths shipped from `git archive <ref>`.
-CODE_PATHS = ("web", "src", "data/field", "pyproject.toml", "deploy/runpod")
+CODE_PATHS = ("web", "data/field", "pyproject.toml", "deploy/runpod")
 # ...minus these (prefix match on the archive path).
 CODE_EXCLUDE_PREFIXES = (
     "web/uploads/", "web/replays/", "web/logs/",

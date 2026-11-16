@@ -46,9 +46,6 @@ runs/train/frc_bumpers_equipment_hardneg/weights/*
 # Raw frames (can regenerate from videos)
 data/raw_frames/
 
-# Label Studio internal data
-labeling/ls_fuelball/
-labeling/.venv/
 
 # Label Studio venv
 .ls-venv/
@@ -180,3 +177,10 @@ deploy/runpod/.known_hosts_*
 deploy/runpod/tune_results/
 deploy/runpod/.swarm/
 data/runpod_pull/
+
+# Local-only: batch run logs, scratch datasets, blog drafts, agent skill locks
+data/batch_logs/
+data/hub_zone_gapfill/
+docs/blog/
+skills-lock.json
+.ui-design/

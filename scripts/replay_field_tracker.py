@@ -585,7 +585,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("trace")
     ap.add_argument("--job", help="job id prefix (for vlm_read rows + identity log)")
-    ap.add_argument("--data-root", default=str(Path("/home/nick/AI/frc-vision-scorer")))
+    ap.add_argument("--data-root", default=str(ROOT))
     ap.add_argument("--dt", type=float, default=DEFAULT_DT)
     ap.add_argument("--fidelity", action="store_true")
     ap.add_argument("--occ", choices=("oracle", "position", "traced", "none"), default="position",

@@ -12,7 +12,7 @@ must not look for it.
 The orchestrator gives you:
 
 - an **audit directory**, for example
-  `/home/nick/AI/frc-vision-scorer/data/eval/audit/2026cur_qm8_a0bbc991`
+  `data/eval/audit/2026cur_qm8_a0bbc991` (absolute path on your machine)
 - a list of **sample ids**, for example `s000`–`s029`, plus the matching lines of
   that directory's `items.jsonl`. Each line holds the image paths (relative to
   the audit directory) and the match roster:

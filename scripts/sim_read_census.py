@@ -584,11 +584,11 @@ def main(argv=None) -> int:
                     help="run every arm with read_keep_evicted ON and report the "
                          "evicted-in-flight rows it recovers")
     ap.add_argument("--build-fixture", action="store_true")
-    ap.add_argument("--db", type=Path, default=Path("/home/nick/AI/frc-vision-scorer/frc_scorer.db"))
+    ap.add_argument("--db", type=Path, default=REPO / "frc_scorer.db")
     ap.add_argument("--diagnostic", type=Path, default=Path(
-        f"/home/nick/AI/frc-vision-scorer/web/uploads/diagnostic_{JOB_ID}.jsonl"))
+        REPO / "web" / "uploads" / f"diagnostic_{JOB_ID}.jsonl"))
     ap.add_argument("--meta", type=Path, default=Path(
-        f"/home/nick/AI/frc-vision-scorer/.worktrees/main-server/web/replays/{JOB_ID}/meta.json"))
+        REPO / "web" / "replays" / JOB_ID / "meta.json"))
     args = ap.parse_args(argv)
     if args.build_fixture:
         fx = build_fixture(args.db, args.diagnostic, args.meta, args.fixture)

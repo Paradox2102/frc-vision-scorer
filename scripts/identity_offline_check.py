@@ -9,7 +9,7 @@ the job's ``vlm_read`` diagnostic rows, and runs the SAME resolve the
 Usage:
   .venv/bin/python scripts/identity_offline_check.py 80a1cd4c \\
       --truth B1=4786,B2=3181,B3=2992,R1=6800,R2=1477,R3=4256 \\
-      [--data-root /home/nick/AI/frc-vision-scorer] [--identity-log dump.json] [--json]
+      [--data-root <repo root>] [--identity-log dump.json] [--json]
 
 Reconstruction rule. A binding row's ``start_frame`` is the loop's
 ``_current_frame`` at bind time, which the main loop assigns at the END of

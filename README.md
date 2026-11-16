@@ -397,21 +397,22 @@ web/                  FastAPI app, job runner, UI
   field/              the vision pipeline
     calibration.py    tag-anchored pinhole resection
     mask_tracker.py   shared mask-tracker logic; builds SAM 2.1 for TRACKING_BACKEND=sam2
-    sam3_tracker.py   SAM3 tracking backend (default; SAM 3.1 with sam3_multiplex)
+    sam3_tracker.py   SAM3 tracking backend (default)
     tracker.py        field-space Kalman tracking
     fusion.py         cross-view fusion
     identity.py       team-number voting / locking
     appearance_gallery.py  DINOv2 exemplar gallery
     radar.py          2D field-map rendering
   static/             frontend
-scripts/              training, dataset prep, evaluation, experiments
+scripts/              training, dataset prep, evaluation, benchmarks
+deploy/runpod/        optional cloud-GPU (RunPod / Vast.ai) job runner
 runs/train/           shipped model weights (Git LFS)
 data/                 field geometry, calibration data, datasets
-  field/              2026 REBUILT field CAD + AprilTag layout
+  field/              field CAD + AprilTag layouts (2019–2026)
   bumper_hardneg_equipment/  committed bumper training imageset
-docs/                 current docs (archive/ holds superseded designs)
+  eval/               ground truth + reader benchmarks used by the tests
+docs/                 design notes
 tests/                pytest suite (run: .venv/bin/python -m pytest)
-labeling/             Label Studio configs for dataset annotation
 ```
 
 ## Models

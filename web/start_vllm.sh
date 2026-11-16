@@ -58,7 +58,7 @@ export VLLM_SERVER_DEV_MODE=1
 # Launch the console script THROUGH the venv's python rather than executing
 # it directly: console-script shebangs bake in the venv's absolute path at
 # creation time, so they break the moment the project dir is moved (e.g.
-# /home/nick/frc-vision-scorer -> /home/nick/AI/frc-vision-scorer) with
+# ~/frc-vision-scorer -> ~/src/frc-vision-scorer) with
 # "cannot execute: required file not found". bin/python is an absolute
 # symlink to the system interpreter and survives the move, so invoking the
 # script as its argument is relocation-proof.

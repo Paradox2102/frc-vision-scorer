@@ -61,7 +61,6 @@ def footage_dirs() -> list[Path]:
     env = os.environ.get("FRC_TEST_FOOTAGE")
     if env:
         dirs.append(Path(env))
-    dirs.append(Path("/home/nick/AI/frc-vision-scorer/data/test_footage"))
     return dirs
 
 

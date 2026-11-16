@@ -11,6 +11,8 @@ denominators), so a sparsely tracked team is compared on what was seen.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,6 +22,7 @@ from web.scouting import motion
 
 LEVEL_ORDER = {"qm": 0, "ef": 1, "qf": 2, "sf": 3, "f": 4}
 
+_TRACK_CACHE_MAX = 4      # cleaned tracks kept per TeamMatch (distinct motion params)
 COMMON_DEFAULTS = {**motion.DEFAULTS, "min_tracked_s": 30.0, "min_matches": 2}
 COMMON_BOUNDS = {**motion.BOUNDS, "min_tracked_s": (0.0, 160.0), "min_matches": (1, 20)}
 
@@ -62,10 +65,17 @@ def cached_track(tm, alliance: str, year: int, params: dict):
     track once per event instead of once each. Tracks are read-only."""
     mp = motion.motion_params(params)
     key = (alliance, int(year), len(tm.samples), tuple(sorted(mp.items())))
-    cache = tm.__dict__.setdefault("_motion_cache", {})
+    # bounded LRU: params come from query strings, and TeamMatch lives in the
+    # long-lived event load cache, so an unbounded dict would grow per distinct
+    # param combination requested
+    cache = tm.__dict__.setdefault("_motion_cache", OrderedDict())
     tr = cache.get(key)
     if tr is None:
         tr = cache[key] = motion.clean_track(tm.samples, alliance, year, mp)
+        while len(cache) > _TRACK_CACHE_MAX:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(key)
     return tr
 
 

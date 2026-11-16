@@ -281,3 +281,12 @@ def test_settled_held_run_on_a_bump_counts():
     beached = [(cx, cy)] * 40 + _jitter(10, cx, cy, sigma=0.03, seed=5)   # froze, then still there
     out = _run(BumpStuck(), [_match(1, {3128: _samples(approach + beached)})], min_tracked_s=10)
     assert out["teams"]["3128"]["episodes"] == 1
+
+
+def test_track_cache_is_bounded():
+    from web.scouting import ranking
+    md = _match(1, {3128: _samples(_circle(100))})
+    tm = md.teams[3128]
+    for k in range(10):
+        ranking.cached_track(tm, "blue", 2026, {"smooth_s": 0.5 + 0.1 * k})
+    assert len(tm.__dict__["_motion_cache"]) == ranking._TRACK_CACHE_MAX

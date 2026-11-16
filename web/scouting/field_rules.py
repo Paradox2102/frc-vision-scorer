@@ -56,6 +56,13 @@ class AutoRules:
     # starting line's far edge); the opponent zone mirrors it, NEUTRAL ZONE
     # = everything between (bumps / trenches / hubs included)
     alliance_zone_x: float = 0.0
+    # Alliance-perspective x of the own barrier's far face (hub cabinet back):
+    # the NEUTRAL ZONE proper (between the two barriers) is
+    # barrier_far_x <= ax <= L - barrier_far_x
+    barrier_far_x: float = 0.0
+    # The four BUMPS as absolute rects (x0, y0, x1, y1), drivable ramps
+    # either side of each hub
+    bumps: tuple = ()
 
 
 @lru_cache(maxsize=None)
@@ -94,10 +101,13 @@ def auto_rules(year: int) -> Optional[AutoRules]:
             obstacles.append((hx0, TRENCH_SPAN_M, hx1, min(b[1] for b in low)))
         if high:
             obstacles.append((hx0, max(b[3] for b in high), hx1, W - TRENCH_SPAN_M))
-    near_face = min(bbox(h)[0] for h in hubs)        # own-side hub's near face
+    own_hub = min((bbox(h) for h in hubs), key=lambda r: r[0])
+    near_face, far_face = own_hub[0], own_hub[2]     # own-side hub's near / far face
     return AutoRules(start_line_x=round(near_face - TAPE_OFFSET_M, 4),
                      obstacles=tuple(tuple(round(v, 4) for v in r) for r in obstacles),
-                     field_m=(L, W), alliance_zone_x=round(near_face, 4))
+                     field_m=(L, W), alliance_zone_x=round(near_face, 4),
+                     barrier_far_x=round(far_face, 4),
+                     bumps=tuple(sorted(tuple(round(v, 4) for v in bbox(b)) for b in bumps)))
 
 
 # ----------------------------------------------------------------- geometry

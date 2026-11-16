@@ -125,6 +125,32 @@
   .sc-table th { color:var(--text-secondary); font-weight:500; }
   details.sc-details summary { cursor:pointer; color:var(--text-secondary); font-size:0.8rem; margin-top:0.5rem; }
 
+  /* ---- team rankings ---- */
+  .sc-table-wrap { overflow:auto; max-height:560px; border:1px solid var(--border);
+                   border-radius:calc(var(--radius) - 2px); }
+  .sc-rank { width:100%; min-width:720px; margin-top:0; }
+  .sc-rank th { cursor:pointer; user-select:none; white-space:nowrap; position:sticky; top:0; z-index:1;
+                background:var(--card); }
+  .sc-rank th:hover, .sc-rank th.sorted { color:var(--foreground); }
+  .sc-rank th .dir { font-size:0.65rem; margin-left:0.2rem; }
+  .sc-rank th.left, .sc-rank td.left { text-align:left; }
+  .sc-rank td { white-space:nowrap; }
+  .sc-rank tr.sc-rrow { cursor:pointer; }
+  .sc-rank tr.sc-rrow:hover td { background:var(--accent); }
+  .sc-rank tr.active td { background:rgba(59,130,246,0.16); }
+  .sc-rank tr.low td { color:var(--text-secondary); }
+  .sc-rank tr.low td.team::after { content:' low data'; font-size:0.65rem; color:var(--st-warning); }
+  .sc-rank td.score { font-weight:600; color:var(--foreground); }
+  .sc-rank tr.low td.score { color:var(--text-secondary); font-weight:500; }
+  .sc-rank td.rk { color:var(--text-secondary); }
+  .sc-rank tr.sc-ep-row td { background:var(--bg-tertiary); text-align:left; white-space:normal; padding:0.35rem 0.6rem; }
+  .sc-ep-btn { background:transparent; border:1px solid var(--border); border-radius:4px; color:var(--foreground);
+               font-size:0.74rem; padding:0.05rem 0.4rem; cursor:pointer; font-variant-numeric:tabular-nums; }
+  .sc-ep-btn:hover { border-color:var(--ring); }
+  .sc-ep-list { display:flex; flex-direction:column; gap:0.2rem; font-size:0.78rem; }
+  .sc-ep-list > div { display:flex; flex-wrap:wrap; gap:0.3rem 0.6rem; align-items:center; }
+  .sc-ep-list .mk { font-weight:600; min-width:2.6rem; }
+
   @media (max-width: 1100px) {
     .sc-auto-body { grid-template-columns:minmax(0,1fr); }
     .sc-list { max-height:none; }
@@ -159,6 +185,18 @@
     </aside>
 
     <main class="sc-main">
+      <section class="sc-panel" id="rankPanel" style="display:none">
+        <div class="sc-panel-head">
+          <h2>Team rankings</h2>
+          <span class="sc-sub" id="rankSub"></span>
+          <div class="sc-controls">
+            <span class="sc-chips" id="rankTabs" role="tablist" aria-label="Ranking"></span>
+          </div>
+        </div>
+        <div class="sc-table-wrap" id="rankBody"></div>
+        <p class="sc-note" id="rankNote"></p>
+      </section>
+
       <section class="sc-panel" id="autoPanel">
         <div class="sc-panel-head">
           <h2 id="autoTitle">Auto paths</h2>
@@ -346,8 +384,9 @@ async function init() {
 }
 
 async function selectEvent(eventKey, wantTeam) {
-  const tok = ++S.token;
+  const tok = ++S.token, evTok = S.evToken = (S.evToken || 0) + 1;
   S.event = eventKey; S.team = null; S.auto = S.heat = null; S.sel = null;
+  $('rankPanel').style.display = 'none'; S.rank = {};
   const ev = S.events.find(e => e.event_key === eventKey) || {};
   S.year = ev.year;
   $('eventStatus').textContent = 'Loading replays…';
@@ -381,6 +420,7 @@ async function selectEvent(eventKey, wantTeam) {
   $('eventStatus').innerHTML = parts.join(' · ');
   $('heatPanel').style.display = S.metrics.includes('shift_heatmap') ? '' : 'none';
   $('autoPanel').style.display = S.metrics.includes('auto_paths') ? '' : 'none';
+  loadRankings(eventKey, evTok);
   renderTeams();
   const t = S.teams.find(x => String(x.team_number) === String(wantTeam))
          || S.teams.find(x => x.n_labelled > 0) || S.teams[0];
@@ -413,6 +453,7 @@ async function selectTeam(team) {
   const tok = ++S.token;
   S.team = team; S.sel = null; S.open = new Set();
   renderTeams(); setURL();
+  if ($('rankPanel').style.display !== 'none') renderRankings();
   const active = $('teamList').querySelector('.sc-team.active');
   if (active) active.scrollIntoView({block: 'nearest'});
   $('autoTitle').textContent = `Auto paths — ${team}`;
@@ -1048,6 +1089,171 @@ function drawMini(cv, bk, row, val, max, fmtV) {
       : `x ${fx.toFixed(1)} m, y ${fy.toFixed(1)} m: no time`;
   };
 }
+
+// ------------------------------------------------------------------ team rankings
+// Event-wide tables, one envelope per metric fetched once per event. Rows sort
+// by the metric's rank; headers re-sort; clicking a row selects that team.
+const num = (v, d = 2) => v == null ? '—' : Number(v).toFixed(d);
+const clock = v => v == null ? '—' : `${Math.floor(v / 60)}:${String(Math.floor(v % 60)).padStart(2, '0')}`;
+const nMatches = t => `${t.n_counted ?? 0}/${t.n_matches ?? 0}`;
+const COMMON_COLS = [
+  {id: 'n', label: 'Matches', title: 'Counted matches (enough valid tracking) / matches in the lineup',
+   get: t => t.n_counted, show: nMatches},
+  {id: 'cov', label: 'Coverage', title: 'Valid (non-held) tracked seconds ÷ seconds on the field, all lineup matches',
+   get: t => t.coverage, show: t => pct(t.coverage)},
+];
+const RANK_TABS = [
+  {key: 'movement', label: 'Movement', cols: [
+    {id: 'score', label: 'Avg speed', title: 'Rank score: average speed over all tracked time = moving share × mean speed while moving (m/s)',
+     get: t => t.avg_speed_mps, show: t => num(t.avg_speed_mps), score: true},
+    {id: 'mf', label: 'Moving %', title: 'Moving seconds ÷ (moving + stationary) seconds, pooled over counted matches',
+     get: t => t.moving_frac, show: t => pct(t.moving_frac)},
+    {id: 'ms', label: 'Moving s/match', title: 'Raw moving seconds per counted match (shrinks with low coverage)',
+     get: t => t.moving_s_per_match, show: t => fmtS(t.moving_s_per_match)},
+    {id: 'ss', label: 'Stopped s/match', title: 'Raw stationary seconds per counted match',
+     get: t => t.stationary_s_per_match, show: t => fmtS(t.stationary_s_per_match)},
+    {id: 'med', label: 'Median m/s', title: 'Median speed while moving', get: t => t.median_moving_mps, show: t => num(t.median_moving_mps)},
+    {id: 'p90', label: 'p90 m/s', title: '90th-percentile speed while moving', get: t => t.p90_moving_mps, show: t => num(t.p90_moving_mps)},
+    {id: 'top', label: 'Top m/s', title: 'Typical top speed: median over matches of the highest speed held for the sustain window',
+     get: t => t.max_sustained_mps, show: t => num(t.max_sustained_mps)},
+    {id: 'tmf', label: 'Teleop moving %', title: 'Moving share in teleop only', get: t => t.teleop?.moving_frac, show: t => pct(t.teleop?.moving_frac)},
+    {id: 'tav', label: 'Teleop avg', title: 'Average speed in teleop only (m/s)', get: t => t.teleop?.avg_speed_mps, show: t => num(t.teleop?.avg_speed_mps)},
+  ]},
+  {key: 'cycles', label: 'Cycles', cols: [
+    {id: 'score', label: 'Cycles/min', title: 'Rank score: teleop cycles per tracked teleop minute, pooled over counted matches',
+     get: t => t.cycles_per_min, show: t => num(t.cycles_per_min), score: true},
+    {id: 'ct', label: 'Teleop/match', title: 'Completed teleop cycles per counted match (raw: undercounts with low coverage)',
+     get: t => t.cycles_teleop_per_match, show: t => num(t.cycles_teleop_per_match, 1)},
+    {id: 'ca', label: 'Auto/match', title: 'Completed auto cycles per counted match', get: t => t.cycles_auto_per_match, show: t => num(t.cycles_auto_per_match, 1)},
+    {id: 'cyc', label: 'Cycle s', title: 'Mean cycle time: neutral-zone entry to the next neutral-zone entry',
+     get: t => t.mean_cycle_s, show: t => fmtS(t.mean_cycle_s)},
+    {id: 'nv', label: 'Neutral visit', title: 'Mean seconds in the neutral zone per counted visit', get: t => t.mean_neutral_visit_s, show: t => fmtS(t.mean_neutral_visit_s)},
+    {id: 'ov', label: 'Own visit', title: 'Mean seconds in the own alliance zone per counted visit', get: t => t.mean_own_visit_s, show: t => fmtS(t.mean_own_visit_s)},
+    {id: 'tt', label: 'Tracked teleop', title: 'Valid tracked teleop seconds per counted match (of 140)',
+     get: t => t.teleop_tracked_s_per_match, show: t => fmtS(t.teleop_tracked_s_per_match)},
+    {id: 'rs', label: 'Resets', title: 'Tracking gaps longer than max_gap_s that reset the zone state machine (all counted matches)',
+     get: t => t.resets, show: t => t.resets ?? '—'},
+  ]},
+  {key: 'defense', label: 'Defense', cols: [
+    {id: 'score', label: 'Opp side %', title: "Rank score: share of tracked teleop time in (or near) the opponent's alliance zone",
+     get: t => t.opp_side_frac, show: t => pct(t.opp_side_frac), score: true},
+    {id: 'os', label: 's/match', title: 'Raw seconds there per counted match', get: t => t.opp_side_s_per_match, show: t => fmtS(t.opp_side_s_per_match)},
+    {id: 'on', label: 'per 140 s', title: 'Share × 140 s: what a fully tracked teleop would show', get: t => t.opp_side_s_norm, show: t => fmtS(t.opp_side_s_norm)},
+    {id: 'ol', label: 'Long matches', title: 'Counted matches with at least long_visit_s there', get: t => t.matches_long, show: t => t.matches_long ?? '—'},
+    {id: 'st', label: 'By station', title: 'Share there per alliance + station', get: () => null, nosort: true,
+     show: t => Object.entries(t.by_station || {}).map(([k, v]) => `${k} ${pct(v.opp_side_frac)} (${v.n_counted})`).join(', ') || '—'},
+  ]},
+  {key: 'bump_stuck', label: 'Stuck on bump', cols: [
+    {id: 'score', label: 'Stuck s', title: 'Rank score: total seconds beached on a bump (counted matches)',
+     get: t => t.stuck_s_total, show: t => fmtS(t.stuck_s_total), score: true},
+    {id: 'ep', label: 'Episodes', title: 'Episodes > min_stuck_s', get: t => t.episodes, show: t => t.episodes ?? '—'},
+    {id: 'mw', label: 'Matches w/ ep.', title: 'Counted matches with at least one episode', get: t => t.matches_with_episode, show: t => t.matches_with_episode ?? '—'},
+    {id: 'lg', label: 'Longest', title: 'Longest episode', get: t => t.longest_s, show: t => fmtS(t.longest_s)},
+    {id: 'pm', label: 's/match', title: 'Stuck seconds per counted match', get: t => t.stuck_s_per_match, show: t => fmtS(t.stuck_s_per_match)},
+    {id: 'list', label: 'Details', title: 'Episodes: match, time, duration, bump', get: () => null, nosort: true,
+     show: t => (t.episode_list || []).length
+       ? `<button class="sc-ep-btn" data-ep="${t.team_number}" aria-expanded="${S.rankOpen.has(t.team_number)}">${S.rankOpen.has(t.team_number) ? '▾' : '▸'} ${t.episode_list.length}</button>` : '—', html: true},
+  ]},
+];
+try { S.rankTab = localStorage.getItem('scouting.rankTab') || 'movement'; } catch (_) { S.rankTab = 'movement'; }
+S.rank = {}; S.rankSort = {}; S.rankOpen = new Set();
+
+async function loadRankings(eventKey, tok) {
+  const tabs = RANK_TABS.filter(t => S.metrics.includes(t.key));
+  $('rankPanel').style.display = tabs.length ? '' : 'none';
+  S.rank = {}; S.rankOpen = new Set();
+  if (!tabs.length) return;
+  if (!tabs.some(t => t.key === S.rankTab)) S.rankTab = tabs[0].key;
+  renderRankings();
+  const ek = encodeURIComponent(eventKey);
+  await Promise.all(tabs.map(async t => {
+    const env = await getJSON(`/api/scouting/${ek}/metric/${t.key}`).catch(e => ({error: e.message}));
+    if (tok !== S.evToken) return;
+    S.rank[t.key] = env;
+    if (t.key === S.rankTab) renderRankings();
+  }));
+}
+
+function rankSortState(key) {
+  return S.rankSort[key] || {id: 'rank', dir: 1};
+}
+
+function renderRankings() {
+  const tabs = RANK_TABS.filter(t => S.metrics.includes(t.key));
+  if (!tabs.length) return;
+  $('rankTabs').innerHTML = tabs.map(t =>
+    `<button class="sc-chip${t.key === S.rankTab ? ' on' : ''}" role="tab" data-tab="${t.key}" aria-selected="${t.key === S.rankTab}">${esc(t.label)}</button>`).join('');
+  const tab = tabs.find(t => t.key === S.rankTab) || tabs[0];
+  const env = S.rank[tab.key], body = $('rankBody');
+  if (!env) { body.innerHTML = '<div class="sc-empty" style="padding:1rem">Computing…</div>'; $('rankSub').textContent = ''; $('rankNote').textContent = ''; return; }
+  if (env.error) { body.innerHTML = `<div class="sc-empty" style="padding:1rem">Could not compute: ${esc(env.error)}</div>`; return; }
+  const cols = [{id: 'rank', label: '#', title: "The metric's rank (teams with no counted match are unranked)", get: t => t.rank, show: t => t.rank ?? '—', cls: 'rk'},
+                {id: 'team', label: 'Team', get: t => t.team_number, show: t => t.team_number, cls: 'team left'},
+                ...tab.cols, ...COMMON_COLS];
+  const st = rankSortState(tab.key), col = cols.find(c => c.id === st.id) || cols[0];
+  const rows = Object.values(env.teams || {});
+  rows.sort((a, b) => {
+    const va = col.get(a), vb = col.get(b);
+    if (va == null && vb == null) return a.team_number - b.team_number;
+    if (va == null) return 1;           // missing values always last
+    if (vb == null) return -1;
+    return (va < vb ? -1 : va > vb ? 1 : 0) * st.dir || (a.rank ?? 1e9) - (b.rank ?? 1e9);
+  });
+  const minM = env.params?.min_matches ?? 2;
+  const head = `<tr>${cols.map(c => {
+    const on = c.id === st.id;
+    return `<th class="${c.cls?.includes('left') ? 'left' : ''}${on ? ' sorted' : ''}" ${c.nosort ? '' : `data-sort="${c.id}"`}
+      title="${esc(c.title || '')}" aria-sort="${on ? (st.dir > 0 ? 'ascending' : 'descending') : 'none'}">${esc(c.label)}${on ? `<span class="dir">${st.dir > 0 ? '▲' : '▼'}</span>` : ''}</th>`;
+  }).join('')}</tr>`;
+  const html = rows.map(t => {
+    const cls = ['sc-rrow', t.team_number === S.team ? 'active' : '', t.low_data ? 'low' : ''].join(' ');
+    const tip = t.low_data ? ` title="Only ${t.n_counted} counted match${t.n_counted === 1 ? '' : 'es'} (< ${minM}): treat with care"` : '';
+    let tr = `<tr class="${cls}" data-team="${t.team_number}"${tip}>${cols.map(c =>
+      `<td class="${c.cls || ''}${c.score ? ' score' : ''}">${c.html ? c.show(t) : esc(c.show(t))}</td>`).join('')}</tr>`;
+    if (tab.key === 'bump_stuck' && S.rankOpen.has(t.team_number)) tr += episodeRow(t, cols.length);
+    return tr;
+  }).join('');
+  body.innerHTML = `<table class="sc-table sc-rank"><thead>${head}</thead><tbody>${html}</tbody></table>`;
+  const ranked = rows.filter(t => t.rank != null).length, low = rows.filter(t => t.low_data).length;
+  $('rankSub').textContent = `${rows.length} teams · ${ranked} ranked · ${low} with < ${minM} counted matches (greyed)`;
+  const extra = tab.key === 'movement' && env.event_stats?.held_frac != null
+    ? ` At this event ${pct(env.event_stats.held_frac)} of labelled robot time was held (frozen) positions that ended somewhere else and is excluded as unknown; frozen stretches where the robot was still in the same place afterwards (${fmtS(env.event_stats.held_kept_s)}) count as stationary.` : '';
+  $('rankNote').textContent = (env.legend || '') + extra + ' Click a row to show that team below; click a header to re-sort.';
+}
+
+function episodeRow(t, span) {
+  const eps = (t.episode_list || []).map(e => `<div>
+      <span class="mk">${esc(matchLabel(e))}</span>${allianceChip(e)}
+      <span>${e.period === 'auto' ? 'Auto' : 'Teleop'} clock ${clock(e.remaining_at_start)} (t = ${num(e.t_start, 1)} s)</span>
+      <span><b>${fmtS(e.duration_s)}</b> on the ${esc(e.bump)} bump (${esc(e.bump_field_side)} side of the field)</span>
+      ${e.counted ? '' : '<span class="sc-badge warn" title="Match has too little valid tracking to count toward the totals">not counted</span>'}</div>`).join('');
+  return `<tr class="sc-ep-row"><td colspan="${span}"><div class="sc-ep-list">${eps}</div></td></tr>`;
+}
+
+$('rankTabs').addEventListener('click', e => {
+  const b = e.target.closest('.sc-chip');
+  if (!b) return;
+  S.rankTab = b.dataset.tab;
+  try { localStorage.setItem('scouting.rankTab', S.rankTab); } catch (_) {}
+  renderRankings();
+});
+$('rankBody').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]');
+  if (th) {
+    const id = th.dataset.sort, cur = rankSortState(S.rankTab);
+    // rank / team start ascending, metric columns start descending (biggest first)
+    S.rankSort[S.rankTab] = cur.id === id ? {id, dir: -cur.dir} : {id, dir: id === 'rank' || id === 'team' ? 1 : -1};
+    renderRankings(); return;
+  }
+  const ep = e.target.closest('.sc-ep-btn');
+  if (ep) {
+    const team = +ep.dataset.ep;
+    S.rankOpen.has(team) ? S.rankOpen.delete(team) : S.rankOpen.add(team);
+    renderRankings(); return;
+  }
+  const row = e.target.closest('tr.sc-rrow');
+  if (row) selectTeam(+row.dataset.team);
+});
 
 // ------------------------------------------------------------------ resize
 let resizeTimer = null;

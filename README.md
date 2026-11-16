@@ -442,6 +442,15 @@ and [Team 1148's Project Vector](https://www.chiefdelphi.com/t/1148-project-vect
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, study, modify, and
-share for any noncommercial purpose (education, research, personal projects,
-FRC teams). Commercial use is not permitted.
+Copyright (C) 2026 Nick Foote, FRC Team 2102 "Team Paradox"
+(https://github.com/Paradox2102).
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(AGPL-3.0-only) — free to use, study, modify, and share. If you distribute a
+modified version, or run one as a network service for others, you must make
+its complete source available under the same license.
+
+This project builds on [Ultralytics YOLO](https://github.com/ultralytics/ultralytics),
+which is itself AGPL-3.0; the shipped YOLO weights were trained with it.
+Models downloaded at first use carry their own licenses — notably SAM 3 (Meta's
+SAM License) and Qwen / DINOv2 (Apache-2.0).

@@ -1,0 +1,78 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.flow { display: grid; grid-template-columns: 1fr 22px 1fr 22px 1fr; gap: 10px 4px; align-items: stretch; }
+.flow .card { min-height: 220px; }
+.down { grid-column: 5; text-align: center; color: var(--dim); font-size: 26px; line-height: 1; }
+.row2 { direction: rtl; }
+.row2 > * { direction: ltr; }
+.out { border-color: var(--amber); }
+</style></head>
+<body>
+<h1>One match, start to finish</h1>
+<div class="sub">Input is the TBA-linked YouTube video. Nothing at the event, no per-event training.</div>
+
+<div class="flow">
+  <div class="card">
+    <div class="step amber">1 · Set up</div>
+    <h3>Calibrate + trim</h3>
+    <ul>
+      <li>Find AprilTags, solve each camera's position, angle, lens</li>
+      <li>Re-check every match, re-solve if a camera got bumped</li>
+      <li>Read the scoreboard clock, keep only auto + teleop</li>
+    </ul>
+  </div>
+  <div class="arrow">→</div>
+  <div class="card">
+    <div class="step blue">2 · See</div>
+    <h3>Detect</h3>
+    <div><span class="chip a">YOLO bumpers</span><span class="chip a">YOLO field</span><span class="chip d">YOLO people</span></div>
+    <ul>
+      <li>Red / blue bumper boxes give alliance colour</li>
+      <li>Robots, fuel, hub openings</li>
+      <li>Refs + field staff so they don't become robots</li>
+    </ul>
+  </div>
+  <div class="arrow">→</div>
+  <div class="card">
+    <div class="step blue">3 · Follow</div>
+    <h3>Track on the field</h3>
+    <div><span class="chip b">3-camera tracker</span><span class="chip b">SAM 3</span></div>
+    <ul>
+      <li>All 3 cameras merged into field coordinates (metres)</li>
+      <li>SAM 3 masks only where robots cross or hide</li>
+    </ul>
+  </div>
+
+  <div></div><div></div><div></div><div></div>
+  <div class="down">↓</div>
+</div>
+
+<div class="flow row2" style="margin-top:2px">
+  <div class="card">
+    <div class="step red">4 · Name</div>
+    <h3>Identify</h3>
+    <div><span class="chip r">Our digit reader</span><span class="chip r">Jev</span><span class="chip r">Our embedder</span></div>
+    <ul>
+      <li>Read bumper numbers during the match</li>
+      <li>Re-label the whole match with hindsight at the end</li>
+    </ul>
+  </div>
+  <div class="arrow">←</div>
+  <div class="card out">
+    <div class="step amber">5 · Use</div>
+    <h3>Outputs</h3>
+    <ul>
+      <li>Replay video with overlays + top-down map</li>
+      <li>Per-team auto paths, heatmaps by hub shift</li>
+      <li>JSON export for our scouting app</li>
+    </ul>
+  </div>
+  <div class="arrow" style="visibility:hidden">←</div>
+  <div class="card" style="border-style:dashed; background:transparent">
+    <div class="step" style="color:var(--dim)">Timing</div>
+    <h3>~5 min per match</h3>
+    <p>on a rented RTX 5090 (about 7–9 min on my home 3090). Results land a few minutes after the video goes up.</p>
+  </div>
+</div>
+</body></html>

@@ -178,9 +178,15 @@ deploy/runpod/tune_results/
 deploy/runpod/.swarm/
 data/runpod_pull/
 
-# Local-only: batch run logs, scratch datasets, blog drafts, agent skill locks
+# Local-only: batch run logs, scratch datasets, agent skill locks
 data/batch_logs/
 data/hub_zone_gapfill/
-docs/blog/
+# Blog: generated upload copies, unused screenshot alternates, third-party data (Manta notes, Match13 API)
+docs/blog/upload/
+docs/blog/*.discourse.md
+docs/blog/img/candidates/
+docs/blog/cmp/data/manta_notes.json
+docs/blog/cmp/data/match13_*.json
 skills-lock.json
 .ui-design/
+docs/blog/cmp/data/statbotics_*.json

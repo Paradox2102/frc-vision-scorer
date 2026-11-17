@@ -1,0 +1,62 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.flow { display: grid; grid-template-columns: 1fr 30px 1.25fr 30px 1fr; align-items: stretch; }
+.pods { display: grid; gap: 8px; }
+.pod { background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; display: flex; justify-content: space-between; align-items: center; }
+.pod b { font-size: 15.5px; }
+.pod span { font-size: 13.5px; color: var(--dim); }
+.busy { color: var(--amber) !important; } .idle { color: var(--green) !important; }
+.sync { margin-top: 10px; text-align: center; color: var(--dim); font-size: 14px; border-top: 1px dashed var(--line); padding-top: 8px; }
+table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+td, th { text-align: left; padding: 7px 8px; font-size: 15.5px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.costs { margin-top: 18px; }
+</style></head>
+<body>
+<h1>At a live event: a small swarm of rented GPUs</h1>
+<div class="sub">One match per server. More servers scale almost linearly, and a bigger GPU barely helps (the pipeline is CPU-bound; the GPU sits ~25% busy).</div>
+
+<div class="flow">
+  <div class="card">
+    <div class="step amber">Home PC</div>
+    <h3>Watch + fetch</h3>
+    <ul>
+      <li>Polls TBA every 60 s for new match videos</li>
+      <li>Downloads at home (YouTube blocks datacenter IPs)</li>
+      <li>Uploads to the pod that's been idle longest</li>
+    </ul>
+  </div>
+  <div class="arrow">→</div>
+  <div class="card">
+    <div class="step blue">vast.ai · RTX 5090 pods</div>
+    <div class="pods">
+      <div class="pod"><b>Pod 1</b><span class="busy">qm41 · 3 of ~5 min</span></div>
+      <div class="pod"><b>Pod 2</b><span class="busy">qm42 · just started</span></div>
+      <div class="pod"><b>Pod 3</b><span class="idle">idle, next in line</span></div>
+    </div>
+    <div class="sync">A camera move solved on one pod is copied to all pods</div>
+  </div>
+  <div class="arrow">→</div>
+  <div class="card">
+    <div class="step amber">Back home</div>
+    <h3>Results</h3>
+    <ul>
+      <li>Each finished match is pulled and imported into the local app</li>
+      <li>Replays, auto paths, heatmaps, export to our scouting app</li>
+    </ul>
+  </div>
+</div>
+
+<div class="card costs">
+  <div class="step red">Rough cost for a 3-day event (~27 hours of matches)</div>
+  <table>
+    <tr><th>Setup</th><th>Keeps up?</th><th style="text-align:right">GPU cost</th></tr>
+    <tr><td>1 × RTX 5090 (~$0.75–1.00/h)</td><td>Barely: ~5 min per match vs ~7 min between quals, no slack for delays</td><td class="n">~$20–27</td></tr>
+    <tr><td><b>2 × RTX 5090</b></td><td><b>Yes, with room to catch up after a backlog</b></td><td class="n"><b>~$40–55</b></td></tr>
+    <tr><td>3 × RTX 5090</td><td>Yes, also re-runs and back-catalog</td><td class="n">~$60–80</td></tr>
+    <tr><td>Jev reads + lineup checks</td><td>~5¢ per match, ~100 quals</td><td class="n">~$5</td></tr>
+  </table>
+</div>
+</body></html>

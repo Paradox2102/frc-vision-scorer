@@ -1,0 +1,102 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.lane h2 { font-size: 19px; margin-bottom: 10px; }
+.stack { display: grid; gap: 8px; }
+.stack .card { padding: 11px 14px; }
+.stack .card h3 { font-size: 16.5px; margin-bottom: 3px; }
+.stack .card p { font-size: 15px; }
+.num { display: inline-block; width: 24px; height: 24px; border-radius: 50%; background: var(--red); color: var(--bg); font-weight: 800; font-size: 14px; text-align: center; line-height: 24px; margin-right: 8px; }
+.num.b { background: var(--blue); }
+.rule { margin-top: 16px; border: 1px solid var(--amber); border-radius: 12px; padding: 12px 16px; }
+.rule b { color: var(--amber); }
+.rule p { color: var(--text); font-size: 16px; }
+
+.ex { margin-top: 18px; }
+.ex h2 { font-size: 19px; margin-bottom: 2px; }
+.ex .sub { margin-bottom: 12px; font-size: 15px; }
+.tl { display: grid; grid-template-columns: 150px repeat(2, 1fr) 62px repeat(3, 1fr) 62px repeat(2, 1fr); gap: 5px; align-items: stretch; }
+.rl { font-size: 14px; font-weight: 700; color: var(--text); display: flex; align-items: center; }
+.rl small { display: block; color: var(--dim); font-weight: 400; font-size: 12.5px; }
+.w { border-radius: 6px; padding: 5px 4px; text-align: center; font-size: 14px; line-height: 1.2; display: flex; flex-direction: column; justify-content: center; min-height: 44px; }
+.w small { font-size: 11.5px; opacity: .85; }
+.blank { background: var(--card2); border: 1px solid var(--line); color: var(--dim); }
+.read { background: var(--red); color: var(--bg); font-weight: 800; }
+.line { background: transparent; border: 2px solid var(--red); color: var(--text); font-weight: 700; }
+.uns { background: transparent; border: 1.5px dashed #6b7590; color: var(--dim); }
+.gapc { color: var(--dim); font-size: 11.5px; text-align: center; display: flex; align-items: center; justify-content: center; line-height: 1.15; }
+.final { display: grid; grid-template-columns: 150px 1fr; gap: 5px; margin-top: 10px; }
+.bar { display: grid; grid-template-columns: repeat(2, 1fr) 62px repeat(3, 1fr) 62px repeat(2, 1fr); gap: 5px; }
+.bar div { height: 34px; border-radius: 6px; background: #3d8fe0; color: var(--bg); font-weight: 800; display: flex; align-items: center; justify-content: center; font-size: 15px; }
+.bar .h { background: transparent; border: 1.5px dashed #6b7590; color: var(--dim); font-weight: 600; font-size: 13px; }
+.bar .g { background: transparent; }
+.sep { grid-column: 1 / -1; height: 1px; background: var(--line); margin: 4px 0; }
+</style></head>
+<body>
+<h1>Putting a team number on each track</h1>
+<div class="sub">The bumper number is the only thing that tells two same-alliance robots apart. Everything else only supports it.</div>
+
+<div class="cols">
+  <div class="lane">
+    <h2 class="blue">During the match</h2>
+    <div class="stack">
+      <div class="card"><h3><span class="num b">1</span>Crop the bumpers</h3>
+        <p>Skip a crop when the bumper is hidden in every camera, or the robot hasn't moved since the last read.</p></div>
+      <div class="card"><h3><span class="num b">2</span>Read the number</h3>
+        <p><span class="chip r">Jev</span> picks from only the 3 teams on that alliance, or says "unreadable".</p></div>
+      <div class="card"><h3><span class="num b">3</span>Vote, lock, re-check</h3>
+        <p>3 agreeing reads lock a team; 2 contradicting reads unlock it. <span class="chip r">Our embedder</span> keeps the track on the same robot through crossings.</p></div>
+    </div>
+  </div>
+
+  <div class="lane">
+    <h2 class="red">After the match: relabel with hindsight</h2>
+    <div class="stack">
+      <div class="card"><h3><span class="num">1</span>Cut every track into short windows</h3>
+        <p>4 s or less, and always cut where the track was lost or jumped, so each window is almost surely one robot.</p></div>
+      <div class="card"><h3><span class="num">2</span>Read digits in each window</h3>
+        <p><span class="chip r">Our digit reader</span> runs locally and only answers when it's sure.</p></div>
+      <div class="card"><h3><span class="num">3</span>Match the rest against a lineup</h3>
+        <p>The sure reads give ~6 photos of each robot <i>from this match</i>. For each unread window, <span class="chip r">Jev</span> picks the matching robot or says "unsure".</p></div>
+    </div>
+  </div>
+</div>
+
+<div class="ex card">
+  <h2 class="red">Example (illustrative): one red robot, 0:20 to 0:51 of the match</h2>
+  <div class="sub">Each box is one window of that robot's track. Follow a column down to see what happened to it.</div>
+  <div class="tl">
+    <div class="rl"><div>1 · Cut<small>windows ≤ 4 s</small></div></div>
+    <div class="w blank">0:20<small>–0:24</small></div><div class="w blank">0:24<small>–0:27</small></div>
+    <div class="gapc">lost behind hub</div>
+    <div class="w blank">0:31<small>–0:35</small></div><div class="w blank">0:35<small>–0:38</small></div><div class="w blank">0:38<small>–0:41</small></div>
+    <div class="gapc">track jumped</div>
+    <div class="w blank">0:44<small>–0:48</small></div><div class="w blank">0:48<small>–0:51</small></div>
+
+    <div class="sep"></div>
+    <div class="rl"><div>2 · Digit reader<small>sure reads only</small></div></div>
+    <div class="w read">6497<small>read</small></div><div class="w blank">no read<small>bumper hidden</small></div>
+    <div></div>
+    <div class="w blank">no read<small>blurry</small></div><div class="w read">6497<small>read</small></div><div class="w blank">no read<small>behind fuel</small></div>
+    <div></div>
+    <div class="w blank">no read<small>side view</small></div><div class="w read">6497<small>read</small></div>
+
+    <div class="sep"></div>
+    <div class="rl"><div>3 · Lineup match<small>Jev, unread windows</small></div></div>
+    <div class="w read">6497<small>read</small></div><div class="w line">6497<small>matched</small></div>
+    <div></div>
+    <div class="w line">6497<small>matched</small></div><div class="w read">6497<small>read</small></div><div class="w uns">unsure</div>
+    <div></div>
+    <div class="w line">6497<small>matched</small></div><div class="w read">6497<small>read</small></div>
+  </div>
+  <div class="final">
+    <div class="rl"><div>Final label<small>what the replay shows</small></div></div>
+    <div class="bar">
+      <div>6497</div><div>6497</div><div class="g"></div><div>6497</div><div>6497</div><div class="h">no label</div><div class="g"></div><div>6497</div><div>6497</div>
+    </div>
+  </div>
+</div>
+
+<div class="rule"><p><b>House rule:</b> a wrong number is worse than no number. Appearance alone never names a robot, and every step is allowed to abstain, so "unsure" windows stay unlabelled instead of guessing.</p></div>
+</body></html>

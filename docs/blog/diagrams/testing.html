@@ -1,0 +1,57 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.lanes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+.lane .card { height: 100%; }
+.lane h3 { font-size: 18px; }
+.big { font-size: 30px; font-weight: 800; line-height: 1.1; margin: 6px 0 2px; }
+.lane ul { margin-top: 8px; }
+.foot { margin-top: 16px; display: grid; grid-template-columns: 1fr; }
+.foot .card { border-color: var(--amber); }
+.foot p { color: var(--text); }
+</style></head>
+<body>
+<h1>How we know if a change helped</h1>
+<div class="sub">Everything is scored against robots a human tracked by hand, not against the pipeline's own opinion.</div>
+
+<div class="lanes">
+  <div class="lane"><div class="card">
+    <div class="step amber">1 · Ground truth</div>
+    <h3>Hand-track every robot</h3>
+    <div class="big amber">23 robots</div>
+    <p>4 matches · 4 events · 2 seasons</p>
+    <ul>
+      <li>Hold the mouse on one robot at 0.25× speed; let go to hand off to a corner camera</li>
+      <li>Hold Shift when it's hidden: marked as a guess</li>
+    </ul>
+  </div></div>
+
+  <div class="lane"><div class="card">
+    <div class="step blue">2 · Score</div>
+    <h3>Compare every 0.25 s</h3>
+    <div class="big blue">≤ 1 m</div>
+    <p>to count as the same robot</p>
+    <ul>
+      <li>Was the robot tracked?</li>
+      <li>Right team, wrong team, or no team?</li>
+      <li>Seconds of mis-ID, position error</li>
+    </ul>
+  </div></div>
+
+  <div class="lane"><div class="card">
+    <div class="step red">3 · Decide</div>
+    <h3>A/B on all 4 matches</h3>
+    <div class="big red">× 2 runs</div>
+    <p>each arm, because identical runs differ</p>
+    <ul>
+      <li>Labels swing ±5 pts between identical runs</li>
+      <li>A change ships only if it beats that noise and no match gets worse</li>
+    </ul>
+  </div></div>
+</div>
+
+<div class="foot"><div class="card">
+  <div class="step amber">Claude's role: judge and teacher, never in the live pipeline</div>
+  <p>Claude Code ran as a blind judge on the same crops and track windows the pipeline saw, and was checked against the hand ground truth. It showed what was possible (and how), calibrated a cheap automatic auditor, and labelled the gold sets our own small models were trained and tested on.</p>
+</div></div>
+</body></html>

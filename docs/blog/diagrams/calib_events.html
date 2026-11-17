@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.ev { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 22px; }
+.ev h2 { grid-column: 1 / -1; font-size: 19px; }
+.ev h2 small { color: var(--dim); font-weight: 400; font-size: 15px; margin-left: 8px; }
+.ev img { width: 100%; display: block; border-radius: 8px; border: 1px solid var(--line); }
+.stack { display: grid; gap: 10px; align-content: start; }
+.lab { color: var(--dim); font-size: 13.5px; margin-top: 4px; }
+</style></head>
+<body>
+<h1>Same game, very different broadcasts</h1>
+<div class="sub">Left: the app finds where each camera sits in the broadcast. Right: the field wireframe after the automatic AprilTag solve.</div>
+
+<div class="ev">
+  <h2 class="amber">Hawaii Regional <small>low, wide main camera; scoreboard and corner cameras stacked mid-screen</small></h2>
+  <div><img src="assets/composite_layout_2026hiho.jpg"><div class="lab">Broadcast layout detected: main (green), corner left (cyan), corner right (magenta)</div></div>
+  <div class="stack">
+    <div><img src="assets/calibration_auto_2026hiho_main.jpg"><div class="lab">Main camera solve</div></div>
+    <div><img src="assets/calibration_auto_2026hiho_corner_right.jpg"><div class="lab">Corner right solve</div></div>
+  </div>
+</div>
+
+<div class="ev">
+  <h2 class="blue">Utah Regional <small>high, steep main camera; corners along the bottom</small></h2>
+  <div><img src="assets/composite_layout_2026utwv.jpg"><div class="lab">Broadcast layout detected</div></div>
+  <div class="stack">
+    <div><img src="assets/calibration_auto_2026utwv_main.jpg"><div class="lab">Main camera solve</div></div>
+    <div><img src="assets/calibration_auto_2026utwv_corner_right.jpg"><div class="lab">Corner right solve</div></div>
+  </div>
+</div>
+</body></html>

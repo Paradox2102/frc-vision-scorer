@@ -1,0 +1,68 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css">
+<style>
+.legend { display: flex; gap: 22px; margin: 0 0 18px; font-size: 15.5px; color: var(--dim); flex-wrap: wrap; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+.c-right { background: #3d8fe0; } .c-wrong { background: #e5484d; } .c-unl { background: #7c86a2; }
+.c-none { background: transparent; border: 1.5px dashed #4a5578; }
+.grid { display: grid; grid-template-columns: 210px 1fr 92px; gap: 16px 14px; align-items: center; }
+.head { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
+.name b { display: block; font-size: 17px; }
+.name small { color: var(--dim); font-size: 14px; }
+.bar { display: flex; height: 38px; gap: 2px; }
+.seg { height: 100%; display: flex; align-items: center; padding-left: 8px; font-size: 15px; font-weight: 700; color: #0d1220; white-space: nowrap; overflow: visible; }
+.seg:first-child { border-radius: 4px 0 0 4px; }
+.seg:last-child { border-radius: 0 4px 4px 0; }
+.seg.none { border: 1.5px dashed #4a5578; border-left: none; background: transparent; color: var(--dim); font-weight: 600; }
+.seg.wrong { padding-left: 0; }
+.mis { font-size: 17px; font-weight: 700; text-align: right; }
+.mis small { display:block; color: var(--dim); font-weight: 400; font-size: 13px; }
+.mean { border-top: 1px solid var(--line); padding-top: 14px; }
+.bar.mean { height: 52px; }
+.axis { display: flex; justify-content: space-between; color: var(--dim); font-size: 13px; margin-top: -6px; }
+</style></head>
+<body>
+<h1>Hand-tracked ground truth vs. the pipeline</h1>
+<div class="sub">Share of each robot's on-field time (while visible in at least one camera), scored every 0.25 s. Current defaults, Nov 15 2026.</div>
+
+<div class="legend">
+  <span><i class="sw c-right"></i>Tracked, right team</span>
+  <span><i class="sw c-wrong"></i>Tracked, wrong team</span>
+  <span><i class="sw c-unl"></i>Tracked, no team yet</span>
+  <span><i class="sw c-none"></i>Missed, mostly at the field ends and corners</span>
+</div>
+
+<div class="grid" id="g">
+  <div class="head">Match</div><div class="head">Robot-time</div><div class="head" style="text-align:right">Mis-ID</div>
+</div>
+<div class="grid" style="margin-top:6px"><div></div><div class="axis"><span>0%</span><span>50%</span><span>100%</span></div><div></div></div>
+<div class="note">Missed time: about half is within 3.5 m of an alliance wall and a third is in the four field corners, where the corner cameras sit too close and too low to help. The corners are 21% of robot time but 32% of the misses.</div>
+<div class="note" style="margin-top:6px">Mis-ID = seconds per match where a robot carried another team's number (summed over robots). 2026cur qm8 has 5 robots (one no-show); the others have 6.</div>
+
+<script>
+const rows = [
+  ["2026 Curie", "qm8 · 5 robots",        66.8, 1.8, 12.2, 13.8],
+  ["2026 San Diego", "qm14 · 6 robots",   89.3, 0.1, 5.2, 0.5],
+  ["2026 Hopper", "qm45 · 6 robots",      60.7, 2.2, 18.9, 18.8],
+  ["2025 Hopper (Reefscape)", "qm2 · 6 robots", 83.2, 0.3, 4.3, 2.5],
+];
+const mean = ["Mean of 4", "", 75.0, 1.1, 10.1, 8.9];
+const g = document.getElementById('g');
+function add(r, extra) {
+  const [n, s, right, wrong, unl, mis] = r;
+  const none = 100 - right - wrong - unl;
+  const name = `<div class="name ${extra||''}"><b>${n}</b><small>${s}</small></div>`;
+  const seg = (cls, v, label) => `<div class="seg ${cls}" style="flex:0 0 calc(${v}% - 2px)">${label||''}</div>`;
+  const bar = `<div class="bar ${extra||''}">` +
+    seg('c-right', right, Math.round(right) + '%') +
+    seg('c-wrong wrong', Math.max(wrong, 0.35), '') +
+    seg('c-unl', unl, unl >= 8 ? Math.round(unl) + '%' : '') +
+    seg('none', none, none >= 8 ? Math.round(none) + '%' : '') + '</div>';
+  const m = `<div class="mis ${extra||''}">${mis} s<small>${wrong.toFixed(1)}% wrong</small></div>`;
+  g.insertAdjacentHTML('beforeend', name + bar + m);
+}
+rows.forEach(r => add(r));
+add(mean, 'mean');
+</script>
+</body></html>

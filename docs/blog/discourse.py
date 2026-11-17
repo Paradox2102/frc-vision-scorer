@@ -172,9 +172,32 @@ def merge(arg: str | None) -> None:
           else f"clipboard unavailable: open {OUT} and copy it")
 
 
+GITHUB_OUT = HERE / "vision-scouting.md"
+GITHUB_HEADER = ("<!-- Generated from vision-scouting-post.md by `python3 discourse.py github`; "
+                 "edit the post, not this file. -->\n\n")
+
+
+def github() -> None:
+    """Shareable GitHub-rendering copy: no [color] tags, no |WxH hints, captions under images."""
+    text = POST.read_text()
+    text = re.sub(r"\[color=#[0-9A-Fa-f]{3,8}\]", "", text).replace("[/color]", "")
+    text = re.sub(r"^(#+ .*?)\s+-\s+", r"\1: ", text, flags=re.M)      # "Title  - Subtitle" headers
+
+    def img(m: re.Match) -> str:
+        cap, path = m.group(1), m.group(2)
+        cap = cap.split("|")[0].strip()
+        return f"![{cap}]({path})\n*{cap}*" if cap else f"![]({path})"
+
+    text, n_images = re.subn(r"!\[([^\]]*)\]\(([^)\s]+)\)", img, text)
+    GITHUB_OUT.write_text(GITHUB_HEADER + text)
+    print(f"wrote {GITHUB_OUT.name} ({n_images} images)")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "prep":
+    if cmd == "github":
+        github()
+    elif cmd == "prep":
         prep(fresh="--fresh" in sys.argv[2:])
     elif cmd == "merge":
         merge(next((a for a in sys.argv[2:] if not a.startswith("-")), None))

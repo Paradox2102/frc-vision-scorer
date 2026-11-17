@@ -1,6 +1,8 @@
 # Vision scouting blog post (Nov 2026)
 
 - `vision-scouting-post.md` is the post, in Chief Delphi / Discourse markdown with `[color=...]` headers.
+- `vision-scouting.md` is the shareable GitHub-rendering copy (no color tags, captions under images).
+  It's generated: edit the post, then run `python3 discourse.py github`.
 - Images are referenced as `img/...` with Discourse size hints (`|690xH`). To post with all images:
   `python3 discourse.py prep`, drag everything in `upload/` into a new Chief Delphi composer, Ctrl+A,
   Ctrl+C, `python3 discourse.py merge`, then Ctrl+A, Ctrl+V in the composer. If some uploads fail

@@ -1,444 +1,485 @@
+![2102 Vision Scouting](docs/blog/img/splash.png)
+
 # FRC Vision Scorer
 
-Automated vision scouting for FRC (FIRST Robotics Competition) from ordinary
-broadcast match video. Point it at an event's match videos from The Blue
-Alliance and it tracks every robot in real field coordinates, identifies each
-one by reading bumper numbers with a vision-language model, and renders a
-reviewable match replay with a live top-down field map. The whole pipeline
-is designed to process a match in under ~15 minutes on a single 24 GB GPU.
+Automated vision scouting for FRC from the event livestream. Point it at an
+event on The Blue Alliance and it tracks every robot on the field in meters,
+puts a team number on each one by reading bumpers, and turns that into
+scouting data: auto paths, heatmaps, cycle counts, defense time and more. No
+human scouters, no cameras or equipment at the event, and no per-event
+training.
 
-Built for the 2026 REBUILT season by Team 2102 (Team Paradox). **Very much a
-work in progress** — robot detection, tracking, and identity work today;
-fuel attribution doesn't exist yet. See [Limitations](#limitations).
+Built by FRC Team 2102 (Team Paradox) during the 2026 REBUILT season. It's a
+work in progress: detection, location and identity work well; per-robot
+scoring doesn't exist yet.
 
-## Table of Contents
+- **Demo reel** (20 minutes of the whole 2026 Curie Division, good, middling
+  and bad): https://youtu.be/ZpAQoMeAiNk
+- **Full write-up** with every chart and how it was tested:
+  [docs/blog/vision-scouting.md](docs/blog/vision-scouting.md)
 
-- [Why](#why)
-- [Goals](#goals)
+![Six robots tracked and labelled in a 2026 San Diego qual, with the top-down field map and corner cameras below](docs/blog/img/hud_casnd_qm14.jpg)
+
+## Contents
+
+- [What It Does](#what-it-does)
+- [Results So Far](#results-so-far)
 - [How It Works](#how-it-works)
-  - [Calibration](#calibration)
-  - [Robot Detection](#robot-detection)
-  - [Robot Tracking](#robot-tracking)
-  - [Field Coordinates and the 2D Map](#field-coordinates-and-the-2d-map)
-  - [Robot Identity](#robot-identity)
-  - [Fitting the Time Budget](#fitting-the-time-budget)
+- [How It's Tested](#how-its-tested)
 - [Limitations](#limitations)
-- [Hardware Requirements](#hardware-requirements)
-- [Installation](#installation)
-- [Running](#running)
-- [Usage](#usage)
+- [Hardware](#hardware)
+- [Install](#install)
+- [Model Weights](#model-weights)
+- [Running Locally](#running-locally)
+- [Running in the Cloud](#running-in-the-cloud)
 - [Configuration](#configuration)
 - [Project Structure](#project-structure)
-- [Models](#models)
+- [Tests](#tests)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
 
-## Why
+## What It Does
 
-Good scouting data takes an army of well-trained, motivated scouters, and
-most teams don't have one. This project asks: how much of that can a vision
-pipeline do on its own, using nothing but the public event stream?
+![Pipeline overview: calibrate, detect, track, identify, output](docs/blog/img/diagram_pipeline.png)
 
-Robot identity came first, before any scoring analysis, deliberately —
-tracking game pieces does you no good if you can't attribute them to the
-right robot.
+1. **Set up.** Work out where each broadcast camera is and how its lens bends
+   the image, using the AprilTags on the field. Read the scoreboard clock so
+   only auto and teleop get processed.
+2. **See.** YOLO detectors find bumpers (and their alliance color), robots,
+   fuel, hub openings and people.
+3. **Follow.** All three camera views (the main camera and two corner
+   cameras) are projected onto the field in meters and merged into one
+   tracker, so a robot is a point on the field, not a box in a video.
+4. **Name.** Bumper numbers are read to put a team on each track, then the
+   whole match is relabelled with hindsight once it's over.
+5. **Use.** A replay video with overlays and a top-down map, per-team auto
+   paths and heatmaps, event-wide rankings, and a JSON export.
 
-## Goals
+A full match takes about 5 minutes on a rented RTX 5090, or 7-9 minutes on a
+home RTX 3090.
 
-- **No human scouters** identifying robot images
-- **No special equipment at events** — works from the broadcast stream's
-  YouTube video, no cameras in the stands
-- **Universal to any event** — no per-event training, datasets, or robot
-  photo sessions
-- **Adaptable to future seasons** — detection/tracking/identity carry over
-  even as the game changes
-- **Not realtime, but bounded** — under ~15 minutes per match, so it can
-  catch up during field resets and lunch and be ready for match strategy and
-  the picklist meeting
-- Develops on consumer hardware (one RTX 3090); can rent a beefier GPU
-  (e.g. an H100) for event weekends
+## Results So Far
+
+**Hand-tracked ground truth.** On 4 matches from 4 events across 2 seasons,
+tracked by hand robot by robot, the pipeline tracks 86% of robot time and has
+the right team number on 75% of it. It has the wrong team number about 1% of
+the time; the rest is "tracked, but not confident enough to name yet", which
+is deliberate.
+
+![Hand-tracked ground truth vs the pipeline, per match](docs/blog/img/chart_gt_results.png)
+
+**A whole event.** The entire 2026 Curie Division (138 matches) ran unattended
+straight from the TBA videos:
+
+- 137 of 138 matches processed in 16.7 hours on one RTX 3090 (median 7.5
+  minutes a match), with about $8 of Jev reads for the whole event.
+- 86% of robot time tracked and 79% of that named, in line with the
+  hand-tracked numbers. About 1% of named time has the wrong team, estimated
+  by an automatic auditor that checked about 4,400 sampled moments.
+- The main camera moved twice during the event; both times the match noticed,
+  re-solved its calibration from its own frames and carried on.
+
+**Against human scouting.** The event-wide rankings were checked against
+3128's human-scouted Manta data and Match13's team ratings. Auto cycles and
+defense time line up with the scouts at about 0.8 (Spearman); speed is
+looser, and stuck-on-the-bump is the weakest. It's good for sorting teams
+into tiers, not for deciding whether a team is 12th or 15th. Details and
+charts are in the [write-up](docs/blog/vision-scouting.md).
 
 ## How It Works
 
-### Calibration
+### Camera calibration: AprilTags + field geometry
 
-Cameras at an event are consistent, but their viewing angles are not — and
-they get bumped or re-zoomed mid-event. Instead of requiring our own
-cameras, each broadcast camera is calibrated against the field itself: you
-click AprilTags in the frame and their locations on a 2D field map
-(`/calibrate`), and a single-view pinhole resection solves the camera's
-position, rotation, and lens distortion from CAD-derived field geometry.
-(Most tags are too small in the broadcast to decode automatically, hence the
-click-to-map UI.)
+The broadcast cameras are the same at every event, but their angles aren't,
+and they get bumped mid-event. Calibration solves each camera's position,
+angle and lens distortion from the AprilTags and the known field layout. Most
+tags are too small on the stream to decode, so the app finds tag-shaped
+squares, has Jev confirm each one is a tag, and uses the field map to work out
+which tag it must be. It runs automatically when an event is loaded; you
+review the overlay at `/calibrate` and confirm it, or correct it by hand.
 
-The composite broadcast feed carries three views — a main overhead camera
-and two low corner cameras — and all three are calibrated the same way, so
-the pipeline knows it's looking at one field from three viewpoints. Because
-cameras move mid-event, every job runs an automatic drift check first: if a
-camera has moved more than ~half a meter's worth, the job refuses to run
-rather than produce garbage positions.
+The lenses are wide-angle with strong fisheye warp at the edges, so the solve
+needs tags from the middle *and* the far edges of each view; otherwise the
+overlay looks right in the middle and robots near the edges land in the wrong
+place. Every match is checked against the calibration: if a camera moved
+between matches it re-solves from that match, and if one moves *during* a
+match that camera is dropped for the match rather than producing garbage
+positions. The broadcast layout (where the main and corner cameras sit in the
+stream) is detected too, since it varies a lot between events.
 
-Per match there's also a quick scoreboard setup: draw boxes around the red
-score, blue score, and clock (kept manual so it adapts when the stream
-overlay changes), and segment out auto/teleop from the clock so frames
-outside the match aren't processed at all.
+![Calibration on very different broadcasts: Curie and a 2025 corner camera on top, Hawaii and Utah below](docs/blog/img/calibration_combined.jpg)
 
-### Robot Detection
+Field geometry also lets the tracker ignore anything outside the field
+(robots in queue, the stands) and refuse to start a new robot on static
+structures such as hubs and FMS radio poles.
 
-Detection is three YOLO models working together:
+### Detection: YOLO
 
-- a **bumper detector** trained specifically on red and blue bumpers, with
-  hard-negative training for the things that kept getting detected as robots
-  — scoring tablets, FMS radios on poles, and similar field-side equipment;
-- a **field model** that detects fuel, robots in general, and the hub
-  openings;
-- a **person model**, because refs and scorers walk in front of the field
-  view constantly.
+- **Bumper model** (trained by us): red and blue bumpers, which also gives the
+  alliance color, with hard negatives for field equipment that kept getting
+  detected as robots.
+- **Field model** (trained by us): robots, fuel and hub openings.
+- **Stock YOLO person model**, so refs and field staff don't become robots.
 
-The bumper model contributes alliance color; if the alliance can't be
-determined yet, the robot is still tracked until it can be. (An earlier
-HSV color approach was rejected — it hated dark blue bumpers and kept
-reading painted robot parts as bumper color.)
+On top of the models are sanity checks added one false positive at a time:
+boxes that overlap a person, or that are implausibly wide for their distance
+from the camera, are rejected.
 
-On top of the models sits a stack of runtime sanity checks, added one
-painful false-positive at a time: detections overlapping a person are
-rejected, boxes implausibly wide for their distance from the camera are
-rejected, and masks that are tall and top-heavy (the silhouette of a radio
-on a stand) are rejected — carefully, so a climbing robot isn't.
+### Tracking: multi-camera field tracker + SAM 3
 
-### Robot Tracking
+The tracker turns per-frame detections into six robots moving around the
+field, merging all three cameras in field coordinates. When a robot goes
+somewhere no camera can see, it coasts instead of becoming a "new" robot when
+it reappears. **SAM 3** (Meta's Segment Anything 3) masks and follows whole
+robots, but only runs where it's needed: when robots get close, cross, or
+disappear behind something. Running SAM 3 on every robot every frame was
+tried and was both slower and worse on the ground truth, as were higher
+frame rates.
 
-YOLO boxes are used as prompts to a segmentation tracker (SAM) that masks
-out the entire robot. Segmentation handles overlapping and partially
-occluded robots better than per-frame boxes, and crucially it's *temporally
-aware*: if a robot disappears behind another for a few seconds, the tracker
-carries the same identity through the occlusion instead of "discovering" a
-brand-new robot on the other side. YOLO re-prompts the tracker every ~2
-seconds so anything missed initially gets picked up quickly.
+### Identity: reading bumper numbers
 
-The default backend is **SAM 3.1**. SAM 2.1 (still available via
-`TRACKING_BACKEND=sam2`) wants to hold the whole video's state in VRAM,
-which doesn't fit a full match on 24 GB; the SAM3 backend processes the
-match in chunks of a few hundred frames and re-seeds every live robot
-across each chunk boundary so identities survive. It confirms more robots
-at roughly half the wall-clock time.
+The bumper number is the only thing that reliably tells two robots on the
+same alliance apart, so everything else only supports it.
 
-After the match finishes, a **backward-confirmation pass** re-resolves
-identity over the whole timeline with hindsight — a robot that wasn't
-positively identified until 30 seconds in still gets correctly attributed
-for the time before that.
+![How a track gets a team number: live reads during the match, then a hindsight relabel at the end](docs/blog/img/diagram_identity.png)
 
-### Field Coordinates and the 2D Map
+- **Jev**, a hosted "decision model" from TypeSafe: given an image and a
+  multiple-choice question ("which of these 3 teams is this, or is it
+  unreadable?") it returns a probability per answer. About 0.2 s and a
+  fraction of a cent per read, and it can't invent a team that isn't an
+  option.
+- **Our digit reader** (PARSeq, fine-tuned on about 54,000 bumper crops from 15
+  events across 2024-2026). On events it never saw, it gets about 92% of
+  readable bumpers right and is wrong on under 0.5%; otherwise it declines.
+- **Our robot embedder** (DINOv3, fine-tuned on pairs of the same robot from
+  different matches). It keeps tracks on the same robot through crossings; it
+  is never allowed to name a robot by itself.
 
-Image-space tracks are projected through the camera calibration into field
-coordinates and fused across the three views with a Kalman filter. The
-top-down map is drawn from the same CAD-derived field geometry as the
-calibration overlay — one source of truth, so the map and the camera
-overlays can never disagree about where the hubs, bumps, towers, and
-trenches are.
+During the match, a team locks after 3 agreeing reads and unlocks after 2
+contradicting ones; a confidently wrong lock is much worse than an
+unconfident one. After the match, the **hindsight relabel** cuts every track
+into short windows, reads digits in each, builds a "lineup card" of each
+robot *from this match* out of the sure reads, and has Jev match the
+remaining windows against it. Anything still unsure stays unlabelled.
 
-Making that map trustworthy took explicit distrust:
+Many event streams are **interlaced** (each frame is two half-frames 1/60 s
+apart), which combs moving bumpers into stripes. The relabel de-interlaces
+its crops first.
 
-- **Corner cameras are for identity, not location.** They sit low and have
-  terrible depth resolution, so corner-only measurements are heavily
-  downweighted — they nudge a position rather than yank it.
-- **Occluded robots ease to a stop** instead of sailing off the field: a
-  coasting track's velocity decays each missed frame.
-- **Physically impossible jumps are distrusted** rather than snapped to.
-- **Exclusion zones** drawn on the field map (FMS radio stands, the hubs)
-  prevent the tracker from ever *seeding* a "robot" on a static structure,
-  and the known field bounds reject robots in the queue line and oddities
-  in the audience.
+![Interlaced vs de-interlaced crops from the Curie stream](docs/blog/img/deinterlace.png)
 
-On the replay HUD's radar panel, each robot carries its team number, a
-fading trail, and styling that says how much to trust it: a solid dot is a
-confident main-camera fix, a hollow dot is coasting on the motion model,
-and a dashed ring means corner-cameras-only.
+### Training our own models: teacher and students
 
-### Robot Identity
+The digit reader and embedder were trained by downloading qual videos from 15
+events across 3 seasons, saving about 455,000 bumper and robot crops, having
+Jev label them in bulk (about $8 total), having Claude judge a few hundred as
+a gold test set, and training small fast models that are only tested on
+events they never saw. Claude is a judge and teacher here; it is not part of
+the runtime pipeline.
 
-Bumper crops are periodically read by a small VLM (Qwen3-VL-4B, served
-locally — in-process or behind a vLLM server for better batching). The
-reader knows the six teams in the match and the robot's alliance color, and
-its reads feed a voting system. Two robots can never be positively
-identified as the same team at once; an assignment step resolves conflicts
-toward the read it's more confident about.
+### Scouting output
 
-The locking logic is deliberately reversible: a team **locks after 3
-consecutive agreeing reads, but 2 consecutive contradicting reads flip it**.
-That sounds backwards until you've watched a confidently *wrong* lock freeze
-for a whole match — an early misread is far worse than an unconfident one.
-Even confirmed robots are periodically re-audited with fresh reads.
+Once robots have positions and team numbers, `/scouting` shows per-team auto
+paths (repeated routines grouped, red-side matches rotated onto the same
+side), heatmaps of where a team spends each hub shift split by driver
+station, and event-wide rankings for movement, cycles, defense and getting
+stuck on the bump. Everything exports as JSON.
 
-Two supporting systems:
+![Auto paths for one team across 13 Curie matches](docs/blog/img/scouting_auto_paths_cur.png)
 
-- **Appearance gallery.** Every positively-identified robot deposits a
-  DINOv2 visual embedding into a per-event gallery, so later in the event a
-  robot whose bumper is obscured can still get a vote from what it *looks
-  like*. Appearance is a supplementary vote, never an override. Match-time
-  voting uses only human-verified exemplars, and human corrections outvote
-  automatic deposits — a few minutes of spot-checking per event improves
-  every later match.
-- **Not wasting reads.** VLM reads are among the most expensive steps, so
-  reads are skipped when a bumper is occluded in every camera and when a
-  robot hasn't moved since its last read — substantially fewer reads with
-  no identity loss.
+![Event-wide rankings: defense and cycles per teleop minute](docs/blog/img/scouting_rankings_combined.png)
 
-### Fitting the Time Budget
+## How It's Tested
 
-The tracker and the bumper reader both want the entire GPU, and a resident
-vLLM server (~11 GB) on top of SAM3's propagation peak (~11 GB) OOMs a
-24 GB card. The fix is that they never actually need the GPU at the same
-time: the reader is **phase-exclusive** — shut down during tracking, spun
-up only for the bumper-reading phase, torn down after the job (with an
-in-process fallback if the server won't start).
+Changes are judged against **hand-tracked ground truth**, not the pipeline's
+own opinion. The annotator (`scripts/gt_annotator_server.py`) lets you follow
+one robot at quarter speed with the mouse; a scorer
+(`scripts/score_ground_truth.py`) compares every pipeline run to the hand
+tracks every 0.25 s. Identical runs differ by a few points, so every change
+runs twice on all 4 ground-truth matches and only becomes a default if it
+beats that noise and no match gets worse.
 
-On the tracking side, mask export resolution turns out not to be a speed
-lever at all — SAM resizes every frame to a fixed internal square, so cost
-scales with frames-per-view, making per-view frame rate
-(`SAM3_TRACK_FPS`) the real knob. Combined with the read-skipping above, a
-match lands under the 15-minute budget on a 3090.
+![The ground truth annotator, and how changes get tested](docs/blog/img/testing_combined.png)
 
 ## Limitations
 
-Identity is where most of the iteration has gone, and it's still the
-fragile part:
+- Ground truth is 4 matches: enough to catch regressions, not to promise how
+  it does at your event.
+- Some matches are just harder. Camera height and angle matter a lot: a
+  high, steep camera gives better positions but makes bumpers nearly
+  unreadable.
+- About a fifth of bumper fonts are too thin or tightly spaced to read at
+  broadcast resolution, and low bumpers are easily hidden.
+- Corner cameras sit too close and too low to cover the field ends well, and
+  the event banner covers part of their view.
+- Run-to-run noise is a few points. Fine for trends, not for exact seconds.
+- No per-robot scoring. Detection, location and identity carry over to every
+  game; scoring will be built for the 2027 game once it's revealed.
 
-- **Roughly a fifth of bumper fonts are simply unreadable** at broadcast
-  resolution — too skinny, kerning too tight. Bumpers sit low, so robots
-  and game pieces obscure them constantly. Higher camera angles give better
-  positions but make bumpers nearly impossible to read.
-- **Visual embeddings can't tell teammates apart.** DINOv2 reliably
-  separates red robots from blue robots and is nearly useless at separating
-  two robots on the *same* alliance — from a wide camera, boxes with red
-  bumpers all look alike. The bumper number is the only signal that truly
-  discriminates individuals; everything else can only support it.
-- **Results are noisy run-to-run.** A clean run on the main test match
-  confirms 5 of 6 team numbers; a rougher pass might lock 3. One team's
-  bumpers never resolve no matter how many reads are thrown at them.
-- **Fuel attribution doesn't exist yet.** Fuel *detection* is in (the field
-  model sees fuel every frame), but per-robot scoring attribution is future
-  work.
-- The broadcast's event-name banner eats a chunk of the corner cameras'
-  view, and corner calibration is manual and fiddly
-  (see `docs/corner-camera-calibration.md`).
+## Hardware
 
-## Hardware Requirements
+| | |
+|---|---|
+| GPU | NVIDIA with 24 GB VRAM recommended (RTX 3090/4090/5090 class). Peak use is about 13 GB with the defaults. CUDA 12.8 builds: Ampere, Ada, Hopper and Blackwell all work. |
+| CPU | The pipeline is mostly serial Python and uses about 3-4 cores per match, so a fast single-thread CPU matters as much as the GPU. |
+| RAM | 32 GB or more. |
+| Disk | About 20 GB for the environment and model caches, plus about 120 MB per match video. |
+| OS | Linux x86_64 (developed on Ubuntu-based Pop!_OS). |
 
-The pipeline is **designed for a single NVIDIA GPU with 24 GB of VRAM**
-(developed and tuned on an RTX 3090). That number is a real design
-constraint, not a suggestion: SAM3's tracking propagation peaks around
-~11 GB and the vLLM bumper reader reserves another ~11 GB, and the
-pipeline only fits because the two run in separate phases on the same card
-(see [Fitting the Time Budget](#fitting-the-time-budget)). Cards with less
-VRAM will OOM mid-match; more VRAM (or a rented H100 at an event) just
-makes it faster.
+## Install
 
-| Component | Requirement |
-|-----------|-------------|
-| GPU | NVIDIA, 24 GB VRAM minimum (RTX 3090 / 4090 class) |
-| RAM | 32 GB recommended |
-| Storage | ~20 GB (environments, model weights, downloaded match video) |
-| OS | Linux (developed on Ubuntu-based Pop!_OS) |
-
-## Installation
-
-### 1. System prerequisites
+### 1. System packages
 
 ```bash
-sudo apt install python3.12 python3.12-venv ffmpeg tesseract-ocr
-# Git LFS is required for the model weights
-sudo apt install git-lfs && git lfs install
+sudo apt install git git-lfs ffmpeg tesseract-ocr tesseract-ocr-eng libgl1 libglib2.0-0 curl unzip
+git lfs install
+curl -LsSf https://astral.sh/uv/install.sh | sh    # Python package manager
+curl -fsSL https://deno.land/install.sh | sh        # JavaScript runtime yt-dlp needs for YouTube
 ```
 
-### 2. Clone
+You also need an NVIDIA driver that supports CUDA 12.8.
 
-Run `git lfs install` **before** cloning (step 1) — the trained model
-weights are stored in Git LFS, and without it you get tiny pointer files
-instead of models.
+### 2. Clone
 
 ```bash
 git clone https://github.com/Paradox2102/frc-vision-scorer.git
 cd frc-vision-scorer
-
-# Verify LFS pulled real weights (~50 MB each, not 1 KB pointers)
-ls -lh runs/train/*/weights/best.pt
-
-# If they're tiny, LFS wasn't set up at clone time — fix with:
-git lfs install && git lfs pull
+ls -lh runs/train/*/weights/best.pt data/teacher/models/*.pt   # 20-52 MB each, not 1 KB pointers
+git lfs pull                                                   # only if they're tiny
 ```
 
-### 3. Main environment (`.venv`)
+### 3. Python environment
 
-The app's ML stack is installed directly into the venv (the `pyproject.toml`
-intentionally under-declares it):
+This is the same pinned recipe the cloud bootstrap uses
+(`deploy/runpod/bootstrap.sh`):
 
 ```bash
-python3.12 -m venv .venv
-.venv/bin/pip install --upgrade pip
-# PyTorch with CUDA (cu126 used in development)
-.venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-# Core app + SAM2 (pulled from GitHub via pyproject)
-.venv/bin/pip install -e .
-# The rest of the stack
-.venv/bin/pip install ultralytics supervision fastapi "uvicorn[standard]" \
-    aiosqlite opencv-python pillow pytesseract yt-dlp transformers \
-    accelerate qwen-vl-utils python-dotenv websockets
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
+  --override deploy/runpod/requirements-runpod-overrides.txt -r deploy/runpod/requirements-runpod.txt
+uv pip uninstall --python .venv/bin/python opencv-python
+uv pip install --python .venv/bin/python --reinstall --no-deps opencv-python-headless==4.10.0.84
+SAM2_BUILD_CUDA=0 uv pip install --python .venv/bin/python --no-deps --no-build-isolation \
+  -r deploy/runpod/requirements-runpod-git.txt
 ```
 
-### 4. Tracking backend
-
-**SAM 3.1 (default).** The checkpoint repo is gated — request access to
-[`facebook/sam3.1`](https://huggingface.co/facebook/sam3.1) on Hugging Face,
-put a read token in `.env` (`HF_TOKEN`), then:
+### 4. API keys
 
 ```bash
-.venv/bin/pip install -e '.[sam3]'
+cp .env.example .env
 ```
 
-See `docs/SAM3.md` for details and quirks.
+Then fill in:
 
-**SAM 2.1 (alternative, `TRACKING_BACKEND=sam2`).** Download a checkpoint:
+| Key | Needed for |
+|---|---|
+| `TBA_API_KEY` | Required. Event schedules, rosters and match videos. Get a read key at https://www.thebluealliance.com/account. |
+| `HF_TOKEN` | Required. SAM 3's weights are gated: request access to [`facebook/sam3`](https://huggingface.co/facebook/sam3) on Hugging Face, then create a read token. Without it, tracking falls back to a plain Kalman tracker. |
+| `JEV_TYPESAFE_API_TOKEN` | Required for team numbers. Jev does the live bumper reads, the lineup matching and the tag checks during calibration. Without it, jobs run but robots stay unnamed. |
+| `RUNPOD_API`, `VASTAI_API` | Only for renting cloud GPUs. They stay on your machine and are never copied to a server. |
+
+The app loads `.env` itself; there's no need to export it.
+
+## Model Weights
+
+Every model we trained ships in the repo through Git LFS, so `git lfs pull`
+gets all of them. Third-party models download themselves on first use.
+
+| Model | Path or source |
+|---|---|
+| Field model, 2026cur (robots, fuel, hub openings) | `runs/train/hub_zone_yolo26s_2026cur_v2/weights/best.pt` |
+| Field model, original (fallback) | `runs/train/hub_zone_yolo26s/weights/best.pt` |
+| Bumper detector (with equipment hard negatives) | `runs/train/frc_bumpers_equipment_hardneg/weights/best.pt` |
+| Bumper detector, 2026cur (used by the digit reader) | `runs/train/frc_bumpers_2026cur_v3/weights/best.pt` |
+| Bumper detector, original (fallback) | `runs/train/frc_bumpers/weights/best.pt` |
+| Our digit reader | `data/teacher/models/s1_digits.pt` |
+| Our robot embedder | `data/teacher/models/s4_embedder.pt` |
+| Person detector (downloaded) | `yolo26n.pt`, from Ultralytics |
+| SAM 3 (downloaded) | Hugging Face [`facebook/sam3`](https://huggingface.co/facebook/sam3), gated: needs `HF_TOKEN` |
+| DINOv3 (downloaded) | Hugging Face `timm/vit_small_patch16_dinov3.lvd1689m` |
+
+## Running Locally
+
+### Start and stop
 
 ```bash
-mkdir -p checkpoints && cd checkpoints
-wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
-cd ..
-```
-
-(Other sizes — tiny/small/base_plus — are selectable via `SAM2_MODEL_SIZE`.)
-
-### 5. vLLM environment (`.venv-vllm`)
-
-The team-number reader runs Qwen3-VL-4B as a separate vLLM server. vLLM pins
-its own torch build and **must not** share a venv with the app:
-
-```bash
-python3.12 -m venv .venv-vllm
-.venv-vllm/bin/pip install vllm
-```
-
-### 6. API keys
-
-```bash
-cp .env.example .env   # then fill in your keys (TBA_API_KEY is required)
-```
-
-## Running
-
-Always start via the scripts (they run from the project root — model and
-checkpoint paths resolve relative to it):
-
-```bash
-# Start (loads your API keys, then launches the app in the background)
-set -a; source .env; set +a
-web/start_all.sh
-
-# It's up when this responds (UI at http://localhost:8004)
-curl http://localhost:8004/api/status
-
-# Stop the app and any running vLLM reader
+web/start_all.sh    # starts the app in the background on http://localhost:8004
 web/stop_all.sh
 ```
 
-You do **not** start the vLLM bumper reader yourself: it's job-managed and
-phase-exclusive. Each match job spins it up only for the bumper-reading
-phase (first start takes ~90 s to load the model) and tears it down when
-the job finishes, so idle time between matches costs zero VRAM.
-`web/start_vllm.sh` / `web/stop_vllm.sh` exist for manual debugging only.
-
-Where to look when something's wrong:
-
 | What | Where |
-|------|-------|
-| App logs | `/tmp/frc-vision-dev.log` |
-| vLLM reader logs | `/tmp/frc-vllm.log` |
+|---|---|
+| App log | `/tmp/frc-vision-dev.log` |
 | App PID | `/tmp/frc-vision-dev.pid` |
-| Database | `frc_scorer.db` in the project root (SQLite) |
+| Database | `frc_scorer.db` (SQLite, project root) |
+| Port | 8004 (`FRC_PORT` to change) |
 
-## Usage
+### Scouting an event
 
-1. **Load an event** — enter a TBA event key; schedules, rosters, and match
-   video links come from The Blue Alliance.
-2. **Calibrate the cameras** (once per event, redo if a camera moves) —
-   open `/calibrate`, click AprilTags in each camera view and their
-   positions on the field map, and solve. Draw exclusion zones over static
-   field structures while you're there. Corner cameras:
-   `docs/corner-camera-calibration.md`.
-3. **Set up the match** — pick a match; if it's the first one for this
-   stream layout, draw the score and clock boxes. The clock segments
-   auto/teleop so dead video isn't processed.
-4. **Run the job** — confirm the team roster and submit. Pipeline knobs can
-   be overridden per job.
-5. **Review** — watch the replay HUD (camera views + radar map), check
-   per-robot identity confidence, and verify or correct bumper reads in the
-   gallery UI. Verified exemplars improve every later match at the event.
+1. **Load the event.** Paste a TBA event key or URL (for example `2026cur`).
+   Schedules, rosters and match video links come from TBA, and camera
+   calibration starts automatically in the background.
+2. **Review calibration** at `/calibrate`. Check that the wireframe overlay
+   lines up with the field in each camera, then confirm it or correct it by
+   clicking tags.
+3. **Run a match.** Pick a match and start it. One job runs at a time.
+4. **Review** the replay (camera views, overlays and the top-down map) in the
+   Replays tab.
+5. **Scout** at `/scouting`: auto paths, heatmaps and rankings for every team
+   with processed matches.
+
+### Processing a whole event
+
+The batch tool in `deploy/runpod/` can also drive your own machine. Load the
+event in the UI first, then:
+
+```bash
+alias rp='.venv/bin/python deploy/runpod/runpod_cli.py'
+rp swarm plan --name myevent --event 2026cur --download   # downloads every match video
+rp swarm run --name myevent --local                        # runs them one by one on :8004
+```
+
+Results land in the local app as each match finishes.
+
+## Running in the Cloud
+
+The pipeline is CPU-bound (the GPU sits about 25% busy), so a bigger GPU barely
+helps. One match per server on several cheap servers scales almost linearly.
+An RTX 5090 on vast.ai (about $0.75-1.00 an hour) ran a match in about 5
+minutes; a $2.69/hour RTX PRO 6000 took about 6.
+
+`deploy/runpod/runpod_cli.py` creates the server, ships the code, your `.env`
+and the model weights, installs everything, and starts the app. Full details
+are in [deploy/runpod/README.md](deploy/runpod/README.md).
+
+```bash
+alias rp='.venv/bin/python deploy/runpod/runpod_cli.py'
+```
+
+The app has no login, so servers only expose SSH; you reach the UI through an
+SSH tunnel (`rp tunnel`, then http://localhost:8014).
+
+### vast.ai
+
+Add `VASTAI_API` to `.env` and register your SSH public key on your vast.ai
+account.
+
+```bash
+rp vast-offers --gpu "RTX 5090" --max-dph 0.8      # pick an offer ID (fast CPUs listed first)
+rp up --provider vast --offer OFFER_ID
+rp tunnel --reconnect                              # UI at http://localhost:8014
+rp pull                                            # copy results to data/runpod_pull/<id>/
+rp terminate
+```
+
+The host's container RAM limit can kill the server with no traceback, and the
+host operator can read your `.env`.
+
+### RunPod
+
+Add `RUNPOD_API` to `.env`.
+
+```bash
+rp gpus                                            # types, VRAM, prices, stock
+rp up --gpu "NVIDIA GeForce RTX 5090"              # or any type from `rp gpus`
+rp tunnel --reconnect
+rp status          # or: rp logs -f, rp ssh, rp push (re-ship code)
+rp pull && rp terminate
+```
+
+### Any other Linux GPU server
+
+There's no provider plugin for other hosts, but the bootstrap script works on
+any Ubuntu/Debian x86_64 machine with root and an NVIDIA driver for CUDA 12.8:
+
+1. Copy the repo to `/workspace/frc` (or set `FRC_WS` to another directory
+   that contains it as `frc/`).
+2. Copy your `.env` in, and run `git lfs pull` there if the model weights came
+   across as small pointer files.
+3. Run `bash deploy/runpod/bootstrap.sh --no-vllm`. It installs packages and
+   the Python environment, prefetches SAM 3 and the other downloads, and
+   starts the app on port 8004 (log in `$FRC_WS/logs/server.log`).
+4. Reach it with `ssh -L 8014:localhost:8004 user@host`.
+
+### A whole past event on a swarm
+
+```bash
+rp swarm plan --name cur --event 2026cur --download    # downloads videos at home
+rp swarm up --name cur --count 8
+rp swarm run --name cur --terminate-when-done
+rp swarm import --name cur --apply                     # merge results into the local app
+```
+
+### Live at an event
+
+```bash
+rp swarm up --name ev --count 2
+rp swarm live --name ev --event 2026xyz --auto-import --hours 9 --terminate-when-done
+```
+
+Your home PC polls TBA every minute, downloads each new match video (YouTube
+blocks datacenter IPs, so downloads happen at home), sends it to whichever
+server has been idle longest, and imports the results as they finish. If one
+server re-solves a moved camera, the calibration is copied to the others.
+Rehearse first by replaying a past event's schedule:
+`rp swarm live --name reh --event 2026cur --rehearse --speed 10 --matches qm1-qm6 --local`.
+
+At about 5 minutes a match and quals every 7 minutes, two RTX 5090s keep up
+with room to catch up after a backlog: roughly $40-55 of GPU time for a
+3-day event, plus about $8 of Jev reads. Live mode has been tested against a
+local server and a full-event rehearsal, but not yet at a live event.
 
 ## Configuration
 
-Almost every pipeline knob is an environment variable with a per-job
-override (`config_json`). The authoritative list with defaults and
-documentation lives in `web/job_config.py`. Frequently used:
+Almost every pipeline setting is a "knob" with an environment variable and a
+per-job override. The full list with defaults and notes is in
+[web/job_config.py](web/job_config.py). The ones you're most likely to touch:
 
-| Variable | Purpose |
-|----------|---------|
-| `TRACKING_BACKEND` | `sam3` (default) or `sam2` |
-| `SAM3_TRACK_FPS` | tracking speed-vs-quality tradeoff (legacy `SAM2_*` names of renamed knobs/env vars are still accepted) |
-| `SAM2_MODEL_SIZE` | SAM2-backend encoder size (`TRACKING_BACKEND=sam2` only) |
-| `TEAM_READER` | `vllm` (what `start_all.sh` sets), `local` (in-process), or `clef` (Cloudflare Workers AI; needs `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`, model via `CLEF_MODEL`) |
-| `VLM_MODEL_NAME` | reader model (default `Qwen/Qwen3-VL-4B-Instruct`) |
-| `GALLERY_ENABLED` | appearance-gallery identity assists |
+| Variable | What it does |
+|---|---|
+| `TEAM_READER` | Live bumper reader: `jev` (default), or `vllm` for a fully local Qwen reader (set up with `deploy/runpod/setup_vllm.sh`; needs a separate `.venv-vllm`). |
+| `SAM3_TRACK_FPS` | Tracking frame rate; the main speed-vs-quality trade-off. |
+| `ROBOT_EMBEDDER` | `s4` (our embedder, default) or `dinov3`. |
+| `AUTO_CALIB_ON_LOAD` | `1` (default) calibrates automatically when an event loads. |
+| `FRC_PORT` | Web server port (default 8004). |
 
 ## Project Structure
 
 ```
-web/                  FastAPI app, job runner, UI
-  app.py              API + pipeline orchestration
-  field/              the vision pipeline
-    calibration.py    tag-anchored pinhole resection
-    mask_tracker.py   shared mask-tracker logic; builds SAM 2.1 for TRACKING_BACKEND=sam2
-    sam3_tracker.py   SAM3 tracking backend (default)
-    tracker.py        field-space Kalman tracking
-    fusion.py         cross-view fusion
-    identity.py       team-number voting / locking
-    appearance_gallery.py  DINOv2 exemplar gallery
-    radar.py          2D field-map rendering
-  static/             frontend
-scripts/              training, dataset prep, evaluation, benchmarks
-deploy/runpod/        optional cloud-GPU (RunPod / Vast.ai) job runner
-runs/train/           shipped model weights (Git LFS)
-data/                 field geometry, calibration data, datasets
-  field/              field CAD + AprilTag layouts (2019–2026)
-  bumper_hardneg_equipment/  committed bumper training imageset
-  eval/               ground truth + reader benchmarks used by the tests
-docs/                 design notes
-tests/                pytest suite (run: .venv/bin/python -m pytest)
+web/                    FastAPI app, job runner and UI (/, /calibrate, /scouting)
+  app.py                API and pipeline orchestration
+  job_config.py         every pipeline knob, with defaults
+  field/                the vision pipeline: calibration, tracking, fusion, identity
+  students/             runtime for our digit reader and robot embedder
+  scouting/             scouting metrics (auto paths, heatmaps, rankings)
+  static/               frontend
+deploy/runpod/          cloud CLI: RunPod and vast.ai servers, swarm batch and live mode
+scripts/                training, ground truth, scoring, audits and the demo reel
+  teacher/              crop harvesting and teacher/student training
+runs/train/             shipped YOLO weights (Git LFS)
+data/                   field geometry and AprilTag layouts (2019-2026), ground truth
+docs/                   design notes
+  blog/                 the write-up, its images and chart sources
+tests/                  pytest suite
 ```
 
-## Models
+## Tests
 
-Committed weights (Git LFS):
+```bash
+.venv/bin/python -m pytest
+```
 
-- **Bumper detector** — `runs/train/frc_bumpers_equipment_hardneg/weights/best.pt`
-  (preferred; includes equipment hard negatives) with
-  `runs/train/frc_bumpers/weights/best.pt` as fallback. Override with
-  `FRC_BUMPER_MODEL`. Training data is committed under `data/` and
-  reproducible via `scripts/download_bumper_datasets.py`; retrain with
-  `scripts/train_bumper_model.py`.
-- **Field model** — `runs/train/hub_zone_yolo26s/weights/best.pt` (fuel,
-  robots, hub openings).
-
-Downloaded at install/first use:
-
-- **Team-number reader** — `Qwen/Qwen3-VL-4B-Instruct` (Hugging Face).
-- **Trackers** — SAM 3.1 (gated HF repo) or SAM 2.1 checkpoints.
-- **Appearance embeddings** — DINOv2 (auto-downloaded).
+One test, `tests/field/test_sam2_streaming.py::...test_sam2_precomputation_and_lookup`,
+is a known pre-existing failure. Don't run the suite while a job is using the
+local vLLM reader; one test path stops the reader server.
 
 ## Acknowledgements
 
-Heavily inspired by
-[Roboflow's basketball player detection/tracking/identification](https://www.youtube.com/watch?v=yGQb9KkvQ1Q)
+Inspired by
+[Roboflow's basketball player detection, tracking and identification](https://www.youtube.com/watch?v=yGQb9KkvQ1Q)
 and [Team 1148's Project Vector](https://www.chiefdelphi.com/t/1148-project-vector-ai-scouting-for-rebuilt/519559).
+Thanks to 3128 for sharing their Manta scouting data from Curie, which made
+checking the rankings against human scouts possible.
 
 ## License
 
@@ -446,11 +487,11 @@ Copyright (C) 2026 Nick Foote, FRC Team 2102 "Team Paradox"
 (https://github.com/Paradox2102).
 
 Licensed under the [GNU Affero General Public License v3.0](LICENSE)
-(AGPL-3.0-only) — free to use, study, modify, and share. If you distribute a
+(AGPL-3.0-only): free to use, study, modify and share. If you distribute a
 modified version, or run one as a network service for others, you must make
 its complete source available under the same license.
 
 This project builds on [Ultralytics YOLO](https://github.com/ultralytics/ultralytics),
 which is itself AGPL-3.0; the shipped YOLO weights were trained with it.
-Models downloaded at first use carry their own licenses — notably SAM 3 (Meta's
-SAM License) and Qwen / DINOv2 (Apache-2.0).
+Models downloaded at first use carry their own licenses, notably SAM 3
+(Meta's SAM License) and DINOv3.

@@ -8,7 +8,9 @@ I posted about this earlier in the season, and a lot has changed since then. It 
 
 ![Six robots tracked and labelled in a 2026 San Diego qual, with the top-down field map and corner cameras below|690x385](img/hud_casnd_qm14.jpg)
 
-**[PLACEHOLDER: YouTube link to the 20-minute demo reel: best, middling and bad tracking from Curie, plus edge cases]**
+The 20-minute demo reel shows the best, middling and bad tracking from Curie, plus some edge cases:
+
+https://youtu.be/ZpAQoMeAiNk
 
 ## [color=#1976d2]The Goal[/color]
 
@@ -63,7 +65,7 @@ What broke:
 * **Q32 and Q72** have the wrong video on TBA: crowd shots and the results screen, no match. The pipeline tracked nothing, which is the right answer, but the match is lost.
 * **Q76**: the broadcast cut to a side camera about 75 seconds in and never came back, so the second half of the match is untracked.
 
-The spread across matches is the interesting part. The best matches (Q97, Q98, Q122) have about 90% or more of robot time tracked and 84-92% of that named. The weakest matches with real footage (Q7, Q22, Q61) are tracked almost as well (82-84%), but only 62-65% of that time is named. The gap is identity, not tracking, and it tends to sit on one alliance: in Q22 all three red robots are unnamed about 40% of the time, and in Q61 it's two of the blue robots. The lineup matching needs a few clean bumper reads of each robot to work from, and some matches just don't give it any. The [demo reel](PLACEHOLDER) shows good, middling, and bad matches back to back so you can judge for yourself.
+The spread across matches is the interesting part. The best matches (Q97, Q98, Q122) have about 90% or more of robot time tracked and 84-92% of that named. The weakest matches with real footage (Q7, Q22, Q61) are tracked almost as well (82-84%), but only 62-65% of that time is named. The gap is identity, not tracking, and it tends to sit on one alliance: in Q22 all three red robots are unnamed about 40% of the time, and in Q61 it's two of the blue robots. The lineup matching needs a few clean bumper reads of each robot to work from, and some matches just don't give it any. The [demo reel](https://youtu.be/ZpAQoMeAiNk) shows good, middling, and bad matches back to back so you can judge for yourself.
 
 ## [color=#1976d2]The Tech, Piece By Piece[/color]
 

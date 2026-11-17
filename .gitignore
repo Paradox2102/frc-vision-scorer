@@ -17,7 +17,7 @@ data/hub_zone_distill/
 # Teacher distillation (docs/superpowers/specs/2026-11-10-teacher-distillation-design.md):
 # harvested crops, Jev labels, gold sets, feature cache, student checkpoints (~5 GB)
 # and prior-season match videos — local data, not shared history.
-data/teacher/
+data/teacher/*
 data/prior_years/
 models/*.pt
 models/*.onnx
@@ -167,7 +167,7 @@ data/eval/event_lineup
 
 # Teacher-distillation harvest: downloaded prior-season videos + crops/manifests (local only)
 data/prior_years/
-data/teacher/
+data/teacher/*
 
 # RunPod deployment (deploy/runpod): local pod state, per-pod ssh host keys,
 # tuning results, and everything pulled back from a pod.
@@ -191,3 +191,20 @@ docs/blog/cmp/data/match13_*.json
 skills-lock.json
 .ui-design/
 docs/blog/cmp/data/statbotics_*.json
+
+# Our own trained models ship with the repo (Git LFS, see .gitattributes):
+# 2026cur field model, 2026cur bumper model, digit reader, robot embedder.
+!runs/train/hub_zone_yolo26s_2026cur_v2/
+runs/train/hub_zone_yolo26s_2026cur_v2/*
+!runs/train/hub_zone_yolo26s_2026cur_v2/weights/
+runs/train/hub_zone_yolo26s_2026cur_v2/weights/*
+!runs/train/hub_zone_yolo26s_2026cur_v2/weights/best.pt
+!runs/train/frc_bumpers_2026cur_v3/
+runs/train/frc_bumpers_2026cur_v3/*
+!runs/train/frc_bumpers_2026cur_v3/weights/
+runs/train/frc_bumpers_2026cur_v3/weights/*
+!runs/train/frc_bumpers_2026cur_v3/weights/best.pt
+!data/teacher/models/
+data/teacher/models/*
+!data/teacher/models/s1_digits.pt
+!data/teacher/models/s4_embedder.pt

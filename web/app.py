@@ -70,7 +70,7 @@ from web.embedder import (
     cosine_similarity, embedder_model_name, make_robot_embedder, resolve_embedder_backend,
     thresholds_for,
 )
-from web.job_config import JobConfig
+from web.job_config import FRAME_KNOB_REF_FPS, JobConfig, scale_frames
 from web.env_compat import sam3_env
 from web.ytdlp_cookies import with_cookies as with_ytdlp_cookies
 from web import clef_reader
@@ -2627,26 +2627,7 @@ class InferenceJob:
         view_tracks = None
         if self.config.selective_mask_prop:
             try:
-                cfg = SelectiveConfig(
-                    margin_entry=self.config.selective_margin_entry,
-                    margin_exit=self.config.selective_margin_exit,
-                    gap_trigger=self.config.selective_gap_trigger,
-                    min_streak=self.config.selective_min_streak,
-                    window_max_frames=self.config.selective_window_max_frames,
-                    mask_overlap_exit=self.config.selective_mask_overlap_exit,
-                    sam_budget_frac=self.config.selective_sam_budget_frac,
-                    kill_coast=self.config.selective_kill_coast,
-                    kill_coast_frames=self.config.selective_kill_coast_frames,
-                    app_weight=(self.config.selective_app_weight
-                                * self._emb_thr().selective_app_scale),
-                    app_ema=self.config.selective_app_ema,
-                    starve_windows=self.config.selective_starve_windows,
-                    starve_trigger=self.config.selective_starve_trigger,
-                    starve_max_frames=self.config.selective_starve_max_frames,
-                    starve_min_obs=self.config.selective_starve_min_obs,
-                    retire_closed=self.config.selective_retire_closed,
-                    lazy_seed=self.config.selective_lazy_seed,
-                )
+                cfg = self._selective_config()
                 view_tracks = await _in_thread(
                     mask_tracker.track_selective,
                     frames_dir=track_kwargs["frames_dir"],
@@ -6612,6 +6593,92 @@ class InferenceJob:
         except Exception:
             pass
 
+    # ── frame_knobs_fps_relative ─────────────────────────────────────────
+    # Frame-denominated tracking thresholds are tuned "in frames at 5 fps"
+    # (FRAME_KNOB_REF_FPS). These helpers turn them into runtime values at the
+    # job's tracking fps without touching the stored knob values.
+
+    def _frame_knob_fps(self) -> float:
+        """The job's nominal tracking fps (per-job override, else the
+        sam3_track_fps knob) -- the rate the frame knobs are rescaled to.
+        Nominal, not video_fps / frame_skip: the rounded skip (e.g. 24 fps
+        video at 5 fps -> skip 5 -> 4.8 fps) would break 5-fps identity."""
+        fps = getattr(self, "target_tracking_fps", None)
+        if fps is None:
+            fps = self.config.sam3_track_fps
+        return float(fps)
+
+    def _scale_frames(self, n_ref: int, *, min_value: int = 1) -> int:
+        """``n_ref`` (frames at 5 fps) at this job's tracking fps; the raw
+        ``int(n_ref)`` when frame_knobs_fps_relative is OFF. 0 stays 0."""
+        if not getattr(self.config, "frame_knobs_fps_relative", False):
+            return int(n_ref)
+        return scale_frames(n_ref, self._frame_knob_fps(),
+                            FRAME_KNOB_REF_FPS, min_value=min_value)
+
+    def _selective_config(self) -> SelectiveConfig:
+        """SelectiveConfig for track_selective from the job knobs, with the
+        frame-count fields rescaled to the tracking fps (max_missed, the TBD
+        track death budget, has no knob: its dataclass default is the 5-fps
+        reference)."""
+        c = self.config
+        fs = self._scale_frames
+        return SelectiveConfig(
+            margin_entry=c.selective_margin_entry,
+            margin_exit=c.selective_margin_exit,
+            gap_trigger=fs(c.selective_gap_trigger),
+            min_streak=fs(c.selective_min_streak),
+            window_max_frames=fs(c.selective_window_max_frames),
+            mask_overlap_exit=c.selective_mask_overlap_exit,
+            max_missed=fs(SelectiveConfig.max_missed),
+            sam_budget_frac=c.selective_sam_budget_frac,
+            kill_coast=c.selective_kill_coast,
+            kill_coast_frames=fs(c.selective_kill_coast_frames),
+            app_weight=(c.selective_app_weight
+                        * self._emb_thr().selective_app_scale),
+            app_ema=c.selective_app_ema,
+            starve_windows=c.selective_starve_windows,
+            starve_trigger=fs(c.selective_starve_trigger),
+            starve_max_frames=fs(c.selective_starve_max_frames),
+            starve_min_obs=fs(c.selective_starve_min_obs),
+            retire_closed=c.selective_retire_closed,
+            lazy_seed=c.selective_lazy_seed,
+        )
+
+    def _mask_tracker_frame_kwargs(self, view_stride: float) -> dict:
+        """Frame-denominated MaskFieldTracker.track() kwargs: rescaled to the
+        tracking fps, then (evict_dark_frames / backfill_min_lived_frames, as
+        before) divided by the view's decimation stride."""
+        from web.field.mask_tracker import (
+            BACKFILL_DARK_STOP, BACKFILL_MIN_LIVED_FRAMES, DARK_REANCHOR_FRAMES,
+            RETIREMENT_FRAMES)
+        fs = self._scale_frames
+        return dict(
+            evict_dark_frames=scale_frame_knob(
+                fs(self.config.evict_dark_frames), view_stride),
+            backfill_min_lived_frames=scale_frame_knob(
+                fs(BACKFILL_MIN_LIVED_FRAMES), view_stride),
+            retirement_frames=fs(RETIREMENT_FRAMES),
+            dark_reanchor_frames=fs(DARK_REANCHOR_FRAMES),
+            backfill_dark_stop=fs(BACKFILL_DARK_STOP),
+        )
+
+    def _field_tracker_frame_kwargs(self) -> dict:
+        """Update-count FieldTracker kwargs (one update per analysis frame)
+        rescaled to the tracking fps. blind_zone_max_coast 0 (= use the
+        occluded budget) stays 0."""
+        from web.field.tracker import (
+            GUARD_MOTION_WINDOW, MAX_COAST_OCCLUDED, MAX_COAST_OPEN)
+        fs = self._scale_frames
+        return dict(
+            max_coast_open=fs(MAX_COAST_OPEN),
+            max_coast_occluded=fs(MAX_COAST_OCCLUDED),
+            guard_motion_window=fs(GUARD_MOTION_WINDOW),
+            dup_reap_updates=fs(self.config.dup_reap_updates),
+            blind_zone_max_coast=fs(
+                int(getattr(self.config, "blind_zone_max_coast", 0) or 0)),
+        )
+
     def _build_identity_registry(self) -> IdentityRegistry:
         """The job's IdentityRegistry, wired to the identity_continuity knobs."""
         cfg = getattr(self, "config", None)
@@ -7475,12 +7542,22 @@ class InferenceJob:
                 alliance_by_territory=self.config.alliance_by_territory,
                 dup_seed_guard_m=self.config.dup_seed_guard_m,
                 dup_reap_m=self.config.dup_reap_m,
-                dup_reap_updates=self.config.dup_reap_updates,
                 colourless_stationary_gate=self.config.colourless_stationary_gate,
                 colourless_stationary_s=self.config.colourless_stationary_s,
                 colourless_stationary_span_m=self.config.colourless_stationary_span_m,
                 blind_zone_hold=bool(getattr(self.config, "blind_zone_coast", False)),
-                blind_zone_max_coast=int(getattr(self.config, "blind_zone_max_coast", 0) or 0))
+                # Update-count budgets (max_coast_open/occluded,
+                # guard_motion_window, dup_reap_updates,
+                # blind_zone_max_coast), rescaled to the tracking fps.
+                **self._field_tracker_frame_kwargs())
+            _ffps = self._frame_knob_fps()
+            print(f"  [frame-knobs] fps_relative="
+                  f"{bool(self.config.frame_knobs_fps_relative)} "
+                  f"track_fps={_ffps:g} (ref {FRAME_KNOB_REF_FPS:g} fps, "
+                  f"scale x{_ffps / FRAME_KNOB_REF_FPS:.2f})"
+                  + ("" if self.config.frame_knobs_fps_relative
+                     or _ffps == FRAME_KNOB_REF_FPS
+                     else " -- raw frame counts, durations NOT preserved"))
             self.radar = Radar(self.field_model.length_m, self.field_model.width_m,
                                field_model=self.field_model)
             self._radar_trails = {}
@@ -8921,7 +8998,8 @@ class InferenceJob:
                         # calibration only); the barrier after the export
                         # awaits this task before seeding uses the tracker.
                         if self.tracking_backend == "sam3":
-                            from web.field.sam3_tracker import Sam3FieldTracker
+                            from web.field.sam3_tracker import (
+                                SAM3_RESEED_MAX_AGE, Sam3FieldTracker)
                             from web.cpu_budget import effective_cpu_count
 
                             # sam3_frame_load_workers: 0 = auto
@@ -8945,6 +9023,10 @@ class InferenceJob:
                                     skip_detector_heads=self.config.sam3_skip_detector_heads,
                                     retire_culled=self.config.sam3_retire_culled,
                                     frame_load_workers=_frame_load_workers,
+                                    # Boundary re-seed freshness (tracked
+                                    # frames, 5-fps reference) at track fps.
+                                    reseed_max_age=self._scale_frames(
+                                        SAM3_RESEED_MAX_AGE),
                                 )
 
                             tracker = _make_sam3_tracker()
@@ -9570,9 +9652,12 @@ class InferenceJob:
                             # default the same way evict_dark_frames is below.
                             backfill_max_frames = max(1, int(round(
                                 self.config.backfill_seconds * eff_fps)))
-                            from web.field.mask_tracker import BACKFILL_MIN_LIVED_FRAMES
-                            backfill_min_lived_frames = scale_frame_knob(
-                                BACKFILL_MIN_LIVED_FRAMES, view_stride)
+                            # Frame-denominated tracker thresholds (5-fps
+                            # reference): rescaled to the tracking fps
+                            # (frame_knobs_fps_relative), then
+                            # evict_dark_frames / backfill_min_lived_frames
+                            # divided by view_stride as before.
+                            _frame_kw = self._mask_tracker_frame_kwargs(view_stride)
 
                             # Build a projector mapping a SAM mask box (tracker/0.5x
                             # top-cropped pixel coords) to field meters, for the
@@ -9778,8 +9863,7 @@ class InferenceJob:
                                 # for decimated views ("dark for ~1s" must not
                                 # become ~2s on a stride-2 corner). Absence counts
                                 # are per re-prompt cycle, already rescaled above.
-                                evict_dark_frames=scale_frame_knob(
-                                    self.config.evict_dark_frames, view_stride),
+                                evict_dark_frames=_frame_kw["evict_dark_frames"],
                                 evict_min_absences=self.config.evict_min_absences,
                                 # Misaligned-mask re-anchor: drift correction
                                 # between dark and sliver re-anchor.
@@ -9822,7 +9906,12 @@ class InferenceJob:
                                 # reverse propagation after the forward loop.
                                 late_seed_backfill=self.config.late_seed_backfill,
                                 backfill_max_frames=backfill_max_frames,
-                                backfill_min_lived_frames=backfill_min_lived_frames,
+                                backfill_min_lived_frames=_frame_kw["backfill_min_lived_frames"],
+                                # fps-rescaled tracker defaults (byte-identical
+                                # values at 5 fps / knob OFF).
+                                retirement_frames=_frame_kw["retirement_frames"],
+                                dark_reanchor_frames=_frame_kw["dark_reanchor_frames"],
+                                backfill_dark_stop=_frame_kw["backfill_dark_stop"],
                                 # Cooperative stop: the tracker polls this once per
                                 # propagated frame and raises TrackStopped so a user
                                 # STOP aborts this (longest) phase within a frame's

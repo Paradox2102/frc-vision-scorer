@@ -17,6 +17,13 @@ ALLIANCES = ("blue", "red")
 # Stand-in cost of a gated-out pair under assign_partial_fix: larger than any
 # sum of in-gate costs, so fewer matches can never beat more.
 _GATED_OUT_COST = 1e6
+# Update-count budgets (one update per analysis frame), tuned at the 5 fps
+# default track rate: 8 updates = 1.6 s open coast, 90 = 18 s occluded coast,
+# 5 = 1 s guard-motion window. The pipeline passes them rescaled to the job's
+# track fps under frame_knobs_fps_relative (web/job_config.scale_frames).
+MAX_COAST_OPEN = 8
+MAX_COAST_OCCLUDED = 90
+GUARD_MOTION_WINDOW = 5
 
 
 @dataclass
@@ -131,12 +138,12 @@ class _Track:
 
 
 class FieldTracker:
-    def __init__(self, field_length, gate_m=2.5, max_coast_open=8,
-                 max_coast_occluded=90, color_penalty=3.0, zones=None,
+    def __init__(self, field_length, gate_m=2.5, max_coast_open=MAX_COAST_OPEN,
+                 max_coast_occluded=MAX_COAST_OCCLUDED, color_penalty=3.0, zones=None,
                  corner_only_r_scale=8.0, coast_vel_decay=0.85,
                  max_speed_m_s=5.5, sticky_max_dist_m=0.0,
                  suspect_zones=None, occlusion_rebind_guard=False,
-                 guard_motion_m=0.3, guard_motion_window=5,
+                 guard_motion_m=0.3, guard_motion_window=GUARD_MOTION_WINDOW,
                  kin_gate_enabled=False, kin_max_speed_mps=6.5,
                  record_history=False,
                  coast_gate_phys=False, reseed_identity=False,

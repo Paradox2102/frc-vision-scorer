@@ -186,7 +186,9 @@ def github() -> None:
     def img(m: re.Match) -> str:
         cap, path = m.group(1), m.group(2)
         cap = cap.split("|")[0].strip()
-        return f"![{cap}]({path})\n*{cap}*" if cap else f"![]({path})"
+        if len(cap.split()) <= 4:            # title-like alt text (the splash): no caption line
+            return f"![{cap}]({path})"
+        return f"![{cap}]({path})\n*{cap}*"
 
     text, n_images = re.subn(r"!\[([^\]]*)\]\(([^)\s]+)\)", img, text)
     GITHUB_OUT.write_text(GITHUB_HEADER + text)

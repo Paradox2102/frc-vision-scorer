@@ -1,5 +1,7 @@
 <!-- Generated from vision-scouting-post.md by `python3 discourse.py github`; edit the post, not this file. -->
 
+![2102 Vision Scouting](img/splash.png)
+
 I really enjoy working on our scouting application. It's grown in scope over the past 2 seasons and has basically become a full competition app, not just scouting, and we have no intention of abandoning it... However, if I'm honest, it's hard to motivate team members to input good data, and we just don't have the disciplined culture of teams with armies of well trained and motivated scouters, especially for a game this hard to scout. So what's the alternative?
 
 ## Automated Vision Scouting: Still In Progress, But Getting Real

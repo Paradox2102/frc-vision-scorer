@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Anton&display=block" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 1280px; height: 720px; overflow: hidden; background: #05070d; }
+.frame { position: absolute; inset: 0; overflow: hidden; }
+/* x-ray frame: main camera view only (top 723 rows of the 1920x1080 HUD), zoomed onto the robot cluster */
+.frame img { position: absolute; width: 2500px; left: -920px; top: -215px; filter: saturate(1.15) contrast(1.05); }
+.shade { position: absolute; inset: 0;
+  background:
+    linear-gradient(180deg, rgba(3,5,10,.94) 0%, rgba(3,5,10,.80) 24%, rgba(3,5,10,.25) 44%, rgba(3,5,10,0) 58%),
+    radial-gradient(ellipse 85% 75% at 50% 62%, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%); }
+.title { position: absolute; top: 34px; left: 0; right: 0; text-align: center;
+  font-family: 'Anton', Impact, sans-serif; font-size: 138px; line-height: 1; letter-spacing: 2px;
+  text-transform: uppercase; white-space: nowrap; }
+.title span { -webkit-text-stroke: 5px #0a0a0a; paint-order: stroke fill;
+  text-shadow: 0 5px 0 rgba(0,0,0,.7), 0 0 18px rgba(0,0,0,.9), 0 0 36px rgba(0,0,0,.6); }
+.gold { color: #FFC20E; }
+.red  { color: #E8202A; }
+.rule { position: absolute; top: 188px; left: 50%; transform: translateX(-50%); width: 520px; height: 7px; display: flex; gap: 8px; }
+.rule i { flex: 1; border-radius: 4px; box-shadow: 0 0 12px rgba(0,0,0,.7); }
+.rule i:first-child { background: #FFC20E; } .rule i:last-child { background: #E8202A; }
+</style></head>
+<body>
+<div class="frame"><img src="assets/xray_qm10_t80.png" alt=""></div>
+
+<div class="title"><span class="gold">2102</span> <span class="red">Vision Scouting</span></div>
+<div class="rule"><i></i><i></i></div>
+</body></html>

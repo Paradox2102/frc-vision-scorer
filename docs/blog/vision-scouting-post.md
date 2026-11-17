@@ -1,3 +1,5 @@
+![2102 Vision Scouting|690x172](img/splash.png)
+
 I really enjoy working on our scouting application. It's grown in scope over the past 2 seasons and has basically become a full competition app, not just scouting, and we have no intention of abandoning it... However, if I'm honest, it's hard to motivate team members to input good data, and we just don't have the disciplined culture of teams with armies of well trained and motivated scouters, especially for a game this hard to scout. So what's the alternative?
 
 ## [color=#FFC107]Automated Vision Scouting[/color] [color=#D32F2F] - Still In Progress, But Getting Real[/color]

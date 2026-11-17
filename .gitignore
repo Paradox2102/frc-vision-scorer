@@ -184,6 +184,7 @@ data/hub_zone_gapfill/
 # Blog: generated upload copies, unused screenshot alternates, third-party data (Manta notes, Match13 API)
 docs/blog/upload/
 docs/blog/*.discourse.md
+docs/blog/upload_links.tsv
 docs/blog/img/candidates/
 docs/blog/cmp/data/manta_notes.json
 docs/blog/cmp/data/match13_*.json

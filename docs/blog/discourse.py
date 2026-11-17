@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Get the blog post into Chief Delphi (Discourse) with every image, in two pastes.
+"""Get the blog post into Chief Delphi (Discourse) with every image.
 
 1. python3 discourse.py prep
-     Copies exactly the images the post uses into upload/ (nothing else).
-2. In a NEW Chief Delphi composer, drag ALL files from upload/ in at once.
+     Copies the images the post still needs into upload/ (only ones that don't
+     already have an upload:// link remembered from an earlier batch).
+2. In a Chief Delphi composer, drag ALL files from upload/ in at once.
    Discourse uploads them and inserts one ![name|WxH](upload://...) line each.
    Select all in the composer (Ctrl+A) and copy (Ctrl+C).
 3. python3 discourse.py merge
-     Reads that copied text from the clipboard (or: merge FILE, or pipe it on stdin),
-     swaps every img/... path in the post for its upload:// link, writes
-     vision-scouting-post.discourse.md and puts it on the clipboard.
-     It refuses if any image is missing, so nothing gets silently dropped.
-4. Back in the composer: Ctrl+A, Ctrl+V. Done.
+     Reads that copied text from the clipboard (or: merge FILE, or pipe it on stdin)
+     and remembers every link in upload_links.tsv. If some uploads failed, it
+     refills upload/ with just the missing images: wait a minute (Chief Delphi
+     rate-limits uploads), drag those in, copy, and merge again.
+     Once every image has a link it writes vision-scouting-post.discourse.md
+     and puts it on the clipboard.
+4. In the composer: Ctrl+A, Ctrl+V. Done.
 
-The upload:// links belong to your account, so they work in any post you write,
-including when you paste the merged post into the same composer.
+Links are remembered per image along with a hash of the file, so an image you
+re-render afterwards is treated as needing a new upload. `prep --fresh` forgets
+every remembered link. The upload:// links belong to your account, so they work
+in any post you write.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -28,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 POST = HERE / "vision-scouting-post.md"
 OUT = HERE / "vision-scouting-post.discourse.md"
 UPLOAD_DIR = HERE / "upload"
+LINKS = HERE / "upload_links.tsv"            # key \t url \t sha1-of-file-when-learned
 
 # ![caption|690x414](img/chart.png)  -> path group
 POST_IMG = re.compile(r"(!\[[^\]]*\]\()([^)\s]+)(\))")
@@ -41,32 +48,69 @@ def key(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", stem.lower())
 
 
-def post_images(text: str) -> list[str]:
-    return [m.group(2) for m in POST_IMG.finditer(text) if not m.group(2).startswith(("upload://", "http"))]
+def sha1(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()[:16]
 
 
-def prep() -> None:
-    text = POST.read_text()
-    paths = post_images(text)
-    if UPLOAD_DIR.exists():
-        shutil.rmtree(UPLOAD_DIR)
-    UPLOAD_DIR.mkdir()
-    seen = {}
-    for p in paths:
+def post_images() -> dict[str, Path]:
+    """key -> image file, for every local image the post references."""
+    out: dict[str, Path] = {}
+    for m in POST_IMG.finditer(POST.read_text()):
+        p = m.group(2)
+        if p.startswith(("upload://", "http")):
+            continue
         src = (HERE / p).resolve()
         if not src.exists():
             sys.exit(f"post references a missing file: {p}")
         k = key(src.name)
-        if k in seen and seen[k] != src:
-            sys.exit(f"two different images share the name {src.stem}: {seen[k]} and {src}")
-        seen[k] = src
-        shutil.copy2(src, UPLOAD_DIR / src.name)
-    big = [f.name for f in UPLOAD_DIR.iterdir() if f.stat().st_size > 4 * 1024 * 1024]
-    print(f"{len(seen)} images copied to {UPLOAD_DIR}")
+        if k in out and out[k] != src:
+            sys.exit(f"two different images share the name {src.stem}: {out[k]} and {src}")
+        out[k] = src
+    return out
+
+
+def load_links() -> dict[str, tuple[str, str]]:
+    links = {}
+    if LINKS.exists():
+        for line in LINKS.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                links[parts[0]] = (parts[1], parts[2])
+    return links
+
+
+def save_links(links: dict[str, tuple[str, str]]) -> None:
+    LINKS.write_text("".join(f"{k}\t{u}\t{h}\n" for k, (u, h) in sorted(links.items())))
+
+
+def still_needed(images: dict[str, Path], links: dict[str, tuple[str, str]]) -> dict[str, Path]:
+    return {k: p for k, p in images.items() if k not in links or links[k][1] != sha1(p)}
+
+
+def fill_upload_dir(files: dict[str, Path]) -> None:
+    if UPLOAD_DIR.exists():
+        shutil.rmtree(UPLOAD_DIR)
+    UPLOAD_DIR.mkdir()
+    for p in files.values():
+        shutil.copy2(p, UPLOAD_DIR / p.name)
+
+
+def prep(fresh: bool) -> None:
+    if fresh and LINKS.exists():
+        LINKS.unlink()
+    images = post_images()
+    need = still_needed(images, load_links())
+    fill_upload_dir(need)
+    have = len(images) - len(need)
+    print(f"{len(images)} images in the post; {have} already uploaded, {len(need)} copied to {UPLOAD_DIR}")
+    big = [p.name for p in need.values() if p.stat().st_size > 4 * 1024 * 1024]
     if big:
         print("over 4 MB (Discourse may shrink or refuse these):", ", ".join(big))
-    print("Next: drag every file in that folder into a new Chief Delphi composer, Ctrl+A, Ctrl+C,"
-          " then run: python3 discourse.py merge")
+    if need:
+        print("Next: drag every file in that folder into the Chief Delphi composer, Ctrl+A, Ctrl+C,"
+              " then run: python3 discourse.py merge")
+    else:
+        print("Nothing to upload. Run: python3 discourse.py merge")
 
 
 def read_uploaded(arg: str | None) -> str:
@@ -93,43 +137,46 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 def merge(arg: str | None) -> None:
-    uploaded = read_uploaded(arg)
-    links = {key(name): url for name, url in UPLOADED.findall(uploaded)}
-    if not links:
-        sys.exit("no ![name](upload://...) lines found in what you copied. "
-                 "Copy the composer text after the uploads finish.")
-    text = POST.read_text()
-    missing = []
+    images = post_images()
+    links = load_links()
+    found = UPLOADED.findall(read_uploaded(arg))
+    learned = 0
+    for name, url in found:
+        k = key(name)
+        if k in images:               # remember against the file as it is right now
+            if links.get(k, ("", ""))[0] != url:
+                learned += 1
+            links[k] = (url, sha1(images[k]))
+    save_links(links)
+    if found:
+        print(f"read {len(found)} upload link(s) ({learned} new)")
+
+    need = still_needed(images, links)
+    if need:
+        fill_upload_dir(need)
+        names = "\n  ".join(p.name for p in need.values())
+        sys.exit(f"{len(images) - len(need)} of {len(images)} images have links. Still needed:\n  {names}\n"
+                 f"Those are now the only files in {UPLOAD_DIR}. Wait a minute, drag them into the"
+                 " composer, Ctrl+A, Ctrl+C, then run merge again.")
 
     def swap(m: re.Match) -> str:
         path = m.group(2)
         if path.startswith(("upload://", "http")):
             return m.group(0)
-        url = links.get(key(Path(path).name))
-        if url is None:
-            missing.append(path)
-            return m.group(0)
-        return f"{m.group(1)}{url}{m.group(3)}"
+        return f"{m.group(1)}{links[key(Path(path).name)][0]}{m.group(3)}"
 
-    merged = POST_IMG.sub(swap, text)
-    if missing:
-        sys.exit("these images have no upload yet (drag them in too, then copy and merge again):\n  "
-                 + "\n  ".join(missing))
+    merged = POST_IMG.sub(swap, POST.read_text())
     OUT.write_text(merged)
-    n = len(post_images(text))
-    extra = len(links) - len({key(Path(p).name) for p in post_images(text)})
-    print(f"all {n} images linked -> {OUT.name}")
-    if extra > 0:
-        print(f"({extra} uploaded image(s) aren't used by the post; that's harmless)")
-    print("copied to clipboard: paste over the composer contents" if copy_to_clipboard(merged)
+    print(f"all {len(images)} images linked -> {OUT.name}")
+    print("copied to clipboard: in the composer, Ctrl+A then Ctrl+V" if copy_to_clipboard(merged)
           else f"clipboard unavailable: open {OUT} and copy it")
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "prep":
-        prep()
+        prep(fresh="--fresh" in sys.argv[2:])
     elif cmd == "merge":
-        merge(sys.argv[2] if len(sys.argv) > 2 else None)
+        merge(next((a for a in sys.argv[2:] if not a.startswith("-")), None))
     else:
         print(__doc__)

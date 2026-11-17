@@ -3,7 +3,9 @@
 - `vision-scouting-post.md` is the post, in Chief Delphi / Discourse markdown with `[color=...]` headers.
 - Images are referenced as `img/...` with Discourse size hints (`|690xH`). To post with all images:
   `python3 discourse.py prep`, drag everything in `upload/` into a new Chief Delphi composer, Ctrl+A,
-  Ctrl+C, `python3 discourse.py merge`, then Ctrl+A, Ctrl+V in the composer. See `discourse.py`.
+  Ctrl+C, `python3 discourse.py merge`, then Ctrl+A, Ctrl+V in the composer. If some uploads fail
+  (Chief Delphi rate-limits them), merge remembers the links it got and refills `upload/` with just
+  the missing images; upload those and merge again. See `discourse.py`.
 - `diagrams/*.html` are the sources for the diagram PNGs. Re-render one at 2x with headless Chrome
   (1000 px wide CSS, full page) after editing it.
 - `img/candidates/` holds alternate replay frames and raw screenshots that didn't make the cut.

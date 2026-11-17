@@ -53,6 +53,55 @@ def scale_frames(n_ref: int, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS,
     return max(int(min_value), int(round(n_ref * float(fps) / float(ref_fps))))
 
 
+# Per-update RATES tuned at ref_fps (one application per analysis / tracked
+# frame) converted to the same effect per SECOND at ``fps``. Each returns its
+# input unchanged (the same float object value, no arithmetic) when
+# fps == ref_fps, so the 5 fps reference is byte-identical by construction.
+
+def scale_decay(factor: float, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS) -> float:
+    """A multiplicative retention applied once per update (velocity decay
+    ``v *= d``): ``d ** (ref_fps / fps)``, so ``fps / ref_fps`` updates
+    multiply to the same per-second retention. 0 (stop at once), 1 (no
+    decay) and out-of-range values are returned unchanged."""
+    factor = float(factor)
+    if float(fps) == float(ref_fps) or not 0.0 < factor < 1.0:
+        return factor
+    return factor ** (float(ref_fps) / float(fps))
+
+
+def scale_alpha(alpha: float, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS) -> float:
+    """An EMA weight on the NEW sample applied once per update
+    (``x = (1 - a) * x + a * new``): ``1 - (1 - a) ** (ref_fps / fps)``, so
+    the OLD state's per-second retention is unchanged. 0 / 1 and
+    out-of-range values are returned unchanged. (For an EMA written as the
+    retention of the OLD state, use :func:`scale_decay` on that weight.)"""
+    alpha = float(alpha)
+    if float(fps) == float(ref_fps) or not 0.0 < alpha < 1.0:
+        return alpha
+    return 1.0 - (1.0 - alpha) ** (float(ref_fps) / float(fps))
+
+
+def scale_step(step: float, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS) -> float:
+    """A linear increment applied once per update (confidence ramp, gate
+    widening per missed update): ``step * ref_fps / fps``, the same total
+    per second."""
+    step = float(step)
+    if float(fps) == float(ref_fps):
+        return step
+    return step * float(ref_fps) / float(fps)
+
+
+def scale_accel_noise(q: float, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS) -> float:
+    """Process-noise intensity of a piecewise-constant (per-step) white
+    acceleration CV Kalman model (``Q = G q G^T``, ``G = [dt^2/2, dt]``): the
+    velocity variance it injects per SECOND is ``q * dt``, so keeping it fixed
+    as dt shrinks needs ``q * fps / ref_fps``."""
+    q = float(q)
+    if float(fps) == float(ref_fps):
+        return q
+    return q * float(fps) / float(ref_fps)
+
+
 @dataclass(frozen=True)
 class Knob:
     name: str                       # override key / config attribute
@@ -98,6 +147,16 @@ KNOBS = [
     # byte-identical to OFF. OFF = raw frame counts at any fps (A/B arm).
     # Counts of things (chunk sizes, corner_track_stride, re-prompt
     # boundaries, VLM image counts) are never scaled.
+    # Also covered (second pass): look-back windows (TBD / kill-coast
+    # velocity deltas, window-label fill stop slack, track-verdict
+    # displacement median window, segment overlap frames, identity
+    # assignment cadence, identity warm-up, position-history buffers) are
+    # rescaled like frame counts, and per-update RATES keep their per-second
+    # effect: coast_vel_decay d -> d ** (5 / fps); the field tracker's gate
+    # widening per missed update and the identity-confidence ramps (decay /
+    # rise / low-margin / roster-conflict) step -> step * 5 / fps; the field
+    # KF's process noise q -> q * fps / 5. Per-observation appearance EMAs
+    # (identity / fused / selective_app_ema) are NOT converted.
     Knob("frame_knobs_fps_relative", "FRAME_KNOBS_FPS_RELATIVE", bool, True,
          section="Tracking backend"),
     # Floor 0.25: below that SAM is starved of pixels; above 1.0 only
@@ -1060,6 +1119,8 @@ KNOBS = [
          section="Identity & votes"),
     Knob("identity_continuity_max_m", "IDENTITY_CONTINUITY_MAX_M", float, 1.0,
          min=0.1, max=1.5, section="Identity & votes"),
+    # (observations at 5 fps; rescaled to the track fps under
+    # frame_knobs_fps_relative, like the other frame counts)
     Knob("identity_warmup_frames", "IDENTITY_WARMUP_FRAMES", int, 5,
          min=0, max=30, section="Identity & votes"),
     # Per-camera appearance (identity layer, web/field/identity.py): fusion
@@ -1171,6 +1232,8 @@ KNOBS = [
          min=1.0, max=100.0, section="Fusion & field position"),
     # Per-missed-frame velocity decay while coasting: occluded robots ease
     # to a stop instead of sailing away; 1.0 restores constant-velocity.
+    # Value is per update at 5 fps; under frame_knobs_fps_relative the
+    # tracker gets d ** (5 / track_fps) (same decay per second).
     Knob("coast_vel_decay", "COAST_VEL_DECAY", float, 0.85,
          min=0.0, max=1.0, section="Fusion & field position"),
     # Sticky-rebind distance gate: a detection carrying a known SAM3 track_id

@@ -136,6 +136,28 @@ def check_fillable(meta: dict) -> None:
         raise Refused("already filled live (window_labels_fill was on)")
 
 
+def fill_stop_slack(summary: dict) -> int:
+    """fill_runs' stop slack (replay-frame indices) as the live stage would
+    use it for this replay: FILL_STOP_SLACK_FRAMES (tuned at 5 fps) rescaled
+    to the job's sam3_track_fps under frame_knobs_fps_relative. Both come
+    from the replay's recorded config (summary.config holds the knobs that
+    differed from the code default); absent = the defaults (5 fps, ON), i.e.
+    the 5 fps behaviour. A per-job target_tracking_fps override is not
+    recorded and is not recoverable here."""
+    from web.job_config import FRAME_KNOB_REF_FPS, scale_frames
+    cfg = summary.get("config") or {}
+    if not cfg.get("frame_knobs_fps_relative", True):
+        return wl.FILL_STOP_SLACK_FRAMES
+    fps = cfg.get("sam3_track_fps", cfg.get("sam2_track_fps", FRAME_KNOB_REF_FPS))
+    try:
+        fps = float(fps)
+    except (TypeError, ValueError):
+        fps = FRAME_KNOB_REF_FPS
+    if fps <= 0:
+        fps = FRAME_KNOB_REF_FPS
+    return scale_frames(wl.FILL_STOP_SLACK_FRAMES, fps, FRAME_KNOB_REF_FPS)
+
+
 def fill_meta(meta: dict, fps: float) -> tuple:
     """Fill ``meta`` in place. Returns (summary.window_labels.fill, lab)."""
     frames = meta["frames"]
@@ -144,7 +166,8 @@ def fill_meta(meta: dict, fps: float) -> tuple:
     lab = reconstruct_lab(frames, windows)
     raw = summary.get("window_labels_digit_calls")
     point, info = reconstruct_point(frames, windows, raw)
-    stats = wl.fill_runs(frames, windows, lab, fps, point, (raw or {}).get("roster"))
+    stats = wl.fill_runs(frames, windows, lab, fps, point, (raw or {}).get("roster"),
+                         stop_slack_frames=fill_stop_slack(summary))
     wl.apply_labels(frames, lab)
     wl.restamp_events(frames, meta.get("events") or [])
     out = {**stats, "offline": True, "windows": len(windows), **info}

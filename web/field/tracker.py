@@ -24,6 +24,15 @@ _GATED_OUT_COST = 1e6
 MAX_COAST_OPEN = 8
 MAX_COAST_OCCLUDED = 90
 GUARD_MOTION_WINDOW = 5
+# Per-update RATES, also tuned at 5 fps (the pipeline passes them converted
+# to the same per-second effect: web/job_config.scale_step /
+# scale_accel_noise). A coasting slot's association gate widens by
+# GATE_WIDEN_PER_MISS x gate_m per missed update (capped at
+# GATE_WIDEN_MAX_MULT x): +2.5 x gate_m per second of coast at 5 fps.
+# KF_PROCESS_Q: the CV Kalman's per-step white-acceleration variance.
+GATE_WIDEN_PER_MISS = 0.5
+GATE_WIDEN_MAX_MULT = 4.0
+KF_PROCESS_Q = 2.0
 
 
 @dataclass
@@ -74,7 +83,7 @@ class TrackOut:
 class _KF:
     """Constant-velocity Kalman filter. State vector: [x, y, vx, vy]."""
 
-    def __init__(self, xy, q=2.0, r=0.05):
+    def __init__(self, xy, q=KF_PROCESS_Q, r=0.05):
         self.x = np.array([xy[0], xy[1], 0.0, 0.0], float)
         self.P = np.diag([r, r, 4.0, 4.0])
         self.q, self.r = q, r
@@ -155,8 +164,14 @@ class FieldTracker:
                  dup_seed_guard_m=0.0, dup_reap_m=0.0, dup_reap_updates=8,
                  colourless_stationary_gate=False, colourless_stationary_s=10.0,
                  colourless_stationary_span_m=1.0, blind_zone_hold=False,
-                 blind_zone=None, blind_zone_max_coast=0):
+                 blind_zone=None, blind_zone_max_coast=0,
+                 gate_widen_per_miss=GATE_WIDEN_PER_MISS, kf_q=KF_PROCESS_Q):
         self.gate = gate_m
+        # Per-missed-update gate widening (see GATE_WIDEN_PER_MISS) and the
+        # slots' KF process noise; both per-update rates the pipeline
+        # converts to the job's track fps (frame_knobs_fps_relative).
+        self.gate_widen_per_miss = float(gate_widen_per_miss)
+        self.kf_q = float(kf_q)
         # Sticky-rebind distance gate (meters); 0 = off. A detection carrying a
         # known track_id normally re-binds to that id's slot unconditionally; when
         # this is > 0, a re-bind farther than this from the slot is rejected
@@ -171,6 +186,8 @@ class FieldTracker:
         # measurements get inflated noise (poor range from low cameras),
         # coasting velocity decays toward rest, and measurements implying
         # impossible robot speed are downweighted instead of followed.
+        # coast_vel_decay is applied once per missed update (the pipeline
+        # passes the 5-fps knob value as d ** (5 / track_fps)).
         self.corner_only_r_scale = float(corner_only_r_scale)
         self.coast_vel_decay = float(coast_vel_decay)
         self.max_speed = float(max_speed_m_s)
@@ -356,7 +373,18 @@ class FieldTracker:
             **({"blind_zone_hold": True,
                 "blind_zone_max_coast": self.blind_zone_max_coast}
                if self.blind_zone_hold else {}),
+            # Per-update rates: keys only when not the 5-fps defaults (traces
+            # of 5 fps runs unchanged; replay rebuilds the scaled values).
+            **({"gate_widen_per_miss": self.gate_widen_per_miss}
+               if self.gate_widen_per_miss != GATE_WIDEN_PER_MISS else {}),
+            **({"kf_q": self.kf_q} if self.kf_q != KF_PROCESS_Q else {}),
         }
+
+    def _gate_mult(self, missed) -> float:
+        """Association-gate multiplier for a slot that missed ``missed``
+        updates: 1 + gate_widen_per_miss x missed, capped (coasting tracks get
+        a wider gate, but not a teleport)."""
+        return min(GATE_WIDEN_MAX_MULT, 1.0 + self.gate_widen_per_miss * missed)
 
     def _reach_excess(self, t, pos, det_corner, dt) -> float:
         """Meters by which ``pos`` lies beyond where slot ``t``'s robot can
@@ -801,7 +829,7 @@ class FieldTracker:
                     dist = float(np.linalg.norm(tp - dp))
                     # Widen the gate for coasting tracks (more missed frames →
                     # wider gate), but cap the multiplier to prevent teleportation.
-                    effective_gate = self.gate * min(4.0, 1.0 + 0.5 * t.missed)
+                    effective_gate = self.gate * self._gate_mult(t.missed)
                     in_gate = dist <= effective_gate
                     # Portal second chance: an occlusion-coasting slot may
                     # re-acquire a detection near its predicted hub-exit point
@@ -889,7 +917,7 @@ class FieldTracker:
                     t = active_slots[r]
                     self._note_reacquire(
                         t, dets[c], dt, "portal" if (r, c) in portal_pairs else "distance",
-                        self.gate * min(4.0, 1.0 + 0.5 * t.missed))
+                        self.gate * self._gate_mult(t.missed))
                     self._measured_update(t, dets[c], dt)
                     t.box = dets[c].box
                     t.missed = 0
@@ -1055,7 +1083,7 @@ class FieldTracker:
     def _seed_slot(self, slot, d, orig_idx, ambiguous_tids):
         """Seed free ``slot`` from detection ``d`` (fused index ``orig_idx``)."""
         self._note_seed(slot, d)
-        slot.kf = _KF(d.pos)
+        slot.kf = _KF(d.pos, q=self.kf_q)
         slot.box = d.box
         slot.corner_only = d.box is None
         slot.tracker_prob = d.tracker_prob  # payload only

@@ -66,6 +66,8 @@ FILL_BRIDGE_SPEED_M_S = 3.0       #     metres of where it vanished
 FILL_POINT_MIN_P = DIGIT_MIN_P    # a single sample read is a waypoint at this p or above
 FILL_STOP_RADIUS_M = 3.0          # an edge fill stops where another chain starts / ends
 FILL_STOP_SLACK_FRAMES = 2        # this close (frame indices) and closer than RADIUS
+#   (analysis-frame indices at the 5 fps reference track rate: 0.4 s; callers
+#   pass it rescaled to the job's track fps -- fill_stop_slack_frames)
 
 # Chain roster elimination (eliminate_chains; window_labels_eliminate knob,
 # experimental, default OFF). An unlabelled frame of a track chain takes the
@@ -462,7 +464,8 @@ def _sample_team(probs, roster) -> Optional[tuple]:
 
 
 def fill_runs(frames: list, windows: list, lab: dict, fps: float, point: Optional[dict] = None,
-              roster: Optional[list] = None) -> dict:
+              roster: Optional[list] = None,
+              stop_slack_frames: int = FILL_STOP_SLACK_FRAMES) -> dict:
     """Spread window labels over the unread windows of the same track chain
     (fill_chains). Changes ``lab`` in place (assemble_labels' format) and
     returns {"fill_frames", "fill_windows", "fill_chains_bridged"}.
@@ -479,7 +482,8 @@ def fill_runs(frames: list, windows: list, lab: dict, fps: float, point: Optiona
     between). Before the first and after the last waypoint its team extends
     outward until the first hazard frame (exclusive): another chain (any
     slot, the same slot's other chains included) starts or ends within
-    FILL_STOP_SLACK_FRAMES frames of it, closer than FILL_STOP_RADIUS_M to
+    ``stop_slack_frames`` (default FILL_STOP_SLACK_FRAMES, frame indices at
+    the 5 fps reference) frames of it, closer than FILL_STOP_RADIUS_M to
     this slot's position there. A sample waypoint's own frame is filled when
     it bounds a fill (an agreeing neighbour, or it is an edge waypoint).
 
@@ -498,7 +502,7 @@ def fill_runs(frames: list, windows: list, lab: dict, fps: float, point: Optiona
             xy = _slot_xy(frames, i, slot)
             if xy is None:
                 continue
-            for d in range(-FILL_STOP_SLACK_FRAMES, FILL_STOP_SLACK_FRAMES + 1):
+            for d in range(-stop_slack_frames, stop_slack_frames + 1):
                 ends.setdefault(i + d, []).append((ci, xy[0], xy[1]))
 
     def hazard(i, ci, slot):
@@ -797,6 +801,10 @@ class Params:
     # window_labels_fill knob: fill_runs after assembly (named windows' teams
     # spread over unread windows of the same track chain, RANK_FILL).
     fill_runs: bool = False
+    # fill_runs' hazard slack in replay-frame indices: FILL_STOP_SLACK_FRAMES
+    # at the 5 fps reference; the app passes it rescaled to the job's track
+    # fps (frame_knobs_fps_relative).
+    fill_stop_slack_frames: int = FILL_STOP_SLACK_FRAMES
     # window_labels_eliminate knob (experimental): eliminate_chains after the
     # fill (colour-gated roster elimination, RANK_ELIM).
     eliminate: bool = False
@@ -1395,7 +1403,8 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     stats["cleared_by_uniqueness"] = cleared
     if params.fill_runs:          # after the anchors: a fill is never an anchor or a read
         stats.update(fill_runs(frames, windows, lab, params.fps,
-                               fill_points(windows, tiles, dc), roster))
+                               fill_points(windows, tiles, dc), roster,
+                               stop_slack_frames=params.fill_stop_slack_frames))
     if params.eliminate:          # after the fill: fills block a team, never name a partner
         stats.update(eliminate_chains(frames, windows, lab, params.fps, red, blue,
                                       elim_colours(windows, tiles, dc)))

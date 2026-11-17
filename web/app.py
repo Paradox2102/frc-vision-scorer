@@ -70,7 +70,9 @@ from web.embedder import (
     cosine_similarity, embedder_model_name, make_robot_embedder, resolve_embedder_backend,
     thresholds_for,
 )
-from web.job_config import FRAME_KNOB_REF_FPS, JobConfig, scale_frames
+from web.job_config import (
+    FRAME_KNOB_REF_FPS, JobConfig, scale_accel_noise, scale_alpha, scale_decay,
+    scale_frames, scale_step)
 from web.env_compat import sam3_env
 from web.ytdlp_cookies import with_cookies as with_ytdlp_cookies
 from web import clef_reader
@@ -1798,7 +1800,10 @@ class InferenceJob:
         # slot_id -> fused track id that last fed it (binding-disruption check).
         self._slot_feed_track: Dict[int, Any] = {}
         self.confidence_config = ConfidenceConfig(
-            confident_margin=self._emb_thr().confident_margin)
+            confident_margin=self._emb_thr().confident_margin,
+            # Per-frame confidence ramps at the tracking fps (5-fps values
+            # at 5 fps / frame_knobs_fps_relative OFF).
+            **self._confidence_rate_kwargs())
         self.co_occlusion_tracker = CoOcclusionTracker()
         # max_events raised well above a full multi-view match's event volume so
         # late-match diagnostics (e.g. sam3.object_culled) aren't truncated — the
@@ -6373,7 +6378,7 @@ class InferenceJob:
         # "never embedded" rather than "embedded at frame 0".
         new_track = RobotTrack(
             robot_id=canonical_id, alliance=alliance, team_number=None,
-            last_position=position, positions_history=deque(maxlen=30),
+            last_position=position, positions_history=deque(maxlen=self._scale_frames(30)),
             appearance_embedding=det_embed,
             last_seen_frame=self._current_frame,
         )
@@ -6466,7 +6471,7 @@ class InferenceJob:
                 alliance=alliance,
                 team_number=None,
                 last_position=(0.0, 0.0),
-                positions_history=deque(maxlen=30),
+                positions_history=deque(maxlen=self._scale_frames(30)),
                 consecutive_tracker=ConsecutiveValueTracker(n_consecutive=3),
             )
             self.robot_tracks[identity_id] = track
@@ -6608,13 +6613,47 @@ class InferenceJob:
             fps = self.config.sam3_track_fps
         return float(fps)
 
+    def _frame_knobs_relative(self) -> bool:
+        """frame_knobs_fps_relative for this job (False with no config: a
+        bare test job keeps the raw 5-fps reference values)."""
+        return bool(getattr(getattr(self, "config", None),
+                            "frame_knobs_fps_relative", False))
+
     def _scale_frames(self, n_ref: int, *, min_value: int = 1) -> int:
         """``n_ref`` (frames at 5 fps) at this job's tracking fps; the raw
         ``int(n_ref)`` when frame_knobs_fps_relative is OFF. 0 stays 0."""
-        if not getattr(self.config, "frame_knobs_fps_relative", False):
+        if not self._frame_knobs_relative():
             return int(n_ref)
         return scale_frames(n_ref, self._frame_knob_fps(),
                             FRAME_KNOB_REF_FPS, min_value=min_value)
+
+    # Per-update rates tuned at 5 fps (applied once per analysis / tracked
+    # frame) -> the same per-second effect at the job's tracking fps. Knob
+    # OFF or 5 fps: the input value, unchanged.
+
+    def _scale_decay(self, factor: float) -> float:
+        """Multiplicative per-update retention d -> d ** (5 / fps)."""
+        if not self._frame_knobs_relative():
+            return factor
+        return scale_decay(factor, self._frame_knob_fps(), FRAME_KNOB_REF_FPS)
+
+    def _scale_alpha(self, alpha: float) -> float:
+        """Per-update EMA weight on the NEW sample a -> 1 - (1 - a) ** (5 / fps)."""
+        if not self._frame_knobs_relative():
+            return alpha
+        return scale_alpha(alpha, self._frame_knob_fps(), FRAME_KNOB_REF_FPS)
+
+    def _scale_step(self, step: float) -> float:
+        """Linear per-update increment s -> s * 5 / fps."""
+        if not self._frame_knobs_relative():
+            return step
+        return scale_step(step, self._frame_knob_fps(), FRAME_KNOB_REF_FPS)
+
+    def _scale_accel_noise(self, q: float) -> float:
+        """Per-step white-acceleration KF variance q -> q * fps / 5."""
+        if not self._frame_knobs_relative():
+            return q
+        return scale_accel_noise(q, self._frame_knob_fps(), FRAME_KNOB_REF_FPS)
 
     def _selective_config(self) -> SelectiveConfig:
         """SelectiveConfig for track_selective from the job knobs, with the
@@ -6631,6 +6670,7 @@ class InferenceJob:
             window_max_frames=fs(c.selective_window_max_frames),
             mask_overlap_exit=c.selective_mask_overlap_exit,
             max_missed=fs(SelectiveConfig.max_missed),
+            velocity_deltas=fs(SelectiveConfig.velocity_deltas),
             sam_budget_frac=c.selective_sam_budget_frac,
             kill_coast=c.selective_kill_coast,
             kill_coast_frames=fs(c.selective_kill_coast_frames),
@@ -6679,6 +6719,51 @@ class InferenceJob:
                 int(getattr(self.config, "blind_zone_max_coast", 0) or 0)),
         )
 
+    def _field_tracker_rate_kwargs(self) -> dict:
+        """Per-update RATE FieldTracker kwargs at the tracking fps: the
+        coast_vel_decay knob (per missed update, 5-fps reference) ->
+        d ** (5 / fps); the gate widening per missed update -> x 5 / fps; the
+        slots' KF process noise -> q x fps / 5 (per-second velocity
+        uncertainty growth unchanged)."""
+        from web.field.tracker import GATE_WIDEN_PER_MISS, KF_PROCESS_Q
+        return dict(
+            coast_vel_decay=self._scale_decay(self.config.coast_vel_decay),
+            gate_widen_per_miss=self._scale_step(GATE_WIDEN_PER_MISS),
+            kf_q=self._scale_accel_noise(KF_PROCESS_Q),
+        )
+
+    def _confidence_rate_kwargs(self) -> dict:
+        """Identity-confidence ramps that tick once per analysis frame
+        (calculate_confidence_update runs for every identity every frame):
+        additive steps tuned at 5 fps -> x 5 / fps. The per-VLM-read
+        reinforce / contradict steps are per event and stay as they are."""
+        d = ConfidenceConfig()
+        return dict(
+            decay_rate=self._scale_step(d.decay_rate),
+            observation_rise=self._scale_step(d.observation_rise),
+            low_margin_drop=self._scale_step(d.low_margin_drop),
+            roster_conflict_drop=self._scale_step(d.roster_conflict_drop),
+        )
+
+    def _apply_identity_frame_rates(self) -> None:
+        """(Re)apply the fps-relative identity-layer values to the objects
+        built in __init__ (so a per-job tracking fps set after construction
+        is honoured): the confidence ramps and the registry's warm-up."""
+        cc = getattr(self, "confidence_config", None)
+        if cc is not None:
+            for k, v in self._confidence_rate_kwargs().items():
+                setattr(cc, k, v)
+        reg = getattr(self, "identity_registry", None)
+        if reg is not None and hasattr(reg, "warmup_frames"):
+            reg.warmup_frames = self._identity_warmup_frames()
+
+    def _identity_warmup_frames(self) -> int:
+        """identity_warmup_frames (observations at the 5 fps reference: the
+        span a new identity needs for its confidence to mature) at the
+        tracking fps. 0 (off) stays 0."""
+        cfg = getattr(self, "config", None)
+        return self._scale_frames(int(getattr(cfg, "identity_warmup_frames", 5)))
+
     def _build_identity_registry(self) -> IdentityRegistry:
         """The job's IdentityRegistry, wired to the identity_continuity knobs."""
         cfg = getattr(self, "config", None)
@@ -6688,7 +6773,7 @@ class InferenceJob:
             update_margin=thr.update_margin,
             continuity=bool(getattr(cfg, "identity_continuity", False)),
             continuity_max_m=float(getattr(cfg, "identity_continuity_max_m", 1.0)),
-            warmup_frames=int(getattr(cfg, "identity_warmup_frames", 5)),
+            warmup_frames=self._identity_warmup_frames(),
             alliance_by_territory=bool(getattr(cfg, "alliance_by_territory", True)),
             per_cam_appearance=bool(getattr(cfg, "identity_per_cam_appearance", False)),
         )
@@ -7523,7 +7608,6 @@ class InferenceJob:
             self.field_tracker = FieldTracker(
                 self.field_model.length_m, zones=static_zones,
                 corner_only_r_scale=self.config.corner_only_r_scale,
-                coast_vel_decay=self.config.coast_vel_decay,
                 sticky_max_dist_m=self.config.sticky_max_dist_m,
                 suspect_zones=suspect_zones,
                 occlusion_rebind_guard=self.config.occlusion_rebind_guard,
@@ -7549,7 +7633,13 @@ class InferenceJob:
                 # Update-count budgets (max_coast_open/occluded,
                 # guard_motion_window, dup_reap_updates,
                 # blind_zone_max_coast), rescaled to the tracking fps.
-                **self._field_tracker_frame_kwargs())
+                **self._field_tracker_frame_kwargs(),
+                # Per-update rates (coast_vel_decay knob, gate widening per
+                # miss, KF process noise) at the same per-second effect.
+                **self._field_tracker_rate_kwargs())
+            # Identity-layer per-frame rates / warm-up built in __init__:
+            # re-applied here so a per-job tracking fps is honoured.
+            self._apply_identity_frame_rates()
             _ffps = self._frame_knob_fps()
             print(f"  [frame-knobs] fps_relative="
                   f"{bool(self.config.frame_knobs_fps_relative)} "
@@ -8051,6 +8141,7 @@ class InferenceJob:
                 lineup_min_p=float(getattr(cfg, "window_labels_lineup_min_p", 0.8)),
                 deinterlace=bool(getattr(cfg, "window_labels_deinterlace", False)),
                 fill_runs=bool(getattr(cfg, "window_labels_fill", False)),
+                fill_stop_slack_frames=self._scale_frames(wl.FILL_STOP_SLACK_FRAMES),
                 eliminate=bool(getattr(cfg, "window_labels_eliminate", False)),
                 reader=str(getattr(cfg, "window_labels_reader", "jev") or "jev"),
                 deadline=time.monotonic() + wl.STAGE_TIMEOUT_S,
@@ -8163,11 +8254,14 @@ class InferenceJob:
         accumulated evidence and retroactively drop human/static-track rows from the
         recorded replay frames (refs / parked structures stop appearing as robots).
         Pruning only; does not re-bind slots (that is slice 3)."""
-        from web.field.track_evidence import track_verdicts, prune_replay_frames
+        from web.field.track_evidence import (
+            DISPLACEMENT_WINDOW, prune_replay_frames, track_verdicts)
         rec = getattr(self, "_replay", None)
         if rec is None or not getattr(self, "_match_evidence", None):
             return
-        verdicts = track_verdicts(self._match_evidence)
+        verdicts = track_verdicts(
+            self._match_evidence,
+            displacement_window=self._scale_frames(DISPLACEMENT_WINDOW))
         rec.frames = prune_replay_frames(rec.frames, self._binding_log, verdicts)
         try:
             self.identity_diagnostics.gauge(
@@ -8181,19 +8275,24 @@ class InferenceJob:
         """Slice 3b: rebuild replay frames keyed by stable slot_id (identity_id churns
         — hundreds per match). Per-slot verdict excludes ref/static slots; retroactive
         team per slot. Slot-churn correction is the stitcher's job. Guarded fallback."""
-        from web.field.track_evidence import slot_evidence, classify_track, reresolve_frames_by_slot
+        from web.field.track_evidence import (
+            DISPLACEMENT_WINDOW, classify_track, reresolve_frames_by_slot, slot_evidence)
         rec = getattr(self, "_replay", None)
         if rec is None or not getattr(self, "_identity_log", None):
             return self._apply_track_verdicts()
         sev = slot_evidence(self._identity_log)
-        slot_verdicts = {sid: classify_track(te) for sid, te in sev.items()}
+        # Displacement median window: 5 samples (1 s) at 5 fps -> track fps.
+        _disp_win = self._scale_frames(DISPLACEMENT_WINDOW)
+        slot_verdicts = {sid: classify_track(te, displacement_window=_disp_win)
+                         for sid, te in sev.items()}
         dropped = {}
         fps = getattr(self, "video_fps", None)
         if SEGMENT_RESOLVE_ENABLED and fps:
             # Without a real fps we can't turn frame gaps into seconds, so skip
             # per-segment resolution rather than split on bad time data.
             from web.field.track_segments import slot_dropped_ranges
-            dropped = slot_dropped_ranges(self._identity_log, fps)
+            dropped = slot_dropped_ranges(self._identity_log, fps,
+                                          displacement_window=_disp_win)
         assignments = self._canonical_identity_slots()        # {slot_id: identity_id}
         slot_meta = {}
         for slot_id, iid in assignments.items():
@@ -8324,7 +8423,11 @@ class InferenceJob:
                             vlm_rows, self._identity_log, blue, red,
                             boundary_rows=getattr(self, "_slot_boundaries", None) or [],
                             params=SegmentParams(
-                                fps=float(getattr(self, "video_fps", 0) or SEG_FPS)),
+                                fps=float(getattr(self, "video_fps", 0) or SEG_FPS),
+                                # common replay frames (analysis rate, 5-fps
+                                # reference) -> tracking fps
+                                min_overlap_frames=self._scale_frames(
+                                    SegmentParams.min_overlap_frames)),
                             grid=[f["frame_num"] for f in rec.frames])
                         self._slot_segments = gres["segments"]
                         print(f"  {format_segment_summary(gres, self._slot_label)}")
@@ -10229,6 +10332,9 @@ class InferenceJob:
 
             frame_num = first_processing_frame
             processed_frame_num = 0
+            # Joint identity assignment cadence: IDENTITY_INTERVAL processed
+            # frames (3 s) at the 5 fps reference -> the tracking fps.
+            _identity_interval = max(1, self._scale_frames(IDENTITY_INTERVAL))
             analysis_frame_set = {
                 frame
                 for start, end in self.processing_ranges
@@ -10813,7 +10919,8 @@ class InferenceJob:
                             _p = getattr(_st, "field_position", None)
                             if _p is not None:
                                 self._ident_pos_history.setdefault(
-                                    ident.identity_id, deque(maxlen=600)
+                                    ident.identity_id,
+                                    deque(maxlen=self._scale_frames(600))
                                 ).append((current_match_time, float(_p[0]), float(_p[1])))
                         self._maybe_schedule_adjudication(current_match_time)
 
@@ -10838,7 +10945,7 @@ class InferenceJob:
                                     f"t={current_match_time:.0f}s): positions after this point "
                                     "are suspect; recalibrate before the next match.")
 
-                if processed_frame_num % IDENTITY_INTERVAL == 0:
+                if processed_frame_num % _identity_interval == 0:
                     self.assign_teams_from_votes()
                     self.audit_overturn_confirmations()
                     # Cadence is by processed index, but the row is stamped with
@@ -11029,11 +11136,14 @@ class InferenceJob:
                 # Offline pass: never let a smoothing failure kill a job that
                 # already finished tracking.
                 try:
-                    from web.field.smoother import (smooth_history,
+                    from web.field.smoother import (Q_ACCEL, smooth_history,
                                                     apply_smoothed_paths)
                     stats = apply_smoothed_paths(
                         self.autonomous_paths,
-                        smooth_history(self.field_tracker.history),
+                        # Same process noise as the live slots' KF (fps-
+                        # relative; Q_ACCEL at 5 fps).
+                        smooth_history(self.field_tracker.history,
+                                       q=getattr(self.field_tracker, "kf_q", Q_ACCEL)),
                         self._slot_label,
                         self.video_fps or 1.0)
                     print(f"  [rts] smoothed autonomous_paths "

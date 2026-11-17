@@ -4,6 +4,11 @@ from typing import Optional, List
 
 @dataclass
 class ConfidenceConfig:
+    # Per-frame steps (decay_rate, observation_rise, low_margin_drop,
+    # roster_conflict_drop) are tuned at the 5 fps reference track rate: the
+    # update runs once per analysis frame, and the app passes them scaled by
+    # 5 / track_fps (frame_knobs_fps_relative) so each keeps its per-second
+    # effect. The VLM steps are per read (event) and are never scaled.
     decay_rate: float = 0.005          # decay per frame when occluded/coasting
     # Relink margin (cosine units of the job's embedder) above which an
     # observation counts as confident (web.embedder.EmbedThresholds.confident_margin).
@@ -12,6 +17,7 @@ class ConfidenceConfig:
     low_margin_drop: float = 0.05      # drop when matched with low margin
     vlm_reinforce: float = 0.15        # rise when VLM read reinforces
     vlm_contradict: float = 0.30       # drop when VLM contradicts
+    roster_conflict_drop: float = 0.2  # drop per frame while another identity holds the team
     initial_confidence: float = 0.5    # initial confidence for new identities
     confirmed_floor: float = 0.85      # confidence floor once confirmed
     hysteresis_rise: float = 0.80      # threshold to rise to high confidence
@@ -104,7 +110,7 @@ def calculate_confidence_update(
             reasons.append("vlm_contradiction")
             
     if not signals.roster_uniqueness_ok:
-        conf -= 0.2
+        conf -= config.roster_conflict_drop
         reasons.append("roster_conflict")
         
     # Clamp confidence

@@ -18,7 +18,8 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
-from web.field.track_evidence import TrackEvidence, classify_track, slot_label_to_id
+from web.field.track_evidence import (
+    DISPLACEMENT_WINDOW, TrackEvidence, classify_track, slot_label_to_id)
 
 
 def split_at_jumps(samples, max_gap_s: float = 1.0, jump_m: float = 2.5,
@@ -65,9 +66,10 @@ def segment_evidence(entries) -> TrackEvidence:
     return te
 
 
-def classify_segment(entries) -> str:
+def classify_segment(entries, displacement_window: int = DISPLACEMENT_WINDOW) -> str:
     """'robot' | 'human' | 'static' for one segment, via the shared classifier."""
-    return classify_track(segment_evidence(entries))
+    return classify_track(segment_evidence(entries),
+                          displacement_window=displacement_window)
 
 
 def resolve_segments(verdicts) -> list[bool]:
@@ -84,7 +86,8 @@ def resolve_segments(verdicts) -> list[bool]:
 
 
 def slot_dropped_ranges(identity_log, video_fps: float,
-                        max_gap_s: float = 1.0, jump_m: float = 2.5):
+                        max_gap_s: float = 1.0, jump_m: float = 2.5,
+                        displacement_window: int = DISPLACEMENT_WINDOW):
     """Per slot_id: split its time-ordered log rows at gap-jumps, classify each
     segment, and return the INCLUSIVE ``(lo_frame, hi_frame)`` ranges of the
     segments the do-no-harm resolver drops. Rows with no position are skipped."""
@@ -100,7 +103,8 @@ def slot_dropped_ranges(identity_log, video_fps: float,
         segs = split_at_jumps(samples, max_gap_s, jump_m)
         if len(segs) <= 1:
             continue
-        verdicts = [classify_segment(rows[a:b]) for (a, b) in segs]
+        verdicts = [classify_segment(rows[a:b], displacement_window)
+                    for (a, b) in segs]
         keep = resolve_segments(verdicts)
         dropped = [(rows[a]["frame_num"], rows[b - 1]["frame_num"])
                    for (a, b), k in zip(segs, keep) if not k]

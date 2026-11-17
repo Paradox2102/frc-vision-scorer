@@ -46,6 +46,11 @@ class SelectiveConfig:
     area_degradation: float = 0.25
     border_margin_px: int = 20
     max_missed: int = 30           # TBD track death (die when missed > this)
+    # Constant-velocity look-back: the TBD prediction averages the last
+    # velocity_deltas centre deltas, and a kill-coast seed takes the last
+    # velocity_deltas + 1 SAM boxes (3 deltas = 0.6 s at the 5 fps
+    # reference; the pipeline rescales it with the other frame counts).
+    velocity_deltas: int = 3
     iou_expand: float = 0.25       # expanded-IoU box inflation factor
     sam_budget_frac: float = 1.0   # SAM-frame budget as a fraction of n_frames
     kill_coast: bool = False       # coast killed objects instead of raw TBD
@@ -122,18 +127,19 @@ class _Track:
         self.last_seen = frame_idx
         self.emb = None if emb is None else np.asarray(emb, dtype=np.float32)
 
-    def velocity(self):
-        """Average of the last <=3 center deltas; (0, 0) for new tracks."""
-        c = self._centers[-4:]
+    def velocity(self, n_deltas: int = 3):
+        """Average of the last <= ``n_deltas`` center deltas; (0, 0) for new
+        tracks."""
+        c = self._centers[-(max(1, int(n_deltas)) + 1):]
         if len(c) < 2:
             return (0.0, 0.0)
         dxs = [c[i][0] - c[i - 1][0] for i in range(1, len(c))]
         dys = [c[i][1] - c[i - 1][1] for i in range(1, len(c))]
         return (sum(dxs) / len(dxs), sum(dys) / len(dys))
 
-    def predicted_box(self):
+    def predicted_box(self, n_deltas: int = 3):
         """Last box translated by the constant-velocity estimate."""
-        vx, vy = self.velocity()
+        vx, vy = self.velocity(n_deltas)
         x1, y1, x2, y2 = self.box
         return (x1 + vx, y1 + vy, x2 + vx, y2 + vy)
 
@@ -181,7 +187,8 @@ class TbdTracker:
 
     # -- core step ---------------------------------------------------------
     def _pair_cost(self, track: _Track, det_box, det_color, det_emb=None) -> float:
-        eiou = expanded_iou(track.predicted_box(), det_box, self.cfg.iou_expand)
+        eiou = expanded_iou(track.predicted_box(self.cfg.velocity_deltas),
+                            det_box, self.cfg.iou_expand)
         if eiou <= 0.0:
             return FORBIDDEN
         cost = 1.0 - eiou
@@ -338,7 +345,8 @@ class WindowOutcome:
     probs: dict[int, float | None] = field(default_factory=dict)
     # Kill-coast seed (Task 2, selective_kill_coast): the frame of the last
     # confident SAM box before the convergence streak, and the short trailing
-    # run of SAM boxes (<=4, ascending) used to coast it at constant velocity.
+    # run of SAM boxes (<= velocity_deltas + 1, ascending) used to coast it
+    # at constant velocity.
     # Only populated for ``killed`` outcomes when ``cfg.kill_coast`` is on;
     # ``merge_selective_results`` consumes them. Default None/[] leaves every
     # existing outcome (and the knob-off kill path) byte-identical.
@@ -719,7 +727,8 @@ class ExitMachine:
 
         The kill fires on ``min_streak`` consecutive mask-overlap frames ending
         at ``close_frame``, so the last pre-convergence frame is at or before
-        ``close_frame - min_streak``. We take the trailing run (<=4) of stored
+        ``close_frame - min_streak``. We take the trailing run (<=
+        ``velocity_deltas + 1``, 4 at the 5 fps reference) of stored
         live-mask frames up to that cutoff and their tight bboxes; the last is
         the coast seed box, the run gives a constant-velocity estimate. No-op
         when the knob is off or no such confident frame exists (coast then
@@ -732,7 +741,8 @@ class ExitMachine:
         frames = sorted(f for f in w.masks if f <= cutoff)
         if not frames:
             return
-        fb = [(f, _mask_bbox(w.masks[f])) for f in frames[-4:]]
+        n_boxes = max(1, int(self.cfg.velocity_deltas)) + 1
+        fb = [(f, _mask_bbox(w.masks[f])) for f in frames[-n_boxes:]]
         fb = [(f, b) for f, b in fb if b is not None]
         if not fb:
             return
@@ -854,8 +864,9 @@ def _apply_renames(results, events):
 
 
 def _coast_velocity(boxes):
-    """Constant-velocity ``(dx, dy)`` from the last <=3 center deltas of
-    ``boxes`` (mirrors :meth:`_Track.velocity`; ``(0, 0)`` for a single box)."""
+    """Constant-velocity ``(dx, dy)`` averaged over every center delta of
+    ``boxes`` (the <= ``velocity_deltas + 1`` trailing boxes _capture_coast
+    keeps; mirrors :meth:`_Track.velocity`; ``(0, 0)`` for a single box)."""
     if len(boxes) < 2:
         return (0.0, 0.0)
     centers = [_center(b) for b in boxes]

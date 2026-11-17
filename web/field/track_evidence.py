@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 
 MOTION_CONFIRM_M = float(os.environ.get("MOTION_CONFIRM_M", "0.75"))
 PERSON_OVERLAP_FRAC = float(os.environ.get("PERSON_OVERLAP_FRAC", "0.5"))
+# net_displacement_m's median window, in positioned samples (one per analysis
+# frame): 5 = 1 s at the 5 fps reference track rate. The pipeline passes it
+# rescaled to the job's track fps (frame_knobs_fps_relative).
+DISPLACEMENT_WINDOW = 5
 
 
 def _median(vals):
@@ -61,7 +65,7 @@ class TrackEvidence:
     def add_position(self, frame: int, x: float, y: float) -> None:
         self.field_positions.append((int(frame), float(x), float(y)))
 
-    def net_displacement_m(self, window: int = 5) -> float:
+    def net_displacement_m(self, window: int = DISPLACEMENT_WINDOW) -> float:
         """Robust whole-match displacement: median (x, y) over consecutive windows
         of `window` samples, then the max pairwise distance between window medians.
         Per-window median rejects frame jitter and single outliers; max-pairwise
@@ -112,7 +116,8 @@ class MatchEvidence:
 
 
 def classify_track(evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
-                   person_overlap_frac: float = PERSON_OVERLAP_FRAC) -> str:
+                   person_overlap_frac: float = PERSON_OVERLAP_FRAC,
+                   displacement_window: int = DISPLACEMENT_WINDOW) -> str:
     """Whole-match verdict: 'robot' | 'human' | 'static'. Precedence matters:
     person-overlap is checked BEFORE motion so a *moving ref* is classified human
     (motion cannot exclude refs); a read/appearance-confirmed track is robot even
@@ -121,15 +126,17 @@ def classify_track(evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
         return "robot"
     if evidence.person_overlap_frac() >= person_overlap_frac:
         return "human"
-    if evidence.net_displacement_m() > motion_confirm_m:
+    if evidence.net_displacement_m(displacement_window) > motion_confirm_m:
         return "robot"
     return "static"
 
 
 def track_verdicts(match_evidence, motion_confirm_m: float = MOTION_CONFIRM_M,
-                   person_overlap_frac: float = PERSON_OVERLAP_FRAC) -> dict:
+                   person_overlap_frac: float = PERSON_OVERLAP_FRAC,
+                   displacement_window: int = DISPLACEMENT_WINDOW) -> dict:
     """{track_id: 'robot'|'human'|'static'} for every track in the registry."""
-    return {tid: classify_track(te, motion_confirm_m, person_overlap_frac)
+    return {tid: classify_track(te, motion_confirm_m, person_overlap_frac,
+                                displacement_window)
             for tid, te in match_evidence.by_track.items()}
 
 

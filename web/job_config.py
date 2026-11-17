@@ -27,6 +27,31 @@ from web import clef_reader, jev_reader, vlm_models
 # Matches the truthiness rule used by the app.py env constants.
 _FALSY = ("0", "false", "False")
 
+# Frame-denominated tracking knobs (selective_*_frames/trigger/streak,
+# evict_dark_frames, dup_reap_updates, ...) and the tracker's hardcoded frame
+# budgets were all tuned at the default sam3_track_fps of 5.0. Their values are
+# read as "frames at this reference rate"; with frame_knobs_fps_relative ON the
+# runtime objects get them rescaled to the job's actual tracking fps so each
+# keeps its wall-clock duration (a 7-frame gap = 1.4 s at 5 fps AND at 10 fps).
+FRAME_KNOB_REF_FPS = 5.0
+
+
+def scale_frames(n_ref: int, fps: float, ref_fps: float = FRAME_KNOB_REF_FPS,
+                 *, min_value: int = 1) -> int:
+    """Rescale a frame count tuned at ``ref_fps`` to ``fps``, keeping its
+    duration in seconds: ``max(min_value, round(n_ref * fps / ref_fps))``.
+
+    ``n_ref <= 0`` is returned unchanged (0 conventionally means disabled /
+    uncapped; a negative env sentinel is never turned into a threshold).
+    At ``fps == ref_fps`` the result is exactly ``n_ref`` for any
+    ``n_ref >= min_value`` (integer * 5.0 / 5.0 is exact in float). Python's
+    ``round`` is round-half-to-even, matching view_stride.scale_frame_knob.
+    """
+    n_ref = int(n_ref)
+    if n_ref <= 0:
+        return n_ref
+    return max(int(min_value), int(round(n_ref * float(fps) / float(ref_fps))))
+
 
 @dataclass(frozen=True)
 class Knob:
@@ -60,6 +85,21 @@ KNOBS = [
     Knob("sam3_track_fps", "SAM3_TRACK_FPS", float, 5.0, min=0.5, max=60.0,
          section="Tracking backend",
          aliases=("sam2_track_fps",), env_aliases=("SAM2_TRACK_FPS",)),
+    # Frame-denominated tracking knobs are expressed "in frames at 5 fps"
+    # (FRAME_KNOB_REF_FPS): every one was tuned at the 5 fps default, so at
+    # another sam3_track_fps they silently changed wall-clock meaning
+    # (selective_gap_trigger 7 = 1.4 s at 5 fps but 0.7 s at 10 fps). ON: the
+    # runtime tracker objects get each duration-meaning frame count (selective
+    # gap/streak/window/kill-coast/starve frames, evict_dark_frames,
+    # dup_reap_updates, blind_zone_max_coast and the trackers' hardcoded coast
+    # / retirement / reseed / dark-stop budgets) rescaled by
+    # track_fps / 5, so durations stay the same in seconds. The stored knob
+    # values (UI, persisted config) are unchanged. At 5 fps the scale is 1.0:
+    # byte-identical to OFF. OFF = raw frame counts at any fps (A/B arm).
+    # Counts of things (chunk sizes, corner_track_stride, re-prompt
+    # boundaries, VLM image counts) are never scaled.
+    Knob("frame_knobs_fps_relative", "FRAME_KNOBS_FPS_RELATIVE", bool, True,
+         section="Tracking backend"),
     # Floor 0.25: below that SAM is starved of pixels; above 1.0 only
     # upsamples (no information) and inflates mask RAM.
     Knob("sam3_export_scale", "SAM3_EXPORT_SCALE", float, 0.5, min=0.25, max=1.0,

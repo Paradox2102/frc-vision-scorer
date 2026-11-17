@@ -637,9 +637,15 @@ class Sam3PredictorAdapter:
     """Expose a SAM 3 session predictor through the SAM2 predictor protocol,
     windowing the video into VRAM-sized chunk sessions internally."""
 
-    def __init__(self, predictor: Any, chunk_frames: int = SAM3_CHUNK_FRAMES) -> None:
+    def __init__(self, predictor: Any, chunk_frames: int = SAM3_CHUNK_FRAMES,
+                 reseed_max_age: int | None = None) -> None:
         self._predictor = predictor
         self._chunk_frames = max(int(chunk_frames), 16)
+        # Boundary re-seed freshness, in tracked frames (SAM3_RESEED_MAX_AGE,
+        # tuned at 5 fps; the pipeline passes it rescaled to the job's
+        # track fps under frame_knobs_fps_relative).
+        self.reseed_max_age = (SAM3_RESEED_MAX_AGE if reseed_max_age is None
+                               else int(reseed_max_age))
         # remove_object: send the session-level ``remove_object`` request
         # (True) or do adapter bookkeeping only (False). Sam3FieldTracker sets
         # False for the SAM 3.1 multiplex predictor, whose
@@ -982,7 +988,7 @@ class Sam3PredictorAdapter:
                 # would drag every other object's `last_box` backward too.
                 # `solo_ids` confines the chunk to just the backfill targets.
                 continue
-            if abs(seed_frame - seen_idx) > SAM3_RESEED_MAX_AGE:
+            if abs(seed_frame - seen_idx) > self.reseed_max_age:
                 continue  # stale: let detector re-prompts recover it
             self._send_prompt(state, seed_frame, obj_id, box)
 
@@ -1068,7 +1074,7 @@ class Sam3PredictorAdapter:
                 continue  # backfill scoping — see _open_chunk_for
             if not (chunk["lo"] <= seen_idx < chunk["hi"]):
                 continue
-            if abs(start_global - seen_idx) > SAM3_RESEED_MAX_AGE:
+            if abs(start_global - seen_idx) > self.reseed_max_age:
                 continue
             if refiner is not None and obj_id in refiner[0]:
                 refiner[2](obj_id, local_start)
@@ -1179,6 +1185,7 @@ class Sam3FieldTracker(MaskFieldTracker):
         skip_detector_heads: bool = False,
         retire_culled: bool = False,
         frame_load_workers: int = 0,
+        reseed_max_age: int | None = None,
     ) -> None:
         if device != "cuda":
             raise RuntimeError("SAM 3 video model currently requires CUDA")
@@ -1256,6 +1263,7 @@ class Sam3FieldTracker(MaskFieldTracker):
         adapter = Sam3PredictorAdapter(
             predictor,
             chunk_frames=chunk_frames if chunk_frames else SAM3_CHUNK_FRAMES,
+            reseed_max_age=reseed_max_age,
         )
         # Multiplex remove_objects can KeyError on trimmed memory: retire by
         # adapter bookkeeping only there.

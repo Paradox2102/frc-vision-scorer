@@ -264,6 +264,9 @@ BACKFILL_MIN_LIVED_FRAMES = int(sam3_env("BACKFILL_MIN_LIVED", "8"))
 # point in the video, or backward propagation lost it; stopping early keeps it
 # from latching onto background.
 BACKFILL_DARK_STOP = int(sam3_env("BACKFILL_DARK_STOP", "4"))
+# Absent frames before an object stops counting toward the active roster cap
+# (track()'s retirement_frames default; 15 frames = 3 s at the 5 fps default).
+RETIREMENT_FRAMES = 15
 # Max IoS (over smaller) a recovered mask may score against another object's
 # mask already stored in that frame. Above this the "late seed" is most likely
 # a re-detection of an already-tracked robot under a new id — storing it would
@@ -1137,7 +1140,7 @@ class MaskFieldTracker:
         max_objects: int | None = None,
         max_active_objects: int = 6,
         max_lifetime_objects: int = 20,
-        retirement_frames: int = 15,
+        retirement_frames: int = RETIREMENT_FRAMES,
         new_obj_ios_thresh: float = 0.5,
         propagate_backward: bool = False,
         cull_enabled: bool = CULL_HIJACK_ENABLED,
@@ -1165,6 +1168,7 @@ class MaskFieldTracker:
         late_seed_backfill: bool = LATE_SEED_BACKFILL,
         backfill_max_frames: int = BACKFILL_MAX_FRAMES,
         backfill_min_lived_frames: int = BACKFILL_MIN_LIVED_FRAMES,
+        backfill_dark_stop: int = BACKFILL_DARK_STOP,
         opening_reprompt_every: int | None = None,
         opening_window_frames: int | None = None,
         seed_gate_fn=None,
@@ -1301,8 +1305,9 @@ class MaskFieldTracker:
                 another object's mask already stored in that frame is dropped
                 (see :data:`BACKFILL_OVERLAP_IOS`) rather than double-counting
                 the same robot under two ids. Backward propagation for one
-                object stops early after :data:`BACKFILL_DARK_STOP` consecutive
-                frames with no recovered mask. The pipeline knob defaults ON
+                object stops early after ``backfill_dark_stop`` (default
+                :data:`BACKFILL_DARK_STOP`) consecutive frames with no
+                recovered mask. The pipeline knob defaults ON
                 since 2026-07-18 (qm11 validated); the module env default
                 (SAM3_LATE_SEED_BACKFILL) stays off for library callers.
             backfill_max_frames: Max frames to propagate backward from an
@@ -2743,7 +2748,7 @@ class MaskFieldTracker:
                                 dark_streak = 0
                             else:
                                 dark_streak += 1
-                                if dark_streak >= BACKFILL_DARK_STOP:
+                                if dark_streak >= backfill_dark_stop:
                                     dark_stopped = True
                                     break
                             # Cooperative stop, same contract as the other loops.

@@ -29,7 +29,8 @@ _FALSY = ("0", "false", "False")
 
 # Frame-denominated tracking knobs (selective_*_frames/trigger/streak,
 # evict_dark_frames, dup_reap_updates, ...) and the tracker's hardcoded frame
-# budgets were all tuned at the default sam3_track_fps of 5.0. Their values are
+# budgets were all tuned at sam3_track_fps 5.0 (the default until Nov 17 2026;
+# now 10). Their values are
 # read as "frames at this reference rate"; with frame_knobs_fps_relative ON the
 # runtime objects get them rescaled to the job's actual tracking fps so each
 # keeps its wall-clock duration (a 7-frame gap = 1.4 s at 5 fps AND at 10 fps).
@@ -131,7 +132,13 @@ KNOBS = [
     # stream_analysis, team_reader jev + read_census + read_keep_evicted.
     # Full match 8.9 min (qm8) / 11.3 min (qm11) vs ~25 min; costs some auto
     # coverage on a few robots. Superseded once SAM 3.1 multiplex works.
-    Knob("sam3_track_fps", "SAM3_TRACK_FPS", float, 5.0, min=0.5, max=60.0,
+    # Nov 17 2026: default 5 -> 10 fps. With frame_knobs_fps_relative (frame
+    # knobs kept constant in seconds) 10 fps beat 5 fps on all 4 hand-GT
+    # matches (data/eval/fps_yolo_sweep, single runs): coverage 86.4 -> 88.8 %,
+    # labels right 72.8 -> 77.0 %, misID 9.1 -> 4.6 s, wall 8.1 -> 12.4 min on
+    # a local 3090. The frame knobs below are still written at the 5 fps
+    # reference (FRAME_KNOB_REF_FPS), NOT at this default.
+    Knob("sam3_track_fps", "SAM3_TRACK_FPS", float, 10.0, min=0.5, max=60.0,
          section="Tracking backend",
          aliases=("sam2_track_fps",), env_aliases=("SAM2_TRACK_FPS",)),
     # Frame-denominated tracking knobs are expressed "in frames at 5 fps"

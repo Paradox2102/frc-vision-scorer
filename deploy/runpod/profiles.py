@@ -63,10 +63,10 @@ KNOB_ENV = {
     "sam3_chunk_frames": "SAM3_CHUNK_FRAMES",
 }
 
-# Current repo defaults for the ladder knobs (web/job_config.py, Nov 12 2026).
+# Current repo defaults for the ladder knobs (web/job_config.py, Nov 17 2026).
 REPO_DEFAULTS = {
     "corner_track_stride": 3,
-    "sam3_track_fps": 5.0,
+    "sam3_track_fps": 10.0,
     "sam3_chunk_frames": 200,
 }
 
@@ -144,33 +144,32 @@ _STEPS = (
      "coverage' (job_config) and the Nov 6 held-out A/B lost auto coverage on "
      "4/4 matches vs pre-B3. Cost: corner propagation +~50% (~+25-35% job wall "
      "on the 3090)."),
-    ("R2", {"sam3_track_fps": 8.0},
-     "Back to the pre-B3 tracking rate (8 fps). Held-out Nov 6: B3 (5 fps + "
-     "stride 3) agg meanNN 0.47 -> 0.73 m vs pre-B3, and selective_mask_prop's "
-     "frame-denominated knobs (gap_trigger 7, min_streak 5, window_max 120) were "
-     "tuned at 8 fps and are NOT rescaled for fps (ab_qm8.py 'speed' note), so "
-     "this also puts selective back on its tuned time scale. Cost: ~+60% SAM "
-     "frames on every view."),
-    ("R3", {"sam3_chunk_frames": None, "sam3_track_fps": 10.0},
+    ("R2", {"sam3_track_fps": 15.0},
+     "15 fps. Since Nov 17 2026 the repo default is 10 fps and the frame "
+     "knobs are fps-relative (frame_knobs_fps_relative: durations kept in "
+     "seconds), which turned 10 fps from a coverage loss into a win over 5 fps "
+     "on all 4 hand-GT matches; 15 fps is the next step up. Cost: ~+50% "
+     "YOLO/TBD frames on every view."),
+    ("R3", {"sam3_chunk_frames": None},
      "BIG JUMP (Nov 12, Nick: big GPUs sit mostly idle at R1/R2 -- GPU util "
      "0-77% spiky, CPU idle, peak 12 GB of 96). Tier-cap SAM3 chunks (fewer "
      "chunk boundaries, each drops SAM3 appearance memory; VRAM-bound, roughly "
-     "time-neutral; UNVALIDATED beyond 400 frames) + 10 fps (denser evidence "
-     "through crossings; no A/B above 8 fps). Cost ~+25% SAM frames over R2."),
+     "time-neutral; UNVALIDATED beyond 400 frames)."),
     ("R4", {"corner_track_stride": 1},
      "Full-rate corners. Oct 31 A/B found no per-slot identity gain of stride 1 "
      "over stride 2 at 8 fps, for ~2x corner propagation -- measured again "
-     "here at 10 fps because corners are the cheap views (~70-90 ms/frame)."),
-    ("R5", {"sam3_track_fps": 15.0},
-     "15 fps: the ceiling probe. Only reachable inside 8 min if views run "
-     "concurrently or the card is much faster per frame than the 3090."),
+     "here at higher fps because corners are the cheap views (~70-90 ms/frame)."),
+    ("R5", {"sam3_track_fps": 30.0},
+     "30 fps: the ceiling probe (every 2nd frame of 60 fps video, every frame "
+     "of 30 fps video). Only reachable inside 8 min if views run concurrently "
+     "or the card is much faster per frame than the 3090."),
 )
 
 
 def ladder(tier: Tier) -> list[Rung]:
     """Cumulative rungs R0..R5 for ``tier``. R0 = repo defaults; R3+ jump harder."""
     rungs = [Rung("R0", dict(REPO_DEFAULTS), {},
-                  "Repo defaults (Nov 12 2026: 5 fps, corner stride 3, 200-frame "
+                  "Repo defaults (Nov 17 2026: 10 fps, corner stride 3, 200-frame "
                   "SAM3 chunks) — what :8004 runs on the 3090.")]
     cur = dict(REPO_DEFAULTS)
     for name, delta, why in _STEPS:

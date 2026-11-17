@@ -431,7 +431,10 @@ def test_replay_provenance_records_config_stop_and_calibration():
     prov = InferenceJob._replay_provenance(job)
     assert prov == {"config": {**job.config.non_defaults(), "window_labels": True,
                                "window_labels_reader": job.config.window_labels_reader,
-                               "auto_period_only": job.config.auto_period_only},
+                               "auto_period_only": job.config.auto_period_only,
+                               "sam3_track_fps": job.config.sam3_track_fps,
+                               "frame_knobs_fps_relative":
+                                   job.config.frame_knobs_fps_relative},
                     "stopped": True, "calibration_version": "20260630-210916-570400"}
     assert prov["config"]["window_labels"] is True
     assert prov["config"]["ground_center_offset_m"] == 0.2

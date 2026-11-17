@@ -1581,7 +1581,12 @@ class JobStopped(Exception):
 
 
 _PROVENANCE_KNOBS = ("window_labels", "window_labels_reader", "auto_period_only",
-                     "ground_center_offset_m")
+                     "ground_center_offset_m",
+                     # Tracking rate + fps-relative frame knobs: offline tools
+                     # (scripts/fill_replay_labels.py) rescale frame counts by
+                     # them. The default moved 5 -> 10 fps Nov 17 2026, so a
+                     # missing key = a pre-flip replay = 5 fps.
+                     "sam3_track_fps", "frame_knobs_fps_relative")
 
 
 

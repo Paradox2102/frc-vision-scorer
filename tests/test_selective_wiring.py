@@ -26,6 +26,10 @@ from web.app import InferenceJob
 def _make_job():
     with patch("web.app.YOLO"):
         job = InferenceJob("test_job", "/mock/video.mp4")
+    # Wiring tests run at the 5 fps frame-knob reference rate so knob values
+    # reach SelectiveConfig unscaled (the default is 10 fps since Nov 17 2026;
+    # fps rescaling is covered by tests/test_frame_knobs_fps.py).
+    job.config.sam3_track_fps = 5.0
     return job
 
 

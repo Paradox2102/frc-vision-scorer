@@ -78,7 +78,7 @@ def test_ladder_is_cumulative_and_starts_at_repo_defaults():
         assert cur.knobs == {**prev.knobs, **cur.delta}
         assert cur.delta and cur.rationale
     top = rungs[-1].knobs
-    assert top["corner_track_stride"] == 1 and top["sam3_track_fps"] == 15.0
+    assert top["corner_track_stride"] == 1 and top["sam3_track_fps"] == 30.0
     assert top["sam3_chunk_frames"] == tier.chunk_cap
     # quality only goes up: fps never drops, stride never rises, chunk never shrinks
     for prev, cur in zip(rungs, rungs[1:]):
@@ -103,7 +103,7 @@ def test_profile_env_render_roundtrip():
     parsed = profiles.parse_env_file(profiles.render_profile_env(env, "hdr"))
     assert parsed == {k: str(v) for k, v in env.items()}
     assert parsed["SAM3_CHUNK_FRAMES"] == str(tier.chunk_cap)
-    assert parsed["SAM3_TRACK_FPS"] == "10.0" and parsed["CORNER_TRACK_STRIDE"] == "2"
+    assert parsed["SAM3_TRACK_FPS"] == "15.0" and parsed["CORNER_TRACK_STRIDE"] == "2"
     assert parsed["VLLM_PHASE_EXCLUSIVE"] == "0" and parsed["FRC_PROFILE_RUNG"] == "R3"
     with pytest.raises(ValueError):
         profiles.render_profile_env({"X": "a b"})

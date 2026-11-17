@@ -141,8 +141,10 @@ def fill_stop_slack(summary: dict) -> int:
     use it for this replay: FILL_STOP_SLACK_FRAMES (tuned at 5 fps) rescaled
     to the job's sam3_track_fps under frame_knobs_fps_relative. Both come
     from the replay's recorded config (summary.config holds the knobs that
-    differed from the code default); absent = the defaults (5 fps, ON), i.e.
-    the 5 fps behaviour. A per-job target_tracking_fps override is not
+    differed from the code default, plus sam3_track_fps /
+    frame_knobs_fps_relative always since Nov 17 2026); absent = a replay
+    from before that, when the default was 5 fps (ON), i.e. the 5 fps
+    behaviour -- NOT today's 10 fps default. A per-job target_tracking_fps override is not
     recorded and is not recoverable here."""
     from web.job_config import FRAME_KNOB_REF_FPS, scale_frames
     cfg = summary.get("config") or {}

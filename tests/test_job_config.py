@@ -15,7 +15,7 @@ def test_defaults_without_env(monkeypatch):
     cfg = JobConfig()
     assert cfg.tracking_backend == "sam3"
     assert cfg.sam2_model_size == "small"
-    assert cfg.sam3_track_fps == 5.0
+    assert cfg.sam3_track_fps == 10.0      # 5 -> 10 Nov 17 2026
     assert cfg.sam3_export_scale == 0.5
     assert cfg.reprompt_seconds == 2.0
     assert cfg.cull_hijack_enabled is False
@@ -545,15 +545,22 @@ def test_identity_continuity_knobs_env_override_and_bounds(monkeypatch):
 def test_identity_registry_built_from_knobs(monkeypatch):
     from web.app import InferenceJob
     job = InferenceJob.__new__(InferenceJob)
+    # 5 fps = the frame-knob reference rate: warm-up passes through unscaled.
     job.config = JobConfig({"identity_continuity": True,
                             "identity_continuity_max_m": 0.8,
-                            "identity_warmup_frames": 3})
+                            "identity_warmup_frames": 3,
+                            "sam3_track_fps": 5.0})
     from web.field.identity import IdentityRegistry
     # Mirrors the constructor wiring in InferenceJob.__init__.
     reg = InferenceJob._build_identity_registry(job)
     assert isinstance(reg, IdentityRegistry)
     assert reg.continuity is True and reg.continuity_max_m == 0.8
     assert reg.warmup_frames == 3
+    # At the 10 fps default the same knob is 6 tracked frames (same 0.6 s).
+    job.config = JobConfig({"identity_continuity": True,
+                            "identity_continuity_max_m": 0.8,
+                            "identity_warmup_frames": 3})
+    assert InferenceJob._build_identity_registry(job).warmup_frames == 6
 
 
 def test_identity_per_cam_appearance_knob_default_on_and_wired(monkeypatch):
@@ -906,7 +913,7 @@ def test_runtime_override_accepts_legacy_name(monkeypatch):
         entry = next(e for e in describe_knobs() if e["name"] == "sam3_track_fps")
         assert entry["source"] == "runtime"
         jc.set_runtime_override("sam2_track_fps", None)   # clear via old name
-        assert JobConfig().sam3_track_fps == 5.0
+        assert JobConfig().sam3_track_fps == 10.0
     finally:
         jc.reset_runtime_overrides()
 
@@ -916,7 +923,7 @@ def test_normalize_overrides_and_helpers():
     assert canonical_knob_name("sam2_export_scale") == "sam3_export_scale"
     assert canonical_knob_name("reprompt_seconds") == "reprompt_seconds"
     assert canonical_knob_name("not_a_knob") == "not_a_knob"
-    assert knob_default("sam2_track_fps") == knob_default("sam3_track_fps") == 5.0
+    assert knob_default("sam2_track_fps") == knob_default("sam3_track_fps") == 10.0
     assert normalize_overrides({"sam2_track_fps": 8, "bogus": 1}) == {
         "sam3_track_fps": 8, "bogus": 1}
     assert normalize_overrides(None) == {}

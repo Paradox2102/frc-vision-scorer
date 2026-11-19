@@ -8233,6 +8233,10 @@ class InferenceJob:
                   f"digits, {stats.get('lineup_named')} by lineup, {stats.get('unlabelled')} "
                   f"unlabelled; {stats.get('requests')} requests, ~{stats.get('cost_cents')}c, "
                   f"{stats['seconds']}s")
+            if stats.get("lineup_failed"):
+                timings["window_labels.lineup_failed"] = 1
+                print(f"[window-labels] WARNING lineup pass failed, digit labels kept: "
+                      f"{stats['lineup_failed']}")
             if "fill_frames" in stats:
                 print(f"[window-labels] fill: {stats['fill_frames']} slot-frames in "
                       f"{stats.get('fill_windows')} unread windows "

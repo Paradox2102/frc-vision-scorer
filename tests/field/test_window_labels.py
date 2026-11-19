@@ -400,13 +400,39 @@ def test_lineup_disabled_sends_no_who_request_and_keeps_digit_labels():
     assert res["lineup_jpeg"] is None
 
 
-def test_lineup_pass_errors_abort_with_no_labels():
+def test_lineup_pass_errors_keep_the_digit_labels():
+    # Nov 19 2026: Jev ran out of credits (HTTP 402) mid-batch; the lineup
+    # pass failing used to abort the whole stage and drop every digit label.
     frames = _lineup_frames()
     s = _lineup_session(frames, who_p={"B": 0.9}, fail=1)       # the one "who" request fails
     res = _run(frames, s, seed=1)
-    assert res["aborted"] and "request errors" in res["aborted"]
-    assert "lineup pass" in res["aborted"]
-    assert res["labels"] is None and res["segments"] is None
+    assert res["aborted"] is None
+    st = res["stats"]
+    assert "request errors" in st["lineup_failed"] and "lineup pass" in st["lineup_failed"]
+    assert st["lineup_named"] == 0 and st["digit_named"] == 8
+    b1 = next(w for w in wl.build_windows(frames, FPS) if w.slot == "B1")
+    assert res["labels"][(b1.idx[0], "B1")][:2] == ("3128", wl.RANK_DIGITS)
+    assert res["segments"] is not None
+
+
+def test_lineup_pass_user_stop_still_aborts():
+    frames = _lineup_frames()
+    params_box = {}
+
+    class StopDuringLineup(type(_lineup_session(frames, who_p={"B": 0.9}))):
+        def ask(self, items, question):
+            if question == "who":
+                params_box["p"].cancelled = True
+                self.available = False
+                self.disabled_reason = "stopped"
+            return super().ask(items, question)
+
+    s = _lineup_session(frames, who_p={"B": 0.9})
+    s.__class__ = StopDuringLineup
+    p = _params(seed=1)
+    params_box["p"] = p
+    res = wl.run_window_labels(frames, "video.mp4", _Cal(), s, p, frame_source=_source)
+    assert res["aborted"] and res["labels"] is None
 
 
 def test_lineup_pass_is_skipped_below_two_rows_or_when_disabled():

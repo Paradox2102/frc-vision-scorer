@@ -1352,6 +1352,7 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
     todo_all = [w.wid for w in windows if w.wid not in digit and tiles.get(w.wid)]
     note = params.ball_note if params.ball_note is not None else jev_reader.BALL_NOTE_2026
     lineup, jpegs, lettered = {}, {}, []
+    lineup_failed = None
     for name, teams in cards:
         order = [t for t in teams if t in rows]
         random.Random(params.seed).shuffle(order)
@@ -1376,9 +1377,22 @@ def _run_stage(frames, video_path, cal, session, params, frame_source, clock, st
                                                        lineup_asset=card_asset,
                                                        colour_note=params.event_lineup)
 
-        # 5. lineup pass on the windows the digit pass did not name
-        answered = _ask_batched(session, todo, lineup_item, "who", params, clock, stats,
-                                "in the lineup pass", partial_ok=True)
+        # 5. lineup pass on the windows the digit pass did not name. The digit
+        # labels are already decided, so a reader failure here (billing,
+        # network, the session latching off) costs only the lineup names:
+        # keep the digit labels and go on to assemble/fill. A user stop still
+        # aborts the stage.
+        if lineup_failed is not None:
+            continue
+        try:
+            answered = _ask_batched(session, todo, lineup_item, "who", params, clock, stats,
+                                    "in the lineup pass", partial_ok=True)
+        except StageAbort as e:
+            if params.cancelled:
+                raise
+            lineup_failed = str(e)
+            stats["lineup_failed"] = lineup_failed
+            continue
         if len(answered) < len(todo):            # deadline mid-pass: keep what we have
             stats["deadline_partial"] = "lineup"
             stats["lineup_skipped"] = stats.get("lineup_skipped", 0) + len(todo) - len(answered)

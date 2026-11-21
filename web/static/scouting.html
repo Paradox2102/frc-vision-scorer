@@ -25,6 +25,9 @@
   .sc-status b { color:var(--foreground); font-weight:600; }
   .sc-export { margin-left:auto; font-size:0.82rem; color:var(--primary); text-decoration:none; }
   .sc-export:hover { text-decoration:underline; }
+  .sc-push { font-size:0.82rem; color:var(--primary); background:none; border:none; cursor:pointer; padding:0; }
+  .sc-push:hover:not(:disabled) { text-decoration:underline; }
+  .sc-push:disabled { color:var(--text-secondary); cursor:default; }
 
   .sc-layout { display:grid; grid-template-columns:190px minmax(0,1fr); gap:0.9rem;
                padding-top:0.75rem; flex:1; min-height:0; }
@@ -176,6 +179,8 @@
     <select id="eventSel"></select>
     <span class="sc-status" id="eventStatus">Loading events…</span>
     <a class="sc-export" id="exportLink" href="#" target="_blank" rel="noopener" style="display:none">Export JSON</a>
+    <button class="sc-push" id="pushBtn" type="button" style="display:none"
+            title="Send this event's auto paths to RoboRecon (ROBORECON_URL)">Send paths to RoboRecon</button>
   </div>
 
   <div class="sc-layout">
@@ -275,6 +280,26 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pct = v => v == null ? '—' : `${Math.round(v * 100)}%`;
 const fmtS = v => v == null ? '—' : (v >= 100 ? `${Math.round(v)} s` : `${v.toFixed(1)} s`);
+
+async function pushToRoboRecon() {
+  const btn = $('pushBtn'), eventKey = S.event;
+  if (!eventKey) return;
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const r = await fetch(`/api/scouting/${encodeURIComponent(eventKey)}/push-roborecon?metrics=auto_paths`,
+                          { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || `${r.status}`);
+    const res = (body.results || [])[0] || {};
+    btn.textContent = body.ok
+      ? `Sent ✓ (${res.teamsStored ?? 0} teams${res.eventKnown === false ? ', event not in RoboRecon yet' : ''})`
+      : `Rejected: ${(res.errors || []).join('; ') || 'see server log'}`;
+  } catch (e) {
+    btn.textContent = `Send failed: ${e.message}`;
+  } finally {
+    if (S.event === eventKey) setTimeout(() => { btn.disabled = false; }, 1500);
+  }
+}
 
 async function getJSON(url) {
   const r = await fetch(url);
@@ -393,6 +418,9 @@ async function selectEvent(eventKey, wantTeam) {
   $('teamList').innerHTML = '';
   $('exportLink').href = `/api/scouting/${encodeURIComponent(eventKey)}/export`;
   $('exportLink').style.display = '';
+  $('pushBtn').style.display = '';
+  $('pushBtn').disabled = false;
+  $('pushBtn').textContent = 'Send paths to RoboRecon';
   let info, teams;
   try {
     [info, teams] = await Promise.all([
@@ -437,6 +465,7 @@ function renderTeams() {
       <span>${t.team_number}</span><small>${t.n_labelled}/${t.n_matches}</small></button>`;
   }).join('') || '<div class="sc-empty">No team matches.</div>';
 }
+$('pushBtn').addEventListener('click', pushToRoboRecon);
 $('teamList').addEventListener('click', e => {
   const b = e.target.closest('.sc-team');
   if (b) selectTeam(+b.dataset.team);

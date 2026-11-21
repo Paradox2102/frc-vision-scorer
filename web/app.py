@@ -11409,6 +11409,15 @@ class InferenceJob:
                         **self._replay_row_render_fields(),
                     })
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
+                    # Send the event's refreshed metrics to RoboRecon (opt-in via
+                    # ROBORECON_AUTO_PUSH; background thread, never raises).
+                    if status == "complete" and self.match_key:
+                        try:
+                            from web.scouting import autopush as _autopush
+                            if _autopush.schedule(self.event_key):
+                                print(f"[roborecon] auto-push queued for {self.event_key}")
+                        except Exception as e:
+                            print(f"[roborecon] auto-push not queued: {e}")
                     # hud_post_render: render once the identity rows exist (below).
                     self._replay_render_pending = bool(self._replay_draw_list)
             except Exception as e:

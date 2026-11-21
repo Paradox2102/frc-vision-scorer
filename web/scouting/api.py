@@ -6,6 +6,9 @@
   GET /api/scouting/{event}/metric/{key}        one metric envelope (?team=N, ?<param>=v)
   GET /api/scouting/{event}/export              every applicable metric (the RoboRecon payload)
   GET /api/scouting/field-image/{year}[/meta]   AdvantageScope field2d jpg + its corner pixels
+  GET  /api/scouting/roborecon/status           RoboRecon connection/auth check (no token echoed)
+  POST /api/scouting/{event}/push-roborecon     push metric envelopes to RoboRecon
+                                                (?metrics=auto_paths,... ; default all)
 
 Everything blocking (sqlite, meta.json parsing, metric compute) runs in a worker
 thread. Event loading is cached by registry on the replay-set fingerprint, so the
@@ -181,3 +184,46 @@ def _export_sync(event_key: str) -> dict:
 @router.get("/{event_key}/export")
 async def event_export(event_key: str):
     return await asyncio.to_thread(_export_sync, event_key)
+
+# ----------------------------------------------------------------- RoboRecon push
+def push_event(event_key: str, metrics: Optional[list] = None, sink=None,
+               team: Optional[int] = None) -> dict:
+    """Run the event's metrics (all applicable, or just ``metrics``) and push the
+    envelopes to RoboRecon. Each team's payload covers every match of the event
+    (RoboRecon replaces per event/metric/team), so re-running after a match is
+    (re)analysed sends that match's newest result exactly once.
+    Raises RoboReconError if the push as a whole fails."""
+    year = _year(event_key)
+    available = {m.key for m in registry.available_metrics(year)}
+    keys = [k for k in (metrics or sorted(available))]
+    unknown = [k for k in keys if k not in available]
+    if unknown:
+        raise ValueError(f"metric(s) not available for {year}: {', '.join(unknown)}")
+    envs = [registry.run_metric(event_key, k, None, DB_PATH) for k in keys]
+    if team is not None:
+        envs = [export.filter_team(e, team) for e in envs]
+    out = (sink or export.RoboReconSink()).push(envs)
+    return {"event_key": event_key, "metrics": keys, **out}
+
+
+# No /{event_key}/status route exists, so "roborecon" is never read as an event key.
+@router.get("/roborecon/status")
+async def roborecon_status():
+    """Connection check plus the auto-push config and last result per event."""
+    from web.scouting import autopush
+    try:
+        conn = await asyncio.to_thread(lambda: export.RoboReconSink().check())
+    except export.RoboReconError as e:
+        conn = {"ok": False, "error": str(e)}
+    return {"connection": conn, "auto_push": autopush.status()}
+
+
+@router.post("/{event_key}/push-roborecon")
+async def push_roborecon(event_key: str, metrics: Optional[str] = None):
+    keys = [k.strip() for k in metrics.split(",") if k.strip()] if metrics else None
+    try:
+        return await asyncio.to_thread(push_event, event_key, keys)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except export.RoboReconError as e:
+        raise HTTPException(502, str(e))

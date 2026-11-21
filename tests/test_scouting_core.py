@@ -252,5 +252,8 @@ def test_envelope_shape_and_team_filter(tmp_path):
     assert list(one["teams"]) == ["6773"] and len(env["teams"]) == 2
     out = JsonFileSink(tmp_path).push([env])
     assert json.loads(open(out["written"][0]).read())["metric"] == "m"
-    with pytest.raises(NotImplementedError):
-        RoboReconSink().push([env])
+    # Unconfigured RoboRecon sink refuses before any network call
+    # (full behaviour: tests/test_scouting_roborecon.py).
+    from web.scouting.export import RoboReconError
+    with pytest.raises(RoboReconError, match="ROBORECON_URL"):
+        RoboReconSink(base_url="", token="").push([env])

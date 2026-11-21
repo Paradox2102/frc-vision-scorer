@@ -11,9 +11,9 @@ framework that new metrics plug into. First two metrics:
    each hub-shift category (active / inactive / endgame, plus auto and
    transition), optionally split by driver station 1/2/3.
 
-Later: push results to RoboRecon (roborecon.net, repo Paradox2102/RoboRecon3).
-Neither side has that API yet. This design prepares a versioned export payload
-and a sink interface for it. The push itself is a future task.
+Results are pushed to RoboRecon (roborecon.net, repo Paradox2102/RoboRecon3)
+through a versioned export payload and `RoboReconSink`; see "Pushing to
+RoboRecon" below.
 
 ## Inputs (what already exists)
 
@@ -115,7 +115,7 @@ available on each sample.
   `opp_half_frac`, `mean_x`, and `lateral` (mean y). These answer questions like
   "do they play defense in the far half?" directly.
 
-## Export envelope (for RoboRecon later)
+## Export envelope (what RoboRecon ingests)
 
 ```json
 {"schema": "frc-vision-scorer.scouting", "schema_version": 1,
@@ -132,11 +132,38 @@ available on each sample.
   plus `comp_level`, `set_number` and `match_number`, because RoboRecon drops
   comp_level. Station is `alliance_position` 1–3 in TBA order, which is what
   RoboRecon's `ScoutingReport.alliancePosition` uses.
-- Paths also carry `points_norm` (0..1 full-field, no timestamps), the shape of
-  RoboRecon's `PathValue`.
-- `RoboReconSink.push(payload)` is a stub. The future work is a RoboRecon API
-  route authenticated like its cron routes (`Authorization: Bearer <secret>`),
-  plus a sink here that POSTs the envelope.
+- Paths also carry `points_norm` (0..1 full-field, no timestamps). RoboRecon
+  itself draws from `points_field` (absolute WPILib metres), converting to its
+  field image at read time, and shows one card per `clusters` routine (the
+  representative run, with every member match and its TBA video).
+
+## Pushing to RoboRecon
+
+Contract (RoboRecon `src/app/api/integrations/vision-scouting/route.ts`):
+
+- `POST {ROBORECON_URL}/api/integrations/vision-scouting`, header
+  `Authorization: Bearer {ROBORECON_TOKEN}` (RoboRecon's
+  `VISION_SCOUTING_API_KEY`), body `{"envelopes": [...]}`: at most 100
+  envelopes and 25 MB per request. `GET` on the same URL is a connection check.
+- 200 all stored, 207 some rejected, 400 all rejected (each result says why),
+  401 bad token, 503 RoboRecon has no key configured.
+- RoboRecon stores every metric, one row per (event_key, metric, team), and
+  REPLACES that row on each push (a push older than the stored
+  `generated_at` is skipped). So each team payload must carry all of the
+  team's matches. Re-analysing a match then overwrites its old result.
+  `auto_paths` payloads are validated strictly; other metrics are stored as sent.
+
+Here (`web/scouting/export.py` `RoboReconSink`, `web/scouting/autopush.py`):
+
+- **Auto-push**: with `ROBORECON_AUTO_PUSH=1` in `.env`, every replay saved as
+  `complete` queues a push of the event's `ROBORECON_AUTO_PUSH_METRICS`
+  (default `auto_paths`). It runs in a background thread, never fails the
+  analysis, and coalesces per event (one re-run covers every match that
+  finished meanwhile). Status: `GET /api/scouting/roborecon/status`.
+- **Manual**: `scripts/push_roborecon.py <event> [--metrics ...] [--team N]
+  [--url ...]` or `--check`; `POST /api/scouting/{event}/push-roborecon`; the
+  scouting page's "Send paths to RoboRecon" button.
+- Envelopes too large for one request are split by whole team, never by match.
 
 ## API and UI
 

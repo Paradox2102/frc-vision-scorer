@@ -103,3 +103,29 @@ There is one new red→blue swap among 190 red instances. Validation on the merg
   but only with Nick's go-ahead.
 
 Full tables: `heldout_eval.md` / `heldout_eval.json` in this directory.
+
+## Full-match A/B (Nov 20 evening): the model ALONE does not help, and needs the HSV-knob fix
+
+The `after` arm ran on a second app instance on :8014, using the same code as :8004 (main-server 986b93df plus
+its uncommitted HSV-knob patch), with `FRC_BUMPER_MODEL` set to these weights and default job config.
+`before` = today's default runs on :8004. `hsv_wide` = the other session's arm: old model plus widened blue
+HSV knobs (hue_min 85, sat_min 60, val_min 25). Each arm has one run per match. Scored by
+`scripts/ab_replay_team_metrics.py`, using TBA rosters and no GT; full tables are in `ab_fullmatch.md`.
+
+| arm | replays (cabl qm5, qm12, cur qm103, qm112) | focus-team label cov | focus slot share | focus wrong-alliance | other teams cov |
+|---|---|---:|---:|---:|---:|
+| before | 525ed57e 2dcf7631 1173562e 07f2b816 | 50.3% | 0.28 | 27.9% | 64.2% |
+| **after (new model)** | ebfc1f1d 12c81643 107a0769 386b1529 | **41.9%** | **0.16** | **34.4%** | 65.2% |
+| hsv_wide (old model) | 765906e3 1a224b1a 38f1cdc6 c27bcb80 | 53.9% | 0.48 | 1.8% | 65.7% |
+
+Focus teams: 4322 (qm5/qm12), 498 (qm5), 6800 (qm103/qm112).
+- **cabl_qm5:** blue-slot occupancy fell from 58% to 48%. Team 498's coverage fell from 56% to 14%, and 4322 is still unlabelled.
+- **cur_qm103:** 6800 sits on a wrong-alliance slot 53% of the time, up from 34%.
+- **Other teams:** flat (64% → 65% coverage).
+
+**Why:** with `bumper_color_read=strict`, the HSV read replaces the YOLO colour on every main-view detection.
+The default thresholds can't see teal, so the new model's extra teal detections get flipped or
+cleared. On the after-arm cabl_qm5 run, 1,392 of 7,537 colours were flipped and 2,245 cleared. The hsv_wide run of the same match
+flipped 184 and cleared 504. The extra detections therefore become colourless or wrong-colour tracks.
+
+**Verdict:** don't ship the model alone. The next test is the combined arm: new model plus the widened HSV knobs.

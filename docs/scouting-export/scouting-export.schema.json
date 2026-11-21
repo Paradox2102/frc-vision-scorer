@@ -1,0 +1,2559 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "frc-vision-scorer whole-event scouting export",
+  "description": "One FRC event's vision-scouting data: a header, one row per analysed match (TBA lineup + phase timestamps on the match video), the matches that could not be used, and one envelope per scouting metric. Produced by GET /api/scouting/{event_key}/export. This schema describes top-level schema_version 2, envelope schema_version 1 and timeline_version 1. Every object may gain new keys in later releases without a version bump: importers must ignore keys they do not know. Human guide: README.md next to this file.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "event_key",
+    "year",
+    "generated_at",
+    "matches",
+    "skipped",
+    "envelopes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "frc-vision-scorer.scouting-export",
+      "description": "File-type tag. Always this string for the whole-event export (single metric envelopes use 'frc-vision-scorer.scouting')."
+    },
+    "schema_version": {
+      "const": 2,
+      "description": "Version of the whole-file layout (header + matches + skipped + envelopes). Bumped only on a breaking change to this layout. v2 added the header and matches[]."
+    },
+    "event_key": {
+      "$ref": "#/$defs/eventKey"
+    },
+    "year": {
+      "$ref": "#/$defs/year"
+    },
+    "generated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "matches": {
+      "type": "array",
+      "description": "One row per match that has a usable replay, in play order (qm, then ef, qf, sf, f; by set_number, then match_number). Matches listed in skipped[] are not here. Each carries robots[] (whole-match robot paths) unless the export was made with paths=false.",
+      "items": {
+        "$ref": "#/$defs/match"
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "description": "Matches that have a replay but could not be used (no data from them appears anywhere in the file). Matches with no replay at all are simply absent.",
+      "items": {
+        "$ref": "#/$defs/skippedMatch"
+      }
+    },
+    "envelopes": {
+      "type": "array",
+      "description": "One envelope per scouting metric that applies to this season, in a fixed order (2026: shift_heatmap, auto_paths, movement, cycles, defense, bump_stuck). Discriminate on envelope.metric, never on position. An unknown metric key must be skipped, not treated as an error.",
+      "items": {
+        "$ref": "#/$defs/envelope"
+      }
+    },
+    "path_frame": {
+      "$ref": "#/$defs/pathFrame",
+      "description": "Coordinate frame of matches[].robots[].path. Absent when the export was made with paths=false."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "eventKey": {
+      "type": "string",
+      "pattern": "^[0-9]{4}[a-z0-9]+$",
+      "description": "The Blue Alliance event key, e.g. '2026cur' (2026 Curie division)."
+    },
+    "year": {
+      "type": "integer",
+      "minimum": 1992,
+      "description": "FRC season year (selects the game, field size and rules)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this file (or envelope) was generated, ISO-8601 UTC with an explicit +00:00 offset, whole seconds, e.g. '2026-11-20T23:04:11+00:00'."
+    },
+    "matchKey": {
+      "type": "string",
+      "pattern": "^[0-9]{4}[a-z0-9]+_(qm|ef|qf|sf|f)[0-9]+(m[0-9]+)?$",
+      "description": "The Blue Alliance match key: '<event_key>_<comp_level><set>m<match>' for playoffs ('2026cur_sf4m1', '2026cur_f1m2') or '<event_key>_qm<n>' for qualifications."
+    },
+    "compLevel": {
+      "type": "string",
+      "enum": [
+        "qm",
+        "ef",
+        "qf",
+        "sf",
+        "f"
+      ],
+      "description": "TBA comp_level: qm = qualification, ef = eighth-final, qf = quarter-final, sf = semi-final (2023+ double-elimination rounds), f = final."
+    },
+    "alliance": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "red",
+        "blue",
+        null
+      ],
+      "description": "Alliance colour the team played on in this match. null = unknown (not produced for lineup teams in practice)."
+    },
+    "station": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 3,
+      "description": "Driver station 1..3 in TBA order (TBA alliances[*].team_keys index + 1; RoboRecon alliancePosition). null = unknown (not produced for lineup teams in practice)."
+    },
+    "teamKey": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "A team number as a decimal string (JSON object keys must be strings), e.g. '3128'."
+    },
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "fraction": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "nullableFraction": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "xy": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "description": "[x, y] in metres."
+    },
+    "sourceRef": {
+      "type": "object",
+      "description": "Which replay (pipeline run) a match's data came from.",
+      "required": [
+        "match_key",
+        "comp_level",
+        "set_number",
+        "match_number",
+        "replay_id",
+        "replay_created_at",
+        "legacy_labels"
+      ],
+      "properties": {
+        "match_key": {
+          "$ref": "#/$defs/matchKey"
+        },
+        "comp_level": {
+          "$ref": "#/$defs/compLevel"
+        },
+        "set_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TBA set_number: 1 for every qualification match; the series number in playoffs (sf4m1 -> 4)."
+        },
+        "match_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TBA match_number: the qualification number (qm8 -> 8); in playoffs the game within the set (sf4m1 -> 1, f1m2 -> 2)."
+        },
+        "replay_id": {
+          "type": "string",
+          "description": "Opaque id (a UUID) of the vision-pipeline replay used for this match. Changes when the match is re-analysed; use it to detect that data changed."
+        },
+        "replay_created_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "When that replay was created, ISO-8601 WITHOUT a timezone (the analysis server's local clock), e.g. '2026-11-20T12:07:32'. Informational only. null if unknown."
+        },
+        "legacy_labels": {
+          "type": "boolean",
+          "description": "true = the replay predates the pipeline's window-label identity stage, so robot->team attribution is less reliable. Treat its team data with caution."
+        }
+      },
+      "additionalProperties": true
+    },
+    "match": {
+      "description": "One analysed match: TBA identity + lineup and the phase timestamps on its video.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/sourceRef"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "alliances",
+        "timeline"
+      ],
+      "properties": {
+        "alliances": {
+          "type": "object",
+          "description": "TBA lineup. Each array is [station 1, station 2, station 3] team numbers; an entry is null when TBA does not list a team in that station.",
+          "required": [
+            "red",
+            "blue"
+          ],
+          "properties": {
+            "red": {
+              "$ref": "#/$defs/lineupRow"
+            },
+            "blue": {
+              "$ref": "#/$defs/lineupRow"
+            }
+          },
+          "additionalProperties": true
+        },
+        "timeline": {
+          "description": "Phase timestamps on the match's source video, or null when the replay has no usable match clock / frame rate.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "if": {
+            "type": "object"
+          },
+          "then": {
+            "$ref": "#/$defs/timeline"
+          }
+        },
+        "robots_version": {
+          "const": 1,
+          "description": "Version of robots[] / path and the top-level path_frame. Bumped only on a breaking change to them. Absent with paths=false."
+        },
+        "auto_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Match seconds of auto (2026: 20). Path times t < auto_s are auto, later ones teleop. Absent with paths=false."
+        },
+        "robots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/robot"
+          },
+          "description": "Every robot of the match: lineup order (red 1-3, blue 1-3), then any identified team the lineup does not list. Absent with paths=false."
+        }
+      },
+      "additionalProperties": true
+    },
+    "lineupRow": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1
+      },
+      "description": "Team numbers in driver-station order 1, 2, 3 (null = no team listed)."
+    },
+    "skippedMatch": {
+      "type": "object",
+      "description": "A match whose replay could not be used.",
+      "required": [
+        "match_key",
+        "reason"
+      ],
+      "properties": {
+        "match_key": {
+          "$ref": "#/$defs/matchKey"
+        },
+        "replay_id": {
+          "type": "string",
+          "description": "The replay that was rejected (absent when the replay's files could not be read at all)."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Human-readable reason, e.g. 'no match clock (summary.periods)' or 'no readable meta.json'."
+        }
+      },
+      "additionalProperties": true
+    },
+    "timeline": {
+      "type": "object",
+      "description": "Where each match phase sits in the SOURCE VIDEO (the TBA/YouTube match video file the pipeline analysed). All times are video seconds = frame / video.fps, measured from the first frame of that file. Boundaries are fitted from the on-screen match clock minus a 0.5 s display lag; accuracy about +-0.25 s (match_start from the scoreboard start indicator is frame-accurate). Durations are VIDEO seconds, not rule lengths: the broadcast clock runs ~1% slow against the video, so teleop typically spans ~141.5 s of video, not 140.",
+      "required": [
+        "timeline_version",
+        "video",
+        "marks",
+        "phases"
+      ],
+      "properties": {
+        "timeline_version": {
+          "const": 1,
+          "description": "Version of the timeline block. Bumped on a breaking change to its shape or meaning."
+        },
+        "video": {
+          "$ref": "#/$defs/timelineVideo"
+        },
+        "marks": {
+          "type": "object",
+          "description": "Instants in the video. Auto marks (match_start, auto_end) and teleop marks (teleop_start, endgame_start, match_end) each come as a group: an auto-only replay has only the auto pair; a replay with no auto period has only the teleop three.",
+          "properties": {
+            "match_start": {
+              "$ref": "#/$defs/mark",
+              "description": "Autonomous starts (the field's match start)."
+            },
+            "auto_end": {
+              "$ref": "#/$defs/mark",
+              "description": "Autonomous ends (countdown reaches 0:00)."
+            },
+            "teleop_start": {
+              "$ref": "#/$defs/mark",
+              "description": "Teleoperated period starts."
+            },
+            "endgame_start": {
+              "$ref": "#/$defs/mark",
+              "description": "Endgame starts (teleop countdown reaches the season's endgame value: 30 s in 2026, 20 s in 2024-2025)."
+            },
+            "match_end": {
+              "$ref": "#/$defs/mark",
+              "description": "Teleop countdown reaches 0:00 (match over)."
+            }
+          },
+          "dependentRequired": {
+            "match_start": [
+              "auto_end"
+            ],
+            "auto_end": [
+              "match_start"
+            ],
+            "teleop_start": [
+              "endgame_start",
+              "match_end"
+            ],
+            "endgame_start": [
+              "teleop_start",
+              "match_end"
+            ],
+            "match_end": [
+              "teleop_start",
+              "endgame_start"
+            ]
+          },
+          "additionalProperties": true
+        },
+        "phases": {
+          "type": "array",
+          "description": "Intervals between marks, sorted by start_s (a parent phase before the sub-phases that start with it). Top-level phases: auto, between (the auto->teleop pause), teleop. Sub-phases carry within='teleop': 2026 transition, shift1..shift4, endgame; other seasons endgame only. A phase is present only when both of its bounding marks are.",
+          "items": {
+            "$ref": "#/$defs/phase"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "timelineVideo": {
+      "type": "object",
+      "description": "The video the times refer to.",
+      "required": [
+        "fps",
+        "fps_source",
+        "frame_count",
+        "duration_s",
+        "youtube_key",
+        "youtube_url"
+      ],
+      "properties": {
+        "fps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Frames per second used to convert frame <-> seconds (the file's average frame rate, rounded to 4 decimals). Often not exactly 60 (59.94, 59.716, ...): always use this value, never assume 30/60."
+        },
+        "fps_source": {
+          "type": "string",
+          "enum": [
+            "video",
+            "clock_estimate"
+          ],
+          "description": "'video' = read from the source file (ffprobe). 'clock_estimate' = no video file was available; fps estimated from clock-scan frame counts (within ~2%), so times are less exact, and frame_count / duration_s are null."
+        },
+        "frame_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Frames in the source file, or null if unknown."
+        },
+        "duration_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Length of the source file in seconds, or null if unknown."
+        },
+        "youtube_key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "YouTube video id of the TBA match video (the same footage, so the same video seconds), or null if TBA lists none."
+        },
+        "youtube_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri",
+          "description": "https://www.youtube.com/watch?v=<youtube_key>&t=<N>s with N = floor(match_start.t), i.e. opens at the match start (to the whole second). null without youtube_key or match_start."
+        }
+      },
+      "additionalProperties": true
+    },
+    "mark": {
+      "type": "object",
+      "description": "One instant in the source video.",
+      "required": [
+        "t",
+        "frame",
+        "video_time",
+        "source"
+      ],
+      "properties": {
+        "t": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Video seconds from the start of the file (3 decimals). Clamped at 0."
+        },
+        "frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "round(t * video.fps): the frame index (0-based) in the source file."
+        },
+        "video_time": {
+          "type": "string",
+          "pattern": "^[0-9]+:[0-5][0-9]\\.[0-9]{2}$",
+          "description": "t formatted M:SS.ss for humans, e.g. '2:21.25'."
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^[a-z_]+(\\([0-9]+\\))?(\\+[0-9]+(\\.[0-9]+)?s)?$",
+          "description": "How the value was measured. 'indicator' = frame where the scoreboard start indicator lights (frame-accurate, match_start only). 'clock_ticks(N)' = fitted from N on-screen clock ticks near this boundary, minus the 0.5 s display lag (~+-0.25 s). 'clock_offset' / 'true_start_frame' = pipeline start estimate. 'clock_lead' = fallback from the clock scan's first-sample frame (~+-0.5 s). '<method>+<N>s' = derived as another mark's value + N seconds of rule time (when no local clock fit was possible)."
+        }
+      },
+      "additionalProperties": true
+    },
+    "phase": {
+      "type": "object",
+      "description": "One interval of the source video.",
+      "required": [
+        "phase",
+        "start_s",
+        "end_s",
+        "duration_s",
+        "start_frame",
+        "end_frame"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "description": "Phase name. Known values: auto, between, teleop; within teleop: transition, shift1, shift2, shift3, shift4 (2026 hub shifts), endgame.",
+          "examples": [
+            "auto",
+            "between",
+            "teleop",
+            "transition",
+            "shift1",
+            "shift2",
+            "shift3",
+            "shift4",
+            "endgame"
+          ]
+        },
+        "start_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Start, video seconds (equals the bounding mark's t)."
+        },
+        "end_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "End, video seconds."
+        },
+        "duration_s": {
+          "type": "number",
+          "description": "end_s - start_s in VIDEO seconds (not the rule length; teleop ~141.5, auto ~20.1, between ~4.0, shifts ~25.25)."
+        },
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "round(start_s * video.fps)."
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "round(end_s * video.fps)."
+        },
+        "within": {
+          "const": "teleop",
+          "description": "Present only on sub-phases: the parent phase this interval lies inside. Absent on top-level phases."
+        }
+      },
+      "additionalProperties": true
+    },
+    "frame": {
+      "type": "object",
+      "description": "Coordinate frame of the envelope's positions.",
+      "required": [
+        "units",
+        "field_m",
+        "perspective",
+        "symmetry",
+        "note"
+      ],
+      "properties": {
+        "units": {
+          "const": "m",
+          "description": "Positions are metres."
+        },
+        "field_m": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "items": false,
+          "minItems": 2,
+          "description": "[length L along x, width W along y] of the field in metres (2026: [16.541, 8.069])."
+        },
+        "perspective": {
+          "const": "alliance",
+          "description": "ALLIANCE PERSPECTIVE: x = 0 is the team's own alliance wall, +x toward the opponent wall, so a team's red and blue matches overlay. Blue positions equal WPILib field coordinates; red ones are transformed by the field symmetry. Exceptions documented per field: auto_paths points_field and bump_stuck bumps are absolute WPILib field coordinates."
+        },
+        "symmetry": {
+          "type": "string",
+          "enum": [
+            "rotational",
+            "mirror"
+          ],
+          "description": "How red is mapped into alliance perspective. rotational (2025, 2026): (x, y) -> (L - x, W - y). mirror (2023, 2024): (x, y) -> (L - x, y)."
+        },
+        "note": {
+          "type": "string",
+          "description": "Human-readable summary of the frame."
+        }
+      },
+      "additionalProperties": true
+    },
+    "matchHead": {
+      "type": "object",
+      "description": "Common header of every per-match row inside a team entry.",
+      "required": [
+        "match_key",
+        "comp_level",
+        "set_number",
+        "match_number",
+        "alliance",
+        "station"
+      ],
+      "properties": {
+        "match_key": {
+          "$ref": "#/$defs/matchKey"
+        },
+        "comp_level": {
+          "$ref": "#/$defs/compLevel"
+        },
+        "set_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TBA set_number."
+        },
+        "match_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TBA match_number."
+        },
+        "alliance": {
+          "$ref": "#/$defs/alliance"
+        },
+        "station": {
+          "$ref": "#/$defs/station"
+        }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "description": "One metric's results for the whole event. The base keys below are common to every metric; metric-specific keys (teams payload and extras) are described in the then-branches, selected by 'metric'. Unknown metrics validate against the base only.",
+      "required": [
+        "schema",
+        "schema_version",
+        "metric",
+        "metric_version",
+        "metric_title",
+        "event_key",
+        "year",
+        "generated_at",
+        "frame",
+        "params",
+        "sources",
+        "skipped",
+        "teams"
+      ],
+      "properties": {
+        "schema": {
+          "const": "frc-vision-scorer.scouting",
+          "description": "Envelope type tag."
+        },
+        "schema_version": {
+          "const": 1,
+          "description": "Version of the envelope's common keys. Bumped on a breaking change to them."
+        },
+        "metric": {
+          "type": "string",
+          "description": "Metric key; the discriminator for the payload. Known: shift_heatmap, auto_paths, movement, cycles, defense, bump_stuck."
+        },
+        "metric_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Version of this metric's payload (teams + extras). Bumped on any breaking change to it."
+        },
+        "metric_title": {
+          "type": "string",
+          "description": "Display name, e.g. 'Auto paths'."
+        },
+        "event_key": {
+          "$ref": "#/$defs/eventKey"
+        },
+        "year": {
+          "$ref": "#/$defs/year"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "frame": {
+          "$ref": "#/$defs/frame"
+        },
+        "params": {
+          "type": "object",
+          "description": "The metric's tuning parameters used for this run (name -> number / boolean). Recorded for reproducibility; the defaults unless someone overrode them.",
+          "additionalProperties": {
+            "type": [
+              "number",
+              "boolean",
+              "string"
+            ]
+          }
+        },
+        "sources": {
+          "type": "array",
+          "description": "The replays this metric was computed from (same set as the top-level matches[], ordered by match_key string, NOT play order).",
+          "items": {
+            "$ref": "#/$defs/sourceRef"
+          }
+        },
+        "skipped": {
+          "type": "array",
+          "description": "Same as the top-level skipped[].",
+          "items": {
+            "$ref": "#/$defs/skippedMatch"
+          }
+        },
+        "teams": {
+          "type": "object",
+          "description": "Per-team results keyed by team number as a string. Includes every team in any analysed match's TBA lineup (even if never seen by the cameras).",
+          "propertyNames": {
+            "$ref": "#/$defs/teamKey"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/teamBase"
+          }
+        }
+      },
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "shift_heatmap"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/shiftHeatmapEnvelope"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "auto_paths"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/autoPathsEnvelope"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "movement"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/movementEnvelope"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "cycles"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/cyclesEnvelope"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "defense"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/defenseEnvelope"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "const": "bump_stuck"
+              }
+            },
+            "required": [
+              "metric"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/bumpStuckEnvelope"
+          }
+        }
+      ]
+    },
+    "teamBase": {
+      "type": "object",
+      "description": "Common part of every team entry.",
+      "required": [
+        "team_number"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "FRC team number (same as the key)."
+        }
+      },
+      "additionalProperties": true
+    },
+    "rankingExtras": {
+      "type": "object",
+      "description": "Extras shared by the ranking metrics (movement, cycles, defense, bump_stuck).",
+      "required": [
+        "ranking",
+        "score_key",
+        "legend"
+      ],
+      "properties": {
+        "ranking": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/teamKey"
+          },
+          "description": "Every team key in rank order (best first); unrankable teams (rank null) last, by team number."
+        },
+        "score_key": {
+          "type": "string",
+          "description": "The team-entry field the ranking sorts on (larger = higher rank)."
+        },
+        "legend": {
+          "type": "string",
+          "description": "Human-readable explanation of the metric with the actual parameter values."
+        }
+      }
+    },
+    "rankingTeam": {
+      "type": "object",
+      "description": "Keys shared by team entries of the ranking metrics.",
+      "required": [
+        "team_number",
+        "n_matches",
+        "n_counted",
+        "low_data",
+        "coverage",
+        "rank",
+        "matches"
+      ],
+      "properties": {
+        "n_matches": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Analysed matches with this team in the lineup."
+        },
+        "n_counted": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Matches with enough valid tracking (>= params.min_tracked_s seconds in the metric's scope) to count toward the averages."
+        },
+        "low_data": {
+          "type": "boolean",
+          "description": "true when n_counted < params.min_matches; the team is still ranked but its numbers are unreliable."
+        },
+        "coverage": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Tracked seconds over all n_matches / (expected seconds per match x n_matches); null when n_matches is 0."
+        },
+        "rank": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "1-based rank on score_key (1 = largest). null = unrankable (no counted data)."
+        }
+      }
+    },
+    "rankingRow": {
+      "type": "object",
+      "description": "Keys shared by per-match rows of the ranking metrics.",
+      "required": [
+        "counted",
+        "coverage"
+      ],
+      "properties": {
+        "counted": {
+          "type": "boolean",
+          "description": "Whether this match counts toward the team's averages (enough valid tracking)."
+        },
+        "coverage": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Valid tracked seconds / expected seconds for the metric's scope in one match (0..1)."
+        }
+      }
+    },
+    "bucketSeconds": {
+      "type": "object",
+      "description": "Seconds per 2026 shift bucket.",
+      "required": [
+        "auto",
+        "transition",
+        "active",
+        "inactive",
+        "endgame",
+        "unknown"
+      ],
+      "properties": {
+        "auto": {
+          "type": "number",
+          "minimum": 0
+        },
+        "transition": {
+          "type": "number",
+          "minimum": 0
+        },
+        "active": {
+          "type": "number",
+          "minimum": 0
+        },
+        "inactive": {
+          "type": "number",
+          "minimum": 0
+        },
+        "endgame": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "heatBucket": {
+      "type": "object",
+      "description": "One team's time in one shift bucket (for one station split).",
+      "required": [
+        "seconds",
+        "cells",
+        "summary"
+      ],
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total labelled robot-seconds in this bucket."
+        },
+        "cells": {
+          "type": "array",
+          "description": "Sparse heatmap, only non-zero cells, sorted by (ix, iy). Each entry [ix, iy, seconds]: cell column ix = floor(ax / grid.cell_m) (0..grid.nx-1, x in alliance perspective), row iy = floor(ay / grid.cell_m) (0..grid.ny-1), seconds spent there. Cell centre = ((ix + 0.5) * cell_m, (iy + 0.5) * cell_m).",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            ],
+            "items": false,
+            "minItems": 3
+          }
+        },
+        "summary": {
+          "type": "object",
+          "description": "Time-weighted summary of the bucket. All fields except n_samples are null when there are no samples.",
+          "required": [
+            "own_zone_frac",
+            "neutral_zone_frac",
+            "opp_zone_frac",
+            "mean_ax",
+            "mean_ay",
+            "n_samples"
+          ],
+          "properties": {
+            "own_zone_frac": {
+              "$ref": "#/$defs/nullableFraction",
+              "description": "Share of the time in the team's own ALLIANCE ZONE (ax <= zones.own_max_x)."
+            },
+            "neutral_zone_frac": {
+              "$ref": "#/$defs/nullableFraction",
+              "description": "Share of the time between the two alliance zones."
+            },
+            "opp_zone_frac": {
+              "$ref": "#/$defs/nullableFraction",
+              "description": "Share of the time in the opponent's ALLIANCE ZONE (ax >= zones.opp_min_x)."
+            },
+            "mean_ax": {
+              "$ref": "#/$defs/nullableNumber",
+              "description": "Time-weighted mean alliance-perspective x, metres."
+            },
+            "mean_ay": {
+              "$ref": "#/$defs/nullableNumber",
+              "description": "Time-weighted mean alliance-perspective y, metres."
+            },
+            "n_samples": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Position samples (~0.2 s each) behind this bucket."
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "heatBuckets": {
+      "type": "object",
+      "description": "heatBucket per 2026 shift bucket.",
+      "required": [
+        "auto",
+        "transition",
+        "active",
+        "inactive",
+        "endgame",
+        "unknown"
+      ],
+      "properties": {
+        "auto": {
+          "$ref": "#/$defs/heatBucket"
+        },
+        "transition": {
+          "$ref": "#/$defs/heatBucket"
+        },
+        "active": {
+          "$ref": "#/$defs/heatBucket"
+        },
+        "inactive": {
+          "$ref": "#/$defs/heatBucket"
+        },
+        "endgame": {
+          "$ref": "#/$defs/heatBucket"
+        },
+        "unknown": {
+          "$ref": "#/$defs/heatBucket"
+        }
+      },
+      "additionalProperties": true
+    },
+    "shiftHeatmapTeam": {
+      "type": "object",
+      "description": "shift_heatmap team entry.",
+      "required": [
+        "team_number",
+        "n_matches",
+        "matches",
+        "matches_by_station",
+        "by_station",
+        "coverage"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "n_matches": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Analysed matches with this team in the lineup."
+        },
+        "matches": {
+          "type": "array",
+          "description": "One row per match, play order.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/matchHead"
+              }
+            ],
+            "type": "object",
+            "required": [
+              "auto_winner",
+              "seconds"
+            ],
+            "properties": {
+              "auto_winner": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "red",
+                  "blue",
+                  null
+                ],
+                "description": "Alliance that scored more FUEL in auto (from TBA); decides which shifts the team's hub was active. null = tie or no TBA data: shifts 1-4 go to bucket 'unknown'."
+              },
+              "seconds": {
+                "$ref": "#/$defs/bucketSeconds",
+                "description": "Labelled seconds of this team in each bucket in this match."
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "matches_by_station": {
+          "type": "object",
+          "description": "Matches played from each driver station, keys '1', '2', '3' (always all three).",
+          "propertyNames": {
+            "enum": [
+              "1",
+              "2",
+              "3"
+            ]
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "by_station": {
+          "type": "object",
+          "description": "Heatmaps per station split: 'all' (every match) plus '1'..'3' for each station the team played. Each value maps bucket -> heatBucket.",
+          "required": [
+            "all"
+          ],
+          "propertyNames": {
+            "enum": [
+              "all",
+              "1",
+              "2",
+              "3"
+            ]
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/heatBuckets"
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Per bucket: labelled seconds (by_station.all) / seconds the team could have been seen in that bucket over its matches. null when nothing was expected (e.g. 'unknown' when every match had a known auto winner). Low coverage = sparse map, not a robot that sat still.",
+          "required": [
+            "auto",
+            "transition",
+            "active",
+            "inactive",
+            "endgame",
+            "unknown"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "shiftHeatmapEnvelope": {
+      "type": "object",
+      "description": "metric = shift_heatmap (2026 only): where each robot spends time per 2026 REBUILT hub shift.",
+      "required": [
+        "metric_version",
+        "teams",
+        "grid",
+        "zones",
+        "buckets",
+        "default_buckets",
+        "station_layout",
+        "auto_winner_by_match"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 2
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/shiftHeatmapTeam"
+          }
+        },
+        "grid": {
+          "type": "object",
+          "description": "Heatmap grid in alliance perspective.",
+          "required": [
+            "cell_m",
+            "nx",
+            "ny",
+            "field_m"
+          ],
+          "properties": {
+            "cell_m": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Cell edge length, metres (default 0.5)."
+            },
+            "nx": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Columns along x = ceil(L / cell_m) (34 for 2026); the last column extends past the far wall."
+            },
+            "ny": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Rows along y = ceil(W / cell_m) (17 for 2026)."
+            },
+            "field_m": {
+              "$ref": "#/$defs/xy",
+              "description": "[L, W] metres."
+            }
+          },
+          "additionalProperties": true
+        },
+        "zones": {
+          "type": "object",
+          "description": "Zone bounds used by heatBucket.summary, alliance-perspective x in metres.",
+          "required": [
+            "own_max_x",
+            "opp_min_x"
+          ],
+          "properties": {
+            "own_max_x": {
+              "type": "number",
+              "description": "Own ALLIANCE ZONE is ax <= this (2026: 4.029)."
+            },
+            "opp_min_x": {
+              "type": "number",
+              "description": "Opponent ALLIANCE ZONE is ax >= this (2026: 12.512)."
+            }
+          },
+          "additionalProperties": true
+        },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "All bucket names: auto, transition, active, inactive, endgame, unknown. active/inactive = the team's own hub is active/inactive during shifts 1-4."
+        },
+        "default_buckets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Buckets the source UI shows by default (active, inactive, endgame)."
+        },
+        "station_layout": {
+          "type": "object",
+          "description": "Drawing hint only: where each driver station sits along the alliance wall in alliance-perspective y ('high' / 'mid' / 'low'). NOT verified against the game manual; the data itself is split by TBA station number.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "auto_winner_by_match": {
+          "type": "object",
+          "description": "match_key -> 'red' | 'blue' | null (tie / no TBA data) for every analysed match.",
+          "propertyNames": {
+            "$ref": "#/$defs/matchKey"
+          },
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "red",
+              "blue",
+              null
+            ]
+          }
+        }
+      }
+    },
+    "autoPathRow": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/matchHead"
+        }
+      ],
+      "type": "object",
+      "description": "One team's autonomous path in one match. Rows exist for every lineup match even without a path (n_samples 0, empty arrays).",
+      "required": [
+        "source",
+        "coverage",
+        "label_share",
+        "runner_up_share",
+        "identity_conflict",
+        "legacy_labels",
+        "n_samples",
+        "start_check",
+        "start_offset_m",
+        "n_clamped",
+        "n_detour",
+        "cluster",
+        "mirrored",
+        "points",
+        "points_norm",
+        "points_field",
+        "point_kinds"
+      ],
+      "properties": {
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "autonomous_paths",
+            "frames",
+            null
+          ],
+          "description": "Where the path came from: 'autonomous_paths' = the pipeline's slot-continuous smoothed auto track, attributed to the team by majority label; 'frames' = rebuilt from per-frame team labels; null = no path."
+        },
+        "coverage": {
+          "$ref": "#/$defs/fraction",
+          "description": "Share of the auto period actually seen (0.25 s grid, gaps <= params.max_gap_s bridged); inserted points do not count."
+        },
+        "label_share": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Share of the slot's auto labels naming this team (attribution confidence). null without a path."
+        },
+        "runner_up_share": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Share of the most common OTHER team label on that slot. null without a path."
+        },
+        "identity_conflict": {
+          "type": "boolean",
+          "description": "runner_up_share >= 0.25: the path may be partly another robot."
+        },
+        "legacy_labels": {
+          "type": "boolean",
+          "description": "Same as the match's sourceRef.legacy_labels."
+        },
+        "n_samples": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "OBSERVED samples before field rules. points[] can be longer (inserted start / detour points) - use points.length to iterate."
+        },
+        "start_check": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "ok",
+            "inferred",
+            "unseen",
+            "violation",
+            null
+          ],
+          "description": "2026 starting-line check: ok = first point on the start line; inferred = first point reachable from the line, a start point on the line was inserted at t=0 (or replaced the t=0 point); unseen = first point later than params.start_window_s, start unknown; violation = cannot have started on the line (very likely another robot: listed but never clustered); null = no path or field rules off."
+        },
+        "start_offset_m": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Distance from the first point to the nearest legal start, metres; null when start_check is unseen / null."
+        },
+        "n_clamped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Observed points moved out of an obstacle (hub base / trench blocks)."
+        },
+        "n_detour": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Points inserted to route a segment around an obstacle."
+        },
+        "cluster": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "id of the team's routine cluster this path belongs to (see clusters[]); null = not clustered (no path, coverage < params.min_coverage, or start violation)."
+        },
+        "mirrored": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "true = this path is the left/right reflection (ay -> W - ay) of its cluster's representative (same routine run from the other side). null when cluster is null."
+        },
+        "points": {
+          "type": "array",
+          "description": "[t, ax, ay] per point: t = seconds since auto start on the game clock (0..20 in 2026, rounded to 0.01), ax/ay = ALLIANCE-PERSPECTIVE metres (rounded to 0.01). Time-sorted.",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number",
+                "minimum": 0
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 3
+          }
+        },
+        "points_norm": {
+          "type": "array",
+          "description": "[ax / L, ay / W] per point (same order as points, no time): 0..1 of the full field in alliance perspective, 4 decimals. Matches RoboRecon PathValue stroke points.",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 2
+          }
+        },
+        "points_field": {
+          "type": "array",
+          "description": "[t, x, y] per point in ABSOLUTE WPILib field metres (blue wall at x = 0): where the robot really drove, e.g. to draw red autos on the red side. Equals points for blue.",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number",
+                "minimum": 0
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 3
+          }
+        },
+        "point_kinds": {
+          "type": "array",
+          "description": "One letter per point: s = seen (observed), c = clamped (observed, pushed out of an obstacle), d = detour (inserted to route around an obstacle), i = inferred start (inserted on the start line).",
+          "items": {
+            "type": "string",
+            "enum": [
+              "s",
+              "c",
+              "d",
+              "i"
+            ]
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "autoCluster": {
+      "type": "object",
+      "description": "A repeated auto routine: paths whose time-aligned mean distance (mirror-aware) is within params.threshold_m (average-linkage clustering).",
+      "required": [
+        "id",
+        "count",
+        "members",
+        "representative",
+        "mean_spread_m",
+        "n_mirrored",
+        "start",
+        "end",
+        "duration_s"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cluster id within this team (0 = most frequent). Referenced by autoPathRow.cluster."
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of member paths."
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/matchKey"
+          },
+          "description": "Match keys of the member paths, play order."
+        },
+        "representative": {
+          "$ref": "#/$defs/matchKey",
+          "description": "The medoid path's match key (draw this one as 'the routine')."
+        },
+        "mean_spread_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Mean pairwise path distance inside the cluster, metres (0 for a single path)."
+        },
+        "n_mirrored": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Members that are reflections of the representative."
+        },
+        "start": {
+          "$ref": "#/$defs/xy",
+          "description": "Median first point [ax, ay] (alliance perspective, in the representative's orientation)."
+        },
+        "end": {
+          "$ref": "#/$defs/xy",
+          "description": "Median last point [ax, ay]."
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Median seen span of the member paths, seconds."
+        }
+      },
+      "additionalProperties": true
+    },
+    "autoPathsTeam": {
+      "type": "object",
+      "description": "auto_paths team entry.",
+      "required": [
+        "team_number",
+        "n_matches",
+        "n_with_path",
+        "matches",
+        "clusters"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "n_matches": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Analysed matches with this team in the lineup."
+        },
+        "n_with_path": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Of those, matches with at least one observed point."
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/autoPathRow"
+          },
+          "description": "One row per match, play order."
+        },
+        "clusters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/autoCluster"
+          },
+          "description": "Routines, largest first."
+        }
+      },
+      "additionalProperties": true
+    },
+    "autoPathsEnvelope": {
+      "type": "object",
+      "description": "metric = auto_paths (any season): each team's autonomous path per match, grouped into routines.",
+      "required": [
+        "metric_version",
+        "teams",
+        "legend"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 2
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/autoPathsTeam"
+          }
+        },
+        "legend": {
+          "type": "object",
+          "description": "Display hints, e.g. {perspective: 'own alliance wall at x=0'}.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "movementSummary": {
+      "type": "object",
+      "description": "Pooled movement numbers over the team's counted matches. Every field is null when there is no speed-known time.",
+      "required": [
+        "moving_s_per_match",
+        "stationary_s_per_match",
+        "moving_frac",
+        "mean_moving_mps",
+        "median_moving_mps",
+        "p90_moving_mps",
+        "avg_speed_mps",
+        "speed_known_s"
+      ],
+      "properties": {
+        "moving_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Seconds moving (smoothed speed >= params.move_speed_mps) per counted match, raw (shrinks with low coverage)."
+        },
+        "stationary_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Seconds stationary per counted match, raw."
+        },
+        "moving_frac": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "moving / (moving + stationary) seconds, pooled."
+        },
+        "mean_moving_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Mean speed while moving, m/s."
+        },
+        "median_moving_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Median speed while moving, m/s."
+        },
+        "p90_moving_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "90th-percentile speed while moving, m/s."
+        },
+        "avg_speed_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Average speed over all speed-known time (stationary counts as 0) = moving_frac x mean_moving_mps, m/s. The rank score."
+        },
+        "speed_known_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Total seconds with a defined speed (moving + stationary), all counted matches."
+        }
+      },
+      "additionalProperties": true
+    },
+    "movementTeam": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingTeam"
+        },
+        {
+          "$ref": "#/$defs/movementSummary"
+        }
+      ],
+      "type": "object",
+      "description": "movement team entry (whole match = auto + teleop; teleop-only alongside).",
+      "required": [
+        "tracked_s_per_match",
+        "max_sustained_mps",
+        "max_sustained_best_mps",
+        "teleop"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "tracked_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Valid tracked seconds per counted match."
+        },
+        "max_sustained_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Typical top speed: median over counted matches of the highest speed held for params.sustain_s, m/s."
+        },
+        "max_sustained_best_mps": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Best single-match value of that, m/s."
+        },
+        "teleop": {
+          "$ref": "#/$defs/movementSummary",
+          "description": "The same summary over teleop only."
+        },
+        "matches": {
+          "type": "array",
+          "description": "One row per match, play order.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/matchHead"
+              },
+              {
+                "$ref": "#/$defs/rankingRow"
+              }
+            ],
+            "type": "object",
+            "description": "movement per-match row. The moving/stationary keys are present only when counted is true.",
+            "required": [
+              "tracked_s",
+              "held_s"
+            ],
+            "properties": {
+              "tracked_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Valid tracked seconds (whole match)."
+              },
+              "held_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds of stalled (bit-identical repeated) tracking positions in this match."
+              },
+              "moving_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds moving (whole match)."
+              },
+              "stationary_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds stationary."
+              },
+              "moving_frac": {
+                "$ref": "#/$defs/nullableFraction",
+                "description": "moving / (moving + stationary)."
+              },
+              "avg_speed_mps": {
+                "$ref": "#/$defs/nullableNumber",
+                "description": "Average speed over speed-known time, m/s."
+              },
+              "max_sustained_mps": {
+                "$ref": "#/$defs/nullableNumber",
+                "description": "Highest speed held for params.sustain_s in this match, m/s."
+              },
+              "teleop": {
+                "type": "object",
+                "description": "Teleop-only numbers for this match.",
+                "required": [
+                  "moving_s",
+                  "stationary_s",
+                  "moving_frac",
+                  "avg_speed_mps",
+                  "tracked_s"
+                ],
+                "properties": {
+                  "moving_s": {
+                    "type": "number"
+                  },
+                  "stationary_s": {
+                    "type": "number"
+                  },
+                  "moving_frac": {
+                    "$ref": "#/$defs/nullableFraction"
+                  },
+                  "avg_speed_mps": {
+                    "$ref": "#/$defs/nullableNumber"
+                  },
+                  "tracked_s": {
+                    "type": "number",
+                    "description": "Valid tracked teleop seconds."
+                  }
+                },
+                "additionalProperties": true
+              }
+            },
+            "if": {
+              "properties": {
+                "counted": {
+                  "const": true
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "moving_s",
+                "stationary_s",
+                "moving_frac",
+                "avg_speed_mps",
+                "teleop",
+                "max_sustained_mps"
+              ]
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "movementEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingExtras"
+        }
+      ],
+      "type": "object",
+      "description": "metric = movement (2026): seconds moving vs stationary and speed, ranked on avg_speed_mps.",
+      "required": [
+        "metric_version",
+        "teams",
+        "event_stats"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 1
+        },
+        "score_key": {
+          "const": "avg_speed_mps"
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/movementTeam"
+          }
+        },
+        "event_stats": {
+          "type": "object",
+          "description": "Data-quality totals over the whole event.",
+          "required": [
+            "labelled_s",
+            "held_s",
+            "held_frac",
+            "held_kept_s",
+            "implausible_speed_samples"
+          ],
+          "properties": {
+            "labelled_s": {
+              "type": "number",
+              "description": "Robot-seconds with a team label."
+            },
+            "held_s": {
+              "type": "number",
+              "description": "Robot-seconds of stalled (held) positions."
+            },
+            "held_frac": {
+              "$ref": "#/$defs/nullableFraction",
+              "description": "held_s / labelled_s."
+            },
+            "held_kept_s": {
+              "type": "number",
+              "description": "Held seconds kept as stationary (robot was still there when tracking resumed)."
+            },
+            "implausible_speed_samples": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Samples whose speed exceeded params.max_speed_mps (label jumps) and were set unknown."
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "cyclesTeam": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingTeam"
+        }
+      ],
+      "type": "object",
+      "description": "cycles team entry (neutral zone -> own alliance zone trips).",
+      "required": [
+        "cycles_per_min",
+        "cycles_teleop_per_match",
+        "cycles_auto_per_match",
+        "cycles_teleop_total",
+        "cycles_auto_total",
+        "teleop_tracked_s_per_match",
+        "mean_cycle_s",
+        "median_cycle_s",
+        "mean_neutral_visit_s",
+        "mean_own_visit_s",
+        "resets"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "cycles_per_min": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Teleop cycles per tracked teleop minute, pooled over counted matches. The rank score."
+        },
+        "cycles_teleop_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Teleop cycles per counted match (raw: undercounts with low coverage)."
+        },
+        "cycles_auto_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Auto cycles per counted match."
+        },
+        "cycles_teleop_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Teleop cycles over counted matches."
+        },
+        "cycles_auto_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Auto cycles over counted matches."
+        },
+        "teleop_tracked_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Valid tracked teleop seconds per counted match."
+        },
+        "mean_cycle_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Mean cycle time (neutral entry to next neutral entry), seconds."
+        },
+        "median_cycle_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Median cycle time, seconds."
+        },
+        "mean_neutral_visit_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Mean dwell per neutral-zone visit, seconds."
+        },
+        "mean_own_visit_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Mean dwell per own-zone visit, seconds."
+        },
+        "resets": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tracking gaps > params.max_gap_s that reset the zone state machine (counted matches)."
+        },
+        "matches": {
+          "type": "array",
+          "description": "One row per match, play order.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/matchHead"
+              },
+              {
+                "$ref": "#/$defs/rankingRow"
+              }
+            ],
+            "type": "object",
+            "required": [
+              "teleop_tracked_s",
+              "cycles_teleop",
+              "cycles_auto",
+              "resets",
+              "cycles_per_min",
+              "cycle_return_times"
+            ],
+            "properties": {
+              "teleop_tracked_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Valid tracked teleop seconds (coverage = this / 140 in 2026)."
+              },
+              "cycles_teleop": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Completed neutral -> own trips in teleop."
+              },
+              "cycles_auto": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Completed trips in auto."
+              },
+              "resets": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "State-machine resets on tracking gaps."
+              },
+              "cycles_per_min": {
+                "$ref": "#/$defs/nullableNumber",
+                "description": "cycles_teleop per tracked teleop minute; null with no teleop tracking."
+              },
+              "cycle_return_times": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "description": "Game-clock seconds since auto start (auto 0..20, teleop 20..160 in 2026, pause removed) at which each cycle's own-zone return began, auto and teleop cycles together."
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "cyclesEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingExtras"
+        }
+      ],
+      "type": "object",
+      "description": "metric = cycles (2026): neutral-zone -> own-alliance-zone trips (collect, come home to shoot), ranked on cycles_per_min.",
+      "required": [
+        "metric_version",
+        "teams",
+        "zones"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 1
+        },
+        "score_key": {
+          "const": "cycles_per_min"
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/cyclesTeam"
+          }
+        },
+        "zones": {
+          "type": "object",
+          "description": "State-machine zone bounds, alliance-perspective x in metres.",
+          "required": [
+            "own_max_x",
+            "neutral_min_x",
+            "neutral_max_x"
+          ],
+          "properties": {
+            "own_max_x": {
+              "type": "number",
+              "description": "'own' zone: ax <= this."
+            },
+            "neutral_min_x": {
+              "type": "number",
+              "description": "'neutral' zone lower bound."
+            },
+            "neutral_max_x": {
+              "type": "number",
+              "description": "'neutral' zone upper bound."
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "defenseTeam": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingTeam"
+        }
+      ],
+      "type": "object",
+      "description": "defense team entry (teleop time on the opponent's side).",
+      "required": [
+        "opp_side_frac",
+        "opp_side_s_per_match",
+        "opp_side_s_norm",
+        "matches_long",
+        "teleop_tracked_s_per_match",
+        "by_station"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "opp_side_frac": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Share of tracked teleop time with ax >= zones.opp_min_x, pooled over counted matches. The rank score."
+        },
+        "opp_side_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Seconds there per counted match (raw)."
+        },
+        "opp_side_s_norm": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "opp_side_frac x 140 s: what a fully tracked match would show."
+        },
+        "matches_long": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Counted matches with >= params.long_visit_s seconds there."
+        },
+        "teleop_tracked_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Valid tracked teleop seconds per counted match."
+        },
+        "by_station": {
+          "type": "object",
+          "description": "Split by alliance + station, keys like 'red1', 'blue3' (counted matches only; only splits the team played).",
+          "propertyNames": {
+            "pattern": "^(red|blue|\\?)[1-3]?$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "n_counted",
+              "opp_side_s_per_match",
+              "opp_side_frac"
+            ],
+            "properties": {
+              "n_counted": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "opp_side_s_per_match": {
+                "type": "number"
+              },
+              "opp_side_frac": {
+                "$ref": "#/$defs/nullableFraction"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "matches": {
+          "type": "array",
+          "description": "One row per match, play order.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/matchHead"
+              },
+              {
+                "$ref": "#/$defs/rankingRow"
+              }
+            ],
+            "type": "object",
+            "required": [
+              "teleop_tracked_s",
+              "opp_side_s",
+              "opp_side_frac"
+            ],
+            "properties": {
+              "teleop_tracked_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Valid tracked teleop seconds."
+              },
+              "opp_side_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Teleop seconds on the opponent's side."
+              },
+              "opp_side_frac": {
+                "$ref": "#/$defs/nullableFraction",
+                "description": "opp_side_s / teleop_tracked_s; null with no teleop tracking."
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "defenseEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingExtras"
+        }
+      ],
+      "type": "object",
+      "description": "metric = defense (2026): teleop time in or near the opponent's alliance zone (a defense proxy), ranked on opp_side_frac.",
+      "required": [
+        "metric_version",
+        "teams",
+        "zones"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 1
+        },
+        "score_key": {
+          "const": "opp_side_frac"
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/defenseTeam"
+          }
+        },
+        "zones": {
+          "type": "object",
+          "required": [
+            "opp_min_x"
+          ],
+          "properties": {
+            "opp_min_x": {
+              "type": "number",
+              "description": "'Opponent side' = alliance-perspective ax >= this, metres (L - alliance zone depth - params.near_m; 2026: 11.512)."
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "bumpEpisode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/matchHead"
+        }
+      ],
+      "type": "object",
+      "description": "A stretch stopped on one bump (for finding it in the video; does not drive the ranking).",
+      "required": [
+        "period",
+        "t_start",
+        "remaining_at_start",
+        "duration_s",
+        "stopped_s",
+        "bump",
+        "bump_field_side",
+        "counted"
+      ],
+      "properties": {
+        "period": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "teleop"
+          ],
+          "description": "Period the episode starts in."
+        },
+        "t_start": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Game-clock seconds since auto start (auto 0..20, teleop 20..160 in 2026, pause removed)."
+        },
+        "remaining_at_start": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Countdown within that period at the start, seconds (what the on-screen clock showed)."
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Wall span of the episode, seconds."
+        },
+        "stopped_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Seconds actually observed stopped on the bump within it."
+        },
+        "bump": {
+          "type": "string",
+          "enum": [
+            "own left",
+            "own right",
+            "opponent left",
+            "opponent right"
+          ],
+          "description": "Which bump, from the team's side: own / opponent half, left / right as seen from its own driver station."
+        },
+        "bump_field_side": {
+          "type": "string",
+          "enum": [
+            "red",
+            "blue"
+          ],
+          "description": "Which alliance's half of the field the bump is on (absolute)."
+        },
+        "counted": {
+          "type": "boolean",
+          "description": "Whether the episode's match counts toward the team's numbers."
+        }
+      },
+      "additionalProperties": true
+    },
+    "bumpStuckTeam": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingTeam"
+        }
+      ],
+      "type": "object",
+      "description": "bump_stuck team entry (time stopped on a bump, 'beached').",
+      "required": [
+        "stuck_s_total",
+        "episodes",
+        "matches_with_episode",
+        "longest_s",
+        "matches_stuck",
+        "stuck_s_per_match",
+        "tracked_s_per_match",
+        "episode_list"
+      ],
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "stuck_s_total": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Seconds stopped on a bump over counted matches."
+        },
+        "episodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of counted episodes."
+        },
+        "matches_with_episode": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Counted matches with at least one episode."
+        },
+        "longest_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Longest counted episode's stopped_s."
+        },
+        "matches_stuck": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Counted matches with >= 1 s stopped on a bump."
+        },
+        "stuck_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "stuck_s_total / n_counted. The rank score (larger = more often beached)."
+        },
+        "tracked_s_per_match": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Valid tracked seconds per counted match."
+        },
+        "episode_list": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bumpEpisode"
+          },
+          "description": "All episodes (counted and not), play order then t_start."
+        },
+        "matches": {
+          "type": "array",
+          "description": "One row per match, play order.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/matchHead"
+              },
+              {
+                "$ref": "#/$defs/rankingRow"
+              }
+            ],
+            "type": "object",
+            "required": [
+              "tracked_s",
+              "n_episodes",
+              "stuck_s"
+            ],
+            "properties": {
+              "tracked_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Valid tracked seconds (whole match)."
+              },
+              "n_episodes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Episodes in this match."
+              },
+              "stuck_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds stopped on any bump in this match."
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "bumpStuckEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rankingExtras"
+        }
+      ],
+      "type": "object",
+      "description": "metric = bump_stuck (2026): time stopped on a bump, ranked on stuck_s_per_match.",
+      "required": [
+        "metric_version",
+        "teams",
+        "bumps"
+      ],
+      "properties": {
+        "metric_version": {
+          "const": 2
+        },
+        "score_key": {
+          "const": "stuck_s_per_match"
+        },
+        "teams": {
+          "additionalProperties": {
+            "$ref": "#/$defs/bumpStuckTeam"
+          }
+        },
+        "bumps": {
+          "type": "array",
+          "description": "The four bump rectangles [x0, y0, x1, y1] in ABSOLUTE WPILib field metres (blue wall at x = 0), not alliance perspective.",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 4
+          }
+        }
+      }
+    },
+    "pathFrame": {
+      "type": "object",
+      "required": [
+        "units",
+        "field_m",
+        "perspective"
+      ],
+      "description": "Frame of the robot paths: absolute WPILib field coordinates (NOT the metrics' alliance perspective).",
+      "properties": {
+        "units": {
+          "const": "m"
+        },
+        "field_m": {
+          "$ref": "#/$defs/xy",
+          "description": "[length, width] of the field in metres."
+        },
+        "perspective": {
+          "const": "absolute",
+          "description": "Origin at the blue alliance wall's right corner (seen from the blue driver station), +x toward the red wall, +y to the left; the same for both alliances."
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "robot": {
+      "type": "object",
+      "required": [
+        "team_number",
+        "alliance",
+        "alliance_position",
+        "path"
+      ],
+      "description": "One robot of a match and its whole-match path.",
+      "properties": {
+        "team_number": {
+          "type": "integer"
+        },
+        "alliance": {
+          "$ref": "#/$defs/alliance"
+        },
+        "alliance_position": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 3,
+          "description": "TBA station 1..3; null when the lineup does not list the team."
+        },
+        "path": {
+          "$ref": "#/$defs/robotPath"
+        }
+      },
+      "additionalProperties": true
+    },
+    "robotPath": {
+      "type": "object",
+      "required": [
+        "n_points",
+        "seen_s",
+        "first_t",
+        "last_t",
+        "auto_source",
+        "auto_label_share",
+        "confirmed_share",
+        "segments",
+        "n_jumps",
+        "t",
+        "x",
+        "y",
+        "frame"
+      ],
+      "description": "Where the robot was over the whole match. t/x/y/frame are parallel arrays of length n_points, sorted by t, one point per analysed frame where the robot was located AND identified as this team.",
+      "properties": {
+        "n_points": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "seen_s": {
+          "type": "object",
+          "required": [
+            "auto",
+            "teleop"
+          ],
+          "properties": {
+            "auto": {
+              "type": "number"
+            },
+            "teleop": {
+              "type": "number"
+            }
+          },
+          "description": "Seconds the robot was located, per period.",
+          "additionalProperties": true
+        },
+        "first_t": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "last_t": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "auto_source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "autonomous_paths",
+            "frames",
+            null
+          ],
+          "description": "autonomous_paths = auto points from the pipeline's slot-continuous auto track; frames = from labelled frames; null = no auto points."
+        },
+        "auto_label_share": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Share of the auto track's team readings naming this team (autonomous_paths only)."
+        },
+        "confirmed_share": {
+          "$ref": "#/$defs/nullableFraction",
+          "description": "Share of labelled frames whose team number was read directly."
+        },
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "items": false,
+            "minItems": 2
+          },
+          "description": "[first, last] index ranges (inclusive) safe to draw as one polyline: split where points are > 1.0 s apart or a step is faster than 7 m/s."
+        },
+        "n_jumps": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Segment breaks caused by a step faster than 7 m/s (label jumped robots / bad position)."
+        },
+        "t": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Match seconds: auto 0..auto_s, teleop auto_s.. (the auto->teleop pause removed)."
+        },
+        "x": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Metres, path_frame (absolute)."
+        },
+        "y": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Metres, path_frame (absolute)."
+        },
+        "frame": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "Source-video frame; video seconds = frame / timeline.video.fps."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

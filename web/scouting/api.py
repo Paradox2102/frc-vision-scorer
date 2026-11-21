@@ -4,7 +4,12 @@
   GET /api/scouting/{event}/metrics             applicable metrics + the replay per match used
   GET /api/scouting/{event}/teams               teams seen (lineup or label) + match counts
   GET /api/scouting/{event}/metric/{key}        one metric envelope (?team=N, ?<param>=v)
-  GET /api/scouting/{event}/export              every applicable metric (the RoboRecon payload)
+  GET /api/scouting/{event}/export              every applicable metric + per-match video
+                                                timeline + every robot's whole-match path
+                                                (?paths=false drops the paths; format:
+                                                docs/scouting-export/README.md)
+  GET /api/scouting/{event}/match/{match_key}   one match: lineup, timeline, robot paths
+                                                (?team=N for one robot)
   GET /api/scouting/field-image/{year}[/meta]   AdvantageScope field2d jpg + its corner pixels
   GET  /api/scouting/roborecon/status           RoboRecon connection/auth check (no token echoed)
   POST /api/scouting/{event}/push-roborecon     push metric envelopes to RoboRecon
@@ -18,12 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from web.scouting import export, geometry, loader, registry
+from web.scouting import export, geometry, loader, registry, timeline
 
 router = APIRouter(prefix="/api/scouting", tags=["scouting"])
 
@@ -174,16 +180,43 @@ async def event_metric(event_key: str, key: str, request: Request,
     return export.filter_team(env, team) if team is not None else env
 
 
-def _export_sync(event_key: str) -> dict:
+def _export_sync(event_key: str, paths: bool = True) -> dict:
     year = _year(event_key)
     envs = [registry.run_metric(event_key, m.key, None, DB_PATH)
             for m in registry.available_metrics(year)]
-    return {"event_key": event_key, "year": year, "envelopes": envs}
+    matches, skipped = _load(event_key)
+    return export.event_export(event_key, year, matches, skipped, envs,
+                               {m.match_key: timeline.for_match(m) for m in matches},
+                               paths=paths)
 
 
 @router.get("/{event_key}/export")
-async def event_export(event_key: str):
-    return await asyncio.to_thread(_export_sync, event_key)
+async def event_export(event_key: str, paths: bool = True):
+    return await asyncio.to_thread(_export_sync, event_key, paths)
+
+
+def _match_sync(event_key: str, match_key: str, team: Optional[int]) -> dict:
+    matches, skipped = _load(event_key)
+    md = next((m for m in matches if m.match_key == match_key), None)
+    if md is None:
+        why = next((s.get("reason") for s in skipped if s.get("match_key") == match_key), None)
+        raise HTTPException(404, f"{match_key}: {why}" if why
+                            else f"no analysed match {match_key!r} in {event_key}")
+    row = export.match_row(md, timeline.for_match(md), paths=True)
+    if team is not None:
+        row["robots"] = [r for r in row["robots"] if r["team_number"] == int(team)]
+        if not row["robots"]:
+            raise HTTPException(404, f"team {team} is not in {match_key}")
+    return {"schema": export.MATCH_SCHEMA, "schema_version": export.EXPORT_SCHEMA_VERSION,
+            "event_key": event_key, "year": md.year,
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "path_frame": export.path_frame(md.year), "match": row}
+
+
+@router.get("/{event_key}/match/{match_key}")
+async def match_export(event_key: str, match_key: str, team: Optional[int] = None):
+    return await asyncio.to_thread(_match_sync, event_key, match_key, team)
+
 
 # ----------------------------------------------------------------- RoboRecon push
 def push_event(event_key: str, metrics: Optional[list] = None, sink=None,

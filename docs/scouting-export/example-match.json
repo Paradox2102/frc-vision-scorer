@@ -1,0 +1,1497 @@
+{
+  "_note": "ABRIDGED example built from data/exports/2026cur_scouting_export.json: one match (2026cur_qm8) and one team (3128) per envelope. Lists (matches, cells, points, clusters, episode_list, ranking, sources) are cut down, so counts such as n_matches do not match the list lengths here. Keys starting with '_' are not part of the format. Each robots[].path keeps only its first 8 points (n_points and seen_s are the real totals).",
+  "schema": "frc-vision-scorer.scouting-export",
+  "schema_version": 2,
+  "event_key": "2026cur",
+  "year": 2026,
+  "generated_at": "2026-11-20T23:04:11+00:00",
+  "path_frame": {
+    "units": "m",
+    "field_m": [
+      16.541,
+      8.069
+    ],
+    "perspective": "absolute",
+    "note": "WPILib field coordinates: origin at the blue alliance wall's right corner (as seen from the blue driver station), +x toward the red wall, +y to the left; the same for red and blue robots"
+  },
+  "matches": [
+    {
+      "match_key": "2026cur_qm8",
+      "comp_level": "qm",
+      "set_number": 1,
+      "match_number": 8,
+      "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+      "replay_created_at": "2026-11-20T12:07:32",
+      "legacy_labels": false,
+      "alliances": {
+        "red": [
+          6497,
+          2724,
+          2637
+        ],
+        "blue": [
+          3128,
+          6773,
+          9066
+        ]
+      },
+      "timeline": {
+        "timeline_version": 1,
+        "video": {
+          "fps": 60.0,
+          "fps_source": "video",
+          "frame_count": 12870,
+          "duration_s": 214.5,
+          "youtube_key": "Pialfz0joK8",
+          "youtube_url": "https://www.youtube.com/watch?v=Pialfz0joK8&t=6s"
+        },
+        "marks": {
+          "match_start": {
+            "t": 6.217,
+            "frame": 373,
+            "video_time": "0:06.22",
+            "source": "indicator"
+          },
+          "auto_end": {
+            "t": 26.25,
+            "frame": 1575,
+            "video_time": "0:26.25",
+            "source": "clock_ticks(6)"
+          },
+          "teleop_start": {
+            "t": 30.25,
+            "frame": 1815,
+            "video_time": "0:30.25",
+            "source": "clock_ticks(6)"
+          },
+          "endgame_start": {
+            "t": 141.25,
+            "frame": 8475,
+            "video_time": "2:21.25",
+            "source": "clock_ticks(13)"
+          },
+          "match_end": {
+            "t": 171.75,
+            "frame": 10305,
+            "video_time": "2:51.75",
+            "source": "clock_ticks(7)"
+          }
+        },
+        "phases": [
+          {
+            "phase": "auto",
+            "start_s": 6.217,
+            "end_s": 26.25,
+            "duration_s": 20.033,
+            "start_frame": 373,
+            "end_frame": 1575
+          },
+          {
+            "phase": "between",
+            "start_s": 26.25,
+            "end_s": 30.25,
+            "duration_s": 4.0,
+            "start_frame": 1575,
+            "end_frame": 1815
+          },
+          {
+            "phase": "teleop",
+            "start_s": 30.25,
+            "end_s": 171.75,
+            "duration_s": 141.5,
+            "start_frame": 1815,
+            "end_frame": 10305
+          },
+          {
+            "phase": "transition",
+            "start_s": 30.25,
+            "end_s": 40.25,
+            "duration_s": 10.0,
+            "start_frame": 1815,
+            "end_frame": 2415,
+            "within": "teleop"
+          },
+          {
+            "phase": "shift1",
+            "start_s": 40.25,
+            "end_s": 65.75,
+            "duration_s": 25.5,
+            "start_frame": 2415,
+            "end_frame": 3945,
+            "within": "teleop"
+          },
+          {
+            "phase": "shift2",
+            "start_s": 65.75,
+            "end_s": 90.75,
+            "duration_s": 25.0,
+            "start_frame": 3945,
+            "end_frame": 5445,
+            "within": "teleop"
+          },
+          {
+            "phase": "shift3",
+            "start_s": 90.75,
+            "end_s": 116.25,
+            "duration_s": 25.5,
+            "start_frame": 5445,
+            "end_frame": 6975,
+            "within": "teleop"
+          },
+          {
+            "phase": "shift4",
+            "start_s": 116.25,
+            "end_s": 141.25,
+            "duration_s": 25.0,
+            "start_frame": 6975,
+            "end_frame": 8475,
+            "within": "teleop"
+          },
+          {
+            "phase": "endgame",
+            "start_s": 141.25,
+            "end_s": 171.75,
+            "duration_s": 30.5,
+            "start_frame": 8475,
+            "end_frame": 10305,
+            "within": "teleop"
+          }
+        ]
+      },
+      "robots_version": 1,
+      "auto_s": 20.0,
+      "robots": [
+        {
+          "team_number": 6497,
+          "alliance": "red",
+          "alliance_position": 1,
+          "path": {
+            "n_points": 1238,
+            "seen_s": {
+              "auto": 15.2,
+              "teleop": 107.4
+            },
+            "first_t": 0.08,
+            "last_t": 159.91,
+            "auto_source": "autonomous_paths",
+            "auto_label_share": 1.0,
+            "confirmed_share": 0.667,
+            "segments": [
+              [
+                0,
+                7
+              ]
+            ],
+            "n_jumps": 22,
+            "t": [
+              0.08,
+              0.18,
+              0.28,
+              0.37,
+              0.47,
+              0.57,
+              0.67,
+              0.76
+            ],
+            "x": [
+              13.24,
+              13.24,
+              13.22,
+              13.22,
+              13.21,
+              13.2,
+              13.16,
+              13.05
+            ],
+            "y": [
+              2.17,
+              2.17,
+              2.14,
+              2.09,
+              2.02,
+              1.92,
+              1.79,
+              1.57
+            ],
+            "frame": [
+              378,
+              384,
+              390,
+              396,
+              402,
+              408,
+              414,
+              420
+            ]
+          }
+        },
+        {
+          "team_number": 2724,
+          "alliance": "red",
+          "alliance_position": 2,
+          "path": {
+            "n_points": 1183,
+            "seen_s": {
+              "auto": 2.8,
+              "teleop": 114.6
+            },
+            "first_t": 12.28,
+            "last_t": 159.91,
+            "auto_source": "autonomous_paths",
+            "auto_label_share": 1.0,
+            "confirmed_share": 0.626,
+            "segments": [
+              [
+                0,
+                7
+              ]
+            ],
+            "n_jumps": 22,
+            "t": [
+              12.28,
+              12.37,
+              12.47,
+              12.57,
+              12.67,
+              12.76,
+              12.86,
+              12.96
+            ],
+            "x": [
+              11.52,
+              11.32,
+              11.05,
+              10.7,
+              10.26,
+              9.77,
+              9.26,
+              8.85
+            ],
+            "y": [
+              5.71,
+              5.89,
+              6.05,
+              6.15,
+              6.22,
+              6.21,
+              6.14,
+              5.9
+            ],
+            "frame": [
+              1128,
+              1134,
+              1140,
+              1146,
+              1152,
+              1158,
+              1164,
+              1170
+            ]
+          }
+        },
+        {
+          "team_number": 2637,
+          "alliance": "red",
+          "alliance_position": 3,
+          "path": {
+            "n_points": 931,
+            "seen_s": {
+              "auto": 10.1,
+              "teleop": 82.2
+            },
+            "first_t": 1.45,
+            "last_t": 156.63,
+            "auto_source": "autonomous_paths",
+            "auto_label_share": 1.0,
+            "confirmed_share": 0.76,
+            "segments": [
+              [
+                0,
+                7
+              ]
+            ],
+            "n_jumps": 22,
+            "t": [
+              1.45,
+              1.54,
+              1.64,
+              1.74,
+              1.84,
+              1.93,
+              2.03,
+              2.13
+            ],
+            "x": [
+              11.22,
+              11.14,
+              10.99,
+              10.72,
+              10.42,
+              10.07,
+              9.72,
+              9.35
+            ],
+            "y": [
+              7.11,
+              7.16,
+              7.22,
+              7.25,
+              7.26,
+              7.22,
+              7.22,
+              7.19
+            ],
+            "frame": [
+              462,
+              468,
+              474,
+              480,
+              486,
+              492,
+              498,
+              504
+            ]
+          }
+        },
+        {
+          "team_number": 3128,
+          "alliance": "blue",
+          "alliance_position": 1,
+          "path": {
+            "n_points": 1044,
+            "seen_s": {
+              "auto": 17.5,
+              "teleop": 85.9
+            },
+            "first_t": 0.08,
+            "last_t": 157.13,
+            "auto_source": "autonomous_paths",
+            "auto_label_share": 1.0,
+            "confirmed_share": 0.68,
+            "segments": [
+              [
+                0,
+                7
+              ]
+            ],
+            "n_jumps": 20,
+            "t": [
+              0.08,
+              0.18,
+              0.28,
+              0.37,
+              0.47,
+              0.57,
+              0.67,
+              0.76
+            ],
+            "x": [
+              3.36,
+              3.36,
+              3.35,
+              3.43,
+              3.46,
+              3.41,
+              3.33,
+              3.25
+            ],
+            "y": [
+              2.0,
+              2.0,
+              2.0,
+              2.02,
+              2.05,
+              2.04,
+              2.06,
+              2.1
+            ],
+            "frame": [
+              378,
+              384,
+              390,
+              396,
+              402,
+              408,
+              414,
+              420
+            ]
+          }
+        },
+        {
+          "team_number": 6773,
+          "alliance": "blue",
+          "alliance_position": 2,
+          "path": {
+            "n_points": 1305,
+            "seen_s": {
+              "auto": 14.8,
+              "teleop": 114.5
+            },
+            "first_t": 1.45,
+            "last_t": 159.91,
+            "auto_source": "autonomous_paths",
+            "auto_label_share": 1.0,
+            "confirmed_share": 0.743,
+            "segments": [
+              [
+                0,
+                5
+              ],
+              [
+                6,
+                7
+              ]
+            ],
+            "n_jumps": 25,
+            "t": [
+              1.45,
+              1.54,
+              1.64,
+              1.74,
+              2.13,
+              2.33,
+              4.57,
+              4.67
+            ],
+            "x": [
+              5.8,
+              5.89,
+              5.98,
+              6.02,
+              6.75,
+              7.32,
+              7.06,
+              7.08
+            ],
+            "y": [
+              5.14,
+              5.24,
+              5.4,
+              5.76,
+              6.72,
+              6.99,
+              4.25,
+              4.36
+            ],
+            "frame": [
+              462,
+              468,
+              474,
+              480,
+              504,
+              516,
+              654,
+              660
+            ]
+          }
+        },
+        {
+          "team_number": 9066,
+          "alliance": "blue",
+          "alliance_position": 3,
+          "path": {
+            "n_points": 0,
+            "seen_s": {
+              "auto": 0.0,
+              "teleop": 0.0
+            },
+            "first_t": null,
+            "last_t": null,
+            "auto_source": null,
+            "auto_label_share": null,
+            "confirmed_share": null,
+            "segments": [],
+            "n_jumps": 0,
+            "t": [],
+            "x": [],
+            "y": [],
+            "frame": []
+          }
+        }
+      ]
+    }
+  ],
+  "skipped": [
+    {
+      "match_key": "2026cur_qm32",
+      "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+      "reason": "no match clock (summary.periods)"
+    },
+    {
+      "match_key": "2026cur_qm72",
+      "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+      "reason": "no match clock (summary.periods)"
+    }
+  ],
+  "envelopes": [
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "shift_heatmap",
+      "metric_version": 2,
+      "metric_title": "Shift heatmaps",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:00+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "cell_m": 0.5
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "grid": {
+        "cell_m": 0.5,
+        "nx": 34,
+        "ny": 17,
+        "field_m": [
+          16.541,
+          8.069
+        ]
+      },
+      "zones": {
+        "own_max_x": 4.029,
+        "opp_min_x": 12.512
+      },
+      "buckets": [
+        "auto",
+        "transition",
+        "active",
+        "inactive",
+        "endgame",
+        "unknown"
+      ],
+      "default_buckets": [
+        "active",
+        "inactive",
+        "endgame"
+      ],
+      "station_layout": {
+        "1": "high",
+        "2": "mid",
+        "3": "low"
+      },
+      "auto_winner_by_match": {
+        "2026cur_qm8": "blue"
+      },
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "match_number": 8,
+              "set_number": 1,
+              "alliance": "blue",
+              "station": 1,
+              "auto_winner": "blue",
+              "seconds": {
+                "auto": 20.16,
+                "transition": 6.95,
+                "active": 19.26,
+                "inactive": 41.9,
+                "endgame": 21.45,
+                "unknown": 0.0
+              }
+            }
+          ],
+          "matches_by_station": {
+            "1": 3,
+            "2": 7,
+            "3": 3
+          },
+          "by_station": {
+            "all": {
+              "auto": {
+                "seconds": 197.82,
+                "cells": [
+                  [
+                    3,
+                    4,
+                    1.39
+                  ],
+                  [
+                    3,
+                    10,
+                    3.19
+                  ],
+                  [
+                    4,
+                    3,
+                    1.19
+                  ]
+                ],
+                "summary": {
+                  "own_zone_frac": 0.457,
+                  "neutral_zone_frac": 0.543,
+                  "opp_zone_frac": 0.0,
+                  "mean_ax": 4.735,
+                  "mean_ay": 4.008,
+                  "n_samples": 1097
+                }
+              },
+              "transition": {
+                "seconds": 93.96,
+                "cells": [
+                  [
+                    4,
+                    4,
+                    2.58
+                  ],
+                  [
+                    4,
+                    5,
+                    1.39
+                  ],
+                  [
+                    4,
+                    10,
+                    4.16
+                  ]
+                ],
+                "summary": {
+                  "own_zone_frac": 0.359,
+                  "neutral_zone_frac": 0.641,
+                  "opp_zone_frac": 0.0,
+                  "mean_ax": 5.452,
+                  "mean_ay": 4.242,
+                  "n_samples": 508
+                }
+              },
+              "active": {
+                "seconds": 390.87,
+                "cells": [
+                  [
+                    0,
+                    5,
+                    0.6
+                  ],
+                  [
+                    0,
+                    6,
+                    0.4
+                  ],
+                  [
+                    0,
+                    7,
+                    0.79
+                  ]
+                ],
+                "summary": {
+                  "own_zone_frac": 0.511,
+                  "neutral_zone_frac": 0.489,
+                  "opp_zone_frac": 0.0,
+                  "mean_ax": 4.591,
+                  "mean_ay": 4.076,
+                  "n_samples": 2064
+                }
+              },
+              "inactive": {
+                "seconds": 534.31,
+                "cells": [
+                  [
+                    0,
+                    14,
+                    0.99
+                  ],
+                  [
+                    1,
+                    2,
+                    0.2
+                  ],
+                  [
+                    1,
+                    14,
+                    0.4
+                  ]
+                ],
+                "summary": {
+                  "own_zone_frac": 0.108,
+                  "neutral_zone_frac": 0.865,
+                  "opp_zone_frac": 0.027,
+                  "mean_ax": 7.341,
+                  "mean_ay": 4.195,
+                  "n_samples": 2900
+                }
+              },
+              "endgame": {
+                "seconds": 303.67,
+                "cells": [
+                  [
+                    1,
+                    3,
+                    0.2
+                  ],
+                  [
+                    1,
+                    4,
+                    0.2
+                  ],
+                  [
+                    1,
+                    5,
+                    0.4
+                  ]
+                ],
+                "summary": {
+                  "own_zone_frac": 0.479,
+                  "neutral_zone_frac": 0.515,
+                  "opp_zone_frac": 0.007,
+                  "mean_ax": 5.177,
+                  "mean_ay": 4.261,
+                  "n_samples": 1636
+                }
+              },
+              "unknown": {
+                "seconds": 0.0,
+                "cells": [],
+                "summary": {
+                  "own_zone_frac": null,
+                  "neutral_zone_frac": null,
+                  "opp_zone_frac": null,
+                  "mean_ax": null,
+                  "mean_ay": null,
+                  "n_samples": 0
+                }
+              }
+            }
+          },
+          "coverage": {
+            "auto": 0.761,
+            "transition": 0.723,
+            "active": 0.601,
+            "inactive": 0.822,
+            "endgame": 0.779,
+            "unknown": null
+          }
+        }
+      }
+    },
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "auto_paths",
+      "metric_version": 2,
+      "metric_title": "Auto paths",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:01+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "threshold_m": 0.9,
+        "grid_s": 0.25,
+        "max_gap_s": 1.5,
+        "max_shift_s": 1.0,
+        "min_overlap_frac": 0.4,
+        "min_overlap_s": 3.0,
+        "min_coverage": 0.25,
+        "mirror_aware": true,
+        "field_rules": true,
+        "obstacle_margin_m": 0.25,
+        "start_tol_m": 0.8,
+        "start_window_s": 1.5,
+        "start_noise_m": 0.5
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "legend": {
+        "perspective": "own alliance wall at x=0"
+      },
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "n_with_path": 12,
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "match_number": 8,
+              "set_number": 1,
+              "alliance": "blue",
+              "station": 1,
+              "source": "autonomous_paths",
+              "coverage": 0.975,
+              "label_share": 1.0,
+              "runner_up_share": 0.0,
+              "identity_conflict": false,
+              "legacy_labels": false,
+              "n_samples": 188,
+              "start_check": "ok",
+              "start_offset_m": 0.0,
+              "n_clamped": 1,
+              "n_detour": 2,
+              "cluster": 1,
+              "mirrored": true,
+              "points": [
+                [
+                  0.08,
+                  3.36,
+                  2.0
+                ],
+                [
+                  0.18,
+                  3.36,
+                  2.0
+                ],
+                [
+                  0.28,
+                  3.35,
+                  2.0
+                ],
+                [
+                  0.37,
+                  3.43,
+                  2.02
+                ],
+                [
+                  19.98,
+                  2.94,
+                  2.17
+                ]
+              ],
+              "points_norm": [
+                [
+                  0.2032,
+                  0.2484
+                ],
+                [
+                  0.2032,
+                  0.2484
+                ],
+                [
+                  0.2028,
+                  0.2484
+                ],
+                [
+                  0.2071,
+                  0.2509
+                ],
+                [
+                  0.1775,
+                  0.2689
+                ]
+              ],
+              "points_field": [
+                [
+                  0.08,
+                  3.36,
+                  2.0
+                ],
+                [
+                  0.18,
+                  3.36,
+                  2.0
+                ],
+                [
+                  0.28,
+                  3.35,
+                  2.0
+                ],
+                [
+                  0.37,
+                  3.43,
+                  2.02
+                ],
+                [
+                  19.98,
+                  2.94,
+                  2.17
+                ]
+              ],
+              "point_kinds": [
+                "s",
+                "s",
+                "s",
+                "s",
+                "s"
+              ]
+            }
+          ],
+          "clusters": [
+            {
+              "id": 1,
+              "count": 4,
+              "members": [
+                "2026cur_qm8",
+                "2026cur_qm50",
+                "2026cur_sf4m1",
+                "2026cur_sf10m1"
+              ],
+              "representative": "2026cur_sf4m1",
+              "mean_spread_m": 0.67,
+              "n_mirrored": 2,
+              "start": [
+                3.7,
+                6.74
+              ],
+              "end": [
+                2.91,
+                5.95
+              ],
+              "duration_s": 19.62
+            }
+          ]
+        }
+      }
+    },
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "movement",
+      "metric_version": 1,
+      "metric_title": "Time moving",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:04+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "held_s": 0.5,
+        "gap_s": 0.6,
+        "smooth_s": 1.0,
+        "speed_window_s": 1.0,
+        "max_speed_mps": 6.0,
+        "held_settle_m": 0.3,
+        "min_tracked_s": 30.0,
+        "min_matches": 2,
+        "move_speed_mps": 0.5,
+        "sustain_s": 1.5
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "ranking": [
+        "3128"
+      ],
+      "score_key": "avg_speed_mps",
+      "event_stats": {
+        "labelled_s": 89128.4,
+        "held_s": 3181.5,
+        "held_frac": 0.036,
+        "held_kept_s": 4357.0,
+        "implausible_speed_samples": 135
+      },
+      "legend": "Moving = smoothed speed >= 0.5 m/s (a parked robot's smoothed speed reads below this ~98% of the time). Moving fraction = moving \u00f7 (moving + stationary) seconds [...]",
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "n_counted": 13,
+          "low_data": false,
+          "tracked_s_per_match": 113.9,
+          "coverage": 0.712,
+          "moving_s_per_match": 74.97,
+          "stationary_s_per_match": 26.22,
+          "moving_frac": 0.741,
+          "mean_moving_mps": 1.73,
+          "median_moving_mps": 1.71,
+          "p90_moving_mps": 2.77,
+          "avg_speed_mps": 1.281,
+          "speed_known_s": 1315.5,
+          "max_sustained_mps": 2.5,
+          "max_sustained_best_mps": 3.06,
+          "teleop": {
+            "moving_s_per_match": 66.87,
+            "stationary_s_per_match": 20.7,
+            "moving_frac": 0.764,
+            "mean_moving_mps": 1.72,
+            "median_moving_mps": 1.69,
+            "p90_moving_mps": 2.77,
+            "avg_speed_mps": 1.316,
+            "speed_known_s": 1138.4
+          },
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "set_number": 1,
+              "match_number": 8,
+              "alliance": "blue",
+              "station": 1,
+              "tracked_s": 108.2,
+              "coverage": 0.676,
+              "held_s": 1.5,
+              "counted": true,
+              "moving_s": 69.1,
+              "stationary_s": 24.8,
+              "moving_frac": 0.736,
+              "avg_speed_mps": 1.378,
+              "teleop": {
+                "moving_s": 57.2,
+                "stationary_s": 17.1,
+                "moving_frac": 0.77,
+                "avg_speed_mps": 1.436,
+                "tracked_s": 88.1
+              },
+              "max_sustained_mps": 2.72
+            }
+          ],
+          "rank": 1
+        }
+      }
+    },
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "cycles",
+      "metric_version": 1,
+      "metric_title": "Neutral \u2194 alliance-zone cycles",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:04+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "held_s": 0.5,
+        "gap_s": 0.6,
+        "smooth_s": 1.0,
+        "speed_window_s": 1.0,
+        "max_speed_mps": 6.0,
+        "held_settle_m": 0.3,
+        "min_tracked_s": 30.0,
+        "min_matches": 2,
+        "zone_margin_m": 0.3,
+        "min_dwell_s": 1.0,
+        "max_gap_s": 3.0
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "ranking": [
+        "3128"
+      ],
+      "score_key": "cycles_per_min",
+      "zones": {
+        "own_max_x": 3.729,
+        "neutral_min_x": 5.522,
+        "neutral_max_x": 11.019
+      },
+      "legend": "Zone state machine on smoothed alliance-perspective x: own = x <= 3.73 m (alliance zone minus 0.3 m), neutral = 5.52\u201311.02 m (between the two barriers, 0.3 m in [...]",
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "n_counted": 13,
+          "low_data": false,
+          "cycles_per_min": 2.24,
+          "cycles_teleop_per_match": 3.69,
+          "cycles_auto_per_match": 1.23,
+          "cycles_teleop_total": 48,
+          "cycles_auto_total": 16,
+          "teleop_tracked_s_per_match": 98.9,
+          "coverage": 0.706,
+          "mean_cycle_s": 16.3,
+          "median_cycle_s": 11.9,
+          "mean_neutral_visit_s": 8.7,
+          "mean_own_visit_s": 5.0,
+          "resets": 52,
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "set_number": 1,
+              "match_number": 8,
+              "alliance": "blue",
+              "station": 1,
+              "teleop_tracked_s": 88.1,
+              "coverage": 0.629,
+              "counted": true,
+              "cycles_teleop": 2,
+              "cycles_auto": 2,
+              "resets": 5,
+              "cycles_per_min": 1.36,
+              "cycle_return_times": [
+                5.9,
+                15.3,
+                48.3,
+                142.7
+              ]
+            }
+          ],
+          "rank": 6
+        }
+      }
+    },
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "defense",
+      "metric_version": 1,
+      "metric_title": "Time on the opponent's side",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:04+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "held_s": 0.5,
+        "gap_s": 0.6,
+        "smooth_s": 1.0,
+        "speed_window_s": 1.0,
+        "max_speed_mps": 6.0,
+        "held_settle_m": 0.3,
+        "min_tracked_s": 30.0,
+        "min_matches": 2,
+        "near_m": 1.0,
+        "long_visit_s": 15.0
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "ranking": [
+        "3128"
+      ],
+      "score_key": "opp_side_frac",
+      "zones": {
+        "opp_min_x": 11.512
+      },
+      "legend": "Teleop time with smoothed alliance-perspective x >= 11.51 m: inside the opponent's alliance zone or within 1 m of it. Ranked on the share of tracked teleop time [...]",
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "n_counted": 13,
+          "low_data": false,
+          "opp_side_frac": 0.015,
+          "opp_side_s_per_match": 1.4,
+          "opp_side_s_norm": 2.0,
+          "matches_long": 0,
+          "teleop_tracked_s_per_match": 98.9,
+          "coverage": 0.706,
+          "by_station": {
+            "blue1": {
+              "n_counted": 2,
+              "opp_side_s_per_match": 1.1,
+              "opp_side_frac": 0.013
+            },
+            "blue2": {
+              "n_counted": 2,
+              "opp_side_s_per_match": 3.9,
+              "opp_side_frac": 0.032
+            },
+            "blue3": {
+              "n_counted": 2,
+              "opp_side_s_per_match": 0.9,
+              "opp_side_frac": 0.008
+            },
+            "red1": {
+              "n_counted": 1,
+              "opp_side_s_per_match": 0.0,
+              "opp_side_frac": 0.0
+            },
+            "red2": {
+              "n_counted": 5,
+              "opp_side_s_per_match": 0.0,
+              "opp_side_frac": 0.0
+            },
+            "red3": {
+              "n_counted": 1,
+              "opp_side_s_per_match": 7.0,
+              "opp_side_frac": 0.108
+            }
+          },
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "set_number": 1,
+              "match_number": 8,
+              "alliance": "blue",
+              "station": 1,
+              "teleop_tracked_s": 88.1,
+              "coverage": 0.629,
+              "counted": true,
+              "opp_side_s": 2.3,
+              "opp_side_frac": 0.026
+            }
+          ],
+          "rank": 71
+        }
+      }
+    },
+    {
+      "schema": "frc-vision-scorer.scouting",
+      "schema_version": 1,
+      "metric": "bump_stuck",
+      "metric_version": 2,
+      "metric_title": "Stuck on a bump",
+      "event_key": "2026cur",
+      "year": 2026,
+      "generated_at": "2026-11-20T23:04:04+00:00",
+      "frame": {
+        "units": "m",
+        "field_m": [
+          16.541,
+          8.069
+        ],
+        "perspective": "alliance",
+        "symmetry": "rotational",
+        "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
+      },
+      "params": {
+        "held_s": 0.5,
+        "gap_s": 0.6,
+        "smooth_s": 1.0,
+        "speed_window_s": 1.0,
+        "max_speed_mps": 6.0,
+        "held_settle_m": 0.3,
+        "min_tracked_s": 30.0,
+        "min_matches": 2,
+        "bump_inset_m": 0.0,
+        "stop_speed_mps": 0.5,
+        "min_episode_s": 2.0,
+        "max_dropout_s": 2.0
+      },
+      "sources": [
+        {
+          "match_key": "2026cur_qm8",
+          "comp_level": "qm",
+          "set_number": 1,
+          "match_number": 8,
+          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
+          "replay_created_at": "2026-11-20T12:07:32",
+          "legacy_labels": false
+        }
+      ],
+      "skipped": [
+        {
+          "match_key": "2026cur_qm32",
+          "replay_id": "3201d4dc-dbd7-4267-91a9-74540266ac20",
+          "reason": "no match clock (summary.periods)"
+        },
+        {
+          "match_key": "2026cur_qm72",
+          "replay_id": "507d5bc0-7b50-461c-bda3-56525ac05f3d",
+          "reason": "no match clock (summary.periods)"
+        }
+      ],
+      "ranking": [
+        "3128"
+      ],
+      "score_key": "stuck_s_per_match",
+      "bumps": [
+        [
+          4.0615,
+          1.5772,
+          5.1895,
+          3.4312
+        ],
+        [
+          4.0615,
+          4.638,
+          5.1895,
+          6.492
+        ],
+        [
+          11.3515,
+          1.5772,
+          12.4795,
+          3.4312
+        ],
+        [
+          11.3515,
+          4.638,
+          12.4795,
+          6.492
+        ]
+      ],
+      "legend": "Rank score = seconds per counted match the robot is STOPPED (smoothed speed < 0.5 m/s) with its centre on any bump, added up over the whole match (a beached rob [...]",
+      "teams": {
+        "3128": {
+          "team_number": 3128,
+          "n_matches": 13,
+          "n_counted": 13,
+          "low_data": false,
+          "stuck_s_total": 19.3,
+          "episodes": 1,
+          "matches_with_episode": 1,
+          "longest_s": 13.8,
+          "matches_stuck": 4,
+          "stuck_s_per_match": 1.5,
+          "tracked_s_per_match": 113.9,
+          "coverage": 0.712,
+          "episode_list": [
+            {
+              "match_key": "2026cur_qm39",
+              "comp_level": "qm",
+              "set_number": 1,
+              "match_number": 39,
+              "alliance": "blue",
+              "station": 3,
+              "period": "auto",
+              "t_start": 7.2,
+              "remaining_at_start": 12.8,
+              "duration_s": 14.9,
+              "stopped_s": 13.8,
+              "bump": "own right",
+              "bump_field_side": "blue",
+              "counted": true
+            }
+          ],
+          "matches": [
+            {
+              "match_key": "2026cur_qm8",
+              "comp_level": "qm",
+              "set_number": 1,
+              "match_number": 8,
+              "alliance": "blue",
+              "station": 1,
+              "tracked_s": 108.2,
+              "coverage": 0.676,
+              "counted": true,
+              "n_episodes": 0,
+              "stuck_s": 0.0
+            }
+          ],
+          "rank": 9
+        }
+      }
+    }
+  ]
+}

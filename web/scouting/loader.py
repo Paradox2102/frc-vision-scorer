@@ -68,11 +68,16 @@ def _read_meta(path: Path) -> Optional[dict]:
         return None
 
 
+def _columns(conn, table: str) -> set:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def candidate_replays(conn, event_key: str) -> dict:
     """{match_key: [replay rows newest first]} for complete replays."""
     conn.row_factory = sqlite3.Row
+    extra = ", source_video_path" if "source_video_path" in _columns(conn, "replays") else ""
     rows = conn.execute(
-        "SELECT id, match_key, created_at, meta_path FROM replays "
+        f"SELECT id, match_key, created_at, meta_path{extra} FROM replays "
         "WHERE event_key = ? AND status = 'complete' AND match_key IS NOT NULL "
         "AND match_key != '' ORDER BY created_at DESC", (event_key,)).fetchall()
     out: dict = defaultdict(list)
@@ -113,8 +118,9 @@ def pick_replay(rows: list) -> tuple:
 def match_lineup(conn, match_key: str) -> dict:
     """TBA lineup + hub auto totals from the matches tables (empty if unknown)."""
     conn.row_factory = sqlite3.Row
+    extra = ", tba_video_key" if "tba_video_key" in _columns(conn, "matches") else ""
     m = conn.execute("SELECT id, comp_level, match_number, set_number, tba_red_hub_auto, "
-                     "tba_blue_hub_auto FROM matches WHERE tba_match_key = ?",
+                     f"tba_blue_hub_auto{extra} FROM matches WHERE tba_match_key = ?",
                      (match_key,)).fetchone()
     if not m:
         return {}
@@ -127,7 +133,8 @@ def match_lineup(conn, match_key: str) -> dict:
             pass
     return {"comp_level": m["comp_level"], "match_number": m["match_number"],
             "set_number": m["set_number"] or 1, "alliances": alliances,
-            "hub_auto": {"red": m["tba_red_hub_auto"], "blue": m["tba_blue_hub_auto"]}}
+            "hub_auto": {"red": m["tba_red_hub_auto"], "blue": m["tba_blue_hub_auto"]},
+            "video_key": m["tba_video_key"] if extra else None}
 
 
 def _team_int(v) -> Optional[int]:
@@ -164,7 +171,9 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
         legacy_labels=bool(legacy), alliances=alliances,
         hub_auto=lineup.get("hub_auto") or {"red": None, "blue": None},
         frame_period_s=float(dt),
-        labelled_s={"auto": 0.0, "teleop": 0.0}, tracked_s={"auto": 0.0, "teleop": 0.0})
+        labelled_s={"auto": 0.0, "teleop": 0.0}, tracked_s={"auto": 0.0, "teleop": 0.0},
+        periods=list(summary.get("periods") or []),
+        video_path=replay.get("source_video_path"), youtube_key=lineup.get("video_key"))
 
     def team_match(team: int, alliance: str) -> TeamMatch:
         tm = md.teams.get(team)

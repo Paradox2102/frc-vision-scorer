@@ -185,3 +185,37 @@ def test_field_image_2026(client):
     assert img.status_code == 200 and img.headers["content-type"] == "image/jpeg"
     assert client.get("/api/scouting/field-image/1999/meta").status_code == 404
     assert client.get("/api/scouting/field-image/1999").status_code == 404
+
+
+# ----------------------------------------------------------------- robot paths
+def test_export_carries_every_lineup_robots_path(client):
+    d = client.get("/api/scouting/2026tst/export").json()
+    assert d["path_frame"]["perspective"] == "absolute"
+    qm1 = next(m for m in d["matches"] if m["match_key"] == "2026tst_qm1")
+    assert qm1["robots_version"] == 1 and qm1["auto_s"] > 0
+    assert [(r["team_number"], r["alliance"], r["alliance_position"]) for r in qm1["robots"]] == [
+        (1, "red", 1), (2, "red", 2), (3, "red", 3), (4, "blue", 1), (5, "blue", 2), (6, "blue", 3)]
+    r1 = qm1["robots"][0]["path"]
+    assert r1["n_points"] == 3 and len(r1["t"]) == len(r1["x"]) == len(r1["y"]) == len(r1["frame"]) == 3
+    assert r1["segments"] == [[0, 2]]
+    unseen = qm1["robots"][1]["path"]                 # in the lineup, never identified
+    assert unseen["n_points"] == 0 and unseen["t"] == [] and unseen["segments"] == []
+
+
+def test_export_paths_false_drops_robots(client):
+    d = client.get("/api/scouting/2026tst/export?paths=false").json()
+    assert "path_frame" not in d
+    assert all("robots" not in m for m in d["matches"])
+
+
+def test_match_endpoint_and_team_filter(client):
+    d = client.get("/api/scouting/2026tst/match/2026tst_qm2").json()
+    assert d["schema"] == "frc-vision-scorer.scouting-match"
+    assert d["match"]["match_key"] == "2026tst_qm2" and len(d["match"]["robots"]) == 6
+    one = client.get("/api/scouting/2026tst/match/2026tst_qm2?team=9").json()
+    assert [r["team_number"] for r in one["match"]["robots"]] == [9]
+    assert one["match"]["robots"][0]["path"]["n_points"] == 1
+    assert client.get("/api/scouting/2026tst/match/2026tst_qm2?team=1234").status_code == 404
+    miss = client.get("/api/scouting/2026tst/match/2026tst_qm3")
+    assert miss.status_code == 404 and "no match clock" in miss.json()["detail"]
+    assert client.get("/api/scouting/2026tst/match/2026tst_qm99").status_code == 404

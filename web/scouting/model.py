@@ -66,6 +66,10 @@ class MatchData:
     teams: dict = field(default_factory=dict)         # {team:int -> TeamMatch}
     off_roster_samples: int = 0       # labels naming a team not in the TBA lineup (dropped)
     duplicate_label_samples: int = 0  # same team on two slots in one frame (one kept)
+    # For the export's per-match video timeline (timeline.py, built lazily):
+    periods: list = field(default_factory=list)   # summary.periods (clock scan)
+    video_path: Optional[str] = None              # source match video on disk
+    youtube_key: Optional[str] = None             # TBA match video key
 
     def source_ref(self) -> dict:
         return {"match_key": self.match_key, "comp_level": self.comp_level,

@@ -24,6 +24,7 @@ Bump SCHEMA_VERSION on any breaking envelope change; bump a metric's
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,15 @@ from web.scouting.geometry import frame_info
 
 SCHEMA = "frc-vision-scorer.scouting"
 SCHEMA_VERSION = 1
+
+# The whole-event file (GET /api/scouting/{event}/export). Documented for
+# outside readers in docs/scouting-export/ (README.md + JSON Schema): update
+# both when this shape changes. v2 added the top-level header and ``matches``.
+EXPORT_SCHEMA = "frc-vision-scorer.scouting-export"
+EXPORT_SCHEMA_VERSION = 2
+# One match on its own (GET /api/scouting/{event}/match/{match_key}): the same
+# ``matches[]`` row, wrapped in a header.
+MATCH_SCHEMA = "frc-vision-scorer.scouting-match"
 
 
 def envelope(metric, event_key: str, year: int, matches: list, skipped: list,
@@ -53,6 +63,148 @@ def envelope(metric, event_key: str, year: int, matches: list, skipped: list,
             env[k] = v
     env["teams"] = teams
     return env
+
+
+def event_export(event_key: str, year: int, matches: list, skipped: list,
+                 envelopes: list, timelines: dict, paths: bool = True) -> dict:
+    """The whole-event export: header, one row per match (lineup + video
+    timeline + each robot's whole-match path), then every metric envelope.
+    ``paths=False`` leaves out ``robots`` (a much smaller file)."""
+    rows = [match_row(m, timelines.get(m.match_key), paths)
+            for m in sorted(matches, key=match_order)]
+    out = {"schema": EXPORT_SCHEMA, "schema_version": EXPORT_SCHEMA_VERSION,
+           "event_key": event_key, "year": int(year),
+           "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if paths:
+        out["path_frame"] = path_frame(year)
+    out.update({"matches": rows, "skipped": list(skipped), "envelopes": envelopes})
+    return out
+
+
+_LEVEL_ORDER = {"qm": 0, "ef": 1, "qf": 2, "sf": 3, "f": 4}
+
+
+def match_order(m) -> tuple:
+    return (_LEVEL_ORDER.get(m.comp_level, 9), m.set_number, m.match_number)
+
+
+def match_row(m, timeline: Optional[dict], paths: bool = True) -> dict:
+    """One ``matches[]`` entry: TBA identity + lineup, video timeline and
+    (``paths``) every robot's whole-match path."""
+    row = m.source_ref()
+    row["alliances"] = {a: list(m.alliances.get(a) or [None] * 3) for a in ("red", "blue")}
+    row["timeline"] = timeline
+    if paths:
+        row["robots_version"] = ROBOTS_VERSION
+        row["auto_s"] = _auto_s(m)
+        row["robots"] = match_robots(m)
+    return row
+
+
+# ----------------------------------------------------------------- robot paths
+# Each robot's position over the WHOLE match, for apps that want the raw path
+# rather than our aggregates. Documented in docs/scouting-export/README.md
+# ("Robot paths"); bump ROBOTS_VERSION on a breaking change to ``robots``.
+ROBOTS_VERSION = 1
+PATH_GAP_S = 1.0     # consecutive points further apart than this start a new segment
+# ...and so does a step faster than any FRC robot drives (~5.5 m/s top speed):
+# that is the label hopping to another robot or a bad position, not motion.
+PATH_MAX_SPEED_MPS = 7.0
+
+
+def path_frame(year: int) -> dict:
+    """The coordinate frame of ``robots[].path`` (absolute, NOT the metrics'
+    alliance perspective)."""
+    from web.scouting.geometry import field_dims
+    return {"units": "m", "field_m": list(field_dims(year)), "perspective": "absolute",
+            "note": ("WPILib field coordinates: origin at the blue alliance wall's right "
+                     "corner (as seen from the blue driver station), +x toward the red "
+                     "wall, +y to the left; the same for red and blue robots")}
+
+
+def _auto_s(m) -> float:
+    from web.scouting.clock import MatchClock
+    from web.scouting.timeline import PERIOD_S
+    auto = MatchClock(m.periods).auto_len if m.periods else 0.0
+    return float(auto or PERIOD_S.get(int(m.year), {}).get("auto", 15))
+
+
+def _robot_points(tm) -> list:
+    """(t_match, x, y, frame) sorted by time, one per frame: the pipeline's
+    slot-continuous auto path for auto when there is one, labelled frames
+    otherwise."""
+    use_auto_path = tm.auto_source == "autonomous_paths" and tm.auto_path
+    pts = list(tm.auto_path) if use_auto_path else []
+    pts += [s for s in tm.samples if not (use_auto_path and s.period == "auto")]
+    pts.sort(key=lambda s: (s.t_match, s.frame_num))
+    out, seen = [], set()
+    for s in pts:
+        if s.frame_num in seen:            # two auto pieces overlapping by < 0.4 s
+            continue
+        seen.add(s.frame_num)
+        out.append((float(s.t_match), float(s.x), float(s.y), int(s.frame_num)))
+    return out
+
+
+def robot_path(tm, match_period_s: float) -> dict:
+    """One robot's whole-match path as columnar arrays + quality summary."""
+    pts = _robot_points(tm) if tm is not None else []
+    segments, start, jumps = [], 0, 0
+    for i in range(1, len(pts) + 1):
+        if i < len(pts):
+            dt = pts[i][0] - pts[i - 1][0]
+            jump = math.dist(pts[i][1:3], pts[i - 1][1:3]) > PATH_MAX_SPEED_MPS * max(dt, 1e-6)
+            if dt <= PATH_GAP_S and not jump:
+                continue
+            jumps += jump and dt <= PATH_GAP_S
+        segments.append([start, i - 1])
+        start = i
+    samples = tm.samples if tm is not None else []
+    seen = {"auto": 0.0, "teleop": 0.0}
+    for s in samples:
+        seen[s.period] = seen.get(s.period, 0.0) + s.dt
+    if tm is not None and tm.auto_source == "autonomous_paths" and tm.auto_path:
+        ts = sorted({round(s.t_match, 3) for s in tm.auto_path})
+        seen["auto"] = sum(min(b - a, match_period_s) for a, b in zip(ts, ts[1:])) + (
+            match_period_s if ts else 0.0)
+    n_conf = sum(1 for s in samples if s.confirmed)
+    return {
+        "n_points": len(pts),
+        "seen_s": {k: round(v, 1) for k, v in seen.items()},
+        "first_t": round(pts[0][0], 2) if pts else None,
+        "last_t": round(pts[-1][0], 2) if pts else None,
+        "auto_source": tm.auto_source if tm is not None else None,
+        "auto_label_share": tm.auto_label_share if tm is not None else None,
+        "confirmed_share": round(n_conf / len(samples), 3) if samples else None,
+        "segments": segments,
+        "n_jumps": int(jumps),
+        "t": [round(p[0], 2) for p in pts],
+        "x": [round(p[1], 2) for p in pts],
+        "y": [round(p[2], 2) for p in pts],
+        "frame": [p[3] for p in pts],
+    }
+
+
+def match_robots(m) -> list:
+    """Every robot of the match, lineup order (red 1-3, blue 1-3), then any
+    labelled team the lineup does not list (lineup unknown). A lineup robot we
+    never identified still gets an entry with an empty path."""
+    out, done = [], set()
+    period = float(m.frame_period_s or 0.2)
+    for alliance in ("red", "blue"):
+        for i, team in enumerate(m.alliances.get(alliance) or []):
+            if team is None or int(team) in done:
+                continue
+            team = int(team)
+            done.add(team)
+            out.append({"team_number": team, "alliance": alliance,
+                        "alliance_position": i + 1,
+                        "path": robot_path(m.teams.get(team), period)})
+    for team in sorted(t for t in m.teams if int(t) not in done):
+        tm = m.teams[team]
+        out.append({"team_number": int(team), "alliance": tm.alliance,
+                    "alliance_position": tm.station, "path": robot_path(tm, period)})
+    return out
 
 
 def filter_team(env: dict, team) -> dict:

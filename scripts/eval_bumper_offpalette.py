@@ -64,6 +64,12 @@ DEFAULT_MATCHES = {
 
 GROUPS = ("teal", "royal blue", "navy", "red")
 GROUP_COLOUR = {"teal": "blue", "royal blue": "blue", "navy": "blue", "red": "red"}
+# Masks no colour group claims (tiny, or washed-out venue colour — most cabl
+# robots fail the strict royal/red saturation gates). Detection rate is still a
+# label-free regression signal; colour is not scored (expected None).
+UNCLASSIFIED = "unclassified"
+REPORT_GROUPS = GROUPS + (UNCLASSIFIED,)
+GROUP_COLOUR[UNCLASSIFIED] = None
 CACHE_ARM = "cache"          # pseudo-arm: the x-ray cache's own "bumpers" field
 DET_CACHE_VERSION = 1
 
@@ -400,7 +406,7 @@ def summarise(samples, arm, expected):
 
 
 def group_expected(s):
-    return GROUP_COLOUR[s.group]
+    return GROUP_COLOUR[s.group or UNCLASSIFIED]
 
 
 def alliance_expected(s):
@@ -456,30 +462,30 @@ def build_report(a, arms, matches, samples, boxes, prod_arm):
 
     by_mg = defaultdict(list)       # (match|"pooled", group) -> samples
     for s in samples:
-        if s.group:
-            by_mg[(s.match, s.group)].append(s)
-            by_mg[("pooled", s.group)].append(s)
+        g = s.group or UNCLASSIFIED
+        by_mg[(s.match, g)].append(s)
+        by_mg[("pooled", g)].append(s)
     for name in names:
         res["groups"][name] = {m: {g: summarise(by_mg.get((m, g), []), name, group_expected)
-                                   for g in GROUPS} for m in list(matches) + ["pooled"]}
+                                   for g in REPORT_GROUPS} for m in list(matches) + ["pooled"]}
 
     # Pooled tables, one per colour group (rows = arm).
     md.append(f"### Bumper detection by colour group, pooled over {len(matches)} matches")
     md.append(f"conf ≥ {a.conf:g}, stride {a.stride}; colour ok = matched box has the "
               f"group's expected colour (teal/royal/navy → blue, red → red).")
-    for g in GROUPS:
+    for g in REPORT_GROUPS:
         rows = [[name] + stat_cells(res["groups"][name]["pooled"][g]) for name in names]
         if has_delta:
             rows.append(["Δ after − before"] + delta_cells(res["groups"]["before"]["pooled"][g],
                                                            res["groups"]["after"]["pooled"][g]))
-        md.append(f"\n#### {g} (expected {GROUP_COLOUR[g]})\n")
+        md.append(f"\n#### {g} (expected {GROUP_COLOUR[g] or 'colour not scored'})\n")
         md.append(md_table(["arm"] + STAT_HEADERS, rows))
 
     # Per-match tables (rows = group x arm).
     md.append("\n### Per match")
     for m in matches:
         rows = []
-        for g in GROUPS:
+        for g in REPORT_GROUPS:
             for name in names:
                 rows.append([g, name] + stat_cells(res["groups"][name][m][g]))
             if has_delta:

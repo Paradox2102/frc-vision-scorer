@@ -51,7 +51,8 @@ import numpy as np
 
 # Data, weights and videos live in the main checkout (a worktree may only hold
 # LFS pointers); every relative data path below is resolved against this root.
-REPO_DATA = Path("/home/nick/AI/frc-vision-scorer")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from web.students.paths import MAIN as REPO_DATA  # noqa: E402
 PROD_WEIGHTS_REL = "runs/train/frc_bumpers_equipment_hardneg/weights/best.pt"
 DEFAULT_OUT_REL = "data/eval/bumper_offpalette"
 

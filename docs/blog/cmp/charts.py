@@ -1,7 +1,7 @@
 """Blog charts: our 2026cur vision-scouting metrics vs Manta (3128 human scouting) and
 Statbotics EPA (or TBA component OPR if the Statbotics API is unavailable).
 Inputs: data/teams.json (build.py), data/statbotics_team_events_2026cur.json or data/tba_opr_2026cur.json.
-Outputs: /home/nick/AI/frc-vision-scorer/docs/blog/img/cmp_*.png (1380 px wide)."""
+Outputs: docs/blog/img/cmp_*.png (1380 px wide)."""
 import json, os, sys, textwrap
 import numpy as np
 import matplotlib
@@ -12,7 +12,7 @@ from scipy.stats import spearmanr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 D = os.path.join(HERE, "data")
-OUT = "/home/nick/AI/frc-vision-scorer/docs/blog/img"
+OUT = os.path.abspath(os.path.join(HERE, "..", "img"))
 
 # ---- blog look (docs/blog/diagrams/style.css) + dataviz-validated series colours
 BG, TEXT, DIM, MUTED = "#0d1220", "#e8ecf5", "#9aa5c0", "#6f7a96"

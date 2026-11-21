@@ -1,6 +1,6 @@
 {
  "config": {
-  "root": "/home/nick/AI/frc-vision-scorer",
+  "root": ".",
   "stride": 3,
   "max_frames": null,
   "conf": 0.35,
@@ -11,8 +11,8 @@
    "498"
   ],
   "arms": {
-   "before": "/home/nick/AI/frc-vision-scorer/runs/train/frc_bumpers_equipment_hardneg/weights/best.pt",
-   "after": "/home/nick/AI/frc-vision-scorer/.claude/worktrees/practical-nightingale-8a8288/runs/train/frc_bumpers_offpalette_v1/weights/best.pt"
+   "before": "runs/train/frc_bumpers_equipment_hardneg/weights/best.pt",
+   "after": "runs/train/frc_bumpers_offpalette_v1/weights/best.pt"
   },
   "matches": [
    "2026cabl_qm5",
@@ -20,7 +20,7 @@
    "2026cur_qm103",
    "2026cur_qm112"
   ],
-  "production_weights": "/home/nick/AI/frc-vision-scorer/runs/train/frc_bumpers_equipment_hardneg/weights/best.pt"
+  "production_weights": "runs/train/frc_bumpers_equipment_hardneg/weights/best.pt"
  },
  "frames": {
   "2026cabl_qm5": 841,

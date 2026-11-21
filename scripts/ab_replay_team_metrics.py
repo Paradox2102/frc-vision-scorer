@@ -24,9 +24,13 @@ import json
 import sqlite3
 import statistics
 from collections import defaultdict
+import sys
 from pathlib import Path
 
-ROOT = Path("/home/nick/AI/frc-vision-scorer")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from web.students.paths import MAIN  # noqa: E402  (main checkout, even from a worktree)
+
+ROOT = MAIN
 
 
 _ROSTERS: dict = {}

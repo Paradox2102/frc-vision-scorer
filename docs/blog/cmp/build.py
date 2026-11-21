@@ -8,7 +8,7 @@ from scipy.stats import spearmanr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 D = os.path.join(HERE, "data")
-REPO = "/home/nick/AI/frc-vision-scorer"
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 EV = "2026cur"
 SPEED = re.compile(
     r"\b(?P<a>very |really |rlly |kinda |decently |pretty )?(?P<w>fast|slow|average)\s+(?:speed\s+)?(?:dt|drivetrain|drive ?train|drivetrian|bot|robot|speed)\b"

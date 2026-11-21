@@ -152,3 +152,37 @@ The colour read logged `blue_hue_min=85, blue_sat_min=60, blue_val_min=25`.
 - The HSV-knob fix is the main win and should ship first.
 - The new weights add firmer focus-team naming on top, but only alongside the HSV knobs. Never ship them with the default strict thresholds.
 - Before making the weights default: run a second combined and hsv_wide run on these matches to measure noise, plus a standard-palette match to check for regressions.
+
+## Repeats + standard-palette regression (Nov 20, late)
+
+Each arm got a second run on the same :8014 setup. `combined_r2` used the new weights with the widened HSV knobs. `hsvwide_r2` used the production weights with the widened HSV knobs. Both arms also ran on 2026cur_qm8, which has standard bumpers and hand-labelled ground truth. All 10 jobs exited rc=0. Full tables are in `ab_repeats.md` / `ab_repeats.json`.
+
+| arm | replays (cabl qm5, qm12, cur qm103, qm112) | focus cov | focus share | focus wrong-al | other cov | other share |
+|---|---|---:|---:|---:|---:|---:|
+| before | 525ed57e 2dcf7631 1173562e 07f2b816 | 50.3% | 0.28 | 27.9% | 64.2% | 0.54 |
+| hsvwide_r1 | 765906e3 1a224b1a 38f1cdc6 c27bcb80 | 53.9% | 0.48 | 1.8% | 65.7% | 0.54 |
+| hsvwide_r2 | 30e6bbee 80b4a2eb 6f2f0db8 9eede4e7 | 52.3% | 0.43 | 1.1% | 65.5% | 0.53 |
+| combined_r1 | a20f1b8b 8e901296 27f4624b 9c15a07a | 53.1% | 0.65 | 1.6% | 66.2% | 0.50 |
+| combined_r2 | 5b1cfd9b 60d3001e f9d72a47 22460399 | 49.8% | 0.65 | 1.5% | 67.0% | 0.50 |
+
+**Noise:** run-to-run spread is small, about 2–3 pp on coverage and ≤ 0.05 on share. The arm differences below therefore hold up.
+- **Firmer focus naming with combined, but uneven.** Focus share is 0.65 in both combined runs versus 0.43–0.48 for hsvwide. Most of the gain is 6800 on cur_qm103 (0.87–0.91 vs 0.40–0.48) and 4322 on cabl_qm12 (0.70 vs 0.48–0.60). Part of it is a degenerate cell: 4322 on cabl_qm5 gets share 1.00 at ≤ 1% coverage. Leave that cell out and focus share is about 0.56 (combined) vs 0.48 (hsvwide).
+- **498 on cabl_qm5 gets worse with combined, and replicably.** No slot ends up named 498 (share 0.00 in both runs, vs 0.42 for hsvwide), and coverage is 42–57% vs 55–60%.
+- **The "other share" dip with combined is real, not noise.** It is 0.50 in both runs vs 0.53–0.54. Per team it is mixed: 1197, 2724 and 302 lose share, while 59 and 1684 gain. Other-team coverage is flat to slightly up (66–67% vs 65.5%).
+- **Wrong-alliance:** both HSV arms stay at 1–2%, against 28% before.
+
+### 2026cur_qm8 regression (standard palette, GT, `score_replay(score_shift_m=0.475)`)
+
+| arm | replay | cov | err m | label ok | wrong | label on wrong robot | misID s (cross) | wrong-colour slot | lost s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| default ×3 | 485037fd bc3961f2 9b8bbb8f | 84.9% | 0.36 | 68.7–69.9% | 0.9% | 5.8–6.1% | 7.25 (3.00) | 4.5% | 117.2 |
+| hsvwide_r2 | b76197c7 | 84.3% | 0.36 | 68.2% | 1.3% | 7.8% | 9.75 (4.25) | 6.8% | 121.8 |
+| combined_r2 | fbc24932 | 85.0% | 0.35 | 68.8% | 1.1% | 6.6% | 8.50 (5.50) | 7.9% | 117.0 |
+
+The three default runs produce identical tracking, and only the label stage varies. Both HSV arms show a small rise in cross-colour error on standard bumpers: misID +1.3 to +2.5 s, wrong-colour slot 4.5% → 6.8–7.9%. Both arms share the widened knobs, so the widened blue gate is the likely cause, not the weights. It is within the known ±4 s qm8 misID noise for single runs, so it needs watching rather than blocking. The new weights themselves cause no regression on qm8: combined is no worse than hsvwide, and matches default on coverage and label-correct.
+
+### Updated verdict
+
+1. **Ship the widened HSV knobs** (already the other session's patch). This is the big win: focus wrong-alliance falls from 28% to 1–2% and replicates. Before flipping the default, watch the small cross-colour rise on standard-palette matches with 1–2 more GT matches, e.g. qm11 or qm22.
+2. **These weights are optional, on top of the HSV knobs only.** They replicably name 6800 and 4322 more firmly and do not regress qm8. However, they lose the 498 slot name on cabl_qm5 and shift naming among other teams, so they are a net positive but not a clear one. Do not make them default yet. The next step would be a GT-labelled off-palette match, which would turn "share" into right/wrong.
+3. **4322 on cabl_qm5 stays unlabelled in every arm.** That is a reader/lineup problem, not detection.

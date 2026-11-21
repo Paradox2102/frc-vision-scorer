@@ -1,0 +1,62 @@
+[
+ {
+  "match": "2026hop_qm45",
+  "arm": "default",
+  "id": "64a3c86d",
+  "cov": 0.8613,
+  "err": 0.372,
+  "ok": 0.6784,
+  "wrong": 0.0204,
+  "unl": 0.1668,
+  "far": 0.0586,
+  "misid": 17.5,
+  "cross": 1.5,
+  "wcol": 0.0256,
+  "lost": 115.5
+ },
+ {
+  "match": "2026hop_qm45",
+  "arm": "hsvwide",
+  "id": "6ea76e96",
+  "cov": 0.8429,
+  "err": 0.374,
+  "ok": 0.6112,
+  "wrong": 0.0114,
+  "unl": 0.2224,
+  "far": 0.051,
+  "misid": 9.75,
+  "cross": 1.5,
+  "wcol": 0.0386,
+  "lost": 133.25
+ },
+ {
+  "match": "2026casnd_qm14",
+  "arm": "default",
+  "id": "96341ea8",
+  "cov": 0.9356,
+  "err": 0.375,
+  "ok": 0.8894,
+  "wrong": 0.0,
+  "unl": 0.0471,
+  "far": 0.0165,
+  "misid": 0.0,
+  "cross": 0.0,
+  "wcol": 0.0,
+  "lost": 53.0
+ },
+ {
+  "match": "2026casnd_qm14",
+  "arm": "hsvwide",
+  "id": "29ba9b97",
+  "cov": 0.9585,
+  "err": 0.375,
+  "ok": 0.9032,
+  "wrong": 0.0,
+  "unl": 0.0558,
+  "far": 0.0181,
+  "misid": 0.0,
+  "cross": 0.0,
+  "wcol": 0.0,
+  "lost": 34.25
+ }
+]

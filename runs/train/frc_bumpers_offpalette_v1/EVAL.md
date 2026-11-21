@@ -186,3 +186,23 @@ The three default runs produce identical tracking, and only the label stage vari
 1. **Ship the widened HSV knobs** (already the other session's patch). This is the big win: focus wrong-alliance falls from 28% to 1–2% and replicates. Before flipping the default, watch the small cross-colour rise on standard-palette matches with 1–2 more GT matches, e.g. qm11 or qm22.
 2. **These weights are optional, on top of the HSV knobs only.** They replicably name 6800 and 4322 more firmly and do not regress qm8. However, they lose the 498 slot name on cabl_qm5 and shift naming among other teams, so they are a net positive but not a clear one. Do not make them default yet. The next step would be a GT-labelled off-palette match, which would turn "share" into right/wrong.
 3. **4322 on cabl_qm5 stays unlabelled in every arm.** That is a reader/lineup problem, not detection.
+
+### Widened-HSV GT check on all three 2026 GT matches (Nov 20, 22:22–23:20)
+
+Default vs `hsv_wide` (production weights; only the three blue HSV knobs differ), fresh runs on the :8014 copy of main-server. Today's hop_qm45 replays belong to the corner-gate A/B and can't be pinned to a code version, so they weren't reused. The cur_qm8 rows are repeated from the section above. Scored with `score_replay(score_shift_m=0.475)`; raw numbers in `gt_qm8.json` / `gt_hop_casnd.json`.
+
+| match | arm | replay | cov | label ok | wrong | unlabelled | label on wrong robot | misID s (cross) | wrong-colour slot | lost s |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| cur_qm8 | default ×3 | 485037fd… | 84.9% | 69.3% | 0.9% | 14.5% | 6.0% | 7.25 (3.00) | 4.5% | 117.2 |
+| cur_qm8 | hsv_wide | b76197c7 | 84.3% | 68.2% | 1.3% | 14.8% | 7.8% | 9.75 (4.25) | 6.8% | 121.8 |
+| hop_qm45 | default | 64a3c86d | 86.1% | 67.8% | 2.0% | 16.7% | 5.9% | 17.50 (1.50) | 2.6% | 115.5 |
+| hop_qm45 | hsv_wide | 6ea76e96 | 84.3% | 61.1% | 1.1% | 22.2% | 5.1% | 9.75 (1.50) | 3.9% | 133.2 |
+| casnd_qm14 | default | 96341ea8 | 93.6% | 88.9% | 0.0% | 4.7% | 1.7% | 0.00 | 0.0% | 53.0 |
+| casnd_qm14 | hsv_wide | 29ba9b97 | 95.9% | 90.3% | 0.0% | 5.6% | 1.8% | 0.00 | 0.0% | 34.2 |
+
+- **Wrong-colour slot rate** rises a little on 2 of 3 matches: +2.3 pp on cur_qm8, +1.3 pp on hop_qm45, flat at 0 on casnd_qm14. That is the one consistent sign that the wider blue gate lets some non-blue pixels through on standard bumpers.
+- **Cross-colour misID** is +1.25 s on cur_qm8 and flat elsewhere. Total misID is mixed: up 2.5 s on cur_qm8, down 7.75 s on hop_qm45 (same-alliance), and 0 on casnd_qm14.
+- **hop_qm45 labels-correct falls 6.7 pp.** That is unlabelled time rising (+5.5 pp), not wrong labels, which fall (2.0 → 1.1%). Lost time also rises 18 s there, but casnd_qm14 improves on coverage, labels and lost time (−19 s).
+- **These are single runs.** hop/casnd determinism is untested, and qm8 misID noise is about ±4 s.
+
+**Verdict on the HSV knobs:** no systematic regression on standard bumpers. The cost is a small, repeatable wrong-colour-slot rise of 1–2 pp on two venues, set against the off-palette win: focus wrong-alliance 28% → 1–2%, replicated. Flipping the three knobs to default is reasonable. A safer variant is to apply the wider gate only per event, for events with off-palette teams. The weights verdict is unchanged: optional, HSV-knobs-only, not default.

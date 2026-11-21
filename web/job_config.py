@@ -1426,6 +1426,31 @@ KNOBS = [
     # alliance_by_territory=False — strict leaves more inputs colourless).
     Knob("bumper_color_read", "BUMPER_COLOR_READ", str, "strict",
          choices=("off", "override", "strict"), section="Fusion & field position"),
+    # HSV windows of the bumper colour read (OpenCV H 0-179). Blue widened to
+    # the default Nov 20 2026 (was hue_min 100 / sat_min 110 / val_min 50):
+    # off-palette bumpers -- 2026cabl 4322 teal H 95-96 / S 78-86, 2026cur
+    # 6800 dark navy V 17-43 -- never read blue, so strict mode put them on
+    # wrong-alliance slots (focus teams 28% wrong-alliance -> 1-2%, replicated;
+    # 3 GT matches: no systematic regression, wrong-colour slot +1-2 pp on 2).
+    # Red unchanged: widening it to H<12 made 4322's orange plates read red,
+    # and 2026 fuel balls sit at H 13-27, so keep red_hue_max <= 12.
+    # Evidence: runs/train/frc_bumpers_offpalette_v1/EVAL.md.
+    Knob("bumper_color_red_hue_max", "BUMPER_COLOR_RED_HUE_MAX", int, 8,
+         min=1, max=20, section="Fusion & field position"),
+    Knob("bumper_color_red_sat_min", "BUMPER_COLOR_RED_SAT_MIN", int, 110,
+         min=0, max=255, section="Fusion & field position"),
+    Knob("bumper_color_blue_hue_min", "BUMPER_COLOR_BLUE_HUE_MIN", int, 85,
+         min=70, max=120, section="Fusion & field position"),
+    Knob("bumper_color_blue_sat_min", "BUMPER_COLOR_BLUE_SAT_MIN", int, 60,
+         min=0, max=255, section="Fusion & field position"),
+    # Brightness floors. Dark navy (2026cur 6800: V 17-43) fails blue V > 50:
+    # blue_val_min 25 (with blue_sat_min 60; default since Nov 20) on 4 matches' crops took 6800 on
+    # blue 4 -> 27 of 32 right, 498 navy 4 -> 28 of 60, 1 new wrong of ~1260.
+    # red_val_min 40 gained little and added wrong reads on navy -> keep 70.
+    Knob("bumper_color_red_val_min", "BUMPER_COLOR_RED_VAL_MIN", int, 70,
+         min=0, max=255, section="Fusion & field position"),
+    Knob("bumper_color_blue_val_min", "BUMPER_COLOR_BLUE_VAL_MIN", int, 25,
+         min=0, max=255, section="Fusion & field position"),
     # Scope of the too-large image-fraction backstop in detect_bridge.
     # "always" (legacy): drop any box spanning >50% of the frame in either
     # dimension. "uncalibrated": apply only when the pose-based width checks

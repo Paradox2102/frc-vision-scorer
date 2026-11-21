@@ -3227,6 +3227,12 @@ class InferenceJob:
         mode = getattr(cfg, "bumper_color_read", "off") if cfg is not None else "off"
         return mode if mode in ("override", "strict") else "off"
 
+    def _bumper_colour_thresholds(self):
+        """HSV windows for the read (job knobs bumper_color_*; blue window
+        widened by default for teal / dark-navy bumpers, Nov 20 2026)."""
+        from web.field.bumper_colour import thresholds_from_config
+        return thresholds_from_config(getattr(self, "config", None))
+
     def _bumper_colour_main_view(self):
         return next((v for v in (getattr(self, "views", None) or [])
                      if v.name == "main"), None)
@@ -3256,7 +3262,7 @@ class InferenceJob:
                     frames.append(im[y:y + h, x:x + w].copy())
         finally:
             cap_bg.release()
-        mask = build_background(frames)
+        mask = build_background(frames, self._bumper_colour_thresholds())
         return mask, len(frames), time.perf_counter() - t0
 
     async def _setup_bumper_colour_read(self) -> None:
@@ -3293,7 +3299,8 @@ class InferenceJob:
         self._bc_bg = mask
         self._bc_ready = True
         print(f"  [bumper-colour] mode={mode}: background from {n} frames in "
-              f"{secs:.1f}s ({int(mask.sum())} static red/blue px masked)")
+              f"{secs:.1f}s ({int(mask.sum())} static red/blue px masked) "
+              f"hsv={self._bumper_colour_thresholds()}")
 
     def _apply_bumper_colour_read(self, detections, composite_frame,
                                   early: bool = False) -> None:
@@ -3315,7 +3322,8 @@ class InferenceJob:
         stats = self._bc_stats
         n_before = stats.c["reads"]
         apply_bumper_colour(self._bumper_colour_mode(), detections, main_bgr,
-                            view.calibration, self._bc_bg, offset, stats=stats)
+                            view.calibration, self._bc_bg, offset, stats=stats,
+                            th=self._bumper_colour_thresholds())
         if early:
             stats.c["early_reads"] += stats.c["reads"] - n_before
 

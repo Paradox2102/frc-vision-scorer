@@ -24,6 +24,8 @@ prototype showed per-SAM-track colour memory is harmful (tracks swap robots).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 
@@ -45,18 +47,55 @@ MIN_PIXELS = 15
 _MAX_ABS_PX = 1e5
 
 
-def colour_masks(hsv: np.ndarray):
+@dataclass(frozen=True)
+class HsvThresholds:
+    """OpenCV HSV (H 0-179) windows, set by the job knobs
+    bumper_color_{red,blue}_{hue,sat,val}_{min,max}. The blue window was widened
+    to the default on Nov 20 2026 for off-palette bumpers: 2026cabl 4322 teal
+    = H 95-96 / S 78-86 and 2026cur 6800 dark navy = H 112-120 / S 64-155 /
+    V 17-43 never read blue at the original fixed window (H > 100, S > 110,
+    V > 50 -- still the LEGACY_THRESHOLDS below). Red is unchanged: fuel balls
+    sit at H 13-27, so red_hue_max must stay <= 12, and a wider red read 4322's
+    orange plates as red. Full-match A/B + 3-match GT check in
+    runs/train/frc_bumpers_offpalette_v1/EVAL.md."""
+    red_hue_max: int = 8        # red: H < red_hue_max or H > 170
+    red_sat_min: int = 110
+    blue_hue_min: int = 85      # blue: blue_hue_min < H < 128 (was 100)
+    blue_sat_min: int = 60      # was 110
+    red_val_min: int = 70
+    blue_val_min: int = 25      # was 50; the sat floor keeps black parts / shadows out
+
+
+DEFAULT_THRESHOLDS = HsvThresholds()
+# Pre-Nov-20-2026 fixed windows (standard FIRST red / royal blue only).
+LEGACY_THRESHOLDS = HsvThresholds(blue_hue_min=100, blue_sat_min=110, blue_val_min=50)
+
+
+def thresholds_from_config(cfg) -> HsvThresholds:
+    """HsvThresholds from a JobConfig-like object (missing knobs -> defaults)."""
+    d = DEFAULT_THRESHOLDS
+    return HsvThresholds(
+        red_hue_max=int(getattr(cfg, "bumper_color_red_hue_max", d.red_hue_max)),
+        red_sat_min=int(getattr(cfg, "bumper_color_red_sat_min", d.red_sat_min)),
+        blue_hue_min=int(getattr(cfg, "bumper_color_blue_hue_min", d.blue_hue_min)),
+        blue_sat_min=int(getattr(cfg, "bumper_color_blue_sat_min", d.blue_sat_min)),
+        red_val_min=int(getattr(cfg, "bumper_color_red_val_min", d.red_val_min)),
+        blue_val_min=int(getattr(cfg, "bumper_color_blue_val_min", d.blue_val_min)),
+    )
+
+
+def colour_masks(hsv: np.ndarray, th: HsvThresholds | None = None):
     """(red, blue) boolean masks for an HSV uint8 image (any leading shape)."""
+    th = th or DEFAULT_THRESHOLDS
     H = hsv[..., 0]
     S = hsv[..., 1]
     V = hsv[..., 2]
-    sat = S > 110
-    red = ((H < 8) | (H > 170)) & sat & (V > 70)
-    blue = (H > 100) & (H < 128) & sat & (V > 50)
+    red = ((H < th.red_hue_max) | (H > 170)) & (S > th.red_sat_min) & (V > th.red_val_min)
+    blue = (H > th.blue_hue_min) & (H < 128) & (S > th.blue_sat_min) & (V > th.blue_val_min)
     return red, blue
 
 
-def build_background(frames_bgr) -> np.ndarray | None:
+def build_background(frames_bgr, th: HsvThresholds | None = None) -> np.ndarray | None:
     """Static-colour mask from robot-free-ish main-view frames.
 
     ``frames_bgr``: iterable of equally-sized HxWx3 uint8 BGR frames (~40
@@ -76,7 +115,7 @@ def build_background(frames_bgr) -> np.ndarray | None:
     for y0 in range(0, shape[0], step):
         med[y0:y0 + step] = np.median(stack[:, y0:y0 + step], axis=0).astype(np.uint8)
     hsv = cv2.cvtColor(med, cv2.COLOR_BGR2HSV)
-    red, blue = colour_masks(hsv)
+    red, blue = colour_masks(hsv, th)
     return cv2.dilate((red | blue).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
 
 
@@ -118,7 +157,7 @@ def band_poly(cal, centre_xy, z0=BAND_Z0_M, z1=BAND_Z1_M, half=HALF_FOOTPRINT_M)
 
 
 def read_bumper_colour(main_bgr, cal, ground_pos, bg_mask=None,
-                       offset_m=DEFAULT_OFFSET_M):
+                       offset_m=DEFAULT_OFFSET_M, th: HsvThresholds | None = None):
     """Read one input's bumper colour from the main-view image.
 
     ``main_bgr``: the main view's HxWx3 BGR pixels (calibration coordinates).
@@ -154,7 +193,7 @@ def read_bumper_colour(main_bgr, cal, ground_pos, bg_mask=None,
     if n < MIN_PIXELS:
         return "unknown", 0.0, 0.0
     hsv = cv2.cvtColor(np.ascontiguousarray(main_bgr[y0:y1, x0:x1]), cv2.COLOR_BGR2HSV)
-    red, blue = colour_masks(hsv[keep])
+    red, blue = colour_masks(hsv[keep], th)
     r = float(red.mean())
     b = float(blue.mean())
     if max(r, b) < MIN_FRAC or abs(r - b) < MIN_MARGIN:
@@ -176,7 +215,8 @@ class BumperColourStats:
 
 
 def apply_bumper_colour(mode, detections, main_bgr, cal, bg_mask, offset_m,
-                        stats: BumperColourStats | None = None):
+                        stats: BumperColourStats | None = None,
+                        th: HsvThresholds | None = None):
     """Apply the read to ``detections`` (FieldDetection-like, mutated IN PLACE
     so every holder of the object — fused observation, tracker input, frame
     evidence — sees the same colour).
@@ -191,7 +231,7 @@ def apply_bumper_colour(mode, detections, main_bgr, cal, bg_mask, offset_m,
     for d in detections:
         if getattr(d, "box", None) is None:
             continue
-        read, _r, _b = read_bumper_colour(main_bgr, cal, d.pos, bg_mask, offset_m)
+        read, _r, _b = read_bumper_colour(main_bgr, cal, d.pos, bg_mask, offset_m, th)
         pipe = d.color if d.color in ("red", "blue") else "unknown"
         if mode == "override":
             new = read if read != "unknown" else d.color

@@ -290,3 +290,52 @@ def test_app_override_wiring_and_ground_offset_remainder(monkeypatch):
     assert job.timings["bumper_colour.early_reads"] == 1
     assert job.timings["bumper_colour.flipped"] == 1
     assert job.timings["bumper_colour.bg_build"] == 0.5
+
+
+# --- HSV windows (blue widened to default Nov 20 2026) -----------------------
+
+TEAL = (150, 140, 40)    # BGR -> H 93, S 187: 2026cabl 4322-style teal
+
+
+def _hsv_px(bgr):
+    return cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)
+
+
+def test_hsv_knob_defaults_are_widened_blue_and_unchanged_red():
+    cfg = JobConfig()
+    assert (cfg.bumper_color_blue_hue_min, cfg.bumper_color_blue_sat_min,
+            cfg.bumper_color_blue_val_min) == (85, 60, 25)
+    assert (cfg.bumper_color_red_hue_max, cfg.bumper_color_red_sat_min,
+            cfg.bumper_color_red_val_min) == (8, 110, 70)
+    assert bc.thresholds_from_config(cfg) == bc.DEFAULT_THRESHOLDS
+    # a config without the knobs (old SimpleNamespace callers) gets the same
+    assert bc.thresholds_from_config(SimpleNamespace()) == bc.DEFAULT_THRESHOLDS
+    legacy = bc.thresholds_from_config(JobConfig({
+        "bumper_color_blue_hue_min": 100, "bumper_color_blue_sat_min": 110,
+        "bumper_color_blue_val_min": 50}))
+    assert legacy == bc.LEGACY_THRESHOLDS
+
+
+def test_teal_and_dark_navy_read_blue_only_with_widened_window():
+    teal = _hsv_px(TEAL)
+    navy = np.uint8([[[115, 120, 35]]])           # HSV: dark navy, V below 50
+    for px in (teal, navy):
+        _, blue = bc.colour_masks(px)
+        assert blue.all()
+        _, blue_legacy = bc.colour_masks(px, bc.LEGACY_THRESHOLDS)
+        assert not blue_legacy.any()
+    # royal blue / red still read the same under both windows
+    for th in (bc.DEFAULT_THRESHOLDS, bc.LEGACY_THRESHOLDS):
+        r, b = bc.colour_masks(_hsv_px(BLUE), th)
+        assert b.all() and not r.any()
+        r, b = bc.colour_masks(_hsv_px(RED), th)
+        assert r.all() and not b.any()
+    # near-black / grey stays neither colour
+    r, b = bc.colour_masks(np.uint8([[[115, 40, 20]], [[0, 0, 128]]]))
+    assert not r.any() and not b.any()
+
+
+def test_teal_robot_read_blue_end_to_end_at_defaults():
+    img = _robot_frame(TEAL)
+    assert bc.read_bumper_colour(img, CAL, POS)[0] == "blue"
+    assert bc.read_bumper_colour(img, CAL, POS, th=bc.LEGACY_THRESHOLDS)[0] == "unknown"

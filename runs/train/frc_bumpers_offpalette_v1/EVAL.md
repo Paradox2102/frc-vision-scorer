@@ -129,3 +129,26 @@ cleared. On the after-arm cabl_qm5 run, 1,392 of 7,537 colours were flipped and 
 flipped 184 and cleared 504. The extra detections therefore become colourless or wrong-colour tracks.
 
 **Verdict:** don't ship the model alone. The next test is the combined arm: new model plus the widened HSV knobs.
+
+### Combined arm: new model + widened HSV knobs (same :8014 setup)
+
+Replays: a20f1b8b (cabl qm5), 8e901296 (cabl qm12), 27f4624b (cur qm103), 9c15a07a (cur qm112).
+The colour read logged `blue_hue_min=85, blue_sat_min=60, blue_val_min=25`.
+
+| arm | focus-team label cov | focus slot share | focus wrong-alliance | other teams cov | other share |
+|---|---:|---:|---:|---:|---:|
+| before | 50.3% | 0.28 | 27.9% | 64.2% | 0.54 |
+| new model only | 41.9% | 0.16 | 34.4% | 65.2% | 0.52 |
+| hsv_wide only | 53.9% | 0.48 | 1.8% | 65.7% | 0.54 |
+| **combined** | 53.1% | **0.65** | **1.6%** | 66.2% | 0.50 |
+
+- **Wrong-alliance:** the combined arm undoes the model-only regression, matching hsv_wide.
+- **Slot naming:** combined names the focus teams' slots most firmly. 6800 on cur_qm103 reaches a 0.91 share (hsv_wide 0.48, before 0.22); 4322 on cabl_qm12 reaches 0.71 (hsv_wide 0.60).
+- **Coverage:** focus-team coverage ties hsv_wide (53% vs 54%).
+- **4322 on cabl_qm5** stays essentially unlabelled (≤ 9% cov) in every arm. Detection is no longer the bottleneck there; the reader/lineup path is the next place to look.
+- **Other teams:** the slot share dip (0.54 → 0.50) comes from single-run swings of individual slots (e.g. 302 on qm112 at 0.27, against 0.65–0.88 elsewhere). One run per arm can't separate that from noise.
+
+**Verdict:**
+- The HSV-knob fix is the main win and should ship first.
+- The new weights add firmer focus-team naming on top, but only alongside the HSV knobs. Never ship them with the default strict thresholds.
+- Before making the weights default: run a second combined and hsv_wide run on these matches to measure noise, plus a standard-palette match to check for regressions.

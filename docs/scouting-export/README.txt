@@ -27,7 +27,9 @@ whole-match path, which is more than half the file.
 For **one match**, `GET /api/scouting/{event_key}/match/{match_key}` returns
 that match's `matches[]` entry (lineup, video timeline, robot paths) wrapped
 in a small header; add `?team=N` for a single robot. See
-[Robot paths](#robot-paths).
+[Robot paths](#robot-paths). `scripts/export_scouting.py <event_key>
+--per-match` writes every match's file at once, to
+`data/exports/<event_key>_matches/<match_key>.json`.
 
 The reference file is `data/exports/2026cur_scouting_export.json`: 2026 Curie
 division, 136 analysed matches, 74 teams, 17.5 MB of compact JSON. The

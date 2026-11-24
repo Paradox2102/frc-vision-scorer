@@ -1,0 +1,72 @@
+{
+  "event": {
+    "key": "2026mantanos",
+    "name": "Manta Sim (truth cameras, 9066 listed but absent)",
+    "year": 2026,
+    "city": "Sim",
+    "state_prov": "",
+    "start_date": "2026-03-01",
+    "end_date": "2026-03-01"
+  },
+  "matches": [
+    {
+      "key": "2026mantanos_qm8",
+      "comp_level": "qm",
+      "set_number": 1,
+      "match_number": 8,
+      "alliances": {
+        "red": {
+          "team_keys": [
+            "frc6497",
+            "frc2724",
+            "frc2637"
+          ],
+          "score": 292
+        },
+        "blue": {
+          "team_keys": [
+            "frc3128",
+            "frc6773",
+            "frc9066"
+          ],
+          "score": 330
+        }
+      },
+      "videos": [],
+      "time": null,
+      "score_breakdown": null
+    }
+  ],
+  "teams": [
+    {
+      "key": "frc6497",
+      "team_number": 6497,
+      "nickname": "Team 6497"
+    },
+    {
+      "key": "frc2724",
+      "team_number": 2724,
+      "nickname": "Team 2724"
+    },
+    {
+      "key": "frc2637",
+      "team_number": 2637,
+      "nickname": "Team 2637"
+    },
+    {
+      "key": "frc3128",
+      "team_number": 3128,
+      "nickname": "Team 3128"
+    },
+    {
+      "key": "frc6773",
+      "team_number": 6773,
+      "nickname": "Team 6773"
+    },
+    {
+      "key": "frc9066",
+      "team_number": 9066,
+      "nickname": "Team 9066"
+    }
+  ]
+}

@@ -334,6 +334,74 @@ def test_videos_upload_one_at_a_time(on, tmp_path, monkeypatch):
         f"gdrive:2026cur/videos/2026cur_qm{i}.mp4" for i in range(3)]
 
 
+# ----------------------------------------------------------------- knob-driven render hook
+def _replay(tmp_path, knobs, *, status="complete", meta=None):
+    d = tmp_path / "r-imp"
+    d.mkdir(exist_ok=True)
+    (d / "hud.mp4").write_bytes(b"\x00" * 10)
+    (d / "meta.json").write_text(meta if meta is not None else json.dumps(
+        {"summary": {"config": knobs}, "frames": []}))
+    return {"id": "r-imp", "event_key": EV, "match_key": "2026cur_qm9", "status": status,
+            "meta_path": str(d / "meta.json"), "video_path": str(d / "hud.mp4")}
+
+
+def test_replay_knobs_tolerant(tmp_path):
+    row = _replay(tmp_path, {"gdrive_upload": True, "sam3_track_fps": 8})
+    assert gd.replay_knobs(row["meta_path"]) == {"gdrive_upload": True, "sam3_track_fps": 8}
+    assert gd.replay_knobs(None) == {} and gd.replay_knobs(tmp_path / "nope.json") == {}
+    for bad in ("not json", "[1, 2]", '{"summary": null}', '{"summary": {"config": [1]}}'):
+        (tmp_path / "bad.json").write_text(bad)
+        assert gd.replay_knobs(tmp_path / "bad.json") == {}, bad
+
+
+def test_unregistered_render_uploads_video_when_knobs_ask(on, tmp_path, capsys):
+    row = _replay(tmp_path, {"gdrive_upload": True, "gdrive_upload_video": True})
+    assert gd.on_render_done("r-imp", "rendered", row["video_path"], row) is True
+    _wait_idle()
+    (args, timeout, _), = on.calls
+    assert args == ["copyto", row["video_path"], "gdrive:2026cur/videos/2026cur_qm9.mp4"]
+    assert "knobs ask for its video" in capsys.readouterr().out
+
+
+def test_unregistered_render_falls_back_to_row_video_path(on, tmp_path):
+    row = _replay(tmp_path, {"gdrive_upload": True, "gdrive_upload_video": True})
+    assert gd.on_render_done("r-imp", "rendered", None, row) is True
+    _wait_idle()
+    assert on.remotes() == ["gdrive:2026cur/videos/2026cur_qm9.mp4"]
+
+
+@pytest.mark.parametrize("knobs,status,kw", [
+    ({"gdrive_upload": True}, "rendered", {}),                                   # video knob off
+    ({"gdrive_upload_video": True}, "rendered", {}),                             # upload knob off
+    ({}, "rendered", {}),
+    ({"gdrive_upload": True, "gdrive_upload_video": True}, "render_failed", {}),
+    ({"gdrive_upload": True, "gdrive_upload_video": True}, "rendered", {"meta": "{broken"}),
+    ({"gdrive_upload": True, "gdrive_upload_video": True}, "rendered", {"status": "partial"}),
+])
+def test_unregistered_render_skips_unless_knobs_and_render_ok(on, tmp_path, knobs, status, kw):
+    row = _replay(tmp_path, knobs, **kw)
+    assert gd.on_render_done("r-imp", status, row["video_path"], row) is False
+    _wait_idle()
+    assert on.calls == []
+
+
+def test_unregistered_render_without_row_or_keys_is_noop(on, tmp_path):
+    row = _replay(tmp_path, {"gdrive_upload": True, "gdrive_upload_video": True})
+    assert gd.on_render_done("r-imp", "rendered", row["video_path"]) is False
+    assert gd.on_render_done("r-imp", "rendered", row["video_path"], {**row, "match_key": None}) is False
+    _wait_idle()
+    assert on.calls == []
+
+
+def test_registered_render_wins_over_knobs(on, tmp_path):
+    """A job that registered its video is uploaded once, not again via its knobs."""
+    row = _replay(tmp_path, {"gdrive_upload": True, "gdrive_upload_video": True})
+    gd.expect_video_after_render("r-imp", EV, "2026cur_qm9")
+    assert gd.on_render_done("r-imp", "rendered", row["video_path"], row) is True
+    _wait_idle()
+    assert len(on.calls) == 1
+
+
 def test_video_failure_is_recorded_not_raised(on, tmp_path):
     v = tmp_path / "v.mp4"
     v.write_bytes(b"x")
@@ -421,6 +489,16 @@ def test_cli_dry_run_match_filter_and_video(env, cli, monkeypatch, capsys):
     assert "no readable meta.json" in capsys.readouterr().err
 
 
+def test_cli_dry_run_video_match_only_for_listed(env, cli, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_video_for", lambda md: (f"/x/{md.match_key}.mp4", ""))
+    assert cli.main([EV, "--dry-run", "--match", "2026cur_qm2", "--video-match", "2026cur_qm10"]) == 0
+    out = capsys.readouterr().out
+    assert "2026cur/2026cur_matches/2026cur_qm2.json" in out
+    assert "2026cur/2026cur_matches/2026cur_qm10.json" in out
+    assert "2026cur/videos/2026cur_qm10.mp4" in out and "videos/2026cur_qm2.mp4" not in out
+    assert "scouting_export" in out
+
+
 def test_cli_uploads_and_exit_code(on, cli, capsys):
     assert cli.main([EV, "--match", "2026cur_qm2"]) == 0
     assert on.remotes() == ["gdrive:2026cur/2026cur_matches/2026cur_qm2.json",
@@ -480,7 +558,9 @@ def test_render_done_hands_video_to_uploader(on, monkeypatch):
     seen = []
     monkeypatch.setattr(gd, "on_render_done", lambda *a: seen.append(a))
     app_mod._gdrive_render_done("job1", "rendered", "/r/hud.mp4")
-    assert seen == [("job1", "rendered", "/r/hud.mp4")]
+    row = {"id": "job1", "meta_path": "/r/meta.json"}
+    app_mod._gdrive_render_done("job1", "rendered", "/r/hud.mp4", row)
+    assert seen == [("job1", "rendered", "/r/hud.mp4", None), ("job1", "rendered", "/r/hud.mp4", row)]
     monkeypatch.setattr(gd, "on_render_done", lambda *a: 1 / 0)
     app_mod._gdrive_render_done("job1", "rendered", "/r/hud.mp4")      # never raises
 

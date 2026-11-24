@@ -11,7 +11,7 @@ deployment (same bundle, secrets, bootstrap), driven by the same detached
     swarm run       --name N [--config-json JSON] [--terminate-when-done]
     swarm status    --name N
     swarm pull      --name N [--with-video]
-    swarm import    --name N [--apply] [--render]
+    swarm import    --name N [--apply] [--render] [--gdrive] [--gdrive-video]
     swarm stop|terminate --name N [--force]
     swarm sweep evalset|plan|run|score|report ...   quality sweep (sweep.py)
     swarm live --name N --event EV [--rehearse] [--local]   live staggered dispatch (live.py)
@@ -1940,6 +1940,8 @@ def _cmd_run(args, sw: Swarm) -> int:
             warn_local_restart(args, restart_each)
             run = sw.data["run"] = new_run(plan, pods, cfg, policy=policy, pod_config=pod_cfg,
                                            restart_each=restart_each)
+            if not getattr(args, "local", False) and run_wants_gdrive(run):
+                print("NOTE: " + GDRIVE_REMOTE_NOTE.format(name=args.name))
             print(f"new run ({policy}{', restart before each job' if restart_each else ''}): "
                   f"{len(plan['items'])} item(s) on {len(pods)} member(s): "
                   + "; ".join(f"{p}: {len(q)}" for p, q in run["queues"].items())
@@ -1979,6 +1981,8 @@ def _cmd_run(args, sw: Swarm) -> int:
     else:
         print(f"next: {pull}swarm import --name {args.name}            (dry run)\n"
               f"      swarm import --name {args.name} --apply")
+        if run_wants_gdrive(run):
+            print("      (" + GDRIVE_REMOTE_NOTE.format(name=args.name) + ")")
     return 0 if c["failed"] == 0 and run_finished(run) else 1
 
 
@@ -2163,7 +2167,10 @@ def plan_import(sw: Swarm, *, local_db: Path, replays_dir: Path, pull_root: Path
                         new["source_video_path"] = str(Path(vid).resolve())
                     else:
                         e["notes"].append(f"source video not local (kept {row.get('source_video_path')})")
-                    if not (d / Path(new.get("video_path") or "hud.mp4").name).exists():
+                    e["event_key"] = row.get("event_key") or str(row.get("match_key") or "").split("_")[0] or None
+                    e["knobs"] = replay_knobs(d / "meta.json")
+                    e["hud_pulled"] = (d / Path(new.get("video_path") or "hud.mp4").name).exists()
+                    if not e["hud_pulled"]:
                         if vid and Path(vid).is_file() and "render_status" in new:
                             new["render_status"], new["render_error"] = "queued", None
                             e["notes"].append("no HUD mp4 pulled: render queued (local server renders it)")
@@ -2282,7 +2289,7 @@ def apply_import(entries: list, *, local_db: Path, replays_dir: Path) -> int:
 
 def cmd_import(args, *, local_db: Path | None = None, replays_dir: Path | None = None,
                uploads_dir: Path | None = None, pull_root: Path | None = None,
-               active_job=local_active_job, post=None) -> int:
+               active_job=local_active_job, post=None, upload=None) -> int:
     sw = Swarm.load(args.name)
     main = cli.main_checkout()
     local_db = Path(local_db or main / "frc_scorer.db")
@@ -2306,7 +2313,12 @@ def cmd_import(args, *, local_db: Path | None = None, replays_dir: Path | None =
         print("\nevent-state files NOT merged (calibrations / layouts made on the pods; copy by hand if wanted):")
         for pod, fname, why in diff:
             print(f"  {pod}: {fname} ({why}) <- {pull_root / pod / 'web' / 'uploads' / fname}")
+    gplan = gdrive_import_plan(add, force=getattr(args, "gdrive", False),
+                               force_video=getattr(args, "gdrive_video", False))
     if not args.apply:
+        if gplan:
+            print("\nGoogle Drive upload after --apply:")
+            print_gdrive_plan(gplan, main, render=getattr(args, "render", False), dry=True)
         print("\nnothing changed (dry run). --apply to merge.")
         return 0
     if not add:
@@ -2327,7 +2339,126 @@ def cmd_import(args, *, local_db: Path | None = None, replays_dir: Path | None =
         else:
             print(f"{len(queued)} replay(s) have render_status=queued: restart :8004 (its startup sweep "
                   f"renders them) or re-run with --render while it is up")
+    if gplan:
+        print("\nGoogle Drive upload:")
+        print_gdrive_plan(gplan, main, render=getattr(args, "render", False), dry=False)
+        if not upload_gdrive(gplan, main, upload or run_gdrive_upload):
+            return 1
     return 0
+
+
+# --------------------------------------------------------------------------
+# Google Drive upload at import. Pods have no rclone and no Drive credentials
+# (GDRIVE_* is never shipped: runpod_cli.NEVER_SEND_PREFIXES), so a remote
+# run's gdrive_upload knob is honoured here, from the local checkout, after
+# the import (web/gdrive_upload.py has the Drive layout).
+# --------------------------------------------------------------------------
+GDRIVE_REMOTE_NOTE = ("pods have no Google Drive access: the gdrive_upload knob uploads at "
+                      "`swarm import --name {name} --apply` (add --render for the HUD videos)")
+
+
+def replay_knobs(meta_path) -> dict:
+    """The job's non-default knobs a pulled replay recorded (meta.json
+    ``summary.config``); {} for a missing / unreadable file. Stdlib twin of
+    web.gdrive_upload.replay_knobs."""
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        cfg = (meta.get("summary") or {}).get("config") if isinstance(meta, dict) else None
+        return dict(cfg) if isinstance(cfg, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def run_wants_gdrive(run: dict | None) -> bool:
+    """Whether a run's config (or a per-pod override) turns gdrive_upload on."""
+    run = run or {}
+    cfgs = [run.get("config") or {}, *((run.get("pod_config") or {}).values())]
+    return any(bool((c or {}).get("gdrive_upload")) for c in cfgs)
+
+
+def gdrive_import_plan(entries: list, *, force: bool = False, force_video: bool = False) -> dict:
+    """What to upload for imported entries, per event:
+    {event: {"matches": [mk], "video": [mk], "after_render": [mk], "notes": [str]}}.
+    A match goes up when its job's knobs had gdrive_upload (``force`` /
+    ``force_video``: every imported complete match). Its video: ``video``
+    when the HUD mp4 is already here; ``after_render`` when the local render
+    is queued and the knobs ask for it (the :8004 render hook uploads it);
+    else a note."""
+    out: dict = {}
+    for e in entries:
+        mk, ev = e.get("match_key"), e.get("event_key")
+        if e.get("action") != "add" or e.get("status") != "complete" or not mk or not ev:
+            continue
+        knobs = e.get("knobs") or {}
+        knob_video = bool(knobs.get("gdrive_upload")) and bool(knobs.get("gdrive_upload_video"))
+        if not (force or force_video or knobs.get("gdrive_upload")):
+            continue
+        p = out.setdefault(ev, {"matches": [], "video": [], "after_render": [], "notes": []})
+        p["matches"].append(mk)
+        if not (force_video or knob_video):
+            continue
+        if e.get("hud_pulled"):
+            p["video"].append(mk)
+        elif e.get("render") and knob_video:
+            p["after_render"].append(mk)
+        elif e.get("render"):
+            p["notes"].append(f"{mk}: HUD render queued and its knobs don't ask for the video: once "
+                              f"rendered, `scripts/upload_gdrive.py {ev} --match {mk} --video --no-event-export`")
+        else:
+            p["notes"].append(f"{mk}: no HUD video here (pull --with-video, or re-render once the "
+                              f"source video is local), video not uploaded")
+    return out
+
+
+def gdrive_command(main: Path, event: str, p: dict) -> list:
+    """One scripts/upload_gdrive.py call for an event: every match file, the
+    listed videos, the event export once."""
+    py = Path(main) / ".venv" / "bin" / "python"
+    cmd = [str(py if py.exists() else Path(sys.executable)), str(Path(main) / "scripts" / "upload_gdrive.py"), event]
+    for mk in p["matches"]:
+        cmd += ["--video-match", mk] if mk in p["video"] else ["--match", mk]
+    return cmd
+
+
+def run_gdrive_upload(cmd: list, cwd: Path) -> int:
+    """Run the upload script (its output streams to this terminal); its exit code."""
+    return subprocess.run(cmd, cwd=str(cwd)).returncode
+
+
+def print_gdrive_plan(gplan: dict, main: Path, *, render: bool, dry: bool) -> None:
+    for ev, p in gplan.items():
+        print(f"  {ev}: {len(p['matches'])} match file(s) + event export"
+              + (f", {len(p['video'])} video(s)" if p["video"] else ""))
+        if dry:
+            print(f"    would run: {shlex.join(gdrive_command(main, ev, p))}")
+        if p["after_render"]:
+            how = ("--render asked :8004 to render them" if render and not dry else
+                   "with --render while :8004 is up, or when a :8004 restart's sweep renders them")
+            print(f"    {len(p['after_render'])} video(s) go up from :8004 after their HUD render "
+                  f"(their knobs ask for it; renders {how}): {', '.join(p['after_render'])}")
+        for n in p["notes"]:
+            print(f"    - {n}")
+
+
+def upload_gdrive(gplan: dict, main: Path, runner) -> bool:
+    """One upload subprocess per event. A failure is reported, never rolls
+    back the import. True when every event uploaded."""
+    ok = True
+    for ev, p in gplan.items():
+        cmd = gdrive_command(main, ev, p)
+        try:
+            rc = runner(cmd, main)
+            err = None if rc == 0 else f"exit {rc}"
+        except Exception as e:          # noqa: BLE001 - report, keep the import
+            err = f"{type(e).__name__}: {e}"
+        if err:
+            ok = False
+            print(f"  gdrive upload FAILED for {ev} ({err}); the import is kept. Re-send with: "
+                  f"{shlex.join(cmd)}")
+        else:
+            print(f"  gdrive upload done for {ev}")
+    return ok
 
 
 def _post_render(rid: str) -> str:
@@ -2462,6 +2593,12 @@ def add_parser(sub) -> None:
     q.add_argument("--apply", action="store_true")
     q.add_argument("--render", action="store_true",
                    help="ask the local :8004 to render HUD videos for imported replays that have none")
+    q.add_argument("--gdrive", action="store_true",
+                   help="upload every imported match to Google Drive (default: only matches whose job "
+                        "had the gdrive_upload knob)")
+    q.add_argument("--gdrive-video", action="store_true",
+                   help="like --gdrive, plus each match's HUD video (default: only when the job had "
+                        "gdrive_upload_video)")
     q.set_defaults(fn=cmd_import)
 
     q = named("stop", "stop every member (one typed confirmation)")

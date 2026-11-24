@@ -32,10 +32,19 @@ more matches arrive. Videos (~100 MB) go through one global serial worker so
 they never compete with each other for bandwidth. With hud_post_render on, the
 video only exists after the render subprocess: the finaliser registers it with
 ``expect_video_after_render`` and the render worker hands it over through
-``on_render_done``. That hand-off is in memory only, so a server restart drops
-videos still waiting for their render; re-send them with
-``scripts/upload_gdrive.py <event> --video``, which is also how results pulled
-from RunPod / vast.ai runs (imported locally) are uploaded.
+``on_render_done``. A render nobody registered (a render the startup sweep
+re-queued after a server restart, or an imported replay rendered later) is
+matched by its knobs instead: ``on_render_done`` reads the replay's meta.json
+(``summary.config``, every job records its non-default knobs there) and queues
+the video when both ``gdrive_upload`` and ``gdrive_upload_video`` are on.
+
+Remote swarm runs (RunPod / vast.ai pods) never upload: pods have no rclone and
+no Drive credentials, and GDRIVE_* vars are never shipped to them. Their results
+are uploaded at ``swarm import --apply`` (deploy/runpod/swarm.py) for every
+imported match whose job had ``gdrive_upload`` on (``--gdrive`` /
+``--gdrive-video`` force it); videos still waiting for their HUD render go up
+through the knob path above once :8004 renders them. Backfills and re-sends:
+``scripts/upload_gdrive.py <event> [--video]``.
 """
 from __future__ import annotations
 
@@ -349,13 +358,51 @@ def expect_video_after_render(replay_id: str, event_key: str, match_key: str) ->
     print(f"[gdrive] {event_key}/{match_key}: video upload waits for the HUD render")
 
 
-def on_render_done(replay_id: str, status: Optional[str], local_video) -> bool:
-    """Render worker hand-off: queue the expected video if the render worked."""
+def replay_knobs(meta_path) -> dict:
+    """The job's non-default knobs a replay recorded (meta.json
+    ``summary.config``); {} for a missing / unreadable / odd file."""
+    try:
+        if not meta_path:
+            return {}
+        with open(str(meta_path)) as f:
+            meta = json.load(f)
+        cfg = (meta.get("summary") or {}).get("config") if isinstance(meta, dict) else None
+        return dict(cfg) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def wants_video(knobs: dict) -> bool:
+    return bool(knobs.get("gdrive_upload")) and bool(knobs.get("gdrive_upload_video"))
+
+
+def _knob_video(replay_id: str, status: Optional[str], local_video, row) -> bool:
+    """A render nobody registered: upload its video when the replay's own
+    knobs ask for it (imported remote replays, renders re-queued after a
+    server restart)."""
+    if not row:
+        return False
+    event_key, match_key = row.get("event_key"), row.get("match_key")
+    if not event_key or not match_key or row.get("status", "complete") != "complete":
+        return False
+    if not wants_video(replay_knobs(row.get("meta_path"))):
+        return False
+    if status != "rendered":
+        print(f"[gdrive] {event_key}/{match_key}: video not uploaded (render {status})")
+        return False
+    print(f"[gdrive] {event_key}/{match_key}: replay {replay_id} knobs ask for its video")
+    return schedule_video(event_key, match_key, local_video or row.get("video_path"))
+
+
+def on_render_done(replay_id: str, status: Optional[str], local_video, row=None) -> bool:
+    """Render worker hand-off: queue the video if the render worked and either
+    the job registered it (``expect_video_after_render``) or the replay's
+    knobs ask for it (``row``: the replay row, read after the render)."""
     try:
         with _lock:
             exp = _expected.pop(str(replay_id), None)
         if exp is None:
-            return False
+            return _knob_video(replay_id, status, local_video, row)
         event_key, match_key = exp
         if status != "rendered":
             print(f"[gdrive] {event_key}/{match_key}: video not uploaded (render {status})")

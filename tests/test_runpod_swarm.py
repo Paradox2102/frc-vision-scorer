@@ -45,6 +45,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "ssh_out", no_network)
     monkeypatch.setattr(swarm, "default_downloader", no_network)
     monkeypatch.setattr(swarm, "remote", no_network)
+    monkeypatch.setattr(swarm, "run_gdrive_upload", no_network)
     return tmp_path
 
 
@@ -921,7 +922,8 @@ def _dump(db):
 
 
 def _import(env, apply, **kw):
-    args = argparse.Namespace(name="imp", apply=apply, render=kw.pop("render", False))
+    args = argparse.Namespace(name="imp", apply=apply, render=kw.pop("render", False),
+                              gdrive=kw.pop("gdrive", False), gdrive_video=kw.pop("gdrive_video", False))
     return swarm.cmd_import(args, local_db=env.db, replays_dir=env.replays, uploads_dir=env.uploads, **kw)
 
 
@@ -993,6 +995,149 @@ def test_import_render_posts_to_local_app(import_env):
     assert _import(import_env, True, active_job=lambda: None, render=True,
                    post=lambda rid: posted.append(rid) or "queued") == 0
     assert posted == ["r-new"]
+
+
+# ----------------------------------------------------------------- Google Drive upload at import
+GD_ON = {"gdrive_upload": True}
+GD_VIDEO = {"gdrive_upload": True, "gdrive_upload_video": True}
+
+
+def _set_knobs(rid, knobs):
+    (cli.PULL_ROOT / "podA" / "web" / "replays" / rid / "meta.json").write_text(
+        json.dumps({"summary": {"config": knobs}, "frames": []}))
+
+
+def _add_pulled(rid, mk, knobs, *, event="2026tst", hud=False):
+    """Another complete replay on podA (optionally another event / with its HUD mp4)."""
+    pod = cli.PULL_ROOT / "podA"
+    pc = sqlite3.connect(pod / "frc_scorer.db")
+    _insert(pc, "replays", {**_replay_row(rid, mk), "event_key": event})
+    pc.commit()
+    pc.close()
+    d = pod / "web" / "replays" / rid
+    d.mkdir(parents=True)
+    (d / cli.PULL_MARKER).write_text("{}")
+    if hud:
+        (d / "hud.mp4").write_bytes(b"mp4")
+    _set_knobs(rid, knobs)
+
+
+class FakeUpload:
+    def __init__(self, rc=0):
+        self.calls, self.rc = [], rc
+
+    def __call__(self, cmd, cwd):
+        self.calls.append((list(cmd), cwd))
+        if isinstance(self.rc, BaseException):
+            raise self.rc
+        return self.rc
+
+    def tails(self):
+        """Each call's args after the script path."""
+        return [c[2:] for c, _ in self.calls]
+
+
+def test_import_no_knobs_runs_no_upload(import_env, capsys):
+    up = FakeUpload()
+    assert _import(import_env, True, active_job=lambda: None, upload=up) == 0
+    assert up.calls == [] and "Google Drive" not in capsys.readouterr().out
+
+
+def test_import_knob_driven_upload_one_call_per_event(import_env, capsys):
+    _set_knobs("r-new", GD_ON)                                   # qm2: render queued (no HUD pulled)
+    _add_pulled("r-v", "2026tst_qm6", GD_VIDEO, hud=True)       # HUD pulled -> video in the same call
+    _add_pulled("r-off", "2026tst_qm7", {"sam3_track_fps": 8})  # knob off -> not uploaded
+    _add_pulled("r-oth", "2026oth_qm1", GD_ON, event="2026oth")
+    up = FakeUpload()
+    assert _import(import_env, True, active_job=lambda: None, upload=up) == 0
+    assert up.tails() == [["2026tst", "--match", "2026tst_qm2", "--video-match", "2026tst_qm6"],
+                          ["2026oth", "--match", "2026oth_qm1"]]
+    cmd, cwd = up.calls[0]
+    assert cmd[1].endswith("scripts/upload_gdrive.py") and Path(cwd) == swarm.cli.main_checkout()
+    out = capsys.readouterr().out
+    assert "gdrive upload done for 2026tst" in out and "gdrive upload done for 2026oth" in out
+    # the import itself happened
+    con = sqlite3.connect(import_env.db)
+    assert con.execute("SELECT COUNT(*) FROM replays WHERE id IN ('r-new','r-v','r-off','r-oth')").fetchone()[0] == 4
+    con.close()
+
+
+def test_import_video_waiting_for_render_is_left_to_the_server(import_env, capsys):
+    _set_knobs("r-new", GD_VIDEO)                               # render queued: :8004 hook uploads it
+    up = FakeUpload()
+    posted = []
+    assert _import(import_env, True, active_job=lambda: None, upload=up, render=True,
+                   post=lambda rid: posted.append(rid) or "queued") == 0
+    assert up.tails() == [["2026tst", "--match", "2026tst_qm2"]] and posted == ["r-new"]
+    out = capsys.readouterr().out
+    assert "1 video(s) go up from :8004 after their HUD render" in out and "2026tst_qm2" in out
+
+
+def test_import_gdrive_force_uploads_every_imported_match(import_env):
+    _add_pulled("r-off", "2026tst_qm7", {})
+    up = FakeUpload()
+    assert _import(import_env, True, active_job=lambda: None, upload=up, gdrive=True) == 0
+    assert up.tails() == [["2026tst", "--match", "2026tst_qm2", "--match", "2026tst_qm7"]]
+
+
+def test_import_gdrive_video_force(import_env, capsys):
+    _add_pulled("r-v", "2026tst_qm6", {}, hud=True)
+    up = FakeUpload()
+    assert _import(import_env, True, active_job=lambda: None, upload=up, gdrive_video=True) == 0
+    # qm2's render is queued and its knobs don't ask: not passed, told how to send it later
+    assert up.tails() == [["2026tst", "--match", "2026tst_qm2", "--video-match", "2026tst_qm6"]]
+    out = capsys.readouterr().out
+    assert "2026tst_qm2: HUD render queued and its knobs don't ask for the video" in out
+    assert "upload_gdrive.py 2026tst --match 2026tst_qm2 --video --no-event-export" in out
+
+
+def test_import_dry_run_lists_drive_uploads_and_runs_nothing(import_env, capsys):
+    _set_knobs("r-new", GD_ON)
+    up = FakeUpload()
+    assert _import(import_env, False, active_job=lambda: pytest.fail("dry run must not ask"), upload=up) == 0
+    assert up.calls == []
+    out = capsys.readouterr().out
+    assert "Google Drive upload after --apply:" in out
+    assert "would run:" in out and "upload_gdrive.py 2026tst --match 2026tst_qm2" in out
+    assert "nothing changed (dry run)" in out
+
+
+@pytest.mark.parametrize("rc", [1, OSError("no such file")])
+def test_import_upload_failure_is_nonzero_but_import_kept(import_env, capsys, rc):
+    _set_knobs("r-new", GD_ON)
+    up = FakeUpload(rc=rc)
+    assert _import(import_env, True, active_job=lambda: None, upload=up) == 1
+    assert len(up.calls) == 1
+    out = capsys.readouterr().out
+    assert "gdrive upload FAILED for 2026tst" in out and "import is kept" in out
+    con = sqlite3.connect(import_env.db)
+    assert con.execute("SELECT COUNT(*) FROM replays WHERE id = 'r-new'").fetchone()[0] == 1
+    con.close()
+    assert (import_env.replays / "r-new" / "meta.json").exists()
+
+
+def test_swarm_replay_knobs_tolerant(tmp_path):
+    assert swarm.replay_knobs(tmp_path / "missing.json") == {}
+    for bad in ("{", "[]", '{"summary": 3}', '{"summary": {"config": "x"}}'):
+        (tmp_path / "m.json").write_text(bad)
+        assert swarm.replay_knobs(tmp_path / "m.json") == {}, bad
+
+
+def test_run_wants_gdrive():
+    assert not swarm.run_wants_gdrive(None) and not swarm.run_wants_gdrive({"config": {}})
+    assert swarm.run_wants_gdrive({"config": GD_ON})
+    assert swarm.run_wants_gdrive({"config": {}, "pod_config": {"b": GD_ON}})
+
+
+def test_remote_run_notes_drive_upload_happens_at_import(monkeypatch, tmp_path, capsys):
+    _ready_swarm("tg", ["a"], KEYS[:1], tmp_path)
+    monkeypatch.setattr(swarm, "process_item", lambda ctx, m, mk: (True, {"job_id": f"job-{mk}"}))
+    monkeypatch.setattr(swarm.time, "sleep", lambda s: None)
+    rc = cli.main(["swarm", "run", "--name", "tg", "--poll-s", "0", "--config-json", json.dumps(GD_VIDEO)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.count("pods have no Google Drive access") == 2         # at start + in the "next:" text
+    assert "swarm import --name tg --apply` (add --render" in out
 
 
 # ----------------------------------------------------------------- stop / terminate

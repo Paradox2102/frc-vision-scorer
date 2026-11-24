@@ -1222,16 +1222,25 @@ stay the same):
 <event>/videos/<match_key>.mp4              HUD replay video (gdrive_upload_video)
 ```
 
-**Backfill / re-send** (also for results from remote GPU runs imported locally):
+**Remote GPU runs** (RunPod / vast.ai swarms). Pods have no Drive access, so
+the upload happens when the results come home: `swarm import --name <name>
+--apply` uploads every imported match whose job had `gdrive_upload` on
+(`--gdrive` / `--gdrive-video` force it). See `deploy/runpod/README.md`.
+
+**Videos waiting for a render.** Each replay's `meta.json` records its job's
+knobs. When the HUD render finishes, the server re-reads them and uploads the
+video if `gdrive_upload` and `gdrive_upload_video` are both on. That covers
+imported remote replays rendered later and renders the startup sweep re-queues
+after a server restart.
+
+**Backfill / re-send:**
 
 ```sh
 .venv/bin/python scripts/upload_gdrive.py 2026cur --dry-run
 .venv/bin/python scripts/upload_gdrive.py 2026cur                 # every match + event export
 .venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --video
+.venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --video-match 2026cur_qm9
 ```
-
-A server restart drops videos still waiting for their render; re-send them
-with `--video`.
 
 ## Gotchas checklist
 

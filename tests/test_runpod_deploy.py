@@ -133,6 +133,12 @@ def test_mask_shows_last_four_only():
     assert cli.mask("") == "(unset)"
 
 
+def test_gdrive_vars_are_never_sent():
+    for n in ("GDRIVE_FOLDER_ID", "GDRIVE_RCLONE_REMOTE", "GDRIVE_UPLOAD", "GDRIVE_ANYTHING"):
+        assert cli.never_send(n), n
+    assert not cli.never_send("HF_TOKEN")
+
+
 def test_select_secrets_noninteractive_never_sends_denied():
     got = cli.select_secrets(LOCAL, interactive=False)
     assert set(got) == {"JEV_TYPESAFE_API_TOKEN", "HF_TOKEN", "TBA_API_KEY"}

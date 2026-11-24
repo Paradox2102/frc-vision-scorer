@@ -122,7 +122,7 @@ SECRET_SPECS = (
 )
 # Never shipped to the pod, whatever the caller passes.
 NEVER_SEND_EXACT = {"RUNPOD_API", "VASTAI_API", "ROBOFLOW_API", "MANTA_API"}
-NEVER_SEND_PREFIXES = ("CLOUDFLARE_", "RUNPOD_", "VASTAI_")
+NEVER_SEND_PREFIXES = ("CLOUDFLARE_", "RUNPOD_", "VASTAI_", "GDRIVE_", "ROBORECON_")
 
 
 def never_send(name: str) -> bool:

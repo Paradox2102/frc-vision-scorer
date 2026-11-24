@@ -9,6 +9,8 @@ results pulled + imported from RunPod / vast.ai runs).
   .venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --match 2026cur_qm9
   .venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --no-event-export
   .venv/bin/python scripts/upload_gdrive.py 2026cur --video          # + each match's HUD video
+  .venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --video-match 2026cur_qm9
+                                       # qm8 data; qm9 data + video
 
 Uses GDRIVE_FOLDER_ID / GDRIVE_RCLONE_REMOTE from .env (web/gdrive_upload.py has
 the Drive layout). The match files, event export and videos come from the same
@@ -63,6 +65,9 @@ def main(argv=None) -> int:
     ap.add_argument("--no-event-export", action="store_true",
                     help="don't refresh <event>_scouting_export.json")
     ap.add_argument("--video", action="store_true", help="also upload each match's HUD video")
+    ap.add_argument("--video-match", action="append", default=[], metavar="MATCH_KEY",
+                    help="also upload this match's HUD video (repeatable; the match is included "
+                         "like --match)")
     ap.add_argument("--dry-run", action="store_true", help="print what would be uploaded")
     args = ap.parse_args(argv)
     if not args.check and not args.event_key:
@@ -88,7 +93,9 @@ def main(argv=None) -> int:
     matches, skipped = api._load(ev)
     matches = sorted(matches, key=export.match_order)
     known = {m.match_key for m in matches}
-    if args.match:
+    video_only = set(args.video_match)
+    if args.match or video_only:
+        args.match = list(dict.fromkeys([*args.match, *args.video_match]))
         unknown = [mk for mk in args.match if mk not in known]
         if unknown:
             why = {s.get("match_key"): s.get("reason") for s in skipped}
@@ -104,7 +111,7 @@ def main(argv=None) -> int:
         mk = md.match_key
         plan.append(("match", gd.match_path(ev, mk),
                      lambda mk=mk: gd.upload_match(ev, mk)))
-        if args.video:
+        if args.video or mk in video_only:
             local, why = _video_for(md)
             if local:
                 plan.append(("video", gd.video_path(ev, mk),

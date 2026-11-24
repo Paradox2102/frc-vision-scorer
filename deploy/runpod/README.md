@@ -504,6 +504,30 @@ rp swarm terminate --name cur                                  # whatever is lef
   that is stopped, start it in the RunPod console and `swarm pull` before
   terminating; `--force` deletes its unpulled results.
 
+**Google Drive upload for remote runs.** Pods have no rclone and no Drive
+credentials, and `GDRIVE_*` vars are never shipped to them (the
+`gdrive_upload` knob is a no-op on a pod). The knobs still travel with the
+results: each replay's `meta.json` records its job's knobs, so `import` uploads
+from this machine instead:
+
+```bash
+rp swarm run --name cur --config-json '{"gdrive_upload": true, "gdrive_upload_video": true}'
+rp swarm pull --name cur
+rp swarm import --name cur                    # dry run: also lists the Drive uploads
+rp swarm import --name cur --apply --render   # merge, then upload; :8004 uploads videos after rendering
+```
+
+After `--apply`, every imported `complete` match whose job had `gdrive_upload`
+goes up in one `scripts/upload_gdrive.py <event> --match ...` call per event
+(match files, then the event export once). Videos: a HUD mp4 that was pulled
+(`pull --with-video`) goes up in the same call. A video whose render is queued
+goes up from :8004 once it renders (its render hook re-reads the knobs), so
+pass `--render` or restart :8004. `--gdrive` uploads every imported match
+whatever its knobs; `--gdrive-video` also uploads videos. A failed upload makes
+`import` exit 1 but never undoes the import; re-send with
+`scripts/upload_gdrive.py`. `run` prints a reminder when its config has
+`gdrive_upload`.
+
 Caveats:
 
 * In batch and sweep runs each pod's calibration state is independent (live mode syncs it). Each pod starts from the

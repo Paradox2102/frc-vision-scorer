@@ -11649,7 +11649,11 @@ async def _run_render(replay_id: str) -> None:
             await database.set_render_status(replay_id, "render_failed",
                                              f"timeout after {timeout:g} s")
             print(f"[hud-render] {replay_id}: render_failed (timeout after {timeout:g} s)")
-            _gdrive_render_done(replay_id, "render_failed", None)
+            try:
+                failed_row = await database.get_replay(replay_id)
+            except Exception:
+                failed_row = None
+            _gdrive_render_done(replay_id, "render_failed", None, failed_row)
             return
         rc = proc.returncode
         tail = " | ".join((out or b"").decode(errors="replace").strip().splitlines()[-3:])
@@ -11667,15 +11671,16 @@ async def _run_render(replay_id: str) -> None:
                                              f"renderer exited {rc}: {tail[-300:]}")
     print(f"[hud-render] {replay_id}: {status}")
     # The renderer wrote the final video_path into the row read above.
-    _gdrive_render_done(replay_id, status, row.get("video_path"))
+    _gdrive_render_done(replay_id, status, row.get("video_path"), row)
 
 
-def _gdrive_render_done(replay_id: str, status, video_path) -> None:
-    """gdrive_upload_video: hand a finished render's video to the uploader
-    (a no-op unless the job registered it). Never raises."""
+def _gdrive_render_done(replay_id: str, status, video_path, row=None) -> None:
+    """gdrive_upload_video: hand a finished render's video to the uploader (a
+    no-op unless the job registered it or the replay's recorded knobs, read
+    from ``row``'s meta.json, ask for it). Never raises."""
     try:
         from web import gdrive_upload
-        gdrive_upload.on_render_done(replay_id, status, video_path)
+        gdrive_upload.on_render_done(replay_id, status, video_path, row)
     except Exception as e:
         print(f"[gdrive] {replay_id}: video not queued: {e}")
 

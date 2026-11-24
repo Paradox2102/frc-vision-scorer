@@ -12279,12 +12279,246 @@ def _match_stream_url(match_key: str):
         return None, f"Stream resolve failed: {e}"
 
 
+# ------------------------------------------------------- calibration video picker
+# /calibrate can grab frames from any local video the user picks (not only the
+# selected match's footage), so a sim render / offseason upload can be checked by
+# hand. Readable videos: the footage dirs (auto_calibrate.FOOTAGE_DIRS =
+# data/test_footage, data/videos — any file, any depth) and main-page uploads
+# (web/uploads/video_<md5>.<ext> only — that dir also holds calibration JSON etc.).
+# Every check compares RESOLVED paths: in a worktree data/test_footage and
+# web/uploads are symlinks into the main checkout, and a symlink inside a footage
+# dir pointing elsewhere must not escape.
+CALIB_VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm")
+_CALIB_UPLOAD_VIDEO_RE = re.compile(r"^video_[0-9a-f]{32}\.(mp4|mov|mkv|webm)$", re.I)
+CALIB_VIDEO_UPLOAD_MAX_BYTES = 8 * 1024 ** 3
+
+
+def _calib_footage_dirs() -> tuple:
+    return tuple(Path(d) for d in auto_calibrate.FOOTAGE_DIRS)
+
+
+def _calib_rel_path(p: Path) -> str:
+    """Repo-relative path string for ``p`` (absolute when outside the repo)."""
+    try:
+        return Path(p).relative_to(Path(PROJECT_ROOT).absolute()).as_posix()
+    except ValueError:
+        return str(p)
+
+
+def _resolve_calib_video_path(raw):
+    """(resolved Path, None) when ``raw`` names a video the calibrate page may read,
+    else (None, error). Relative paths are taken from the repo root."""
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        return None, "bad video_path"
+    if "://" in raw:
+        return None, "video_path outside allowed directory"
+    p = Path(raw.strip())
+    if not p.is_absolute():
+        p = Path(PROJECT_ROOT).absolute() / p
+    try:
+        cand = p.resolve()
+    except (OSError, RuntimeError):
+        return None, "bad video_path"
+    allowed = False
+    for d in _calib_footage_dirs():
+        try:
+            cand.relative_to(d.resolve())
+            allowed = True
+            break
+        except (ValueError, OSError):
+            continue
+    if not allowed and cand.parent == UPLOAD_DIR.resolve() \
+            and _CALIB_UPLOAD_VIDEO_RE.match(cand.name):
+        allowed = True
+    if not allowed:
+        return None, "video_path outside allowed directory"
+    if cand.suffix.lower() not in CALIB_VIDEO_SUFFIXES:
+        return None, "unsupported video extension"
+    return cand, None
+
+
+def _calib_video_entry(p: Path, source: str, event: Optional[str]) -> Optional[dict]:
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    if st.st_size <= 0:
+        return None
+    mk = p.stem if auto_calibrate.valid_match_key(p.stem) else None
+    return {"path": _calib_rel_path(p), "name": p.name, "dir": p.parent.name,
+            "source": source, "size": int(st.st_size), "mtime": float(st.st_mtime),
+            "match_key": mk,
+            "event_match": bool(mk and event and mk.startswith(f"{event}_")),
+            # the file the match dropdown itself reads for this match (local_video_for)
+            "match_default": False, "label": None}
+
+
+def _list_calib_videos(event: Optional[str], upload_rows=()) -> list:
+    """Every selectable video, the event's matches first (match order), then the
+    rest newest first. ``upload_rows``: replay rows (source_video_path, match_key,
+    label) used to label main-page uploads, newest first."""
+    from web.field.match_order import match_sort_key
+    out, seen = [], set()
+    for d in _calib_footage_dirs():
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if p.name.startswith(".") or p.suffix.lower() not in CALIB_VIDEO_SUFFIXES:
+                continue
+            if not p.is_file():
+                continue
+            try:
+                key = p.resolve()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            e = _calib_video_entry(p, "footage", event)
+            if e is None:
+                continue
+            if e["match_key"]:
+                dflt = auto_calibrate.local_video_for(e["match_key"])
+                e["match_default"] = dflt is not None and dflt.resolve() == key
+            out.append(e)
+    # main-page uploads: content-addressed names, labelled from the replays table
+    labels: dict = {}
+    for row in upload_rows or ():
+        name = Path(str(row.get("source_video_path") or "")).name
+        if not _CALIB_UPLOAD_VIDEO_RE.match(name):
+            continue
+        cur = labels.get(name)
+        if cur is None or (not cur.get("match_key") and row.get("match_key")):
+            labels[name] = row
+    if UPLOAD_DIR.is_dir():
+        for p in UPLOAD_DIR.iterdir():
+            if not _CALIB_UPLOAD_VIDEO_RE.match(p.name) or not p.is_file():
+                continue
+            e = _calib_video_entry(p, "upload", event)
+            if e is None:
+                continue
+            row = labels.get(p.name)
+            if row:
+                mk = row.get("match_key")
+                if auto_calibrate.valid_match_key(mk):
+                    e["match_key"] = mk
+                    e["event_match"] = bool(event and mk.startswith(f"{event}_"))
+                lab = row.get("label") or None
+                e["label"] = lab if lab and lab != p.stem else None
+            out.append(e)
+    ev = [e for e in out if e["event_match"]]
+    rest = [e for e in out if not e["event_match"]]
+    ev.sort(key=lambda e: (match_sort_key(e["match_key"]), not e["match_default"],
+                           e["source"] != "footage", -e["mtime"]))
+    rest.sort(key=lambda e: -e["mtime"])
+    return ev + rest
+
+
+@app.get("/api/calibration/videos")
+async def calibration_videos(event: Optional[str] = None):
+    """Local videos the calibrate page can grab frames from (``video_path`` on the
+    frame / refine-tag / solve-tags routes): {videos: [{path (repo-relative), name,
+    dir, source ("footage" | "upload"), size, mtime, match_key, event_match,
+    match_default, label}], upload_dir}. ``match_default``: this is the file the
+    match dropdown reads for match_key (local footage wins over the TBA stream)."""
+    try:
+        rows = await database.replay_source_videos()
+    except Exception as e:                      # labels are a nicety, never fatal
+        print(f"  [calib-videos] replay labels unavailable: {e}")
+        rows = []
+    videos = await asyncio.to_thread(_list_calib_videos, (event or "").strip() or None, rows)
+    return {"videos": videos,
+            "upload_dir": _calib_rel_path(Path(auto_calibrate.DOWNLOAD_DIR))}
+
+
+def _sanitize_calib_video_name(filename: str, match_key: Optional[str]):
+    """(safe file name, None) or (None, error) for an uploaded calibration video."""
+    base = Path(str(filename or "").replace("\\", "/")).name
+    suffix = Path(base).suffix.lower()
+    if suffix not in CALIB_VIDEO_SUFFIXES:
+        return None, ("unsupported video extension (allowed: "
+                      + ", ".join(CALIB_VIDEO_SUFFIXES) + ")")
+    if match_key:
+        if not auto_calibrate.valid_match_key(match_key):
+            return None, f"invalid match key '{match_key}'"
+        return f"{match_key}{suffix}", None
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(base).stem).strip("_-")[:120]
+    return f"{stem or 'video'}{suffix}", None
+
+
+@app.post("/api/calibration/videos/upload")
+async def calibration_video_upload(file: UploadFile = File(...),
+                                   match_key: Optional[str] = Form(None),
+                                   force: bool = Form(False)):
+    """Save an uploaded video into data/test_footage/ for /calibrate. The name is
+    sanitised (``match_key`` given: renamed to <match_key>.<ext>, so an .mp4 becomes
+    that match's local footage). 409 when the file exists unless ``force``. Streams
+    to a hidden .part file and renames once the video is known to decode."""
+    mk = (match_key or "").strip() or None
+    name, err = _sanitize_calib_video_name(file.filename, mk)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    dest_dir = Path(auto_calibrate.DOWNLOAD_DIR)
+    dest = dest_dir / name
+    try:
+        dest.resolve().relative_to(dest_dir.resolve())
+    except ValueError:                           # unreachable after sanitising
+        return JSONResponse(status_code=400, content={"error": "bad file name"})
+    if dest.exists() and not force:
+        return JSONResponse(status_code=409, content={
+            "error": f"{_calib_rel_path(dest)} already exists", "exists": True,
+            "path": _calib_rel_path(dest)})
+
+    def _store():
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dest_dir / f".{name}.{uuid.uuid4().hex[:8]}.part"
+        try:
+            n = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = file.file.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if n > CALIB_VIDEO_UPLOAD_MAX_BYTES:
+                        return None, "file too large"
+                    f.write(chunk)
+            if n == 0:
+                return None, "empty file"
+            cap = cv2.VideoCapture(str(tmp))
+            try:
+                ok = cap.isOpened() and cap.read()[0]
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+            finally:
+                cap.release()
+            if not ok:
+                return None, "not a readable video (OpenCV could not decode a frame)"
+            os.replace(tmp, dest)
+            return {"size": n, "fps": round(fps, 3),
+                    "duration_s": round(frames / fps, 2) if fps else None}, None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    meta, err = await asyncio.to_thread(_store)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    default = auto_calibrate.local_video_for(mk) if mk else None
+    return {"status": "ok", "path": _calib_rel_path(dest), "name": name,
+            "match_key": mk if mk else (dest.stem if auto_calibrate.valid_match_key(dest.stem)
+                                        else None),
+            "match_default": bool(default is not None
+                                  and default.resolve() == dest.resolve()),
+            **meta}
+
+
 def _read_composite_frame(body: dict, info: Optional[dict] = None):
     """Read the full composite frame a calibration request refers to.
-    Source precedence: match_key (the loaded event's YouTube video for that
-    match, single-frame ffmpeg extract — needed when recalibrating a moved
-    camera against footage from that match) > video_path (local file restricted
-    to data/test_footage/) > CALIB_TEST_VIDEO. Local match footage
+    Source precedence: video_path (a video the user picked on /calibrate; restricted
+    by ``_resolve_calib_video_path`` to the footage dirs / main-page uploads) >
+    match_key (the loaded event's YouTube video for that match, single-frame ffmpeg
+    extract — needed when recalibrating a moved camera against footage from that
+    match) > CALIB_TEST_VIDEO. Local match footage
     (data/test_footage|videos/<match_key>.mp4) is preferred over the stream.
     ``body.aggregate`` (local sources only): return the temporal median of the frames
     at 1 s steps within ts +/- 15 s instead of one frame; ``info["aggregated"]`` is
@@ -12294,6 +12528,16 @@ def _read_composite_frame(body: dict, info: Optional[dict] = None):
     import subprocess
     ts = float(body.get("timestamp", 75))
     match_key = body.get("match_key")
+    # An explicitly picked video wins over the match's footage: the user chose it to
+    # check the calibration against (the epoch's start match is independent of it).
+    raw = body.get("video_path")
+    if raw:
+        path, err = _resolve_calib_video_path(raw)
+        if err:
+            return None, err
+        if not path.is_file():
+            return None, "video not found"
+        return _read_local_video_frame(path, ts, aggregate, info)
     # Local footage for the match (data/test_footage/<key>.mp4 or data/videos/<key>.mp4)
     # wins over resolving a YouTube stream: same timestamps, no yt-dlp (which 403s).
     local = auto_calibrate.local_video_for(match_key) if match_key else None
@@ -12316,21 +12560,7 @@ def _read_composite_frame(body: dict, info: Optional[dict] = None):
         if frame is None:
             return None, "ffmpeg could not extract a frame from the match video."
         return frame, None
-    # video_path is restricted to data/test_footage/ with a video extension to
-    # prevent arbitrary local-file / URL reads via cv2.VideoCapture.
-    raw = body.get("video_path")
-    if not raw:
-        path = CALIB_TEST_VIDEO
-    else:
-        allowed_dir = (Path(__file__).resolve().parents[1] / "data/test_footage").resolve()
-        candidate = Path(raw).resolve()
-        try:
-            candidate.relative_to(allowed_dir)
-        except ValueError:
-            return None, "video_path outside allowed directory"
-        if candidate.suffix.lower() not in {".mp4", ".mov", ".mkv"}:
-            return None, "unsupported video extension"
-        path = candidate
+    path = CALIB_TEST_VIDEO
     if not path.exists():
         return None, "video not found"
     return _read_local_video_frame(path, ts, aggregate, info)
@@ -13491,8 +13721,8 @@ async def calibration_frame(request: Request):
 
 @app.post("/api/calibration/refine-tag")
 async def calibration_refine_tag(request: Request):
-    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key?, aggregate?,
-    u, v, id} (aggregate reuses the cached median frame /frame returned).
+    """Manual-locate -> auto-refine. Body: {camera?, timestamp?, match_key? | video_path?,
+    aggregate?, u, v, id} (aggregate reuses the cached median frame /frame returned).
     Reads the same source frame the page grabbed (match video / video_path /
     CALIB_TEST_VIDEO), crops to the camera's composite region, runs tag detection
     in an upscaled ROI around (u,v), and returns {corners: [[u,v]x4]} in
@@ -13743,8 +13973,9 @@ def _solve_tags_overlay(frame, cl, cal, fm, used, camera) -> Optional[str]:
 
 @app.post("/api/calibration/solve-tags")
 async def calibration_solve_tags(request: Request):
-    """Body: {event?, camera?, season?, image_size:[w,h], timestamp?,
-    auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}], lens_from?, lens_version_id?,
+    """Body: {event?, camera?, season?, image_size:[w,h], timestamp?, match_key? |
+    video_path? (the frame source, see _read_composite_frame; stored in the version
+    source), auto_tags:{id:[[u,v]x4]}, manual_tags:[{id,u,v}], lens_from?, lens_version_id?,
     joint_with?, joint_version_id?}.
     Solves a single-view pinhole camera model from AprilTag correspondences
     (auto -> 4 corners, manual -> center), saves it, and returns RMS + overlay.
@@ -13906,6 +14137,9 @@ async def calibration_solve_tags(request: Request):
                 "holdout_ids": sorted(holdout_ids),
                 "timestamp": float(body.get("timestamp", 75)),
                 "match_key": body.get("match_key"),
+                # a video picked on /calibrate (else None): restoring the epoch
+                # re-grabs the same frame from it
+                **({"video_path": body["video_path"]} if body.get("video_path") else {}),
                 **lens_fields}))
         _auto_calib_mark_manual(event, camera, new_vid)
     holdout_err = holdout_field_error(cal, held) if held else None
@@ -13919,6 +14153,7 @@ async def calibration_solve_tags(request: Request):
         # the partner's overlay on ITS stored frame: both cameras must line up
         pframe, _ = await asyncio.to_thread(_read_composite_frame, {
             "event": event, "match_key": psrc.get("match_key"),
+            "video_path": psrc.get("video_path"),
             "timestamp": psrc.get("timestamp", 75)})
         pused = ({int(s) for s in (psrc.get("auto_tags") or {})}
                  | {int(m["id"]) for m in psrc.get("manual_tags") or []})

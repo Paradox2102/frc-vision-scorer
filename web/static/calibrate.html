@@ -57,6 +57,10 @@
   .overlay-section h2 { font-size:1em; color:#a0c4ff; margin-bottom:8px; }
   #overlayImg { max-width:100%; border:1px solid #334; display:none; background:#0a0a14; }
   .hint { color:#7a86a0; font-size:12px; margin-top:4px; }
+  select { background:#16213e; border:1px solid #334; color:#e0e0e0; padding:4px 6px;
+           border-radius:4px; font-size:13px; }
+  #videoSel { max-width:340px; }
+  #frameSource { color:#a0c4ff; font-family:monospace; font-size:12px; }
   button:disabled { opacity:.45; cursor:default; }
   button:disabled:hover { background:#0f3460; }
 
@@ -224,14 +228,27 @@
       <option value="">event start (test video)</option>
     </select>
   </label>
+  <label title="Where frames are grabbed from. Default: the selected match's own footage. Pick any local video to check the calibration against it by hand — the saved version still applies from the match chosen on the left.">Video:
+    <select id="videoSel">
+      <option value="">Match's video (default)</option>
+    </select>
+  </label>
+  <button type="button" id="videoUploadBtn" title="Upload a video into data/test_footage/ and grab frames from it">Upload video…</button>
+  <label class="hint" style="margin:0;" title="Save the upload as the selected match's footage (&lt;match_key&gt;.&lt;ext&gt;) instead of its own file name; an .mp4 then becomes that match's local footage">
+    <input type="checkbox" id="videoUploadAsMatch"> name after selected match</label>
+  <input type="file" id="videoUploadInput" accept="video/*,.mp4,.mov,.mkv,.webm" style="display:none">
 </div>
 <p class="hint" style="margin:-8px 0 14px;">
   Pick a match when the camera moved mid-event: frames are grabbed from <b>that match's
   video</b>, and the solved calibration is saved as a new version applying from that match
-  onward (earlier matches keep their old calibration). Matches without a ▶ have no
-  TBA-linked video, so frames fall back to the default test video. ❌ marks matches
+  onward (earlier matches keep their old calibration). 💾 marks matches with
+  <b>local footage</b> (data/test_footage or data/videos) — it is used first; ▶ marks a
+  TBA-linked video (streamed from YouTube); matches with neither fall back to the default
+  test video. Pick a <b>Video</b> to grab frames from any local file instead (the version
+  still applies from the selected match). ❌ marks matches
   where the drift check failed for this camera — recalibrate from there. 🔧 marks
   matches with an <b>auto-fix awaiting your approval</b> (panel appears above).
+  Frame source: <span id="frameSource">—</span>
 </p>
 
 <div class="canvases">
@@ -379,6 +396,9 @@ let zoneDrag = null;      // {x0,y0,x1,y1} in map pixels while dragging
 let frameMasks = [];      // [[x,y,w,h], ...] in actual cropped frame coordinates
 let frameDrag = null;      // {x0,y0,x1,y1} in canvas pixels while dragging
 let eventMatches = [];    // matches of the loaded event (from /api/event/current)
+let calibVideos = [];     // selectable local videos (from /api/calibration/videos)
+let localMatchKeys = new Set();   // matches whose local footage the server reads first
+let lastVideoSel = '';    // the Video pick before the current change (restored on cancel)
 let driftMap = {};        // {camera: {match_key: {error_m, epoch, recalibrated}}}
 // Automatic-calibration review state (/api/calibration/auto/status).
 let autoRecords = {};     // {camera: auto record (without calibration)}
@@ -424,7 +444,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 (async function init(){
-  await fetchCurrentEvent(); await loadDrift(); populateMatchSelector();
+  await fetchCurrentEvent(); await loadDrift(); await loadVideos(); populateMatchSelector();
   await fetchTagMap(); drawMap(); await loadZones();
   await loadAutoStatus();
   // Manual correction opens itself for the drift-abort deep link (?match=) and
@@ -440,6 +460,24 @@ document.addEventListener('visibilitychange', () => {
 // list are per camera, so a camera switch also relabels the options.
 document.getElementById('camera').addEventListener('change', function(){ populateMatchSelector(); refreshForSelection(); });
 document.getElementById('matchSel').addEventListener('change', function(){ refreshForSelection(); });
+// Picking a video grabs a frame from it straight away (asks first when manual tags
+// would be lost; cancelling restores the previous pick).
+document.getElementById('videoSel').addEventListener('change', async function(){
+  const ok = await grabFrame();
+  if (ok === false && manualTags.length) this.value = lastVideoSel;
+  else lastVideoSel = this.value;
+});
+document.getElementById('event').addEventListener('change', async function(){
+  await loadVideos(); populateMatchSelector();
+});
+document.getElementById('videoUploadBtn').addEventListener('click', () => {
+  document.getElementById('videoUploadInput').click();
+});
+document.getElementById('videoUploadInput').addEventListener('change', function(){
+  const f = this.files && this.files[0];
+  this.value = '';
+  if (f) uploadVideo(f, false);
+});
 
 // Opening the manual editor: run any restore deferred while it was closed, and
 // redraw both canvases. (Canvas sizes come from the frame's natural size and a
@@ -470,6 +508,112 @@ function selectedMatchVideoKey(){
   const m = eventMatches.find(m => m.key === k);
   return m ? m.video_key : null;
 }
+// The server reads the match's local footage first, then its TBA stream.
+function selectedMatchHasFootage(){
+  return !!selectedMatch() && (localMatchKeys.has(selectedMatch()) || !!selectedMatchVideoKey());
+}
+// The picked video's repo-relative path ('' = the match's own video).
+function selectedVideo(){ return document.getElementById('videoSel').value; }
+
+// Human label for a frame source ({match_key, video_path}).
+function frameSourceLabel(src){
+  if (src && src.video_path){
+    const v = calibVideos.find(v => v.path === src.video_path);
+    return 'video ' + (v ? v.name : src.video_path.split('/').pop());
+  }
+  if (src && src.match_key)
+    return src.match_key + (localMatchKeys.has(src.match_key) ? ' (local footage)' : ' (TBA stream)');
+  return 'default test video';
+}
+
+function fmtBytes(n){
+  if (!(n > 0)) return '';
+  return n >= 1e9 ? (n/1e9).toFixed(2) + ' GB' : Math.round(n/1e6) + ' MB';
+}
+
+// Selectable local videos for the Video dropdown + the 💾 local-footage markers.
+async function loadVideos(selectPath){
+  const event = autoEvent();
+  try {
+    const r = await fetch('/api/calibration/videos' + (event ? '?event=' + encodeURIComponent(event) : ''));
+    if (!r.ok) return;
+    calibVideos = (await r.json()).videos || [];
+  } catch(e){ return; }
+  localMatchKeys = new Set(calibVideos.filter(v => v.match_default).map(v => v.match_key));
+  const sel = document.getElementById('videoSel');
+  const keep = selectPath || sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  [...sel.querySelectorAll('optgroup')].forEach(g => g.remove());
+  const groups = [
+    [`This event (${event || '—'})`, v => v.event_match],
+    ['Other local footage', v => !v.event_match && v.source === 'footage'],
+    ['Main-page uploads', v => !v.event_match && v.source === 'upload'],
+  ];
+  for (const [title, pick] of groups){
+    const vids = calibVideos.filter(pick);
+    if (!vids.length) continue;
+    const g = document.createElement('optgroup'); g.label = title;
+    for (const v of vids){
+      const o = document.createElement('option');
+      o.value = v.path;
+      const who = v.source === 'upload'
+        ? `${v.match_key || v.label || 'upload'} · ${v.name.slice(0, 14)}…` : v.name;
+      o.textContent = (v.event_match ? '💾 ' : '') + who + '  (' + fmtBytes(v.size)
+        + (v.source === 'footage' && v.dir !== 'test_footage' ? ', ' + v.dir : '') + ')';
+      o.title = v.path + (v.label ? ' — ' + v.label : '');
+      g.appendChild(o);
+    }
+    sel.appendChild(g);
+  }
+  if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+  else sel.value = '';
+  lastVideoSel = sel.value;
+}
+
+// Upload a video into data/test_footage/ (progress in the status line), then
+// select it and grab a frame. 409 = the name exists: ask before overwriting.
+function uploadVideo(file, force){
+  const fd = new FormData();
+  fd.append('file', file);
+  const asMatch = document.getElementById('videoUploadAsMatch').checked;
+  if (asMatch){
+    if (!selectedMatch()){ setStatus('Pick a match first to name the upload after it.', 'rms-warn'); return; }
+    fd.append('match_key', selectedMatch());
+  }
+  if (force) fd.append('force', 'true');
+  const btn = document.getElementById('videoUploadBtn');
+  btn.disabled = true;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/calibration/videos/upload');
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable)
+      setStatus(`Uploading ${file.name}: ${Math.round(100*e.loaded/e.total)}% `
+        + `(${fmtBytes(e.loaded)} / ${fmtBytes(e.total)})`, 'rms-info');
+  };
+  xhr.onerror = () => { btn.disabled = false; setStatus('Upload failed (network error).', 'rms-err'); };
+  xhr.onload = async () => {
+    btn.disabled = false;
+    let j = {};
+    try { j = JSON.parse(xhr.responseText); } catch(e){ /* non-JSON error */ }
+    if (xhr.status === 409 && j.exists){
+      if (confirm(`${j.path} already exists. Overwrite it?`)) uploadVideo(file, true);
+      else setStatus('Upload cancelled: file exists.', 'rms-warn');
+      return;
+    }
+    if (xhr.status !== 200 || j.error){
+      setStatus('Upload failed: ' + (j.error || xhr.status), 'rms-err'); return;
+    }
+    await loadVideos(j.path);
+    populateMatchSelector();
+    setStatus(`Uploaded ${j.path} (${fmtBytes(j.size)}${j.duration_s ? ', ' + j.duration_s + ' s' : ''}) — grabbing a frame…`, 'rms-info');
+    const ok = await grabFrame();
+    if (ok === false && manualTags.length) {
+      document.getElementById('videoSel').value = lastVideoSel;
+    } else lastVideoSel = document.getElementById('videoSel').value;
+  };
+  setStatus(`Uploading ${file.name}…`, 'rms-info');
+  xhr.send(fd);
+}
 
 // FRC match order (qual before playoff, then set/match number) — mirrors the
 // server's match_order.match_sort_key so the dropdown lists matches in epoch order.
@@ -488,9 +632,10 @@ function matchLabel(m){
   const rec = (driftMap[cam] || {})[m.key];
   const bad = rec && !rec.recalibrated;
   // A staged auto-fix takes the 🔧 marker (approve/reject below); an un-fixed
-  // drift keeps ❌; otherwise the play/blank video marker.
+  // drift keeps ❌; otherwise 💾 (local footage, read first) / ▶ (TBA video) / blank.
   const icon = (bad && rec.autofix_pending) ? '🔧 '
              : bad ? '❌ '
+             : localMatchKeys.has(m.key) ? '💾 '
              : (m.video_key ? '▶ ' : '');
   const suffix = bad ? `  — drift ${rec.error_m} m${rec.autofix_pending ? ' · auto-fix ready' : ''}` : '';
   return icon + lvl + `  (${m.key})` + suffix;
@@ -742,7 +887,7 @@ function usedIds(){
 // The source of the frame currently on screen. Solve overlays and tag refines
 // must read THIS frame (not the live selector/timestamp inputs) so pixel
 // correspondences always line up with what the user is looking at.
-let currentFrameSource = {match_key: null, timestamp: 75};
+let currentFrameSource = {match_key: null, video_path: null, timestamp: 75};
 
 // Resolves true once the frame is on screen; false on error, cancel, or when a
 // newer frame load superseded this one (opts.seq = the caller's ticket; a
@@ -758,22 +903,33 @@ async function grabFrame(opts){
   if (!opts.silent && manualTags.length &&
       !confirm('Grabbing a new frame clears manual tags. Continue?')) return false;
   const seq = (opts.seq != null) ? opts.seq : ++frameLoadSeq;
-  // Only ask the server for the match's video when TBA actually has one;
-  // otherwise fall back to the default source (the epoch anchor still applies).
-  const mk = (opts.matchKey !== undefined) ? opts.matchKey
-           : (selectedMatchVideoKey() ? selectedMatch() : null);
-  setStatus(mk ? `Grabbing frame from ${mk}… (first grab resolves the stream, ~5 s)`
-               : 'Grabbing frame…','rms-info');
+  // Source: an explicit opts.videoPath / opts.matchKey (restoring a saved frame),
+  // else the Video pick, else the selected match when it has footage (local or
+  // TBA); otherwise the default source (the epoch anchor still applies).
+  let vp, mk;
+  if (opts.videoPath !== undefined || opts.matchKey !== undefined){
+    vp = opts.videoPath || null;
+    mk = vp ? null : (opts.matchKey || null);
+  } else {
+    vp = selectedVideo() || null;
+    mk = vp ? null : (selectedMatchHasFootage() ? selectedMatch() : null);
+  }
+  const srcLabel = frameSourceLabel({match_key: mk, video_path: vp});
+  setStatus((mk && !localMatchKeys.has(mk))
+    ? `Grabbing frame from ${mk}… (first grab resolves the stream, ~5 s)`
+    : `Grabbing frame from ${srcLabel}…`, 'rms-info');
   try {
     const r = await fetch('/api/calibration/frame', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({timestamp:ts, camera: document.getElementById('camera').value,
-        event: autoEvent(), match_key: mk, aggregate: aggregateFrames()})});
+        event: autoEvent(), match_key: mk, video_path: vp, aggregate: aggregateFrames()})});
     const j = await r.json();
     if (seq !== frameLoadSeq) return false;
-    if (j.error){ setStatus('Frame error: '+j.error,'rms-err'); return false; }
+    if (j.error){ setStatus(`Frame error (${srcLabel}): ` + j.error,'rms-err'); return false; }
     autoTags = j.detected_tags || {}; manualTags = []; pendingPixel = null; predictedTags = {}; pairPending = null;
-    currentFrameSource = {match_key: mk, timestamp: ts};
+    currentFrameSource = {match_key: mk, video_path: vp, timestamp: ts};
+    document.getElementById('frameSource').textContent = `${srcLabel} @ ${ts} s`
+      + (j.aggregated ? ' (median)' : '');
     return await new Promise(resolve => {
       const img = new Image();
       img.onload = async function(){
@@ -786,7 +942,7 @@ async function grabFrame(opts){
         await loadMasks();
         await loadTopCrop();
         redrawFrame(); drawMap(); renderRows();
-        setStatus(`Frame grabbed. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
+        setStatus(`Frame grabbed from ${srcLabel} @ ${ts} s. ${Object.keys(autoTags).length} tags auto-detected.`,'rms-info');
         resolve(true);
       };
       img.onerror = () => resolve(false);
@@ -824,7 +980,8 @@ async function refreshForSelection(){
   const src = epoch && epoch.source;
   if (!src){ await grabFrame({silent:true, seq}); return; }
   if (src.timestamp != null) document.getElementById('timestamp').value = src.timestamp;
-  await grabFrame({matchKey: src.match_key || null, ts: src.timestamp, silent: true, seq});
+  await grabFrame({matchKey: src.match_key || null, videoPath: src.video_path || null,
+                   ts: src.timestamp, silent: true, seq});
   if (seq !== frameLoadSeq) return;
   autoTags = src.auto_tags || {};
   manualTags = src.manual_tags || [];
@@ -1063,7 +1220,8 @@ async function placeTag(id, px, preview){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({camera, timestamp: currentFrameSource.timestamp,
         u: px.u, v: px.v, id, aggregate: aggregateFrames(), event: autoEvent(),
-        match_key: currentFrameSource.match_key})});
+        match_key: currentFrameSource.match_key,
+        video_path: currentFrameSource.video_path})});
     refined = (await rr.json()).corners;   // [[u,v]x4] or null
   } catch(e) { /* centre point below */ }
   manualTags = manualTags.filter(m => m.id !== id);
@@ -1106,7 +1264,8 @@ document.getElementById('mapCanvas').addEventListener('click', async function(e)
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({camera, timestamp: currentFrameSource.timestamp,
         u: px.u, v: px.v, id: best, aggregate: aggregateFrames(), event: autoEvent(),
-        match_key: currentFrameSource.match_key})});
+        match_key: currentFrameSource.match_key,
+        video_path: currentFrameSource.video_path})});
     const jj = await rr.json();
     refined = jj.corners;   // [[u,v]x4] or null
   } catch(e) { /* fall through to manual */ }
@@ -1258,6 +1417,7 @@ async function solve(opts){
         auto_tags:autoTags, manual_tags:manualTags, holdout_ids:[...heldOut],
         start_match: startMatch,
         match_key: currentFrameSource.match_key,
+        video_path: currentFrameSource.video_path,
         lens_from: lensFrom, lens_version_id: lensVersion,
         joint_with: jointWith, joint_version_id: jointVersion,
         allow_implausible: !!opts.allowImplausible,
@@ -1650,6 +1810,7 @@ async function previewAutofix(){
     const r = await fetch('/api/calibration/autofix/preview', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({event, camera, match_key: match,
+                            video_path: selectedVideo() || null,
                             timestamp: parseFloat(document.getElementById('timestamp').value) || 75})});
     const j = await r.json();
     if (!r.ok || j.error){ st.textContent = 'Preview failed: ' + (j.error || r.status); return; }
@@ -2682,7 +2843,7 @@ async function correctManually(cam){
   // grab exactly that frame (explicit match_key: the server reads local footage).
   const ts = (rec.timestamp != null) ? Number(rec.timestamp)
            : (parseFloat(document.getElementById('timestamp').value) || 75);
-  const grabbed = await grabFrame({matchKey: rec.match_key, ts, silent: true, seq});
+  const grabbed = await grabFrame({matchKey: rec.match_key, videoPath: null, ts, silent: true, seq});
   if (seq !== frameLoadSeq) return;
   // Preload AFTER the grab (which sets autoTags to the single-frame detections).
   const tags = rec.auto_tags || {};
@@ -2690,7 +2851,7 @@ async function correctManually(cam){
   // Centre points the automatic locator found for undecoded tags.
   manualTags = (rec.manual_tags || []).map(m => ({id: m.id, u: m.u, v: m.v}));
   heldOut = new Set(); pendingPixel = null;
-  currentFrameSource = {match_key: rec.match_key, timestamp: ts};
+  currentFrameSource = {match_key: rec.match_key, video_path: null, timestamp: ts};
   // Where the automatic candidate predicts every tag: one click near a label places it.
   predictedTags = {};
   try {

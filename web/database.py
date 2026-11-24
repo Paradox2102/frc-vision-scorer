@@ -756,6 +756,19 @@ async def list_replays() -> List[Dict]:
         return rows
 
 
+async def replay_source_videos() -> List[Dict]:
+    """{source_video_path, match_key, label, created_at} of every replay with a
+    source video, newest first (read-only) — /calibrate labels main-page uploads
+    (web/uploads/video_<md5>.<ext>) with the match they were run as."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT source_video_path, match_key, label, created_at FROM replays "
+            "WHERE source_video_path IS NOT NULL AND source_video_path != '' "
+            "ORDER BY created_at DESC, id DESC")
+        return [dict(r) for r in await cursor.fetchall()]
+
+
 async def get_replay(replay_id: str) -> Optional[Dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

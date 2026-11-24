@@ -5,7 +5,9 @@ Fetches event info, match schedules, team lists, and score breakdowns.
 
 import os
 import re
+import json
 import httpx
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 TBA_BASE_URL = "https://www.thebluealliance.com/api/v3"
@@ -35,6 +37,29 @@ def parse_event_key(url_or_key: str) -> str:
         return match.group(1)
     # Assume it's already a key
     return url_or_key.strip().strip('/')
+
+
+LOCAL_EVENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "local_events"
+
+
+def load_local_event(event_key: str) -> Optional[Dict]:
+    """Return raw TBA-shaped {event, matches, teams} from a local fixture, or None.
+
+    Fixtures (data/local_events/<event_key>.json) let simulated events that TBA
+    doesn't know be loaded. The key must be a plain [A-Za-z0-9_] token so it
+    can't escape the fixture directory.
+    """
+    if not re.fullmatch(r'[A-Za-z0-9_]+', event_key or ''):
+        return None
+    path = LOCAL_EVENTS_DIR / f"{event_key}.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text())
+    return {
+        'event': data.get('event') or {'key': event_key, 'name': event_key},
+        'matches': data.get('matches') or [],
+        'teams': data.get('teams') or [],
+    }
 
 
 async def tba_get(endpoint: str) -> Any:
@@ -123,10 +148,13 @@ async def load_event_data(url_or_key: str) -> Dict:
     """
     event_key = parse_event_key(url_or_key)
 
-    # Fetch event info and matches in parallel
-    event_info = await get_event(event_key)
-    matches_raw = await get_event_matches(event_key)
-    teams_raw = await get_event_teams(event_key)
+    local = load_local_event(event_key)
+    if local:
+        event_info, matches_raw, teams_raw = local['event'], local['matches'], local['teams']
+    else:
+        event_info = await get_event(event_key)
+        matches_raw = await get_event_matches(event_key)
+        teams_raw = await get_event_teams(event_key)
 
     # Build team lookup
     teams = {}

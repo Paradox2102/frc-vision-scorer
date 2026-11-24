@@ -1485,6 +1485,16 @@ KNOBS = [
     # final (window) labels, not the live ones. HUD_POST_RENDER=0 to disable.
     Knob("hud_post_render", "HUD_POST_RENDER", bool, True,
          section="Streaming & output"),
+    # --- uploads (web/gdrive_upload.py) ---
+    # When the job completes, upload the match's scouting export file and
+    # refresh the event export in a Google Drive folder via rclone
+    # (GDRIVE_FOLDER_ID / GDRIVE_RCLONE_REMOTE in .env). Background, never
+    # fails the job; a host without rclone or a folder id logs a skip.
+    # gdrive_upload_video also uploads the HUD replay video (after the
+    # post-render when hud_post_render is on); it needs gdrive_upload too.
+    # Backfill / re-send: scripts/upload_gdrive.py.
+    Knob("gdrive_upload", "GDRIVE_UPLOAD", bool, False, section="Uploads"),
+    Knob("gdrive_upload_video", "GDRIVE_UPLOAD_VIDEO", bool, False, section="Uploads"),
 ]
 
 _BY_NAME = {k.name: k for k in KNOBS}

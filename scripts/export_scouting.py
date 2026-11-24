@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -25,6 +24,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from web.scouting import api  # noqa: E402
+from web.scouting.export import pretty  # noqa: E402
 
 
 def _write(out: Path, text: str) -> None:
@@ -32,18 +32,6 @@ def _write(out: Path, text: str) -> None:
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(text)
     tmp.replace(out)
-
-
-_NUM_LIST = re.compile(r"\[\s+([-\d.eE+,\s]+?)\s+\]")
-_PAIR_LIST = re.compile(r"\[\s+(\[-?\d+, -?\d+\](?:,\s+\[-?\d+, -?\d+\])*)\s+\]")
-
-
-def pretty(obj) -> str:
-    """Indented JSON with lists of numbers (and of index pairs) on one line."""
-    txt = json.dumps(obj, indent=2)
-    txt = _NUM_LIST.sub(lambda m: "[" + ", ".join(x.strip() for x in m.group(1).split(",")) + "]", txt)
-    txt = _PAIR_LIST.sub(lambda m: "[" + re.sub(r",\s+", ", ", m.group(1)) + "]", txt)
-    return txt + "\n"
 
 
 def write_per_match(event_key: str, match_keys: list, out_dir: Path) -> int:

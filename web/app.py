@@ -1713,6 +1713,9 @@ class InferenceJob:
         # drawn on the field map, kept for meta.summary.hud_static.
         self._replay_draw_list = False
         self._replay_render_pending = False
+        # gdrive_upload knob: set at replay save, used once the identity rows exist.
+        self._gdrive_after_finalize = False
+        self._gdrive_video_path = None
         self._radar_reference_paths: list = []
         self.calib = None
         self.field_model = None
@@ -11414,6 +11417,16 @@ class InferenceJob:
                     # segments and its fingerprint-keyed cache would otherwise
                     # keep a load without them.
                     self._roborecon_push_pending = bool(status == "complete" and self.match_key)
+                    # gdrive_upload: upload once the identity rows exist (below),
+                    # since the per-match export reads them.
+                    try:
+                        self._gdrive_after_finalize = (
+                            status == "complete" and bool(self.match_key)
+                            and bool(getattr(self.config, "gdrive_upload", False)))
+                        self._gdrive_video_path = artifacts.get("video_path")
+                    except Exception as e:
+                        self._gdrive_after_finalize = False
+                        print(f"[gdrive] upload not queued: {e}")
                     # hud_post_render: render once the identity rows exist (below).
                     self._replay_render_pending = bool(self._replay_draw_list)
             except Exception as e:
@@ -11491,7 +11504,32 @@ class InferenceJob:
                 except Exception as e:
                     print(f"  [identity-segments] segment persist failed ({e})")
             self._schedule_roborecon_push()
+            # Before the render is queued: _queue_hud_render clears
+            # _replay_render_pending, which decides where the video comes from.
+            self._schedule_gdrive_upload()
             await self._queue_hud_render()
+
+    def _schedule_gdrive_upload(self) -> None:
+        """gdrive_upload knob: queue the match file + event export upload
+        (and, with gdrive_upload_video, the HUD video: now when it already
+        exists, else once its post-render finishes). Background, never raises."""
+        if not getattr(self, "_gdrive_after_finalize", False):
+            return
+        self._gdrive_after_finalize = False
+        try:
+            from web import gdrive_upload
+            if not gdrive_upload.schedule_match(self.event_key, self.match_key):
+                return
+            print(f"[gdrive] upload queued for {self.event_key}/{self.match_key}")
+            if getattr(self.config, "gdrive_upload_video", False):
+                if getattr(self, "_replay_render_pending", False):
+                    gdrive_upload.expect_video_after_render(
+                        self.job_id, self.event_key, self.match_key)
+                else:
+                    gdrive_upload.schedule_video(self.event_key, self.match_key,
+                                                 getattr(self, "_gdrive_video_path", None))
+        except Exception as e:
+            print(f"[gdrive] upload not queued: {e}")
 
     def _replay_row_render_fields(self) -> dict:
         """hud_post_render: the replay row is inserted already ``queued``, so
@@ -11611,6 +11649,7 @@ async def _run_render(replay_id: str) -> None:
             await database.set_render_status(replay_id, "render_failed",
                                              f"timeout after {timeout:g} s")
             print(f"[hud-render] {replay_id}: render_failed (timeout after {timeout:g} s)")
+            _gdrive_render_done(replay_id, "render_failed", None)
             return
         rc = proc.returncode
         tail = " | ".join((out or b"").decode(errors="replace").strip().splitlines()[-3:])
@@ -11627,6 +11666,18 @@ async def _run_render(replay_id: str) -> None:
             await database.set_render_status(replay_id, status,
                                              f"renderer exited {rc}: {tail[-300:]}")
     print(f"[hud-render] {replay_id}: {status}")
+    # The renderer wrote the final video_path into the row read above.
+    _gdrive_render_done(replay_id, status, row.get("video_path"))
+
+
+def _gdrive_render_done(replay_id: str, status, video_path) -> None:
+    """gdrive_upload_video: hand a finished render's video to the uploader
+    (a no-op unless the job registered it). Never raises."""
+    try:
+        from web import gdrive_upload
+        gdrive_upload.on_render_done(replay_id, status, video_path)
+    except Exception as e:
+        print(f"[gdrive] {replay_id}: video not queued: {e}")
 
 
 async def _render_worker(q: asyncio.Queue) -> None:
@@ -11743,6 +11794,14 @@ async def active_job():
                 "match_key": getattr(job, "match_key", None),
             }
     return {"job_id": None}
+
+
+@app.get("/api/gdrive/status")
+def gdrive_status():
+    """Google Drive upload config (no folder id echoed) + uploads in flight
+    and the last result per event (web/gdrive_upload.py)."""
+    from web import gdrive_upload
+    return gdrive_upload.status()
 
 
 @app.get("/api/settings")

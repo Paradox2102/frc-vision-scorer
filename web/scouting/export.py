@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Protocol
@@ -438,6 +439,18 @@ def filter_team(env: dict, team) -> dict:
     out["teams"] = {key: env["teams"][key]} if key in env.get("teams", {}) else {}
     return out
 
+
+_NUM_LIST = re.compile(r"\[\s+([-\d.eE+,\s]+?)\s+\]")
+_PAIR_LIST = re.compile(r"\[\s+(\[-?\d+, -?\d+\](?:,\s+\[-?\d+, -?\d+\])*)\s+\]")
+
+
+def pretty(obj) -> str:
+    """Indented JSON with lists of numbers (and of index pairs) on one line
+    (the single-match file format: scripts/export_scouting.py --per-match)."""
+    txt = json.dumps(obj, indent=2)
+    txt = _NUM_LIST.sub(lambda m: "[" + ", ".join(x.strip() for x in m.group(1).split(",")) + "]", txt)
+    txt = _PAIR_LIST.sub(lambda m: "[" + re.sub(r",\s+", ", ", m.group(1)) + "]", txt)
+    return txt + "\n"
 
 class Sink(Protocol):
     """Somewhere metric envelopes go. ``push`` returns a small status dict."""

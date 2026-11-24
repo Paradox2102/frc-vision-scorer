@@ -1192,6 +1192,47 @@ In TypeScript/Node, use Ajv 8's draft 2020-12 build (`import Ajv2020 from
 "ajv/dist/2020"`). Add `ajv-formats` so the `date-time` and `uri` formats are
 known.
 
+## Uploading results to Google Drive
+
+For operators: the app can copy each analysed match's files to a Google Drive
+folder with [rclone](https://rclone.org/drive/), so readers get them without
+running the export script.
+
+**Setup.** `rclone config` → new remote of type `drive`. In the repo `.env`, set
+`GDRIVE_FOLDER_ID` to the last part of the Drive folder's URL
+(`drive.google.com/drive/folders/<ID>`) and, if the remote isn't called
+`gdrive`, `GDRIVE_RCLONE_REMOTE=<name>:`. Check it with
+`.venv/bin/python scripts/upload_gdrive.py --check`.
+
+**Per job.** Turn on the `gdrive_upload` knob (settings page, section
+"Uploads"; `GDRIVE_UPLOAD=1` in `.env` makes it the default). When a match
+analysis completes, its single-match file is uploaded and the event export is
+refreshed. `gdrive_upload_video` also uploads the HUD replay video, after the
+HUD render finishes. A whole event:
+`swarm run --name <name> --local --config-json '{"gdrive_upload": true}'`. Uploads run in the
+background and never fail the job; `GET /api/gdrive/status` shows the last
+result per event, and the server log has `[gdrive]` lines.
+
+**Layout** inside the folder (re-uploads replace the file in place, so links
+stay the same):
+
+```
+<event>/<event>_scouting_export.json        the event export (this format)
+<event>/<event>_matches/<match_key>.json    the single-match file
+<event>/videos/<match_key>.mp4              HUD replay video (gdrive_upload_video)
+```
+
+**Backfill / re-send** (also for results from remote GPU runs imported locally):
+
+```sh
+.venv/bin/python scripts/upload_gdrive.py 2026cur --dry-run
+.venv/bin/python scripts/upload_gdrive.py 2026cur                 # every match + event export
+.venv/bin/python scripts/upload_gdrive.py 2026cur --match 2026cur_qm8 --video
+```
+
+A server restart drops videos still waiting for their render; re-send them
+with `--video`.
+
 ## Gotchas checklist
 
 * `envelopes[*].sources` is sorted by **string** (`qm1, qm10, qm100, …`). Use

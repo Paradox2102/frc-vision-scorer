@@ -2640,6 +2640,7 @@ function autoMethodText(rec){
     case 'full_solve':   return `Full solve from ${n != null ? n : '?'} tags`;
     case 'verify':       return 'Existing calibration verified';
     case 'pose_resolve': return "Pose re-solved against the event's lens";
+    case 'operator_confirm': return 'Existing calibration confirmed by the operator';
     default:             return rec.status === 'running' ? 'Calibrating…' : '';
   }
 }
@@ -2742,6 +2743,17 @@ function renderAutoCard(cam, rec){
       ok.onclick = () => confirmAuto(cam);
       actions.appendChild(ok);
     }
+    // "Looks right": keep the camera's existing epoch as is (no new version). Only
+    // when there IS an epoch — a failed fresh solve has nothing to keep.
+    if ((st === 'failed' || st === 'ready') && rec.epoch){
+      const good = _el('button', null, 'Confirm good');
+      good.title = `Keep epoch ${rec.epoch} as is — no new version is saved, and later `
+        + 'event loads leave this camera alone (Re-run still re-checks it)'
+        + (rec.overlay_of === 'candidate'
+           ? '. Note: the overlay shows this run\'s re-solved candidate, not that epoch.' : '');
+      good.onclick = () => acceptAuto(cam);
+      actions.appendChild(good);
+    }
     const man = _el('button', null, 'Correct manually');
     man.onclick = () => correctManually(cam);
     const rerun = _el('button', null, 'Re-run');
@@ -2780,6 +2792,18 @@ async function confirmAuto(cam){
       else manualStale = true;
     }
   } catch(e){ setAutoCardMsg(cam, 'Confirm error: ' + e.message, true); }
+}
+
+// "Confirm good": mark the camera's existing epoch operator-confirmed (no new version).
+async function acceptAuto(cam){
+  const event = autoEvent();
+  setAutoCardMsg(cam, 'Saving…');
+  try {
+    const {j, err} = await _postJson('/api/calibration/auto/accept', {event, camera: cam});
+    if (err){ setAutoCardMsg(cam, 'Confirm good failed: ' + err, true); return; }
+    setAutoCardMsg(cam, `Kept epoch ${j.epoch} ✓`);
+    await loadAutoStatus();
+  } catch(e){ setAutoCardMsg(cam, 'Confirm good error: ' + e.message, true); }
 }
 
 // Re-run one camera (cam) or all of them (no cam). force re-runs ready /

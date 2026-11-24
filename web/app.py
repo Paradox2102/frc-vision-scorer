@@ -12869,7 +12869,9 @@ def _auto_calib_mark_manual(event: str, camera: str, version_id: str) -> None:
     """A manual solve-tags save resolves a ready/failed auto record for the camera."""
     try:
         rec = field_store.load_auto_record(event, camera)
-        if rec and rec.get("status") in ("ready", "failed"):
+        # an operator-accepted epoch ("Confirm good") is superseded by the new version
+        if rec and (rec.get("status") in ("ready", "failed")
+                    or rec.get("method") == auto_calibrate.OPERATOR_CONFIRM_METHOD):
             field_store.update_auto_record(
                 event, camera, status="confirmed", reason="corrected manually",
                 resolved_version=version_id, resolved_at=_auto_calib_now())
@@ -12995,8 +12997,12 @@ def _auto_calib_cfg(camera: str, fm) -> "auto_calibrate.AutoCalibConfig":
     drift gate: a corner "verified" at 0.48 m (2026hop qm4) is not usable."""
     gate = (CALIB_DRIFT_MAX_M if camera == "main"
             else min(CALIB_DRIFT_MAX_M, float(JobConfig().corner_check_max_m)))
+    # verify_min_tags mirrors the job's per-match check (CALIB_CHECK_MIN_TAGS tags
+    # under the same gate): verifying an existing epoch on 2-tag frames is what the
+    # job itself accepts, so the review card must not call that epoch failed.
     return auto_calibrate.AutoCalibConfig(
-        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
+        min_tags=3, check_min_tags=CALIB_CHECK_MIN_TAGS,
+        verify_min_tags=CALIB_CHECK_MIN_TAGS, drift_max_m=gate,
         field_season=getattr(fm, "season", "") or _AUTO_CALIB_SEASON)
 
 
@@ -13415,6 +13421,71 @@ async def calibration_auto_dismiss(request: Request):
     rec = field_store.update_auto_record(event, camera, status="failed",
                                          reason="dismissed — calibrate manually")
     return {"status": "ok", "record": _auto_calib_public(rec)}
+
+
+def _json_content_type(request: Request) -> bool:
+    """True when the request body is declared application/json. A cross-site page
+    can only send that with a CORS preflight, which this app never grants (no CORS
+    middleware) — so a JSON-only state-changing route needs no extra CSRF token."""
+    ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    return ct == "application/json"
+
+
+@app.post("/api/calibration/auto/accept")
+async def calibration_auto_accept(request: Request):
+    """"Confirm good": the operator says the camera's EXISTING epoch (the record's
+    ``epoch``) looks right although the auto run came out failed / ready. Marks the
+    record ``confirmed`` (settled: a later event load never re-runs it; Re-run /
+    force still does) WITHOUT saving a calibration version; metrics, overlay and the
+    auto run's verdict stay on the record. Body (application/json only — the CSRF
+    guard): {event, camera}."""
+    if not _json_content_type(request):
+        return JSONResponse(status_code=415, content={
+            "error": "Content-Type must be application/json"})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "body must be an object"})
+    event = body.get("event"); camera = body.get("camera", "main")
+    rec = field_store.load_auto_record(event, camera) if event else None
+    if rec is None:
+        return JSONResponse(status_code=404, content={"error": "no auto-calibration record"})
+    st = rec.get("status")
+    if st == "running":
+        return JSONResponse(status_code=409, content={
+            "error": "auto-calibration is still running for this camera"})
+    if st not in ("failed", "ready"):
+        return JSONResponse(status_code=400, content={
+            "error": f"only a failed or ready record can be confirmed as is (status: {st})"})
+    epoch = rec.get("epoch")
+    if not epoch:
+        return JSONResponse(status_code=400, content={
+            "error": "this camera has no existing calibration epoch to keep — "
+                     "correct it manually or re-run"})
+    versions = field_store.load_versions(event, camera)
+    if not any(v.get("version_id") == epoch for v in versions):
+        return JSONResponse(status_code=409, content={
+            "error": f"epoch {epoch} no longer exists — re-run auto-calibration"})
+    cur = select_epoch(versions, rec.get("match_key"))
+    if cur is not None and cur.get("version_id") != epoch:
+        return JSONResponse(status_code=409, content={
+            "error": f"{rec.get('match_key')} is now covered by version "
+                     f"{cur.get('version_id')}, not epoch {epoch} — re-run auto-calibration"})
+    now = _auto_calib_now()
+    prior = rec.get("reason") or ""
+    rec = field_store.update_auto_record(
+        event, camera, status="confirmed", method=auto_calibrate.OPERATOR_CONFIRM_METHOD,
+        reason=(f"operator confirmed epoch {epoch} looks right — kept as is, no new "
+                f"version saved (auto run said {st}"
+                + (f" ({rec.get('method')}): {prior}" if prior else f" ({rec.get('method')})")
+                + ")"),
+        resolved_at=now,
+        operator_confirmed={"epoch": epoch, "at": now, "from_status": st,
+                            "from_method": rec.get("method")})
+    print(f"[auto-calib] {event}/{camera}: operator confirmed epoch {epoch} (was {st})")
+    return {"status": "ok", "epoch": epoch, "record": _auto_calib_public(rec)}
 
 
 # --- Per-match corner calibration log ----------------------------------------

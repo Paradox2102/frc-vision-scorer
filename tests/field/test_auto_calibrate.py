@@ -126,6 +126,85 @@ def test_verify_drifted_then_pose_resolve_ready(tmp_path):
     assert "misaligned" in rec["reason"]
 
 
+def _shared_tags(*cams, k=2):
+    common = set.intersection(*(set(project_tag_corners(c, FM)) for c in cams))
+    return sorted(common)[:k]
+
+
+def test_verify_two_tag_frames_verify_existing_epoch(tmp_path):
+    # A corner that only ever decodes the hub-front pair: no frame shows 3 tags, but
+    # VERIFYING an existing epoch (nothing new solved) accepts 2-tag frames.
+    cam = truth_pinhole_camera()
+    two = _shared_tags(cam)
+    res = ac.run_camera(_video(tmp_path), "evt_qm8", "corner_left", CROP, FM,
+                        versions=[_version(cam, "v1")], detect_fn=_detector(cam, only=two))
+    rec = res.record
+    assert rec["status"] == "verified" and rec["method"] == "verify", rec["reason"]
+    assert rec["epoch"] == "v1" and rec["calibration"] is None
+    assert rec["reason"].startswith("existing calibration verified on 2 tags")
+    m = rec["metrics"]
+    assert m["val_gate_best_m"] is None and m["val_gate_tags"] == 0
+    assert m["val_verify_gate_tags"] == 2 and m["val_verify_gate_best_m"] < 0.05
+
+
+def test_verify_two_tags_misaligned_still_fails(tmp_path):
+    base = truth_pinhole_camera()
+    moved = truth_pinhole_camera(target=(10.0, 4.03, 0.0))
+    two = _shared_tags(base, moved)
+    res = ac.run_camera(_video(tmp_path), "evt_qm9", "corner_left", CROP, FM,
+                        versions=[_version(base, "v1")],
+                        detect_fn=_detector(moved, only=two))
+    rec = res.record
+    assert rec["status"] == "failed" and rec["method"] == "pose_resolve"
+    assert "misaligned" in rec["reason"] and "2-tag frames" in rec["reason"]
+    # ...and the pose re-solve that would follow still needs 3 tags
+    assert "only 2 known tags found (need >= 3)" in rec["reason"]
+    assert rec["metrics"]["val_verify_gate_best_m"] >= 0.5
+
+
+def test_verify_single_tag_never_verifies(tmp_path):
+    cam = truth_pinhole_camera()
+    one = _shared_tags(cam, k=1)
+    for vmt in (2, 1, 0):                    # the floor holds even if misconfigured
+        cfg = ac.AutoCalibConfig(verify_min_tags=vmt)
+        res = ac.run_camera(_video(tmp_path), "evt_qm8", "corner_left", CROP, FM,
+                            versions=[_version(cam, "v1")], cfg=cfg,
+                            detect_fn=_detector(cam, only=one))
+        assert res.record["status"] == "failed", vmt
+        assert "could not verify" in res.record["reason"]
+
+
+def test_two_tag_verify_does_not_apply_to_forced_resolve_or_full_solve(tmp_path):
+    cam = truth_pinhole_camera()
+    two = _shared_tags(cam)
+    # force_resolve (the job's per-match step) solves a NEW pose: still needs 3
+    forced = ac.run_camera(_video(tmp_path), "evt_qm8", "corner_left", CROP, FM,
+                           versions=[_version(cam, "v1")], force_resolve=True,
+                           detect_fn=_detector(cam, only=two))
+    assert forced.record["status"] == "failed"
+    assert "need >= 3" in forced.record["reason"]
+    # no epoch: a full solve from 2 tags is never ready
+    fresh = ac.run_camera(_video(tmp_path), "evt_qm8", "corner_left", CROP, FM,
+                          versions=[], detect_fn=_detector(cam, only=two))
+    assert fresh.record["status"] == "failed" and fresh.record["method"] == "full_solve"
+    assert "need >= 3" in fresh.record["reason"]
+
+
+def test_three_tag_frames_decide_over_two_tag_frames(tmp_path, monkeypatch):
+    # When a frame shows min_tags tags its (misaligned) verdict wins over a better
+    # 2-tag frame: stronger evidence decides.
+    cam = truth_pinhole_camera()
+    vals = {"best_m": 0.01, "median_m": 0.4, "worst_m": 0.9, "frames": 5,
+            "gate_best_m": 0.8, "gate_tags": 3,
+            "verify_gate_best_m": 0.01, "verify_gate_tags": 2}
+    monkeypatch.setattr(ac, "validate_across_window", lambda *a, **k: dict(vals))
+    res = ac.run_camera(_video(tmp_path), "evt_qm8", "corner_left", CROP, FM,
+                        versions=[_version(cam, "v1")],
+                        detect_fn=_detector(cam, only=_shared_tags(cam)))
+    assert res.record["status"] != "verified"
+    assert "misaligned" in res.record["reason"] and "0.80" in res.record["reason"]
+
+
 def test_verify_drifted_homography_epoch_fails(tmp_path):
     hom = CameraCalibration(mode="homography", H=np.eye(3), image_size=(1920, 1080),
                             field_season="2026-rebuilt-welded")

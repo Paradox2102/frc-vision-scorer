@@ -247,9 +247,17 @@ def test_solve_tags_stores_video_path_in_source(env):
 
 # ------------------------------------------------------------------ upload
 
-def _upload(client, name, data, **form):
+def _upload(client, name, data, headers=None, **form):
     return client.post("/api/calibration/videos/upload",
-                       files={"file": (name, data, "video/mp4")}, data=form)
+                       files={"file": (name, data, "video/mp4")}, data=form,
+                       headers={"X-FRC-Calibrate": "1"} if headers is None else headers)
+
+
+def test_upload_requires_csrf_header(env):
+    src = _video(env["tmp"] / "src.mp4").read_bytes()
+    r = _upload(env["client"], "nohdr.mp4", src, headers={})
+    assert r.status_code == 403
+    assert not any(p.name.startswith("nohdr") for p in env["tmp"].rglob("*"))
 
 
 def test_upload_sanitises_name_and_refuses_overwrite(env):

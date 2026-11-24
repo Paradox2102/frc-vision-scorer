@@ -585,6 +585,7 @@ function uploadVideo(file, force){
   btn.disabled = true;
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/calibration/videos/upload');
+  xhr.setRequestHeader('X-FRC-Calibrate', '1');  // CSRF guard (server requires it)
   xhr.upload.onprogress = (e) => {
     if (e.lengthComputable)
       setStatus(`Uploading ${file.name}: ${Math.round(100*e.loaded/e.total)}% `

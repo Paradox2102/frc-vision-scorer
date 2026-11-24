@@ -12447,13 +12447,21 @@ def _sanitize_calib_video_name(filename: str, match_key: Optional[str]):
 
 
 @app.post("/api/calibration/videos/upload")
-async def calibration_video_upload(file: UploadFile = File(...),
+async def calibration_video_upload(request: Request,
+                                   file: UploadFile = File(...),
                                    match_key: Optional[str] = Form(None),
                                    force: bool = Form(False)):
     """Save an uploaded video into data/test_footage/ for /calibrate. The name is
     sanitised (``match_key`` given: renamed to <match_key>.<ext>, so an .mp4 becomes
     that match's local footage). 409 when the file exists unless ``force``. Streams
-    to a hidden .part file and renames once the video is known to decode."""
+    to a hidden .part file and renames once the video is known to decode.
+
+    CSRF guard: a plain multipart form POST needs no CORS preflight, so any web
+    page could otherwise write (or, with ``force``, overwrite) pipeline footage.
+    Requiring a custom header forces a preflight, which this app (no CORS
+    middleware) never grants to other origins."""
+    if request.headers.get("x-frc-calibrate") != "1":
+        return JSONResponse(status_code=403, content={"error": "missing X-FRC-Calibrate header"})
     mk = (match_key or "").strip() or None
     name, err = _sanitize_calib_video_name(file.filename, mk)
     if err:

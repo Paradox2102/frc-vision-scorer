@@ -92,10 +92,8 @@ DEFAULT_SIM_DIR = REPO / "data" / "sim_qm8"
 FOOTAGE_DIR = REPO / "data" / "test_footage"
 TRUTH_NAME = "truth-1080p60.json"
 IMAGE_TRUTH_NAME = "image-truth-1080p60.json"
-SCRATCH = Path(os.environ.get(
-    "MANTA_SCRATCH",
-    "/tmp/claude-1000/-home-nick-AI-frc-vision-scorer/"
-    "46093ffc-0ecb-4587-89e2-3ef6a0cad7bb/scratchpad/sim"))
+# Where validation overlay JPEGs go (override with MANTA_SCRATCH).
+SCRATCH = Path(os.environ.get("MANTA_SCRATCH", str(REPO / "data" / "eval" / "sim_overlays")))
 
 # our camera name -> sim panel name
 CAMERAS = {"main": "main", "corner_left": "blueCorner", "corner_right": "redCorner"}

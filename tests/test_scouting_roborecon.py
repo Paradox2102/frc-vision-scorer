@@ -1,10 +1,12 @@
 """RoboReconSink (HTTP push to RoboRecon) and auto-push after analysis.
 No network: a fake session records requests and replays canned responses."""
+import inspect
 import json
 import threading
 
 import pytest
 
+import web.app as app_mod
 from web.scouting import autopush, export
 from web.scouting.export import RoboReconError, RoboReconSink, _batches
 
@@ -226,3 +228,44 @@ def test_autopush_failure_is_logged_not_raised(monkeypatch, autopush_on, capsys)
     last = autopush.status()["last"]["2026cur"]
     assert last["ok"] is False and "401" in last["error"]
     assert "auto-push 2026cur failed" in capsys.readouterr().out
+
+
+def _bare_job(**attrs):
+    job = app_mod.InferenceJob.__new__(app_mod.InferenceJob)
+    for k, v in attrs.items():
+        setattr(job, k, v)
+    return job
+
+
+def test_job_schedules_autopush_only_when_pending_and_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(autopush, "schedule", lambda ek: calls.append(ek) or True)
+    job = _bare_job(event_key="2026cur", _roborecon_push_pending=False)
+    job._schedule_roborecon_push()
+    assert calls == []
+    job._roborecon_push_pending = True
+    job._schedule_roborecon_push()
+    job._schedule_roborecon_push()
+    assert calls == ["2026cur"] and job._roborecon_push_pending is False
+    _bare_job(event_key="2026cur")._schedule_roborecon_push()
+    assert calls == ["2026cur"]
+
+
+def test_job_autopush_failure_never_raises(monkeypatch, capsys):
+    def boom(ek):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(autopush, "schedule", boom)
+    job = _bare_job(event_key="2026cur", _roborecon_push_pending=True)
+    job._schedule_roborecon_push()
+    assert job._roborecon_push_pending is False
+    assert "auto-push not queued" in capsys.readouterr().out
+
+
+def test_finalize_pushes_after_identity_segments_are_saved():
+    src = inspect.getsource(app_mod.InferenceJob.process_video)
+    assert "_autopush.schedule(" not in src
+    assert (src.index("replace_match_identity_segments")
+            < src.index("self._schedule_roborecon_push()")
+            < src.index("await self._queue_hud_render()"))
+    assert src.index("database.insert_replay(") < src.index("self._roborecon_push_pending =")

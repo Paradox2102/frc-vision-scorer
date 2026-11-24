@@ -11409,15 +11409,11 @@ class InferenceJob:
                         **self._replay_row_render_fields(),
                     })
                     print(f"[replay] saved replay {self.job_id}: {artifacts['frame_count']} frames, status={status}")
-                    # Send the event's refreshed metrics to RoboRecon (opt-in via
-                    # ROBORECON_AUTO_PUSH; background thread, never raises).
-                    if status == "complete" and self.match_key:
-                        try:
-                            from web.scouting import autopush as _autopush
-                            if _autopush.schedule(self.event_key):
-                                print(f"[roborecon] auto-push queued for {self.event_key}")
-                        except Exception as e:
-                            print(f"[roborecon] auto-push not queued: {e}")
+                    # RoboRecon auto-push is scheduled once the identity rows +
+                    # segments are saved (below): the scouting loader reads the
+                    # segments and its fingerprint-keyed cache would otherwise
+                    # keep a load without them.
+                    self._roborecon_push_pending = bool(status == "complete" and self.match_key)
                     # hud_post_render: render once the identity rows exist (below).
                     self._replay_render_pending = bool(self._replay_draw_list)
             except Exception as e:
@@ -11494,6 +11490,7 @@ class InferenceJob:
                         for sid, rows in sorted(segs.items()) for sg in rows])
                 except Exception as e:
                     print(f"  [identity-segments] segment persist failed ({e})")
+            self._schedule_roborecon_push()
             await self._queue_hud_render()
 
     def _replay_row_render_fields(self) -> dict:
@@ -11502,6 +11499,21 @@ class InferenceJob:
         the queue picks it up leaves a row the startup sweep re-enqueues.
         Knob off: nothing (render_status stays NULL, the row is unchanged)."""
         return {"render_status": "queued"} if getattr(self, "_replay_draw_list", False) else {}
+
+    def _schedule_roborecon_push(self) -> None:
+        """RoboRecon auto-push (opt-in via ROBORECON_AUTO_PUSH; background
+        thread): scheduled once the replay row AND the identity rows/segments
+        are saved, since the scouting loader reads the segments and caches the
+        load on a fingerprint the segment write doesn't change. Never raises."""
+        if not getattr(self, "_roborecon_push_pending", False):
+            return
+        self._roborecon_push_pending = False
+        try:
+            from web.scouting import autopush as _autopush
+            if _autopush.schedule(self.event_key):
+                print(f"[roborecon] auto-push queued for {self.event_key}")
+        except Exception as e:
+            print(f"[roborecon] auto-push not queued: {e}")
 
     async def _queue_hud_render(self) -> None:
         """hud_post_render: queue the HUD render once the replay row and the

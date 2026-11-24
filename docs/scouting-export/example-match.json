@@ -1,18 +1,163 @@
 {
-  "_note": "ABRIDGED example built from data/exports/2026cur_scouting_export.json: one match (2026cur_qm8) and one team (3128) per envelope. Lists (matches, cells, points, clusters, episode_list, ranking, sources) are cut down, so counts such as n_matches do not match the list lengths here. Keys starting with '_' are not part of the format. Each robots[].path keeps only its first 8 points (n_points and seen_s are the real totals).",
+  "_note": "ABRIDGED example built from data/exports/2026cur_scouting_export.json (schema_version 3): one match (2026cur_qm8) and one team (3128) per envelope. Lists (matches, cells, points, clusters, episode_list, ranking, sources) are cut down, so counts such as n_matches do not match the list lengths here. Keys starting with '_' are not part of the format. Each robots[].path keeps only its first 8 points (n_points, seen_s and camera_s are the real totals), each robot only its first 3 identity rows, unidentified only 2 pieces of 5 points (n_points etc. real), and cameras only the versions qm8 used. The envelopes' values come from an earlier analysis of qm8 than the match row.",
   "schema": "frc-vision-scorer.scouting-export",
-  "schema_version": 2,
+  "schema_version": 3,
   "event_key": "2026cur",
   "year": 2026,
-  "generated_at": "2026-11-20T23:04:11+00:00",
+  "generated_at": "2026-11-24T06:39:36+00:00",
   "path_frame": {
     "units": "m",
-    "field_m": [
-      16.541,
-      8.069
-    ],
+    "field_m": [16.541, 8.069],
     "perspective": "absolute",
     "note": "WPILib field coordinates: origin at the blue alliance wall's right corner (as seen from the blue driver station), +x toward the red wall, +y to the left; the same for red and blue robots"
+  },
+  "camera_legend": [
+    "main",
+    "corner_left",
+    "corner_right"
+  ],
+  "cameras": {
+    "main": {
+      "versions": {
+        "20261107-123640-609878": {
+          "version_id": "20261107-123640-609878",
+          "created_at": "2026-11-07T12:36:40",
+          "label": "lens+pose refit (qm8 pose, valid qm7-qm22+)",
+          "start_match": "2026cur_qm7",
+          "rejected": false,
+          "mode": "pinhole",
+          "field_season": "2026-rebuilt-welded",
+          "image_size": [1920, 723],
+          "crop_region": null,
+          "rms_error_px": 4.04,
+          "intrinsics": {
+            "fx": 1309.402,
+            "fy": 1352.647,
+            "cx": 898.37,
+            "cy": 443.702,
+            "K": [
+              [1309.401817, 0.0, 898.370417],
+              [0.0, 1352.646547, 443.702226],
+              [0.0, 0.0, 1.0]
+            ]
+          },
+          "distortion": {
+            "model": "opencv_pinhole",
+            "coefficients": [-0.38450517, 0.13247558, 0.0, 0.0, 0.0],
+            "edge_shift_px": 370.38,
+            "corner_shift_px": 428.91
+          },
+          "pose": {
+            "position_m": [8.4466, -5.1254, 3.2989],
+            "yaw_deg": 94.31,
+            "pitch_deg": -18.457,
+            "roll_deg": 1.395,
+            "rotation_matrix": [
+              [0.99745566, 0.06744621, -0.02309131],
+              [-0.00048905, -0.31742748, -0.94828242],
+              [-0.07128787, 0.94588097, -0.31658686]
+            ],
+            "rvec": [1.89288089, 0.04816393, -0.06788926],
+            "tvec": [-8.00321626, 1.50543523, 6.49455317]
+          },
+          "homography": null
+        }
+      }
+    },
+    "corner_left": {
+      "versions": {
+        "20261111-193547-402799": {
+          "version_id": "20261111-193547-402799",
+          "created_at": "2026-11-11T19:35:47",
+          "label": "auto per-match (corner)",
+          "start_match": "2026cur_qm8",
+          "rejected": false,
+          "mode": "pinhole",
+          "field_season": "2026-rebuilt-welded",
+          "image_size": [960, 377],
+          "crop_region": null,
+          "rms_error_px": 0.444,
+          "intrinsics": {
+            "fx": 664.035,
+            "fy": 663.663,
+            "cx": 446.846,
+            "cy": 145.038,
+            "K": [
+              [664.034675, 0.0, 446.846303],
+              [0.0, 663.66349, 145.037707],
+              [0.0, 0.0, 1.0]
+            ]
+          },
+          "distortion": {
+            "model": "opencv_pinhole",
+            "coefficients": [-0.33348062, 0.08326767, 0.0, 0.0, 0.0],
+            "edge_shift_px": 189.49,
+            "corner_shift_px": 258.32
+          },
+          "pose": {
+            "position_m": [1.0616, 0.3635, 0.6935],
+            "yaw_deg": 63.98,
+            "pitch_deg": 4.611,
+            "roll_deg": -1.985,
+            "rotation_matrix": [
+              [0.89688284, -0.44091915, 0.03451781],
+              [0.06636499, 0.05700856, -0.9961655],
+              [0.43726064, 0.89573452, 0.0803916]
+            ],
+            "rvec": [1.46989497, -0.31290747, 0.39412992],
+            "tvec": [-0.81576977, 0.59963248, -0.84554832]
+          },
+          "homography": null
+        }
+      }
+    },
+    "corner_right": {
+      "versions": {
+        "20261111-193631-107280": {
+          "version_id": "20261111-193631-107280",
+          "created_at": "2026-11-11T19:36:31",
+          "label": "auto per-match (corner)",
+          "start_match": "2026cur_qm8",
+          "rejected": false,
+          "mode": "pinhole",
+          "field_season": "2026-rebuilt-welded",
+          "image_size": [960, 377],
+          "crop_region": [0, 0, 960, 377],
+          "rms_error_px": 0.18,
+          "intrinsics": {
+            "fx": 721.352,
+            "fy": 725.788,
+            "cx": 461.008,
+            "cy": 191.169,
+            "K": [
+              [721.35197, 0.0, 461.007792],
+              [0.0, 725.788338, 191.169093],
+              [0.0, 0.0, 1.0]
+            ]
+          },
+          "distortion": {
+            "model": "opencv_pinhole",
+            "coefficients": [-0.40552084, 0.13735403, 0.0, 0.0, 0.0],
+            "edge_shift_px": 158.82,
+            "corner_shift_px": 199.28
+          },
+          "pose": {
+            "position_m": [15.8427, -0.1668, 0.6292],
+            "yaw_deg": 135.848,
+            "pitch_deg": 1.636,
+            "roll_deg": -3.612,
+            "rotation_matrix": [
+              [0.69647577, 0.71481102, 0.06298182],
+              [0.02344903, 0.0650513, -0.99760637],
+              [-0.71719707, 0.69628553, 0.02854502]
+            ],
+            "rvec": [1.42732695, 0.65740344, -0.5825635],
+            "tvec": [-10.95448682, 0.267057, 11.46055277]
+          },
+          "homography": null
+        }
+      }
+    }
   },
   "matches": [
     {
@@ -20,20 +165,12 @@
       "comp_level": "qm",
       "set_number": 1,
       "match_number": 8,
-      "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-      "replay_created_at": "2026-11-20T12:07:32",
+      "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+      "replay_created_at": "2026-11-21T02:41:24",
       "legacy_labels": false,
       "alliances": {
-        "red": [
-          6497,
-          2724,
-          2637
-        ],
-        "blue": [
-          3128,
-          6773,
-          9066
-        ]
+        "red": [6497, 2724, 2637],
+        "blue": [3128, 6773, 9066]
       },
       "timeline": {
         "timeline_version": 1,
@@ -158,7 +295,28 @@
           }
         ]
       },
-      "robots_version": 1,
+      "cameras": {
+        "main": {
+          "version_id": "20261107-123640-609878",
+          "status": "main",
+          "reason": null
+        },
+        "corner_left": {
+          "version_id": "20261111-193547-402799",
+          "status": "kept",
+          "reason": "epoch 20261111-193547-402799 holds on 2026cur_qm8: best 0.01 m over 3 tags (gate 0.25 m)"
+        },
+        "corner_right": {
+          "version_id": "20261111-193631-107280",
+          "status": "kept",
+          "reason": "epoch 20261111-193631-107280 holds on 2026cur_qm8: best 0.01 m over 4 tags (gate 0.25 m)"
+        }
+      },
+      "unidentified_s": {
+        "auto": 13.5,
+        "teleop": 140.1
+      },
+      "robots_version": 2,
       "auto_s": 20.0,
       "robots": [
         {
@@ -176,53 +334,59 @@
             "auto_source": "autonomous_paths",
             "auto_label_share": 1.0,
             "confirmed_share": 0.667,
-            "segments": [
-              [
-                0,
-                7
-              ]
-            ],
+            "segments": [[0, 7]],
             "n_jumps": 22,
-            "t": [
-              0.08,
-              0.18,
-              0.28,
-              0.37,
-              0.47,
-              0.57,
-              0.67,
-              0.76
-            ],
-            "x": [
-              13.24,
-              13.24,
-              13.22,
-              13.22,
-              13.21,
-              13.2,
-              13.16,
-              13.05
-            ],
-            "y": [
-              2.17,
-              2.17,
-              2.14,
-              2.09,
-              2.02,
-              1.92,
-              1.79,
-              1.57
-            ],
-            "frame": [
-              378,
-              384,
-              390,
-              396,
-              402,
-              408,
-              414,
-              420
-            ]
+            "camera_s": {
+              "main": 95.8,
+              "corner_left": 1.2,
+              "corner_right": 13.8,
+              "none": 25.4
+            },
+            "t": [0.08, 0.18, 0.28, 0.37, 0.47, 0.57, 0.67, 0.76],
+            "x": [13.24, 13.24, 13.22, 13.22, 13.21, 13.2, 13.16, 13.05],
+            "y": [2.17, 2.17, 2.14, 2.09, 2.02, 1.92, 1.79, 1.57],
+            "frame": [378, 384, 390, 396, 402, 408, 414, 420],
+            "cams": [1, 1, 5, 5, 5, 5, 5, 1]
+          },
+          "identity": [
+            {
+              "slot": "B2",
+              "start_frame": 2544,
+              "end_frame": 2562,
+              "start_t": 31.82,
+              "end_t": 32.12,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.979,
+              "confirmed": true
+            },
+            {
+              "slot": "B2",
+              "start_frame": 3204,
+              "end_frame": 3270,
+              "start_t": 42.74,
+              "end_t": 43.84,
+              "source": "window_lineup",
+              "read_camera": "main",
+              "score": 0.91,
+              "confirmed": false
+            },
+            {
+              "slot": "B2",
+              "start_frame": 3300,
+              "end_frame": 3384,
+              "start_t": 44.33,
+              "end_t": 45.72,
+              "source": "window_fill",
+              "read_camera": null,
+              "score": 0.91,
+              "confirmed": false
+            }
+          ],
+          "identity_s": {
+            "window_digits": 84.2,
+            "window_lineup": 12.2,
+            "window_fill": 30.4
           }
         },
         {
@@ -240,53 +404,59 @@
             "auto_source": "autonomous_paths",
             "auto_label_share": 1.0,
             "confirmed_share": 0.626,
-            "segments": [
-              [
-                0,
-                7
-              ]
-            ],
+            "segments": [[0, 7]],
             "n_jumps": 22,
-            "t": [
-              12.28,
-              12.37,
-              12.47,
-              12.57,
-              12.67,
-              12.76,
-              12.86,
-              12.96
-            ],
-            "x": [
-              11.52,
-              11.32,
-              11.05,
-              10.7,
-              10.26,
-              9.77,
-              9.26,
-              8.85
-            ],
-            "y": [
-              5.71,
-              5.89,
-              6.05,
-              6.15,
-              6.22,
-              6.21,
-              6.14,
-              5.9
-            ],
-            "frame": [
-              1128,
-              1134,
-              1140,
-              1146,
-              1152,
-              1158,
-              1164,
-              1170
-            ]
+            "camera_s": {
+              "main": 88.8,
+              "corner_left": 2.4,
+              "corner_right": 13.3,
+              "none": 26.6
+            },
+            "t": [12.28, 12.37, 12.47, 12.57, 12.67, 12.76, 12.86, 12.96],
+            "x": [11.52, 11.32, 11.05, 10.7, 10.26, 9.77, 9.26, 8.85],
+            "y": [5.71, 5.89, 6.05, 6.15, 6.22, 6.21, 6.14, 5.9],
+            "frame": [1128, 1134, 1140, 1146, 1152, 1158, 1164, 1170],
+            "cams": [1, 1, 1, 1, 1, 1, 1, 3]
+          },
+          "identity": [
+            {
+              "slot": "B1",
+              "start_frame": 4242,
+              "end_frame": 4248,
+              "start_t": 59.92,
+              "end_t": 60.02,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9992,
+              "confirmed": true
+            },
+            {
+              "slot": "R1",
+              "start_frame": 1230,
+              "end_frame": 1446,
+              "start_t": 13.93,
+              "end_t": 17.45,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9833,
+              "confirmed": true
+            },
+            {
+              "slot": "R1",
+              "start_frame": 1980,
+              "end_frame": 2160,
+              "start_t": 22.49,
+              "end_t": 25.47,
+              "source": "window_lineup",
+              "read_camera": "main",
+              "score": 0.93,
+              "confirmed": false
+            }
+          ],
+          "identity_s": {
+            "window_digits": 74.9,
+            "window_lineup": 32.0,
+            "window_fill": 12.8
           }
         },
         {
@@ -304,53 +474,59 @@
             "auto_source": "autonomous_paths",
             "auto_label_share": 1.0,
             "confirmed_share": 0.76,
-            "segments": [
-              [
-                0,
-                7
-              ]
-            ],
+            "segments": [[0, 7]],
             "n_jumps": 22,
-            "t": [
-              1.45,
-              1.54,
-              1.64,
-              1.74,
-              1.84,
-              1.93,
-              2.03,
-              2.13
-            ],
-            "x": [
-              11.22,
-              11.14,
-              10.99,
-              10.72,
-              10.42,
-              10.07,
-              9.72,
-              9.35
-            ],
-            "y": [
-              7.11,
-              7.16,
-              7.22,
-              7.25,
-              7.26,
-              7.22,
-              7.22,
-              7.19
-            ],
-            "frame": [
-              462,
-              468,
-              474,
-              480,
-              486,
-              492,
-              498,
-              504
-            ]
+            "camera_s": {
+              "main": 75.9,
+              "corner_left": 15.4,
+              "corner_right": 0.7,
+              "none": 13.6
+            },
+            "t": [1.45, 1.54, 1.64, 1.74, 1.84, 1.93, 2.03, 2.13],
+            "x": [11.22, 11.14, 10.99, 10.72, 10.42, 10.07, 9.72, 9.35],
+            "y": [7.11, 7.16, 7.22, 7.25, 7.26, 7.22, 7.22, 7.19],
+            "frame": [462, 468, 474, 480, 486, 492, 498, 504],
+            "cams": [1, 1, 1, 1, 1, 1, 1, 1]
+          },
+          "identity": [
+            {
+              "slot": "B1",
+              "start_frame": 4728,
+              "end_frame": 4812,
+              "start_t": 67.96,
+              "end_t": 69.35,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9933,
+              "confirmed": true
+            },
+            {
+              "slot": "B1",
+              "start_frame": 4824,
+              "end_frame": 4860,
+              "start_t": 69.55,
+              "end_t": 70.15,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9978,
+              "confirmed": true
+            },
+            {
+              "slot": "B1",
+              "start_frame": 4896,
+              "end_frame": 4896,
+              "start_t": 70.74,
+              "end_t": 70.74,
+              "source": "window_fill",
+              "read_camera": null,
+              "score": 0.7275,
+              "confirmed": false
+            }
+          ],
+          "identity_s": {
+            "window_digits": 71.1,
+            "window_fill": 4.6,
+            "window_lineup": 17.7
           }
         },
         {
@@ -368,53 +544,59 @@
             "auto_source": "autonomous_paths",
             "auto_label_share": 1.0,
             "confirmed_share": 0.68,
-            "segments": [
-              [
-                0,
-                7
-              ]
-            ],
+            "segments": [[0, 7]],
             "n_jumps": 20,
-            "t": [
-              0.08,
-              0.18,
-              0.28,
-              0.37,
-              0.47,
-              0.57,
-              0.67,
-              0.76
-            ],
-            "x": [
-              3.36,
-              3.36,
-              3.35,
-              3.43,
-              3.46,
-              3.41,
-              3.33,
-              3.25
-            ],
-            "y": [
-              2.0,
-              2.0,
-              2.0,
-              2.02,
-              2.05,
-              2.04,
-              2.06,
-              2.1
-            ],
-            "frame": [
-              378,
-              384,
-              390,
-              396,
-              402,
-              408,
-              414,
-              420
-            ]
+            "camera_s": {
+              "main": 88.9,
+              "corner_left": 5.2,
+              "corner_right": 1.3,
+              "none": 13.7
+            },
+            "t": [0.08, 0.18, 0.28, 0.37, 0.47, 0.57, 0.67, 0.76],
+            "x": [3.36, 3.36, 3.35, 3.43, 3.46, 3.41, 3.33, 3.25],
+            "y": [2.0, 2.0, 2.0, 2.02, 2.05, 2.04, 2.06, 2.1],
+            "frame": [378, 384, 390, 396, 402, 408, 414, 420],
+            "cams": [1, 1, 1, 1, 1, 1, 1, 1]
+          },
+          "identity": [
+            {
+              "slot": "B1",
+              "start_frame": 270,
+              "end_frame": 486,
+              "start_t": null,
+              "end_t": 1.84,
+              "source": "window_lineup",
+              "read_camera": "main",
+              "score": 0.86,
+              "confirmed": false
+            },
+            {
+              "slot": "B1",
+              "start_frame": 492,
+              "end_frame": 582,
+              "start_t": 1.93,
+              "end_t": 3.4,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 1.0,
+              "confirmed": true
+            },
+            {
+              "slot": "B1",
+              "start_frame": 588,
+              "end_frame": 648,
+              "start_t": 3.5,
+              "end_t": 4.47,
+              "source": "window_lineup",
+              "read_camera": "main",
+              "score": 0.84,
+              "confirmed": false
+            }
+          ],
+          "identity_s": {
+            "window_lineup": 23.9,
+            "window_digits": 71.2,
+            "window_fill": 9.7
           }
         },
         {
@@ -432,57 +614,59 @@
             "auto_source": "autonomous_paths",
             "auto_label_share": 1.0,
             "confirmed_share": 0.743,
-            "segments": [
-              [
-                0,
-                5
-              ],
-              [
-                6,
-                7
-              ]
-            ],
+            "segments": [[0, 7]],
             "n_jumps": 25,
-            "t": [
-              1.45,
-              1.54,
-              1.64,
-              1.74,
-              2.13,
-              2.33,
-              4.57,
-              4.67
-            ],
-            "x": [
-              5.8,
-              5.89,
-              5.98,
-              6.02,
-              6.75,
-              7.32,
-              7.06,
-              7.08
-            ],
-            "y": [
-              5.14,
-              5.24,
-              5.4,
-              5.76,
-              6.72,
-              6.99,
-              4.25,
-              4.36
-            ],
-            "frame": [
-              462,
-              468,
-              474,
-              480,
-              504,
-              516,
-              654,
-              660
-            ]
+            "camera_s": {
+              "main": 109.1,
+              "corner_left": 25.4,
+              "corner_right": 2.3,
+              "none": 19.3
+            },
+            "t": [1.45, 1.54, 1.64, 1.74, 2.13, 2.33, 4.57, 4.67],
+            "x": [5.8, 5.89, 5.98, 6.02, 6.75, 7.32, 7.06, 7.08],
+            "y": [5.14, 5.24, 5.4, 5.76, 6.72, 6.99, 4.25, 4.36],
+            "frame": [462, 468, 474, 480, 504, 516, 654, 660],
+            "cams": [1, 1, 1, 1, 1, 1, 3, 3]
+          },
+          "identity": [
+            {
+              "slot": "B1",
+              "start_frame": 654,
+              "end_frame": 726,
+              "start_t": 4.57,
+              "end_t": 5.74,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9996,
+              "confirmed": true
+            },
+            {
+              "slot": "B1",
+              "start_frame": 738,
+              "end_frame": 768,
+              "start_t": 5.93,
+              "end_t": 6.42,
+              "source": "window_digits",
+              "read_camera": "main",
+              "score": 0.9999,
+              "confirmed": true
+            },
+            {
+              "slot": "B1",
+              "start_frame": 780,
+              "end_frame": 816,
+              "start_t": 6.62,
+              "end_t": 7.2,
+              "source": "window_fill",
+              "read_camera": null,
+              "score": 0.9999,
+              "confirmed": false
+            }
+          ],
+          "identity_s": {
+            "window_digits": 97.0,
+            "window_fill": 28.4,
+            "window_lineup": 5.2
           }
         },
         {
@@ -502,11 +686,72 @@
             "confirmed_share": null,
             "segments": [],
             "n_jumps": 0,
+            "camera_s": {
+              "main": 0.0,
+              "corner_left": 0.0,
+              "corner_right": 0.0,
+              "none": 0.0
+            },
             "t": [],
             "x": [],
             "y": [],
-            "frame": []
-          }
+            "frame": [],
+            "cams": []
+          },
+          "identity": [],
+          "identity_s": {}
+        }
+      ],
+      "unidentified": [
+        {
+          "track_id": "R1#20",
+          "slot": "R1",
+          "alliance": "red",
+          "first_t": 125.85,
+          "last_t": 133.2,
+          "n_points": 75,
+          "duration_s": 7.45,
+          "team_before": 2724,
+          "gap_before_s": 0.1,
+          "team_after": 6497,
+          "gap_after_s": 0.5,
+          "candidates": [6497, 2724, 2637],
+          "camera_s": {
+            "main": 0.3,
+            "corner_left": 0.0,
+            "corner_right": 0.0,
+            "none": 7.1
+          },
+          "t": [125.85, 125.95, 126.05, 126.15, 126.25],
+          "x": [5.83, 6.36, 6.57, 6.48, 6.48],
+          "y": [0.77, 0.91, 0.91, 0.89, 0.89],
+          "frame": [8226, 8232, 8238, 8244, 8250],
+          "cams": [1, 1, 1, 0, 0]
+        },
+        {
+          "track_id": "B1#1",
+          "slot": "B1",
+          "alliance": "blue",
+          "first_t": 5.84,
+          "last_t": 7.59,
+          "n_points": 6,
+          "duration_s": 0.59,
+          "team_before": 6773,
+          "gap_before_s": 0.1,
+          "team_after": 6773,
+          "gap_after_s": 0.1,
+          "candidates": [6773, 9066],
+          "camera_s": {
+            "main": 0.0,
+            "corner_left": 0.1,
+            "corner_right": 0.0,
+            "none": 0.5
+          },
+          "t": [5.84, 6.52, 7.3, 7.4, 7.5],
+          "x": [6.94, 4.94, 5.09, 5.03, 4.97],
+          "y": [3.51, 5.29, 5.83, 5.89, 5.94],
+          "frame": [732, 774, 822, 828, 834],
+          "cams": [2, 0, 0, 0, 0]
         }
       ]
     }
@@ -535,10 +780,7 @@
       "generated_at": "2026-11-20T23:04:00+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -552,8 +794,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -573,10 +815,7 @@
         "cell_m": 0.5,
         "nx": 34,
         "ny": 17,
-        "field_m": [
-          16.541,
-          8.069
-        ]
+        "field_m": [16.541, 8.069]
       },
       "zones": {
         "own_max_x": 4.029,
@@ -636,21 +875,9 @@
               "auto": {
                 "seconds": 197.82,
                 "cells": [
-                  [
-                    3,
-                    4,
-                    1.39
-                  ],
-                  [
-                    3,
-                    10,
-                    3.19
-                  ],
-                  [
-                    4,
-                    3,
-                    1.19
-                  ]
+                  [3, 4, 1.39],
+                  [3, 10, 3.19],
+                  [4, 3, 1.19]
                 ],
                 "summary": {
                   "own_zone_frac": 0.457,
@@ -664,21 +891,9 @@
               "transition": {
                 "seconds": 93.96,
                 "cells": [
-                  [
-                    4,
-                    4,
-                    2.58
-                  ],
-                  [
-                    4,
-                    5,
-                    1.39
-                  ],
-                  [
-                    4,
-                    10,
-                    4.16
-                  ]
+                  [4, 4, 2.58],
+                  [4, 5, 1.39],
+                  [4, 10, 4.16]
                 ],
                 "summary": {
                   "own_zone_frac": 0.359,
@@ -692,21 +907,9 @@
               "active": {
                 "seconds": 390.87,
                 "cells": [
-                  [
-                    0,
-                    5,
-                    0.6
-                  ],
-                  [
-                    0,
-                    6,
-                    0.4
-                  ],
-                  [
-                    0,
-                    7,
-                    0.79
-                  ]
+                  [0, 5, 0.6],
+                  [0, 6, 0.4],
+                  [0, 7, 0.79]
                 ],
                 "summary": {
                   "own_zone_frac": 0.511,
@@ -720,21 +923,9 @@
               "inactive": {
                 "seconds": 534.31,
                 "cells": [
-                  [
-                    0,
-                    14,
-                    0.99
-                  ],
-                  [
-                    1,
-                    2,
-                    0.2
-                  ],
-                  [
-                    1,
-                    14,
-                    0.4
-                  ]
+                  [0, 14, 0.99],
+                  [1, 2, 0.2],
+                  [1, 14, 0.4]
                 ],
                 "summary": {
                   "own_zone_frac": 0.108,
@@ -748,21 +939,9 @@
               "endgame": {
                 "seconds": 303.67,
                 "cells": [
-                  [
-                    1,
-                    3,
-                    0.2
-                  ],
-                  [
-                    1,
-                    4,
-                    0.2
-                  ],
-                  [
-                    1,
-                    5,
-                    0.4
-                  ]
+                  [1, 3, 0.2],
+                  [1, 4, 0.2],
+                  [1, 5, 0.4]
                 ],
                 "summary": {
                   "own_zone_frac": 0.479,
@@ -809,10 +988,7 @@
       "generated_at": "2026-11-20T23:04:01+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -838,8 +1014,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -885,80 +1061,25 @@
               "cluster": 1,
               "mirrored": true,
               "points": [
-                [
-                  0.08,
-                  3.36,
-                  2.0
-                ],
-                [
-                  0.18,
-                  3.36,
-                  2.0
-                ],
-                [
-                  0.28,
-                  3.35,
-                  2.0
-                ],
-                [
-                  0.37,
-                  3.43,
-                  2.02
-                ],
-                [
-                  19.98,
-                  2.94,
-                  2.17
-                ]
+                [0.08, 3.36, 2.0],
+                [0.18, 3.36, 2.0],
+                [0.28, 3.35, 2.0],
+                [0.37, 3.43, 2.02],
+                [19.98, 2.94, 2.17]
               ],
               "points_norm": [
-                [
-                  0.2032,
-                  0.2484
-                ],
-                [
-                  0.2032,
-                  0.2484
-                ],
-                [
-                  0.2028,
-                  0.2484
-                ],
-                [
-                  0.2071,
-                  0.2509
-                ],
-                [
-                  0.1775,
-                  0.2689
-                ]
+                [0.2032, 0.2484],
+                [0.2032, 0.2484],
+                [0.2028, 0.2484],
+                [0.2071, 0.2509],
+                [0.1775, 0.2689]
               ],
               "points_field": [
-                [
-                  0.08,
-                  3.36,
-                  2.0
-                ],
-                [
-                  0.18,
-                  3.36,
-                  2.0
-                ],
-                [
-                  0.28,
-                  3.35,
-                  2.0
-                ],
-                [
-                  0.37,
-                  3.43,
-                  2.02
-                ],
-                [
-                  19.98,
-                  2.94,
-                  2.17
-                ]
+                [0.08, 3.36, 2.0],
+                [0.18, 3.36, 2.0],
+                [0.28, 3.35, 2.0],
+                [0.37, 3.43, 2.02],
+                [19.98, 2.94, 2.17]
               ],
               "point_kinds": [
                 "s",
@@ -982,14 +1103,8 @@
               "representative": "2026cur_sf4m1",
               "mean_spread_m": 0.67,
               "n_mirrored": 2,
-              "start": [
-                3.7,
-                6.74
-              ],
-              "end": [
-                2.91,
-                5.95
-              ],
+              "start": [3.7, 6.74],
+              "end": [2.91, 5.95],
               "duration_s": 19.62
             }
           ]
@@ -1007,10 +1122,7 @@
       "generated_at": "2026-11-20T23:04:04+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -1033,8 +1145,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -1131,10 +1243,7 @@
       "generated_at": "2026-11-20T23:04:04+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -1158,8 +1267,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -1218,12 +1327,7 @@
               "cycles_auto": 2,
               "resets": 5,
               "cycles_per_min": 1.36,
-              "cycle_return_times": [
-                5.9,
-                15.3,
-                48.3,
-                142.7
-              ]
+              "cycle_return_times": [5.9, 15.3, 48.3, 142.7]
             }
           ],
           "rank": 6
@@ -1241,10 +1345,7 @@
       "generated_at": "2026-11-20T23:04:04+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -1267,8 +1368,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -1366,10 +1467,7 @@
       "generated_at": "2026-11-20T23:04:04+00:00",
       "frame": {
         "units": "m",
-        "field_m": [
-          16.541,
-          8.069
-        ],
+        "field_m": [16.541, 8.069],
         "perspective": "alliance",
         "symmetry": "rotational",
         "note": "x=0 is the team's own alliance wall, +x toward the opponent wall; y follows WPILib after the symmetry transform; *_norm values are 0..1 of the full field"
@@ -1394,8 +1492,8 @@
           "comp_level": "qm",
           "set_number": 1,
           "match_number": 8,
-          "replay_id": "c7a199af-9238-43f4-a550-c6dc9ce50c55",
-          "replay_created_at": "2026-11-20T12:07:32",
+          "replay_id": "aac8608f-91b4-4271-bff1-ecd85cd8c62f",
+          "replay_created_at": "2026-11-21T02:41:24",
           "legacy_labels": false
         }
       ],
@@ -1416,30 +1514,10 @@
       ],
       "score_key": "stuck_s_per_match",
       "bumps": [
-        [
-          4.0615,
-          1.5772,
-          5.1895,
-          3.4312
-        ],
-        [
-          4.0615,
-          4.638,
-          5.1895,
-          6.492
-        ],
-        [
-          11.3515,
-          1.5772,
-          12.4795,
-          3.4312
-        ],
-        [
-          11.3515,
-          4.638,
-          12.4795,
-          6.492
-        ]
+        [4.0615, 1.5772, 5.1895, 3.4312],
+        [4.0615, 4.638, 5.1895, 6.492],
+        [11.3515, 1.5772, 12.4795, 3.4312],
+        [11.3515, 4.638, 12.4795, 6.492]
       ],
       "legend": "Rank score = seconds per counted match the robot is STOPPED (smoothed speed < 0.5 m/s) with its centre on any bump, added up over the whole match (a beached rob [...]",
       "teams": {

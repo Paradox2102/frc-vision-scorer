@@ -192,7 +192,7 @@ def test_export_carries_every_lineup_robots_path(client):
     d = client.get("/api/scouting/2026tst/export").json()
     assert d["path_frame"]["perspective"] == "absolute"
     qm1 = next(m for m in d["matches"] if m["match_key"] == "2026tst_qm1")
-    assert qm1["robots_version"] == 1 and qm1["auto_s"] > 0
+    assert qm1["robots_version"] == 2 and qm1["auto_s"] > 0
     assert [(r["team_number"], r["alliance"], r["alliance_position"]) for r in qm1["robots"]] == [
         (1, "red", 1), (2, "red", 2), (3, "red", 3), (4, "blue", 1), (5, "blue", 2), (6, "blue", 3)]
     r1 = qm1["robots"][0]["path"]

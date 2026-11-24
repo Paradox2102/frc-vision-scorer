@@ -4,7 +4,7 @@ returns) to a JSON file, without the web server.
 
   .venv/bin/python scripts/export_scouting.py 2026cur
   .venv/bin/python scripts/export_scouting.py 2026cur --out /tmp/cur.json
-  .venv/bin/python scripts/export_scouting.py 2026cur --no-paths   # no robot paths
+  .venv/bin/python scripts/export_scouting.py 2026cur --no-paths   # no robot paths / unidentified tracks
   .venv/bin/python scripts/export_scouting.py 2026cur --per-match  # + one file per match
 
 Default output: data/exports/<event>_scouting_export.json. ``--per-match`` also
@@ -57,7 +57,7 @@ def main() -> int:
     ap.add_argument("event_key")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-paths", action="store_true",
-                    help="leave out every robot's whole-match path (much smaller file)")
+                    help="leave out robot paths + unidentified tracks (much smaller file)")
     ap.add_argument("--indent", type=int, default=None, help="pretty-print (bigger file)")
     ap.add_argument("--per-match", nargs="?", const=True, default=None, metavar="DIR",
                     help="also write one single-match file per match "

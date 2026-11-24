@@ -29,6 +29,7 @@ class Sample:
     dt: float                 # seconds of match this sample stands for (frame period)
     confirmed: bool = False   # digit-confirmed label (vs. lineup / fill)
     slot: Optional[str] = None
+    alliance: Optional[str] = None  # the alliance ax/ay were computed for
 
 
 @dataclass
@@ -70,6 +71,18 @@ class MatchData:
     periods: list = field(default_factory=list)   # summary.periods (clock scan)
     video_path: Optional[str] = None              # source match video on disk
     youtube_key: Optional[str] = None             # TBA match video key
+    # For the export's unidentified robots + provenance (export.py, provenance.py):
+    # tracked robot rows with a slot + position but no team, per slot, time-sorted
+    # (Sample.slot set; ax/ay use the row's alliance, else the slot letter's).
+    unidentified: dict = field(default_factory=dict)  # {slot -> [Sample]}
+    unidentified_s: dict = field(default_factory=dict)  # {"auto": s, "teleop": s}
+    # Every in-clock labelled row (roster teams only, duplicates included):
+    # {frame_num: ((slot, team), ...)}; with the clock it gives each slot's
+    # nearest label and which teams were labelled on other slots in a frame.
+    frame_labels: dict = field(default_factory=dict)
+    replay_dir: Optional[str] = None              # web/replays/<replay_id> (draw log)
+    identity_segments: list = field(default_factory=list)  # provenance.identity_segments rows
+    cameras: dict = field(default_factory=dict)   # provenance.match_cameras(summary)
 
     def source_ref(self) -> dict:
         return {"match_key": self.match_key, "comp_level": self.comp_level,

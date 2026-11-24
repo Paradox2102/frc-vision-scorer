@@ -22,20 +22,25 @@ export** packs one event's results into a single JSON document:
   `data/exports/<event_key>_scouting_export.json`.
 
 Add `?paths=false` (script: `--no-paths`) to leave out every robot's
-whole-match path, which is more than half the file.
+whole-match path and the unidentified tracks, which is about three quarters
+of the file.
 
 For **one match**, `GET /api/scouting/{event_key}/match/{match_key}` returns
-that match's `matches[]` entry (lineup, video timeline, robot paths) wrapped
-in a small header; add `?team=N` for a single robot. See
+that match's `matches[]` entry (lineup, video timeline, robot paths,
+unidentified tracks) wrapped in a small header that also carries the
+calibrations of the cameras it used; add `?team=N` for a single robot. See
 [Robot paths](#robot-paths). `scripts/export_scouting.py <event_key>
 --per-match` writes every match's file at once, to
 `data/exports/<event_key>_matches/<match_key>.json`.
 
 The reference file is `data/exports/2026cur_scouting_export.json`: 2026 Curie
-division, 136 analysed matches, 74 teams, 17.5 MB of compact JSON. The
-biggest parts are the robot paths (`matches[].robots`, about 10 MB),
-`auto_paths` (about 3.9 MB) and `shift_heatmap` (about 3.2 MB). Without robot
-paths the file is 7.4 MB.
+division, 136 analysed matches, 74 teams, 28.9 MB of compact JSON
+(`schema_version` 3). The biggest parts are the robot paths
+(`matches[].robots`, about 14.3 MB, of which 3.2 MB is `identity` rows), the
+unidentified tracks (`matches[].unidentified`, about 7.0 MB), `auto_paths`
+(about 3.9 MB) and `shift_heatmap` (about 3.2 MB). Without robot paths the
+file is 7.5 MB. What changed from version 2 is listed under
+[v3 changes](#v3-changes).
 
 All the numbers come from computer vision. Expect gaps where the cameras lost a
 robot, and occasional robots credited to the wrong team. Each metric has
@@ -46,12 +51,14 @@ coverage and data-quality fields. Show them to users, or use them to filter.
 ```jsonc
 {
   "schema": "frc-vision-scorer.scouting-export",   // file-type tag
-  "schema_version": 2,                              // whole-file layout version
+  "schema_version": 3,                              // whole-file layout version
   "event_key": "2026cur",                           // TBA event key
   "year": 2026,
   "generated_at": "2026-11-20T23:04:11+00:00",      // UTC
   "path_frame": { /* coordinate frame of matches[].robots[].path (absent with ?paths=false) */ },
-  "matches":   [ /* one per analysed match: lineup + video timeline + robot paths */ ],
+  "camera_legend": ["main", "corner_left", "corner_right"],  // bit order of every `cams` mask (absent with ?paths=false)
+  "cameras":   { /* calibration of every camera version the matches used */ },
+  "matches":   [ /* one per analysed match: lineup + video timeline + robot paths + unidentified tracks */ ],
   "skipped":   [ /* matches whose replay could not be used */ ],
   "envelopes": [ /* one per metric: shift_heatmap, auto_paths, movement, cycles, defense, bump_stuck */ ]
 }
@@ -73,9 +80,12 @@ Each entry is one analysed match, in play order: qm, then ef/qf/sf/f, sorted by
 | `legacy_labels` | bool | `true` means an older run whose team identification is less reliable. |
 | `alliances` | `{red: [int\|null ×3], blue: [...]}` | TBA lineup in station order 1, 2, 3. |
 | `timeline` | object \| null | Where each phase is in the match video. See [The video timeline](#the-video-timeline). |
-| `robots_version` | int | `1`. Version of the `robots` block. Absent with `?paths=false`. |
+| `cameras` | object | Which calibration version each camera used in this match: `{camera: {version_id, status, reason}}`. See [Cameras and calibration](#cameras-and-calibration). Present with and without paths. |
+| `unidentified_s` | `{auto, teleop}` | Robot-seconds of tracked robots that were never matched to a team in this match. Present with and without paths. |
+| `robots_version` | int | `2`. Version of the `robots` and `unidentified` blocks. Absent with `?paths=false`. |
 | `auto_s` | number | Match seconds of auto (2026: 20). Path times `t < auto_s` are auto, the rest teleop. Absent with `?paths=false`. |
-| `robots` | array | Every robot's position over the whole match. See [Robot paths](#robot-paths). Absent with `?paths=false`. |
+| `robots` | array | Every robot's position over the whole match, which cameras saw each point and how its team was identified. See [Robot paths](#robot-paths). Absent with `?paths=false`. |
+| `unidentified` | array | Tracked robots we never named, with hints about who they may be. See [Unidentified robots](#unidentified-robots). Absent with `?paths=false`. |
 
 ### `skipped[]`
 
@@ -291,12 +301,13 @@ marks.
 ## Robot paths
 
 Each `matches[]` entry carries `robots`: one entry per robot in the match,
-with where that robot was for the **whole match** (auto and teleop). Use it
-to replay a match, draw a robot's path in another app, or compute your own
+with where that robot was for the **whole match** (auto and teleop), which
+cameras saw it at each point, and how its team was identified. Use it to
+replay a match, draw a robot's path in another app, or compute your own
 metrics. The reference file has 816 robot entries; 811 have points.
 
 ```jsonc
-"robots_version": 1,
+"robots_version": 2,
 "auto_s": 20.0,
 "robots": [
   {"team_number": 3128, "alliance": "blue", "alliance_position": 1,
@@ -309,11 +320,22 @@ metrics. The reference file has 816 robot entries; 811 have points.
      "confirmed_share": 0.68,
      "segments": [[0, 38], [39, 188], ...],      // index ranges, inclusive
      "n_jumps": 20,
+     "camera_s": {"main": 88.9, "corner_left": 5.2, "corner_right": 1.3, "none": 13.7},
      "t":     [0.08, 0.18, 0.28, ...],           // match seconds
      "x":     [3.36, 3.36, 3.35, ...],           // metres, absolute field frame
      "y":     [2.0, 2.0, 2.0, ...],
-     "frame": [378, 384, 390, ...]               // source-video frame
-   }},
+     "frame": [378, 384, 390, ...],              // source-video frame
+     "cams":  [1, 1, 1, ...]                     // camera bitmask per point (camera_legend)
+   },
+   "identity": [                                 // how the team label was decided
+     {"slot": "B1", "start_frame": 270, "end_frame": 486, "start_t": null, "end_t": 1.84,
+      "source": "window_lineup", "read_camera": "main", "score": 0.86, "confirmed": false},
+     {"slot": "B1", "start_frame": 492, "end_frame": 582, "start_t": 1.93, "end_t": 3.4,
+      "source": "window_digits", "read_camera": "main", "score": 1.0, "confirmed": true},
+     ...
+   ],
+   "identity_s": {"window_lineup": 23.9, "window_digits": 71.2, "window_fill": 9.7}
+  },
   ...
 ]
 ```
@@ -323,7 +345,7 @@ not list a match's lineup, any team we identified follows, sorted by number.
 A lineup robot we never identified still has an entry, with `n_points: 0` and
 empty arrays.
 
-**Columns.** `t`, `x`, `y` and `frame` are parallel arrays of length
+**Columns.** `t`, `x`, `y`, `frame` and `cams` are parallel arrays of length
 `n_points`, sorted by time, one point per analysed video frame (in 2026cur
 about 10 per second in auto and 5 per second in teleop).
 
@@ -337,6 +359,8 @@ about 10 per second in auto and 5 per second in teleop).
   perspective. Divide by `path_frame.field_m` for 0..1 values.
 * `frame` is the source-video frame. Video seconds = `frame / timeline.video.fps`
   (`frame / fps` is how the timeline's own `frame` values are defined too).
+* `cams` says which cameras saw the robot at that point. See
+  [Cameras per point](#cameras-per-point-cams).
 
 **Gaps and segments.** A point exists only where the robot was located *and*
 identified as this team. Do not draw a line across a gap. `segments` lists
@@ -371,6 +395,205 @@ These are the same positions the metrics use. The `auto_paths` metric applies
 its field rules (hub/trench clamping, start-line check) on top of them, so
 its `points_field` can differ slightly from the auto part here.
 
+### Cameras per point (`cams`)
+
+Each point's `cams` value is a bitmask of the cameras that saw the robot in
+that frame. Bit `i` (value `1 << i`) is camera `camera_legend[i]` from the top
+of the file (the single-match file carries its own `camera_legend`). The
+legend always starts `["main", "corner_left", "corner_right"]`; an event
+with other cameras appends their names in sorted order, so those three bits
+never move.
+
+| `cams` | Meaning (default legend) |
+|---|---|
+| `0` | **No camera saw the robot.** The tracker was coasting: the position is a prediction from the robot's last motion, not a measurement. |
+| `1` | Main camera only. |
+| `2` / `4` | `corner_left` / `corner_right` only. |
+| `3`, `5`, `7`, … | Several cameras at once (`3` = main + corner_left). |
+| `null` | Unknown: the analysis kept no per-frame camera log for that frame. |
+
+The whole `cams` column (and `camera_s`) is `null` when the match's analysis
+kept no per-frame camera log at all. Every 2026cur match has one.
+
+`camera_s` adds up the same information: `{camera: seconds, ..., "none":
+seconds}`, the seconds of the path each camera saw. A point counts toward
+every camera in its mask, so the camera values can add up to more than the
+path's length; `"none"` is the coasting time. Each point stands for the time
+to the next point, capped at one frame period (about 0.1 s), and the last
+point stands for one frame period. In 2026cur, 14% of located robot time is
+coasting (`none`); a corner camera sees the robot in 9% of it, and in 1% a
+corner camera is the only one that does.
+
+Positions from `0` points are less trustworthy than seen points. Drop them,
+or draw them dashed, when precision matters.
+
+### How the team was identified (`identity`)
+
+The pipeline tracks robots in **slots** (`R1`..`R3`, `B1`..`B3`: tracker
+seats, not stations) and labels each slot over time with a team. `identity`
+lists every stretch of a slot that was labelled with this robot's team, in
+slot then frame order, and says how the label was decided:
+
+| Field | Meaning |
+|---|---|
+| `slot` | Tracker slot, e.g. `"B1"`. A team can appear on several slots in one match (the track broke and was re-seeded). |
+| `start_frame` / `end_frame` | Source-video frames, inclusive. |
+| `start_t` / `end_t` | The same as match time (the `t` of the paths), or `null` when that frame is outside the match clock (before auto or in the auto→teleop pause). |
+| `source` | How the label was decided (below). |
+| `read_camera` | `"main"` when the label came from reading the number; `null` otherwise. |
+| `score` | Confidence of the read or assignment, 0..1 (`null` when the stage gave none). |
+| `confirmed` | `true` when the number was read directly (digits). |
+
+| `source` | Meaning |
+|---|---|
+| `window_digits` | The team number was read from the robot's bumper digits. |
+| `window_lineup` | The robot was matched by appearance against a lineup card of this match's teams (reference crops taken from confident digit reads). |
+| `window_fill` | No read here: the label was carried along the same track from a nearby read. |
+| `window_elim` | No read here: the only team of the alliance (by bumper colour) not labelled on another slot. |
+| `read`, `stitched`, `none`, `null` | Older analyses (live reader); no camera recorded. |
+
+**Identification reads come only from the main camera.** The corner cameras
+help locate robots, but no team number is ever read from them, so
+`read_camera` is `"main"` or `null`. Adjacent rows of one slot with the same
+`source` and team are merged into one row (score = frame-weighted mean,
+`confirmed` only if every merged row was).
+
+`identity_s` gives match-clock seconds by `source` over those rows (the part
+of each row inside the match clock). In 2026cur, 73% of labelled robot time
+comes from `window_digits`, 13% from `window_lineup` and 14% from
+`window_fill`.
+
+## Unidentified robots
+
+The cameras also track robots we never matched to a team: a slot with a
+position but no label. These never appear in `robots[]`. `unidentified` lists
+them so you can see the gaps, or assign them yourself. `unidentified_s`
+(present even with `?paths=false`) is the robot-seconds involved per period.
+
+```jsonc
+"unidentified_s": {"auto": 13.5, "teleop": 140.1},
+"unidentified": [
+  {"track_id": "R1#20", "slot": "R1", "alliance": "red",
+   "first_t": 125.85, "last_t": 133.2, "n_points": 75, "duration_s": 7.45,
+   "team_before": 2724, "gap_before_s": 0.1,
+   "team_after": 6497, "gap_after_s": 0.5,
+   "candidates": [6497, 2724, 2637],
+   "camera_s": {"main": 0.3, "corner_left": 0.0, "corner_right": 0.0, "none": 7.1},
+   "t": [125.85, 125.95, ...], "x": [5.83, 6.36, ...], "y": [0.77, 0.91, ...],
+   "frame": [8226, 8232, ...], "cams": [1, 1, ...]},
+  ...
+]
+```
+
+* Each entry is **one contiguous piece of one slot**, split with the same
+  rule as robot path `segments` (more than 1.0 s between points, or a step
+  faster than 7 m/s). `track_id` = `"<slot>#<n>"`, n counting the slot's
+  pieces from 1 in time order. It is stable for a given `replay_id` only.
+* `first_t`, `last_t`, `n_points` and the columns `t`, `x`, `y`, `frame`,
+  `cams` work exactly as in robot paths. `duration_s` is the time the points
+  stand for (see `camera_s` above).
+* `team_before` / `team_after`: the team labelled on the **same slot** in the
+  nearest labelled frame before / after the piece (`null` if none), and
+  `gap_before_s` / `gap_after_s` the match seconds to that frame.
+* `candidates`: the alliance's lineup teams that are **not** labelled on
+  another slot in at least half of the piece's frames, in station order. An
+  empty list means the lineup is unknown, or that all three lineup robots
+  were labelled elsewhere at the time (often a duplicate track on a robot
+  that already has a label).
+
+`team_before`, `team_after` and `candidates` are **hints, not proof**. A slot
+is a tracker seat: after losing a robot it can be re-seeded onto another one,
+so the team before a gap is not always the team after it. A piece whose
+`team_before` equals `team_after` with short gaps is very likely that team;
+treat anything else with care. Many pieces are short (2026cur: 12,903
+pieces, median 1.2 s; 4,177 last 2 s or more and hold 73% of the time) and
+44% of the time is coasting (`cams` 0).
+
+## Cameras and calibration
+
+Every robot position comes from projecting a camera pixel onto the field
+using that camera's calibration. The file says which calibration each match
+used and what each calibration is.
+
+### `matches[].cameras`
+
+```jsonc
+"cameras": {
+  "main":         {"version_id": "20261107-123640-609878", "status": "main", "reason": null},
+  "corner_left":  {"version_id": "20261111-193547-402799", "status": "kept",
+                   "reason": "epoch 20261111-193547-402799 holds on 2026cur_qm8: best 0.01 m over 3 tags (gate 0.25 m)"},
+  "corner_right": {"version_id": "20261111-193631-107280", "status": "kept", "reason": "..."}
+}
+```
+
+`version_id` keys into the top-level `cameras`. `status` is `"main"` for
+the main camera. For a corner camera it is the per-match check's verdict:
+`kept` (the current calibration still fits this match), `adopted` (a new
+calibration was solved and adopted for this match), `dropped` (the camera
+moved or could not be checked; its detections were not used for this match),
+or another value from a future pipeline. `reason` is the check's own note,
+for people. A camera missing from the object was not used.
+
+### Top-level `cameras`
+
+`{camera: {"versions": {version_id: CAMERA_DETAIL}}}`, covering exactly the
+versions that `matches[].cameras` reference (2026cur: 5 main, 23
+corner_left and 20 corner_right versions).
+
+| Field | Meaning |
+|---|---|
+| `version_id`, `created_at`, `label`, `start_match`, `rejected` | The version's identity: when it was made (local time, no timezone), a note, the first match it was made for, and whether an operator rejected it later. |
+| `mode` | `"pinhole"` (OpenCV pinhole + distortion), `"camera"` (fisheye), or `"homography"` (a ground-plane mapping with no 3D pose). |
+| `field_season` | The field model it was solved against. |
+| `image_size` | `[w, h]` of the camera's image in pixels. |
+| `crop_region` | `[x, y, w, h]` of this camera inside the composite broadcast frame, or `null`. |
+| `rms_error_px` | Reprojection error of the solve, pixels. |
+| `intrinsics` | `{fx, fy, cx, cy, K}`: focal lengths and principal point in pixels, and the 3×3 matrix `K`. |
+| `distortion` | `{model, coefficients, edge_shift_px, corner_shift_px}`, see below. |
+| `pose` | Where the camera is and where it points, see below. `null` for `homography`. |
+| `homography` | The 3×3 image→field ground-plane matrix for `homography` mode, else `null`. |
+
+A version whose file can't be read is listed as `{"version_id", "error"}`
+instead of failing the export.
+
+**Pose.** All in the WPILib field frame of `path_frame` (metres, `+x` toward
+the red wall, `+y` left from the blue wall, `+z` up):
+
+* `position_m`: `[x, y, z]` of the camera centre.
+* `yaw_deg`: the heading of the optical axis in the field XY plane,
+  `atan2(dir_y, dir_x)`. 0 = looking toward the red wall (`+x`), 90 =
+  toward `+y`; counter-clockwise seen from above is positive.
+* `pitch_deg`: the elevation of the optical axis. Negative = looking down.
+* `roll_deg`: rotation about the optical axis. 0 = the image's "up" is as
+  close to world up as it can be (horizon level). Positive = the camera body
+  is turned clockwise as seen from behind it, so the scene appears turned
+  counter-clockwise in the image.
+* `rotation_matrix`, `rvec`, `tvec`: the raw OpenCV pose. `p_cam = R ·
+  X_field + t`, with camera axes x right, y down, z forward; `rvec` is `R` as
+  a Rodrigues vector. So `position_m = -Rᵀ t`, and the optical axis is the
+  third row of `R`.
+
+In 2026cur the main camera sits about 5 m back from the field's `y = 0`
+edge, 3.3 to 4.3 m up, near mid-field (`x` ≈ 8.1 to 9.0), looking across the
+field (yaw 90 to 99°) and down (pitch -18 to -24°). The corner cameras sit
+low (about 0.6 to 0.7 m) at the two corners on the same side (`x` ≈ 0.5 to
+1.1 and 15.4 to 16.0, `y` ≈ -0.3 to 0.4), level, looking diagonally into the
+field (yaw ≈ 35 to 67° and 111 to 138°). These numbers are what the
+calibration solved; treat a single version's pose as approximate (a solve
+from few tags can trade position against lens).
+
+**Distortion.** `model` is `"opencv_pinhole"` (OpenCV's `k1, k2, p1, p2,
+k3, ...` order) for `pinhole` mode, `"fisheye_kb4"` (OpenCV fisheye
+`k1..k4`) for `camera` mode, and `null` without a lens model. `coefficients`
+is that list. The two shifts say how strong the lens is, in pixels:
+`edge_shift_px` is how far the lens moves a pixel at the middle of the left
+and right image edges, and `corner_shift_px` the same at the four corners
+(each the larger of those points). 0 means no distortion. A shift is `null`
+when it can't be computed (a very wide lens whose corners lie past 90°). In
+2026cur most main versions move their edges about 370 px (of 1920), and the
+corner lenses mostly 90 to 270 px (of 960). All 2026cur cameras are
+`pinhole` mode.
+
 ### Python: write one robot's path as CSV
 
 ```python
@@ -397,15 +620,19 @@ for seg, (a, b) in enumerate(p["segments"]):
 ```jsonc
 {
   "schema": "frc-vision-scorer.scouting-match",
-  "schema_version": 2,          // same layout version as the event file
+  "schema_version": 3,          // same layout version as the event file
   "event_key": "2026cur", "year": 2026,
   "generated_at": "2026-11-21T17:30:00+00:00",
   "path_frame": { ... },
-  "match": { /* exactly one matches[] entry, robots included */ }
+  "camera_legend": ["main", "corner_left", "corner_right"],  // this file's cams bit order
+  "cameras": { ... },           // top-level `cameras`, only the versions this match used
+  "match": { /* exactly one matches[] entry, robots and unidentified included */ }
 }
 ```
 
-`?team=N` keeps only that robot in `match.robots`. The endpoint answers 404
+The file stands alone: it carries its own `camera_legend` and the
+calibration details of its cameras. `?team=N` keeps only that robot in
+`match.robots` (`unidentified` is kept whole). The endpoint answers 404
 for a match with no usable replay (the `detail` says why), and for a team that
 is not in the match.
 
@@ -657,16 +884,18 @@ count. A robot can also park on a bump on purpose, so check the video.
 ## Versioning
 
 There are four version numbers. Each one covers a different part of the file
-and changes only when that part makes a **breaking** change: a key is removed
-or renamed, a type changes, or a meaning or unit changes.
+and changes when that part makes a **breaking** change: a key is removed or
+renamed, a type changes, or a meaning or unit changes. The one exception so
+far is top-level version 3 / `robots_version` 2, which only added keys but
+was bumped to mark the new provenance data (see [v3 changes](#v3-changes)).
 
 | Version | Where | Current | Covers |
 |---|---|---|---|
-| `schema_version` | top level | 2 | The whole-file layout: header, `matches[]`, `skipped[]`, `envelopes[]`. Version 2 added the header and `matches[]`. |
+| `schema_version` | top level | 3 | The whole-file layout: header, `camera_legend`, `cameras`, `matches[]`, `skipped[]`, `envelopes[]`. Version 2 added the header and `matches[]`; version 3 added camera and identity provenance. |
 | `schema_version` | each envelope | 1 | The envelope's common keys (`frame`, `sources`, `teams` keyed by team, …). |
 | `metric_version` | each envelope | shift_heatmap 2, auto_paths 2, movement 1, cycles 1, defense 1, bump_stuck 2 | That metric's own payload (team entries and extras). |
 | `timeline_version` | each timeline | 1 | The `timeline` block. |
-| `robots_version` | each match | 1 | The `robots` block and its `path` (and the top-level `path_frame`). |
+| `robots_version` | each match | 2 | The `robots` and `unidentified` blocks and the paths' columns (and the top-level `path_frame` / `camera_legend`). |
 
 These changes are **not breaking** and do not bump any version:
 
@@ -682,21 +911,38 @@ like-for-like results.
 How an importer should handle versions:
 
 1. Check `schema == "frc-vision-scorer.scouting-export"` and
-   `schema_version == 2`. If either differs, stop and report it rather than
-   guess.
+   `schema_version == 3`. If either differs, stop and report it rather than
+   guess. (Version 3 only added keys to version 2, so an importer written for
+   2 can also accept 3.)
 2. **Ignore unknown keys** everywhere. The schema allows them
    (`additionalProperties: true`).
 3. Skip an envelope whose `metric` you do not know. Also skip one whose
    `metric_version` (or envelope `schema_version`) is not the version you
    coded for. Log the skip and keep importing everything else.
 4. If `timeline_version` is not 1, ignore that match's timeline but import the
-   rest of the match. Do the same for `robots` when `robots_version` is not 1.
+   rest of the match. Do the same for `robots` and `unidentified` when
+   `robots_version` is not 2 (or 1, if you only read the version-1 fields).
 5. Treat unknown string values in open lists, such as phase names and mark
    `source` methods, as data, not as errors.
 
 The JSON Schema pins the current versions with `const`. A newer file therefore
 fails validation in exactly the place that changed. An envelope with an
 unknown `metric` is checked only against the common envelope keys.
+
+### v3 changes
+
+All additive: every version-2 field is still there with the same meaning.
+
+* Top level: `camera_legend` (with paths) and `cameras` (always): the
+  calibration details of every camera version the matches used. See
+  [Cameras and calibration](#cameras-and-calibration).
+* `matches[]`: `cameras` and `unidentified_s` (always), `unidentified` (with
+  paths). `robots_version` is now 2.
+* `robots[].path`: `cams` (a camera bitmask per point) and `camera_s`. See
+  [Cameras per point](#cameras-per-point-cams).
+* `robots[]`: `identity` and `identity_s`, how the team label was decided.
+  See [How the team was identified](#how-the-team-was-identified-identity).
+* The single-match file carries `camera_legend` and the `cameras` it uses.
 
 ## Importing
 
@@ -708,11 +954,13 @@ type Alliance = "red" | "blue";
 
 interface ScoutingExport {
   schema: "frc-vision-scorer.scouting-export";
-  schema_version: 2;
+  schema_version: 3;
   event_key: string;            // TBA event key, e.g. "2026cur"
   year: number;
   generated_at: string;         // ISO-8601 UTC
   path_frame?: PathFrame;       // absent with ?paths=false
+  camera_legend?: string[];     // bit i of every `cams` mask; absent with ?paths=false
+  cameras: Record<string, { versions: Record<string, CameraDetail | CameraError> }>;
   matches: ExportMatch[];
   skipped: { match_key: string; replay_id?: string; reason: string }[];
   envelopes: Envelope[];
@@ -731,9 +979,12 @@ interface SourceRef {
 interface ExportMatch extends SourceRef {
   alliances: Record<Alliance, [number | null, number | null, number | null]>; // stations 1..3
   timeline: Timeline | null;
-  robots_version?: 1;           // these three are absent with ?paths=false
+  cameras: Record<string, { version_id: string | null; status: string | null; reason: string | null }>;
+  unidentified_s: { auto: number; teleop: number };
+  robots_version?: 2;           // these four are absent with ?paths=false
   auto_s?: number;              // t < auto_s is auto
   robots?: Robot[];
+  unidentified?: Unidentified[];
 }
 
 interface PathFrame {
@@ -757,12 +1008,70 @@ interface Robot {
     confirmed_share: number | null;
     segments: [number, number][];   // inclusive index ranges, safe to draw as polylines
     n_jumps: number;
+    camera_s: Record<string, number> | null;  // seconds per camera + "none" (coasting)
     t: number[];                    // match seconds
     x: number[];                    // metres, path_frame
     y: number[];
     frame: number[];                // source-video frame
+    cams: (number | null)[] | null; // bitmask per point on camera_legend; 0 = coasting
   };
+  identity: IdentityRow[];
+  identity_s: Record<string, number>; // match seconds by source
 }
+
+interface IdentityRow {
+  slot: string;                   // tracker slot, e.g. "B1"
+  start_frame: number;
+  end_frame: number;              // inclusive
+  start_t: number | null;         // match seconds; null outside the match clock
+  end_t: number | null;
+  source: string | null;          // window_digits | window_lineup | window_fill | window_elim | older values
+  read_camera: "main" | null;     // reads only ever come from the main camera
+  score: number | null;
+  confirmed: boolean;
+}
+
+interface Unidentified {
+  track_id: string;               // "<slot>#<n>"
+  slot: string;
+  alliance: Alliance;
+  first_t: number;
+  last_t: number;
+  n_points: number;
+  duration_s: number;
+  team_before: number | null;     // hints, not proof
+  gap_before_s: number | null;
+  team_after: number | null;
+  gap_after_s: number | null;
+  candidates: number[];           // lineup teams not labelled elsewhere, station order
+  camera_s: Record<string, number> | null;
+  t: number[];
+  x: number[];
+  y: number[];
+  frame: number[];
+  cams: (number | null)[] | null;
+}
+
+interface CameraDetail {
+  version_id: string;
+  created_at: string | null;
+  label: string | null;
+  start_match: string | null;
+  rejected: boolean;
+  mode: "pinhole" | "camera" | "homography";
+  field_season: string | null;
+  image_size: [number, number] | null;        // [w, h]
+  crop_region: [number, number, number, number] | null;
+  rms_error_px: number | null;
+  intrinsics: { fx: number; fy: number; cx: number; cy: number; K: number[][] } | null;
+  distortion: { model: "fisheye_kb4" | "opencv_pinhole" | null; coefficients: number[] | null;
+                edge_shift_px: number | null; corner_shift_px: number | null };
+  pose: { position_m: [number, number, number]; yaw_deg: number; pitch_deg: number;
+          roll_deg: number; rotation_matrix: number[][]; rvec: number[]; tvec: number[] } | null;
+  homography: number[][] | null;
+}
+
+interface CameraError { version_id: string; error: string }
 
 type MarkName = "match_start" | "auto_end" | "teleop_start" | "endgame_start" | "match_end";
 
@@ -827,7 +1136,7 @@ import json
 import sys
 
 d = json.load(open(sys.argv[1] if len(sys.argv) > 1 else "2026cur_scouting_export.json"))
-assert d["schema"] == "frc-vision-scorer.scouting-export" and d["schema_version"] == 2
+assert d["schema"] == "frc-vision-scorer.scouting-export" and d["schema_version"] == 3
 
 for m in d["matches"]:
     red = "-".join(str(t) for t in m["alliances"]["red"])
@@ -898,3 +1207,10 @@ known.
 * An auto-only replay (2026cur qm76) still appears in the teleop metrics. It
   appears with `counted: false` and lowers those teams' teleop `coverage`.
 * `replay_created_at` has no timezone. `generated_at` is UTC.
+* A path point with `cams` 0 was predicted (the tracker coasting), not seen.
+* Team numbers are read only from the main camera. `identity` says how each
+  stretch was labelled; `window_fill` and `window_elim` stretches had no read.
+* `unidentified` hints (`team_before`, `team_after`, `candidates`) are not
+  proof: a slot can be re-seeded onto another robot.
+* `camera_legend` is per file. Decode `cams` with the legend of the file you
+  read it from.

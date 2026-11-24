@@ -129,7 +129,7 @@ def test_event_export_orders_matches_and_attaches_timelines():
                          hub_auto={}, frame_period_s=0.2)
     ms = [md("2026tst_f1m1", "f", 1), md("2026tst_qm10", "qm", 10), md("2026tst_qm2", "qm", 2)]
     out = event_export("2026tst", 2026, ms, [], [], {"2026tst_qm2": {"marks": {}}})
-    assert out["schema"] == "frc-vision-scorer.scouting-export" and out["schema_version"] == 2
+    assert out["schema"] == "frc-vision-scorer.scouting-export" and out["schema_version"] == 3
     assert [m["match_key"] for m in out["matches"]] == ["2026tst_qm2", "2026tst_qm10",
                                                          "2026tst_f1m1"]
     assert out["matches"][0]["timeline"] == {"marks": {}}

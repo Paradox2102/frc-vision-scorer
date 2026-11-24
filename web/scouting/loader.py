@@ -6,7 +6,8 @@ identity method) wins; with none, the newest complete one is used and flagged
 ``legacy_labels``.
 
 Identity: a robot sample belongs to the frame's ``team_number``. Unlabelled
-samples are counted in ``tracked_s`` but not attributed. A label naming a team
+samples are counted in ``tracked_s`` but not attributed to a team; the export
+lists them per slot (``MatchData.unidentified``). A label naming a team
 that is not in the TBA lineup is dropped (``off_roster``). Two slots carrying
 the same team in one frame keep one sample (the confirmed one, else the first).
 
@@ -26,6 +27,7 @@ from web.field.season import season_for_event
 from web.scouting.clock import MatchClock
 from web.scouting.geometry import to_alliance
 from web.scouting.model import MatchData, Sample, TeamMatch
+from web.scouting.provenance import identity_segments, match_cameras
 
 REPO = Path(__file__).resolve().parents[2]
 REPLAY_DIR = REPO / "web" / "replays"
@@ -144,6 +146,11 @@ def _team_int(v) -> Optional[int]:
         return None
 
 
+def _slot_alliance(slot) -> str:
+    """'R2' -> 'red', 'B1' -> 'blue' (the tracker's slot naming)."""
+    return "red" if str(slot)[:1].upper() == "R" else "blue"
+
+
 def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy: bool,
                 lineup: dict, year: int) -> tuple:
     """(MatchData, None) or (None, skip_reason)."""
@@ -173,7 +180,8 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
         frame_period_s=float(dt),
         labelled_s={"auto": 0.0, "teleop": 0.0}, tracked_s={"auto": 0.0, "teleop": 0.0},
         periods=list(summary.get("periods") or []),
-        video_path=replay.get("source_video_path"), youtube_key=lineup.get("video_key"))
+        video_path=replay.get("source_video_path"), youtube_key=lineup.get("video_key"),
+        unidentified_s={"auto": 0.0, "teleop": 0.0}, cameras=match_cameras(summary))
 
     def team_match(team: int, alliance: str) -> TeamMatch:
         tm = md.teams.get(team)
@@ -187,7 +195,7 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
         ax, ay = to_alliance(xy[0], xy[1], alliance, year)
         return Sample(frame_num=int(fn), t_match=t, period=period, remaining=remaining,
                       x=float(xy[0]), y=float(xy[1]), ax=ax, ay=ay, dt=dt,
-                      confirmed=bool(confirmed), slot=slot)
+                      confirmed=bool(confirmed), slot=slot, alliance=alliance)
 
     slot_auto_xy: dict = defaultdict(list)    # slot -> [(frame_num, xy)] in auto
     slot_auto_labels: dict = defaultdict(dict)  # slot -> {frame_num: team} in auto
@@ -198,22 +206,31 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
             continue
         period = at[0]
         seen: dict = {}
+        labels: list = []
         for rb in fr.get("robots") or []:
             xy = rb.get("field_pos")
             if not xy or len(xy) < 2:
                 continue
             md.tracked_s[period] += dt
-            if period == "auto" and rb.get("slot"):
-                slot_auto_xy[rb["slot"]].append((int(fr["frame_num"]), xy))
+            slot = rb.get("slot")
+            if period == "auto" and slot:
+                slot_auto_xy[slot].append((int(fr["frame_num"]), xy))
             team = _team_int(rb.get("team_number"))
             if team is None:
+                if slot:
+                    alliance = rb.get("alliance") or _slot_alliance(slot)
+                    md.unidentified.setdefault(slot, []).append(
+                        sample(fr["frame_num"], at, xy, alliance, False, slot))
+                    md.unidentified_s[period] += dt
                 continue
             if roster and team not in roster:
                 off_roster += 1
                 continue
+            if slot:
+                labels.append((slot, team))
             alliance = roster.get(team) or rb.get("alliance") or "blue"
-            if period == "auto" and rb.get("slot"):
-                slot_auto_labels[rb["slot"]][int(fr["frame_num"])] = team
+            if period == "auto" and slot:
+                slot_auto_labels[slot][int(fr["frame_num"])] = team
             prev = seen.get(team)
             if prev is not None:
                 dups += 1
@@ -226,9 +243,25 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
                 sample(fr["frame_num"], at, rb["field_pos"], alliance,
                        rb.get("confirmed"), rb.get("slot")))
             md.labelled_s[period] += dt
+        if labels:
+            md.frame_labels[int(fr["frame_num"])] = tuple(labels)
 
     _attach_auto_paths(md, summary.get("autonomous_paths") or {}, slot_auto_labels,
                        slot_auto_xy, clock, roster, team_match, sample)
+    # An auto slot span is attributed whole to its team (_slot_spans hands the
+    # unlabelled frames between label runs to the nearer run), so those frames
+    # are already in that team's auto path: not unidentified.
+    claimed = {(s.frame_num, s.slot) for tm in md.teams.values()
+               if tm.auto_source == "autonomous_paths" for s in tm.auto_path}
+    for slot in list(md.unidentified):
+        pts = [s for s in md.unidentified[slot] if (s.frame_num, slot) not in claimed]
+        for s in md.unidentified[slot]:
+            if (s.frame_num, slot) in claimed:
+                md.unidentified_s[s.period] -= s.dt
+        if pts:
+            md.unidentified[slot] = sorted(pts, key=lambda s: (s.t_match, s.frame_num))
+        else:
+            del md.unidentified[slot]
     md.off_roster_samples, md.duplicate_label_samples = off_roster, dups
     return md, None
 
@@ -348,6 +381,11 @@ def load_event(event_key: str, db_path=None) -> tuple:
             if md is None:
                 skipped.append({"match_key": match_key, "replay_id": replay["id"], "reason": why})
             else:
+                # Provenance for the export: the replay dir (draw log, read
+                # lazily there) and the identity segments (one indexed query).
+                mp = _meta_path(replay)
+                md.replay_dir = str(mp.parent) if mp else None
+                md.identity_segments = identity_segments(conn, md.replay_id)
                 matches.append(md)
         return matches, skipped
     finally:

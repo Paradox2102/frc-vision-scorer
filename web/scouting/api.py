@@ -8,8 +8,9 @@
                                                 timeline + every robot's whole-match path
                                                 (?paths=false drops the paths; format:
                                                 docs/scouting-export/README.md)
-  GET /api/scouting/{event}/match/{match_key}   one match: lineup, timeline, robot paths
-                                                (?team=N for one robot)
+  GET /api/scouting/{event}/match/{match_key}   one match: lineup, timeline, robot paths,
+                                                unidentified tracks + the camera
+                                                calibrations it used (?team=N for one robot)
   GET /api/scouting/field-image/{year}[/meta]   AdvantageScope field2d jpg + its corner pixels
   GET  /api/scouting/roborecon/status           RoboRecon connection/auth check (no token echoed)
   POST /api/scouting/{event}/push-roborecon     push metric envelopes to RoboRecon
@@ -202,7 +203,9 @@ def _match_sync(event_key: str, match_key: str, team: Optional[int]) -> dict:
         why = next((s.get("reason") for s in skipped if s.get("match_key") == match_key), None)
         raise HTTPException(404, f"{match_key}: {why}" if why
                             else f"no analysed match {match_key!r} in {event_key}")
-    row = export.match_row(md, timeline.for_match(md), paths=True)
+    # The file stands alone: its own camera bit order + the calibrations it uses.
+    legend = export.camera_legend([md])
+    row = export.match_row(md, timeline.for_match(md), paths=True, legend=legend)
     if team is not None:
         row["robots"] = [r for r in row["robots"] if r["team_number"] == int(team)]
         if not row["robots"]:
@@ -210,7 +213,8 @@ def _match_sync(event_key: str, match_key: str, team: Optional[int]) -> dict:
     return {"schema": export.MATCH_SCHEMA, "schema_version": export.EXPORT_SCHEMA_VERSION,
             "event_key": event_key, "year": md.year,
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "path_frame": export.path_frame(md.year), "match": row}
+            "path_frame": export.path_frame(md.year), "camera_legend": legend,
+            "cameras": export.cameras_block(event_key, [md]), "match": row}
 
 
 @router.get("/{event_key}/match/{match_key}")

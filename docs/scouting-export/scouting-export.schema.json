@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "frc-vision-scorer whole-event scouting export",
-  "description": "One FRC event's vision-scouting data: a header, one row per analysed match (TBA lineup + phase timestamps on the match video), the matches that could not be used, and one envelope per scouting metric. Produced by GET /api/scouting/{event_key}/export. This schema describes top-level schema_version 2, envelope schema_version 1 and timeline_version 1. Every object may gain new keys in later releases without a version bump: importers must ignore keys they do not know. Human guide: README.md next to this file.",
+  "description": "One FRC event's vision-scouting data: a header, one row per analysed match (TBA lineup + phase timestamps on the match video), the matches that could not be used, and one envelope per scouting metric. Produced by GET /api/scouting/{event_key}/export. This schema describes top-level schema_version 3, envelope schema_version 1, timeline_version 1 and robots_version 2. Every object may gain new keys in later releases without a version bump: importers must ignore keys they do not know. Human guide: README.md next to this file.",
   "type": "object",
   "required": [
     "schema",
@@ -19,8 +19,8 @@
       "description": "File-type tag. Always this string for the whole-event export (single metric envelopes use 'frc-vision-scorer.scouting')."
     },
     "schema_version": {
-      "const": 2,
-      "description": "Version of the whole-file layout (header + matches + skipped + envelopes). Bumped only on a breaking change to this layout. v2 added the header and matches[]."
+      "const": 3,
+      "description": "Version of the whole-file layout (header + cameras + matches + skipped + envelopes). Bumped on a breaking change to this layout. v2 added the header and matches[]; v3 (additive only) added camera_legend, cameras, matches[].cameras / unidentified_s / unidentified, path cams / camera_s and robot identity / identity_s."
     },
     "event_key": {
       "$ref": "#/$defs/eventKey"
@@ -55,6 +55,51 @@
     "path_frame": {
       "$ref": "#/$defs/pathFrame",
       "description": "Coordinate frame of matches[].robots[].path. Absent when the export was made with paths=false."
+    },
+    "camera_legend": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "const": "main"
+        },
+        {
+          "const": "corner_left"
+        },
+        {
+          "const": "corner_right"
+        }
+      ],
+      "description": "Camera names in bit order for every cams bitmask in the file: bit i (value 1 << i) = camera_legend[i]. Always starts main, corner_left, corner_right; other cameras follow, sorted. Absent when the export was made with paths=false."
+    },
+    "cameras": {
+      "type": "object",
+      "description": "Calibration details of every camera version that matches[].cameras references, keyed by camera name, then version_id. Present with and without paths.",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "versions"
+        ],
+        "properties": {
+          "versions": {
+            "type": "object",
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/cameraDetail"
+                },
+                {
+                  "$ref": "#/$defs/cameraError"
+                }
+              ]
+            }
+          }
+        },
+        "additionalProperties": true
+      }
     }
   },
   "additionalProperties": true,
@@ -206,7 +251,9 @@
       "type": "object",
       "required": [
         "alliances",
-        "timeline"
+        "timeline",
+        "cameras",
+        "unidentified_s"
       ],
       "properties": {
         "alliances": {
@@ -240,8 +287,8 @@
           }
         },
         "robots_version": {
-          "const": 1,
-          "description": "Version of robots[] / path and the top-level path_frame. Bumped only on a breaking change to them. Absent with paths=false."
+          "const": 2,
+          "description": "Version of robots[] / unidentified[] / their path columns and the top-level path_frame + camera_legend. Bumped on a breaking change to them (v2 was additive: cams, camera_s, identity, identity_s, unidentified). Absent with paths=false."
         },
         "auto_s": {
           "type": "number",
@@ -254,6 +301,39 @@
             "$ref": "#/$defs/robot"
           },
           "description": "Every robot of the match: lineup order (red 1-3, blue 1-3), then any identified team the lineup does not list. Absent with paths=false."
+        },
+        "cameras": {
+          "type": "object",
+          "description": "The calibration version each camera used in this match, keyed by camera name (main, corner_left, corner_right, ...). A camera missing here was not used. Present with and without paths.",
+          "additionalProperties": {
+            "$ref": "#/$defs/cameraUse"
+          }
+        },
+        "unidentified_s": {
+          "type": "object",
+          "required": [
+            "auto",
+            "teleop"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "auto": {
+              "type": "number",
+              "minimum": 0
+            },
+            "teleop": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "description": "Robot-seconds of tracked robots never matched to a team, per period. Present with and without paths."
+        },
+        "unidentified": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/unidentified"
+          },
+          "description": "Tracked robots we never named: one entry per contiguous piece of one slot, by slot then time. Absent with paths=false."
         }
       },
       "additionalProperties": true
@@ -2411,7 +2491,9 @@
         "team_number",
         "alliance",
         "alliance_position",
-        "path"
+        "path",
+        "identity",
+        "identity_s"
       ],
       "description": "One robot of a match and its whole-match path.",
       "properties": {
@@ -2432,6 +2514,21 @@
         },
         "path": {
           "$ref": "#/$defs/robotPath"
+        },
+        "identity": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identityRow"
+          },
+          "description": "How this team's label was decided: every stretch of a tracker slot labelled with this team (neighbouring rows of one slot with the same source merged), by slot then start_frame. Team numbers are read ONLY from the main camera."
+        },
+        "identity_s": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          },
+          "description": "Match-clock seconds of identity[] by source (a null source counts as 'unknown')."
         }
       },
       "additionalProperties": true
@@ -2451,9 +2548,11 @@
         "t",
         "x",
         "y",
-        "frame"
+        "frame",
+        "cams",
+        "camera_s"
       ],
-      "description": "Where the robot was over the whole match. t/x/y/frame are parallel arrays of length n_points, sorted by t, one point per analysed frame where the robot was located AND identified as this team.",
+      "description": "Where the robot was over the whole match. t/x/y/frame/cams are parallel arrays of length n_points, sorted by t, one point per analysed frame where the robot was located AND identified as this team.",
       "properties": {
         "n_points": {
           "type": "integer",
@@ -2551,9 +2650,529 @@
             "type": "integer"
           },
           "description": "Source-video frame; video seconds = frame / timeline.video.fps."
+        },
+        "cams": {
+          "$ref": "#/$defs/camsColumn"
+        },
+        "camera_s": {
+          "$ref": "#/$defs/cameraSeconds"
         }
       },
       "additionalProperties": true
+    },
+    "camsColumn": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      },
+      "description": "Per point, a bitmask of the cameras that saw the robot in that frame: bit i (value 1 << i) = camera_legend[i]. 0 = no camera saw it: the tracker was coasting and the position is a prediction. A null item = no camera log for that frame. The whole column is null when the analysis kept no per-frame camera log."
+    },
+    "cameraSeconds": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "none"
+      ],
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0
+      },
+      "properties": {
+        "none": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Coasting seconds (cams 0)."
+        }
+      },
+      "description": "Seconds of the points each camera saw, keyed by camera name, plus 'none' (coasting). A point counts toward every camera in its mask; each point stands for the time to the next point, capped at one frame period. null when cams is null."
+    },
+    "identityRow": {
+      "type": "object",
+      "required": [
+        "slot",
+        "start_frame",
+        "end_frame",
+        "start_t",
+        "end_t",
+        "source",
+        "read_camera",
+        "score",
+        "confirmed"
+      ],
+      "additionalProperties": true,
+      "description": "One stretch of one tracker slot labelled with this team.",
+      "properties": {
+        "slot": {
+          "type": "string",
+          "description": "Tracker slot (R1..R3, B1..B3): a tracker seat, not a station."
+        },
+        "start_frame": {
+          "type": "integer",
+          "description": "Source-video frame, inclusive."
+        },
+        "end_frame": {
+          "type": "integer",
+          "description": "Source-video frame, inclusive."
+        },
+        "start_t": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Match seconds of start_frame; null outside the match clock."
+        },
+        "end_t": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Match seconds of end_frame; null outside the match clock."
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "window_digits (number read from the bumper digits), window_lineup (matched against a lineup card of the match's teams), window_fill (carried along the track, no read), window_elim (the alliance's only unlabelled team, no read); older analyses: read, stitched, none, null. Treat unknown values as data."
+        },
+        "read_camera": {
+          "enum": [
+            "main",
+            null
+          ],
+          "description": "main for window_digits / window_lineup (reads only ever use the main camera); null otherwise."
+        },
+        "score": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Confidence 0..1 (frame-weighted mean over merged rows), or null."
+        },
+        "confirmed": {
+          "type": "boolean",
+          "description": "true = the number was read directly."
+        }
+      }
+    },
+    "unidentified": {
+      "type": "object",
+      "required": [
+        "track_id",
+        "slot",
+        "alliance",
+        "first_t",
+        "last_t",
+        "n_points",
+        "duration_s",
+        "team_before",
+        "gap_before_s",
+        "team_after",
+        "gap_after_s",
+        "candidates",
+        "camera_s",
+        "t",
+        "x",
+        "y",
+        "frame",
+        "cams"
+      ],
+      "additionalProperties": true,
+      "description": "One contiguous piece of one slot that was tracked but never matched to a team (split like robot path segments: > 1.0 s gap or a step faster than 7 m/s). team_before / team_after / candidates are HINTS, not proof: a slot can be re-seeded onto another robot.",
+      "properties": {
+        "track_id": {
+          "type": "string",
+          "description": "'<slot>#<n>', n = 1-based piece index within the slot in time order. Stable for one replay_id."
+        },
+        "slot": {
+          "type": "string"
+        },
+        "alliance": {
+          "$ref": "#/$defs/alliance"
+        },
+        "first_t": {
+          "type": "number"
+        },
+        "last_t": {
+          "type": "number"
+        },
+        "n_points": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Seconds the points stand for (time to the next point, capped at one frame period)."
+        },
+        "team_before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Team labelled on the same slot in the nearest labelled frame before the piece."
+        },
+        "gap_before_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Match seconds from that frame to first_t."
+        },
+        "team_after": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Team labelled on the same slot in the nearest labelled frame after the piece."
+        },
+        "gap_after_s": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Match seconds from last_t to that frame."
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The alliance's lineup teams NOT labelled on another slot in at least 50% of the piece's frames, in station order. Empty when the lineup is unknown (or all three were labelled elsewhere)."
+        },
+        "camera_s": {
+          "$ref": "#/$defs/cameraSeconds"
+        },
+        "t": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Match seconds."
+        },
+        "x": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Metres, path_frame (absolute)."
+        },
+        "y": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Metres, path_frame (absolute)."
+        },
+        "frame": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "Source-video frame."
+        },
+        "cams": {
+          "$ref": "#/$defs/camsColumn"
+        }
+      }
+    },
+    "cameraUse": {
+      "type": "object",
+      "required": [
+        "version_id",
+        "status",
+        "reason"
+      ],
+      "additionalProperties": true,
+      "description": "Which calibration a camera used in one match.",
+      "properties": {
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Key into the top-level cameras[camera].versions."
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "'main' for the main camera; for a corner camera the per-match check's verdict: kept, adopted, dropped (not used for this match), failed_kept, or a future value."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The check's note, for people."
+        }
+      }
+    },
+    "cameraError": {
+      "type": "object",
+      "required": [
+        "version_id",
+        "error"
+      ],
+      "additionalProperties": true,
+      "description": "A calibration version whose file could not be read.",
+      "properties": {
+        "version_id": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "cameraDetail": {
+      "type": "object",
+      "required": [
+        "version_id",
+        "created_at",
+        "label",
+        "start_match",
+        "rejected",
+        "mode",
+        "field_season",
+        "image_size",
+        "crop_region",
+        "rms_error_px",
+        "intrinsics",
+        "distortion",
+        "pose",
+        "homography"
+      ],
+      "additionalProperties": true,
+      "description": "One camera calibration version.",
+      "properties": {
+        "version_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO-8601 local time, no timezone ('' or null for the legacy file)."
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start_match": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "First match the version was made for (TBA key), or null."
+        },
+        "rejected": {
+          "type": "boolean",
+          "description": "An operator rejected this version later."
+        },
+        "mode": {
+          "type": "string",
+          "description": "pinhole (OpenCV pinhole + distortion), camera (fisheye), homography (ground-plane mapping, no pose)."
+        },
+        "field_season": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_size": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[w, h] pixels."
+        },
+        "crop_region": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer"
+          },
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "[x, y, w, h] of this camera inside the composite broadcast frame."
+        },
+        "rms_error_px": {
+          "$ref": "#/$defs/nullableNumber",
+          "description": "Reprojection RMS of the solve, pixels."
+        },
+        "intrinsics": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "fx",
+            "fy",
+            "cx",
+            "cy",
+            "K"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "fx": {
+              "type": "number"
+            },
+            "fy": {
+              "type": "number"
+            },
+            "cx": {
+              "type": "number"
+            },
+            "cy": {
+              "type": "number"
+            },
+            "K": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          },
+          "description": "Pixels; K is the 3x3 camera matrix."
+        },
+        "distortion": {
+          "type": "object",
+          "required": [
+            "model",
+            "coefficients",
+            "edge_shift_px",
+            "corner_shift_px"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "model": {
+              "enum": [
+                "fisheye_kb4",
+                "opencv_pinhole",
+                null
+              ],
+              "description": "fisheye_kb4 = OpenCV fisheye k1..k4 (mode camera); opencv_pinhole = OpenCV k1, k2, p1, p2, k3, ... (mode pinhole)."
+            },
+            "coefficients": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "number"
+              }
+            },
+            "edge_shift_px": {
+              "$ref": "#/$defs/nullableNumber",
+              "description": "Max |distorted - ideal pinhole pixel| at the mid-left and mid-right image edges; null if it can't be computed."
+            },
+            "corner_shift_px": {
+              "$ref": "#/$defs/nullableNumber",
+              "description": "The same at the four image corners; null if it can't be computed (e.g. a wide fisheye whose corners lie past 90 degrees)."
+            }
+          }
+        },
+        "pose": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "position_m",
+            "yaw_deg",
+            "pitch_deg",
+            "roll_deg",
+            "rotation_matrix",
+            "rvec",
+            "tvec"
+          ],
+          "additionalProperties": true,
+          "description": "Camera pose in the WPILib field frame (path_frame, z up). null in homography mode.",
+          "properties": {
+            "position_m": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "Camera centre [x, y, z] in field metres (= -R^T t)."
+            },
+            "yaw_deg": {
+              "type": "number",
+              "description": "Heading of the optical axis in the field XY plane, atan2(dir_y, dir_x): 0 = toward +x (red wall), counter-clockwise from above positive."
+            },
+            "pitch_deg": {
+              "type": "number",
+              "description": "Elevation of the optical axis; negative = looking down."
+            },
+            "roll_deg": {
+              "type": "number",
+              "description": "Rotation about the optical axis: 0 = image up as close to world up as possible; positive = camera turned clockwise seen from behind (scene appears turned counter-clockwise)."
+            },
+            "rotation_matrix": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "R, field -> camera (OpenCV: p_cam = R X_field + t; camera x right, y down, z forward)."
+            },
+            "rvec": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "R as a Rodrigues vector."
+            },
+            "tvec": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "t in metres."
+            }
+          }
+        },
+        "homography": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "description": "3x3 image -> field ground-plane matrix in homography mode, else null."
+        }
+      }
     }
   }
 }

@@ -157,6 +157,124 @@ def test_dismiss_marks_failed(app_mod):
     assert rec["status"] == "failed" and rec["reason"] == "dismissed — calibrate manually"
 
 
+# ------------------------------------------------------- accept ("Confirm good")
+
+def _epoch_record(status="failed", epoch="v1", match_key="evt_qm8"):
+    return ac.new_record(
+        status, "could not verify epoch v1 on evt_qm8 (no sampled frame showed >= 3 "
+        "known tags)", match_key=match_key, method="pose_resolve", epoch=epoch,
+        metrics={"n_tags": 2, "rms_px": 0.02, "val_best_m": 0.014},
+        preview="calibration_auto_evt_corner_left.jpg")
+
+
+def _save_epoch(camera="corner_left", start_match=None):
+    return field_store.save_version("evt", camera, truth_pinhole_camera(),
+                                    start_match=start_match)
+
+
+@pytest.mark.parametrize("status", ["failed", "ready"])
+def test_accept_marks_existing_epoch_confirmed_without_new_version(app_mod, status):
+    vid = _save_epoch()
+    field_store.save_auto_record("evt", "corner_left", _epoch_record(status, epoch=vid))
+    r = _client(app_mod).post("/api/calibration/auto/accept",
+                              json={"event": "evt", "camera": "corner_left"})
+    assert r.status_code == 200, r.text
+    assert r.json()["epoch"] == vid
+    rec = field_store.load_auto_record("evt", "corner_left")
+    assert rec["status"] == "confirmed" and rec["method"] == ac.OPERATOR_CONFIRM_METHOD
+    assert rec["reason"].startswith(f"operator confirmed epoch {vid} looks right")
+    assert rec["resolved_version"] is None and rec["epoch"] == vid
+    assert rec["operator_confirmed"]["from_status"] == status
+    assert rec["metrics"]["val_best_m"] == 0.014                 # metrics kept
+    assert rec["preview"] == "calibration_auto_evt_corner_left.jpg"   # overlay kept
+    assert [v["version_id"] for v in field_store.load_versions("evt", "corner_left")] == [vid]
+    assert "confirmed" in ac.SETTLED_STATUSES
+    assert ac.skip_reason(rec, force=False) == "confirmed"       # event load leaves it
+
+
+def test_accept_survives_event_load_until_forced(app_mod, monkeypatch, tmp_path):
+    vid = _save_epoch("main")
+    field_store.save_auto_record("evt", "main", _epoch_record(epoch=vid))
+    assert _client(app_mod).post("/api/calibration/auto/accept",
+                                 json={"event": "evt", "camera": "main"}).status_code == 200
+    monkeypatch.setattr(ac, "resolve_reference_video",
+                        lambda *a, **k: ("evt_qm1", tmp_path / "evt_qm1.mp4"))
+    ran = []
+    monkeypatch.setattr(ac, "run_camera",
+                        lambda video, mk, camera, *a, **k: ran.append(camera) or _fake_result())
+    asyncio.run(app_mod._run_auto_calibrate("evt", [], ["main"]))
+    assert ran == []
+    assert field_store.load_auto_record("evt", "main")["method"] == ac.OPERATOR_CONFIRM_METHOD
+
+
+def test_accept_refuses_record_without_epoch(app_mod):
+    rec = _epoch_record(epoch=None); rec["method"] = "full_solve"
+    field_store.save_auto_record("evt", "corner_left", rec)
+    r = _client(app_mod).post("/api/calibration/auto/accept",
+                              json={"event": "evt", "camera": "corner_left"})
+    assert r.status_code == 400 and "no existing calibration epoch" in r.json()["error"]
+    assert field_store.load_auto_record("evt", "corner_left")["status"] == "failed"
+
+
+@pytest.mark.parametrize("status,code", [("verified", 400), ("confirmed", 400),
+                                         ("running", 409)])
+def test_accept_refuses_other_statuses(app_mod, status, code):
+    vid = _save_epoch()
+    field_store.save_auto_record("evt", "corner_left", _epoch_record(status, epoch=vid))
+    r = _client(app_mod).post("/api/calibration/auto/accept",
+                              json={"event": "evt", "camera": "corner_left"})
+    assert r.status_code == code
+    assert field_store.load_auto_record("evt", "corner_left")["status"] == status
+
+
+def test_accept_refuses_missing_or_superseded_epoch(app_mod):
+    c = _client(app_mod)
+    assert c.post("/api/calibration/auto/accept",
+                  json={"event": "evt", "camera": "corner_left"}).status_code == 404
+    field_store.save_auto_record("evt", "corner_left", _epoch_record(epoch="gone"))
+    r = c.post("/api/calibration/auto/accept", json={"event": "evt", "camera": "corner_left"})
+    assert r.status_code == 409 and "no longer exists" in r.json()["error"]
+    old = _save_epoch()
+    _save_epoch(start_match="evt_qm5")         # a newer version now covers evt_qm8
+    field_store.save_auto_record("evt", "corner_left", _epoch_record(epoch=old))
+    r = c.post("/api/calibration/auto/accept", json={"event": "evt", "camera": "corner_left"})
+    assert r.status_code == 409 and "now covered by version" in r.json()["error"]
+    assert field_store.load_auto_record("evt", "corner_left")["status"] == "failed"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"data": {"event": "evt", "camera": "corner_left"}},               # form-encoded
+    {"content": '{"event": "evt", "camera": "corner_left"}',
+     "headers": {"Content-Type": "text/plain"}},                        # <form enctype=text/plain>
+    {"content": '{"event": "evt", "camera": "corner_left"}'},           # no content type
+])
+def test_accept_rejects_non_json_bodies_csrf(app_mod, kwargs):
+    vid = _save_epoch()
+    field_store.save_auto_record("evt", "corner_left", _epoch_record(epoch=vid))
+    r = _client(app_mod).post("/api/calibration/auto/accept", **kwargs)
+    assert r.status_code == 415
+    assert field_store.load_auto_record("evt", "corner_left")["status"] == "failed"
+
+
+def test_manual_save_supersedes_operator_confirmed_epoch(app_mod):
+    from web.field.field_model import FieldModel
+    from tests._field_synth import project_tag_corners
+    vid = _save_epoch("main")
+    field_store.save_auto_record("evt", "main", _epoch_record(epoch=vid))
+    c = _client(app_mod)
+    assert c.post("/api/calibration/auto/accept",
+                  json={"event": "evt", "camera": "main"}).status_code == 200
+    fm = FieldModel.load("2026-rebuilt-welded")
+    cam = truth_pinhole_camera()
+    corr = project_tag_corners(cam, fm)
+    r = c.post("/api/calibration/solve-tags", json={
+        "event": "evt", "camera": "main", "image_size": list(cam.image_size),
+        "auto_tags": {str(t): corr[t][0].tolist() for t in corr}, "manual_tags": []})
+    assert r.status_code == 200, r.text
+    rec = field_store.load_auto_record("evt", "main")
+    assert rec["reason"] == "corrected manually" and rec["resolved_version"] not in (None, vid)
+
+
 # ------------------------------------------------------------------------ run
 
 def test_run_returns_409_while_running(app_mod, monkeypatch):
@@ -450,3 +568,12 @@ def test_frame_route_aggregate_returns_median_and_caches(app_mod, monkeypatch, t
     r = _client(app_mod).post("/api/calibration/frame",
                               json={**body, "camera": "main"})
     assert r.status_code == 200 and r.json()["aggregated"] is True
+
+
+def test_auto_calib_cfg_verifies_on_job_check_tag_floor(app_mod):
+    from web.field.field_model import FieldModel
+    fm = FieldModel.load("2026-rebuilt-welded")
+    for cam in ("main", "corner_left"):
+        cfg = app_mod._auto_calib_cfg(cam, fm)
+        assert cfg.min_tags == 3                               # solving still needs 3
+        assert ac.verify_min_tags(cfg) == max(2, app_mod.CALIB_CHECK_MIN_TAGS)

@@ -51,6 +51,12 @@ FAILED_RETRY_AFTER_S = 6 * 3600
 # A run skips cameras already in one of these states unless forced.
 SETTLED_STATUSES = frozenset({"ready", "verified", "confirmed"})
 
+# Fewest known tags a frame may show and still verify an existing epoch (see
+# AutoCalibConfig.verify_min_tags): 4 corners of ONE coplanar tag fit many poses.
+VERIFY_MIN_TAGS_FLOOR = 2
+# method of a record the operator accepted as-is ("Confirm good" on /calibrate).
+OPERATOR_CONFIRM_METHOD = "operator_confirm"
+
 _MATCH_KEY_RE = re.compile(r"^[A-Za-z0-9]+_(qm|ef|qf|sf|f)\d+(m\d+)?$")
 
 # BGR colours for the overlay
@@ -70,6 +76,12 @@ class AutoCalibConfig:
     mad_px: float = 5.0
     min_tags: int = 3                 # solve / verify / pose-resolve conditioning
     check_min_tags: int = 2           # per-frame validation floor (mirrors CALIB_CHECK_MIN_TAGS)
+    # VERIFYING an existing epoch (no new pose / lens is solved) also accepts frames
+    # with this many known tags when no frame shows ``min_tags`` — the job's own
+    # per-match corner check accepts 2 (CALIB_CHECK_MIN_TAGS), and a corner that
+    # only ever decodes the hub-front pair could otherwise never verify. Clamped to
+    # >= VERIFY_MIN_TAGS_FLOOR: one coplanar tag (4 corners) is too weak to verify.
+    verify_min_tags: int = 2
     validate_samples: int = 12
     drift_max_m: float = 0.5          # mirrors CALIB_DRIFT_MAX_M
     max_center_shift_m: float = 1.0   # pose_resolve sanity bound (PoseFixConfig)
@@ -472,12 +484,19 @@ def median_frame(video, crop, t_lo: float, t_hi: float, n: int = 31,
     return (med, frames) if return_stack else med
 
 
+def verify_min_tags(cfg: AutoCalibConfig) -> int:
+    """cfg.verify_min_tags clamped to [VERIFY_MIN_TAGS_FLOOR, cfg.min_tags]."""
+    return max(VERIFY_MIN_TAGS_FLOOR, min(int(cfg.verify_min_tags), int(cfg.min_tags)))
+
+
 def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn):
     """``tag_alignment_error`` on ``cfg.validate_samples`` frames evenly spaced over
     the aggregation window (the match proper, like the job's drift check — not the
     pre-match framing). Returns {best_m, median_m, worst_m, frames, gate_best_m,
-    gate_tags} where the stats use frames with >= check_min_tags tags and the gate
-    (verify / pose-resolve decision) uses frames with >= min_tags tags."""
+    gate_tags, verify_gate_best_m, verify_gate_tags} where the stats use frames with
+    >= check_min_tags tags, the gate (verify / pose-resolve decision) uses frames
+    with >= min_tags tags, and the verify gate (existing-epoch verification only,
+    when no frame reaches min_tags) frames with >= ``verify_min_tags(cfg)`` tags."""
     cap = cv2.VideoCapture(str(video))
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -486,6 +505,7 @@ def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn
     k = max(1, cfg.validate_samples)
     idxs = [int(lo + (hi - lo) * i / (k - 1)) for i in range(k)] if k > 1 else [lo]
     errs, gate_best, gate_n = [], float("inf"), 0
+    vmin, vgate_best, vgate_n = verify_min_tags(cfg), float("inf"), 0
     try:
         for fidx in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
@@ -497,16 +517,22 @@ def validate_across_window(cal, video, crop, fm, cfg: AutoCalibConfig, detect_fn
                 errs.append(e)
             if n >= cfg.min_tags and e < gate_best:
                 gate_best, gate_n = e, n
+            if n >= vmin and e < vgate_best:
+                vgate_best, vgate_n = e, n
     finally:
         cap.release()
     if not errs:
         return {"best_m": None, "median_m": None, "worst_m": None, "frames": 0,
-                "gate_best_m": None, "gate_tags": 0}
+                "gate_best_m": None, "gate_tags": 0,
+                "verify_gate_best_m": None, "verify_gate_tags": 0}
     return {"best_m": round(float(min(errs)), 3),
             "median_m": round(float(np.median(errs)), 3),
             "worst_m": round(float(max(errs)), 3), "frames": len(errs),
             "gate_best_m": None if not np.isfinite(gate_best) else round(float(gate_best), 3),
-            "gate_tags": int(gate_n)}
+            "gate_tags": int(gate_n),
+            "verify_gate_best_m": (None if not np.isfinite(vgate_best)
+                                   else round(float(vgate_best), 3)),
+            "verify_gate_tags": int(vgate_n)}
 
 
 # ---------------------------------------------------------------------- geometry/draw
@@ -645,6 +671,8 @@ def _metrics(n_tags, cal, val, unused, center_shift=None, rot_deg=None) -> dict:
             "val_frames": val.get("frames", 0) if val else 0,
             "val_gate_best_m": val.get("gate_best_m") if val else None,
             "val_gate_tags": val.get("gate_tags", 0) if val else 0,
+            "val_verify_gate_best_m": val.get("verify_gate_best_m") if val else None,
+            "val_verify_gate_tags": val.get("verify_gate_tags", 0) if val else 0,
             "center_shift_m": _finite(center_shift, 3),
             "rotation_delta_deg": _finite(rot_deg, 2),
             "unused_visible_tags": list(unused or [])}
@@ -940,6 +968,14 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
             if n >= cfg.min_tags and np.isfinite(e):
                 v.update(gate_best_m=round(float(e), 3), gate_tags=int(n), source="median",
                          best_m=v["best_m"] if v["best_m"] is not None else round(float(e), 3))
+        vmin = verify_min_tags(cfg)
+        if (v["gate_best_m"] is None and v.get("verify_gate_best_m") is None
+                and len(med_dec) >= vmin):
+            e, n = tag_alignment_error(c, med_dec, fm)
+            if n >= vmin and np.isfinite(e):
+                v.update(verify_gate_best_m=round(float(e), 3), verify_gate_tags=int(n),
+                         verify_source="median",
+                         best_m=v["best_m"] if v["best_m"] is not None else round(float(e), 3))
         return v
 
     def finish(status, method, reason, cal, val, overlay_cal, epoch=None,
@@ -980,6 +1016,12 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
         rec = new_record(status, reason, method=method, epoch=epoch,
                          calibration=None if cal is None else cal.to_json(),
                          metrics=metrics, **base)
+        # What the overlay draws: the existing epoch (verify, or a pose re-solve that
+        # never produced a candidate) or this run's candidate. "Confirm good" keeps
+        # the EPOCH, so the page says when the overlay is not showing it.
+        rec["overlay_of"] = (None if overlay_cal is None
+                             else "candidate" if cal is not None
+                             else "epoch" if epoch is not None else None)
         overlay = None
         if background is not None:
             overlay = render_overlay(background, overlay_cal, fm, corners,
@@ -1068,7 +1110,27 @@ def run_camera(video, match_key: str, camera: str, crop, fm, versions,
                       f"epoch {vid} still aligns on {match_key}: best {gate:.2f} m over "
                       f"{val['gate_tags']} tags (gate {cfg.drift_max_m:.2f} m)",
                       None, val, ecal, epoch=vid)
-    if gate is None:
+    # No frame shows min_tags known tags (a corner that only ever decodes the
+    # hub-front pair): VERIFYING the existing epoch — nothing new is solved — may use
+    # frames with verify_min_tags (>= 2) tags, under the same gate. A frame that
+    # does show min_tags always decides (stronger evidence wins), and one tag never
+    # verifies. Solving a new pose / lens below keeps its min_tags requirement.
+    vgate = val.get("verify_gate_best_m")
+    weak_only = gate is None and vgate is not None
+    if not force_resolve and weak_only and vgate < cfg.drift_max_m:
+        src = " (median frame)" if val.get("verify_source") == "median" else ""
+        return finish("verified", "verify",
+                      f"existing calibration verified on {val['verify_gate_tags']} tags: "
+                      f"epoch {vid} aligns on {match_key}{src}: best {vgate:.2f} m "
+                      f"(gate {cfg.drift_max_m:.2f} m); no sampled frame showed >= "
+                      f"{cfg.min_tags} known tags, so this is weaker evidence than a "
+                      f"{cfg.min_tags}-tag check",
+                      None, val, ecal, epoch=vid)
+    if weak_only and vgate >= cfg.drift_max_m:
+        drift_txt = (f"epoch {vid} misaligned on {match_key} (best {vgate:.2f} m on "
+                     f"{val['verify_gate_tags']}-tag frames; no frame showed >= "
+                     f"{cfg.min_tags} known tags)")
+    elif gate is None:
         drift_txt = (f"could not verify epoch {vid} on {match_key} (no sampled frame "
                      f"showed >= {cfg.min_tags} known tags)")
     else:

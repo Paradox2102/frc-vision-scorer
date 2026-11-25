@@ -36,5 +36,11 @@
   make the older single-source versions (not in the post). Match13 = `GET https://actions.match13.com/v1/events/2026cur/matches`,
   `Authorization: Bearer $MATCH13_API_KEY` (repo .env, never commit); each team's xpPost / xAutoPost / xTelePost
   after its last qual, cached as `cmp/data/match13_2026cur_matches.json`.
+- Blind-spot maps: `python blindspots.py 2026cur|2025hop` (`--refresh` re-reads replays) -> `img/blindspots_<event>.png`.
+  Radar `state`/`corner_only` per robot per draw frame (a slot missing from radar = dropped: unseen at its last position), 0.25 m cells, Gaussian blur (1 cell cur, 2 cells hop). Green = main box
+  >= 50% of the time, yellow = else side cams only >= 15%, red = neither. 2026cur: latest complete replay per qual in the
+  Nov 15-16 batch (120 matches, qm32/37/72/76 skipped). 2025hop: qm2 b1fc98da (GT chart replay), qm3 4ca89189, qm4 568d7ea8;
+  its "corner" insets are barge-mounted cams at midfield. Sparse cells (hop) take the nearest measured tier inside main's frame (lighter). Cone lines = outline of ground points inside each camera's image frame
+  (`web.field.coverage._in_frustum` on the event's latest calibration), dashed back to the camera. Caches in `cmp/data/blindspots_<event>.json`.
 - Scouting screenshots: `img/scouting_*_cur.png` (3128 auto paths + heatmap), `scouting_heatmap_defender.png`,
   `scouting_rankings_*.png` from :8004 /scouting (Playwright, 2x); alternates in `img/candidates/cur_*`.

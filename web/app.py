@@ -1658,6 +1658,10 @@ class InferenceJob:
         # Wall-clock creation time, surfaced by /api/job/active so a
         # reloaded page can show truthful start/elapsed clocks on rejoin.
         self.started_at = time.time()
+        # Last status progress (0-100) / message the job emitted, recorded
+        # whether or not a client is attached, for /api/job/active pollers.
+        self.last_progress: Optional[float] = None
+        self.last_message: Optional[str] = None
         self.websocket: Optional[WebSocket] = None
         self._websocket_send_lock = asyncio.Lock()
         # First ws connection claims the run; later connections only attach
@@ -5306,9 +5310,25 @@ class InferenceJob:
             )
         return queue
 
+    def _note_status(self, payload) -> None:
+        """Remember a status payload's progress/message for /api/job/active.
+
+        Runs before any send or shedding, so the last value is kept even with
+        no websocket attached (a swarm driver that dropped, a closed tab).
+        A payload without a key leaves the previous value in place."""
+        if not isinstance(payload, dict) or payload.get("type") != "status":
+            return
+        progress = payload.get("progress")
+        if isinstance(progress, (int, float)) and not isinstance(progress, bool):
+            self.last_progress = float(progress)
+        message = payload.get("message")
+        if message:
+            self.last_message = str(message)
+
     def _enqueue_ws(self, kind: str, payload) -> None:
         """Queue a payload for its kind's sender without ever blocking the
         inference loop; when the queue is full the oldest payload is shed."""
+        self._note_status(payload)
         queue = self._ws_queue(kind)
         while True:
             try:
@@ -5413,6 +5433,7 @@ class InferenceJob:
 
     async def _send_ws(self, payload: dict) -> bool:
         """Serialize websocket writes and isolate transport failures from inference."""
+        self._note_status(payload)
         websocket = self.websocket
         if websocket is None:
             return False
@@ -11797,6 +11818,8 @@ async def active_job():
                 "status": job.status,
                 "started_at": getattr(job, "started_at", None),
                 "match_key": getattr(job, "match_key", None),
+                "progress": getattr(job, "last_progress", None),
+                "message": getattr(job, "last_message", None),
             }
     return {"job_id": None}
 

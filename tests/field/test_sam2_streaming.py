@@ -442,8 +442,43 @@ def test_active_job_endpoint_reports_running_job():
         assert body["job_id"] == "active-1"
         assert body["status"] == "processing"
         assert isinstance(body.get("started_at"), (int, float))
+        assert body["progress"] is None and body["message"] is None
     finally:
         app_mod.jobs.pop("active-1", None)
+
+
+def test_active_job_endpoint_reports_last_status_progress():
+    """/api/job/active carries the job's last status progress + message,
+    recorded from both send paths even with no websocket attached; a later
+    status without a key keeps the earlier value."""
+    import asyncio
+
+    from starlette.testclient import TestClient
+    import web.app as app_mod
+
+    job = app_mod.InferenceJob("active-2", "/mock/video.mp4")
+    job._run_claimed = True
+    job.status = "processing"
+    assert job.websocket is None
+    app_mod.jobs["active-2"] = job
+    try:
+        async def emit():  # the ws queues need the running loop, as in a job
+            await job._send_ws({"type": "status", "status": "processing",
+                                "message": "Scanning match clock…", "progress": 0.0})
+            job._enqueue_ws("status", {"type": "status", "status": "processing",
+                                       "message": "[SAM3] tracking frame 10/100",
+                                       "progress": 61.5})
+            job._enqueue_ws("status", {"type": "status", "status": "processing",
+                                       "message": "Finalizing"})          # no progress key
+            job._enqueue_ws("frame", {"type": "frame", "progress": 99})  # not a status
+
+        asyncio.run(emit())
+        body = TestClient(app_mod.app).get("/api/job/active").json()
+        assert body["job_id"] == "active-2"
+        assert body["progress"] == 61.5
+        assert body["message"] == "Finalizing"
+    finally:
+        app_mod.jobs.pop("active-2", None)
 
 
 def test_active_job_endpoint_none_when_idle():

@@ -50,6 +50,10 @@ class FieldDetection:
     # quality metadata; it never enters cost, gating, fusion weights, or any
     # tracking decision.
     tracker_prob: Optional[float] = None
+    # Robot detector (YOLO) box confidence behind this detection's measurement
+    # (selective TBD evidence ``det_conf``), or None. PAYLOAD ONLY, exactly
+    # like tracker_prob.
+    det_conf: Optional[float] = None
     # Cameras whose detections fused into this one (fusion payload; empty when
     # unknown). Only corner_dup_suppress reads it: a corner-only detection is
     # a duplicate of a nearby main-backed one only if that one's cluster lacks
@@ -78,6 +82,9 @@ class TrackOut:
     # None (legacy / no prob / coasting-from-a-prob-less measurement). Payload
     # only — see FieldDetection.tracker_prob.
     tracker_prob: Optional[float] = None
+    # Detector box confidence of that same measurement (payload only — see
+    # FieldDetection.det_conf); persists while coasting like tracker_prob.
+    det_conf: Optional[float] = None
 
 
 class _KF:
@@ -126,6 +133,7 @@ class _Track:
     # only, for path-sample quality metadata). None until a prob-carrying
     # detection measures the slot; left untouched while the slot coasts.
     tracker_prob: Optional[float] = None
+    det_conf: Optional[float] = None  # same rule, detector box confidence
     # Went into coast while hub-occluded; stays set until re-acquired. Gates the
     # occlusion re-acquisition guard (suspect-zone detections need motion proof).
     occ_coasting: bool = False
@@ -1087,6 +1095,7 @@ class FieldTracker:
         slot.box = d.box
         slot.corner_only = d.box is None
         slot.tracker_prob = d.tracker_prob  # payload only
+        slot.det_conf = d.det_conf  # payload only
         slot.missed = 0
         slot.hits = 1
         slot.coasting = False
@@ -1161,6 +1170,7 @@ class FieldTracker:
         # Payload: record the measuring detection's SAM confidence on the slot.
         # After the KF update so it can never feed back into the state estimate.
         t.tracker_prob = d.tracker_prob
+        t.det_conf = d.det_conf
         if self.record_history:
             self._pending_meas[t.slot_id] = (
                 (float(d.pos[0]), float(d.pos[1])), float(scale))
@@ -1199,5 +1209,6 @@ class FieldTracker:
                     t.box, "coasting" if t.coasting else "visible",
                     corner_only=t.corner_only,
                     tracker_prob=t.tracker_prob,
+                    det_conf=t.det_conf,
                 ))
         return out

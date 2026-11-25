@@ -82,7 +82,7 @@ Each entry is one analysed match, in play order: qm, then ef/qf/sf/f, sorted by
 | `timeline` | object \| null | Where each phase is in the match video. See [The video timeline](#the-video-timeline). |
 | `cameras` | object | Which calibration version each camera used in this match: `{camera: {version_id, status, reason}}`. See [Cameras and calibration](#cameras-and-calibration). Present with and without paths. |
 | `unidentified_s` | `{auto, teleop}` | Robot-seconds of tracked robots that were never matched to a team in this match. Present with and without paths. |
-| `robots_version` | int | `2`. Version of the `robots` and `unidentified` blocks. Absent with `?paths=false`. |
+| `robots_version` | int | `3`. Version of the `robots` and `unidentified` blocks. Absent with `?paths=false`. |
 | `auto_s` | number | Match seconds of auto (2026: 20). Path times `t < auto_s` are auto, the rest teleop. Absent with `?paths=false`. |
 | `robots` | array | Every robot's position over the whole match, which cameras saw each point and how its team was identified. See [Robot paths](#robot-paths). Absent with `?paths=false`. |
 | `unidentified` | array | Tracked robots we never named, with hints about who they may be. See [Unidentified robots](#unidentified-robots). Absent with `?paths=false`. |
@@ -307,7 +307,7 @@ replay a match, draw a robot's path in another app, or compute your own
 metrics. The reference file has 816 robot entries; 811 have points.
 
 ```jsonc
-"robots_version": 2,
+"robots_version": 3,
 "auto_s": 20.0,
 "robots": [
   {"team_number": 3128, "alliance": "blue", "alliance_position": 1,
@@ -325,7 +325,12 @@ metrics. The reference file has 816 robot entries; 811 have points.
      "x":     [3.36, 3.36, 3.35, ...],           // metres, absolute field frame
      "y":     [2.0, 2.0, 2.0, ...],
      "frame": [378, 384, 390, ...],              // source-video frame
-     "cams":  [1, 1, 1, ...]                     // camera bitmask per point (camera_legend)
+     "cams":  [1, 1, 1, ...],                    // camera bitmask per point (camera_legend)
+     "det_conf":     [0.91, 0.88, null, ...],    // detector box confidence per point (v3; values illustrative)
+     "tracker_prob": [null, null, null, ...],    // SAM3 tracker confidence per point (v3)
+     "conf": {"det_conf_mean": 0.84, "det_conf_min": 0.41,
+              "tracker_prob_mean": 0.97, "tracker_prob_min": 0.62,
+              "n_with_det_conf": 702, "n_with_tracker_prob": 88}
    },
    "identity": [                                 // how the team label was decided
      {"slot": "B1", "start_frame": 270, "end_frame": 486, "start_t": null, "end_t": 1.84,
@@ -345,8 +350,8 @@ not list a match's lineup, any team we identified follows, sorted by number.
 A lineup robot we never identified still has an entry, with `n_points: 0` and
 empty arrays.
 
-**Columns.** `t`, `x`, `y`, `frame` and `cams` are parallel arrays of length
-`n_points`, sorted by time, one point per analysed video frame (in 2026cur
+**Columns.** `t`, `x`, `y`, `frame`, `cams`, `det_conf` and `tracker_prob`
+are parallel arrays of length `n_points`, sorted by time, one point per analysed video frame (in 2026cur
 about 10 per second in auto and 5 per second in teleop).
 
 * `t` is **match time** in seconds: auto runs `0..auto_s`, and teleop runs
@@ -361,6 +366,9 @@ about 10 per second in auto and 5 per second in teleop).
   (`frame / fps` is how the timeline's own `frame` values are defined too).
 * `cams` says which cameras saw the robot at that point. See
   [Cameras per point](#cameras-per-point-cams).
+* `det_conf` and `tracker_prob` say how confident the models were in the
+  measurement behind each point. See
+  [Model confidence per point](#model-confidence-per-point-det_conf-tracker_prob).
 
 **Gaps and segments.** A point exists only where the robot was located *and*
 identified as this team. Do not draw a line across a gap. `segments` lists
@@ -394,6 +402,37 @@ neighbours.
 These are the same positions the metrics use. The `auto_paths` metric applies
 its field rules (hub/trench clamping, start-line check) on top of them, so
 its `points_field` can differ slightly from the auto part here.
+
+### Model confidence per point (`det_conf`, `tracker_prob`)
+
+`robots_version` 3 adds two per-point columns and a per-track summary. They
+are on every robot `path` and every [unidentified](#unidentified-robots)
+track, and work the same way on both.
+
+* `det_conf`: the robot detector's box confidence (0..1) for the detection
+  behind that point: the bumper YOLO model's score when the box came from a
+  bumper (expanded to the whole robot), or the robot YOLO model's
+  whole-robot score when it came from a whole-robot box.
+* `tracker_prob`: the SAM3 per-object tracker confidence (0..1) of the mask
+  behind that point. The pipeline runs SAM3 only in short windows where two
+  detections are hard to tell apart. Most points come from detector boxes
+  alone, so `tracker_prob` is null for most points. Inside a SAM3 window,
+  `det_conf` is the detector box held by the same track in that frame, or
+  null when there was none.
+* Both are **null** for a coasting point (no camera measured the robot that
+  frame, `cams` 0), for replays analysed before these fields existed (the
+  whole column is then null), and wherever the value is unknown. Only the
+  selective SAM3 tracker (the default) records `det_conf`. A replay from the
+  full-SAM3 tracker has `tracker_prob` but no `det_conf`.
+* `conf` summarises both columns over the track's points, skipping nulls:
+  `det_conf_mean`, `det_conf_min`, `tracker_prob_mean`, `tracker_prob_min`
+  (null when no point has a value) and the counts `n_with_det_conf`,
+  `n_with_tracker_prob`.
+
+These are model scores, not calibrated probabilities. Use them to rank or
+flag tracks (a low `det_conf_min` or `det_conf_mean` marks a shaky track),
+not as a probability that the robot was there. They say nothing about
+whether the team label is right: see `identity` for that.
 
 ### Cameras per point (`cams`)
 
@@ -480,7 +519,10 @@ them so you can see the gaps, or assign them yourself. `unidentified_s`
    "candidates": [6497, 2724, 2637],
    "camera_s": {"main": 0.3, "corner_left": 0.0, "corner_right": 0.0, "none": 7.1},
    "t": [125.85, 125.95, ...], "x": [5.83, 6.36, ...], "y": [0.77, 0.91, ...],
-   "frame": [8226, 8232, ...], "cams": [1, 1, ...]},
+   "frame": [8226, 8232, ...], "cams": [1, 1, ...],
+   "det_conf": [0.62, 0.58, ...], "tracker_prob": [null, null, ...],   // v3, values illustrative
+   "conf": {"det_conf_mean": 0.6, "det_conf_min": 0.43, "tracker_prob_mean": null,
+            "tracker_prob_min": null, "n_with_det_conf": 31, "n_with_tracker_prob": 0}},
   ...
 ]
 ```
@@ -490,8 +532,14 @@ them so you can see the gaps, or assign them yourself. `unidentified_s`
   faster than 7 m/s). `track_id` = `"<slot>#<n>"`, n counting the slot's
   pieces from 1 in time order. It is stable for a given `replay_id` only.
 * `first_t`, `last_t`, `n_points` and the columns `t`, `x`, `y`, `frame`,
-  `cams` work exactly as in robot paths. `duration_s` is the time the points
-  stand for (see `camera_s` above).
+  `cams`, `det_conf`, `tracker_prob` (and the `conf` summary) work exactly
+  as in robot paths. `duration_s` is the time the points stand for (see
+  `camera_s` above).
+* **No confidence threshold.** Every unlabelled tracked sample on a tracker
+  slot is included, whatever its `det_conf` or `tracker_prob`, coasting
+  points too. The only samples left out are auto frames already credited to a
+  team's auto path. Use `conf` / `det_conf` to drop low-confidence pieces
+  yourself.
 * `team_before` / `team_after`: the team labelled on the **same slot** in the
   nearest labelled frame before / after the piece (`null` if none), and
   `gap_before_s` / `gap_after_s` the match seconds to that frame.
@@ -661,6 +709,8 @@ pipeline's own files against. Differences from a pipeline file:
   hand label never hops to another robot.
 * `identity` is one row with `source: "ground_truth"`, `slot: "GT"`,
   `confirmed: true`. `unidentified` is empty.
+* Paths carry no `det_conf`, `tracker_prob` or `conf`: a hand click has no
+  model confidence.
 
 ## Metrics
 
@@ -912,8 +962,10 @@ count. A robot can also park on a bump on purpose, so check the video.
 There are four version numbers. Each one covers a different part of the file
 and changes when that part makes a **breaking** change: a key is removed or
 renamed, a type changes, or a meaning or unit changes. The one exception so
-far is top-level version 3 / `robots_version` 2, which only added keys but
-was bumped to mark the new provenance data (see [v3 changes](#v3-changes)).
+far are top-level version 3 / `robots_version` 2, which only added keys but
+was bumped to mark the new provenance data (see [v3 changes](#v3-changes)),
+and `robots_version` 3, which only added the per-point confidence columns
+and `conf` summaries.
 
 | Version | Where | Current | Covers |
 |---|---|---|---|
@@ -921,7 +973,7 @@ was bumped to mark the new provenance data (see [v3 changes](#v3-changes)).
 | `schema_version` | each envelope | 1 | The envelope's common keys (`frame`, `sources`, `teams` keyed by team, …). |
 | `metric_version` | each envelope | shift_heatmap 2, auto_paths 2, movement 1, cycles 1, defense 1, bump_stuck 2 | That metric's own payload (team entries and extras). |
 | `timeline_version` | each timeline | 1 | The `timeline` block. |
-| `robots_version` | each match | 2 | The `robots` and `unidentified` blocks and the paths' columns (and the top-level `path_frame` / `camera_legend`). |
+| `robots_version` | each match | 3 | The `robots` and `unidentified` blocks and the paths' columns (and the top-level `path_frame` / `camera_legend`). Version 3 added `det_conf`, `tracker_prob` and `conf`. |
 
 These changes are **not breaking** and do not bump any version:
 
@@ -947,7 +999,8 @@ How an importer should handle versions:
    coded for. Log the skip and keep importing everything else.
 4. If `timeline_version` is not 1, ignore that match's timeline but import the
    rest of the match. Do the same for `robots` and `unidentified` when
-   `robots_version` is not 2 (or 1, if you only read the version-1 fields).
+   `robots_version` is not 3 (or 2 or 1, if you only read the fields those
+   versions had: version 3 only added keys).
 5. Treat unknown string values in open lists, such as phase names and mark
    `source` methods, as data, not as errors.
 
@@ -969,6 +1022,10 @@ All additive: every version-2 field is still there with the same meaning.
 * `robots[]`: `identity` and `identity_s`, how the team label was decided.
   See [How the team was identified](#how-the-team-was-identified-identity).
 * The single-match file carries `camera_legend` and the `cameras` it uses.
+* Later, `robots_version` 3 (additive): per-point `det_conf` and
+  `tracker_prob` columns plus a `conf` summary on every robot path and
+  unidentified track. See
+  [Model confidence per point](#model-confidence-per-point-det_conf-tracker_prob).
 
 ## Importing
 
@@ -1007,7 +1064,7 @@ interface ExportMatch extends SourceRef {
   timeline: Timeline | null;
   cameras: Record<string, { version_id: string | null; status: string | null; reason: string | null }>;
   unidentified_s: { auto: number; teleop: number };
-  robots_version?: 2;           // these four are absent with ?paths=false
+  robots_version?: 3;           // these four are absent with ?paths=false
   auto_s?: number;              // t < auto_s is auto
   robots?: Robot[];
   unidentified?: Unidentified[];
@@ -1040,6 +1097,9 @@ interface Robot {
     y: number[];
     frame: number[];                // source-video frame
     cams: (number | null)[] | null; // bitmask per point on camera_legend; 0 = coasting
+    det_conf: (number | null)[];    // detector box confidence per point (v3)
+    tracker_prob: (number | null)[];// SAM3 tracker confidence per point (v3)
+    conf: ConfSummary;              // v3
   };
   identity: IdentityRow[];
   identity_s: Record<string, number>; // match seconds by source
@@ -1076,6 +1136,18 @@ interface Unidentified {
   y: number[];
   frame: number[];
   cams: (number | null)[] | null;
+  det_conf: (number | null)[];    // v3, as in Robot.path
+  tracker_prob: (number | null)[];
+  conf: ConfSummary;
+}
+
+interface ConfSummary {           // v3; means/mins null when no point has a value
+  det_conf_mean: number | null;
+  det_conf_min: number | null;
+  tracker_prob_mean: number | null;
+  tracker_prob_min: number | null;
+  n_with_det_conf: number;
+  n_with_tracker_prob: number;
 }
 
 interface CameraDetail {

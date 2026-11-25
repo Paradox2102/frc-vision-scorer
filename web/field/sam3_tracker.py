@@ -343,6 +343,60 @@ def _shim_bound_tracker_memory(model: Any) -> None:
     model._propogate_tracker_one_frame_local_gpu = _step_bounding_memory
 
 
+def _tracker_probs_for(obj_ids: Any, scores: Any) -> np.ndarray:
+    """``out_tracker_probs`` aligned with ``obj_ids`` from upstream's
+    ``obj_id_to_tracker_score`` ({obj_id: float | 0-d tensor}). An id with no
+    score, or a score outside [0, 1] (upstream marks removed objects -1e4),
+    gets NaN; the adapter then drops the whole frame's probs."""
+    if hasattr(obj_ids, "detach"):
+        obj_ids = obj_ids.detach().cpu().numpy()
+    ids = np.asarray(obj_ids if obj_ids is not None else [],
+                     dtype=np.int64).reshape(-1)
+    table: dict[int, float] = {}
+    if isinstance(scores, dict):
+        for k, v in scores.items():
+            try:
+                table[int(k)] = float(v.item() if hasattr(v, "item") else v)
+            except (TypeError, ValueError):
+                continue
+    probs = np.full(ids.shape[0], np.nan, dtype=np.float64)
+    for i, oid in enumerate(ids.tolist()):
+        p = table.get(int(oid))
+        if p is not None and 0.0 <= p <= 1.0:
+            probs[i] = p
+    return probs
+
+
+def _shim_postprocess_tracker_probs(model: Any) -> None:
+    """Base SAM3 ``_postprocess_output`` computes ``out_tracker_probs`` (the
+    per-object tracker score, sigmoid of the object-score logit; 1.0 on a
+    prompt/refine frame) for its non-overlap constraint and then DROPS it:
+    the returned dict carries only ``out_probs`` (the first-frame DETECTION
+    score, pinned to 1.0 for box-prompted objects). Re-attach it, aligned
+    with ``out_obj_ids``, so the adapter's ``tracker_prob`` stops being
+    always-None. Payload only: the prob-conditioned gates default off.
+    Instance-level wrap like the multiplex shims; idempotent; a fixed
+    upstream (key already present) is left untouched."""
+    import functools
+
+    post = getattr(model, "_postprocess_output", None)
+    if post is None or getattr(post, "_frc_tracker_probs_shim", False):
+        return
+
+    @functools.wraps(post)
+    def _postprocess_with_tracker_probs(inference_state, out, *a,
+                                        _orig=post, **kw):
+        outputs = _orig(inference_state, out, *a, **kw)
+        if (isinstance(outputs, dict) and isinstance(out, dict)
+                and "out_tracker_probs" not in outputs):
+            outputs["out_tracker_probs"] = _tracker_probs_for(
+                outputs.get("out_obj_ids"), out.get("obj_id_to_tracker_score"))
+        return outputs
+
+    _postprocess_with_tracker_probs._frc_tracker_probs_shim = True
+    model._postprocess_output = _postprocess_with_tracker_probs
+
+
 def _install_multiplex_shims(model: Any) -> None:
     """Compat shims for the SAM 3.1 multiplex model (no-op without a model)."""
     if model is None:
@@ -1119,6 +1173,8 @@ class Sam3PredictorAdapter:
                 probs = np.asarray(raw_probs, dtype=np.float64).reshape(-1)
                 if probs.shape[0] != obj_ids.shape[0]:
                     probs = None
+                elif not np.all(np.isfinite(probs)):
+                    probs = None  # never let NaN (unscored id) reach JSON
             global_idx = int(response["frame_index"]) + chunk["lo"]
             last_global = global_idx
 
@@ -1240,6 +1296,10 @@ class Sam3FieldTracker(MaskFieldTracker):
                         int(getattr(model, "max_num_objects", 0) or 0),
                         int(max_objects),
                     )
+                # Re-attach the per-object tracker score upstream drops
+                # (payload only — see _shim_postprocess_tracker_probs).
+                if model is not None:
+                    _shim_postprocess_tracker_probs(model)
 
         # sam3_skip_detector_heads: base SAM3 only (never the multiplex model;
         # install_skip_detector_heads also refuses multiplex classes itself).

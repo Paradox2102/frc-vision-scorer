@@ -56,8 +56,9 @@ def test_make_frame_detect_fn_returns_export_boxes_and_records(tmp_path):
         detect = job.make_frame_detect_fn(view, view_plan, 0.5, 0)
         out = detect(0, str(jpg))
 
-    # EXPORT box passed straight through to the TBD tracker, paired with color.
-    assert out == [((10.0, 20.0, 30.0, 40.0), "red")]
+    # EXPORT box passed straight through to the TBD tracker, paired with color
+    # (emb slot None; det_conf None: the mock cascade reported no confidence).
+    assert out == [((10.0, 20.0, 30.0, 40.0), "red", None, None)]
 
     # Archive mirrors make_detect_fn: FULL-RES box (export / 0.5 == *2),
     # corrob_only False, under this view + its source frame.
@@ -89,10 +90,37 @@ def test_make_frame_detect_fn_applies_top_crop_y_offset(tmp_path):
         detect = job.make_frame_detect_fn(view, view_plan, 0.5, 12)
         out = detect(0, str(jpg))
 
-    assert out == [((10.0, 20.0, 30.0, 40.0), "blue")]   # export box unchanged
+    assert out == [((10.0, 20.0, 30.0, 40.0), "blue", None, None)]   # export box unchanged
     recorded = job.detection_archive.record.call_args.args[3]
     # full-res: x/0.5, y/0.5 + 12
     assert recorded == [((20.0, 52.0, 60.0, 92.0), "blue", False)]
+
+
+def test_make_frame_detect_fn_carries_det_conf_payload(tmp_path):
+    """The cascade's conf_out map ({box: detector confidence}) reaches the TBD
+    tuple's 4th slot by exact box; a box with no entry gets None."""
+    job = _make_job()
+    job.field_dims = (16.54, 8.21)
+    job.field_model = None
+    job.detection_archive = MagicMock()
+    boxes = [((10.0, 20.0, 30.0, 40.0), "red", True),
+             ((50.0, 20.0, 70.0, 40.0), "unknown", True)]
+
+    def cascade(img, conf_out=None):
+        assert conf_out is not None
+        conf_out[(10.0, 20.0, 30.0, 40.0)] = 0.83
+        return boxes
+    job._robot_seed_candidates = MagicMock(side_effect=cascade)
+
+    view = SimpleNamespace(name="main", calibration=MagicMock())
+    view_plan = SimpleNamespace(source_frames=[7])
+    jpg = tmp_path / "00000.jpg"
+    cv2.imwrite(str(jpg), np.zeros((100, 200, 3), dtype=np.uint8))
+
+    with patch("web.app.filter_field_robot_boxes", return_value=[0, 1]):
+        out = job.make_frame_detect_fn(view, view_plan, 0.5, 0)(0, str(jpg))
+    assert out == [((10.0, 20.0, 30.0, 40.0), "red", None, 0.83),
+                   ((50.0, 20.0, 70.0, 40.0), "unknown", None, None)]
 
 
 def test_make_frame_detect_fn_swallows_errors_with_first_only_warning(capsys):
@@ -493,3 +521,18 @@ def test_gate_on_passes_segmented_knobs_to_selective_config():
         cfg = tracker.track_selective.call_args.kwargs["cfg"]
         assert cfg.retire_closed is retire
         assert cfg.lazy_seed is lazy
+
+
+def test_replay_confs_null_unless_visible():
+    """meta.json frames[].robots[] confidences: rounded for a visible track,
+    None while coasting (TrackOut keeps the last measurement's values)."""
+    from web.app import _replay_confs
+    from web.field.tracker import TrackOut
+    vis = TrackOut(1, "red", (1.0, 2.0), (0.0, 0.0), (0, 0, 1, 1), "visible",
+                   tracker_prob=0.912345, det_conf=0.55557)
+    assert _replay_confs(vis) == {"tracker_prob": 0.9123, "det_conf": 0.5556}
+    coast = TrackOut(1, "red", (1.0, 2.0), (0.0, 0.0), None, "coasting",
+                     tracker_prob=0.9, det_conf=0.8)
+    assert _replay_confs(coast) == {"tracker_prob": None, "det_conf": None}
+    bare = TrackOut(1, "red", (1.0, 2.0), (0.0, 0.0), None, "visible")
+    assert _replay_confs(bare) == {"tracker_prob": None, "det_conf": None}

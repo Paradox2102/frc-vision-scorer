@@ -149,7 +149,9 @@ def match_row(m, timeline: Optional[dict], paths: bool = True,
 # ("Robot paths"); bump ROBOTS_VERSION on a breaking change to ``robots``.
 # v2 (additive): path ``cams`` + ``camera_s``, robot ``identity`` +
 # ``identity_s``, and the match's ``unidentified`` tracks.
-ROBOTS_VERSION = 2
+# v3 (additive): per-point model confidence ``det_conf`` + ``tracker_prob``
+# columns and a per-track ``conf`` summary on every path and unidentified track.
+ROBOTS_VERSION = 3
 PATH_GAP_S = 1.0     # consecutive points further apart than this start a new segment
 # ...and so does a step faster than any FRC robot drives (~5.5 m/s top speed):
 # that is the label hopping to another robot or a bad position, not motion.
@@ -228,9 +230,32 @@ def _split_path(pts: list) -> tuple:
     return segments, int(jumps)
 
 
+def _point(s, slot=None) -> tuple:
+    """(t, x, y, frame, slot, det_conf, tracker_prob) of one Sample."""
+    return (float(s.t_match), float(s.x), float(s.y), int(s.frame_num),
+            s.slot if slot is None else slot,
+            getattr(s, "det_conf", None), getattr(s, "tracker_prob", None))
+
+
+def _round_conf(v) -> Optional[float]:
+    return None if v is None else round(float(v), 4)
+
+
+def _conf_summary(dc: list, tp: list) -> dict:
+    """Per-track summary of the per-point confidence columns (None-skipping)."""
+    d = [v for v in dc if v is not None]
+    p = [v for v in tp if v is not None]
+    return {"det_conf_mean": round(sum(d) / len(d), 4) if d else None,
+            "det_conf_min": round(min(d), 4) if d else None,
+            "tracker_prob_mean": round(sum(p) / len(p), 4) if p else None,
+            "tracker_prob_min": round(min(p), 4) if p else None,
+            "n_with_det_conf": len(d), "n_with_tracker_prob": len(p)}
+
+
 def _columns(pts: list, cams, period_s: float) -> dict:
-    """The columnar t/x/y/frame(/cams) arrays of (t, x, y, frame, slot) points
-    + ``camera_s``. ``cams`` None (no draw log) -> both null."""
+    """The columnar t/x/y/frame(/cams)/det_conf/tracker_prob arrays of
+    (t, x, y, frame, slot[, det_conf, tracker_prob]) points + ``camera_s`` +
+    the ``conf`` summary. ``cams`` None (no draw log) -> both null."""
     out = {"t": [round(p[0], 2) for p in pts], "x": [round(p[1], 2) for p in pts],
            "y": [round(p[2], 2) for p in pts], "frame": [p[3] for p in pts]}
     if cams is None:
@@ -238,11 +263,15 @@ def _columns(pts: list, cams, period_s: float) -> dict:
     else:
         out["cams"] = [cams(p[3], p[4]) for p in pts]
         out["camera_s"] = cams.seconds(out["cams"], _point_weights([p[0] for p in pts], period_s))
+    out["det_conf"] = [_round_conf(p[5] if len(p) > 5 else None) for p in pts]
+    out["tracker_prob"] = [_round_conf(p[6] if len(p) > 6 else None) for p in pts]
+    out["conf"] = _conf_summary(out["det_conf"], out["tracker_prob"])
     return out
 
 
 def _robot_points(tm) -> list:
-    """(t_match, x, y, frame, slot) sorted by time, one per frame: the
+    """(t_match, x, y, frame, slot, det_conf, tracker_prob) sorted by time, one
+    per frame: the
     pipeline's slot-continuous auto path for auto when there is one, labelled
     frames otherwise."""
     use_auto_path = tm.auto_source == "autonomous_paths" and tm.auto_path
@@ -254,7 +283,7 @@ def _robot_points(tm) -> list:
         if s.frame_num in seen:            # two auto pieces overlapping by < 0.4 s
             continue
         seen.add(s.frame_num)
-        out.append((float(s.t_match), float(s.x), float(s.y), int(s.frame_num), s.slot))
+        out.append(_point(s))
     return out
 
 
@@ -284,6 +313,7 @@ def robot_path(tm, match_period_s: float, cams=None) -> dict:
         "segments": segments,
         "n_jumps": jumps,
         "camera_s": cols.pop("camera_s"),
+        "conf": cols.pop("conf"),
         **cols,
     }
 
@@ -396,8 +426,7 @@ def match_unidentified(m, cams=None) -> list:
     out = []
     for slot in sorted(m.unidentified or {}):
         samples = m.unidentified[slot]
-        pts = [(float(s.t_match), float(s.x), float(s.y), int(s.frame_num), slot)
-               for s in samples]
+        pts = [_point(s, slot) for s in samples]
         alliance = next((s.alliance for s in samples if s.alliance), None) or (
             "red" if str(slot)[:1].upper() == "R" else "blue")
         lineup = [int(t) for t in (m.alliances.get(alliance) or []) if t is not None]
@@ -427,6 +456,7 @@ def match_unidentified(m, cams=None) -> list:
                 "team_after": after[0], "gap_after_s": gap(piece[-1][0], after[1]),
                 "candidates": cands,
                 "camera_s": cols.pop("camera_s"),
+                "conf": cols.pop("conf"),
                 **cols,
             })
     return out

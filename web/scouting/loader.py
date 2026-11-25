@@ -16,6 +16,7 @@ Synchronous sqlite3: called from a thread by the API.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -146,6 +147,17 @@ def _team_int(v) -> Optional[int]:
         return None
 
 
+def _conf(rec, key: str) -> Optional[float]:
+    """A finite float confidence ``rec[key]`` (replay robot record or auto-path
+    sample), else None — old replays lack the key."""
+    v = rec.get(key) if isinstance(rec, dict) else None
+    try:
+        v = float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+    return v if v is not None and math.isfinite(v) else None
+
+
 def _slot_alliance(slot) -> str:
     """'R2' -> 'red', 'B1' -> 'blue' (the tracker's slot naming)."""
     return "red" if str(slot)[:1].upper() == "R" else "blue"
@@ -190,14 +202,16 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
             tm = md.teams[team] = TeamMatch(team=team, alliance=alliance, station=station)
         return tm
 
-    def sample(fn, at, xy, alliance, confirmed=False, slot=None) -> Sample:
+    def sample(fn, at, xy, alliance, confirmed=False, slot=None, rec=None) -> Sample:
         period, t, remaining = at
         ax, ay = to_alliance(xy[0], xy[1], alliance, year)
         return Sample(frame_num=int(fn), t_match=t, period=period, remaining=remaining,
                       x=float(xy[0]), y=float(xy[1]), ax=ax, ay=ay, dt=dt,
-                      confirmed=bool(confirmed), slot=slot, alliance=alliance)
+                      confirmed=bool(confirmed), slot=slot, alliance=alliance,
+                      det_conf=_conf(rec, "det_conf"),
+                      tracker_prob=_conf(rec, "tracker_prob"))
 
-    slot_auto_xy: dict = defaultdict(list)    # slot -> [(frame_num, xy)] in auto
+    slot_auto_xy: dict = defaultdict(list)    # slot -> [(frame_num, xy, record)] in auto
     slot_auto_labels: dict = defaultdict(dict)  # slot -> {frame_num: team} in auto
     off_roster = dups = 0
     for fr in frames:
@@ -214,13 +228,13 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
             md.tracked_s[period] += dt
             slot = rb.get("slot")
             if period == "auto" and slot:
-                slot_auto_xy[slot].append((int(fr["frame_num"]), xy))
+                slot_auto_xy[slot].append((int(fr["frame_num"]), xy, rb))
             team = _team_int(rb.get("team_number"))
             if team is None:
                 if slot:
                     alliance = rb.get("alliance") or _slot_alliance(slot)
                     md.unidentified.setdefault(slot, []).append(
-                        sample(fr["frame_num"], at, xy, alliance, False, slot))
+                        sample(fr["frame_num"], at, xy, alliance, False, slot, rb))
                     md.unidentified_s[period] += dt
                 continue
             if roster and team not in roster:
@@ -241,7 +255,7 @@ def build_match(event_key: str, match_key: str, replay: dict, meta: dict, legacy
             alliance = roster.get(team) or rb.get("alliance") or "blue"
             team_match(team, alliance).samples.append(
                 sample(fr["frame_num"], at, rb["field_pos"], alliance,
-                       rb.get("confirmed"), rb.get("slot")))
+                       rb.get("confirmed"), rb.get("slot"), rb))
             md.labelled_s[period] += dt
         if labels:
             md.frame_labels[int(fr["frame_num"])] = tuple(labels)
@@ -325,14 +339,15 @@ def _attach_auto_paths(md, paths, slot_labels, slot_auto_xy, clock, roster, team
     by_team: dict = defaultdict(list)       # team -> [(votes, slot, points, Counter)]
     for slot, path in paths.items():
         first = min((int(p.get("frame_num", 1 << 30)) for p in path), default=1 << 30)
-        pts = [(fn, xy, clock.at(fn)) for fn, xy in slot_auto_xy.get(slot, []) if fn < first]
-        pts += [(int(p["frame_num"]), p.get("field_pos"), clock.at(int(p.get("frame_num", -1))))
+        pts = [(fn, xy, clock.at(fn), rec)
+               for fn, xy, rec in slot_auto_xy.get(slot, []) if fn < first]
+        pts += [(int(p["frame_num"]), p.get("field_pos"), clock.at(int(p.get("frame_num", -1))), p)
                 for p in path if p.get("field_pos") and "frame_num" in p]
         pts = sorted((p for p in pts if p[1] and p[2] and p[2][0] == "auto"),
                      key=lambda p: p[0])
         labels = slot_labels.get(slot, {})
         presence = sorted((at[1], labels.get(fn)) for fn, at in
-                          ((fn, clock.at(fn)) for fn, _ in slot_auto_xy.get(slot, []))
+                          ((fn, clock.at(fn)) for fn, _xy, _rec in slot_auto_xy.get(slot, []))
                           if at and at[0] == "auto")
         for team, lo, hi, votes in _slot_spans(presence):
             piece = [p for p in pts if lo <= p[2][1] <= hi]
@@ -349,8 +364,8 @@ def _attach_auto_paths(md, paths, slot_labels, slot_auto_xy, clock, roster, team
         slot0 = kept[0][1]
         alliance = roster.get(team) or ("red" if str(slot0).startswith("R") else "blue")
         tm = team_match(team, alliance)
-        tm.auto_path = [sample(fn, at, xy, alliance, slot=slot)
-                        for _, slot, piece, _ in kept for fn, xy, at in piece]
+        tm.auto_path = [sample(fn, at, xy, alliance, slot=slot, rec=rec)
+                        for _, slot, piece, _ in kept for fn, xy, at, rec in piece]
         tm.auto_slot = "+".join(dict.fromkeys(c[1] for c in kept))
         votes = sum((c[3] for c in kept), Counter())
         total = sum(votes.values()) or 1

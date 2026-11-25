@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "frc-vision-scorer whole-event scouting export",
-  "description": "One FRC event's vision-scouting data: a header, one row per analysed match (TBA lineup + phase timestamps on the match video), the matches that could not be used, and one envelope per scouting metric. Produced by GET /api/scouting/{event_key}/export. This schema describes top-level schema_version 3, envelope schema_version 1, timeline_version 1 and robots_version 2. Every object may gain new keys in later releases without a version bump: importers must ignore keys they do not know. Human guide: README.md next to this file.",
+  "description": "One FRC event's vision-scouting data: a header, one row per analysed match (TBA lineup + phase timestamps on the match video), the matches that could not be used, and one envelope per scouting metric. Produced by GET /api/scouting/{event_key}/export. This schema describes top-level schema_version 3, envelope schema_version 1, timeline_version 1 and robots_version 3. Every object may gain new keys in later releases without a version bump: importers must ignore keys they do not know. Human guide: README.md next to this file.",
   "type": "object",
   "required": [
     "schema",
@@ -287,8 +287,8 @@
           }
         },
         "robots_version": {
-          "const": 2,
-          "description": "Version of robots[] / unidentified[] / their path columns and the top-level path_frame + camera_legend. Bumped on a breaking change to them (v2 was additive: cams, camera_s, identity, identity_s, unidentified). Absent with paths=false."
+          "const": 3,
+          "description": "Version of robots[] / unidentified[] / their path columns and the top-level path_frame + camera_legend. Bumped on a breaking change to them (v2 was additive: cams, camera_s, identity, identity_s, unidentified; v3 was additive: per-point det_conf / tracker_prob columns and the per-track conf summary). Absent with paths=false."
         },
         "auto_s": {
           "type": "number",
@@ -2656,9 +2656,89 @@
         },
         "camera_s": {
           "$ref": "#/$defs/cameraSeconds"
+        },
+        "det_conf": {
+          "$ref": "#/$defs/confColumn"
+        },
+        "tracker_prob": {
+          "$ref": "#/$defs/trackerProbColumn"
+        },
+        "conf": {
+          "$ref": "#/$defs/confSummary"
         }
       },
       "additionalProperties": true
+    },
+    "confColumn": {
+      "type": "array",
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "minimum": 0,
+        "maximum": 1
+      },
+      "description": "robots_version 3. Per point, the robot detector's (YOLO) box confidence for the detection behind that point, 0..1. null for a coasting point (no measurement), a point inside a SAM-propagated window with no detection that frame, a replay recorded before this field existed, or wherever unknown."
+    },
+    "trackerProbColumn": {
+      "type": "array",
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "minimum": 0,
+        "maximum": 1
+      },
+      "description": "robots_version 3. Per point, the SAM3 per-object tracker confidence of the mask behind that point, 0..1. Only set inside SAM-propagated windows (most points are detector-only and null); also null for coasting points, older replays, or wherever unknown."
+    },
+    "confSummary": {
+      "type": "object",
+      "required": [
+        "det_conf_mean",
+        "det_conf_min",
+        "tracker_prob_mean",
+        "tracker_prob_min",
+        "n_with_det_conf",
+        "n_with_tracker_prob"
+      ],
+      "additionalProperties": true,
+      "description": "robots_version 3. Summary of the det_conf / tracker_prob columns over this track's points, skipping nulls. Means/minimums are null when no point has a value.",
+      "properties": {
+        "det_conf_mean": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "det_conf_min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tracker_prob_mean": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tracker_prob_min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "n_with_det_conf": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_with_tracker_prob": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     },
     "camsColumn": {
       "type": [
@@ -2867,6 +2947,15 @@
         },
         "cams": {
           "$ref": "#/$defs/camsColumn"
+        },
+        "det_conf": {
+          "$ref": "#/$defs/confColumn"
+        },
+        "tracker_prob": {
+          "$ref": "#/$defs/trackerProbColumn"
+        },
+        "conf": {
+          "$ref": "#/$defs/confSummary"
         }
       }
     },

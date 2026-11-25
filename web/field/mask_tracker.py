@@ -2817,6 +2817,9 @@ class MaskFieldTracker:
                 the local frame index equals the numeric filename.
             detect_frame_fn: ``fn(local_idx, frame_path) -> list[(box_xyxy_export,
                 color)]`` -- the per-frame detections fed to the TBD tracker.
+                May also yield ``(box, color, None, det_conf)``: the 4th slot is
+                the detector box confidence, payload only (TBD evidence
+                ``det_conf``).
             cfg: A :class:`~web.field.selective_prop.SelectiveConfig`.
             progress_cb: Optional ``fn(done, total)`` called once per enumerated
                 frame during the TBD phase (caller handles any throttling).
@@ -2880,7 +2883,10 @@ class MaskFieldTracker:
                 except Exception:
                     embs = [None] * len(dets)
                 if embs is not None and len(embs) == len(dets):
-                    dets = [(b, c, e) for (b, c), e in zip(dets, embs)]
+                    # (box, color, emb[, det_conf]): keep any 4th-slot
+                    # detector confidence (payload) the detect fn supplied.
+                    dets = [(d[0], d[1], e) + tuple(d[3:4])
+                            for d, e in zip(dets, embs)]
                     app_frames += 1
                     app_dets += sum(1 for e in embs if e is not None)
             tbd.step(i, dets)

@@ -98,3 +98,53 @@ def test_fusion_prob_none_when_no_member_has_prob():
     }
     fused = fuse_detections(per_camera, weights={"main": 1.0})
     assert fused[0].detection.tracker_prob is None
+
+
+# --------------------------------------------------------------------------- #
+# det_conf (detector box confidence) rides exactly like tracker_prob
+# --------------------------------------------------------------------------- #
+def test_det_conf_rides_slot_and_persists_while_coasting():
+    tr = FieldTracker(field_length=16.0)
+    outs = tr.update([FieldDetection(pos=(2.0, 2.0), color="blue", box=(0, 0, 1, 1),
+                                     det_conf=0.73)], {}, 0.1)
+    assert outs[0].det_conf == 0.73 and outs[0].tracker_prob is None
+    outs = tr.update([FieldDetection(pos=(2.1, 2.0), color="blue", box=(0, 0, 1, 1),
+                                     det_conf=0.41)], {}, 0.1)
+    assert next(o for o in outs if o.state == "visible").det_conf == 0.41
+    outs = tr.update([], {}, 0.1)
+    coasting = [o for o in outs if o.state == "coasting"]
+    assert coasting and coasting[0].det_conf == 0.41   # app nulls it for coasting
+
+
+def test_det_conf_does_not_change_assignment():
+    def run(with_conf):
+        tr = FieldTracker(field_length=16.0)
+        tr.update([
+            FieldDetection(pos=(2.0, 2.0), color="blue", box=(0, 0, 1, 1)),
+            FieldDetection(pos=(6.0, 6.0), color="blue", box=(0, 0, 1, 1)),
+        ], {}, 0.1)
+        outs = tr.update([
+            FieldDetection(pos=(2.1, 2.0), color="blue", box=(0, 0, 1, 1),
+                           det_conf=0.99 if with_conf else None),
+            FieldDetection(pos=(6.1, 6.0), color="blue", box=(0, 0, 1, 1),
+                           det_conf=0.01 if with_conf else None),
+        ], {}, 0.1)
+        return {round(o.pos[0]): (o.slot_id, tuple(o.pos)) for o in outs}
+
+    assert run(False) == run(True)
+
+
+def test_fusion_carries_max_weight_member_det_conf():
+    per_camera = {
+        "main": [(FieldDetection(pos=(3.0, 3.0), color="blue", box=(0, 0, 1, 1),
+                                 det_conf=0.35), None)],
+        "corner_left": [(FieldDetection(pos=(3.05, 3.0), color="blue", box=None,
+                                        det_conf=0.95), None)],
+    }
+    fused = fuse_detections(per_camera, weights={"main": 1.0, "corner_left": 0.3})
+    assert len(fused) == 1
+    assert fused[0].detection.det_conf == 0.35
+    solo = fuse_detections(
+        {"main": [(FieldDetection(pos=(3.0, 3.0), color="blue", box=(0, 0, 1, 1)), None)]},
+        weights={"main": 1.0})
+    assert solo[0].detection.det_conf is None

@@ -106,7 +106,8 @@ def apply_smoothed_paths(paths, smoothed, label_for_slot, fps):
     Existing samples get their field_pos replaced; smoothed frames strictly
     inside a label's existing frame range that have no sample (occlusion /
     corner-only stretches, which the export loop skips) are inserted as
-    synthetic samples flagged interpolated=True with tracker_prob None, so
+    synthetic samples flagged interpolated=True with tracker_prob / det_conf
+    None, so
     downstream consumers can tell inference from measurement. Returns
     {label: (n_replaced, n_inserted)} for the job log."""
     stats: dict[str, tuple[int, int]] = {}
@@ -134,6 +135,7 @@ def apply_smoothed_paths(paths, smoothed, label_for_slot, fps):
                     "corner_only": bool(info["corner_only"]),
                     "occluded": None,
                     "tracker_prob": None,
+                    "det_conf": None,
                     "interpolated": True,
                 })
                 inserted += 1

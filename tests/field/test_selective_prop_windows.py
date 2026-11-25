@@ -465,14 +465,42 @@ def test_merge_schema_and_types():
         for entry in frame.values():
             assert set(entry) == {"box", "mask", "evidence"}
             assert set(entry["evidence"]) == {
-                "type", "gap_len", "detector_overlap", "tracker_prob"}
+                "type", "gap_len", "detector_overlap", "tracker_prob",
+                "det_conf"}
     assert results[0][1]["evidence"]["type"] == "tbd"
     assert results[0][1]["mask"] is None
     assert results[0][1]["evidence"]["tracker_prob"] is None
     assert results[1][1]["evidence"]["type"] == "selective_sam"
     assert results[1][1]["mask"] is mask
     assert results[1][1]["evidence"]["tracker_prob"] == 0.7
+    assert results[0][1]["evidence"]["det_conf"] is None   # legacy obs: no conf
+    assert results[1][1]["evidence"]["det_conf"] is None
     assert renames == []
+
+
+def test_merge_stamps_det_conf_payload():
+    """det_conf (detector box confidence, payload only): TBD entries carry
+    their obs conf; a selective_sam frame carries the TBD conf the same
+    output oid held at that frame, else None."""
+    cfg = SelectiveConfig()
+    box = (10, 10, 30, 30)
+    history = {0: {1: FrameObs(box, float("inf"), "red", conf=0.91)},
+               1: {1: FrameObs(box, float("inf"), "red", conf=0.42)},
+               2: {}}
+    hw = (50, 50)
+    mask = _rect_mask(hw, box)
+    spec = WindowSpec(oid=1, seed_frame=0, entry_frame=1, trigger="margin")
+    outcome = WindowOutcome(spec=spec, state="clean", swap_to=None,
+                            close_frame=2, masks={1: mask, 2: mask},
+                            probs={1: 0.7, 2: 0.6})
+    results, _ = merge_selective_results(history, [outcome], cfg)
+    assert results[0][1]["evidence"]["type"] == "tbd"
+    assert results[0][1]["evidence"]["det_conf"] == 0.91
+    assert results[1][1]["evidence"]["type"] == "selective_sam"
+    assert results[1][1]["evidence"]["det_conf"] == 0.42
+    # SAM bridged a frame with no detection: no detector confidence.
+    assert results[2][1]["evidence"]["type"] == "selective_sam"
+    assert results[2][1]["evidence"]["det_conf"] is None
 
 
 def test_degraded_abort_leaves_tbd_unchanged():

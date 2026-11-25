@@ -382,6 +382,7 @@ def _merge_fused_group(group, ref_local: int) -> FusedObservation:
                          score=rd.score, track_id=rd.track_id, embedding=emb,
                          robot_crop_b64=rd.robot_crop_b64,
                          tracker_prob=rd.tracker_prob,
+                         det_conf=rd.det_conf,
                          cams=tuple(sorted({m[0] for m in members})),
                          cam_embeddings=cam_embs or None)
     # Carry the registry's per-detection relink annotations forward if present.
@@ -439,6 +440,10 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     prob_members = [(w, det.tracker_prob) for (cam, det, _crop, w) in cluster
                     if det.tracker_prob is not None]
     tracker_prob = max(prob_members)[1] if prob_members else None
+    # det_conf (detector box confidence): same payload-only rule.
+    conf_members = [(w, det.det_conf) for (cam, det, _crop, w) in cluster
+                    if det.det_conf is not None]
+    det_conf = max(conf_members)[1] if conf_members else None
     evidence = [(cam, crop, w, (float(det.pos[0]), float(det.pos[1])))
                 for (cam, det, crop, w) in cluster]
     # Keep one deterministic member key per camera. Same-camera duplicates are a
@@ -484,6 +489,7 @@ def _merge(cluster, is_hub_occluded=None) -> FusedObservation:
     return FusedObservation(
         detection=FieldDetection(pos=(float(avg[0]), float(avg[1])), color=color, box=box,
                                  embedding=merged_embedding, tracker_prob=tracker_prob,
+                                 det_conf=det_conf,
                                  cams=tuple(sorted(member_cameras)),
                                  cam_embeddings=cam_embeddings),
         evidence=evidence,

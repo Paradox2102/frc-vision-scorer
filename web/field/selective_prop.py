@@ -75,11 +75,14 @@ class FrameObs:
 
     ``box`` is the matched (or spawning) detection's box in export coords;
     ``margin`` is this assignment's margin (inf when unambiguous / new / solo);
-    ``color`` is the detection's raw color for this frame (None if unknown).
+    ``color`` is the detection's raw color for this frame (None if unknown);
+    ``conf`` is the detection's detector box confidence (None if unknown) --
+    payload only, never read by tracking.
     """
     box: tuple[int, int, int, int]
     margin: float
     color: str | None
+    conf: float | None = None
 
 
 def _expand_box(box, expand: float):
@@ -162,6 +165,17 @@ class _Track:
             else np.asarray(det_emb, dtype=np.float32)
 
 
+def _conf_or_none(conf) -> float | None:
+    """A finite float detector confidence, else None (payload hygiene)."""
+    if conf is None:
+        return None
+    try:
+        c = float(conf)
+    except (TypeError, ValueError):
+        return None
+    return c if np.isfinite(c) else None
+
+
 class TbdTracker:
     """Deterministic tracking-by-detection with per-assignment margins."""
 
@@ -213,11 +227,14 @@ class TbdTracker:
              dets: list[tuple]) -> dict[int, FrameObs]:
         """Advance one frame.
 
-        ``dets = [(box_xyxy, color), ...]`` or ``[(box_xyxy, color, emb), ...]``
-        where ``emb`` is an ``np.ndarray|None`` appearance vector. Returns this
-        frame's matched and newly-spawned observations keyed by oid. Also
-        appends to ``history``.
+        ``dets = [(box_xyxy, color), ...]``, ``[(box_xyxy, color, emb), ...]``
+        or ``[(box_xyxy, color, emb, conf), ...]`` where ``emb`` is an
+        ``np.ndarray|None`` appearance vector and ``conf`` the detector box
+        confidence (payload only: copied onto the ``FrameObs``, never used for
+        matching). Returns this frame's matched and newly-spawned observations
+        keyed by oid. Also appends to ``history``.
         """
+        confs = [d[3] if len(d) > 3 else None for d in dets]
         dets = [(d[0], d[1], d[2] if len(d) > 2 else None) for d in dets]
         live = sorted(self._tracks.values(), key=lambda t: t.oid)  # rows by oid
         obs: dict[int, FrameObs] = {}
@@ -259,6 +276,7 @@ class TbdTracker:
                     box=tuple(int(v) for v in dbox),
                     margin=float(margin),
                     color=dcolor,
+                    conf=_conf_or_none(confs[c]),
                 )
 
         # Unmatched live tracks coast (miss counter climbs).
@@ -279,6 +297,7 @@ class TbdTracker:
                 box=tuple(int(v) for v in dbox),
                 margin=float("inf"),
                 color=dcolor,
+                conf=_conf_or_none(confs[j]),
             )
 
         # Reap dead tracks: die when missed exceeds max_missed (never revive).
@@ -962,7 +981,8 @@ def _apply_kill_coast(results, history, outcomes, cfg: SelectiveConfig):
                 "box": tuple(int(v) for v in coasted),
                 "mask": None,
                 "evidence": {"type": "kill_coast", "gap_len": 0,
-                             "detector_overlap": 1.0, "tracker_prob": None},
+                             "detector_overlap": 1.0, "tracker_prob": None,
+                             "det_conf": None},
             }
             written += 1
         stats["entries"] += written
@@ -1008,7 +1028,8 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
                 "box": tuple(int(v) for v in obs.box),
                 "mask": None,
                 "evidence": {"type": "tbd", "gap_len": 0,
-                             "detector_overlap": 1.0, "tracker_prob": None},
+                             "detector_overlap": 1.0, "tracker_prob": None,
+                             "det_conf": getattr(obs, "conf", None)},
             }
         results[f] = frame
 
@@ -1066,12 +1087,20 @@ def merge_selective_results(history, outcomes, cfg: SelectiveConfig):
             box = mask_to_box(mask)
             if box is None:
                 continue
+            # det_conf (payload): the TBD detection this output oid already
+            # holds at f (post-rename), if any -- the detector box confidence
+            # behind the frame the mask overrides. None on a gap / coast.
+            prev = results.get(f, {}).get(oid)
+            prev_ev = (prev or {}).get("evidence") or {}
             results.setdefault(f, {})[oid] = {
                 "box": tuple(int(v) for v in box),
                 "mask": mask,
                 "evidence": {"type": "selective_sam", "gap_len": 0,
                              "detector_overlap": 1.0,
-                             "tracker_prob": oc.probs.get(f)},
+                             "tracker_prob": oc.probs.get(f),
+                             "det_conf": (prev_ev.get("det_conf")
+                                          if prev_ev.get("type") == "tbd"
+                                          else None)},
             }
 
     return results, events

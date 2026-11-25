@@ -809,3 +809,25 @@ def test_segmented_respects_budget(tmp_path):
     assert stats["sam_frames"] == 10
     assert [e[1] for e in pred.events if e[0] == "yield"] == list(range(1, 11))
     assert stats["outcomes"] == {"clean": 1, "end": 1}
+
+
+def test_track_selective_det_conf_survives_embed_wrapper(tmp_path):
+    """A detect fn's 4th-slot detector confidence reaches the TBD evidence as
+    ``det_conf``, also when the embed wrapper rebuilds (box, color, emb)."""
+    _write_frames(tmp_path, 3)
+    for app_weight in (0.0, 1.0):
+        pred = StubSelectivePredictor(lambda f, oid: L if oid == 1 else R)
+        tracker = MaskFieldTracker(predictor=pred)
+        cfg = _cfg()
+        cfg.app_weight = app_weight
+        dets = {i: [(L, None, None, 0.5 + i / 10), (R, None, None, None)]
+                for i in range(3)}
+        vec = np.zeros(384, dtype=np.float32)
+        vec[0] = 1.0
+        results = tracker.track_selective(
+            str(tmp_path), _detect_fn(dets), cfg,
+            embed_frame_fn=lambda i, p, boxes: [vec, vec])
+        for f in range(3):
+            assert results[f][1]["evidence"]["type"] == "tbd"
+            assert results[f][1]["evidence"]["det_conf"] == 0.5 + f / 10
+            assert results[f][2]["evidence"]["det_conf"] is None

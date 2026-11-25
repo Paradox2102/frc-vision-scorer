@@ -241,6 +241,23 @@ def jsonify(obj):
     return obj
 
 
+def _replay_confs(t) -> dict:
+    """Per-point model confidence for a replay ``frames[].robots[]`` record
+    (payload only): ``tracker_prob`` (SAM3 per-object tracker score) and
+    ``det_conf`` (robot detector box confidence) of the measurement behind a
+    VISIBLE track, rounded to 4 dp; both None for a coasting track (no
+    measurement this frame) or when unknown."""
+    visible = getattr(t, "state", None) == "visible"
+
+    def _r(v):
+        if not visible or v is None:
+            return None
+        v = float(v)
+        return round(v, 4) if math.isfinite(v) else None
+    return {"tracker_prob": _r(getattr(t, "tracker_prob", None)),
+            "det_conf": _r(getattr(t, "det_conf", None))}
+
+
 def _box_iou(box_a, box_b):
     """Intersection over Union (IoU) of two bounding boxes (x1, y1, x2, y2)."""
     x1 = max(box_a[0], box_b[0])
@@ -2219,11 +2236,14 @@ class InferenceJob:
                 return None
             return base64.b64encode(buf).decode('utf-8')
 
-    def _detect_whole_robots(self, frame: np.ndarray, with_balls: bool = False):
+    def _detect_whole_robots(self, frame: np.ndarray, with_balls: bool = False,
+                             conf_out: Optional[dict] = None):
         """Run YOLO model on the frame, select only the whole-robot class, and
         filter out boxes that exceed ROBOT_FILL_MAX_BOX_FRAC. With
         ``with_balls``, also return the fuel-ball boxes from the same pass
-        (motion-attribution exclusions)."""
+        (motion-attribution exclusions). ``conf_out`` (payload only): when a
+        dict, each returned whole-robot box (the exact tuple) maps to its YOLO
+        box confidence (max on a duplicate box)."""
         if not ROBOT_FILL_ENABLED:
             return ([], []) if with_balls else []
         results = self.model(frame, conf=ROBOT_FILL_CONF, verbose=False)[0]
@@ -2244,6 +2264,9 @@ class InferenceJob:
             if cid == self.whole_robot_class_id:
                 if not box_exceeds_frac(box, frame.shape, max_frac):
                     valid_boxes.append(box)
+                    if conf_out is not None and dets.confidence is not None:
+                        c = float(dets.confidence[i])
+                        conf_out[box] = max(c, conf_out.get(box, c))
             elif with_balls and cid == fuel_cls:
                 ball_boxes.append(box)
         return (valid_boxes, ball_boxes) if with_balls else valid_boxes
@@ -2251,7 +2274,8 @@ class InferenceJob:
     def _robot_seed_candidates(self, frame: np.ndarray, conf: float = 0.4,
                                motion_grays=None, blobs_allowed: bool = False,
                                zone_probe=None, corrob_floor: float = 0.0,
-                               with_corrob_band: bool = False):
+                               with_corrob_band: bool = False,
+                               conf_out: Optional[dict] = None):
         """Shared SAM seeding/re-prompt detection cascade on a full-res view
         frame (already top-cropped): bumper detections — admitted by shape OR
         by whole-robot corroboration — expanded to robot boxes, merged with
@@ -2278,6 +2302,14 @@ class InferenceJob:
         when ``with_corrob_band`` is True (as a second return value); 0
         (the default) produces an empty band and leaves behavior unchanged.
 
+        ``conf_out`` (payload only, never read here): when a dict, it is
+        filled with {box tuple: detector confidence} for every bumper-derived
+        robot box (the bumper YOLO box confidence) and every whole-robot box
+        (the robot YOLO box confidence) this call produced. Returned boxes
+        are those exact tuples, so callers look a candidate's confidence up
+        by its box; a box with no entry (motion blob, or a union_extent box)
+        has no detector confidence.
+
         Returns [(box_xyxy, color, strong)] in the input frame's pixel
         coords, in strict priority order: strong YOLO evidence first
         (bumpers at/above conf + whole-robot fills), then the motion tier
@@ -2287,7 +2319,11 @@ class InferenceJob:
         scaling are the caller's concern (they differ between the
         prompt-seeding and re-prompt paths).
         """
-        whole_boxes, ball_boxes = self._detect_whole_robots(frame, with_balls=True)
+        if conf_out is None:
+            whole_boxes, ball_boxes = self._detect_whole_robots(frame, with_balls=True)
+        else:
+            whole_boxes, ball_boxes = self._detect_whole_robots(
+                frame, with_balls=True, conf_out=conf_out)
         person_res = self.person_model(
             frame, classes=[0], conf=DET_CONF_THRESHOLD, verbose=False
         )[0]
@@ -2341,8 +2377,12 @@ class InferenceJob:
                 for box, color, _confidence in dets:
                     if not bumper_admissible(box, whole_boxes):
                         continue
-                    out.append((expand_bumper_to_robot(
-                        box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR), color))
+                    robot_box = expand_bumper_to_robot(
+                        box, frame.shape, ROBOT_BOX_FROM_BUMPER_FACTOR)
+                    if conf_out is not None:
+                        c = float(_confidence)
+                        conf_out[robot_box] = max(c, conf_out.get(robot_box, c))
+                    out.append((robot_box, color))
                 return out
 
             strong_bumpers = _expand(strong_dets)
@@ -2442,8 +2482,10 @@ class InferenceJob:
         seeking/decoding the source video, it reads the ALREADY-EXPORTED view
         JPEG and runs the SAME detection cascade / field-filter / per-half
         roster cap, returning firm robot boxes in EXPORT coords — exactly the
-        ``fn(local_idx, frame_path) -> [(box_xyxy_export, color), ...]`` contract
-        the image-space TBD tracker consumes.
+        ``fn(local_idx, frame_path) -> [(box_xyxy_export, color, None,
+        det_conf), ...]`` contract the image-space TBD tracker consumes (the
+        3rd slot is the appearance embedding, filled later by the embed fn;
+        ``det_conf`` is payload only).
 
         The cascade runs directly on the export-scale JPEG, so its boxes are
         already in export coords. They are unscaled to full-res view coords
@@ -2473,7 +2515,9 @@ class InferenceJob:
                     return []
                 # Firm boxes only: default cascade (no motion pair, no zone
                 # probe, no corrob band) on the export-scale frame.
-                merged = self._robot_seed_candidates(img)
+                # Payload: per-box detector confidence (never read by TBD).
+                det_confs: dict = {}
+                merged = self._robot_seed_candidates(img, conf_out=det_confs)
                 export_h, export_w = img.shape[:2]
                 # Reconstruct the full-res (non-top-cropped) view frame shape the
                 # field filter expects for its box-fraction backstop: export ->
@@ -2524,8 +2568,12 @@ class InferenceJob:
                         by_territory=self.config.alliance_by_territory))
                 survivors = [idx for idx in keep
                              if merged[idx][2] or idx in kept_motion]
-                # EXPORT-coord boxes straight through to the TBD tracker.
-                out = [(tuple(merged[idx][0]), merged[idx][1])
+                # EXPORT-coord boxes straight through to the TBD tracker, as
+                # (box, color, emb=None, det_conf): det_conf is the YOLO box
+                # confidence behind the box (None when it has none) — payload
+                # only, carried onto the TBD evidence.
+                out = [(tuple(merged[idx][0]), merged[idx][1], None,
+                        det_confs.get(tuple(merged[idx][0])))
                        for idx in survivors]
                 # Telemetry archive mirrors make_detect_fn: full-res boxes,
                 # corrob_only False (no corrob band here).
@@ -10624,6 +10672,10 @@ class InferenceJob:
                                     # this frame (None on the legacy detector path).
                                     tracker_prob=(info.get("evidence") or {}).get(
                                         "tracker_prob"),
+                                    # Payload only: detector box confidence of
+                                    # the TBD measurement (selective path only).
+                                    det_conf=(info.get("evidence") or {}).get(
+                                        "det_conf"),
                                 )
 
                                 # Defer the JPEG encode; only top-K chosen crops resolve.
@@ -10893,9 +10945,12 @@ class InferenceJob:
                             # approximation for path-quality metrics. Store the
                             # occlusion cause string when the bumper is occluded,
                             # else None; tracker_prob is the SAM confidence of the
-                            # detection that measured this slot (None if absent).
+                            # detection that measured this slot (None if absent),
+                            # det_conf the detector box confidence behind it.
+                            # Visible-only branch, so both are this frame's.
                             _occ_slot = (self._occ or {}).get(t.slot_id) or {}
                             _tp = t.tracker_prob
+                            _dc = t.det_conf
                             self.autonomous_paths[self._slot_label(t.slot_id)].append({
                                 "frame_num": frame_num,
                                 "timestamp": round(
@@ -10911,6 +10966,8 @@ class InferenceJob:
                                              else None),
                                 "tracker_prob": (round(float(_tp), 4)
                                                  if _tp is not None else None),
+                                "det_conf": (round(float(_dc), 4)
+                                             if _dc is not None else None),
                             })
                     # Coasting tracks keep their stale last_position untouched.
 
@@ -11059,6 +11116,12 @@ class InferenceJob:
                                     "team_number": self._get_display_team_number(self._get_or_create_slot_track(t.slot_id)),
                                     "confirmed": self._get_or_create_slot_track(t.slot_id).team_number_confirmed,
                                     "field_pos": [float(t.pos[0]), float(t.pos[1])] if t.pos is not None else None,
+                                    # Payload: per-point model confidence. A
+                                    # coasting point has no measurement (TrackOut
+                                    # keeps the last one's values), so both are
+                                    # None unless visible.
+                                    "state": t.state,
+                                    **_replay_confs(t),
                                 }
                                 for t in track_outs if t.state != "empty"
                             ],

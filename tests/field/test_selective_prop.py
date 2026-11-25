@@ -203,3 +203,26 @@ def test_constant_velocity_prediction_tracks_mover():
     obs = trk.step(3, [(_box(190, 100), "red")])
     assert set(obs) == {1}             # never lost, never re-spawned
     assert trk.next_oid == 2
+
+
+# --------------------------------------------------------------------------
+# det_conf payload: optional 4th tuple slot, copied onto FrameObs only.
+# --------------------------------------------------------------------------
+def test_det_conf_rides_fourth_slot_onto_frame_obs():
+    a, b = TbdTracker(SelectiveConfig()), TbdTracker(SelectiveConfig())
+    for f, dx in enumerate((0, 5, 10)):
+        plain = a.step(f, [(_box(100 + dx, 100), "red"), (_box(500, 100), "blue")])
+        conf = b.step(f, [(_box(100 + dx, 100), "red", None, 0.87),
+                          (_box(500, 100), "blue", None, None)])
+        # Matching is identical with and without the confidence slot.
+        assert {o: (v.box, v.margin, v.color) for o, v in plain.items()} == \
+            {o: (v.box, v.margin, v.color) for o, v in conf.items()}
+        assert all(v.conf is None for v in plain.values())
+        assert conf[1].conf == 0.87          # spawned (f=0) and matched (f>0)
+        assert conf[2].conf is None
+
+
+def test_det_conf_non_finite_becomes_none():
+    trk = TbdTracker(SelectiveConfig())
+    obs = trk.step(0, [(_box(100, 100), "red", None, float("nan"))])
+    assert obs[1].conf is None

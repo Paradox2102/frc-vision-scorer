@@ -30,6 +30,11 @@ class Sample:
     confirmed: bool = False   # digit-confirmed label (vs. lineup / fill)
     slot: Optional[str] = None
     alliance: Optional[str] = None  # the alliance ax/ay were computed for
+    # Per-point model confidence of the measurement behind this sample (replay
+    # robot record / auto-path sample; None for coasting points, old replays,
+    # or where unknown): robot detector box confidence and SAM3 tracker score.
+    det_conf: Optional[float] = None
+    tracker_prob: Optional[float] = None
 
 
 @dataclass

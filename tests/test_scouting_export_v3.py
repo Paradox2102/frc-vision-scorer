@@ -304,7 +304,7 @@ def test_paths_false_keeps_cameras_and_drops_tracks(tmp_path, monkeypatch):
     full = export.event_export("2026tst", 2026, [md], [], [], {}, paths=True)
     assert full["camera_legend"] == ["main", "corner_left", "corner_right"]
     m = full["matches"][0]
-    assert m["robots_version"] == 2 and len(m["unidentified"]) == 3
+    assert m["robots_version"] == 3 and len(m["unidentified"]) == 3
     assert all(r["path"]["cams"] is None for r in m["robots"])   # no draw log
     assert {"identity", "identity_s"} <= set(m["robots"][0])
 
@@ -332,3 +332,69 @@ def test_auto_path_claimed_frames_are_not_unidentified():
     assert {s.frame_num for s in md.teams[254].auto_path} >= {24, 30}
     assert not md.unidentified
     assert abs(md.unidentified_s["auto"]) < 1e-9
+
+
+# ----------------------------------------------------------------- model confidence (v3)
+def test_old_replays_give_null_confidence_columns():
+    """Replays without the per-point keys: aligned all-null columns and an
+    empty summary, on unidentified pieces and robot paths alike."""
+    md = _md()
+    empty = {"det_conf_mean": None, "det_conf_min": None, "tracker_prob_mean": None,
+             "tracker_prob_min": None, "n_with_det_conf": 0, "n_with_tracker_prob": 0}
+    for e in export.match_unidentified(md):
+        assert e["det_conf"] == [None] * e["n_points"]
+        assert e["tracker_prob"] == [None] * e["n_points"]
+        assert e["conf"] == empty
+    for r in export.match_robots(md):
+        p = r["path"]
+        assert len(p["det_conf"]) == len(p["tracker_prob"]) == p["n_points"]
+        assert p["conf"] == empty
+
+
+def test_per_point_confidence_columns_and_summary():
+    """Robot records' det_conf / tracker_prob land per point (null where the
+    record has none, e.g. coasting) with a None-skipping per-track summary,
+    for unidentified pieces, labelled paths and the autonomous_paths source."""
+    periods = [{"label": "auto", "start_frame": 0, "end_frame": 600, "start_seconds": 20,
+                "end_seconds": 0, "true_start_frame": 0}]
+    frames, path = [], []
+    for k in range(6):
+        fn = k * 6
+        coast = k == 3
+        rec = {"slot": "B1", "alliance": "blue", "team_number": None,
+               "field_pos": [3.0 + 0.1 * k, 2.0], "state": "coasting" if coast else "visible",
+               "det_conf": None if coast else 0.5 + 0.1 * k,
+               "tracker_prob": 0.9 if k == 1 else None}
+        lab = {"slot": "R1", "alliance": "red", "team_number": "254",
+               "field_pos": [10.0 + 0.1 * k, 4.0], "state": "visible",
+               "det_conf": 0.8, "tracker_prob": None}
+        frames.append({"frame_num": fn, "robots": [rec, lab]})
+        path.append({"frame_num": fn, "field_pos": [10.0 + 0.1 * k, 4.0],
+                     "tracker_prob": 0.7, "det_conf": 0.6})
+    meta = {"summary": {"periods": periods, "autonomous_paths": {"R1": path}},
+            "frames": frames}
+    lineup = {"alliances": {"red": [254, None, None], "blue": [None, None, None]}}
+    md, why = loader.build_match("2026tst", "2026tst_qm1", {"id": "r1"}, meta, False,
+                                 lineup, 2026)
+    assert md is not None, why
+    assert md.unidentified["B1"][0].det_conf == 0.5
+
+    (piece,) = export.match_unidentified(md)
+    assert piece["det_conf"] == [0.5, 0.6, 0.7, None, 0.9, 1.0]
+    assert piece["tracker_prob"] == [None, 0.9, None, None, None, None]
+    assert piece["conf"] == {"det_conf_mean": 0.74, "det_conf_min": 0.5,
+                             "tracker_prob_mean": 0.9, "tracker_prob_min": 0.9,
+                             "n_with_det_conf": 5, "n_with_tracker_prob": 1}
+
+    (robot,) = [r for r in export.match_robots(md) if r["team_number"] == 254]
+    p = robot["path"]
+    assert p["auto_source"] == "autonomous_paths"         # auto points from the path
+    assert p["det_conf"] == [0.6] * 6 and p["tracker_prob"] == [0.7] * 6
+    assert p["conf"]["n_with_det_conf"] == 6 and p["conf"]["tracker_prob_min"] == 0.7
+
+
+def test_conf_summary_and_columns_tolerate_legacy_points():
+    assert export._columns([(0.0, 1.0, 2.0, 5, "R1")], None, 0.1)["det_conf"] == [None]
+    assert export._conf_summary([], []) == {
+        "det_conf_mean": None, "det_conf_min": None, "tracker_prob_mean": None,
+        "tracker_prob_min": None, "n_with_det_conf": 0, "n_with_tracker_prob": 0}

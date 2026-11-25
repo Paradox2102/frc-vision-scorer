@@ -8,6 +8,7 @@ height was invisible to the fill path too). With det_frac_backstop=
 survive; legacy default keeps 0.5.
 """
 import numpy as np
+import pytest
 import supervision as sv
 import web.app as app_mod
 from web.job_config import JobConfig
@@ -61,3 +62,14 @@ def test_near_full_frame_box_still_dropped_in_scoped_mode(monkeypatch):
     monkeypatch.setattr(sv.Detections, "from_ultralytics", _passthrough)
     job = _job({"det_frac_backstop": "uncalibrated"}, (0.0, 5.0, 950.0, 372.0))
     assert job._detect_whole_robots(FRAME) == []
+
+
+def test_conf_out_records_whole_robot_box_confidence(monkeypatch):
+    """conf_out (payload): the returned box maps to its YOLO confidence; the
+    return value is unchanged."""
+    monkeypatch.setattr(sv.Detections, "from_ultralytics", _passthrough)
+    job = _job({"det_frac_backstop": "uncalibrated"}, TALL_BOX)
+    confs: dict = {}
+    assert job._detect_whole_robots(FRAME, conf_out=confs) == [TALL_BOX]
+    assert set(confs) == {TALL_BOX}
+    assert confs[TALL_BOX] == pytest.approx(0.9)

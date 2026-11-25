@@ -9,6 +9,7 @@ from web.field.sam3_tracker import (
     Sam3FieldTracker,
     Sam3PredictorAdapter,
     _install_multiplex_shims,
+    _shim_postprocess_tracker_probs,
     _trim_cond_memory,
     _trim_non_cond_memory,
 )
@@ -184,6 +185,64 @@ def test_sam3_tracker_records_tracker_prob_evidence(tmp_path):
     tracker = Sam3FieldTracker(predictor=raw)
     results = tracker.track(str(tmp_path), prompt_idx=0, prompt_boxes=[(3, 2, 8, 6)])
     assert results[0][7]["evidence"]["tracker_prob"] == pytest.approx(0.82)
+
+
+def test_sam3_adapter_drops_probs_with_nan(tmp_path):
+    """An unscored id (NaN from the postprocess shim) drops the frame's probs."""
+    frames = _run_probs_adapter(
+        tmp_path, [7, 8], np.array([0.3, np.nan], dtype=np.float64)
+    )
+    _f, _ids, _m, probs = frames[0]
+    assert probs is None
+
+
+class _FakePostprocessModel:
+    """Mimics upstream base SAM3: computes tracker scores, returns without
+    ``out_tracker_probs``."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def _postprocess_output(self, inference_state, out, removed_obj_ids=None,
+                            suppressed_obj_ids=None, unconfirmed_obj_ids=None):
+        self.calls += 1
+        ids = sorted(out["obj_id_to_mask"])
+        return {"out_obj_ids": np.asarray(ids, dtype=np.int64),
+                "out_probs": np.ones(len(ids), dtype=np.float32)}
+
+    def run(self, out):
+        return self._postprocess_output({}, out, suppressed_obj_ids=[])
+
+
+def test_postprocess_shim_attaches_aligned_tracker_probs():
+    torch = pytest.importorskip("torch")
+    m = _FakePostprocessModel()
+    _shim_postprocess_tracker_probs(m)
+    _shim_postprocess_tracker_probs(m)          # idempotent
+    assert getattr(m._postprocess_output, "_frc_tracker_probs_shim", False)
+    out = {"obj_id_to_mask": {3: None, 1: None, 5: None, 9: None},
+           "obj_id_to_tracker_score": {np.int64(1): 0.25,
+                                       3: torch.tensor(0.75),
+                                       9: -1e4}}   # upstream "removed" marker
+    res = m.run(out)
+    assert m.calls == 1
+    assert res["out_obj_ids"].tolist() == [1, 3, 5, 9]
+    probs = res["out_tracker_probs"]
+    assert probs[:2].tolist() == pytest.approx([0.25, 0.75])
+    assert np.isnan(probs[2]) and np.isnan(probs[3])   # missing / sentinel
+
+
+def test_postprocess_shim_leaves_upstream_key_and_bare_models_alone():
+    m = _FakePostprocessModel()
+    orig = m._postprocess_output
+    m._postprocess_output = lambda st, out, **kw: {
+        **orig(st, out, **kw), "out_tracker_probs": np.array([0.5])}
+    _shim_postprocess_tracker_probs(m)
+    res = m._postprocess_output({}, {"obj_id_to_mask": {1: None},
+                                     "obj_id_to_tracker_score": {1: 0.9}})
+    assert res["out_tracker_probs"].tolist() == [0.5]
+    _shim_postprocess_tracker_probs(object())          # no attribute: no-op
+    _shim_postprocess_tracker_probs(None)
 
 
 def _write_frames(dir_path, n, width=10, height=8):

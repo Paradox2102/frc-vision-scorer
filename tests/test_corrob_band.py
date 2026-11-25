@@ -9,6 +9,7 @@ band: presence evidence that can never seed, match, re-anchor, or evict
 empty and the primary return value byte-identical to the pre-Task-2 shape.
 """
 import numpy as np
+import pytest
 import supervision as sv
 from unittest.mock import MagicMock, patch
 
@@ -137,3 +138,21 @@ def test_corrob_band_excludes_detections_below_floor():
 
     assert len(result) == 1
     assert band == []
+
+
+def test_conf_out_maps_returned_bumper_box_to_its_confidence():
+    """conf_out (payload): each returned bumper-derived robot box maps to the
+    bumper detection's confidence; the candidate list is unchanged."""
+    job, person_from_ultralytics = _make_job()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    dets = _bumper_detections([BOX_STRONG], [0], [0.6])
+    job.bumper_model = MagicMock(return_value=[MagicMock()])
+    with patch("supervision.Detections.from_ultralytics",
+               side_effect=[person_from_ultralytics(None), dets]):
+        plain = job._robot_seed_candidates(frame, conf=0.4)
+    confs: dict = {}
+    with patch("supervision.Detections.from_ultralytics",
+               side_effect=[person_from_ultralytics(None), dets]):
+        result = job._robot_seed_candidates(frame, conf=0.4, conf_out=confs)
+    assert result == plain and len(result) == 1
+    assert confs[tuple(result[0][0])] == pytest.approx(0.6)

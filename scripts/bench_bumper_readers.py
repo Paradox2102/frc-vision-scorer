@@ -166,7 +166,13 @@ sys.path.insert(0, str(REPO))
 BENCH_DIR = REPO / "data" / "eval" / "bumper_crop_bench"
 ENV_FILE = REPO / ".env"
 
-ARMS = ("freeread", "vllm-choice", "clef-flash", "clef", "clef-omni", "jev")
+ARMS = ("freeread", "vllm-choice", "clef-flash", "clef", "clef-omni", "jev", "local",
+        "local-clef")
+# `local` = the jev payload POSTed to a self-hosted /v1/systemone server
+# (scripts/decision_local/systemone_shim.py); --local-label names the results file.
+# `local-clef` = the clef-flash arm's Workers AI payload (legible noul + surface + team,
+# images list) POSTed to the shim's /v1/clef route: Clef's native request format.
+LOCAL_SYSTEMONE_URL = os.environ.get("LOCAL_SYSTEMONE_URL", "http://127.0.0.1:8100/v1/systemone")
 OPTION_MODES = ("alliance", "decoy", "missing-true")
 HINT_SOURCES = ("baseline", "label", "none")
 ESCAPES = ("none", "other")
@@ -2015,6 +2021,8 @@ class Jev:
     """TypeSafe Jev decision model, single frame: `subject` then `team` with
     four escape options (JEV_ESCAPES)."""
 
+    arm_name = "jev"
+
     def __init__(self, ctx: Ctx, dry_run: bool):
         self.ctx = ctx
         self.dry = dry_run
@@ -2025,6 +2033,11 @@ class Jev:
                            f"or the single fused image of {' / '.join(REGISTERED_MODES)})")
         if getattr(ctx.args, "blank_calibrate_clef", False):
             raise ArmError("jev: blank calibration is not implemented")
+        self.post_url = JEV_URL
+        self.cost_per_m = JEV_USD_PER_M_INPUT
+        self.model_id = JEV_MODEL
+        if self.arm_name != "jev":
+            return  # LocalSystemOne: no token, no cost
         self.env_loaded = load_env_file(ENV_FILE, keys=JEV_ENV_KEYS)
         self.token = os.environ.get("JEV_TYPESAFE_API_TOKEN")
         self.missing = [] if self.token else list(JEV_ENV_KEYS)
@@ -2047,11 +2060,10 @@ class Jev:
         return {str(k): float(v) for k, v in probs.items()}
 
     def _post(self, payload: dict, pred: dict, usages: list) -> dict:
-        body, lat, attempts = post_json(
-            JEV_URL, payload,
-            headers={"Authorization": f"Bearer {self.token}",
-                     "TypeSafe-Danger-Zone-Images": "true"},
-            retries=self.ctx.args.retries)
+        headers = ({"Authorization": f"Bearer {self.token}",
+                    "TypeSafe-Danger-Zone-Images": "true"} if self.arm_name == "jev" else {})
+        body, lat, attempts = post_json(self.post_url, payload, headers=headers,
+                                        retries=self.ctx.args.retries)
         pred["attempts"] = (pred["attempts"] or 0) + attempts
         pred["latencies_s"].append(round(lat, 3))
         if not isinstance(body, dict):
@@ -2066,7 +2078,7 @@ class Jev:
         hint = hint_alliance(row, a.hint_source)
         base = shuffle_options(jev_options(row, a.options, hint), row["id"], a.option_seed)
         img, w, h, padded = jev_image(self.ctx.crop(row))
-        pred = _base_pred("jev", row, self.ctx, hint, JEV_MODEL, a.options)
+        pred = _base_pred(self.arm_name, row, self.ctx, hint, self.model_id, a.options)
         pred["option_ids"] = [o["id"] for o in base]
         pred["escape_ids"] = list(JEV_ESCAPES)
         pred["permutations"] = self.k
@@ -2098,10 +2110,10 @@ class Jev:
         except ArmError as e:
             pred["error"] = str(e)
         pred["est_input_tokens"] = est
-        pred["est_cost_usd"] = est * JEV_USD_PER_M_INPUT / 1e6
+        pred["est_cost_usd"] = est * self.cost_per_m / 1e6
         pred["usage"] = _sum_usage(usages)
         if pred["usage"] and pred["usage"].get("input_tokens") is not None:
-            pred["est_cost_usd"] = pred["usage"]["input_tokens"] * JEV_USD_PER_M_INPUT / 1e6
+            pred["est_cost_usd"] = pred["usage"]["input_tokens"] * self.cost_per_m / 1e6
         if not self.dry:
             _finish_choice_pred(pred, perms, False, escapes=JEV_ESCAPES)
             sp = average_distributions(subjects)
@@ -2109,6 +2121,42 @@ class Jev:
             pred["subject_top"], pred["subject_top_p"] = top_choice(sp)
         pred["requests_per_crop"] = self.requests_per_crop(len(base))
         return pred, first_payload
+
+
+class LocalClef(Clef):
+    """The clef-flash arm's exact Workers AI request (clef_state / clef_questions /
+    clef_image) POSTed to a self-hosted shim's /v1/clef route. No auth, no cost."""
+
+    def __init__(self, ctx: Ctx, dry_run: bool):
+        super().__init__(ctx, "clef-flash", dry_run=True)  # skip the CF credential check
+        self.dry = dry_run
+        self.local_url = ctx.args.local_url.rsplit("/v1/", 1)[0] + "/v1/clef"
+        self.token = "local"
+
+    def url(self, redact: bool = False) -> str:
+        return self.local_url
+
+    def predict(self, row: dict) -> tuple[dict, dict]:
+        pred, payload = super().predict(row)
+        pred["arm"] = "local-clef"
+        pred["model"] = f"local:{self.ctx.args.local_label}"
+        pred["est_cost_usd"] = 0.0
+        return pred, payload
+
+
+class LocalSystemOne(Jev):
+    """The jev arm's exact payload (subject + team, four escapes, jev_image prep)
+    POSTed to a self-hosted Jev-wire server, e.g. an open decision model behind
+    scripts/decision_local/systemone_shim.py. No auth header, no cost."""
+    arm_name = "local"
+
+    def __init__(self, ctx: Ctx, dry_run: bool):
+        super().__init__(ctx, dry_run)
+        self.post_url = ctx.args.local_url
+        self.cost_per_m = 0.0
+        self.model_id = f"local:{ctx.args.local_label}"
+        self.token = None
+        self.missing = []
 
 
 def make_arm(name: str, ctx: Ctx, dry_run: bool):
@@ -2122,6 +2170,10 @@ def make_arm(name: str, ctx: Ctx, dry_run: bool):
         return Clef(ctx, name, dry_run)
     if name == "jev":
         return Jev(ctx, dry_run)
+    if name == "local":
+        return LocalSystemOne(ctx, dry_run)
+    if name == "local-clef":
+        return LocalClef(ctx, dry_run)
     raise ArmError(f"unknown arm {name!r}; valid: {', '.join(ARMS)}")
 
 
@@ -2325,7 +2377,7 @@ def cmd_run(args) -> None:
         def _ok(arm: str) -> bool:
             if arm == "freeread":
                 return args.frames in FREEREAD_FRAME_MODES
-            if arm == "jev":
+            if arm in ("jev", "local"):
                 return False
             if arm in CLEF_MODELS:
                 return args.frames == "multi4" or (args.frames == "video" and arm in VIDEO_ARMS)
@@ -2365,7 +2417,9 @@ def cmd_run(args) -> None:
             print(f"[{name}] ERROR: {e}", file=sys.stderr)
             summary["arms"][name] = {"error": str(e)}
             continue
-        out_path = res_dir / f"{name}-{stamp}.jsonl"
+        file_arm = (f"local-{args.local_label}" if name == "local"
+                    else f"local-clef-{args.local_label}" if name == "local-clef" else name)
+        out_path = res_dir / f"{file_arm}-{stamp}.jsonl"
         print(f"[{name}] {len(rows)} crops -> {out_path}", file=sys.stderr)
         preds = run_arm(name, arm, rows, out_path, args.concurrency)
         if QUOTA_EXHAUSTED.is_set():
@@ -2374,7 +2428,9 @@ def cmd_run(args) -> None:
                   "Upgrade to Workers Paid or re-run after 00:00 UTC.", file=sys.stderr)
         variants = score_file_variants(preds, manifest, _file_label(preds) if preds else name)
         model = (ctx.vlm_model if name in ("freeread", "vllm-choice")
-                 else JEV_MODEL if name == "jev" else CLEF_MODELS[name]["route"])
+                 else JEV_MODEL if name == "jev"
+                 else f"local:{args.local_label}" if name in ("local", "local-clef")
+                 else CLEF_MODELS[name]["route"])
         summary["arms"][name] = {"file": out_path.name, "model": model,
                                  "scores": dict(variants)}
         scored.extend(variants)
@@ -2496,6 +2552,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "(the `score --subset tracklet` crops; about half the paid requests)")
     run.add_argument("--video-with-still", action="store_true",
                      help="--frames video: also send the bench crop as an image")
+    run.add_argument("--local-url", default=LOCAL_SYSTEMONE_URL,
+                     help="local arm: Jev-wire /v1/systemone endpoint (LOCAL_SYSTEMONE_URL)")
+    run.add_argument("--local-label", default="local",
+                     help="local arm: model label for the results file (local-<label>-<stamp>.jsonl)")
     run.add_argument("--bench", default=str(BENCH_DIR))
     sc = sub.add_parser("score", help="score results files against the manifest labels")
     sc.add_argument("--subset", choices=("all", "tracklet"), default="all",

@@ -636,6 +636,32 @@ calibration details of its cameras. `?team=N` keeps only that robot in
 for a match with no usable replay (the `detail` says why), and for a team that
 is not in the match.
 
+### Ground-truth match files
+
+A few matches were also tracked **by hand**: a person followed each robot
+through the video and clicked its bumper footprint on the carpet. These come
+as single-match files in the same layout (schema-valid), in the Drive folder
+`ground_truth/<match_key>.json` (`scripts/export_gt_matches.py [--upload]` →
+`data/exports/ground_truth/`). Use them as the true paths to check the
+pipeline's own files against. Differences from a pipeline file:
+
+* A top-level `ground_truth` block: `kind` (`hand_annotated`),
+  `annotators`, `teams_annotated`, `teams_missing` (lineup robots nobody
+  tracked) and per-robot provenance.
+* `match.robots[]` lists the annotated robots only. The match header
+  (lineup, `timeline`, `cameras`, `replay_id`) is the pipeline replay of the
+  same video, so `t` and `frame` are on exactly the same clock as the
+  pipeline's file for that match.
+* One point per click (~30 per second). An extra column `path.state` is
+  `visible` (clear view; `cams` = the camera clicked in) or `estimated`
+  (occluded, best guess; `cams` = `0`). Times the robot could not be located
+  at all are gaps. `path.visible_share` is the share of `visible` points.
+* `segments` break on time gaps over 1.0 s only (`n_jumps` is 0): click
+  jitter between two clicks 1/30 s apart can exceed the 7 m/s jump rule, and a
+  hand label never hops to another robot.
+* `identity` is one row with `source: "ground_truth"`, `slot: "GT"`,
+  `confirmed: true`. `unidentified` is empty.
+
 ## Metrics
 
 Each subsection below lists the per-team fields and the metric-level extras,

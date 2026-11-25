@@ -473,10 +473,14 @@ def test_active_job_endpoint_reports_last_status_progress():
             job._enqueue_ws("frame", {"type": "frame", "progress": 99})  # not a status
 
         asyncio.run(emit())
+        # Jev spend after the job was made counts toward it; Clef's does not.
+        app_mod.clef_reader._add_process_spend("jev", 0.0125)
+        app_mod.clef_reader._add_process_spend("clef", 1.0)
         body = TestClient(app_mod.app).get("/api/job/active").json()
         assert body["job_id"] == "active-2"
         assert body["progress"] == 61.5
         assert body["message"] == "Finalizing"
+        assert body["jev_usd"] == 0.0125
     finally:
         app_mod.jobs.pop("active-2", None)
 

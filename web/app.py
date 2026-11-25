@@ -1662,6 +1662,10 @@ class InferenceJob:
         # whether or not a client is attached, for /api/job/active pollers.
         self.last_progress: Optional[float] = None
         self.last_message: Optional[str] = None
+        # Process Jev spend when the job was made: /api/job/active reports
+        # the difference as the job's Jev cost so far. Everything Jev does
+        # in the process meanwhile counts (one job runs at a time per app).
+        self._jev_usd_at_start = clef_reader.process_spend_usd("jev")
         self.websocket: Optional[WebSocket] = None
         self._websocket_send_lock = asyncio.Lock()
         # First ws connection claims the run; later connections only attach
@@ -11820,6 +11824,8 @@ async def active_job():
                 "match_key": getattr(job, "match_key", None),
                 "progress": getattr(job, "last_progress", None),
                 "message": getattr(job, "last_message", None),
+                "jev_usd": round(clef_reader.process_spend_usd("jev")
+                                 - getattr(job, "_jev_usd_at_start", 0.0), 4),
             }
     return {"job_id": None}
 

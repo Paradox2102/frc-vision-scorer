@@ -676,13 +676,15 @@ class ClefSession:
                         self._c["ok"] += 1
                         self._latencies.append(latency)
                         if isinstance(tokens, (int, float)):
-                            self._c["input_tokens"] += int(tokens)
+                            n_in = int(tokens)
                         else:
-                            self._c["input_tokens"] += self._estimate_tokens(payload, image_wh)
+                            n_in = self._estimate_tokens(payload, image_wh)
                             self._c["estimated_token_responses"] += 1
+                        self._c["input_tokens"] += n_in
                         out_tok = usage.get("output_tokens")
                         if isinstance(out_tok, (int, float)):
                             self._c["output_tokens"] += int(out_tok)
+                    _add_process_spend(self.name, n_in * self.spec["usd_per_m_input"] / 1e6)
                     return answers
                 msg = f"HTTP {status}: {self._redact((text or '')[:300])}"
                 if self._is_quota(status, text):
@@ -863,6 +865,25 @@ class ClefSession:
         if self.disabled_kind:
             line += f"; DISABLED ({self.disabled_reason}), {st['skipped']} reads skipped"
         return line
+
+
+# Process-wide spend per reader name ("clef", "jev"), summed over every
+# session in this process: per-job sessions, the window-label and
+# auto-calibration sessions, and the fallback below. A job snapshots it at
+# start so /api/job/active can report what the job has spent so far.
+_process_spend: dict[str, float] = {}
+_process_spend_lock = threading.Lock()
+
+
+def _add_process_spend(name: str, usd: float) -> None:
+    with _process_spend_lock:
+        _process_spend[name] = _process_spend.get(name, 0.0) + usd
+
+
+def process_spend_usd(name: str) -> float:
+    """USD this process has spent on reader ``name`` (estimated from tokens)."""
+    with _process_spend_lock:
+        return _process_spend.get(name, 0.0)
 
 
 # Fallback session for reads outside a job (no per-job session passed in).

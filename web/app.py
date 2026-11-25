@@ -258,6 +258,31 @@ def _replay_confs(t) -> dict:
             "det_conf": _r(getattr(t, "det_conf", None))}
 
 
+_POINT_PAYLOAD_KEYS = ("state", "tracker_prob", "det_conf")
+
+
+def _carry_point_payload(rebuilt: list, orig_frames: list) -> list:
+    """Copy the live per-point payload (``state``, ``tracker_prob``,
+    ``det_conf``) from the recorded replay robot rows onto the finalize
+    re-resolve's rebuilt rows, matched by (frame_num, slot). The rebuild
+    (reresolve_frames_by_slot) emits fresh rows from the identity log, which
+    has none of these keys, so without this every replay lost them. Rows with
+    no recorded counterpart are left as rebuilt. In place; returns
+    ``rebuilt``."""
+    by_frame = {f.get("frame_num"): {r.get("slot"): r for r in f.get("robots") or []}
+                for f in orig_frames}
+    for f in rebuilt:
+        recorded = by_frame.get(f.get("frame_num")) or {}
+        for r in f.get("robots") or []:
+            src = recorded.get(r.get("slot"))
+            if src is None:
+                continue
+            for k in _POINT_PAYLOAD_KEYS:
+                if k in src and k not in r:
+                    r[k] = src[k]
+    return rebuilt
+
+
 def _box_iou(box_a, box_b):
     """Intersection over Union (IoU) of two bounding boxes (x1, y1, x2, y2)."""
     x1 = max(box_a[0], box_b[0])
@@ -8553,6 +8578,7 @@ class InferenceJob:
         rebuilt_rows = sum(len(f["robots"]) for f in rebuilt)
         if rebuilt_rows >= max(1, orig_rows) * RERESOLVE_MIN_KEEP_FRAC:
             orig = {f["frame_num"]: f for f in rec.frames}
+            _carry_point_payload(rebuilt, rec.frames)
             rec.frames = [{**orig.get(f["frame_num"], {}), **f} for f in rebuilt]
         else:
             print(f"[backward-confirm] re-resolution kept {rebuilt_rows}/{orig_rows} rows "
@@ -10631,9 +10657,14 @@ class InferenceJob:
                                         sub_mask = mask2d[int(y1):int(y2), int(x1):int(x2)]
                                         if sub_mask.size == 0:
                                             sub_mask = None
+                                # 8th slot: THIS object's evidence (payload:
+                                # tracker_prob / det_conf). The FieldDetection
+                                # loop below must not read the leaked loop
+                                # variable ``info`` (= the view's LAST object,
+                                # so every detection got one object's values).
                                 embed_candidates.append(
                                     (obj_id, full_box, xy, corner_weight, color,
-                                     box_s, sub_mask))
+                                     box_s, sub_mask, info.get("evidence") or {}))
 
                             # One DINOv2 forward pass for every robot in this view
                             # (embed() is embed_batch([box])[0], so semantics match).
@@ -10654,7 +10685,7 @@ class InferenceJob:
                                             masks=[c[6] for c in embed_candidates])
 
                             for (obj_id, full_box, xy, corner_weight, color, box_s,
-                                 sub_mask), det_embed in zip(embed_candidates, det_embeds):
+                                 sub_mask, evidence), det_embed in zip(embed_candidates, det_embeds):
                                 robot_crop_b64 = None
                                 if small_frame is not None:
                                     robot_crop_b64 = self._masked_robot_crop_b64(
@@ -10670,12 +10701,10 @@ class InferenceJob:
                                     robot_crop_b64=robot_crop_b64,
                                     # Payload only: SAM per-object confidence for
                                     # this frame (None on the legacy detector path).
-                                    tracker_prob=(info.get("evidence") or {}).get(
-                                        "tracker_prob"),
+                                    tracker_prob=evidence.get("tracker_prob"),
                                     # Payload only: detector box confidence of
                                     # the TBD measurement (selective path only).
-                                    det_conf=(info.get("evidence") or {}).get(
-                                        "det_conf"),
+                                    det_conf=evidence.get("det_conf"),
                                 )
 
                                 # Defer the JPEG encode; only top-K chosen crops resolve.

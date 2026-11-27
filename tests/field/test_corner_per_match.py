@@ -224,7 +224,7 @@ def test_knob_defaults():
     from web.job_config import JobConfig
     c = JobConfig()
     assert (c.corner_per_match_calib, c.corner_drop_on_fail, c.corner_check_max_m,
-            c.corner_resolve_max_m) == (True, True, 0.25, 0.15)
+            c.corner_resolve_max_m) == (True, True, 0.10, 0.15)
     assert JobConfig({"corner_per_match_calib": False}).non_defaults() == {
         "corner_per_match_calib": False}
 

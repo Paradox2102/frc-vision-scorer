@@ -44,7 +44,7 @@ LABEL = "auto per-match (corner)"
 
 @dataclass
 class CornerStepConfig:
-    check_max_m: float = 0.25       # quick check of the covering epoch
+    check_max_m: float = 0.10       # quick check of the covering epoch (knob corner_check_max_m)
     resolve_max_m: float = 0.15     # within-match validation gate of a re-solve
     check_frames: int = 6
     min_tags: int = 3               # tags per check frame

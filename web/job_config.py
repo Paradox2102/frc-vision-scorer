@@ -1040,11 +1040,16 @@ KNOBS = [
     # version anchored at the match and used immediately. Otherwise the corner
     # view is dropped from the job (corner_drop_on_fail). DEFAULT ON (user
     # decision Nov 11; operator spot-checks on /calibrate). Off = old behaviour.
+    # corner_check_max_m DEFAULT 0.10 (was 0.25; user decision Nov 27): on 2026cabl
+    # 11 matches kept a nudged corner epoch at 0.20-0.24 m because it slipped under
+    # 0.25; re-run at 0.10 every one re-solved (or a newer epoch passed) to
+    # 0.01-0.06 m with 0 extra corner drops. Cost ~30 s per re-solved corner.
+    # Also the corner gate of the event-load auto-calibration (_auto_calib_cfg).
     Knob("corner_per_match_calib", "CORNER_PER_MATCH_CALIB", bool, True,
          section="Fusion & field position"),
     Knob("corner_drop_on_fail", "CORNER_DROP_ON_FAIL", bool, True,
          section="Fusion & field position"),
-    Knob("corner_check_max_m", "CORNER_CHECK_MAX_M", float, 0.25, min=0.01, max=5.0,
+    Knob("corner_check_max_m", "CORNER_CHECK_MAX_M", float, 0.10, min=0.01, max=5.0,
          section="Fusion & field position"),
     Knob("corner_resolve_max_m", "CORNER_RESOLVE_MAX_M", float, 0.15, min=0.01, max=5.0,
          section="Fusion & field position"),
